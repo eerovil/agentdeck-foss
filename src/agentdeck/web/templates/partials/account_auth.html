@@ -1,0 +1,48 @@
+{# One Claude account's login, and the way out when it is broken (#298).
+   `auth` = AuthStatus|None (what the CLI last said), `flow` = LoginFlow|None.
+   Every button swaps this same fragment back in, so the panel is the flow's state.
+   The authorize URL is shown deliberately (it grants nothing on its own); the code
+   the operator pastes is posted once and never rendered back. #}
+<div class="acct-auth" id="acct-auth-{{ account.key | replace(':', '-') }}">
+  {% if flow and flow.state == 'awaiting_code' %}
+  <p class="small">Open this on the device you are reading this from, approve, then paste the code:</p>
+  <p class="acct-auth-link"><a href="{{ flow.url }}" target="_blank" rel="noopener noreferrer">Sign in to {{ account.label }} →</a></p>
+  <form hx-post="/accounts/{{ account.key | urlencode }}/auth/code"
+        hx-target="#acct-auth-{{ account.key | replace(':', '-') }}" hx-swap="outerHTML">
+    <input type="text" name="code" autocomplete="off" spellcheck="false"
+           placeholder="paste the code" aria-label="authorization code for {{ account.label }}">
+    <button type="submit">Finish</button>
+  </form>
+  <form hx-post="/accounts/{{ account.key | urlencode }}/auth/cancel"
+        hx-target="#acct-auth-{{ account.key | replace(':', '-') }}" hx-swap="outerHTML">
+    <button type="submit" class="link-button">cancel</button>
+  </form>
+  {% elif flow and flow.state == 'done' %}
+  <p class="small ok">Signed in{% if flow.status and flow.status.email %} as {{ flow.status.email }}{% endif %}.</p>
+  <p class="small muted">Nothing was re-sent: a message that failed while the login was expired
+    has to be sent again on purpose.</p>
+  {% elif flow and flow.state == 'failed' %}
+  <p class="small bad">{{ flow.detail }}</p>
+  <form hx-post="/accounts/{{ account.key | urlencode }}/auth/login"
+        hx-target="#acct-auth-{{ account.key | replace(':', '-') }}" hx-swap="outerHTML">
+    <button type="submit">Try again</button>
+  </form>
+  {% elif auth and auth.broken %}
+  <p class="small bad">{{ account.label }} is signed out — delegations to it will fail.</p>
+  <form hx-post="/accounts/{{ account.key | urlencode }}/auth/login"
+        hx-target="#acct-auth-{{ account.key | replace(':', '-') }}" hx-swap="outerHTML">
+    <button type="submit">Reconnect</button>
+  </form>
+  {% elif auth and auth.known %}
+  <p class="small muted">Signed in{% if auth.email %} as {{ auth.email }}{% endif %}{% if auth.organization %} · {{ auth.organization }}{% endif %}.</p>
+  {% elif auth %}
+  {# Unknown is not broken: say which one it is rather than inventing a verdict. #}
+  <p class="small muted">Login state unknown{% if auth.detail %} — {{ auth.detail }}{% endif %}.</p>
+  {% endif %}
+  {% if not (flow and flow.state == 'awaiting_code') %}
+  <form hx-post="/accounts/{{ account.key | urlencode }}/auth/verify"
+        hx-target="#acct-auth-{{ account.key | replace(':', '-') }}" hx-swap="outerHTML">
+    <button type="submit" class="link-button">check now</button>
+  </form>
+  {% endif %}
+</div>

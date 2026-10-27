@@ -1,0 +1,34 @@
+{# Start new work from a reply (#3171), in a modal a reply's ＋ opens. It starts a side chat
+   (#2485) cut after that reply, briefed to file one issue in the chosen repository and
+   stop, so the issue is written from the conversation so far. It posts to the leg that
+   owns the chosen reply; `side_chat.js` sets that path and the line. The start's outcome
+   lands in the slot after the modal, so the modal can close and the chat stays put. #}
+{% if fork_leg_keys and new_work %}
+<dialog class="fork-dialog" data-fork-dialog aria-labelledby="fork-title">
+  <form class="fork-form" data-fork-form
+        hx-post="/sessions/{{ fork_leg_keys[-1] }}/fork" hx-target="#fork-session-result"
+        hx-swap="outerHTML" hx-disabled-elt="find button[type=submit]" hx-encoding="multipart/form-data"
+        data-clear-on-send data-agentdeck-action="fork_session"
+        data-fork-legs="{{ fork_leg_keys | tojson | forceescape }}">
+    <input type="hidden" name="seq" value="" data-fork-seq-input>
+    <h2 id="fork-title" class="fork-title">Start new work from here</h2>
+    <p class="fork-banner">A side chat reads this chat up to <a href="#" data-fork-anchor>this reply</a>,
+      files the work as an issue and stops. This chat stays as it is.</p>
+    <label for="fork-message">What is the work?</label>
+    <textarea id="fork-message" name="message" rows="3" required
+              {% if inject_max_chars %}maxlength="{{ inject_max_chars }}" {% endif %}placeholder="What should happen?"></textarea>
+    <label for="fork-repository">Where to file it</label>
+    <select id="fork-repository" name="repository">
+      {% for target in new_work.targets %}
+      <option value="{{ target.repository }}" {% if target.repository == new_work.default %}selected{% endif %}>{{ target.repository }}</option>
+      {% endfor %}
+    </select>
+    <p class="fork-error" data-fork-error role="alert" hidden></p>
+    <div class="composer-actions">
+      <button type="button" class="fork-cancel" data-fork-cancel>Cancel</button>
+      <button type="submit">File</button>
+    </div>
+  </form>
+</dialog>
+<div id="fork-session-result" class="inject-result fork-result"></div>
+{% endif %}

@@ -1,0 +1,47 @@
+{# The /processes tables (#2663). `snapshot` is a host_processes.ProcessSnapshot. #}
+{% macro owner_cell(name, href) -%}
+{%- if href %}<a href="{{ href }}">{{ name }}</a>{% else %}{{ name }}{% endif -%}
+{%- endmacro %}
+{% macro mib(n) -%}
+{%- if n >= 1073741824 %}{{ (n / 1073741824) | round(1) }}G{% else %}{{ (n / 1048576) | round | int }}M{% endif -%}
+{%- endmacro %}
+{% macro age(s) -%}
+{%- if s is none %}—{% elif s < 60 %}{{ s | int }}s{% elif s < 3600 %}{{ (s // 60) | int }}m{% elif s < 86400 %}{{ (s // 3600) | int }}h{% else %}{{ (s // 86400) | int }}d{% endif -%}
+{%- endmacro %}
+<p class="process-summary" data-measured-at="{{ snapshot.measured_at }}">
+  All processes: <b>{{ snapshot.total_cpu_pct | round | int }}%</b> of
+  {{ snapshot.cores * 100 }}% ({{ snapshot.cores }} cores)
+  {%- if host %} · memory {{ host.memory_pct | round | int }}%{% endif %}
+  {%- if snapshot.skipped %} · {{ snapshot.skipped }} unreadable{% endif %}
+</p>
+<h2>By owner</h2>
+<div class="process-table-scroll">
+<table class="process-table process-owners">
+  <thead><tr><th>Owner</th><th class="num">CPU</th><th class="num">Memory</th><th class="num">Procs</th></tr></thead>
+  <tbody>
+  {% for row in snapshot.owners %}{% if row.cpu_pct >= 0.5 or loop.index <= 10 %}
+    <tr><td>{{ owner_cell(row.owner, row.owner_href) }}</td>
+      <td class="num">{{ row.cpu_pct | round | int }}%</td>
+      <td class="num">{{ mib(row.rss_bytes) }}</td>
+      <td class="num">{{ row.processes }}</td></tr>
+  {% endif %}{% endfor %}
+  </tbody>
+</table>
+</div>
+<h2>Busiest processes</h2>
+<div class="process-table-scroll">
+<table class="process-table process-top">
+  <thead><tr><th class="num">CPU</th><th class="num">Mem</th><th class="num">Age</th><th>Owner · command</th></tr></thead>
+  <tbody>
+  {% for row in snapshot.top %}
+    <tr><td class="num">{{ row.cpu_pct | round | int }}%</td>
+      <td class="num">{{ mib(row.rss_bytes) }}</td>
+      <td class="num">{{ age(row.age_s) }}</td>
+      <td class="process-what">
+        <div class="process-owner">{{ owner_cell(row.owner, row.owner_href) }} <span class="muted">pid {{ row.pid }}</span></div>
+        <details class="process-command"><summary>{{ row.command }}</summary><code>{{ row.command }}</code></details>
+      </td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>

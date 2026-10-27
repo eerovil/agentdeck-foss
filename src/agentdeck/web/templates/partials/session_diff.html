@@ -1,0 +1,124 @@
+{# The chat's pending change. Rendered only when its pane is opened, so nothing
+   here is on the live stream. A chat can have worked in more than one checkout,
+   so this is a list of sections; each one names its own repository once there is
+   more than a single section to tell apart (#1120). A Work's page shows the same
+   fragment over the Work's checkouts (#2379): it names itself in `owner`, gives
+   its own `refresh_url`, and a pull request per checkout in `pulls`. #}
+{% set owner_name = owner or "this chat" %}
+{% if not diffs %}
+<p class="diff-empty">No checkout of {{ owner_name }} is on this host, so there is nothing to diff.</p>
+{% endif %}
+{% if refreshing %}
+{# The base branch is being fetched in the background and nobody waited for it,
+   so this is one fetch old. This asks for the settled answer as soon as it is
+   rendered; the follow-up request is the one that waits for the network, and it
+   replaces this whole body with the refreshed diff (#1133). #}
+<p class="diff-refreshing" role="status"
+   hx-get="{{ refresh_url or '/partials/sessions/' ~ session.key ~ '/diff?refresh=wait' }}"
+   hx-trigger="load" hx-target="closest .session-diff-body" hx-swap="innerHTML">
+  <span class="diff-spinner" aria-hidden="true"></span>Checking the base branch for new commits…</p>
+{% endif %}
+{# One changed file, used for both the source list and the grouped-away kinds. #}
+{% macro diff_file(file, expand) %}
+<details class="diff-file"{% if expand and file.has_body %} open{% endif %}>
+  <summary>
+    <span class="diff-path">{{ file.path }}</span>
+    <span class="diff-counts"><span class="diff-add">+{{ file.added }}</span>
+      <span class="diff-del">−{{ file.removed }}</span></span>
+    <span class="diff-status diff-status-{{ file.status }}">{{ file.status_label }}</span>
+  </summary>
+  {% if file.old_path %}<p class="diff-renamed">renamed from <code>{{ file.old_path }}</code></p>{% endif %}
+  {% if file.binary %}
+  <p class="diff-note">Binary file — no text diff to show.</p>
+  {% elif not file.lines %}
+  <p class="diff-note">No text change to show.</p>
+  {% else %}
+  <div class="diff-body">
+    {%- for line in file.lines %}<div class="diff-line diff-{{ line.kind }}">{{ line.text }}</div>{% endfor -%}
+  </div>
+  {% if file.truncated %}<p class="diff-note">This file is cut short.</p>{% endif %}
+  {% endif %}
+</details>
+{% endmacro %}
+{% set many = diffs | length > 1 %}
+{% for diff in diffs %}
+{% set pr = pulls[loop.index0] if pulls else pull_request %}
+{# Only the source lines decide this. A rewritten test file used to collapse the
+   one source file a reader opened the pane for (#1684). #}
+{% set shown_lines = diff.source_files | map(attribute='lines') | map('length') | sum %}
+{% set expand = shown_lines <= 120 and not many %}
+<section class="diff-checkout">
+{% if many %}
+<h3 class="diff-checkout-head">{{ diff.repository or diff.path }}</h3>
+{% endif %}
+<div class="diff-summary">
+  {% if diff.branch %}<span class="chip diff-branch">{{ diff.branch }}</span>{% endif %}
+  {% if diff.base_label %}<span class="chip diff-base">vs {{ diff.base_label }}</span>{% endif %}
+  {# The pull request chip belongs to the checkout the pull request is actually
+     in — a second repository's diff is not that pull request's diff. #}
+  {% if pr and diff.base_source == 'pull-request' %}
+  <a class="chip pr-link" href="{{ pr.url }}" target="_blank" rel="noopener">#{{ pr.number }} ↗</a>
+  {% endif %}
+  {# Source files only: tests, docs and screenshots carry their own counts below (#2331). #}
+  {% set source = diff.source_files %}
+  {% if source %}
+  <span class="chip diff-total">{{ source | length }} file{{ '' if source | length == 1 else 's' }}
+    <span class="diff-add">+{{ diff.source_added }}</span> <span class="diff-del">−{{ diff.source_removed }}</span></span>
+  {% elif diff.files %}
+  <span class="chip diff-total">no source change</span>
+  {% endif %}
+</div>
+
+{% if diff.unavailable %}
+<p class="diff-note" role="note">{{ diff.unavailable }}</p>
+{% else %}
+<p class="diff-note diff-base-note" role="note">Working tree compared against {{ diff.base_description }}, so
+  committed and uncommitted work both appear.</p>
+{% if diff.stale_base and not diff.refreshing %}
+<p class="diff-note diff-stale-base" role="note">The base branch could not be refreshed just now, so this is
+  compared against the copy already in the checkout. Anything merged upstream since then is shown as a change here.</p>
+{% endif %}
+{% if diff.is_empty %}
+<p class="diff-empty">Nothing has changed here yet.</p>
+{% if checkouts > 1 %}
+<p class="diff-note" role="note">{{ checkouts - 1 }} other checkout{{ '' if checkouts == 2 else 's' }} {{ owner_name }}
+  registered had nothing to show either.</p>
+{% endif %}
+{% endif %}
+{% for note in diff.notes %}
+<p class="diff-note" role="note">{{ note }}</p>
+{% endfor %}
+
+{% for file in diff.source_files %}
+{{ diff_file(file, expand) }}
+{% endfor %}
+
+{# Tests, docs and screenshots kept out of the source list and collapsed, so the
+   files a reader came to read are not buried among them (#1684). #}
+{% for group in diff.groups %}
+<details class="diff-group diff-group-{{ group.kind }}">
+  <summary>
+    <span class="diff-path">{{ group.label }}</span>
+    <span class="diff-counts">{{ group.files | length }} file{{ '' if group.files | length == 1 else 's' }}
+      <span class="diff-add">+{{ group.added }}</span> <span class="diff-del">−{{ group.removed }}</span></span>
+  </summary>
+  <div class="diff-group-body">
+    {% for file in group.files %}{{ diff_file(file, false) }}{% endfor %}
+  </div>
+</details>
+{% endfor %}
+
+{% if diff.untracked %}
+<details class="diff-file diff-untracked">
+  <summary>
+    <span class="diff-path">Untracked files</span>
+    <span class="diff-counts">{{ diff.untracked | length }}</span>
+  </summary>
+  <ul class="diff-untracked-list">
+    {% for name in diff.untracked %}<li>{{ name }}</li>{% endfor %}
+  </ul>
+</details>
+{% endif %}
+{% endif %}
+</section>
+{% endfor %}

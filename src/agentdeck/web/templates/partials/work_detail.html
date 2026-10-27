@@ -1,0 +1,332 @@
+{# One section of the Work page (#2147, laid out by #2218), chosen by `section`. Each is its
+   own stream event, so a change swaps only the section it touched. Top to bottom: what the
+   Work is and what it is doing now, the Work-level message box, the milestones, the result,
+   the workspace in a line per repository, and then — collapsed — the Runs, the chats and the
+   technical details. Nothing here is a new lifecycle: `status` is `work_story.work_status`,
+   a reading of the card's own facts. #}
+{%- set card = detail.card -%}
+{#- A Work the deck runs itself (#2895 step 3, D1) keeps the status line, the question, the
+    message box, the result and the details; its column chip, milestones, Runs and Chats go. #}
+{%- set derived = card.derived -%}
+{%- from "partials/work_actions.html" import control -%}
+{%- if section == "status" %}
+<header class="wd-head" data-work-id="{{ card.work_id }}">
+  <p class="wd-source">
+    <a href="{{ card.source_url|issue_href }}" target="_blank" rel="noopener">{{ card.source_label }}</a>
+    {%- if card.work_state and not derived %}<span class="wk-state" data-wk-state="{{ card.work_state }}">{{ card.work_state }}</span>{% endif %}
+    {%- if card.last_activity %}<time class="wk-age" datetime="{{ card.last_activity.isoformat() }}" data-activity-age>{{ card.last_activity | reltime_ago }}</time>{% endif %}
+  </p>
+  {#- ✎ opens the rename form, which sits outside this swapped section (work.html) so a live
+      update never clears a name being typed (#2328). The name is this deck's own. #}
+  <h1 class="wd-title">{{ card.title }}<button type="button" class="wd-rename-btn" data-work-rename-open
+      aria-controls="work-rename" title="Rename this Work on the deck (the issue keeps its title)"
+      aria-label="Rename this Work">✎</button></h1>
+</header>
+<section class="wd-status is-{{ status.tone }}" id="work-status" data-wd-tone="{{ status.tone }}"
+         data-wk-run-state="{{ card.run_state or 'none' }}"{% if derived %} data-wd-derived="{{ derived.kind }}"{% endif %}{% if card.review %} data-wd-review="{{ card.review.state }}"{% endif %}{% if status.kind %} data-wd-attention-kind="{{ status.kind }}"{% endif %}>
+  {#- The operator's category, the same one the front page's row names (#2236), with the same
+      actions it offers (#2237); the technical story stays under it. #}
+  {%- set op = detail.attention %}
+  {%- if op %}
+  <div class="wd-op" data-op-category="{{ op.category }}" data-op-actions="{{ op.actions | join(' ') }}">
+    {#- The status box under it already says the same line when it is the derived one (#2944). #}
+    <p class="wd-op-head">{{ op.label }}{% if op.reason and op.reason != status.summary.rstrip('.') %}<span class="wd-op-reason"> · {{ op.reason }}</span>{% endif %}</p>
+    {%- for button in detail.buttons %}{{ control(card, button) }}{% endfor %}
+  </div>
+  {%- endif %}
+  {#- A Work hidden from Needs you says so, and offers to bring it back (#2238). #}
+  {%- if detail.hidden %}
+  <div class="wd-hidden" data-work-hidden>Hidden from Needs you {{ control(card, detail.bring_back) }}</div>
+  {%- endif %}
+  {#- The last action pressed on this Work and what became of it, kept across a reload. #}
+  {%- set last = detail.last_action %}
+  {%- if last %}
+  <p class="wd-receipt wd-last-action is-{{ last.state }}" data-work-last-action="{{ last.action }}" data-wd-receipt="{{ last.state }}">
+    {%- if detail.last_action_followed %}{{ detail.last_action_followed }}
+    {%- elif last.state == "sent" %}{{ last.result or last.label ~ " sent" }}
+    {%- elif last.state == "failed" %}{{ last.label }} not sent{% if last.result %}: {{ last.result }}{% endif %}
+    {%- else %}{{ last.label }} may have been sent{% endif %}
+    {%- if last.reserved %} · <time datetime="{{ last.reserved.isoformat() }}" data-activity-age>{{ last.reserved | reltime_ago }}</time>{% endif %}</p>
+  {%- endif %}
+  {#- Pause, or Resume on a paused Work (#2548): inline at the end of the headline, so it adds
+      no height. It adds or removes the paused label the Poller honours. A div, not a p: a form
+      inside a p closes it, and the button would land on a line of its own. #}
+  {%- set pause = detail.pause_control %}
+  <div class="wd-status-head"><span class="wd-mark" aria-hidden="true">{{ status.mark }}</span>{{ status.headline }}
+    {%- if pause %}<span class="wd-pause" data-work-pause="{{ pause.action }}">{{ control(card, pause) }}</span>{% endif %}
+    {#- Finish on a closed issue whose pull request still reads first (#3187); a closed Work
+        offers no Pause, so it takes that place and adds no height. #}
+    {#- Merge when ready, or Withdraw while that press stands (#3320): inline, no height. #}
+    {%- set approval = detail.merge_approval_control %}
+    {%- if detail.merge_approved %}<span class="wd-merge-approval" data-work-merge-approved>Merge approved</span>{% endif %}
+    {%- if approval %}<span class="wd-merge-approval" data-work-merge-approval="{{ approval.action }}">{{ control(card, approval) }}</span>{% endif %}
+    {%- set finish = detail.finish_control %}
+    {%- if finish %}<span class="wd-pause" data-work-finish>{{ control(card, finish) }}</span>{% endif %}
+    {#- Star (#3116): this Work goes ahead in the merge queue, the job queue, review starts,
+        start retries and the front page. Inline too, so it adds no height. #}
+    {%- set star = detail.star_control %}<span class="wd-star" data-work-star="{{ star.action }}">{{ control(card, star) }}</span></div>
+  <p class="wd-status-summary">{% if status.summary_href %}<a href="{{ status.summary_href|issue_href }}" data-wd-summary-link target="_blank" rel="noopener">{{ status.summary }}</a>{% else %}{{ status.summary }}{% endif %}</p>
+  {%- if status.detail %}<p class="wd-status-detail">{{ status.detail }}</p>{% endif %}
+  {%- if detail.approval_cleared %}<p class="wd-status-detail" data-work-merge-cleared>{{ detail.approval_cleared }}</p>{% endif %}
+  {#- An unfinished Work that cannot be paused says why (#2559). #}
+  {%- set why = detail.pause_refusal %}
+  {%- if why %}<p class="wd-status-detail" data-work-pause-refused>Pause is not offered: {{ why[:1] | lower }}{{ why[1:] }}</p>{% endif %}
+  {%- if card.attention | length > 1 %}
+  <ul class="wd-rows wd-status-asks">
+    {%- for item in card.attention %}
+    <li class="wd-row needs-attention" data-wd-attention="{{ item.session_key }}">
+      <span class="wo-state">{{ "asks" if item.asks else ("waits on you" if item.interaction else item.state | replace("_", " ")) }}</span>
+      <a href="{{ item.href }}" data-session-key="{{ item.session_key }}">{{ item.chat_title }}</a>
+    </li>
+    {%- endfor %}
+  </ul>
+  {%- elif card.attention %}
+  <span hidden data-wd-attention="{{ card.attention[0].session_key }}"></span>
+  {%- endif %}
+  <dl class="wd-status-lines">
+    {%- if status.next %}<div data-wk-next="{{ status.next }}"><dt>Next</dt><dd>waiting for {{ status.next }}</dd></div>{% endif %}
+    <div class="wd-you" data-wd-you><dt>You</dt><dd>{{ status.you }}
+      {%- if status.where %} · {% if status.where_href %}<a href="{{ status.where_href|issue_href }}" data-wd-where{% if status.where_href.startswith("http") %} target="_blank" rel="noopener"{% endif %}>{{ status.where }}</a>{% else %}<span data-wd-where>{{ status.where }}</span>{% endif %}{% endif %}</dd></div>
+  </dl>
+</section>
+{%- elif section == "tree" %}
+{#- The issue's place in a tree of GitHub sub-issues (#3622): the parent it is part of, and its
+    own sub-issues, each a line with its Work's front-page state, opening that Work. The front
+    page folds the sub-issues into this Work's row; here is where they are listed. #}
+{%- set tree = detail.tree %}
+{%- if tree %}
+<section class="wd-section wd-tree" id="work-tree" data-work-tree>
+  {%- if tree.parent %}
+  <p class="wd-tree-parent" data-work-tree-parent="{{ tree.parent.work_id }}">Part of <a href="{{ tree.parent.href }}">{{ tree.parent.label }} {{ tree.parent.title }}</a></p>
+  {%- endif %}
+  {%- if tree.counts or tree.children or tree.unreadable %}
+  <h3 class="wd-title-sm">{% if tree.diagram %}Map{% else %}Sub-issues{% endif %}{% if tree.done %} <span class="wd-tree-done">{{ tree.done }}</span>{% endif %}</h3>
+  {%- if tree.unreadable %}
+  <p class="rt-note" data-work-tree-unreadable>Sub-issues could not be read from GitHub just now.</p>
+  {%- endif %}
+  {%- if tree.diagram %}
+  {#- A wayfinder map (#3627): its tickets drawn as a diagram instead of the list. #}
+  {%- if tree.diagram.partial %}
+  <p class="rt-note" data-wayfinder-map-partial>Part of the map could not be read from GitHub just now.</p>
+  {%- endif %}
+  {%- with diagram = tree.diagram, key = detail.card.work_id %}{% include "partials/wayfinder_map.html" %}{% endwith %}
+  {%- elif tree.children %}
+  <ul class="wd-tree-list">
+    {%- for child in tree.children %}
+    <li class="wd-tree-item{% if child.needs_you %} is-needs-you{% endif %}{% if child.closed %} is-closed{% endif %}" data-work-tree-child="{{ child.work_id }}">
+      <a href="{{ child.href }}"><span class="wd-tree-ref">{{ child.label }}</span> {{ child.title }}</a>
+      <span class="wd-tree-status">{% if child.needs_you %}Needs you · {% endif %}{{ child.status }}</span>
+      {%- if child.button %}
+      {#- The child's own strongest control, acting on its own Work (#3622). #}
+      <span class="wd-tree-action">{{ control(child.card, child.button) }}<span class="work-action-result" aria-live="polite"></span></span>
+      {%- endif %}
+    </li>
+    {%- endfor %}
+  </ul>
+  {%- endif %}
+  {%- endif %}
+</section>
+{%- endif %}
+{%- elif section == "message" %}
+{#- Only the part that changes with the target: the box a person types in sits outside this
+    section (work.html), so a live update never touches unsent text. #}
+{%- set target = detail.message_target %}
+{%- if target %}
+<p class="wd-message-to" data-wd-message-target="{{ target.session_key }}"{% if target.answer %} data-wd-answer{% endif %}>
+  Goes to <a href="{{ target.href }}" data-session-key="{{ target.session_key }}">{{ target.title }}</a>{% if target.why %}: {{ target.why }}{% endif %}
+</p>
+<button type="submit" class="wd-message-send{% if target.answer %} is-answer{% endif %}">{{ "Answer question" if target.answer else "Send" }}</button>
+{%- else %}
+<p class="wd-message-to" data-wd-no-target>No chat in this Work can take a message right now{% if detail.chats and not derived %}; open one under Chats{% endif %}.</p>
+{%- endif %}
+{%- elif section == "lifecycle" and derived %}
+<div id="work-lifecycle" hidden></div>
+{%- elif section == "lifecycle" %}
+<ol class="wd-steps" id="work-lifecycle" aria-label="Milestones">
+  {%- for step in status.milestones %}
+  <li class="wd-step is-{{ step.state }}" data-wd-step="{{ step.key }}" data-wd-step-state="{{ step.state }}">
+    <span class="wd-step-label">{{ step.label }}</span>
+    <span class="wd-step-note"><span class="wd-mark" aria-hidden="true">{{ step.mark }}</span>{{ step.note }}</span>
+  </li>
+  {%- endfor %}
+</ol>
+{%- elif section == "result" %}
+<section class="wd-section wd-result" id="work-result">
+  <h3 class="wd-title-sm">Result</h3>
+  <ul class="wd-facts">
+    {%- for output in card.outputs %}
+    <li data-wd-output="{{ output.url }}"><a href="{{ output.url }}" target="_blank" rel="noopener">PR {{ output.label }}</a>{% if output.state %} · <span class="wo-state">{{ output.state }}</span>{% endif %}
+      {%- if output.additions is not none and output.deletions is not none and output.files is not none %} · <span data-wd-output-size>{% if output.files %}+{{ output.additions }}/−{{ output.deletions }} · {{ output.files }} {{ "file" if output.files == 1 else "files" }}{% else %}no source change{% endif %}</span>{% endif %}
+      {%- if output.base and output.base != "master" %} · <span data-wd-output-target>into {{ output.base }}</span>{% endif %}</li>
+    {%- endfor %}
+    {%- if card.staging %}
+    {#- Staging already runs every open pull request's head (#3180), even while review and
+        verification still run; a newer push takes this away until it is deployed too. #}
+    <li class="wk-staging" data-wd-staging="{{ card.staging.slug }}">Ready to test on staging
+      {%- for label, url in card.staging.links %}{{ ":" if loop.first else " ·" }} <a href="{{ url }}" target="_blank" rel="noopener">{{ label }}</a>{% endfor %}</li>
+    {%- endif %}
+    {%- if card.verification %}
+    <li class="wk-verify is-{{ card.verification.status }}{% if card.verification.status == "failed" and card.verification.superseded %} is-superseded{% endif %}" data-wk-verification="{{ card.verification.status }}">{{ card.verification.label }}</li>
+    {%- endif %}
+    {%- if card.untested %}
+    <li class="wk-verify is-untested" data-wk-untested>No green run yet on {{ card.untested | join(", ") }}. Each pull request needs its own verification job, run in its own checkout.</li>
+    {%- endif %}
+    {%- if card.review and card.review.state == "passed" %}
+    <li class="wk-review is-passed" data-wd-review-result="passed">{{ card.review.label }}</li>
+    {%- endif %}
+  </ul>
+  {%- if not card.outputs and not card.verification %}
+  <p class="rt-note" data-wk-verification="none">No pull request or verification job names this Work yet.</p>
+  {%- endif %}
+</section>
+{%- elif section == "resolution" %}
+{#- The Work's own decision record (#2328): what the problem was, what changed, why this
+    solution over the alternatives, and why it is believed correct. Written by the verify
+    worker; nothing at all is shown before it is. #}
+{%- set resolution = detail.resolution %}
+{%- if resolution %}
+<section class="wd-section wd-resolution" id="work-resolution" data-work-resolution>
+  <h3 class="wd-title-sm">Resolution</h3>
+  {%- for name, heading, blocks in resolution.display_parts() %}
+  <h4 class="wd-title-xs">{{ heading }}</h4>
+  <div class="wd-resolution-text" data-wd-resolution="{{ name }}">
+    {%- for kind, body in blocks %}
+    {%- if kind == "ul" %}
+    <ul>{% for item in body %}<li>{{ item }}</li>{% endfor %}</ul>
+    {%- else %}
+    <p>{{ body }}</p>
+    {%- endif %}
+    {%- endfor %}
+  </div>
+  {%- endfor %}
+  {%- if resolution.updated_at %}
+  {#- On the same line, so a current summary costs no height (#3199). #}
+  {%- set behind = detail.resolution_behind %}
+  <p class="rt-note wd-resolution-when">Updated <time datetime="{{ resolution.updated_at.isoformat() }}" data-activity-age>{{ resolution.updated_at | reltime_ago }}</time>
+  {%- if behind %} · <span class="wd-resolution-behind" data-wd-resolution-behind>written before the latest commit (<time datetime="{{ behind.isoformat() }}" title="{{ behind | chat_time_title }}">{{ behind | chat_time }}</time>)</span>{% endif %}</p>
+  {%- endif %}
+</section>
+{%- endif %}
+{%- elif section == "workspace" %}
+<section class="wd-section wd-workspace" id="work-workspace-summary" data-work-id="{{ card.work_id }}">
+  <h3 class="wd-title-sm">Workspace</h3>
+  {%- set rows = detail.workspace_rows %}
+  {%- if rows %}
+  <ul class="wd-facts wd-repos">
+    {%- for row in rows %}
+    <li class="wd-repo{% if row.problem %} is-problem{% endif %}" data-wd-repo="{{ row.repository }}">
+      <span class="wd-repo-name">{{ row.name }}</span>
+      {%- if row.branch %} · <span class="wd-repo-branch">{{ row.branch }}</span>{% endif %}
+      {%- if row.state %} · <span class="wd-repo-state">{% if row.problem %}! {% endif %}{{ row.state }}</span>{% endif %}
+    </li>
+    {%- endfor %}
+  </ul>
+  {%- else %}
+  <p class="rt-note">No repository, worktree or claim is known for this Work.</p>
+  {%- endif %}
+  {%- if detail.workspace and detail.workspace.issues | selectattr("problem") | list %}
+  <ul class="ww-issues">
+    {%- for issue in detail.workspace.issues if issue.problem %}
+    <li class="ww-issue is-problem" data-ww-issue="{{ issue.kind }}">{{ issue.detail }}</li>
+    {%- endfor %}
+  </ul>
+  {%- endif %}
+  {%- if card.workspace_note %}<p class="rt-note">{{ card.workspace_note }}</p>{% endif %}
+</section>
+{%- elif section == "runs" and derived %}
+<div id="work-runs" hidden></div>
+{%- elif section == "runs" %}
+{%- set runs = ((1 if detail.trace and detail.trace.current else 0) + (detail.trace.previous | length if detail.trace else 0)) %}
+<details class="wd-section wd-fold" id="work-runs" data-keep-open="work-runs:{{ card.work_id }}">
+  <summary>Runs <span class="rt-count">{{ runs }}</span>{% if card.run_state %}<span class="wd-fold-note">current: {{ card.run_label }}</span>{% endif %}</summary>
+  {%- if detail.trace %}
+  {{ run_html | safe }}
+  {{ history_html | safe }}
+  {%- else %}
+  <p class="rt-note" data-wd-no-run>No Run: no Poller card, delivery or Runtime record names this Work. Its chats were started by hand.</p>
+  {%- endif %}
+</details>
+{%- elif section == "chats" and derived %}
+<div id="work-chats" hidden></div>
+{%- elif section == "chats" %}
+{%- set working = detail.chats | selectattr("working") | list | length %}
+<details class="wd-section wd-fold wd-chats" id="work-chats" data-keep-open="work-chats:{{ card.work_id }}">
+  <summary>Chats <span class="rt-count">{{ detail.chats | length }}</span>{% if working %}<span class="wd-fold-note">{{ working }} working</span>{% endif %}{% if detail.unplaced %}<span class="wd-fold-note" data-wd-unplaced-count>{{ detail.unplaced | length }} not placed</span>{% endif %}</summary>
+  {%- if detail.chats %}
+  <ul class="wd-rows">
+    {%- for chat in detail.chats %}
+    <li class="wd-row{% if chat.working %} is-working{% endif %}" data-wd-chat="{{ chat.chat_id }}">
+      <a href="{{ chat.href }}" data-session-key="{{ chat.session_key }}">{{ chat.title }}</a>
+      <span class="wo-state">{{ "working" if chat.working else "idle" }}</span>
+      {%- if chat.last_activity %}<time class="wo-age" datetime="{{ chat.last_activity.isoformat() }}" data-activity-age>{{ chat.last_activity | reltime_ago }}</time>{% endif %}
+      {%- if chat.other_works %}<span class="rt-note">also in {{ chat.other_works }} other {{ "Work" if chat.other_works == 1 else "Works" }}</span>{% endif %}
+      {%- if chat.pull_requests %}
+      <span class="rt-note" data-wd-chat-pulls>registered on this chat:
+        {%- for url in chat.pull_requests %} <a href="{{ url }}" target="_blank" rel="noopener">#{{ url.rsplit("/", 1)[-1] }}</a>{% endfor %}</span>
+      {%- endif %}
+    </li>
+    {%- endfor %}
+  </ul>
+  {%- else %}
+  <p class="rt-note">No chat has joined this Work yet.</p>
+  {%- endif %}
+  {%- if detail.unplaced %}
+  <p class="rt-note" data-wd-unplaced-note>Not placed: delegated by a chat that was in several Works, so it joined none of them.</p>
+  <ul class="wd-rows">
+    {%- for chat in detail.unplaced %}
+    <li class="wd-row is-unplaced" data-wd-unplaced="{{ chat.chat_id }}">
+      <a href="{{ chat.href }}" data-session-key="{{ chat.session_key }}">{{ chat.title }}</a>
+      <span class="rt-note">not placed · one of {{ chat.candidates }} candidate Works</span>
+    </li>
+    {%- endfor %}
+  </ul>
+  {%- endif %}
+</details>
+{%- elif section == "inspector" %}
+<details class="wd-section wd-fold wd-inspector" id="work-inspector" data-keep-open="work-inspector:{{ card.work_id }}">
+  <summary>Technical details</summary>
+  <p class="rt-note">work <code>{{ card.work_id }}</code>{% if card.run_id %} · run <code>{{ card.run_id }}</code>{% endif %}</p>
+  <h4 class="wd-title-xs">Sessions and providers</h4>
+  <ul class="wd-rows">
+    {%- for chat in detail.chats %}
+    {%- for leg in chat.legs %}
+    <li class="wd-row" data-wd-leg="{{ leg }}">
+      <a href="/sessions/{{ leg }}"><code>{{ leg }}</code></a>
+      <span class="rt-note">{{ leg.split(":")[0] }} · {{ leg.split(":")[1] if ":" in leg else "" }}{% if chat.chat_id != leg %} · chat <code>{{ chat.chat_id }}</code>{% endif %}{% if chat.evidence %} · {{ chat.evidence | join(", ") | replace("_", " ") }}{% endif %}</span>
+    </li>
+    {%- endfor %}
+    {%- endfor %}
+    {%- if detail.trace %}
+    {%- for run in ([detail.trace.current] if detail.trace.current else []) + detail.trace.previous | list %}
+    {%- for session in run.sessions %}
+    <li class="wd-row" data-wd-run-leg="{{ session.session_key }}">
+      <a href="/sessions/{{ session.session_key }}"><code>{{ session.session_key }}</code></a>
+      <span class="rt-note">run <code>{{ run.run_id }}</code> · {{ session.provider }} · {{ session.account }}</span>
+    </li>
+    {%- endfor %}
+    {%- endfor %}
+    {%- endif %}
+  </ul>
+  {%- if detail.verifications %}
+  <h4 class="wd-title-xs">Verification jobs</h4>
+  <ul class="ww-verifications">
+    {%- for check in detail.verifications %}
+    <li class="ww-verification is-{{ check.status }}" data-ww-verification="{{ check.job_id }}">
+      <span class="ww-verification-status">{{ check.status }}</span>
+      {%- for name, snapshot in check.tested %}
+      <span class="ww-tested{% if not snapshot.clean %} is-problem{% endif %}">{{ name }}@<code>{{ snapshot.head[:7] or "?" }}</code>{% if not snapshot.provable %} unprovable{% elif not snapshot.clean %} dirty{% endif %}</span>
+      {%- endfor %}
+      <span class="ww-note">{% if check.run_id == card.run_id %}current Run{% else %}earlier Run{% endif %} · job <code>{{ check.job_id }}</code></span>
+    </li>
+    {%- endfor %}
+  </ul>
+  {%- endif %}
+  {%- if card.review %}
+  <p class="rt-note" data-wd-review-detail="{{ card.review.state }}">review: {{ card.review.label }}{% if card.review.next_expected %} · next: {{ card.review.next_expected }}{% endif %}</p>
+  {%- endif %}
+  {%- if workspace_html %}
+  <h4 class="wd-title-xs">Workspace evidence</h4>
+  {{ workspace_html | safe }}
+  {%- endif %}
+</details>
+{%- endif %}

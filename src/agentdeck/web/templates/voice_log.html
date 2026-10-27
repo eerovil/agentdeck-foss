@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+
+{% block title %}Voice log{% endblock %}
+{% block body_class %}voice-log-page{% endblock %}
+{# What voice mode's fast agent heard and said in one chat (#3475), newest first.
+   Rendered once per load; nothing streams it. #}
+{% block body_sse %}{% endblock %}
+{% block topbar_sse %} sse-connect="/events/topbar"{% endblock %}
+{% block topbar_nav %}<a class="back" href="/sessions/{{ session_key }}" aria-label="back to the chat">←</a>{% endblock %}
+
+{% block content %}
+<article class="voice-log">
+  <h1>Voice log</h1>
+  <p class="voice-log-hint">What voice mode's fast helper heard, said and fixed, and what
+    the page then sent to this chat, newest first. "Sent" is saved when the page presses
+    Send; a send that then failed still shows here.</p>
+  {% for phrase in phrases %}
+  <section class="voice-log-phrase" data-outcome="{{ phrase.outcome }}">
+    <div class="voice-log-when">{{ phrase.when }} · {{ phrase.ms }} ms
+      {%- if phrase.fresh %} · new helper{% endif %}
+      {%- if phrase.outcome != answered %} · <strong>{{ phrase.outcome }}</strong>{% endif %}</div>
+    {% for line in phrase.aloud or [] %}
+    <p class="voice-log-aloud">🔊 {{ line }}</p>
+    {% endfor %}
+    <p><span class="voice-log-label">Heard</span> {{ phrase.heard }}</p>
+    {% if phrase.say %}<p><span class="voice-log-label">Said</span> {{ phrase.say }}</p>{% endif %}
+    {% if phrase.outcome == answered %}
+    <p><span class="voice-log-label">Fixed</span>
+      {%- if phrase.relay is none %} <em>nothing: taken as not meant for the chat</em>
+      {%- elif phrase.relay == phrase.heard %} <em>unchanged</em>
+      {%- else %} {{ phrase.relay }}{% endif %}</p>
+    {% endif %}
+    {% set report = phrase.report %}
+    <p><span class="voice-log-label">Sent</span>
+      {%- if not report %} <em>not reported by the page</em>
+      {%- elif report.sent is none %} <em>{{ report.how }}</em>
+      {%- else %} {{ report.sent }}{% if report.how != "sent" %} <em>({{ report.how }})</em>{% endif %}{% endif %}</p>
+    {% if phrase.reply %}
+    <details class="voice-log-reply"><summary>Helper's reply</summary>
+      <pre>{{ phrase.reply }}</pre></details>
+    {% endif %}
+  </section>
+  {% else %}
+  <p class="voice-log-empty">Nothing saved yet. Phrases heard in voice mode show here.</p>
+  {% endfor %}
+</article>
+{% endblock %}

@@ -1,0 +1,344 @@
+{% extends "base.html" %}
+{# keep tab/home-screen titles short (< 15 chars): the repo name, else the brand #}
+{% block title %}{% if session.cwd and session.cwd.name %}{{ session.cwd.name[:14] }}{% else %}agentdeck{% endif %}{% endblock %}
+{% block body_class %}{% if session_pane %}session-pane-page{% else %}session-page session-stack-page{% endif %}{% endblock %}
+
+{# The diff control sits in the topbar row rather than the chip line: the row's
+   height is already set by the back arrow, so the chat keeps every pixel of
+   vertical space it had. #}
+{% block topbar_nav %}<a class="back" href="/" aria-label="back to all sessions"
+  data-agentdeck-action="open_session_list">←</a><button type="button"
+  class="diff-toggle" data-session-diff-open aria-expanded="false" aria-controls="session-diff"
+  aria-label="Show this chat's diff" title="Diff">±</button>{% endblock %}
+
+{# The selected session stream also carries the usage topics, keeping the page on one
+   socket. Session navigation reconnects this body stream when it mounts a different
+   detail pane. #}
+{% block body_sse %}sse-connect="/events/sessions/{{ session.key }}?after_seq={{ transcript_after_seq }}"{% endblock %}
+{% block limit_bars %}{% include "partials/limit_bars.html" %}{% endblock %}
+
+{% block content %}
+<div class="session-layout">
+{% if not detail_navigation %}
+{# A chat page carries no chat list of its own (#2603). The empty sidebar is only the slot
+   `session_navigation.js` fills on a desktop with the front page and the chat's Work,
+   named by `data-work-path`, between the two (#2346). While it stays empty, Back and the
+   arrow load the front page for real rather than revealing nothing. #}
+<aside class="session-sidebar" aria-label="Works" data-list-path="/" data-list-empty
+       {%- if work_column_path %} data-work-path="{{ work_column_path }}"{% endif %}></aside>
+{% endif %}
+{# The diff pane is the layer to the right of the chat: pull it in from the
+   right edge, or press the topbar control. Its body is fetched the first time
+   it opens and never on a stream, because reading it runs git in a checkout.
+   The pane and its control live outside the chat pane, which session navigation
+   replaces on its own — so they carry no session key and take their target from
+   the chat pane's ``data-diff-url`` every time it changes. #}
+{% if not session_pane %}
+<section class="session-diff" id="session-diff" aria-label="Worktree diff" tabindex="-1"
+         aria-hidden="true" inert>
+  <div class="session-diff-head">
+    <button type="button" class="session-diff-close" data-session-diff-close
+            aria-label="Close diff">←</button>
+    <h2>Diff</h2>
+    <button type="button" class="session-diff-refresh" data-session-diff-refresh
+            aria-label="Reload diff" title="Reload">↻</button>
+  </div>
+  {# What the body shows while its fragment is in flight. Kept here rather than
+     built in script so the markup and its wording live with the rest of the
+     pane; it sits outside the body, which the fragment replaces wholesale. #}
+  <template data-session-diff-loading>
+    <p class="diff-loading" role="status">
+      <span class="diff-spinner" aria-hidden="true"></span>Reading this chat's checkout…</p>
+  </template>
+  <div class="session-diff-body" data-session-diff-body>
+    <p class="diff-empty">Opening the diff reads this chat's checkout.</p>
+  </div>
+</section>
+{% endif %}
+<section class="session-detail" aria-label="Selected chat" data-session-key="{{ session.key }}"
+         data-session-path="{{ request.url.path }}"
+         data-session-title="{{ session.display_title }}"
+         {%- if work_id %} data-chat-work-id="{{ work_id }}"{% endif %}
+         data-diff-url="{% if session.cwd %}/partials/sessions/{{ session.key }}/diff{% endif %}">
+{# The chat's own header, pinned to the top of this pane's scroll box so the
+   transcript you are reading keeps saying which chat it is (#1571). Only a
+   direct child of the scrolling pane can stay pinned for the whole transcript,
+   so the title line and the chip line are siblings rather than one wrapper:
+   the phone pins the title line alone, and the desktop pins both. #}
+<div class="session-detail-head">
+<div id="session-status" sse-swap="status">{{ session_fragments["status"] | safe }}</div>
+{# Jump back up to your own last message, so a long answer can be read from its
+   start (#1810). It lives in the pinned header because that is on screen for the
+   whole transcript, exists for read-only chats that have no composer, and is a
+   fixed-height row, so the button costs no vertical space on a phone. Hidden
+   until the script confirms there is a user message to jump to. #}
+<button type="button" class="last-user-jump" data-last-user-jump hidden
+        aria-label="Scroll up to your latest message" title="Scroll up to your latest message">
+  <span aria-hidden="true">⤒</span>
+</button>
+{# Up to the Work that owns this chat (#2512). A phone's front-page row opens the chat
+   rather than the Work, so this is how the Work page is reached from it; the pinned header
+   has a fixed height, so it costs no vertical space. A desktop already shows that Work in
+   the column beside the chat. #}
+{% if work_path and not session_pane %}
+<a class="session-work-link" href="{{ work_path }}" aria-label="Open this chat's Work"
+   title="Open this chat's Work">Work</a>
+{% endif %}
+{% if not session_pane %}
+<button type="button" class="session-extra-add" data-session-extra-add
+        aria-label="Move this chat to an extra pane" title="Move this chat to an extra pane">
+  <span aria-hidden="true">▥</span><span>Move to extra</span>
+</button>
+{% endif %}
+</div>
+
+<div class="detail-meta">
+  {% if detail.model %}<span class="chip">{{ detail.model }}</span>{% endif %}
+  {% set t = detail.tokens %}
+  {% if t and t.total %}
+  <span class="chip" title="input / output / cache-read / cache-create">
+    {{ "{:,}".format(t.total) }} tok
+    ({{ "{:,}".format(t.input_tokens) }}i / {{ "{:,}".format(t.output_tokens) }}o /
+     {{ "{:,}".format(t.cache_read_tokens) }}cr)
+  </span>
+  {% endif %}
+  <span class="chip">{{ detail.total_events }} events</span>
+  {% if session.cwd %}<span class="chip cwd">{{ session.cwd }}</span>{% endif %}
+</div>
+
+{# Every control that opens into something taller than itself lives here, below
+   the pinned header rather than inside it (#1993). The desktop pins the chip row
+   above as a second header line of fixed height, and a control that expands in
+   place — the Mac approval frame is 60vh of it — either gets clipped by that
+   fixed height or makes the pinned box taller than the viewport, which parks its
+   top at 0 forever. This row scrolls with the transcript, so each control can be
+   as tall as it needs and the header's height stays the exact number the pin
+   shelf's offset is calculated from. #}
+<div class="detail-controls">
+  {% include "partials/session_title_editor.html" %}
+  {% if model_preference_available %}
+  {% include "partials/session_model_preference.html" %}
+  {% endif %}
+  {% if permission_prompts_available %}
+  {% include "partials/session_permission_prompts.html" %}
+  {% endif %}
+  {% if bypass_permissions_available %}
+  {% include "partials/session_bypass_permissions.html" %}
+  {% endif %}
+  {% include "partials/session_mac_runner.html" %}
+  {% include "partials/new_work.html" %}
+  {% include "partials/side_chat_origin.html" %}
+  {% if voice_log_saved %}
+  <a class="chip voice-log-link" href="/sessions/{{ session.key }}/voice-log"
+     title="What voice mode's fast helper heard and said">🎧 Voice log</a>
+  {% endif %}
+  {% if live_prototype_url %}
+  <a class="chip live-prototype-link" href="{{ live_prototype_url }}"
+     title="The meeting page of this chat's live prototype">▶ Live prototype</a>
+  {% endif %}
+</div>
+
+{% if continue_chat_accounts %}
+<div class="continue-chat">
+  <form hx-post="/sessions/{{ session.key }}/continue"
+        hx-target="#continue-session-result" hx-swap="outerHTML"
+        hx-disabled-elt="find button" data-model-picker>
+    <label for="continue-chat-account">Account</label>
+    <select id="continue-chat-account" name="account_key" required data-model-picker-account>
+      {% for account in continue_chat_accounts %}
+      <option value="{{ account.key }}" data-provider="{{ account.provider_id }}"
+              data-default-model="{{ new_chat_defaults[account.key].model }}"
+              data-default-effort="{{ new_chat_defaults[account.key].effort }}">{{ account.label }} · {{ account.provider_id | replace('_', ' ') }}</option>
+      {% endfor %}
+    </select>
+    <div class="model-field" id="continue-chat-model-field"{% if not new_chat_initial_has_models %} hidden{% endif %} data-model-picker-field>
+      <label for="continue-chat-model">Model</label>
+      <select id="continue-chat-model" name="model" data-model-picker-select>
+        <option value="">Default ({{ new_chat_defaults[continue_chat_accounts[0].key].model }})</option>
+        {% for model in new_chat_models %}
+        <option value="{{ model.value }}" data-provider="{{ model.provider_id }}">{{ model.label }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="model-field" id="continue-chat-effort-field"{% if not new_chat_initial_has_efforts %} hidden{% endif %} data-effort-picker-field>
+      <label for="continue-chat-effort">Effort</label>
+      <select id="continue-chat-effort" name="effort" data-effort-picker-select>
+        <option value="">Default ({{ new_chat_defaults[continue_chat_accounts[0].key].effort }})</option>
+        {% for effort in new_chat_efforts %}
+        <option value="{{ effort.value }}" data-provider="{{ effort.provider_id }}">{{ effort.label }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="continue-actions">
+      <button type="submit" name="mode" value="transcript">Continue in new chat</button>
+      {% if continue_chat_can_handoff %}
+      <button type="submit" name="mode" value="handoff">Hand off to new chat</button>
+      {% endif %}
+    </div>
+  </form>
+  <div id="continue-session-result" class="inject-result"></div>
+</div>
+{% endif %}
+
+<div id="assistant-session-details" sse-swap="assistant-session">
+  {% include "partials/assistant_session_details.html" %}
+</div>
+
+{% if detail.todos %}
+<div class="todos">
+  <h3>Todos</h3>
+  {% for todo in detail.todos %}
+  <div class="todo {{ todo.status }}"><span class="todo-status">{{ todo.status }}</span>{{ todo.subject }}</div>
+  {% endfor %}
+</div>
+{% endif %}
+
+<div id="chat-notes" class="chat-notes-source" hidden sse-swap="chat-notes" hx-swap="innerHTML">
+  {{ rendered_chat_notes | default('') | safe }}
+</div>
+
+<div class="transcript-stage">
+  <div class="transcript" data-session-key="{{ session.key }}" sse-swap="transcript" hx-swap="beforeend">
+    {# One continuous window across the chat's legs, built by
+       render.render_chat_transcript so the full page and every "load earlier"
+       fragment agree on what a message's identity is (#1265). #}
+    {{ rendered_transcript | safe }}
+    {# The partial addresses this chat's own routes, and the page only names
+       `session_key` further down, so it is set here rather than rendering the
+       row with an empty one. #}
+    {% set session_key = session.key %}
+    {% for item in pending_messages %}{% include "partials/pending_message.html" %}{% endfor %}
+  </div>
+
+  <div id="tool-activity" sse-swap="tools">{{ session_fragments["tools"] | safe }}</div>
+</div>
+
+<div id="subagent-activity" sse-swap="subagents">{{ session_fragments["subagents"] | safe }}</div>
+
+{% set session_key = session.key %}
+{% include "partials/held_messages.html" %}
+
+{# Session-level handoff actions belong together at the bottom of the transcript. #}
+<div id="session-action-bar" class="session-action-bar">
+  <div id="session-related-links" class="session-related-links" sse-swap="related-links"
+       hx-swap="innerHTML">{{ session_fragments["related-links"] | safe }}</div>
+  {#- The Work's own buttons, the ones its page offers (#2972), drawn once when the page
+      loads and outside the live fragment above, so no push eats a press or its answer.
+      A desktop with the Work column beside the chat hides them, since the column offers
+      the same. #}
+  {%- if work_buttons %}
+  {%- from "partials/work_actions.html" import control %}
+  {%- set card = work_card %}
+  <div class="session-work-actions" data-session-work-actions>
+    <div class="session-work-actions-row">{% for button in work_buttons %}{{ control(card, button) }}{% endfor %}</div>
+    <div class="work-action-result" aria-live="polite"></div>
+  </div>
+  {%- endif %}
+</div>
+
+{# A worker killed by its own memory cap must say so here rather than leave the
+   chat looking mysteriously stalled (#1546). It sits above the composer because
+   the answer is to send another message, which revives the chat and clears it. #}
+{% if worker_exit_message %}
+<div class="worker-exit-notice" role="status">{{ worker_exit_message }}</div>
+{% endif %}
+
+
+<div id="pending-interaction-slot" sse-swap="interaction" hx-swap="innerHTML"
+     data-refresh-url="/partials/sessions/{{ session.key }}/interaction">{{ session_fragments["interaction"] | safe }}</div>
+
+{% if session.deep_link %}
+<div class="chat-bar">
+  <div class="chat-bar-row">
+    {% if account_label %}<span class="acct-badge acct-{{ account_label }}">{{ account_label }}</span>{% endif %}
+    <a class="chat-link" href="{{ session.deep_link }}" target="_blank" rel="noopener">{{ session.deep_link_label or 'open session' }} ↗</a>
+  </div>
+</div>
+{% endif %}
+
+{% include "partials/fork_form.html" %}
+{% include "partials/rollback_form.html" %}
+
+{% if can_inject %}
+<form class="inject-form" hx-post="/sessions/{{ session.key }}/inject"
+      hx-target="#inject-result" hx-swap="outerHTML" hx-disabled-elt="find button"
+      hx-encoding="multipart/form-data" data-clear-on-send data-agentdeck-action="send">
+  {% if issue_post_target %}
+  {#- Floats just above the pinned composer, so the composer never covers it (#2416). #}
+  {% with notice = issue_post_notice, notice_oob = false %}{% include "partials/issue_post_notice.html" %}{% endwith %}
+  {% endif %}
+  <label for="inject-message">Message</label>
+  <div class="composer-input" data-composer-autocomplete>
+    <textarea id="inject-message" class="send-on-enter" name="message" rows="3"{% if inject_max_chars %} maxlength="{{ inject_max_chars }}"{% endif %}
+              required placeholder="Send a follow-up…" autocomplete="off" aria-autocomplete="list"
+              aria-controls="composer-suggestions" aria-expanded="false"></textarea>
+    <div id="composer-suggestions" class="composer-suggestions" role="listbox"
+         aria-label="Commands and skills" data-composer-suggestions hidden></div>
+    <script type="application/json">{{ composer_suggestions | tojson }}</script>
+  </div>
+  <label class="image-picker" for="inject-images">＋ Attach file <span class="paste-hint">or paste screenshot</span></label>
+  <input id="inject-images" class="image-input" type="file" name="images" multiple>
+  <div class="composer-actions">
+    <span class="composer-hint">Enter to send · Shift+Enter for newline</span>
+    {#- With the host's speech service, 🎤 is voice mode's microphone too (#3540). #}
+    {% with voice_mic = host_speech %}{% include "partials/speech_button.html" %}{% endwith %}
+    {#- Voice mode (#3401) needs the host's speech service (#3409, #3470); CSS keeps it
+        hidden until voice_mode.js finds the browser can record. #}
+    {%- if host_speech %}
+    <span class="speech-control voice-control" data-voice-line="{{ voice_line }}"
+          data-voice-unheard="{{ voice_unheard_line }}" data-voice-short="{{ voice_short_answer_line }}"
+          {%- if host_speech and speech_language != "en" %} data-voice-line-fi="{{ voice_line_fi }}"{% endif %}
+          {%- if host_speech and speech_language == "fi" %} data-voice-language="fi"{% endif %}
+          {%- if host_speech %} data-host-speech{% endif %}
+          {%- if voice_idle_seconds %} data-voice-idle-seconds="{{ voice_idle_seconds }}"{% endif %}
+          {%- if host_speech %} data-voice-wake="{{ voice_wake }}"{% endif %}>
+      <button type="button" class="speech-button voice-button" data-voice-button aria-pressed="false"
+              aria-label="Read replies aloud" title="Read replies aloud">🎧</button>
+      <span class="speech-status" role="status" hidden></span>
+    </span>
+    {%- endif %}
+    {% if composer_phrases %}
+    {# Collapsed by default so the composer keeps its mobile height; the panel
+       opens over the transcript the same way the effort menu does. #}
+    <details class="phrase-menu" data-quick-phrases data-composer-menu>
+      <summary aria-label="Quick phrases" title="Quick phrases">⚡</summary>
+      <div class="phrase-menu-panel">
+        <p class="phrase-menu-hint">Sends right away. If you have already typed
+          something, the phrase is added to your draft instead.</p>
+        <div class="phrase-menu-list">
+          {% for phrase in composer_phrases %}
+          <button type="button" class="phrase-chip" data-quick-phrase="{{ phrase.text }}"
+                  title="{{ phrase.text }}">{{ phrase.label }}</button>
+          {% endfor %}
+        </div>
+      </div>
+    </details>
+    {% endif %}
+    {% if issue_post_target %}{% include "partials/issue_post_menu.html" %}{% endif %}
+    {% if session_efforts %}
+    <details class="effort-menu">
+      <summary>Effort</summary>
+      <div class="effort-menu-panel">
+        <label for="inject-effort">Reasoning effort</label>
+        <select id="inject-effort" name="effort">
+          <option value="">Keep current</option>
+          {% for effort in session_efforts %}
+          <option value="{{ effort.value }}">{{ effort.label }}</option>
+          {% endfor %}
+        </select>
+      </div>
+    </details>
+    {% endif %}
+    <div id="composer-controls" class="composer-controls" sse-swap="composer-controls"
+         hx-target="this" hx-swap="innerHTML">{{ session_fragments["composer-controls"] | safe }}</div>
+  </div>
+  {% set inject_status = request.app.state.injector.status(session.key) %}
+  {% set session_key = session.key %}
+  {% include "partials/inject_status.html" %}
+</form>
+<form id="interrupt-form" hx-post="/sessions/{{ session.key }}/interrupt"
+      hx-target="#inject-result" hx-swap="outerHTML" data-agentdeck-action="stop"></form>
+{% endif %}
+</section>
+</div>
+{% endblock %}

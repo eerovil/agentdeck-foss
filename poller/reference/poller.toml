@@ -1,0 +1,276 @@
+# The AgentDeck Reference Poller Project — Poller Manifest.
+#
+# This is the canonical copy-me example (#183): portable, committed, and readable. It names its
+# world semantically and holds no secrets, no machine paths, and no GitHub node ids — those live
+# in the Host Overlay or are resolved once at activation and frozen (#108).
+#
+# ONE VALUE MUST BE FILLED BEFORE THIS CAN ACTIVATE: board.project_number. It is the number in
+# the Project board's URL. Left at 0 the offline check refuses it, which is the intended
+# fail-closed behavior rather than a poller pointed at a board nobody chose.
+
+contract = 1
+
+[board]
+org = "eerovil"
+project_number = 0  # <- the board's number; activation fails closed until this is real
+
+# The label that means "this engine owns the card". Optional — omit it and the engine uses
+# `claude`. It lives here rather than in the engine because it is a fact about this project's
+# world, and one shared engine must not choose it on behalf of every project at once (#108).
+#
+# A list accepts aliases without abandoning old cards. The first entry remains canonical for
+# issue creation, while provisioning creates every entry. Each entry is queried independently
+# because GitHub ANDs a connection's label filter.
+ownership_label = ["agent", "claude"]
+
+# A card carrying this label gets a specification comment only. The worker hands it to Needs
+# More Info; a person removes the label after approval before starting implementation.
+spec_only_label = "spec-only"
+
+# While present, this label pauses the card (#2548): the engine starts, restarts and merges
+# nothing on it, and a running turn finishes as usual. The deck's Pause and Resume add and
+# remove it.
+paused_label = "paused"
+
+# Statuses are named by ROLE. The value is the column's own spelling on your board, matched
+# case-insensitively at activation, so renaming a column is a config edit rather than a code
+# change.
+#
+# Three roles are optional. Backlog simply has nothing parked in it when the board has no such
+# column. Ready to merge is where a release attempt that did not merge comes to rest — a failed
+# merge, or a review that asked for changes — instead of being split between Blocked and In
+# review, where neither says "approved, it just did not land"; `/merge` is admitted from it, so
+# retrying is one comment rather than dragging the card back by hand. Human review pending is
+# the column the poller never writes on its own: you drag a card into it, or a worker reports
+# `finish human_review_pending` because the card explicitly asked it to, and the engine then
+# leaves the card alone until somebody comments `/claude` on it. None of the three needs a line
+# here: make a column named exactly "Backlog", "Ready to merge" or "Human review pending" on the
+# board and activation finds it. Write the line only to give the role a different spelling.
+[board.statuses]
+todo = "Todo"
+in_progress = "In progress"
+in_review = "In review"
+done = "Done"
+needs_more_info = "Needs More Info"
+blocked = "Blocked"
+
+[policy]
+merge_method = "merge"
+worker_cap = 5  # cards this project may hold In progress; the host-wide mid-turn bound is separate
+# Idle terminal cards are reconciliation backstops, not active work. Keep active, queued,
+# stopping, recovery and release cards fresh every wake while cooling these reads down.
+terminal_recheck_s = 900
+# The project token shares its GraphQL quota with other host control paths. Below this reserve,
+# the wake keeps durable intake/queues intact and defers live GraphQL reads until quota recovers.
+graphql_reserve = 200
+# The REST core quota is shared with CI and other host automation. Preserve enough requests for
+# those services when the shared login is close to exhaustion.
+core_reserve = 500
+# When the deck's webhook watcher is provably alive and no delivery has landed for this
+# project's repositories, a timed wake may skip its live GitHub queries — for at most this many
+# seconds since the last full wake, so a silently dropped delivery costs bounded latency
+# (#1631). Skipping needs all three proofs at once: unread streams empty, watcher heartbeat
+# fresh, and a full wake within this window. Anything missing — a dead watcher, an unreadable
+# stream, a repository with no stream at all — restores full 30-second polling on its own.
+# What waits is only the fresh view of GitHub: the wake still runs, so a queued command and a
+# delivery waiting to be retried keep moving every 30 seconds either way.
+# Set 0 to turn the skip off and poll fully on every wake.
+webhook_skip_s = 900
+# How far a worker may deploy when a requester explicitly asks for it on the card, in a
+# `/claude` comment, the issue or the worker's chat (#2656). One of "none", "staging" or
+# "production". "staging" — the default — allows staging, dev-cluster and canary environments
+# and nothing else; "production" adds production; "none" forbids every deploy. A worker never
+# deploys unasked, and never pushes to the base branch at any level.
+worker_may_deploy = "staging"
+# Whether a worker may merge its own card's pull request when a requester explicitly asks for
+# that merge on the card or in the worker's chat (#2723). "on_request" — the default — allows
+# it; "never" leaves every merge to the poller's release. A spec or merge-review turn never
+# merges, and no worker pushes to the base branch.
+worker_may_merge = "on_request"
+
+# Titles this project's issue templates pre-fill, which mean "nobody wrote a title" (#338). A
+# card still wearing one is renamed on the wake that sees it, using what the requester typed
+# after the placeholder, or the first line of the body. Every card otherwise reads the same
+# boilerplate on the board, in the issue list and on the deck.
+#
+# List each one exactly as its template writes it. Leave the list out and no *placeholder* is
+# ever matched — the engine treats no wording as boilerplate a project has not named. It still
+# repairs a title GitHub took from a paste, `<img ...` or a bare link (#595), which names no
+# work in any project and so needs nothing declared here.
+placeholder_titles = ["Requested changes"]
+
+# One entry per repository, with everything it does stated inline. The old three-parallel-lists
+# shape made "what does this repo do?" a cross-reference exercise and drifted out of sync.
+#
+# A repository that holds issues but no code of its own has nowhere to send a worker. This change
+# proposes that it name one: `workspace = "<code-repo-id>"` says its cards are worked in that
+# repository's checkout, and its worktrees and branches carry its own id so equal issue numbers in
+# the two repositories cannot collide (#1087). Only the code repository owns an Overlay
+# `[checkouts]` path — two ids may never resolve to one directory by accident.
+[[repos]]
+id = "agentdeck"
+holds_issues = true
+holds_code = true
+verification = "agentdeck_job"  # required on every code repository; see below (#2832)
+auto_deploys = true  # deploy-watch observes the deployed commit + /healthz below
+
+# Where this project's screenshot evidence is committed (#1791). This change proposes a fourth
+# role: `holds_artifacts = true` on exactly one repository sends every worker's screenshots
+# there instead of into the repository the card ships from, which is how a code repository ends
+# up carrying tens of megabytes of PNGs nothing builds. The evidence still has to be committed
+# somewhere on GitHub — a commit-pinned `blob/...?raw=1` file is the only embed a reviewer of a
+# private repository is actually served.
+#
+# Unlike `workspace`, it cannot borrow: the images are pushed to this repository itself, so it
+# owns an Overlay `[checkouts]` path of its own. An issue-only repository may hold it (a
+# project's `issues` repo is the intended one) while its cards continue to be worked in a code
+# checkout.
+# The clone is not what a worker is handed: each card gets its own worktree of it, registered
+# and cleaned up with that card's code worktrees, because every card writes evidence at once and
+# one shared working tree would let one card's `git add` stage another's screenshots.
+# Left out here, and unset for AgentDeck itself until that repository exists, so both keep
+# committing screenshots beside their code exactly as before.
+#
+#   [[repos]]
+#   id = "agentdeck-shots"
+#   holds_artifacts = true
+
+# Whether a pull request opened in a code repository may carry a GitHub closing keyword (#1734).
+# `required` — the default, and what every project did before this field existed — has the worker
+# brief demand `Closes #n` in a completion pull request's description. A repository whose own
+# guide bans closing keywords sets `prohibited` instead, and its workers are told to reference
+# the card in the fully qualified `owner/repo#n` form and nothing more.
+#
+# Nothing about the lifecycle changes: the release path finds a pull request from that qualified
+# reference with no keyword involved, and the poller closes the finished card itself. The point
+# is only that AgentDeck stops handing a worker a generic rule its repository forbids, which is
+# a contradiction no model should have to resolve and a command guardian correctly denies.
+#
+# Declare it on the repository the pull request lands in — the one with `holds_code = true`.
+# An issue-only repository that borrows a workspace inherits the code repository's answer.
+#
+#   [[repos]]
+#   id = "some-fork"
+#   holds_code = true
+#   closing_keywords = "prohibited"
+#
+# What proves a pull request (#2364) is `verification`, per repository too, and every repository
+# with `holds_code = true` must name it: activation refuses one that does not (#2832). There is no
+# default, because the old one sent a repository with no tests to wait for a run nothing made.
+# Ask, while onboarding: does this repository have tests, and where do they run?
+#
+# - `agentdeck_job`: a worker runs the tests with `agentdeck job submit --verification`.
+# - `github_checks`: the repository's CI owns the suite; every check GitHub holds for the pull
+#   request's exact head has to pass, and a head with no reported check is not verified.
+# - `review_only` (#2729): there are no tests; the review pass on the exact head is the whole
+#   proof. Refused on a repository that deploys (`auto_deploys`), and on one holding no code.
+#
+# Each source feeds the same tests bit, and none merges anything; `capabilities.auto_release`
+# stays the only way to do that.
+#
+#   [[repos]]
+#   id = "some-service"
+#   holds_code = true
+#   verification = "github_checks"
+#
+#   [[repos]]
+#   id = "some-notes"
+#   holds_code = true
+#   verification = "review_only"
+
+# Who may steer, per #110. Work is a subset of Release, so a Release Controller never needs to be
+# listed twice. The role bars are the designed defaults, restated here because a canonical example
+# should show the shape rather than rely on a default nobody can see.
+[authorization]
+# `bot` names the account the engine itself speaks as, and that account may never authorize
+# anything — not a command comment, and not its own activation. It is deliberately UNSET here.
+#
+# This project has one operator, and the engine speaks with that operator's own credential, so
+# naming them as the bot would deny them Release authority and leave nobody able to approve an
+# activation at all. Setting it to a fictitious account would be worse: the rule would look
+# enforced while the engine still posts as a human.
+#
+# Set it as soon as the engine has a GitHub account of its own — that is the only arrangement in
+# which the rule protects anything, because only then is "the engine said it" distinguishable
+# from "a person said it". Until then, treat comments from this engine as unsigned.
+#
+#   bot = "example-poller"
+
+[authorization.work]
+role = "triage"
+# `allow` adds a login the role bar would not reach, and it is the only way a *bot* account can
+# steer a card at all (#2033): the comment scan drops every bot-authored comment before it reads
+# the grammar, unless the project named that bot here. Name an app a person runs deliberately —
+# a review integration that knows how to say `/claude` — and nothing else; an app cannot be
+# reached by the role bar either, because GitHub reports no collaborator permission for one.
+#
+#   allow = ["example-reviewer[bot]"]
+
+[authorization.release]
+role = "maintain"
+
+# The full preset (#113): every capability this engine offers is on for the Reference Project,
+# because it exists to demonstrate them.
+[capabilities]
+work_control = true
+guarded_release = true
+merge_review = true
+deployment_observation = true
+artifacts = true
+
+# The control guide appended to every comment this engine posts (#373). The engine ships no
+# wording of its own: what the guide says, and the language it says it in, are facts about this
+# project's board. Each line is keyed by the control it explains, so a line for a capability
+# switched off above is refused by the offline check rather than posted.
+#
+# Left out here, so the Reference Project keeps posting bare comments. Uncomment to opt in:
+#
+#   [comments.guide]
+#   heading = "🤖 **Steer this card with a new comment**"
+#   work = "**Reply, continue, or ask for changes:** `/claude <what you want>`"
+#   stop = "**Stop the work:** `/claude stop`"
+#   merge = "**Approve and release finished work:** `/merge` *(only from In review)*"
+#   merge_review = "**Review before releasing:** `/merge review`"
+#   shot = "**Ask for screenshots:** `/shot`"
+
+# Each extension validates its own settings through its own hook; the core loader knows nothing
+# about what is in these blocks (#112/#179).
+[extensions.deploy-watch]
+hooks = ["validate-config", "release-gate", "health"]   # what this project allows it (#2158)
+service = "agentdeck.service"
+health_url = "http://127.0.0.1:8756/healthz"
+# The Overlay names where the deploy records its live commit (`deployed_commit_file`,
+# `repo_path`): a web deploy hot-reloads rather than restarting, so the restart stamp alone no
+# longer moves on deploy (#2308).
+grace_seconds = 900
+
+[extensions.screenshots]
+hooks = ["validate-config", "command", "health"]   # what this project allows it (#2158)
+default_routes = ["/", "/pollers"]
+
+
+# sentry-autofix is deliberately left out of the Reference Project: it needs a Sentry
+# organization and a token this project does not have. The extension itself is shipped and
+# contract-tested (#179); enabling it is a per-project choice, not part of the example.
+#
+# A project that does enable it should also state its ceilings, because the extension bounds only
+# what it asks for per wake — the engine owns what it honors (#371):
+#
+#   [policy.proposals]
+#   daily_cap = 15   # proposals honored per UTC day; omit for no ceiling
+#   worker_cap = 3   # concurrent workers on proposal-only cards; omit to use policy.worker_cap
+#
+# There is no [policy.proposals] block below for the same reason there is no Sentry block: with
+# no extension proposing anything, a ceiling here would bound nothing and read as if it did.
+
+# Bounded command output (#2154) is off here, as it is for every project that has not asked for
+# it. With it on, a covered shell command's full output is kept as a private artifact and the
+# worker's model sees a bounded result it can slice further.
+#
+#   [command_output]
+#   enabled = true
+#   visible_tool_result_chars = 8000       # how much of one command result the model sees
+#   retention_days = 30                    # how long a full command artifact is kept
+#   slice_max_bytes = 65536                # the largest bounded slice one read returns
+#   slice_call_limit = 8                   # slices one artifact may serve to its worker
+#   no_archive_commands = ["vault read"]   # output of these is never archived

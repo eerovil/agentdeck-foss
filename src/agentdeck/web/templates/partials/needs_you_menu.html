@@ -1,0 +1,56 @@
+{# The top bar's list of new Needs you Works (#3239): Works that stopped for a person
+   since their page was last opened — the front page's unseen marks, so the two agree.
+   Opening a Work marks it seen, and the next push drops it. Pushed over the event stream
+   only when what it lists changed (``NEEDS_YOU_TOPIC``); static/needs_you_menu.js keeps
+   an open list open across that swap. The label carries the count too: a colour is not
+   available to a screen reader. Each row can be marked read without opening it (#3246);
+   that reply leaves the marked Works out (``seen_now``) before the rebuild has. A row opens
+   the Work's chat, which marks it seen too, and its page only when it has no chat (#3263). #}
+{% set menu = needs_you_menu(seen_now | default(())) %}
+{% if menu.new == 1 %}{% set label = '1 new Work needs you' %}
+{% elif menu.new %}{% set label = menu.new ~ ' new Works need you' %}
+{% else %}{% set label = 'Needs you' %}{% endif %}
+<details class="needs-you-menu" data-new="{{ menu.new }}">
+  <summary class="needs-you-nav-link" aria-label="{{ label }}" title="{{ label }}">
+    <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
+      <path fill="currentColor" d="M2.5 2h11c.83 0 1.5.67 1.5 1.5v9c0 .83-.67 1.5-1.5 1.5h-11C1.67 14 1 13.33 1 12.5v-9C1 2.67 1.67 2 2.5 2Zm0 1.4a.1.1 0 0 0-.1.1V8.6h3.3l.9 1.8h2.8l.9-1.8h3.3V3.5a.1.1 0 0 0-.1-.1h-11Zm11.1 6.6h-2.45l-.9 1.8H5.75l-.9-1.8H2.4v2.5c0 .06.04.1.1.1h11a.1.1 0 0 0 .1-.1V10Z"/>
+    </svg>
+    {%- if menu.new %}<span class="needs-you-count">{{ menu.new }}</span>{% endif %}
+  </summary>
+  <div class="needs-you-panel">
+    <div class="needs-you-head">
+      <strong>New — needs you</strong>
+      {% if menu.ids %}
+      <form hx-post="/works/seen" hx-target="#needs-you-slot" hx-swap="innerHTML">
+        {% for work_id in menu.ids %}<input type="hidden" name="work_id" value="{{ work_id }}">{% endfor %}
+        <button type="submit" class="needs-you-read-all">Mark all read</button>
+      </form>
+      {% endif %}
+    </div>
+    {% if menu.rows %}
+    <ul class="needs-you-list">
+      {% for item in menu.rows %}
+      {% set card = item.card %}
+      <li class="needs-you-item" data-work-id="{{ card.work_id }}"{% if item.attention %} data-op-category="{{ item.attention.category }}"{% endif %}>
+        <a href="{{ card.chat_href or card.href }}" title="{{ card.source_label }}">
+          <span class="needs-you-glyph" aria-hidden="true">{{ item.glyph }}</span>
+          <span class="needs-you-text">
+            <span class="needs-you-title">{{ card.title }}</span>
+            <span class="needs-you-line">{{ item.attention.label if item.attention else "Needs you" }} · {{ item.source }}
+              {%- if item.stopped_at %} · <time datetime="{{ item.stopped_at.isoformat() }}" title="{{ item.stopped_at | chat_time_title }}">{{ item.stopped_at | chat_time }}</time>{% endif %}</span>
+          </span>
+        </a>
+        <form hx-post="/works/seen" hx-target="#needs-you-slot" hx-swap="innerHTML">
+          <input type="hidden" name="work_id" value="{{ card.work_id }}">
+          <button type="submit" class="needs-you-read" aria-label="Mark read: {{ card.title }}" title="Mark read">&check;</button>
+        </form>
+      </li>
+      {% endfor %}
+    </ul>
+    {% if menu.more %}<p class="needs-you-more">+{{ menu.more }} more</p>{% endif %}
+    {% else %}
+    <p class="needs-you-empty">Nothing new needs you.</p>
+    {% endif %}
+    <a class="needs-you-all" href="/">All Needs you ({{ menu.total }}) &rarr;</a>
+  </div>
+</details>

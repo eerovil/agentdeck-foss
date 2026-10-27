@@ -1,0 +1,6 @@
+<div id="inject-result" class="inject-result" aria-live="polite"></div>
+{% set held_oob = true %}
+{% include "partials/held_messages.html" %}
+{% if issue_post %}
+{% with notice = issue_post, notice_oob = true %}{% include "partials/issue_post_notice.html" %}{% endwith %}
+{% endif %}

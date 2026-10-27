@@ -1,0 +1,37 @@
+{#- A wayfinder map (#3627): ``diagram`` is ``wayfinder_map.Diagram``, laid out by the server.
+    ``wayfinder_map.js`` makes the frame a map: drag the background to pan, pinch or
+    Ctrl+wheel to zoom, drag a box to move it, tap a box to open its ticket's Work. Moved
+    boxes are saved on the deck (``data-wm-save``), so every device draws them there; the view
+    is kept on this device, by ``key``.
+    Without the script it is a still picture whose boxes are still links. #}
+<div class="wm" data-wayfinder-map data-wm-key="{{ key }}" data-wm-save="/api/works/{{ key|urlencode }}/map-layout">
+  <p class="wm-legend">
+    {%- for state, word, n in diagram.legend %}
+    <span class="wm-key wm-{{ state }}"><i></i>{{ n }} {{ word|lower }}</span>
+    {%- endfor %}
+  </p>
+  <div class="wm-frame" data-wm-frame>
+    <svg class="wm-svg" width="{{ '%.0f'|format(diagram.width) }}" height="{{ '%.0f'|format(diagram.height) }}" data-wm-width="{{ '%.0f'|format(diagram.width) }}" data-wm-height="{{ '%.0f'|format(diagram.height) }}" role="img" aria-label="Map of {{ diagram.boxes|length }} boxes">
+      <defs>
+        <marker id="wm-head" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L8,4 L0,8 z" class="wm-head"/></marker>
+      </defs>
+      <g class="wm-world" data-wm-world>
+        {%- for arrow in diagram.arrows %}
+        <path class="wm-arrow wm-from-{{ arrow.state }}" d="{{ arrow.path }}" marker-end="url(#wm-head)" data-wm-from="{{ arrow.source }}" data-wm-to="{{ arrow.target }}"/>
+        {%- endfor %}
+        {%- for box in diagram.boxes %}
+        {%- if box.href %}<a href="{{ box.href }}" class="wm-link"{% else %}<g{% endif %} data-wm-box="{{ box.key }}" data-wm-w="{{ '%.1f'|format(box.w) }}" data-wm-h="{{ '%.1f'|format(box.h) }}"{% if box.home %} data-wm-home="{{ '%.1f'|format(box.home[0]) }} {{ '%.1f'|format(box.home[1]) }}"{% endif %} transform="translate({{ '%.1f'|format(box.x) }} {{ '%.1f'|format(box.y) }})">
+          <title>{{ box.tip }}</title>
+          <rect class="wm-box wm-{{ box.state }}" width="{{ '%.1f'|format(box.w) }}" height="{{ '%.1f'|format(box.h) }}" rx="8"/>
+          <text class="wm-head-text" x="8" y="15">{{ box.head }}</text>
+          {%- for line in box.lines %}
+          <text class="wm-title" x="8" y="{{ 32 + loop.index0 * 15 }}">{{ line }}</text>
+          {%- endfor %}
+        {% if box.href %}</a>{% else %}</g>{% endif %}
+        {%- endfor %}
+      </g>
+    </svg>
+    <button type="button" class="wm-retry" data-wm-retry hidden>Not saved · Retry</button>
+    <button type="button" class="wm-reset" data-wm-reset hidden>Reset</button>
+  </div>
+</div>

@@ -1,0 +1,120 @@
+<!doctype html>
+{# Live prototyping's meeting page (#3569): the screen the boss shares. The prototype
+   fills the frame; live_prototype.js reloads it when the agent records a change. #}
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Live · {{ title }}</title>
+  <style>
+    [hidden] { display: none !important; }
+    html, body { margin: 0; height: 100%; font: 14px/1.4 system-ui, sans-serif; background: #111; color: #eee; }
+    .live { display: flex; height: 100%; }
+    .live-stage { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+    .live-bar { display: flex; gap: .5rem; align-items: center; padding: .4rem .6rem; background: #1c1c1c; flex-wrap: wrap; }
+    .live-bar a { color: #9cf; }
+    .live-title { font-weight: 600; margin-right: auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .live-versions button[aria-pressed="true"] { background: #2d6cdf; color: #fff; }
+    .live-frame { flex: 1; border: 0; background: #fff; width: 100%; }
+    .live-empty { flex: 1; display: grid; place-items: center; color: #aaa; }
+    .live-side { width: 18rem; display: flex; flex-direction: column; background: #1a1a1a; border-left: 1px solid #333; }
+    .live-steps { flex: 1; overflow: auto; margin: 0; padding: .5rem; list-style: none; }
+    .live-steps li { padding: .35rem 0; border-bottom: 1px solid #2a2a2a; }
+    .live-steps .n { color: #888; margin-right: .3rem; }
+    .live-steps button { float: right; font-size: 12px; }
+    .live-send { display: flex; flex-direction: column; gap: .4rem; padding: .5rem; border-top: 1px solid #333; }
+    .live-send textarea { width: 100%; box-sizing: border-box; min-height: 4rem; font: inherit; }
+    .live-status { color: #aaa; font-size: 12px; min-height: 1em; }
+    .live-activity { color: #fc6; font-size: 12px; max-width: 40%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .live-activity::before { content: "● "; animation: live-pulse 1.2s ease-in-out infinite; }
+    @keyframes live-pulse { 50% { opacity: .3; } }
+    .live-view { flex: 1; display: flex; position: relative; min-height: 0; }
+    .live-walk { position: absolute; left: .6rem; right: .6rem; bottom: .6rem; padding: .5rem .7rem; border-radius: 6px; background: rgba(20, 20, 20, .92); box-shadow: 0 4px 18px rgba(0, 0, 0, .5); display: flex; gap: .6rem; align-items: center; }
+    .live-walk-text { flex: 1; min-width: 0; }
+    .live-walk-title { color: #aaa; font-size: 12px; }
+    .live-walk-step { font-size: 16px; }
+    .live-tabs { display: flex; gap: .3rem; padding: .5rem .5rem 0; }
+    .live-tabs button[aria-pressed="true"] { background: #2d6cdf; color: #fff; }
+    .live-cases { flex: 1; overflow: auto; padding: .5rem; }
+    .live-cases ul { margin: 0; padding: 0; list-style: none; }
+    .live-cases li { padding: .35rem 0; border-bottom: 1px solid #2a2a2a; }
+    .live-cases li .meta { color: #888; font-size: 12px; }
+    .live-cases li .actions { display: flex; gap: .3rem; margin-top: .25rem; }
+    .live-case-form { display: flex; flex-direction: column; gap: .4rem; margin-top: .5rem; }
+    .live-case-form input, .live-case-form textarea, .live-case-form select { width: 100%; box-sizing: border-box; font: inherit; }
+    .live-case-form textarea { min-height: 6rem; }
+    .live-send-row { display: flex; gap: .4rem; align-items: center; }
+    .live-send-row button[type="submit"] { flex: 1; }
+    {# The chat composer's 🎤 (#2456), shown only where the browser can dictate. #}
+    .speech-control { position: relative; display: none; flex: none; }
+    .speech-supported .speech-control, .speech-recordable .speech-control[data-host-speech] { display: inline-flex; }
+    .speech-button[aria-pressed="true"] { background: #a33; border-color: #e55; }
+    .speech-status { position: absolute; left: 0; bottom: calc(100% + 6px); padding: 4px 8px; border: 1px solid #555; border-radius: 6px; background: #222; font-size: 12px; white-space: nowrap; }
+    .speech-status.is-listening { padding: 0; }
+    .speech-status button { border: 0; background: none; }
+    button { font: inherit; padding: .25rem .6rem; border-radius: 4px; border: 1px solid #555; background: #2a2a2a; color: #eee; cursor: pointer; }
+  </style>
+</head>
+<body>
+<div class="live" id="live" data-session-key="{{ session_key }}">
+  <main class="live-stage">
+    <div class="live-bar">
+      <a href="/sessions/{{ session_key }}" title="Back to the chat">←</a>
+      <span class="live-title">{{ title }}</span>
+      <span class="live-activity" id="live-activity" role="status" hidden></span>
+      <span class="live-versions" id="live-versions"></span>
+      <span class="live-status" id="live-step-label"></span>
+      <button type="button" id="live-reload" title="Reload the prototype">↻</button>
+      <button type="button" id="live-side-toggle" aria-controls="live-side">Panel</button>
+    </div>
+    <div class="live-view">
+      <iframe class="live-frame" id="live-frame" title="The prototype" hidden></iframe>
+      <div class="live-empty" id="live-empty">Waiting for the agent to start the prototype…</div>
+      {# A use case's walkthrough (#3571): the current step over the prototype. #}
+      <div class="live-walk" id="live-walk" hidden>
+        <div class="live-walk-text">
+          <div class="live-walk-title" id="live-walk-title"></div>
+          <div class="live-walk-step" id="live-walk-step"></div>
+        </div>
+        <button type="button" id="live-walk-back">Back</button>
+        <button type="button" id="live-walk-next">Next</button>
+        <button type="button" id="live-walk-end" title="End the walkthrough">×</button>
+      </div>
+    </div>
+  </main>
+  <aside class="live-side" id="live-side">
+    <div class="live-tabs">
+      <button type="button" data-live-tab="live-steps" aria-pressed="true">Changes</button>
+      <button type="button" data-live-tab="live-cases" aria-pressed="false">Use cases</button>
+    </div>
+    <ol class="live-steps" id="live-steps"></ol>
+    <div class="live-cases" id="live-cases" hidden>
+      <ul id="live-case-list"></ul>
+      <button type="button" id="live-case-add">Add use case</button>
+      <form class="live-case-form" id="live-case-form" hidden>
+        <input name="title" placeholder="Who does what" aria-label="Use case title" required>
+        <select name="version" aria-label="Version it starts on"></select>
+        <input name="url" placeholder="Link where it starts (optional)" aria-label="Start link">
+        <textarea name="steps" placeholder="Steps, one per line" aria-label="Steps"></textarea>
+        <div class="live-send-row">
+          <button type="submit">Save</button>
+          <button type="button" id="live-case-cancel">Cancel</button>
+        </div>
+      </form>
+    </div>
+    <form class="live-send" id="live-send">
+      <textarea name="message" placeholder="Suggestion for the prototype" aria-label="Suggestion"></textarea>
+      <div class="live-send-row">
+        <button type="submit">Send suggestion</button>
+        {% include "partials/speech_button.html" %}
+      </div>
+      <button type="button" id="live-spec">Write the spec from what we picked</button>
+      <div class="live-status" id="live-status" role="status"></div>
+    </form>
+  </aside>
+</div>
+<script id="live-initial" type="application/json">{{ live | tojson }}</script>
+<script src="/static/composer_speech.js?v={{ asset_ver }}" defer></script>
+<script src="/static/live_prototype.js?v={{ asset_ver }}" defer></script>
+</body>
+</html>

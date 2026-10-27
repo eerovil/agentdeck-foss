@@ -1,0 +1,106 @@
+{% extends "base.html" %}
+
+{% block title %}{{ detail.card.source_label }} · {{ detail.card.title }} · agentdeck{% endblock %}
+{% block body_class %}work-page{% endblock %}
+{# The page's own stream (#3228) is told what the page shows: the key it was built at and
+   each section's digest, so it builds the Work again only when something it reads moved,
+   and sends only the sections that changed. A section a person is using is held
+   (`data-hold-in-use`, work_list.js). The top bar keeps its own small stream. #}
+{% block body_sse %}sse-connect="{{ stream_url }}"{% endblock %}
+{% block topbar_sse %} sse-connect="/events/topbar"{% endblock %}
+{% block topbar_nav %}<a class="back" href="/" aria-label="back to the dashboard">←</a>{% endblock %}
+
+{% block content %}
+{#- A desktop opens the Work's chat beside it (#2345); session_navigation.js reads these. #}
+{%- set open_chat = detail.open_chat %}
+<main class="work-main" data-work-id="{{ detail.card.work_id }}"
+  {%- if open_chat %} data-open-chat-key="{{ open_chat[0] }}" data-open-chat="{{ open_chat[1] }}"{% endif %}>
+  {%- for name, html in sections %}
+  {%- if name == "message" %}
+  {#- Message this Work (#2218): the deck picks the chat when the message is sent. The text box
+      is outside the swapped section, so a live update never clears what is being typed.
+      `data-agentdeck-action` gives each send the chat composer's stable action ID. #}
+  <form class="wd-message" id="work-message" hx-post="{{ message_url }}" hx-target="#work-message-result"
+        hx-swap="innerHTML" hx-disabled-elt="find .wd-message-send" data-work-message
+        data-agentdeck-action="send">
+    <textarea name="message" rows="1" required
+              aria-label="Message this Work" placeholder="{{ 'Answer the question…' if detail.message_target and detail.message_target.answer else 'Message this Work…' }}"></textarea>
+    {%- if issue_post_target %}
+    {#- Outside the swapped section, so a live update never resets the tick (#2416). #}
+    {% include "partials/issue_post_menu.html" %}
+    {%- endif %}
+    <div class="work-sec wd-message-bar" id="work-sec-message">{{ html | safe }}</div>
+    {%- if new_chat %}
+    {#- New chat (#2388): beside Send, so shut it adds no height. #}
+    <button type="button" class="wd-new-chat-open" data-work-new-chat-open aria-controls="work-new-chat" aria-expanded="false">New chat</button>
+    {%- endif %}
+    <div class="wd-message-result" id="work-message-result" aria-live="polite"></div>
+  </form>
+  {%- if new_chat %}
+  {#- A side chat for this Work (#2388): part of the Work, never a Run. Shut until New chat
+      opens it, and outside every swapped section, so a live update never closes it or
+      touches the text. Its action ID is minted when it opens (work_list.js), so pressing
+      Start twice, or again after no answer, is the same press and never a second chat. #}
+  <form class="wd-new-chat" id="work-new-chat" hidden hx-post="{{ new_chat.url }}"
+        hx-target="#work-new-chat-slot" hx-swap="innerHTML"
+        hx-disabled-elt="find .wd-new-chat-start" data-work-new-chat>
+    <input type="hidden" name="client_action_id" value="">
+    <p class="wd-new-chat-where" data-work-new-chat-folder="{{ new_chat.folder }}">Runs in
+      {% if new_chat.folder %}<code>{{ new_chat.folder }}</code>{% else %}a local checkout of {{ new_chat.repository }}{% endif %}</p>
+    <textarea name="message" rows="2" required aria-label="First message for the new chat"
+              placeholder="What should the new chat do?"></textarea>
+    {%- set chosen = new_chat.accounts | selectattr("key", "equalto", new_chat.account_key) | first %}
+    <details class="wd-new-chat-account">
+      <summary>Account: <span data-work-new-chat-account>{{ chosen.label }} · {{ chosen.provider_id }}</span></summary>
+      {%- for account in new_chat.accounts %}
+      <label><input type="radio" name="account_key" value="{{ account.key }}"{% if account.key == new_chat.account_key %} checked{% endif %}> {{ account.label }} · {{ account.provider_id }}</label>
+      {%- endfor %}
+    </details>
+    <div class="wd-new-chat-buttons">
+      <button type="submit" class="wd-new-chat-start">Start</button>
+      <button type="button" class="secondary" data-work-new-chat-cancel>Cancel</button>
+    </div>
+  </form>
+  <div class="wd-new-chat-slot" id="work-new-chat-slot" aria-live="polite"></div>
+  {%- endif %}
+  {%- else %}
+  <div class="work-sec" id="work-sec-{{ name }}" sse-swap="work-{{ name }}" hx-swap="innerHTML" data-hold-in-use>{{ html | safe }}</div>
+  {%- if name == "status" %}
+  {#- What a Work action press did (#2237): outside the swapped section, so it stays put. #}
+  <div class="work-action-result" id="work-action-result" aria-live="polite"></div>
+  {#- Rename (#2328): shut until the title's ✎ opens it, and outside every swapped section so
+      a live update never touches the name being typed. An empty name, or the automatic-title
+      button, clears the custom name. The GitHub issue is never renamed. #}
+  <form class="wd-rename" id="work-rename" hidden hx-post="{{ rename_url }}"
+        hx-target="#work-rename-result" hx-swap="innerHTML" data-work-rename>
+    <input name="title" type="text" autocomplete="off" maxlength="{{ title_max }}"
+           value="{{ detail.custom_title }}" placeholder="Automatic title" aria-label="Work title">
+    <button type="submit" name="action" value="save">Save</button>
+    <button type="submit" class="secondary" name="action" value="clear">Use the automatic title</button>
+    <button type="button" class="secondary" data-work-rename-cancel>Cancel</button>
+  </form>
+  <div class="wd-rename-result" id="work-rename-result" aria-live="polite"></div>
+  {%- elif name == "workspace" and diff_url %}
+  {#- The Work's diff (#2379), without going through a chat. Shut by default, and read each
+      time it is opened, never on the stream, because reading it runs git in the checkouts.
+      Outside every swapped section, so a live update never throws away a diff being read. #}
+  <details class="wd-section wd-fold wd-diff" id="work-diff" data-work-diff
+           hx-get="{{ diff_url }}" hx-trigger="toggle[this.open]"
+           hx-target="find .session-diff-body" hx-swap="innerHTML">
+    <summary>Diff</summary>
+    <div class="session-diff-body">
+      <p class="diff-loading" role="status">
+        <span class="diff-spinner" aria-hidden="true"></span>Reading this Work's checkouts…</p>
+    </div>
+  </details>
+  {%- endif %}
+  {%- if name == "workspace" and detail.card.source_url %}
+  {#- The Work's issue conversation lives on GitHub (#2591, replacing #2420's in-deck reader):
+      one line, no GitHub reads, outside every swapped section. #}
+  <p class="wd-section wd-conv-link-row" id="work-conversation">
+    <a href="{{ detail.card.source_url|issue_href }}" target="_blank" rel="noopener">Open the conversation on GitHub ↗</a></p>
+  {%- endif %}
+  {%- endif %}
+  {%- endfor %}
+</main>
+{% endblock %}

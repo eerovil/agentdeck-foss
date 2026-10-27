@@ -1,0 +1,8 @@
+{# Live activity marker. The elapsed counter keeps moving during quiet model
+   reasoning/tool waits, making it clear that the open turn is still tracked. #}
+{%- if label -%}
+<div class="ev tool-wait" data-activity-elapsed="{{ elapsed_s | default(0) | int }}">
+  <span class="tool-wait-label" title="{{ label }}">{{ label }}</span>
+  <span class="tool-wait-elapsed" aria-label="elapsed time">{{ elapsed_s | default(0) | int }}s</span>
+</div>
+{%- endif -%}

@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block title %}accounts · agentdeck{% endblock %}
+{% block body_class %}accounts-page{% endblock %}
+{#- Each card's usage figures follow the stream (#3228). #}
+{% block body_sse %}sse-connect="/events?view=accounts"{% endblock %}
+{% block topbar_nav %}<a class="back" href="/" aria-label="back to all sessions">←</a>{% endblock %}
+
+{% block content %}
+<section class="accounts-index" aria-labelledby="accounts-title">
+  <header class="accounts-heading">
+    <p class="account-kicker">Settings</p>
+    <h1 id="accounts-title">Accounts</h1>
+    <p>Choose an account to manage its New chat defaults, usage limits, and login.</p>
+  </header>
+  <div class="account-card-grid">
+    {% for row in account_rows %}{% set account = row.account %}{% set usage = row.usage %}
+    <a class="account-card" href="/accounts/{{ account.key | urlencode }}">
+      <span class="account-card-heading">
+        <strong>{{ account.label }}</strong>
+        <span>{{ account.provider_id | replace('_', ' ') }}</span>
+      </span>
+      <span class="account-card-defaults">{{ row.default_model }} · {{ row.default_effort }}</span>
+      {% include "partials/account_card_usage.html" %}
+      {% if row.auth and row.auth.broken %}<span class="account-card-warning">Login required</span>{% endif %}
+      <span class="account-card-arrow" aria-hidden="true">→</span>
+    </a>
+    {% else %}
+    <p class="muted">No accounts configured.</p>
+    {% endfor %}
+  </div>
+</section>
+{% endblock %}

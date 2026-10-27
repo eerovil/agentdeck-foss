@@ -1,0 +1,27 @@
+<form id="account-new-chat-defaults" class="account-defaults-form"
+      hx-post="/accounts/{{ account.key | urlencode }}/new-chat-defaults"
+      hx-target="#account-new-chat-defaults" hx-swap="outerHTML">
+  {% if model_choices %}
+  <label for="account-default-model">Model</label>
+  <select id="account-default-model" name="model">
+    <option value="">Account default ({{ choice_label(native_defaults.model, model_choices) }})</option>
+    {% for choice in model_choices %}
+    <option value="{{ choice.value }}"{% if saved_defaults.model == choice.value %} selected{% endif %}>{{ choice.label }}</option>
+    {% endfor %}
+  </select>
+  {% endif %}
+  {% if effort_choices %}
+  <label for="account-default-effort">Effort</label>
+  <select id="account-default-effort" name="effort">
+    <option value="">Account default ({{ choice_label(native_defaults.effort, effort_choices) }})</option>
+    {% for choice in effort_choices %}
+    <option value="{{ choice.value }}"{% if saved_defaults.effort == choice.value %} selected{% endif %}>{{ choice.label }}</option>
+    {% endfor %}
+  </select>
+  {% endif %}
+  <div class="account-default-actions">
+    <span class="muted">Current: {{ choice_label(effective_defaults.model, model_choices) }} · {{ choice_label(effective_defaults.effort, effort_choices) }}</span>
+    <button type="submit">Save defaults</button>
+  </div>
+  {% if defaults_saved %}<p class="account-save-ok" role="status">{{ defaults_saved }}</p>{% endif %}
+</form>

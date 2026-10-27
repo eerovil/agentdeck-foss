@@ -1,0 +1,45 @@
+# Tests skipped for being slower than 0.5 s on a pod (#3046).
+# Median wall time over 49 full pod runs, 2026-10-12..13. Each line is a pytest node id.
+# Plus every test over 0.5 s in full pod run f9c0d0f6760e (2026-10-13), taken after the first batch.
+# Plus the tests over the cap in the first pod run that enforced it, job 5d624c0b7139 (#3053).
+# A test leaves this list once its fix issue makes it fast; AGENTDECK_RUN_TOO_SLOW=1 runs them anyway.
+# Browser tests are skipped by marker in conftest, not listed here.
+
+tests/test_browser_tier.py::test_every_playwright_test_is_marked_browser
+tests/test_browser_tier.py::test_the_browser_slot_cap_announces_itself_under_q
+tests/test_browser_tier.py::test_there_are_test_functions_to_check
+tests/test_claude_worker_runtime.py::test_deliver_and_key_endpoints_route_to_host
+tests/test_delivery_scheduling.py::test_a_fleet_with_every_circuit_open_is_refused_as_such[asyncio]
+tests/test_direct_pytest_single_process.py::test_a_real_direct_run_starts_no_workers[False]
+tests/test_direct_pytest_single_process.py::test_a_real_direct_run_starts_no_workers[True]
+tests/test_ensure_delivery.py::test_a_runtime_error_mid_delivery_is_uncertain_and_never_retried
+tests/test_ensure_delivery.py::test_each_runtime_answer_reads_as_it_did_through_the_web[result3-DeliveryOutcome.UNCERTAIN]
+tests/test_ensure_delivery.py::test_each_runtime_answer_reads_as_it_did_through_the_web[result5-DeliveryOutcome.SAFE_RETRY]
+tests/test_ensure_delivery.py::test_the_direct_delivery_carries_the_engines_saved_ids_to_the_runtime
+tests/test_flaky_verification.py::test_a_rerun_tests_the_verified_commit_after_the_worktree_moves_on
+tests/test_flaky_verification.py::test_the_queue_reruns_a_failed_verification_by_itself_and_forgives_it
+tests/test_injection_history_cleanup.py::test_disposable_history_preserves_the_exact_ui_window[1000-complete]
+tests/test_mac_runner_web.py::test_a_caller_without_the_shared_token_is_refused[asyncio]
+tests/test_mac_runner_web.py::test_the_icon_is_pushed_only_when_the_count_moves
+tests/test_new_work.py::test_an_action_id_reused_for_another_repository_is_refused
+tests/test_new_work.py::test_trailhead_attachments_go_to_outdoors_own_evidence_repository
+tests/test_new_work.py::test_the_repository_is_matched_without_regard_to_case
+tests/test_poller_host.py::test_the_engine_launcher_runs_the_engine_of_the_checkout_it_sits_in
+tests/test_review_fallback.py::test_a_deck_run_work_never_answers_no_poller
+tests/test_revival.py::test_a_registered_survivor_refused_at_capacity_is_retried_once_as_a_revival
+tests/test_run_verification.py::test_a_new_chat_that_continues_nothing_joins_no_run
+tests/test_run_workspace_evidence.py::test_recorded_evidence_outlives_the_worktree_and_later_work
+tests/test_select_suite.py::test_every_service_worker_test_is_also_a_browser_test
+tests/test_select_suite.py::test_the_service_worker_group_is_not_empty
+tests/test_test_timings.py::test_a_real_parallel_run_records_every_test_once
+tests/test_web.py::test_a_chat_running_in_the_live_deploy_checkout_is_badged
+tests/test_web.py::test_local_file_route_previews_html_and_serves_binary_inline
+tests/test_web.py::test_partial_limit_bars
+tests/test_web.py::test_tests_docs_and_screenshots_are_grouped_below_the_source
+tests/test_web_supervisor.py::test_reload_serves_requests_until_the_replacement_is_ready
+tests/test_work_actions.py::test_a_close_runs_as_the_owners_non_human_authority
+tests/test_work_actions.py::test_a_second_press_inside_the_window_is_refused
+tests/test_work_agent_title.py::test_a_rescue_chat_that_registered_the_issue_names_its_work
+tests/test_work_resolution.py::test_a_chat_in_two_works_must_name_one_of_its_own
+tests/test_work_resolution.py::test_an_empty_name_clears_it_too
+tests/test_work_ui.py::test_one_project_offers_no_filter

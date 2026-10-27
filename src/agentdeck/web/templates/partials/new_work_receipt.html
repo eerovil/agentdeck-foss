@@ -1,0 +1,7 @@
+{# What became of a New work press (#2415): filed with its link, refused with the reason, or
+   perhaps filed with the repository's issues to check before filing again. A Work the deck
+   starts itself also links its chat, which opens once the chat exists (#3590), and so does
+   a filing that may not have landed, whose agent waits to be told the number or stopped. #}
+<p class="new-work-receipt is-{{ state }}" data-new-work-receipt="{{ state }}" role="status">{{ text }}
+  {%- if chat_url %} · <a href="{{ chat_url }}" data-new-work-chat>open the Work chat</a>{% endif %}
+  {%- if url %} · <a href="{{ url }}" target="_blank" rel="noopener">{% if state != "sent" %}check the issues{% elif chat_url %}issue{% else %}open the issue{% endif %}</a>{% endif %}</p>

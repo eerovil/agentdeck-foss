@@ -1,0 +1,96 @@
+[project]
+name = "agentdeck"
+version = "0.3.1"
+description = "Self-hosted, mobile-first dashboard for monitoring and steering coding-agent CLI sessions"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "Eero Vilpponen" }]
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "jinja2>=3.1",
+    "httpx>=0.27",
+    "watchfiles>=0.22",
+    "pydantic-settings>=2",
+    "python-multipart",
+    "pywebpush>=2.3.0",
+    # pywebpush imports cryptography directly for Web Push encryption. Keep the
+    # dependency explicit instead of relying on an undeclared transitive package.
+    "cryptography>=42",
+    # Optional *reporting*, mandatory *dependency*: error_reporting.py stays
+    # inert without AGENTDECK_SENTRY_DSN, so the cost of shipping this small
+    # pure-Python wheel is nothing, while an extra would mean an operator who
+    # sets a DSN gets silence until they also remember a sync flag.
+    "sentry-sdk>=2.68.1",
+    # images.py shrinks an oversized attachment before any provider forwards it,
+    # because one image over 2000px permanently kills an image-heavy Claude chat
+    # (#2038). The import is lazy and only the resize path pays for it, but a
+    # deck that quietly skipped the shrink would hand that failure back, so this
+    # is a base dependency rather than an extra.
+    "pillow>=11",
+]
+
+[project.urls]
+Homepage = "https://github.com/eerovil/agentdeck-foss"
+
+[project.scripts]
+agentdeck = "agentdeck.__main__:main"
+
+[dependency-groups]
+dev = [
+    "playwright>=1.61.0",
+    "pytest",
+    "pytest-asyncio",
+    "pytest-xdist>=3.8.0",
+    "respx",
+    "ruff",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agentdeck"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+# One event loop per xdist worker instead of one per test (#1834). This is what
+# lets browser tests share a single Playwright driver and a single Chromium —
+# a Playwright connection is pinned to the loop that opened it, so a shared
+# browser and the test using it have to be on the same loop. Trying to scope
+# the loop to browser tests alone does not work: pytest-asyncio reads the
+# marker in its own `pytest_generate_tests`, and a conftest hook cannot get in
+# ahead of it, so the tests silently kept their own loops and every call into
+# the shared browser hung. Setting the documented default is the supported way.
+asyncio_default_test_loop_scope = "session"
+testpaths = ["tests"]
+# The suite is browser-heavy: ~120 Playwright tests are ~4% of the count and ~88%
+# of the wall clock, so a serial full run took 8:42. Parallel is the default
+# because the slow command is the one everyone types (`uv run pytest -q`, and CI
+# runs exactly that); measured 8:42 -> 2:52 on four cores, and 2:30-3:45 once #760
+# capped how many of those browser tests may run at once. `auto` follows the
+# host's core count, so a bigger machine gets more of the win for free.
+# Pass `-n0` for the two things xdist cannot do: `--pdb` and live output. It also
+# costs a focused run about two seconds of worker startup, which is why `-p
+# no:cacheprovider`-style micro-runs are better off with `-n0` too.
+addopts = ["-n", "auto", "--dist", "load"]
+markers = [
+    "browser: drives a real Chromium through Playwright (slow; excluded by -m 'not browser')",
+    # Narrows `browser` rather than standing beside it: every serviceworker test
+    # is also a browser test, so `-m 'not browser'` still drops them all. It
+    # exists so a change that cannot reach sw.js or the shell can drop ~59s of
+    # serial browser time without dropping the rest of the browser tier (#1837).
+    # `scripts/select_suite.py` decides when that is allowed; do not hand-pick it.
+    "serviceworker: drives a real service-worker claim (implies browser; see scripts/select_suite.py)",
+    "issue_refresh: lets the issue-list refresher actually run (see conftest)",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]

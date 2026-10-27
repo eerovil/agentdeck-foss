@@ -1,0 +1,8 @@
+{# A start refused in the response itself, rendered in the same shape the later
+   status poll uses for `failed` — the control must never report a bare status
+   number when the server can say what happened (#746). The route answers this
+   with 4xx and `static/refusal_swap.js` opts an HTML-bodied refusal into the
+   normal htmx swap. #}
+<div id="{{ result_id }}" class="inject-result failed" role="alert"
+     data-new-session-state="failed">{{ refusal_message }}{% if refusal_link %}
+  <a class="refusal-link" href="{{ refusal_link }}">{{ refusal_link_label }}</a>{% endif %}</div>

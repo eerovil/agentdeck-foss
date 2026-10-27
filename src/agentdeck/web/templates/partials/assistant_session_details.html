@@ -1,0 +1,17 @@
+{% if git_context %}
+<section class="assistant-chat-details" aria-label="Deckhand details for this chat">
+  <div class="assistant-chat-head">
+    <span class="assistant-kicker">Deckhand</span>
+    <strong>Context for this chat</strong>
+  </div>
+  <div class="assistant-git-context">
+    <div class="assistant-git-line">
+      {% if git_context.repository %}
+      <a href="https://github.com/{{ git_context.repository }}" target="_blank" rel="noopener">{{ git_context.repository }}</a>
+      {% endif %}
+      {% if git_context.branch %}<code>{{ git_context.branch }}</code>{% endif %}
+      {% if git_context.dirty %}<span class="assistant-dirty">uncommitted changes</span>{% endif %}
+    </div>
+  </div>
+</section>
+{% endif %}

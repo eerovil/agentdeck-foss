@@ -1,0 +1,19 @@
+[Unit]
+Description=Wake AgentDeck Poller Instance %i every 2 min
+
+[Timer]
+Unit=agentdeck-poller@%i.service
+OnBootSec=60
+# Two minutes, not 30 s (#3010): GitHub webhooks start an instance early
+# (`poller_wake.py`), so this is the backstop for a dropped delivery and the pace for
+# local news (a finished job, a worker report, a deck Merge). A dozen instances waking
+# every 30 s cost a small host a large share of its CPU, nearly all on wakes with nothing new.
+OnUnitInactiveSec=120
+AccuracySec=5
+# Deliberately NOT persistent: a missed wake is never replayed. A wake is only useful now,
+# and replaying a backlog after downtime would spawn against a stale world and stampede the
+# worker cap. Recovery is the next ordinary wake's job (#176 reconcile).
+Persistent=false
+
+[Install]
+WantedBy=timers.target

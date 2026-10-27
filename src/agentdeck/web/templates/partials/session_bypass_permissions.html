@@ -1,0 +1,16 @@
+{# "Bypass permissions" (#2285): moves this chat's agent into bypassPermissions
+   mode, where every tool call runs without a permission check. Offered only
+   while the chat's own mode is something else, so unticking has a mode to go
+   back to. #}
+<form id="session-bypass-permissions" class="session-permission-prompts session-bypass-permissions"
+      hx-post="/sessions/{{ session.key }}/bypass-permissions"
+      hx-trigger="change" hx-target="this" hx-swap="outerHTML"
+      hx-disabled-elt="find input">
+  <label class="chip{% if bypass_permissions_enabled %} bypass-permissions-on{% endif %}"
+         title="Run every tool call without asking and without Claude's safety check. Untick to put the chat back in its own mode.">
+    <input type="checkbox" name="enabled" value="true"
+           {% if bypass_permissions_enabled %}checked{% endif %}>
+    Bypass permissions
+  </label>
+  {% if bypass_permissions_error %}<span class="permission-prompt-error" role="alert">{{ bypass_permissions_error }}</span>{% endif %}
+</form>

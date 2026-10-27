@@ -1,0 +1,15 @@
+{#- A person's planned usage reset (#3379). Outside the streamed bars, so a usage push never wipes a typed time. #}
+<form id="account-planned-reset" class="account-defaults-form"
+      hx-post="/accounts/{{ account.key | urlencode }}/planned-reset"
+      hx-target="#account-planned-reset" hx-swap="outerHTML">
+  <label for="account-planned-reset-at">Reset at</label>
+  <input id="account-planned-reset-at" name="at" type="time"{% if planned_reset_at %} value="{{ planned_reset_at.astimezone().strftime('%H:%M') }}"{% endif %}>
+  <div class="account-default-actions">
+    <span class="muted">{% if planned_reset_at %}Planned: {{ planned_reset_at | chat_time }}{% else %}No reset planned{% endif %}</span>
+    {#- Save first: Enter in the time field presses the first submit button. #}
+    <button type="submit">Save</button>
+    {% if planned_reset_at %}<button type="submit" name="clear" value="1">Clear</button>{% endif %}
+  </div>
+  {% if planned_reset_error %}<p class="deck-setting-error" role="alert">{{ planned_reset_error }}</p>{% endif %}
+  {% if planned_reset_saved %}<p class="account-save-ok" role="status">{{ planned_reset_saved }}</p>{% endif %}
+</form>

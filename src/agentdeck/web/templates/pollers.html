@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block title %}pollers · agentdeck{% endblock %}
+{#- The instance list follows its stream (#3228): a row changes when its board or the runtime
+    moved, at most every few seconds, and a row being used or a fold left open stays put. #}
+{% block body_sse %}sse-connect="/events?view=pollers"{% endblock %}
+{% block content %}
+<section class="pollers">
+  <header class="page-head">
+    <h1>Poller Instances</h1>
+  </header>
+  <p class="muted small">
+    Read from each instance's durable state and systemd, and updated when its board changes —
+    there is no live channel to a poller between wakes, so an overdue instance reads as stale
+    rather than as current.
+  </p>
+  {% include "partials/poller_build.html" %}
+  {% include "partials/poller_instances.html" %}
+</section>
+<script src="/static/poller_boards.js?v={{ asset_ver }}" defer></script>
+{% endblock %}

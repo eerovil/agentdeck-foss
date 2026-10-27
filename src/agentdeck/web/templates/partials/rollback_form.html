@@ -1,0 +1,20 @@
+{# Roll the chat back to before one of your messages (#3474). A message's ↶ opens it;
+   `rollback.js` posts the message's line to the leg it belongs to, then puts the
+   message back into the message box and reloads the chat without it. #}
+{% if rollback_leg_key %}
+<dialog class="fork-dialog rollback-dialog" data-rollback-dialog data-rollback-leg="{{ rollback_leg_key }}" data-rollback-floor="{{ rollback_floor | default(0) }}" aria-labelledby="rollback-title">
+  <form class="fork-form" data-rollback-form>
+    <h2 id="rollback-title" class="fork-title">Roll back to before this message?</h2>
+    <p class="fork-banner"><a href="#" data-rollback-anchor>This message</a> and everything after it
+      leave the chat, and the agent carries on as if they were never sent. Your message goes back
+      into the message box.</p>
+    <p class="fork-banner">Only the conversation goes back: files the agent changed, and messages
+      or comments it already sent, stay. Wake-ups and jobs it asked for since then are cancelled.</p>
+    <p class="fork-error" data-rollback-error role="alert" hidden></p>
+    <div class="composer-actions">
+      <button type="button" class="fork-cancel" data-rollback-cancel>Cancel</button>
+      <button type="submit">Roll back</button>
+    </div>
+  </form>
+</dialog>
+{% endif %}

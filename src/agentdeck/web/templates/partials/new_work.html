@@ -1,0 +1,51 @@
+{# File a new Work's issue at once (#2415): on the front page, and from a chat. Closed by
+   default, so neither page is any taller until it is opened.
+
+   The form is the composer's shape on purpose — a `message` textarea beside an `images` file
+   input inside `data-clear-on-send` — so the deck's existing draft keeping, file chips and
+   paste-a-screenshot all apply with no code of their own. `data-async-outcome` stops that
+   same code clearing the form on every 2xx: only a filing known to have landed clears it
+   (`new_work.js`), and "may have been filed" keeps the words. `data-agentdeck-action` gives
+   each press its own `client_action_id`, which the route reserves before it writes. The same
+   shape is why the composer's 🎤 dictation (#2464) works here with no code of its own. #}
+{% if new_work %}
+{% set nw_id = "session-new-work" if new_work.session_key else "new-work" %}
+<details class="new-chat new-work" id="{{ nw_id }}">
+  <summary>{% if new_work.session_key %}New work from this chat{% else %}＋ New work{% endif %}</summary>
+  <form hx-post="/works/new{% if new_work.session_key %}?from={{ new_work.session_key | urlencode }}{% endif %}"
+        hx-target="next [data-new-work-result]" hx-swap="innerHTML"
+        hx-disabled-elt="find button[type=submit]" hx-encoding="multipart/form-data"
+        data-clear-on-send data-async-outcome data-new-work
+        data-agentdeck-action="new_work"
+        {% if new_work.default %}data-new-work-default="{{ new_work.default }}"{% endif %}
+        {% if new_work.guess_project %}data-guess-project{% endif %}>
+    <label for="{{ nw_id }}-message">What should happen?</label>
+    <textarea id="{{ nw_id }}-message" name="message" rows="3" required
+              placeholder="First line becomes the title"></textarea>
+    <label for="{{ nw_id }}-repository">Repository <span class="new-work-guessed"
+           data-new-work-guessed hidden>· guessed from your text</span></label>
+    <select id="{{ nw_id }}-repository" name="repository" data-new-work-repository>
+      {% for target in new_work.targets %}
+      <option value="{{ target.repository }}" data-project="{{ target.project }}"
+              data-evidence="{{ target.evidence_repository }}"
+              data-spec-only="{{ '1' if target.spec_only_label else '' }}"
+              {% if target.repository == new_work.default %}selected{% endif %}>{{ target.repository }}</option>
+      {% endfor %}
+    </select>
+    <label class="new-work-check" data-new-work-spec-only>
+      <input type="checkbox" name="spec_only" value="1" checked> Spec only — write a spec first
+    </label>
+    <div class="new-work-attach" data-new-work-attach>
+      <label class="image-picker" for="{{ nw_id }}-images">＋ Attach file <span class="paste-hint">or paste screenshot</span></label>
+      <input id="{{ nw_id }}-images" class="image-input" type="file" name="images" multiple>
+      <p class="new-work-note">Files are committed to <span data-new-work-evidence></span> — don't attach secrets. At most {{ new_work.max_files }}.</p>
+    </div>
+    <div class="composer-actions">
+      <span>Filed as an issue the Poller picks up</span>
+      {% include "partials/speech_button.html" %}
+      <button type="submit">File</button>
+    </div>
+  </form>
+  <div class="inject-result new-work-result" data-new-work-result aria-live="polite"></div>
+</details>
+{% endif %}

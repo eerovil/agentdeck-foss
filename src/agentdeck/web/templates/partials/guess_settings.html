@@ -1,0 +1,13 @@
+{# The "Guess for me" switch (#3367). A tick posts at once; the native method/action
+   keep it working before htmx hydrates, as the quick-phrase editor does. #}
+<form id="guess-settings" class="guess-settings" method="post" action="/settings/guessing"
+      hx-post="/settings/guessing" hx-trigger="change" hx-target="#guess-settings"
+      hx-swap="outerHTML">
+  <input type="hidden" name="enabled" value="0">
+  <label class="stop-sound-setting">
+    <input type="checkbox" name="enabled" value="1"{% if guessing_enabled %} checked{% endif %}>
+    Guess a new Work's project and keep my chat filters
+  </label>
+  <noscript><button type="submit">Save</button></noscript>
+  {% if guessing_saved %}<p class="muted" role="status">Saved · guessing is {{ 'on' if guessing_enabled else 'off' }}.</p>{% endif %}
+</form>

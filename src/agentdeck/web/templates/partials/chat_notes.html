@@ -1,0 +1,18 @@
+{#- Notes this chat shows and its agent never sees (#3227), oldest first. They wait here,
+    hidden, and static/chat_notes.js puts a copy of each into the transcript at its time. #}
+{%- for note in notes %}
+<details class="chat-note" data-note-id="{{ note.comment_id }}" data-note-at="{{ note.at.isoformat() }}" data-note-version="{{ note.version }}" open>
+  <summary>
+    <span class="chat-note-icon" aria-hidden="true">💬</span>
+    <span class="chat-note-label">Commented on <a href="{{ note.url }}" target="_blank" rel="noopener">{{ note.item }}</a></span>
+    <span class="chat-note-badge" title="Shown here only. The agent does not see this note.">not in context</span>
+    <time class="ev-time" datetime="{{ note.at.isoformat() }}" title="{{ note.at | chat_time_title }}">{{ note.at | chat_time }}</time>
+  </summary>
+  {%- if note.html %}
+  <div class="chat-note-body chat-note-md">{{ note.html | safe }}</div>
+  {%- else %}
+  <div class="chat-note-body ev-text">{{ note.body }}</div>
+  {%- endif %}
+  <div class="chat-note-foot"><span>as {{ note.author }}</span> · <a href="{{ note.url }}" target="_blank" rel="noopener">Open on GitHub ↗</a></div>
+</details>
+{%- endfor %}

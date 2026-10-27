@@ -1,0 +1,9 @@
+agentdeck
+Copyright 2026 Eero Vilpponen
+
+This product includes software developed at third parties, vendored under
+src/agentdeck/web/static/:
+
+- htmx 2.0.4 (htmx.min.js) — https://htmx.org — BSD Zero Clause License (0BSD)
+- htmx-ext-sse 2.2.2 (sse.js) — https://github.com/bigskysoftware/htmx-extensions —
+  BSD Zero Clause License (0BSD)

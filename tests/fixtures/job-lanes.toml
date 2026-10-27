@@ -1,0 +1,22 @@
+# The remote lanes every test sees (#3623), so no test reads the host's own
+# ~/.config/agentdeck/job-lanes.toml. A test of a host without lanes points
+# AGENTDECK_JOB_LANES somewhere else.
+
+[lanes.kube]
+profile = "kube"
+label = "the kube cluster"
+
+[lanes.mac]
+profile = "mac"
+label = "the Mac's Kubernetes"
+
+[lanes.desktop]
+profile = "desktop"
+label = "the desktop"
+aliases = ["old-desktop"]
+
+# Another project's runner, which serves several nested checkouts.
+[projects.trailhead]
+runner = "helm/app/jobs/test/run.sh"
+lanes = ["kube"]
+suites = { web = "store", store = "store", abacus = "abacus" }

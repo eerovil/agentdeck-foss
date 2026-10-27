@@ -1,0 +1,54 @@
+{# Who does the reviews: ChatGPT, or Claude and Codex until a set time (#2736, #2766). Collapsed, so it costs one
+   line at rest; the summary carries the end time while it is on. Swapped only by its own forms,
+   never by the live channel, so an open box stays open. #}
+<details class="chat-board-review-fallback{% if review_fallback.on %} is-on{% endif %}"
+         {%- if review_fallback.open %} open{% endif %}>
+  <summary>
+    {%- if review_fallback.only -%}
+      {{ review_fallback.only }}
+    {%- elif review_fallback.on -%}
+      {{ review_fallback.names }} reviewing until <time datetime="{{ review_fallback.until_iso }}">{{ review_fallback.until }}</time>
+    {%- else -%}
+      Reviews by ChatGPT, {{ review_fallback.names }} behind it
+    {%- endif -%}
+  </summary>
+  {% if review_fallback.error %}
+    <p class="small error">{{ review_fallback.error }}</p>
+  {% endif %}
+  {% if review_fallback.on %}
+    <p class="small muted">
+      {% if review_fallback.only -%}
+      {{ review_fallback.only }} ({{ review_fallback.lanes }});
+      {% if review_fallback.then_agents -%}
+      then {{ review_fallback.names }} until <time datetime="{{ review_fallback.until_iso }}">{{ review_fallback.until }}</time>.
+      {%- else -%}
+      then back to ChatGPT.
+      {%- endif %}
+      ChatGPT is not started.
+      {%- else -%}
+      {{ review_fallback.names }} share every waiting review chat
+      ({{ review_fallback.lanes }}), and ChatGPT is not started.
+      {%- endif %} {{ review_fallback.status }}
+    </p>
+    <form hx-post="/chat-board/review-fallback" hx-target="#chat-board-review-fallback"
+          hx-swap="innerHTML">
+      <input type="hidden" name="action" value="off">
+      <button type="submit">Turn off now</button>
+      <span class="small muted">Reviews already running finish.</span>
+    </form>
+  {% else %}
+    <p class="small muted">
+      {{ review_fallback.names }} step in on a review chat when the last review of the same
+      Work was not finished, or when no ChatGPT run takes it or its run goes silent for
+      30 minutes. When ChatGPT is struggling, they can do every review instead until the time
+      you set; it switches itself off then. {{ review_fallback.status }}
+    </p>
+  {% endif %}
+  <form hx-post="/chat-board/review-fallback" hx-target="#chat-board-review-fallback"
+        hx-swap="innerHTML">
+    <input type="hidden" name="action" value="on">
+    <input type="datetime-local" name="until" value="{{ review_fallback.default_until }}"
+           aria-label="Agents review until" required>
+    <button type="submit">{% if review_fallback.on %}Change end time{% else %}Agents review until then{% endif %}</button>
+  </form>
+</details>

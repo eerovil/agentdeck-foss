@@ -1,0 +1,7 @@
+{# What became of a message sent to the Work (#2218), and of its post to the issue (#2416). #}
+<p class="wd-receipt is-{{ state }}" data-wd-receipt="{{ state }}" role="status">{{ text }}
+  {%- if target %} · <a href="{{ target.href }}" data-session-key="{{ target.session_key }}">{{ target.title }}</a>{% endif %}</p>
+{%- if issue_post %}
+<p class="wd-receipt wd-issue-post is-{{ issue_post.code }}" data-wd-issue-post="{{ issue_post.code }}" role="status">{{ issue_post.text }}
+  <a href="{{ issue_post.link }}" target="_blank" rel="noopener" aria-label="Open issue #{{ issue_post.target.number }}">↗</a></p>
+{%- endif %}

@@ -1,0 +1,18 @@
+{# The top bar's Mac-approvals icon (#2017): a link to the Mac's own approval page,
+   lit while something is waiting there. This deck must never draw what is pending,
+   so the icon says only that *something* is. The count comes from the collector,
+   which asks the Mac once for every tab; this fragment is pushed over the event
+   stream when it changes (#2864), so no browser polls for it. The label carries the
+   count too: a colour is not available to a screen reader. #}
+{% set waiting = mac_runner_waiting() %}
+{% if waiting == 1 %}{% set label = '1 Mac command waiting for approval' %}
+{% elif waiting %}{% set label = waiting ~ ' Mac commands waiting for approval' %}
+{% else %}{% set label = 'Mac command approvals' %}{% endif %}
+<a class="mac-runner-nav-link" href="{{ mac_runner_url() }}" data-waiting="{{ waiting }}"
+   target="_blank" rel="noopener noreferrer"
+   aria-label="{{ label }}" title="{{ label }}">
+  <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
+    <path fill="currentColor" d="M3 2.5h10c.83 0 1.5.67 1.5 1.5v6c0 .83-.67 1.5-1.5 1.5H3c-.83 0-1.5-.67-1.5-1.5V4c0-.83.67-1.5 1.5-1.5Zm0 1.4a.1.1 0 0 0-.1.1v6a.1.1 0 0 0 .1.1h10a.1.1 0 0 0 .1-.1V4a.1.1 0 0 0-.1-.1H3Zm-2.2 8.7h14.4v1.4H.8v-1.4Z"/>
+    <path fill="currentColor" d="M5.4 5.2 7.5 7l-2.1 1.8-.9-1.05L5.3 7l-.8-.75.9-1.05Zm2.9 2.6h2.4v1.3H8.3V7.8Z"/>
+  </svg>
+</a>

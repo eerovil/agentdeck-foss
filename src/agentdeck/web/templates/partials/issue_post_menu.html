@@ -1,0 +1,15 @@
+{#- "Also post to issue" (#2416): one message, ticked on purpose, posted quoted by the deck's
+    bot. Collapsed to one chip so the composer keeps its height; the chip itself shows the
+    state, and it sits outside every swapped fragment so a live update never resets it. #}
+{%- set issue_number = issue_post_target.number %}
+<details class="issue-post-menu" data-composer-menu data-issue-post>
+  <summary aria-label="Also post to issue #{{ issue_number }}" title="Also post to issue #{{ issue_number }}">#{{ issue_number }}</summary>
+  <div class="issue-post-menu-panel">
+    <label><input type="checkbox" name="post_to_issue" value="{{ issue_post_target.repository }}#{{ issue_number }}"
+                  autocomplete="off" data-issue-post-box
+                  data-issue-post-placeholder="Message — also posts to issue #{{ issue_number }}">
+      Also post to issue #{{ issue_number }}</label>
+    <p>Posted by the deck's bot, quoted. Anyone who can read the issue sees it. Delete it on
+      GitHub to take it back.</p>
+  </div>
+</details>

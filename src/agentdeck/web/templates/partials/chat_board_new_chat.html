@@ -1,0 +1,36 @@
+{# Starting a chat is the thing the board is opened to do, so it sits at the top of the
+   page and answers in its own place (#1827).
+
+   It used to live inside `#chat-board-nudge-rows`, two collapsed sections down, and every
+   control here answers by swapping that whole fragment — so pressing Start chat re-rendered
+   this form from scratch: the section snapped shut and the words somebody had typed were
+   gone, refusal and all. Both of the live refusals on 2026-09-10 looked to the operator like
+   the button doing nothing.
+
+   One box, not two. A title box next to a request box asks for the same thing twice, and the
+   requester's answer to it was "I don't want to give a title" — so the chat is named after
+   the first line of what you type, and there is nothing else to fill in.
+
+   Still a <details>, still shut at rest, because a textarea always on screen would push the
+   chats down on every phone load. What a submit reopens is a deliberate tap of its own. #}
+<details class="chat-board-new"{% if new_chat_open %} open{% endif %}>
+  <summary>Start a new chat</summary>
+  {% if new_chat_error %}
+    <p class="small error">{{ new_chat_error }}</p>
+  {% endif %}
+  {% if new_chat_note %}
+    <p class="small">
+      {{ new_chat_note }}.
+      {%- if new_chat_url %} <a href="{{ new_chat_url }}">Open it on GitHub &rarr;</a>{% endif %}
+    </p>
+  {% endif %}
+  {# `required` is the cheap half of the fix: an empty request is refused before a round
+     trip, in the browser's own words and next to the box it is about. The route refuses it
+     too, because a form is not the only caller. #}
+  <form hx-post="/chat-board/new" hx-target="#chat-board-new" hx-swap="innerHTML">
+    <textarea name="body" rows="4" required
+              placeholder="What do you want done? The worker reads this and nothing else — its first line names the chat."
+              aria-label="what the chat should do">{{ new_chat_body }}</textarea>
+    <button type="submit">Start chat</button>
+  </form>
+</details>

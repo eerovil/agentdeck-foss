@@ -1,0 +1,31 @@
+[Unit]
+Description=agentdeck dashboard
+After=network-online.target tailscaled.service agentdeck-codex.service
+Wants=agentdeck-codex.service
+
+[Service]
+WorkingDirectory=%h/agentdeck
+Sockets=agentdeck.socket
+ExecStart=%h/agentdeck/.venv/bin/python -m agentdeck.web_supervisor
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+Environment=AGENTDECK_CONFIG=%h/.config/agentdeck/config.toml
+Environment=AGENTDECK_WEB_WORKER_PID=%t/agentdeck-web/worker.pid
+# Optional centralized error reporting (#1514). Unset, failures stay in the
+# journal exactly as before; set, unhandled failures reach one monitored place.
+#Environment=AGENTDECK_SENTRY_DSN=
+RuntimeDirectory=agentdeck-web
+RuntimeDirectoryMode=0700
+# Keep the control surface usable while deck-owned workers and their test suites
+# put the host under CPU, disk, or memory pressure. The worker runtime remains at
+# systemd's default weights, so these values favor only the small web process.
+CPUWeight=1000
+IOWeight=1000
+MemoryLow=2G
+# The web service no longer owns Codex chat processes. Its control-group can be
+# restarted for UI deploys without signaling agentdeck-codex.service.
+KillMode=control-group
+
+[Install]
+WantedBy=default.target

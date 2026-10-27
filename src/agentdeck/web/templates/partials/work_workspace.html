@@ -1,0 +1,88 @@
+{# The Work's Workspace section (#2143): read-only, one entry per repository. #}
+{%- set problems = workspace.problems -%}
+<section class="work-workspace" id="work-workspace" data-work-id="{{ workspace.work_id }}">
+  <h3 class="ww-title">Workspace
+    <span class="ww-count">{{ workspace.repositories|length }} {{ "repository" if workspace.repositories|length == 1 else "repositories" }}</span>
+    {%- if problems %}<span class="ww-flag" data-ww-problems="{{ problems|length }}">{{ problems|length }} {{ "problem" if problems|length == 1 else "problems" }}</span>{% endif %}
+  </h3>
+  {%- if workspace.issues %}
+  <ul class="ww-issues">
+    {%- for issue in workspace.issues %}
+    <li class="ww-issue{% if issue.problem %} is-problem{% endif %}" data-ww-issue="{{ issue.kind }}">{{ issue.detail }}{% if issue.path %} <code>{{ issue.path }}</code>{% endif %}</li>
+    {%- endfor %}
+  </ul>
+  {%- endif %}
+  {#- The Work page (#2147) shows verification in its own section, so it can say it here once. #}
+  {%- if workspace.verifications and show_verifications | default(true) %}
+  {#- What each Run's explicit verification jobs tested, repository by repository (#2148).
+      Only the release rule's own answer is labelled verified. #}
+  <ul class="ww-verifications">
+    {%- for check in workspace.verifications %}
+    <li class="ww-verification is-{{ check.status }}" data-ww-verification="{{ check.job_id }}">
+      <span class="ww-verification-status">{{ check.status }}</span>
+      {%- for name, snapshot in check.tested %}
+      <span class="ww-tested{% if not snapshot.clean %} is-problem{% endif %}" data-ww-tested="{{ name }}"{% if snapshot.unprovable %} title="{{ snapshot.unprovable|join('; ') }}"{% endif %}>{{ name }}@<code>{{ snapshot.head[:7] or "?" }}</code>{% if not snapshot.provable %} unprovable{% elif not snapshot.clean %} dirty{% endif %}</span>
+      {%- endfor %}
+      <span class="ww-note">run <code>{{ check.run_id[:8] }}</code> · job <code>{{ check.job_id }}</code></span>
+    </li>
+    {%- endfor %}
+  </ul>
+  {%- endif %}
+  {%- for repo in workspace.repositories %}
+  <article class="ww-repo{% if repo.problems %} has-problems{% endif %}{% if repo.repository == workspace.primary %} is-primary{% endif %}" data-ww-repo="{{ repo.repository }}">
+    <header class="ww-repo-head">
+      <a class="ww-repo-name" href="https://github.com/{{ repo.repository }}" target="_blank" rel="noopener">{{ repo.repository }}</a>
+      {%- for role in repo.roles %}<span class="ww-role ww-role-{{ role }}">{{ role }}</span>{% endfor %}
+    </header>
+    {%- if repo.branches or repo.heads or repo.base_refs or repo.pull_requests %}
+    <p class="ww-facts">
+      {%- for branch in repo.branches %}<span class="ww-branch">{{ branch }}</span>{% endfor %}
+      {%- for head in repo.heads %}<code class="ww-head">{{ head[:7] }}</code>{% endfor %}
+      {%- if repo.base_refs %}<span class="ww-base">base {{ repo.base_refs|join(", ") }}</span>{% endif %}
+      {%- for pull in repo.pull_requests %}<a class="ww-pull" href="{{ pull.url }}" target="_blank" rel="noopener">#{{ pull.number }}{% if pull.status %} {{ pull.status }}{% endif %}</a>{% endfor %}
+    </p>
+    {%- endif %}
+    {%- if repo.worktrees %}
+    <ul class="ww-paths">
+      {%- for tree in repo.worktrees %}
+      <li data-ww-worktree="{{ tree.path }}"><code>{{ tree.path }}</code>{% if tree.observation.detached %} <span class="ww-note">detached</span>{% endif %}</li>
+      {%- endfor %}
+    </ul>
+    {%- endif %}
+    {%- if repo.cwds %}
+    <p class="ww-cwds">{{ repo.cwds|length }} {{ "session runs" if repo.cwds|length == 1 else "sessions run" }} here
+      {%- set outside = repo.cwds|rejectattr("registered_worktree")|list %}
+      {%- if repo.worktrees and outside %}, {{ outside|length }} outside the registered worktree{% endif %}</p>
+    {%- endif %}
+    {%- if repo.issues %}
+    <ul class="ww-issues">
+      {%- for issue in repo.issues %}
+      <li class="ww-issue{% if issue.problem %} is-problem{% endif %}" data-ww-issue="{{ issue.kind }}">{{ issue.detail }}</li>
+      {%- endfor %}
+    </ul>
+    {%- endif %}
+    <details class="ww-inspector">
+      <summary>Evidence</summary>
+      <ul>
+        {%- for item in repo.provenance %}
+        <li>{{ item.evidence }}{% if item.source %} · <code>{{ item.source }}</code>{% endif %}{% if item.run_id %} · run <code>{{ item.run_id }}</code>{% endif %}</li>
+        {%- endfor %}
+        {%- for cwd in repo.cwds %}
+        <li>{{ cwd.provenance.evidence }} · <code>{{ cwd.session_key }}</code> in <code>{{ cwd.cwd }}</code></li>
+        {%- endfor %}
+      </ul>
+    </details>
+  </article>
+  {%- endfor %}
+  {%- if workspace.unresolved_observations %}
+  <article class="ww-repo ww-unresolved{% if workspace.unresolved_problem %} has-problems{% endif %}" data-ww-repo="">
+    <header class="ww-repo-head"><span class="ww-repo-name">Repository unknown</span></header>
+    <ul class="ww-paths">
+      {%- for item in workspace.unresolved_observations %}
+      <li><code>{{ item.cwd if item.cwd is defined else item.path }}</code>
+        <span class="ww-note">{% if item.session_key is defined %}cwd of {{ item.session_key }}{% else %}registered worktree{% endif %}</span></li>
+      {%- endfor %}
+    </ul>
+  </article>
+  {%- endif %}
+</section>

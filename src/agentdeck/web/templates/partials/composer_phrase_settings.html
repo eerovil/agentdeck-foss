@@ -1,0 +1,56 @@
+{# The ⚡ quick-phrase editor (#743). One form for the whole list: the row order
+   is the chip order, clearing both of a row's fields removes that phrase, and the
+   trailing blank rows are how one is added. It replaces only itself on save, so
+   nothing else on the page is disturbed. No hx-disabled-elt here — disabling the
+   buttons would drop the clicked submitter's name, which is what tells Save from
+   Reset.
+
+   The native method/action are load-bearing rather than decorative: htmx is
+   deferred, so a submit before it hydrates — a fast tap on a cold cache — would
+   otherwise fall through to a plain GET of this page and silently drop the edit.
+   The route answers a non-HX post with the whole page, so that submit still
+   saves and still shows its refusal. #}
+<form id="composer-phrase-settings" class="phrase-settings"
+      method="post" action="/settings/composer-phrases"
+      hx-post="/settings/composer-phrases" hx-target="#composer-phrase-settings"
+      hx-swap="outerHTML">
+  <p class="muted">{% if phrases_customized %}This deck sends your own
+    {{ phrase_count }} phrases.{% else %}This deck still sends the
+    {{ phrase_count }} built-in phrases.{% endif %}
+    The chip label is what your thumb hits; the message underneath is what the
+    agent actually receives, so spell the intent out there. Chips appear in this
+    order, up to {{ phrase_max }} of them.</p>
+  <ol class="phrase-settings-list">
+    {% for row in phrase_rows %}
+    <li class="phrase-settings-row">
+      <div class="phrase-settings-label">
+        <label for="phrase-label-{{ loop.index0 }}">Chip {{ loop.index }}</label>
+        <input id="phrase-label-{{ loop.index0 }}" name="label__{{ loop.index0 }}"
+               type="text" value="{{ row.label }}" maxlength="{{ phrase_label_max }}"
+               autocomplete="off" placeholder="Add a chip…"
+               aria-describedby="phrase-text-{{ loop.index0 }}">
+      </div>
+      <div class="phrase-settings-text">
+        <label for="phrase-text-{{ loop.index0 }}">Sends</label>
+        <textarea id="phrase-text-{{ loop.index0 }}" name="text__{{ loop.index0 }}"
+                  rows="3" maxlength="{{ phrase_text_max }}"
+                  placeholder="The full message this chip sends…">{{ row.text }}</textarea>
+      </div>
+    </li>
+    {% endfor %}
+  </ol>
+  <div class="phrase-settings-actions">
+    <span class="muted">Clear both fields of a row to remove that chip.</span>
+    <span class="phrase-settings-buttons">
+      {% if phrases_customized %}
+      <button class="secondary" type="submit" name="action" value="reset">Reset to defaults</button>
+      {% endif %}
+      <button type="submit" name="action" value="save">Save phrases</button>
+    </span>
+  </div>
+  {% if phrase_error %}
+  <p class="deck-setting-error" role="alert">{{ phrase_error }}</p>
+  {% elif phrase_saved %}
+  <p class="account-save-ok" role="status">{{ phrase_saved }}</p>
+  {% endif %}
+</form>

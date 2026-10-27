@@ -1,0 +1,17 @@
+{#- The account page's limit bars; its stream replaces them whole on a usage change (#3228). #}
+<div id="account-capacity" class="account-capacity{% if row.stale %} stale{% endif %}" sse-swap="account-capacity" hx-swap="outerHTML">
+  {% set u = row.usage %}
+  {% if u %}
+    {% for w in row.windows %}{% set pct = w.pct %}
+    <div class="bar-row">
+      <span class="bar-kind">{{ w.kind }}</span>
+      <div class="bar">{% if pct is not none %}<div class="fill {% if pct >= 90 %}crit{% elif pct >= 70 %}warn{% endif %}" style="width: {{ pct if pct <= 100 else 100 }}%"></div>{% endif %}{% if w.elapsed_pct is not none %}<div class="elapsed" style="width: {{ w.elapsed_pct }}%" title="{{ w.elapsed_pct | round | int }}% of the {{ w.title }} window elapsed"></div>{% endif %}</div>
+      <span class="bar-pct">{% if pct is not none %}{{ pct | round | int }}%{% else %}—{% endif %}</span>
+      <span class="bar-pace{% if w.pace %} {{ w.pace.level }}{% endif %}"{% if w.pace %} title="{{ w.pace.title }}" aria-label="{{ w.pace.title }}"{% endif %}>{% if w.pace %}⚠{% endif %}</span>
+      <span class="bar-reset">{% if w.planned_reset %}<span title="Planned reset: this account gets work first until then">↺ {{ w.planned_reset | chat_time }}</span>{% elif w.resets %}{{ w.resets | reltime }}{% endif %}</span>
+    </div>
+    {% endfor %}
+  {% else %}
+    <p class="muted">No usage data yet.</p>
+  {% endif %}
+</div>

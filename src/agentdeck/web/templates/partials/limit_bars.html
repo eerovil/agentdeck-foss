@@ -1,0 +1,120 @@
+{# Per-account usage meters. `rows` = [{account, usage, windows, stale_age, fetched_epoch}].
+   `row.windows` is the account provider's own window set — 5h + 7d for Claude and
+   Codex, one billing cycle for Cursor (#730) — so nothing here names a window.
+   Collapsed by default to a one-line summary (the sticky header shouldn't eat
+   the phone screen); tapping toggles body.usage-open (persisted, JS in base).
+   The toggle is an empty button laid over the whole line rather than the line
+   itself, so the host CPU/MEM figures can be a real link to /processes (#2663)
+   without nesting a link inside a button. #}
+<div class="usage-mini">
+  <button class="usage-mini-toggle" type="button" aria-label="toggle usage details"
+          data-body-toggle="usage-open" data-toggle-key="agentdeck.usageOpen"></button>
+  {% for row in rows %}{% set u = row.usage %}
+  {# ``data-account-key`` last, after every attribute this row already had: this
+     fragment is the live one, and the New chat account tiles copy their own
+     numbers out of it whenever it is swapped in so the two can never disagree
+     (#2045) — but several tests read this opening tag as a literal string, and
+     they are asserting the row's real contract rather than incidental markup. #}
+  <span class="mini-acct{% if row.stale %} stale{% endif %}{% if row.account.key == active_account_key %} active{% endif %}"{% if row.account.key == active_account_key %} aria-current="true" title="Current chat account"{% endif %}{% if u %} data-since="{{ row.fetched_epoch }}" data-stale-after="{{ row.stale_after }}"{% endif %} data-account-key="{{ row.account.key }}">
+    <span class="mini-label">{{ row.account.label }}</span>
+    {# Every provider window stays visible in its own order (#1157). Stacking the
+       smaller figures keeps both 5h and 7d readable at phone width without making
+       either one impersonate an overall account percentage as usage changes. #}
+    <span class="mini-windows">
+      {% for w in row.windows %}
+      <span class="mini-window">
+        <b class="mini-pct{% if w.pct is not none and w.pct >= 90 %} crit{% elif w.pct is not none and w.pct >= 70 %} warn{% endif %}">{% if w.pct is not none %}{{ w.pct | round | int }}%{% else %}—{% endif %}</b>
+        <span class="mini-window-kind">{{ w.kind }}</span>
+      </span>
+      {% else %}<span class="mini-window"><b class="mini-pct">—</b></span>{% endfor %}
+    </span>
+    {# Projected overspend (#1137): this account is burning a window faster than
+       the window can last. Inline on the existing line so the collapsed header
+       does not get taller, and one icon per account however many windows are
+       ahead of pace. #}
+    {% if row.pace %}<span class="pace-flag {{ row.pace.level }}" title="{{ row.pace.title }}" aria-label="{{ row.pace.title }}">⚠</span>{% endif %}
+    {# A signed-out account is worth seeing before you delegate into it (#298),
+       and a refused meter credential reads the same way — the number above is
+       missing because a human has to sign in, not because nothing polled yet
+       (#758). Inline on the existing line: the collapsed header must not get
+       taller, and never two badges on one account. #}
+    {% if row.auth and row.auth.broken %}<b class="mini-auth crit" title="{{ row.account.label }} is signed out">!</b>
+    {%- elif row.meter_credential_error %}<b class="mini-auth crit" title="{{ row.account.label }} usage meter rejected the credential — sign in again ({{ row.meter_credential_error }})">!</b>{% endif %}
+  </span>
+  {% endfor %}
+  {% if host %}
+  <a class="mini-host" href="/processes" aria-label="Host CPU {{ host.cpu_pct | round | int if host.cpu_pct is not none else 'unknown' }} percent, memory {{ host.memory_pct | round | int }} percent. Show processes">
+    <span class="mini-label">CPU</span>
+    <b class="mini-pct {% if host.cpu_pct is not none and host.cpu_pct >= 90 %}crit{% elif host.cpu_pct is not none and host.cpu_pct >= 70 %}warn{% endif %}">{% if host.cpu_pct is not none %}{{ host.cpu_pct | round | int }}%{% else %}—{% endif %}</b>
+    <span class="mini-label">MEM</span>
+    <b class="mini-pct {% if host.memory_pct >= 90 %}crit{% elif host.memory_pct >= 70 %}warn{% endif %}">{{ host.memory_pct | round | int }}%</b>
+  </a>
+  {% endif %}
+  <span class="mini-caret">▾</span>
+</div>
+<div class="limit-bars">
+  {% for row in rows %}
+  {% set u = row.usage %}
+  <div class="acct{% if row.stale %} stale{% endif %}{% if row.account.key == active_account_key %} active{% endif %}">
+    <div class="acct-label">
+      <a href="/accounts/{{ row.account.key | urlencode }}">{{ row.account.label }}</a>
+      {% if u %}<span class="upd-tag {% if row.stale %}stale-tag{% endif %}" data-since="{{ row.fetched_epoch }}" data-stale-after="{{ row.stale_after }}">
+        <span class="upd-stale">stale · </span>updated <span class="upd-rel">{{ row.stale_age }}</span></span>{% endif %}
+    </div>
+    {% if u %}
+      {% for w in row.windows %}{% set pct = w.pct %}
+      <div class="bar-row">
+        <span class="bar-kind">{{ w.kind }}</span>
+        <div class="bar">
+          {% if pct is not none %}
+          <div class="fill {% if pct >= 90 %}crit{% elif pct >= 70 %}warn{% endif %}"
+               style="width: {{ pct if pct <= 100 else 100 }}%"></div>
+          {% endif %}
+          {# How far through the window the clock is (#2181): a translucent layer
+             over the fill, inside the same track, so usage reads against time
+             without making the bar any taller. #}
+          {% if w.elapsed_pct is not none %}<div class="elapsed" style="width: {{ w.elapsed_pct }}%" title="{{ w.elapsed_pct | round | int }}% of the {{ w.title }} window elapsed"></div>{% endif %}
+        </div>
+        <span class="bar-pct">{% if pct is not none %}{{ pct | round | int }}%{% else %}—{% endif %}</span>
+        {# This window's own projected-overspend flag (#1137). The cell is always
+           present, empty and zero-width when on pace, so a flagged row does not
+           shift the reset column out of line with its siblings. #}
+        <span class="bar-pace{% if w.pace %} {{ w.pace.level }}{% endif %}"{% if w.pace %} title="{{ w.pace.title }}" aria-label="{{ w.pace.title }}"{% endif %}>{% if w.pace %}⚠{% endif %}</span>
+        <span class="bar-reset">{% if w.planned_reset %}<span title="Planned reset: this account gets work first until then">↺ {{ w.planned_reset | chat_time }}</span>{% elif w.resets %}{{ w.resets | reltime }}{% endif %}</span>
+      </div>
+      {% endfor %}
+    {% else %}
+      {# Two different silences: nothing has polled yet, or the meter credential
+         was refused and the last percentage was withdrawn with it (#758). The
+         second one is a task for a human, so say so; the diagnostic detail rides
+         the title rather than a second line. #}
+      <div class="bar-row"><span class="bar-kind">—</span>
+        {%- if row.meter_credential_error %}<span class="muted" title="{{ row.meter_credential_error }}">sign in again to read usage</span>
+        {%- else %}<span class="muted">no usage data yet</span>{% endif %}</div>
+    {% endif %}
+  </div>
+  {% endfor %}
+  {% if host %}
+  <a class="acct host-acct" href="/processes" title="Which processes use the CPU">
+    <div class="acct-label"><span>host processes →</span><span class="upd-tag">live</span></div>
+    {% for kind, pct in [('CPU', host.cpu_pct), ('MEM', host.memory_pct)] %}
+    <div class="bar-row">
+      <span class="bar-kind">{{ kind }}</span>
+      <div class="bar">
+        {% if pct is not none %}
+        <div class="fill {% if pct >= 90 %}crit{% elif pct >= 70 %}warn{% endif %}"
+             style="width: {{ pct if pct <= 100 else 100 }}%"></div>
+        {% endif %}
+      </div>
+      <span class="bar-pct">{% if pct is not none %}{{ pct | round | int }}%{% else %}—{% endif %}</span>
+      <span class="bar-reset">
+        {%- if kind == 'MEM' -%}
+        {{ (host.memory_used_bytes / 1073741824) | round(1) }}G /
+        {{ (host.memory_total_bytes / 1073741824) | round(1) }}G
+        {%- endif -%}
+      </span>
+    </div>
+    {% endfor %}
+  </a>
+  {% endif %}
+</div>

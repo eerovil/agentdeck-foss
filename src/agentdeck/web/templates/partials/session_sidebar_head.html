@@ -1,0 +1,10 @@
+{# Sidebar head, and the desktop control that closes the selected chat. The
+   dashboard renders it too (hidden while no chat is selected) so client-side
+   navigation promotes the live list into a sidebar that already has it. #}
+<div class="session-sidebar-head">
+  <a href="/">Sessions</a>
+  {#- The Work-first front page builds no chat list, so it has no count to show (#2219). #}
+  {%- if session_total_count is defined %}
+  <span class="count">{{ session_total_count }}</span>
+  {%- endif %}
+</div>

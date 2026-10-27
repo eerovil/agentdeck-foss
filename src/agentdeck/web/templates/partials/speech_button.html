@@ -1,0 +1,20 @@
+{#- Dictation (#2456). Hidden by CSS until composer_speech.js finds the browser's
+    speech recognition, or, where the deck has a speech service, a microphone it can
+    record for the host's Whisper (#3422), so a browser without either never shows a
+    dead button. -#}
+<span class="speech-control"{% if host_speech %} data-host-speech{% endif %}>
+  <button type="button" class="speech-button" data-speech-button aria-pressed="false"
+          {%- if voice_mic %} data-voice-mic{% endif %}
+          aria-label="Dictate" title="Dictate">🎤</button>
+  <span class="speech-status" role="status" hidden></span>
+  {%- if voice_mic %}
+  {#- How 🎤 listens in the chat composer (#3540): a long press opens this; voice_mode.js
+      marks the current choice. Closed by default, it takes no room. #}
+  <span class="voice-mic-menu" data-voice-mic-menu role="menu" aria-label="How 🎤 listens" hidden>
+    <button type="button" role="menuitemradio" data-voice-mic-mode="open">Always listening</button>
+    <button type="button" role="menuitemradio" data-voice-mic-mode="jarvis">Only after “Hey Jarvis”</button>
+    <button type="button" role="menuitemradio" data-voice-mic-mode="tap">Tap to talk</button>
+    <button type="button" role="menuitemradio" data-voice-mic-mode="dictate">Dictate</button>
+  </span>
+  {%- endif %}
+</span>

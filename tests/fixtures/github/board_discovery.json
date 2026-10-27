@@ -1,0 +1,46 @@
+{
+ "data": {
+  "organization": {
+   "projectV2": {
+    "id": "PVT_kwDOEXAMPLE",
+    "field": {
+     "id": "PVTSSF_lADOEXAMPLE",
+     "options": [
+      {
+       "id": "opt00",
+       "name": "Backlog"
+      },
+      {
+       "id": "opt01",
+       "name": "Todo"
+      },
+      {
+       "id": "opt02",
+       "name": "In progress"
+      },
+      {
+       "id": "opt03",
+       "name": "In review"
+      },
+      {
+       "id": "opt04",
+       "name": "Done"
+      },
+      {
+       "id": "opt05",
+       "name": "Needs More Info"
+      },
+      {
+       "id": "opt06",
+       "name": "Blocked"
+      },
+      {
+       "id": "opt07",
+       "name": "Bot-issues"
+      }
+     ]
+    }
+   }
+  }
+ }
+}

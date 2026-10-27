@@ -1,0 +1,25 @@
+{# The honest framing, not a disclaimer bolted on: a row is rebuilt from a webhook
+   delivery this deck happened to read, and delivery is at-most-once. Since #1872 the
+   board is also read back from GitHub on start and every hour, so the gap between this
+   page and GitHub is bounded — but between those reads it is still a gap.
+
+   Its own fragment, because an hourly read that changes no row still changes both of
+   these: how long ago GitHub was read, and whether that read failed. A page left open
+   on a quiet board is exactly the case this is here to answer (#1872). #}
+<p class="muted small chat-board-freshness">
+  Each issue is one ChatGPT web chat, worked by chats in a ChatGPT project. This is what
+  the webhook stream has told this deck, corrected against GitHub when the deck starts and
+  once an hour — a delivery is never retried, so between those reads a chat can be missing
+  from here and perfectly fine on GitHub.
+  {{ freshness }}
+</p>
+{% if backfill_error %}
+  <p class="small error">{{ backfill_error }}</p>
+{% endif %}
+{% if rate_limited %}
+  {# Above the chats and outside the collapsed nudge section, because the question it answers is
+     "why has this board gone quiet" and somebody asking it is about to start pressing buttons to
+     find out (#1945). Costs no height at rest: the paragraph exists only while a cooldown is
+     open, and it arrives on this live fragment rather than waiting for a deliberate press. #}
+  <p class="small error chat-board-rate-limited">{{ rate_limited }}</p>
+{% endif %}

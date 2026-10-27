@@ -1,0 +1,1019 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="dark light">
+  <title>{% block title %}agentdeck{% endblock %}</title>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="/static/apple-touch-icon.png">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <meta name="theme-color" content="#14161a">
+  <meta name="apple-mobile-web-app-title" content="agentdeck">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <link rel="stylesheet" href="/static/app.css?v={{ asset_ver }}">
+  <script>
+  // Register the service worker (installable PWA / standalone display). Served
+  // from the site root so its scope covers the whole app; failures are non-fatal
+  // (e.g. plain-HTTP remote origin, which is not a secure context).
+  // Scoped: this block owns a dozen small helpers, and nothing outside it has
+  // any business reaching them.
+  (function () {
+    if (!('serviceWorker' in navigator)) return;
+    // Auto-update: force an update check on each load, and when a freshly
+    // activated worker takes control (the new SW calls skipWaiting +
+    // clients.claim), reload once so stale cached CSS/JS is replaced without
+    // the user having to clear site data. The page HTML is never SW-cached, so
+    // this script always runs fresh even behind an out-of-date worker.
+    var reloading = false;
+    var updatePending = false;
+    var updateRetry = null;
+    var RETRY_MS = 5000;
+    // Hidden inputs are machinery, not work: action_timing.js leaves a filled
+    // carrier behind after a press.
+    var VALUE_FIELDS = 'input:not([type=hidden]), textarea, select';
+    function valueFields(root) {
+      var found = (root || document).querySelectorAll(VALUE_FIELDS), fields = [];
+      for (var i = 0; i < found.length; i++) {
+        // `data-reload-safe` marks a field a reload restores by itself (the deck
+        // filter round-trips through sessionStorage). Holding the update back
+        // for one of those would cost the page its new assets for nothing.
+        if (!found[i].hasAttribute('data-reload-safe')) fields.push(found[i]);
+      }
+      return fields;
+    }
+    // Field values as they stood once the page settled — after the draft and
+    // search-query restores and the model-picker rebuild have run. In-progress
+    // work is measured against *these*, not against the markup: a query
+    // restored from sessionStorage or a <select> rebuilt by model_picker.js
+    // differs from its markup on every single load, and treating that as "the
+    // person changed something" would block every future update forever.
+    var settled = new WeakMap();
+    function snapshotFields() {
+      var fields = valueFields();
+      // Only fields this page has not settled on yet, so a swap elsewhere can
+      // never adopt a value someone typed as the new baseline.
+      for (var i = 0; i < fields.length; i++) {
+        if (!settled.has(fields[i])) settled.set(fields[i], fields[i].value);
+      }
+    }
+    // Coalesced: htmx fires `afterSwap` once per swapped element, and a single
+    // SSE push reconciles a card at a time, so scheduling per event would run a
+    // whole-document query dozens of times over one update.
+    var snapshotQueued = false;
+    function scheduleSnapshot() {
+      if (snapshotQueued) return;
+      snapshotQueued = true;
+      setTimeout(function () { snapshotQueued = false; snapshotFields(); }, 0);
+    }
+    // A tick late every time, so the value read is the one the restoring and
+    // rebuilding scripts left behind rather than the markup they started from.
+    window.addEventListener('load', scheduleSnapshot);
+    document.addEventListener('agentdeck:session-navigation', scheduleSnapshot);
+    // Fields arriving on an HTMX swap get their baseline the same way.
+    document.addEventListener('htmx:afterSwap', scheduleSnapshot);
+    // What the markup alone says a field holds, for one that arrived after the
+    // last snapshot. A <select> has no `defaultValue`: the browser starts it on
+    // the first `selected` option, else the first option.
+    function markupValue(field) {
+      if (field.tagName !== 'SELECT') return field.defaultValue;
+      for (var i = 0; i < field.options.length; i++) {
+        if (field.options[i].defaultSelected) return field.options[i].value;
+      }
+      return field.options.length ? field.options[0].value : '';
+    }
+
+    // Whether this document was already controlled. A *first* claim replaces
+    // nothing: no worker served this document, and the fetch handler is
+    // network-first, so its assets are already the current generation's.
+    // Reloading a second or two after load would only wipe what the user has
+    // already opened, chosen or typed —
+    // the New chat form, say, which the message-draft guard below does not
+    // cover (issue #720). Only a later change is a deploy replacing a stale
+    // shell under a long-lived tab.
+    var controlled = navigator.serviceWorker.controller !== null;
+
+    function composingMessage() {
+      var drafts = document.querySelectorAll(
+        'form[data-clear-on-send] textarea[name="message"]'
+      );
+      for (var i = 0; i < drafts.length; i++) {
+        if (drafts[i].value) return true;
+        // The box empties the moment a message leaves (#2843). Until the send
+        // succeeds or its text is put back, that text lives only in the request
+        // a reload would abort — including an automatic retry still waiting.
+        var form = drafts[i].form;
+        if (form && (form.hasAttribute('data-sending') || form._agentdeckAutoRetryRecord)) {
+          return true;
+        }
+      }
+      return false;
+    }
+    function editingControl() {
+      var active = document.activeElement;
+      if (!active) return false;
+      if (active.isContentEditable) return true;
+      if (!active.matches || !active.matches('input, textarea, select')) return false;
+      // clearComposer(..., keepFocus) re-focuses the emptied message box after
+      // every send, so an *empty* composer caret would hold a pending reload
+      // off for the page's whole life. Empty means there is nothing to lose —
+      // a draft is composingMessage()'s job, and the sessionStorage restore
+      // puts one back after a reload anyway.
+      if (active.matches('form[data-clear-on-send] textarea[name="message"]') &&
+          !active.value) {
+        return false;
+      }
+      return true;
+    }
+    function openEditingPanel() {
+      // A disclosure someone deliberately opened to edit something: Default
+      // usage details, New chat, the effort menu. A reload closes
+      // it *and* discards whatever is in it (#726). `valueFields`, not a raw
+      // query, so a panel holding nothing but reload-safe controls cannot hold
+      // the update back for the page's whole life — collapsing a filter row
+      // behind a <details> is exactly this repo's way of saving phone height.
+      // A field inside a *shut* nested disclosure is not open for editing, so
+      // it cannot be what the person is in the middle of. #1458 put the whole
+      // chat list behind a disclosure of its own, and the New chat form and the
+      // settings panels live inside it — without this, opening the chat list once
+      // would hold every future deploy back for the page's whole life.
+      var panels = document.querySelectorAll('details[open]');
+      for (var i = 0; i < panels.length; i++) {
+        var fields = valueFields(panels[i]);
+        for (var j = 0; j < fields.length; j++) {
+          if (!fields[j].closest('details:not([open])')) return true;
+        }
+      }
+      return false;
+    }
+    function changedField() {
+      var fields = valueFields();
+      for (var i = 0; i < fields.length; i++) {
+        var field = fields[i];
+        if (field.type === 'checkbox' || field.type === 'radio') {
+          if (field.checked !== field.defaultChecked) return true;
+        } else if (field.type === 'file') {
+          if (field.files && field.files.length) return true;
+        } else {
+          // Selects are in here too: a picked account, model, effort or usage
+          // range is a "selected control". Only the effort menu sits inside a
+          // <details> that already holds the reload back — the continue-chat
+          // pickers and the /usage filters are bare forms on the page.
+          var before = settled.has(field) ? settled.get(field) : markupValue(field);
+          if (field.value !== before) return true;
+        }
+      }
+      return false;
+    }
+    function readingHistory() {
+      // A transcript deliberately scrolled away from its end is reading in
+      // progress: the reload re-follows to the bottom and loses the place.
+      // Pages without a transcript have no follow to lose. The scroll root and
+      // the 80px near-bottom slack mirror session_bottom_follow.js.
+      if (!document.querySelector('.transcript')) return false;
+      var detail = document.querySelector('.session-detail');
+      if (detail && getComputedStyle(detail).overflowY === 'auto') {
+        return detail.scrollTop + detail.clientHeight < detail.scrollHeight - 80;
+      }
+      return window.scrollY + window.innerHeight <
+        document.documentElement.scrollHeight - 80;
+    }
+    // A frontend deploy must not throw away what someone is in the middle of:
+    // unsent text, a typed amount, an attached screenshot, a ticked answer, an
+    // open panel, the caret itself, or the place they scrolled to.
+    function workInProgress() {
+      if (composingMessage() || editingControl() || openEditingPanel() ||
+          changedField() || readingHistory()) return true;
+      // Extra desktop chats live in same-origin frames so their forms and live
+      // streams stay independent. A deploy of the parent must still respect an
+      // unfinished draft, changed control, or reading position inside them.
+      var frames = document.querySelectorAll('.session-extra-frame');
+      for (var i = 0; i < frames.length; i++) {
+        try {
+          if (frames[i].contentWindow.AgentDeckWorkInProgress &&
+              frames[i].contentWindow.AgentDeckWorkInProgress()) return true;
+        } catch (_) {}
+      }
+      return false;
+    }
+    window.AgentDeckWorkInProgress = workInProgress;
+    function reloadWhenIdle() {
+      if (reloading || !updatePending || workInProgress()) return;
+      reloading = true;
+      if (updateRetry !== null) { clearInterval(updateRetry); updateRetry = null; }
+      window.location.reload();
+    }
+    navigator.serviceWorker.addEventListener('controllerchange', function () {
+      if (reloading) return;
+      var wasControlled = controlled;
+      controlled = navigator.serviceWorker.controller !== null;
+      // A first claim is not a pending update, so it must not arm the retry
+      // either: leaving `updatePending` false here is what keeps a fresh visit
+      // from reloading itself the moment the page goes idle (#720).
+      if (!wasControlled) return;
+      updatePending = true;
+      reloadWhenIdle();
+      // Deferred, not dropped. The reload is what replaces stale cached CSS/JS,
+      // so a page that was busy when the worker claimed it still picks the new
+      // shell up as soon as the person is done, rather than running old assets
+      // until they happen to navigate.
+      if (!reloading && updateRetry === null) {
+        updateRetry = setInterval(reloadWhenIdle, RETRY_MS);
+      }
+    });
+    window.addEventListener('load', function () {
+      navigator.serviceWorker.register('/sw.js').then(function (reg) {
+        reg.update();
+      }).catch(function () {});
+    });
+    // Fallback for a notification tap when the worker can't navigate the window
+    // itself (an uncontrolled, frozen PWA client): the SW asks the page to go to
+    // the notification's chat (#3348), or home, and we land on a freshly loaded
+    // page rather than a stale view (issue #35). ``open-home`` is an older worker's.
+    navigator.serviceWorker.addEventListener('message', function (event) {
+      var data = event.data || {};
+      if (data.type !== 'agentdeck:open' && data.type !== 'agentdeck:open-home') return;
+      var path = data.type === 'agentdeck:open' && typeof data.path === 'string'
+        && /^\/(?![\/\\])/.test(data.path) ? data.path : '/';
+      if (location.pathname + location.search + location.hash === path) window.location.reload();
+      else window.location.assign(path);
+    });
+  })();
+  </script>
+  <script src="/static/error_reporting.js?v={{ asset_ver }}" defer></script>
+  <script src="/static/htmx.min.js?v={{ asset_ver }}" defer></script>
+  <script src="/static/work_list.js?v={{ asset_ver }}" defer></script>
+  <script src="/static/work_stop_sound.js?v={{ asset_ver }}" defer></script>
+  <script src="/static/sse.js?v={{ asset_ver }}" defer></script>
+  <script src="/static/action_timing.js?v={{ asset_ver }}" defer></script>
+  <script src="/static/mobile_session_stack.js?v={{ asset_ver }}" defer></script>
+  <script src="/static/session_diff.js?v={{ asset_ver }}" defer></script>
+  <script src="/static/session_bottom_follow.js?v={{ asset_ver }}" defer></script>
+  <script src="/static/session_last_user_jump.js?v={{ asset_ver }}" defer></script>
+  <script src="/static/tool_call_groups.js?v={{ asset_ver }}" defer></script>
+  <script src="/static/chat_notes.js?v={{ asset_ver }}" defer></script>
+  <script src="/static/message_collapse.js?v={{ asset_ver }}" defer></script>
+  <script src="/static/side_chat.js?v={{ asset_ver }}" defer></script>
+  <script src="/static/rollback.js?v={{ asset_ver }}" defer></script>
+  <script src="/static/session_navigation.js?v={{ asset_ver }}" defer></script>
+  <script src="/static/session_panels.js?v={{ asset_ver }}" defer></script>
+  <script src="/static/activity_elapsed.js?v={{ asset_ver }}" defer></script>
+  <script src="/static/message_age.js?v={{ asset_ver }}" defer></script>
+  <script src="/static/interaction_feedback.js?v={{ asset_ver }}" defer></script>
+  <script src="/static/question_drafts.js?v={{ asset_ver }}" defer></script>
+  <script src="/static/refusal_swap.js?v={{ asset_ver }}" defer></script>
+  <script src="/static/starting_chat.js?v={{ asset_ver }}" defer></script>
+  <script src="/static/new_chat_usage_mirror.js?v={{ asset_ver }}" defer></script>
+  <script src="/static/new_work.js?v={{ asset_ver }}" defer></script>
+  <script src="/static/push.js?v={{ asset_ver }}" defer></script>
+  <script src="/static/session_babysit.js?v={{ asset_ver }}" defer></script>
+  <script src="/static/body_disclosure.js?v={{ asset_ver }}" defer></script>
+  <script src="/static/job_queue.js?v={{ asset_ver }}" defer></script>
+  <script src="/static/account_navigation.js?v={{ asset_ver }}" defer></script>
+  <script src="/static/composer_autocomplete.js?v={{ asset_ver }}" defer></script>
+  <script src="/static/composer_phrases.js?v={{ asset_ver }}" defer></script>
+  <script src="/static/composer_speech.js?v={{ asset_ver }}" defer></script>
+  <script src="/static/voice_mode.js?v={{ asset_ver }}" defer></script>
+  <script src="/static/issue_post.js?v={{ asset_ver }}" defer></script>
+  <script src="/static/code_copy.js?v={{ asset_ver }}" defer></script>
+  <script src="/static/live_html.js?v={{ asset_ver }}" defer></script>
+  <script src="/static/page_refresh.js?v={{ asset_ver }}" defer></script>
+  <script src="/static/wayfinder_map.js?v={{ asset_ver }}" defer></script>
+  {#- Not deferred: the folds and the hidden projects are stylesheets before the first row is
+      parsed, so a reload never paints them and then hides them (#3108). On every page, not
+      only the front page's: a desktop Work or chat page mounts the front page beside itself
+      after it loads (session_navigation.js), and its folds and filter must work there too (#3114). #}
+  <script src="/static/front_filters.js?v={{ asset_ver }}"></script>
+  <script src="/static/needs_you_menu.js?v={{ asset_ver }}" defer></script>
+</head>
+<body class="{% block body_class %}{% endblock %}" hx-ext="sse,keyed-works,keyed-rows" {% block body_sse %}sse-connect="/events"{% endblock %}>
+  <header class="topbar">
+    <div class="topbar-row">
+      {% block topbar_nav %}{% endblock %}
+      {# The wordmark carries a house mark alongside it so a phone can keep this
+         link — it is home on a chat layered over the list — without keeping its
+         85px of text (#1767). Only one of the two ever shows. #}
+      <a class="brand" href="/" aria-label="AgentDeck front page" title="AgentDeck front page">
+        <svg class="brand-mark" viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
+          <path fill="currentColor" d="M8 1.7 1.4 7.3l.9 1.1.7-.6V14h4V10.3h2V14h4V7.8l.7.6.9-1.1L8 1.7Zm0 1.85 3.5 2.98V12.6H10V8.9H6v3.7H4.5V6.53L8 3.55Z"/>
+        </svg><span class="brand-word">agentdeck</span></a>
+      <div class="topbar-actions">
+        {# Installed from the home screen there is no browser reload and no
+           pull-to-refresh, so the deck carries its own (#2240). #}
+        <button class="refresh-nav-link" type="button" data-page-refresh
+                aria-label="Reload page" title="Reload page">
+          <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
+            <path fill="currentColor" d="M8 2.5a5.5 5.5 0 1 0 5.2 7.3.75.75 0 1 1 1.4.5A7 7 0 1 1 12.9 3V1.75a.75.75 0 0 1 1.5 0v3.5a.75.75 0 0 1-.75.75h-3.5a.75.75 0 0 1 0-1.5h1.6A5.5 5.5 0 0 0 8 2.5Z"/>
+          </svg>
+        </button>
+        <a class="settings-nav-link" href="/settings"
+           aria-label="Settings" title="Settings"{% if request.url.path.startswith('/settings') %} aria-current="page"{% endif %}>
+          <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
+            <path fill="currentColor" d="M8 5.6a2.4 2.4 0 1 0 0 4.8 2.4 2.4 0 0 0 0-4.8Zm0 1.4a1 1 0 1 1 0 2 1 1 0 0 1 0-2Z"/>
+            <path fill="currentColor" d="M6.9.9h2.2l.3 1.7c.4.14.79.3 1.15.52l1.5-.86 1.56 1.56-.86 1.5c.21.36.38.75.51 1.15l1.7.3v2.2l-1.7.3c-.13.4-.3.79-.51 1.15l.86 1.5-1.56 1.56-1.5-.86c-.36.21-.75.38-1.15.51l-.3 1.7H6.9l-.3-1.7a5.4 5.4 0 0 1-1.15-.51l-1.5.86L2.39 12.6l.86-1.5A5.4 5.4 0 0 1 2.74 9.95L1.04 9.65v-2.2l1.7-.3c.13-.4.3-.79.51-1.15l-.86-1.5L3.95 2.94l1.5.86c.36-.22.75-.38 1.15-.52L6.9.9Zm1.2 1.4-.2 1.15-.79.24c-.3.1-.6.23-.87.4l-.72.42-1.02-.59-.36.36.59 1.02-.43.72c-.16.28-.29.57-.39.87l-.24.79-1.15.2v.5l1.15.2.24.79c.1.3.23.6.4.87l.42.72-.59 1.02.36.36 1.02-.59.72.43c.28.16.57.29.87.39l.79.24.2 1.15h.5l.2-1.15.79-.24c.3-.1.6-.23.87-.4l.72-.42 1.02.59.36-.36-.59-1.02.43-.72c.16-.28.29-.57.39-.87l.24-.79 1.15-.2v-.5l-1.15-.2-.24-.79a4 4 0 0 0-.4-.87l-.42-.72.59-1.02-.36-.36-1.02.59-.72-.43a4 4 0 0 0-.87-.39l-.79-.24-.2-1.15h-.5Z"/>
+          </svg>
+        </a>
+        {# The chat board is the only page a phone cannot reach from anywhere else, and
+           the one somebody opens to start a chat (#1820). Icon-only, like its
+           neighbours, so the row does not grow. #}
+        {% if chat_board_shown %}
+        <a class="chat-board-nav-link" href="/chat-board"
+           aria-label="ChatGPT chats" title="ChatGPT chats"{% if request.url.path.startswith('/chat-board') %} aria-current="page"{% endif %}>
+          <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
+            <path fill="currentColor" d="M8 2c-3.31 0-6 2.02-6 4.5 0 1.4.86 2.65 2.2 3.47l-.6 2.53 2.73-1.5c.53.12 1.09.18 1.67.18 3.31 0 6-2.02 6-4.68C14 4.02 11.31 2 8 2Zm0 1.4c2.65 0 4.6 1.5 4.6 3.1S10.65 9.78 8 9.78c-.55 0-1.08-.07-1.57-.2l-.36-.09-1.2.66.26-1.1-.4-.24C3.75 8.29 3.4 7.42 3.4 6.5c0-1.6 1.95-3.1 4.6-3.1Z"/>
+          </svg>
+        </a>
+        {% endif %}
+        {# The deck chat (#3403): one always-on chat for steering the deck, a tap away
+           from every page. Icon-only, like its neighbours. #}
+        <a class="meta-chat-nav-link" href="/meta"
+           aria-label="Deck chat" title="Deck chat"{% if is_deck_chat is defined and is_deck_chat %} aria-current="page"{% endif %}>
+          <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
+            <path fill="currentColor" d="M8 1.5A2.5 2.5 0 0 0 5.5 4v4a2.5 2.5 0 0 0 5 0V4A2.5 2.5 0 0 0 8 1.5ZM7 4a1 1 0 0 1 2 0v4a1 1 0 0 1-2 0V4Z"/>
+            <path fill="currentColor" d="M3.75 7.25a.75.75 0 0 1 .75.75 3.5 3.5 0 0 0 7 0 .75.75 0 0 1 1.5 0 5 5 0 0 1-4.25 4.94V14.5h-1.5v-1.56A5 5 0 0 1 3 8a.75.75 0 0 1 .75-.75Z"/>
+          </svg>
+        </a>
+        {# A page with no stream of its own connects this wrapper to /events/topbar,
+           which carries both icons below (#2864, #3239). #}
+        <span class="topbar-live"{% block topbar_sse %}{% endblock %}>
+        {# New Works in Needs you (#3239): a stable slot, swapped when that list changes. #}
+        {% if needs_you_menu is defined %}
+        <span id="needs-you-slot" sse-swap="needs_you">{% include 'partials/needs_you_menu.html' %}</span>
+        {% endif %}
+        {# The Mac's approval page, when a Mac program is configured (#2017). It opens
+           top-level rather than in a frame, because that is the only place approving
+           is allowed to happen. A stable slot, swapped when the waiting count moves. #}
+        {% if mac_runner_configured() %}
+        <span id="mac-runner-slot" sse-swap="mac_runner">{% include 'partials/mac_runner_link.html' %}</span>
+        {% endif %}
+        </span>
+        <button class="notif-bell" type="button" data-state="busy" hidden
+                aria-label="Notifications" aria-pressed="false" title="Notifications">
+          <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path fill="currentColor"
+            d="M8 1.5a3 3 0 0 0-3 3v2.2c0 .5-.2 1-.55 1.36L3.3 11H12.7l-1.15-2.94A1.94 1.94 0 0 1 11 6.7V4.5a3 3 0 0 0-3-3Zm0 13a1.9 1.9 0 0 0 1.85-1.5h-3.7A1.9 1.9 0 0 0 8 14.5Z"/></svg>
+        </button>
+        {# Stable slot so a blocked state appearing later can materialize the pill
+           on an open tab; the fragment is pushed only on a real deploy-state
+           change (#786). #}
+        <span id="deployment-status-slot" sse-swap="deployment">{% include 'partials/deployment_status.html' %}</span>
+        {# Same stable-slot trick for the job queue (#1301): empty while the
+           queue is idle, so the pill can appear on an open tab the moment a
+           job is submitted without the topbar reserving width for it. #}
+        <span id="job-queue-slot" sse-swap="jobs">{% include 'partials/job_queue.html' %}</span>
+      </div>
+    </div>
+    <div id="limit-bars" sse-swap="usage">
+      {% block limit_bars %}{% endblock %}
+    </div>
+  </header>
+  <main>
+    {% block content %}{% endblock %}
+  </main>
+  <script>
+  // Minimal, injection-safe markdown → HTML (escape first, then format). Used to
+  // prettify transcript messages in the detail view and expanded list cards.
+  function mdEscape(s) {
+    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+  function mdSafeHref(url) {
+    var scheme = url.match(/^([a-z][a-z0-9+.-]*):/i);
+    return !scheme || /^(?:https?|mailto)$/i.test(scheme[1]);
+  }
+  function mdPreviewHref(url, sessionKey) {
+    var prefix = 'agentdeck-preview:';
+    if (!sessionKey) return null;
+    var explicit = url.slice(0, prefix.length).toLowerCase() === prefix;
+    var scheme = url.match(/^([a-z][a-z0-9+.-]*):/i);
+    if (!explicit && (scheme || url.slice(0, 2) === '//')) return null;
+    var encoded = explicit ? url.slice(prefix.length) : url;
+    var hash = '';
+    var hashAt = encoded.indexOf('#');
+    if (hashAt >= 0) { hash = encoded.slice(hashAt + 1); encoded = encoded.slice(0, hashAt); }
+    var path;
+    try { path = decodeURIComponent(encoded); } catch (_) { return null; }
+    if (!path || path[0] === '/' || path.indexOf('\\') >= 0 || path.indexOf('?') >= 0) return null;
+    var parts = path.split('/');
+    if (parts.some(function (part) { return !part || part === '.' || part === '..'; })) return null;
+    if (!/\.html?$/i.test(parts[parts.length - 1])) return null;
+    var href = '/sessions/' + encodeURIComponent(sessionKey) + '/preview/' +
+      parts.map(function (part) { return encodeURIComponent(part); }).join('/');
+    if (hash) href += '#' + encodeURIComponent(hash);
+    return href;
+  }
+  function mdAutoLink(html) {
+    var template = document.createElement('template');
+    template.innerHTML = html;
+    var walker = document.createTreeWalker(template.content, NodeFilter.SHOW_TEXT);
+    var nodes = [], node;
+    while ((node = walker.nextNode())) {
+      if (!node.parentElement || !node.parentElement.closest('a, code')) nodes.push(node);
+    }
+    nodes.forEach(function (textNode) {
+      var text = textNode.nodeValue;
+      var pattern = /\bhttps?:\/\/[^\s<>"']+/gi;
+      var match, offset = 0, fragment = document.createDocumentFragment();
+      while ((match = pattern.exec(text))) {
+        var url = match[0];
+        var trailing = url.match(/[.,!?;:\)\]\}]+$/);
+        if (trailing) url = url.slice(0, -trailing[0].length);
+        if (!url) continue;
+        fragment.appendChild(document.createTextNode(text.slice(offset, match.index)));
+        var link = document.createElement('a');
+        link.setAttribute('href', url);
+        link.setAttribute('target', '_blank');
+        link.setAttribute('rel', 'noopener');
+        link.textContent = url;
+        fragment.appendChild(link);
+        offset = match.index + url.length;
+      }
+      if (offset) {
+        fragment.appendChild(document.createTextNode(text.slice(offset)));
+        textNode.replaceWith(fragment);
+      }
+    });
+    return template.innerHTML;
+  }
+  function mdInline(s, sessionKey) {
+    s = s.replace(/`([^`]+)`/g, function (_, c) { return '<code>' + c + '</code>'; });
+    s = s.replace(/\*\*([^*]+?)\*\*/g, '<strong>$1</strong>');
+    s = s.replace(/(^|[^\w*])\*([^*\n]+?)\*(?!\w)/g, '$1<em>$2</em>');
+    s = s.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, function (match, label, url) {
+      var href = mdPreviewHref(url, sessionKey);
+      if (!href && !mdSafeHref(url)) return match;
+      return '<a href="' + (href || url) + '" target="_blank" rel="noopener">' + label + '</a>';
+    });
+    return mdAutoLink(s);
+  }
+  function mdTableCells(line) {
+    var source = line.trim(), cells = [], cell = '', inCode = false, sawSeparator = false;
+    if (source.indexOf('|') < 0) return null;
+    if (source.charAt(0) === '|') source = source.slice(1);
+    if (source.charAt(source.length - 1) === '|' && source.charAt(source.length - 2) !== '\\') {
+      source = source.slice(0, -1);
+    }
+    for (var i = 0; i < source.length; i++) {
+      var ch = source.charAt(i);
+      if (ch === '\\' && source.charAt(i + 1) === '|') { cell += '|'; i++; continue; }
+      if (ch === '`') inCode = !inCode;
+      if (ch === '|' && !inCode) {
+        cells.push(cell.trim()); cell = ''; sawSeparator = true;
+      } else cell += ch;
+    }
+    cells.push(cell.trim());
+    return sawSeparator ? cells : null;
+  }
+  function mdTableAlignments(cells) {
+    if (!cells) return null;
+    var alignments = [];
+    for (var i = 0; i < cells.length; i++) {
+      var marker = cells[i].trim();
+      if (!/^:?-{3,}:?$/.test(marker)) return null;
+      if (marker.charAt(0) === ':' && marker.charAt(marker.length - 1) === ':') alignments.push('center');
+      else if (marker.charAt(marker.length - 1) === ':') alignments.push('right');
+      else if (marker.charAt(0) === ':') alignments.push('left');
+      else alignments.push('');
+    }
+    return alignments;
+  }
+  // The stacked narrow-container layout prints the header above each value, so a
+  // body cell carries its column's header as plain text. The source is already
+  // escaped by mdEscape, so quotes cannot break out of the attribute.
+  function mdTableLabel(text) {
+    return text.replace(/`([^`]*)`/g, '$1')
+      .replace(/\[([^\]]+)\]\([^)\s]+\)/g, '$1')
+      .replace(/\*/g, '')
+      .trim();
+  }
+  function mdTableCell(tag, text, alignment, sessionKey, label) {
+    var attrs = alignment ? ' class="md-align-' + alignment + '"' : '';
+    if (label !== undefined) attrs += ' data-label="' + label + '"';
+    return '<' + tag + attrs + '>' + mdInline(text, sessionKey) + '</' + tag + '>';
+  }
+  // The copy control is an icon and nothing else: a button labelled with the
+  // word "Copy" would sit inside the block a reader selects by hand, so their
+  // clipboard would carry "Copy" along with the code. It lives in a wrapper
+  // rather than in the <pre>, because <pre> is the horizontal scroll container
+  // and anything positioned inside it slides away with the code.
+  var MD_CODE_COPY =
+    '<button class="code-copy" type="button" aria-label="Copy code" title="Copy code">' +
+    '<svg class="code-copy-idle" viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">' +
+    '<path fill="currentColor" d="M5.5 1.5h6A1.5 1.5 0 0 1 13 3v7h-1.4V3a.1.1 0 0 0-.1-.1h-6V1.5Z"/>' +
+    '<path fill="currentColor" d="M3.5 4h5.7A1.8 1.8 0 0 1 11 5.8v7.4A1.8 1.8 0 0 1 9.2 15H3.5a1.8 1.8 0 0 1-1.8-1.8V5.8A1.8 1.8 0 0 1 3.5 4Zm0 1.4a.4.4 0 0 0-.4.4v7.4c0 .22.18.4.4.4h5.7a.4.4 0 0 0 .4-.4V5.8a.4.4 0 0 0-.4-.4H3.5Z"/>' +
+    '</svg>' +
+    '<svg class="code-copy-done" viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">' +
+    '<path fill="currentColor" d="M13.3 4.2 6.5 11l-3.8-3.8 1-1L6.5 9l5.8-5.8 1 1Z"/>' +
+    '</svg></button>';
+  // `live` is set for an agent's own reply: there an `html-live` block is shown as
+  // working HTML in a sandboxed frame rather than as code (live_html.js, #3547).
+  function mdToHtml(text, sessionKey, live) {
+    var segs = mdEscape(text).split(/```/), out = '';
+    for (var i = 0; i < segs.length; i++) {
+      if (i % 2 === 1) {                       // inside a fenced code block
+        var body = segs[i].replace(/^[^\n]*\n/, '').replace(/\n$/, '');
+        if (live && window.AgentdeckLiveHtml && /^html-live[ \t]*\n/.test(segs[i])) {
+          out += window.AgentdeckLiveHtml.frame(body);
+          continue;
+        }
+        out += '<div class="md-code"><pre><code>' +
+          body +
+          '</code></pre>' + MD_CODE_COPY + '</div>';
+        continue;
+      }
+      var lines = segs[i].split('\n'), buf = '', inList = false;
+      for (var j = 0; j < lines.length; j++) {
+        var ln = lines[j], li = ln.match(/^\s*[-*+]\s+(.*)$/), hd = ln.match(/^\s*(#{1,6})\s+(.*)$/);
+        if (li) { if (!inList) { buf += '<ul>'; inList = true; } buf += '<li>' + mdInline(li[1], sessionKey) + '</li>'; continue; }
+        if (inList) { buf += '</ul>'; inList = false; }
+        var headers = mdTableCells(ln);
+        var alignments = j + 1 < lines.length ? mdTableAlignments(mdTableCells(lines[j + 1])) : null;
+        if (headers && alignments && headers.length === alignments.length) {
+          // Two columns still read fine side by side on a phone; three or more
+          // shred into unreadable slivers, so mark those for the stacked layout.
+          var stackable = headers.length > 2 ? ' md-table-stackable' : '';
+          var labels = [];
+          buf += '<div class="md-table-scroll' + stackable + '"><table><thead><tr>';
+          for (var k = 0; k < headers.length; k++) {
+            labels.push(mdTableLabel(headers[k]));
+            buf += mdTableCell('th', headers[k], alignments[k], sessionKey);
+          }
+          buf += '</tr></thead><tbody>';
+          j++; // delimiter row
+          while (j + 1 < lines.length) {
+            var row = mdTableCells(lines[j + 1]);
+            if (!row) break;
+            j++;
+            buf += '<tr>';
+            for (var c = 0; c < headers.length; c++) {
+              buf += mdTableCell('td', row[c] || '', alignments[c], sessionKey, labels[c]);
+            }
+            buf += '</tr>';
+          }
+          buf += '</tbody></table></div>';
+        } else if (hd) buf += '<div class="md-h">' + mdInline(hd[2], sessionKey) + '</div>';
+        else if (ln.trim() === '') buf += '<br>';
+        else buf += mdInline(ln, sessionKey) + '<br>';
+      }
+      if (inList) buf += '</ul>';
+      out += buf;
+    }
+    return out
+      .replace(/<br>(\s*<(?:ul|pre|iframe)\b|\s*<div class="md-code">)/g, '$1')
+      .replace(/(<\/button><\/div>|<\/(?:ul|pre|iframe)>)<br>/g, '$1')
+      .replace(/<br>\s*$/, '');
+  }
+
+  // Connection hygiene + live-stream recovery across the (mobile PWA) lifecycle.
+  // Over HTTP/1.1 a browser allows ~6 sockets per host and each open page holds
+  // a long-lived SSE stream, so a few navigations exhaust the cap. We close
+  // streams on leave; a bfcached page keeps its EventSource but won't reconnect,
+  // so reload on restore. The harder case is an installed PWA: mobile freezes
+  // the app in the background and tears the SSE socket down, and a source we've
+  // .close()d never fires htmx's auto-reconnect — so on return the cards sit
+  // stale until a manual refresh. Fix: when the page becomes visible again,
+  // check the stream and reload if it's dead (what pull-to-refresh did by hand).
+  (function () {
+    var sources = new Set();
+    // The server pushes a `usage` event at least every 30s (plus a ping comment
+    // every 15s), so under health we hear from it constantly. Track the last
+    // time we did: this is the reliable liveness signal. EventSource.readyState
+    // is NOT — a socket the OS froze in the background commonly still reports
+    // OPEN, so a readyState check would think a dead stream is fine.
+    var lastMsgAt = Date.now();
+    document.body.addEventListener('htmx:sseOpen', function (e) {
+      if (e.detail && e.detail.source) sources.add(e.detail.source);
+      lastMsgAt = Date.now();
+      // The stream treats whatever interaction exists when it connects as
+      // already on screen, so one asked between this page's render and now —
+      // a slow first connect, or any reconnect — would never be pushed (#2611).
+      refreshPendingInteraction();
+    });
+    document.body.addEventListener('htmx:sseMessage', function () { lastMsgAt = Date.now(); });
+    document.body.addEventListener('htmx:sseClose', function (e) {
+      if (e.detail && e.detail.source) sources.delete(e.detail.source);
+    });
+    // Dead if we've heard nothing for well past the 30s usage cadence.
+    function streamStale() { return Date.now() - lastMsgAt > 75000; }
+    function reconnectStreams(replace) {
+      // Start a fresh grace period before connecting. The next real open/message
+      // refreshes this again; if reconnecting fails, the watchdog retries rather
+      // than reloading and wiping focused/selected controls or deliberate scroll.
+      lastMsgAt = Date.now();
+      // Every stream, not only the body's: on a desktop the front page and an open Work
+      // are columns with streams of their own (#2290), and `closeStreams` shuts those too.
+      // Reopening the body's alone left both columns frozen after any tab switch (#2406).
+      streamElements().forEach(function (elt) {
+        try { htmx.reconnectSSE(elt, replace); } catch (_) {}
+      });
+    }
+    function recover() {
+      if (document.visibilityState === 'visible' && streamStale()) {
+        reconnectStreams(true);
+      }
+    }
+
+    var bgClosed = false;
+    function streamElements() {
+      return Array.prototype.slice.call(document.querySelectorAll('[sse-connect]'));
+    }
+    function closeStreams() {
+      sources.forEach(function (s) { try { s.close(); } catch (_) {} });
+      sources.clear();
+      // A stream still connecting has not announced itself through `htmx:sseOpen` yet;
+      // shut it through its element too, or the reopen below would run a second copy.
+      streamElements().forEach(function (elt) {
+        try { htmx.trigger(elt, 'htmx:beforeCleanupElement'); } catch (_) {}
+      });
+    }
+    window.addEventListener('pagehide', closeStreams);
+    window.addEventListener('pageshow', function (e) { if (e.persisted) location.reload(); });
+    // Battery: backgrounding an installed PWA fires visibilitychange(hidden) but
+    // NOT reliably pagehide, and Android keeps the app + its SSE socket alive for
+    // minutes. Left open, the server keeps tailing the transcript and pushing
+    // fragments (~1.5s cadence) to a hidden client, holding the radio awake — the
+    // main background drain. So close the stream when hidden and re-open it when
+    // shown. We reconnect via htmx.reconnectSSE (NOT location.reload) so unsent
+    // composer text, scroll, and the in-JS feed survive. The stream deliberately
+    // does not re-push an unchanged pending interaction, so reconcile that one
+    // slot separately by interaction ID: a question created while hidden appears,
+    // while an unchanged form keeps its selected/typed answer.
+    // Also pause continuous CSS animations so a hidden PWA stops driving the
+    // compositor.
+    function applyBgPause() { document.body.classList.toggle('bg-paused', document.hidden); }
+    function refreshPendingInteraction() {
+      var slot = document.getElementById('pending-interaction-slot');
+      if (!slot || !slot.dataset.refreshUrl) return;
+      var current = slot.querySelector('input[name="interaction_id"]');
+      var url = new URL(slot.dataset.refreshUrl, document.baseURI);
+      url.searchParams.set('known_interaction_id', current ? current.value : '');
+      try {
+        htmx.ajax('GET', url.pathname + url.search, {
+          target: '#pending-interaction-slot',
+          swap: 'innerHTML'
+        });
+      } catch (_) {}
+    }
+    applyBgPause();
+    // Voice mode (voice_mode.js, #3408) goes on reading replies with the page hidden,
+    // so the stream stays open while it is on and closes once it turns off.
+    function voiceOn() { return document.documentElement.classList.contains('voice-on'); }
+    document.addEventListener('agentdeck:voice-state', function (e) {
+      if (document.hidden && e.detail.mode === 'off' && !bgClosed) {
+        closeStreams();
+        bgClosed = true;
+      }
+    });
+    document.addEventListener('visibilitychange', function () {
+      applyBgPause();
+      if (document.hidden) {
+        if (voiceOn()) return;
+        closeStreams();
+        bgClosed = true;
+        return;
+      }
+      if (bgClosed) {
+        bgClosed = false;
+        reconnectStreams(false);
+      }
+      refreshPendingInteraction();
+      setTimeout(recover, 2000);
+    });
+    // Some mobile standalone restores regain window focus without delivering a
+    // visibility transition to the old document. Treat focus as another resume
+    // signal; only replace the stream when its message heartbeat is actually old.
+    window.addEventListener('focus', recover);
+    // And a watchdog while visible, to catch a socket that silently died mid-use
+    // (a zombie OPEN EventSource never fires onerror, so htmx won't reconnect).
+    setInterval(recover, 20000);
+  })();
+
+  // Tick the usage "updated Ns ago" every second, off each tag's data-since
+  // epoch — so it stays live between server pushes (must mirror _fmt_age()).
+  (function () {
+    function fmtAge(sec) {
+      if (sec < 5) return 'just now';
+      if (sec < 60) return Math.floor(sec) + 's ago';
+      var m = Math.floor(sec / 60);
+      if (m < 60) return m + 'm ago';
+      var h = Math.floor(m / 60); m = m % 60;
+      if (h < 24) return h + 'h ' + m + 'm ago';
+      var d = Math.floor(h / 24); h = h % 24;
+      return d + 'd ' + h + 'h ago';
+    }
+    // Flip "stale" purely on data age (issue #6), not on a single failed poll —
+    // so a transient 429 on fresh data never shows stale, and the badge appears
+    // once the numbers are genuinely old, live between server pushes.
+    function isStale(el, now) {
+      var since = parseFloat(el.getAttribute('data-since'));
+      var after = parseFloat(el.getAttribute('data-stale-after'));
+      return !!(since && after) && (now - since) > after;
+    }
+    setInterval(function () {
+      var now = Date.now() / 1000;
+      document.querySelectorAll('.upd-tag[data-since]').forEach(function (el) {
+        var since = parseFloat(el.getAttribute('data-since'));
+        var rel = el.querySelector('.upd-rel');
+        if (since && rel) rel.textContent = fmtAge(now - since);
+        var stale = isStale(el, now);
+        el.classList.toggle('stale-tag', stale);
+        var acct = el.closest('.acct');
+        if (acct) acct.classList.toggle('stale', stale);
+      });
+      document.querySelectorAll('.mini-acct[data-since]').forEach(function (el) {
+        el.classList.toggle('stale', isStale(el, now));
+      });
+    }, 1000);
+  })();
+
+  // Render markdown in detail-view transcript and the question an agent is
+  // waiting on (once each; new events and interactions
+  // arrive over SSE and get enhanced on afterSwap). An agent writes its question
+  // in the same markdown as its messages, so leaving it raw showed the reader
+  // literal `**bold**` and bracketed link syntax in the one place they have to
+  // read carefully before answering (#1579).
+  (function () {
+    function enhance(scope) {
+      (scope || document).querySelectorAll(
+        '.ev-text:not([data-md]),'
+        + ' .interaction-prompt:not([data-md])'
+      ).forEach(function (el) {
+        var sessionScope = el.closest('[data-session-key]');
+        var sessionKey = sessionScope && sessionScope.getAttribute('data-session-key');
+        var live = el.classList.contains('ev-text') && !!el.closest('.ev.assistant');
+        el.innerHTML = mdToHtml(el.textContent, sessionKey, live);
+        el.setAttribute('data-md', '');
+      });
+    }
+    window.addEventListener('load', function () { enhance(); });
+    document.body.addEventListener('htmx:afterSwap', function (e) { enhance(e.target); });
+    // Opening a chat from the list mounts the detail pane with a plain
+    // appendChild, so no swap event ever reaches this listener. Without the
+    // navigation event the transcript stays raw markdown until a reload.
+    document.addEventListener('agentdeck:session-navigation', function () {
+      enhance(document.querySelector('.session-detail'));
+    });
+  })();
+
+  // Chat composers: attach arbitrary files, while pasting clipboard screenshots
+  // into the same field. The delegated handlers cover both composer surfaces,
+  // including controls swapped later by HTMX.
+  (function () {
+    var imageTypes = /^(?:image\/png|image\/jpeg|image\/webp|image\/gif)$/;
+    var previewUrls = new WeakMap();
+
+    function imageInput(form) {
+      return form && form.querySelector('input[type="file"][name="images"]');
+    }
+    function setFiles(input, files) {
+      var transfer = new DataTransfer();
+      files.forEach(function (file) { transfer.items.add(file); });
+      input.files = transfer.files;
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+    function renderAttachments(input) {
+      var old = previewUrls.get(input) || [];
+      old.forEach(function (url) { URL.revokeObjectURL(url); });
+      var urls = [];
+      var box = input.nextElementSibling;
+      if (!box || !box.classList.contains('paste-previews')) {
+        box = document.createElement('div');
+        box.className = 'paste-previews';
+        box.setAttribute('aria-live', 'polite');
+        input.insertAdjacentElement('afterend', box);
+      }
+      box.textContent = '';
+      Array.from(input.files || []).forEach(function (file, index) {
+        var item = document.createElement('span');
+        item.className = 'paste-preview';
+        var content;
+        if (imageTypes.test(file.type)) {
+          content = document.createElement('img');
+          var url = URL.createObjectURL(file); urls.push(url);
+          content.src = url; content.alt = '';
+        } else {
+          item.classList.add('file-attachment');
+          content = document.createElement('span');
+          content.className = 'attached-file-name';
+          content.textContent = file.name || 'attachment';
+        }
+        var remove = document.createElement('button');
+        remove.type = 'button'; remove.className = 'paste-remove';
+        remove.textContent = '×'; remove.title = 'Remove ' + (file.name || 'attachment');
+        remove.setAttribute('aria-label', remove.title);
+        remove.addEventListener('click', function () {
+          setFiles(input, Array.from(input.files).filter(function (_, i) { return i !== index; }));
+        });
+        item.appendChild(content); item.appendChild(remove); box.appendChild(item);
+      });
+      if (input.files && input.files.length) {
+        var count = document.createElement('span');
+        count.className = 'paste-count';
+        count.textContent = input.files.length + (input.files.length === 1 ? ' file attached' : ' files attached');
+        box.appendChild(count);
+      }
+      previewUrls.set(input, urls);
+    }
+
+    document.addEventListener('paste', function (event) {
+      var textarea = event.target.closest('textarea[name="message"]');
+      var input = textarea && imageInput(textarea.form);
+      if (!input || !event.clipboardData) return;
+      var pasted = Array.from(event.clipboardData.items || []).filter(function (item) {
+        return item.kind === 'file' && imageTypes.test(item.type);
+      }).map(function (item) { return item.getAsFile(); }).filter(Boolean);
+      if (!pasted.length) return; // ordinary text paste keeps its native behavior
+      event.preventDefault();
+      setFiles(input, Array.from(input.files || []).concat(pasted));
+      textarea.focus();
+    });
+    document.addEventListener('change', function (event) {
+      if (event.target.matches('input[type="file"][name="images"]')) renderAttachments(event.target);
+    });
+  })();
+
+  // Keep unsent prompts through PWA update reloads (and ordinary navigation
+  // back to the same chat). The form action includes the session key, so each
+  // chat gets an independent draft.
+  (function () {
+    var DRAFT_PREFIX = 'agentdeck:message-draft:';
+    function messageInput(form) {
+      return form && form.querySelector('textarea[name="message"]');
+    }
+    function draftKey(input) {
+      var action = input.form && input.form.getAttribute('hx-post');
+      return DRAFT_PREFIX + (action || location.pathname);
+    }
+    function persist(input) {
+      try {
+        if (/^\s*\/secret(?:\s|$)/.test(input.value)) {
+          sessionStorage.removeItem(draftKey(input));
+        } else if (input.value) sessionStorage.setItem(draftKey(input), input.value);
+        else sessionStorage.removeItem(draftKey(input));
+      } catch (_) {}
+    }
+    function restore(root) {
+      var selector = 'form[data-clear-on-send] textarea[name="message"]';
+      var inputs = root.matches && root.matches(selector) ? [root] : [];
+      if (root.querySelectorAll) inputs = inputs.concat(Array.from(root.querySelectorAll(selector)));
+      inputs.forEach(function (input) {
+        if (input.value) return;
+        try {
+          var saved = sessionStorage.getItem(draftKey(input)) || '';
+          if (/^\s*\/secret(?:\s|$)/.test(saved)) {
+            sessionStorage.removeItem(draftKey(input));
+          } else {
+            input.value = saved;
+          }
+        } catch (_) {}
+      });
+    }
+
+    document.addEventListener('input', function (event) {
+      if (event.target.matches('form[data-clear-on-send] textarea[name="message"]')) {
+        persist(event.target);
+      }
+    });
+    document.body.addEventListener('htmx:load', function (event) {
+      restore((event.detail && event.detail.elt) || event.target);
+    });
+    restore(document);
+
+    // Enter submits, Shift+Enter keeps the expected multiline behavior.
+    document.addEventListener('keydown', function (event) {
+      if (event.key !== 'Enter' || event.shiftKey || event.isComposing) return;
+      var input = event.target.closest('textarea.send-on-enter');
+      if (!input || !input.form) return;
+      event.preventDefault();
+      input.form.requestSubmit();
+    });
+    // Keep the mobile keyboard up when tapping the composer's Send/Stop buttons.
+    // A plain <button> takes focus off the message textarea on press, so mobile
+    // dismisses the keyboard and the afterRequest refocus below then re-shows it
+    // — a visible jump (issue #17). Enter never blurs, so it stays smooth; match
+    // that by not letting the button steal focus. preventDefault on mousedown
+    // keeps focus on the textarea while the click still fires and submits.
+    document.addEventListener('mousedown', function (event) {
+      if (event.target.closest('form.inject-form button[type="submit"]')) {
+        event.preventDefault();
+      }
+    });
+    // One send at a time per composer. The emptied box would otherwise take a
+    // second Enter while the first send is in flight, and htmx would queue it
+    // under the first send's action ID and optimistic row (#2843).
+    document.addEventListener('submit', function (event) {
+      var form = event.target;
+      if (form.matches && form.matches('form[data-clear-on-send][data-sending]')) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+      }
+    }, true);
+    // Each send keeps one record, `form._agentdeckSend`, tied to its own
+    // request (`xhr`). Only that request's own events move it on, so another
+    // request finishing inside the form — the in-form status poll's completion
+    // is re-homed here after its node is swapped out — never settles a send that
+    // is still on its way (#2843).
+    document.body.addEventListener('htmx:beforeRequest', function (event) {
+      var form = event.detail && event.detail.elt;
+      if (!form || !form.matches('form[data-clear-on-send]')) return;
+      if (form._agentdeckSend && form._agentdeckSend.active) return;
+      var input = messageInput(form);
+      var replay = Object.prototype.hasOwnProperty.call(form, '_agentdeckRetrySubmittedMessage');
+      var images = form.querySelector('input[type="file"][name="images"]');
+      form._agentdeckSend = {
+        xhr: event.detail.xhr,
+        message: replay ? form._agentdeckRetrySubmittedMessage : (input ? input.value : ''),
+        images: Object.prototype.hasOwnProperty.call(form, '_agentdeckRetrySubmittedImages')
+          ? form._agentdeckRetrySubmittedImages : Array.from((images && images.files) || []),
+        // Only the person's own send owns the box's contents. An automatic
+        // replay carries its saved text; whatever the box holds is a newer draft.
+        ownsBox: !replay,
+        active: false
+      };
+      delete form._agentdeckRetrySubmittedMessage;
+      delete form._agentdeckRetrySubmittedImages;
+    });
+    // The box empties the moment a message goes out, not when the server
+    // answers (#2843). `beforeSend` comes after every listener that could still
+    // cancel the request, and htmx has already copied the text into it. A send
+    // that fails for good puts the text back below. Starting a chat keeps its
+    // draft until a chat exists (`data-async-outcome`, #559).
+    document.body.addEventListener('htmx:beforeSend', function (event) {
+      var form = event.detail && event.detail.elt;
+      if (!form || !form.matches || !form.matches('form[data-clear-on-send]') ||
+          form.hasAttribute('data-async-outcome')) return;
+      var send = form._agentdeckSend;
+      if (!send || send.active || send.xhr !== event.detail.xhr) return;
+      send.active = true;
+      form.setAttribute('data-sending', '');
+      var input = messageInput(form);
+      // htmx fires beforeRequest and beforeSend in one synchronous pass, so the
+      // box still holds exactly the text this request carries.
+      if (send.ownsBox && input && input.value) {
+        input.value = '';
+        persist(input);
+      }
+    });
+    function restoreUnsent(form, submitted) {
+      var input = messageInput(form);
+      // A secret is never kept anywhere after it leaves (see interaction_feedback.js).
+      if (!input || !submitted || /^\s*\/secret(?:\s|$)/.test(submitted)) return;
+      // Only into an empty box: a newer draft — a /secret among them — is never
+      // rewritten. The failed row in the transcript still shows the text.
+      if (input.value) return;
+      input.value = submitted;
+      persist(input);
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+    function clearComposer(form, submittedImages, keepFocus) {
+      var input = messageInput(form);
+      // The sent text already left the box in `htmx:beforeSend`; whatever is
+      // there now is a new draft, even one that repeats the sent words.
+      if (input) {
+        persist(input);
+        // Focus belongs to the turn the person is in. Only their own send moves
+        // it; a background status poll landing seconds later must not pull the
+        // caret (and the mobile keyboard) back to a composer they left.
+        if (keepFocus) input.focus();
+      }
+      var images = form.querySelector('input[type="file"][name="images"]');
+      var currentImages = Array.from((images && images.files) || []);
+      var sameImages = currentImages.length === submittedImages.length &&
+        currentImages.every(function (file, index) { return file === submittedImages[index]; });
+      if (images && sameImages) {
+        images.value = '';
+        images.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+    }
+
+    document.body.addEventListener('htmx:afterRequest', function (event) {
+      var form = event.detail && event.detail.elt;
+      if (!form || !form.matches('form[data-clear-on-send]')) return;
+      var send = form._agentdeckSend;
+      if (!send || send.xhr !== event.detail.xhr) return;
+      delete form._agentdeckSend;
+      var submitted = send.message;
+      var submittedImages = send.images;
+      if (!send.active) return;
+      if (!event.detail.successful) {
+        // Wait for interaction_feedback.js to decide on an automatic retry of a
+        // 502; while one is pending the replay still carries this text, and the
+        // reload guard above still counts it as unsent work.
+        setTimeout(function () {
+          if (!form._agentdeckAutoRetryRecord) restoreUnsent(form, submitted);
+          form.removeAttribute('data-sending');
+        }, 0);
+        return;
+      }
+      form.removeAttribute('data-sending');
+      // Starting a chat (`data-async-outcome`) never got here: its send stays
+      // inactive, because the response only *accepts* the start (#1799) and the
+      // refusal that matters reaches the status strip seconds later. The draft
+      // is left alone until `static/starting_chat.js` sees a chat exist (#559).
+      clearComposer(form, submittedImages, true);
+    });
+  })();
+  </script>
+</body>
+</html>

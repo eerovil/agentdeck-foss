@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+
+{% block title %}{{ repository }} · agentdeck{% endblock %}
+{% block body_class %}chat-board-page{% endblock %}
+{# Only the issue rows follow the stream, so only they get a live channel. The nudge rows
+   below are refreshed on a deliberate press instead: a receipt lands minutes after a launch
+   and moves nothing this connection can see, and a swap there would close an open row. #}
+{% block body_sse %}sse-connect="/events/chat-board?signature={{ signature | urlencode }}"{% endblock %}
+{% block topbar_nav %}<a class="back" href="/" aria-label="back to sessions">←</a>{% endblock %}
+
+{% block content %}
+<main class="chat-board-main">
+  <header class="page-head">
+    <h1>ChatGPT chats</h1>
+    <a href="{{ repository_url }}">{{ repository }} &rarr;</a>
+  </header>
+
+  {# A second swap target on the same connection, because the two move independently: an
+     hourly read that changes no row still changes this text, and a row change does not
+     always change it. Swapping the rows would not touch it — it lives above them. #}
+  <div id="chat-board-freshness" sse-swap="chat-board-freshness" hx-swap="innerHTML">
+    {% include "partials/chat_board_freshness.html" %}
+  </div>
+
+  {# Above the chats, not below the machinery: starting one is why this page is opened, and
+     it should not be a collapsed box inside another collapsed box at the bottom (#1827).
+     Its own swap target, so a refusal answers beside the form instead of replacing it. #}
+  <div id="chat-board-review-fallback">
+    {% include "partials/chat_board_review_fallback.html" %}
+  </div>
+
+  <div id="chat-board-new">
+    {% include "partials/chat_board_new_chat.html" %}
+  </div>
+
+  <div id="chat-board-rows" sse-swap="chat-board" hx-swap="innerHTML"
+       data-chat-board-signature="{{ signature }}">
+    {% include "partials/chat_board_rows.html" %}
+  </div>
+
+  {% include "partials/chat_board_nudges.html" %}
+</main>
+{% endblock %}

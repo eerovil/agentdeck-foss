@@ -1,0 +1,252 @@
+{# The Work-first front page's live parts (#2219), in the order a Work moves through them
+   (#3578, replacing #2254's): `needs` (Not started, Needs answer), `active`, `stuck`, `waiting`,
+   `release`, `live`, `cleanup`, `finished`, `paused`, `stopped`. `part` picks one. The
+   Work lists are keyed rows that `work_list.js`
+   swaps by `data-work-id` and `data-work-rev`, so an unchanged row keeps focus; each part
+   draws its own header, so its count moves with the push that changed it. `summary` is the
+   counts line at the top and `board` the footer. A row says what the Work is and what it
+   waits on in a line; every action is on the Work page, except Archive on a finished row,
+   Finish on a Work whose issue closed (#2510) and Start agent on one no agent works on (#3558). A row names the chat its Work opens into, and
+   a phone opens that chat instead of the Work page (#2512, `session_navigation.js`). The title
+   shows in full and the detail line wraps (#3386); age and repo# end the detail line, and the side column is
+   only for a row's one button (#2526). #}
+{%- set front = work_overview.front -%}
+{%- from "partials/work_actions.html" import control -%}
+{%- macro size(card, lead=true) -%}
+{#- The Work's pull requests' size, and their target only when it is not master (#2236).
+    Source files only: tests, docs and non-code files are left out (#2331). -#}
+{%- set stat = card.diffstat -%}
+{%- if stat %}{% if lead %} · {% endif %}<span class="fr-size" data-work-diffstat>{% if stat.files %}+{{ stat.additions }}/&minus;{{ stat.deletions }} · {{ stat.files }} {{ "file" if stat.files == 1 else "files" }}{% if stat.new_files %} ({{ stat.new_files }} new){% endif %}{% else %}no source change{% endif %}</span>{% endif -%}
+{%- if card.targets %} · <span class="fr-target" data-work-target>into {{ card.targets | join(", ") }}</span>{% endif -%}
+{%- endmacro -%}
+{%- macro diff_icon(card) -%}
+{#- GitHub's diff square (#3617): [+] when most changed lines are in new files, [•] otherwise,
+    coloured good/ok/bad by the lines in edited files alone; a large diff of new files is
+    usually fine. First on the title line, so it is always in the same place. -#}
+{%- set stat = card.diffstat -%}
+{%- if stat and stat.split %}<span class="fr-diff fr-diff-{{ stat.grade }}" role="img" title="{{ stat.split_label }}" aria-label="{{ stat.split_label }}" data-work-diff="{{ stat.grade }} {{ 'new' if stat.mostly_new else 'edited' }}"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="1.75" y="1.75" width="12.5" height="12.5" rx="2" fill="none" stroke="currentColor" stroke-width="1.5"/>
+{%- if stat.mostly_new %}<path d="M8 4.5v7M4.5 8h7" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>{% else %}<circle cx="8" cy="8" r="2.4" fill="currentColor"/>{% endif %}</svg></span>{% endif -%}
+{%- endmacro -%}
+{%- macro ref(item) -%}{{ item.number if front.one_repository else item.source }}{%- endmacro -%}
+{%- macro age(card, finished=false) -%}
+{#- A finished row is dated by when the Work finished, not when its chats last moved; one a
+    chat carried on in says when that chat moved instead (#2357). -#}
+{%- set when = card.finished_at if finished and card.finished_at else card.last_activity %}
+{%- if when %}<time class="fr-age" datetime="{{ when.isoformat() }}" data-activity-age>{{ when | reltime_ago }}</time>{% endif %}
+{%- endmacro -%}
+{%- macro active(item, finished=false) -%}
+{#- The time the row's age shows, a finished row's carried-on chat included: the project
+    tabs put the project with the newest first (#3399). -#}
+{%- set card = item.card -%}
+{%- set when = (item.continued or card.finished_at or card.last_activity) if finished else card.last_activity %}
+{%- if when %} data-work-active="{{ when.isoformat() }}"{% endif %}
+{%- endmacro -%}
+{%- macro head(key, label, count, note="", link="", new=0) -%}
+{#- Every header folds its group (#2283): `work_list.js` keeps the folded keys in localStorage,
+    and a folded group still shows its count, NEW pill and note. #}
+<h3 class="fr-group fr-group-{{ key }}" data-front-group="{{ key }}"><span class="fr-group-mark" aria-hidden="true"></span><span class="fr-group-label">{{ label }}</span> <span class="fr-group-count">{{ count }}</span>
+  {%- if new %}<span class="fr-new" data-front-new="{{ new }}">{{ new }} new</span>{% endif %}
+  {%- if link %}<a class="fr-group-note" href="{{ link }}">{{ note }}</a>{% elif note %}<span class="fr-group-note">{{ note }}</span>{% endif -%}
+  <button type="button" class="fr-chev" data-front-toggle="{{ key }}" aria-expanded="true" aria-label="Show or hide {{ label }}"></button></h3>
+{%- endmacro -%}
+{%- macro title(item, hidden=false) -%}
+{#- A starred Work (#3116) leads its title with a star, inside it so it adds no line. -#}
+{%- set star %}{% if item.card.starred %}<span class="fr-star" role="img" aria-label="starred" title="Starred: goes ahead in every queue">★</span>{% endif %}{% endset -%}
+{#- An unseen Work (#2283) says so with weight and a dot as well as its row's colour. -#}
+{%- if item.unseen and not hidden %}<span class="fr-title-line"><span class="fr-title">{{ diff_icon(item.card) }}{{ star }}{{ item.card.title }}</span><span class="fr-dot" role="img" aria-label="new" title="New since you last opened it"></span></span>
+{%- else %}<span class="fr-title">{{ diff_icon(item.card) }}{{ star }}{{ item.card.title }}</span>{% endif -%}
+{%- endmacro -%}
+{%- macro row(item, hidden=false, group="", paused=false) -%}
+{%- set card = item.card -%}
+{%- set op = item.attention -%}
+<article class="fr fr-{{ item.section }} fr-tone-{{ item.status.tone }}{% if op %} fr-cat-{{ op.category }}{% endif %}{% if item.unseen and not hidden %} fr-unseen{% endif %}{% if item.continued and card.working_count %} fr-chatting{% endif %}"
+         data-work-id="{{ card.work_id }}" data-work-rev="{{ item.revision }}"
+         data-front-section="{{ item.section }}" data-wd-tone="{{ item.status.tone }}"
+         {%- if card.project %} data-work-project="{{ card.project }}"{% endif %}
+         {%- if group %} data-front-in="{{ group }}"{% endif %}
+         {%- if item.stopped_at %} data-work-stopped="{{ item.stopped_at.isoformat() }}"{% endif %}
+         {{- active(item, finished=item.section == "finished") }}
+         {%- if item.unseen and not hidden %} data-work-unseen="{{ item.stopped_at.isoformat() if item.stopped_at else '' }}"{% endif %}
+         {%- if op %} data-op-category="{{ op.category }}" data-op-actions="{{ op.actions | join(' ') }}"{% endif %}>
+  <span class="fr-mark" aria-hidden="true">{{ item.glyph if op else "" }}</span>
+  {#- A parent issue's row opens its Work page, never its chat, on a phone too (#3622, D8). #}
+  <a class="fr-body" href="{{ card.href }}" title="{{ card.source_label }}"
+     {%- if card.chat_href and not item.progress %} data-chat-href="{{ card.chat_href }}"{% endif %}>
+    {{ title(item, hidden) }}
+    {%- if item.section == "finished" %}
+    <span class="fr-line"><span class="fr-what"><span class="fr-source">{{ ref(item) }}</span>{% if item.reason %} · merged{% endif %} ·
+      {%- if item.continued %} chat <time class="fr-age" datetime="{{ item.continued.isoformat() }}" data-activity-age>{{ item.continued | reltime_ago }}</time>
+      {%- else %} {{ age(card, finished=true) }}{% endif %}</span></span>
+    {%- else %}
+    <span class="fr-line"><span class="fr-what">
+      {%- if op and hidden %}<span class="fr-headline">{{ op.label }}</span>{% if item.line or card.staging %} · {% endif %}
+      {%- elif not op %}<span class="fr-headline">{{ item.status.headline }}</span>{% if item.line or card.staging %} · {% endif %}{% endif -%}
+      {#- Staging already runs every open pull request's head (#3180): said before the reason,
+          which the row may cut short; the links are on the Work page. -#}
+      {%- if card.staging %}<span class="fr-staging" data-work-staging>ready to test</span>{% if item.line %} · {% endif %}{% endif -%}
+      {%- set said = item.line or (op and hidden) or not op %}<span class="fr-reason{% if op and card.question and op.reason == card.question %} fr-asks{% endif %}">{{ item.line }}</span>{{ size(card, lead=said) }}</span>
+      {%- if not hidden and not (op and op.category == "issue_closed") %}<span class="fr-when">{{ age(card) }}<span class="fr-source fr-ref">{{ ref(item) }}</span></span>{% endif -%}
+    </span>
+    {%- endif %}
+  </a>
+  {%- if item.progress %}
+  {#- A parent issue's row (#3622): how far its sub-issues are, a line of its own. When the row
+      shows a child's state, the line opens that child's Work, one tap from its question. #}
+  {%- if item.lead %}<a class="fr-tree" href="{{ item.lead.card.href }}" data-work-tree="{{ item.lead.card.work_id }}">{{ item.progress }} &rarr;</a>
+  {%- else %}<span class="fr-tree" data-work-tree>{{ item.progress }}</span>{% endif %}
+  {%- endif %}
+  {%- if hidden or paused or item.section == "finished" or (op and op.category in ("issue_closed", "unstarted")) %}
+  <span class="fr-side">
+    {%- if hidden %}{{ control(card, item.bring_back) }}
+    {%- elif paused %}{{ control(card, item.resume) }}
+    {%- elif item.section == "finished" %}{{ control(card, item.archive) }}
+    {%- elif op.category == "unstarted" %}{{ control(item.actor, item.start) }}
+    {%- else %}{{ control(item.actor, item.finish) }}{% endif %}
+  </span>
+  {%- endif %}
+</article>
+{%- endmacro -%}
+{%- macro put(m, item) -%}
+{#- One row through `row_html` when the caller gave one (#3228): built once per revision for
+    every tab, and a placeholder on a stream that already sent it. -#}
+{%- if row_html is defined and row_html %}{{ row_html(m, item, **kwargs) }}{% else %}{{ m(item, **kwargs) }}{% endif -%}
+{%- endmacro -%}
+{%- macro needs_groups(place) -%}
+{#- The Needs you groups listed at one place in the page's flow (#3578). -#}
+{%- for group in front.groups_in(place) %}
+{{ head(group.category, group.label, group.rows | length, note=group.note, new=group.new) }}
+{%- for item in group.rows %}
+{{ put(row, item, group=group.category) }}
+{%- endfor %}
+{%- endfor %}
+{%- endmacro -%}
+{%- macro stopped_row(item) -%}
+{#- A Recently stopped row (#2283): where the Work landed, and no buttons; the row opens the
+    Work. The same Work is also a row in that category. Its age is the Work's last activity,
+    like every other row and the Work page, not when it stopped: a stop never moves, so the
+    row read as a last activity that did not update (#2397). -#}
+{%- set card = item.card -%}
+{%- set op = item.attention -%}
+<article class="fr fr-stopped{% if op %} fr-cat-{{ op.category }}{% endif %}{% if item.unseen %} fr-unseen{% endif %}"
+         data-work-id="{{ card.work_id }}" data-work-rev="{{ item.revision }}"
+         data-front-section="stopped" data-front-in="stopped"
+         {%- if item.stopped_at %} data-work-stopped="{{ item.stopped_at.isoformat() }}"{% endif %}
+         {{- active(item) }}
+         {%- if card.project %} data-work-project="{{ card.project }}"{% endif %}
+         {%- if item.unseen %} data-work-unseen="{{ item.stopped_at.isoformat() if item.stopped_at else '' }}"{% endif %}
+         {%- if op %} data-op-category="{{ op.category }}"{% endif %}>
+  <span class="fr-mark" aria-hidden="true">{{ item.glyph }}</span>
+  <a class="fr-body" href="{{ card.href }}" title="{{ card.source_label }}"
+     {%- if card.chat_href %} data-chat-href="{{ card.chat_href }}"{% endif %}>
+    {{ title(item) }}
+    <span class="fr-line"><span class="fr-what">&rarr; <span class="fr-landed" data-front-landed>{{ op.label if op else "Needs you" }}</span>{% if item.line %} · {{ item.line }}{% endif %}</span>
+      <span class="fr-when">{{ age(card) }}<span class="fr-source fr-ref">{{ ref(item) }}</span></span></span>
+  </a>
+</article>
+{%- endmacro -%}
+
+{%- if part == "summary" %}
+{#- Each count carries its count per project, so a project the reader hides (#2311,
+    `work_list.js`) leaves the counts too; a word that changes with the count carries both. #}
+{%- set by_project = front.summary_by_project %}
+{%- for key, count, words in front.summary %}
+{%- set plural = front.summary_plurals.get(key) %}
+<span class="fs-item fs-{{ key }}" data-front-summary="{{ key }}" data-by-project='{{ by_project.get(key, {}) | tojson }}'><span class="fs-mark" aria-hidden="true"></span><b>{{ count }}</b> <span class="fs-words"{% if plural %} data-one="{{ plural[0] }}" data-many="{{ plural[1] }}"{% endif %}>{{ words }}</span></span>
+{%- endfor %}
+
+{%- elif part == "needs" %}
+{{ needs_groups("start") }}
+{%- if not front.groups %}
+<p class="front-empty" data-front-empty>Nothing needs you</p>
+{%- endif %}
+
+{%- elif part in ("stuck", "release", "cleanup") %}
+{{ needs_groups(part) }}
+
+{%- elif part == "live" %}
+{%- if front.live %}
+{{ head("live", "Live checking", front.live | length, "merged; the agent checks it live") }}
+{%- endif %}
+{%- for item in front.live %}
+{{ put(row, item, group="live") }}
+{%- endfor %}
+
+{%- elif part == "paused" %}
+{#- The Works a person paused (#2548), each row with only Resume (#2566). #}
+{%- if front.paused %}
+{{ head("paused", "Paused", front.paused | length, "until you resume them") }}
+{%- for item in front.paused %}
+{{ put(row, item, group="paused", paused=true) }}
+{%- endfor %}
+{%- endif %}
+{#- Hidden (#2238) is one link line to its own list. #}
+{%- if front.hidden %}
+<p class="work-more"><a href="/works?view=hidden" data-hidden-link>Hidden ({{ front.hidden | length }}) &rarr;</a></p>
+{%- endif %}
+
+{%- elif part == "hidden" %}
+{#- The Works Hide or Archive took off the front page (#2238), each with only Bring back. #}
+{%- for item in front.hidden %}
+{{ put(row, item, hidden=true) }}
+{%- else %}
+<p class="front-empty" data-front-empty>No hidden Work.</p>
+{%- endfor %}
+
+{%- elif part == "active" %}
+{%- if front.active %}
+{{ head("working", "Working now", front.active | length, "All Works", "/works") }}
+{%- endif %}
+{%- for item in front.active %}
+{{ put(row, item, group="working") }}
+{%- endfor %}
+{%- if front.active_more %}
+<p class="work-more" data-work-more data-front-in="working"><a href="/works" data-active-more>{{ front.active_more }} more active &rarr;</a></p>
+{%- endif %}
+
+{%- elif part == "waiting" %}
+{%- if front.waiting %}
+{{ head("waiting", "Waiting", front.waiting | length, "on a review, job, blocker or deploy") }}
+{%- endif %}
+{%- for item in front.waiting %}
+{{ put(row, item, group="waiting") }}
+{%- endfor %}
+
+{%- elif part == "stopped" %}
+{%- if front.stopped %}
+{{ head("stopped", "Recently stopped", front.stopped | length, "where they landed", new=front.stopped_new) }}
+{%- endif %}
+{%- for item in front.stopped %}
+{{ put(stopped_row, item) }}
+{%- endfor %}
+
+{%- elif part == "finished" %}
+{%- if front.finished %}
+{{ head("finished", "Recently finished", front.finished | length, (front.finished_more ~ " more") if front.finished_more else "", "/works" if front.finished_more else "") }}
+{%- endif %}
+{%- for item in front.finished %}
+{{ put(row, item, group="finished") }}
+{%- else %}
+<span hidden data-front-none></span>
+{%- endfor %}
+
+{%- elif part == "board" %}
+{%- set board = work_overview.board %}
+<span class="front-board-line">
+{%- if board is not none %}
+<span class="front-board-label">Board</span>
+<span data-board-count="cards">{{ board.cards }} {{ "card" if board.cards == 1 else "cards" }}</span>
+{%- if board.in_review %} · <span data-board-count="in_review">{{ board.in_review }} in review</span>{% endif %}
+{%- if board.blocked %} · <span class="is-warn" data-board-count="blocked">{{ board.blocked }} blocked</span>{% endif %}
+{%- if board.needs_info %} · <span class="is-warn" data-board-count="needs_info">{{ board.needs_info }} need info</span>{% endif %}
+{%- if not board.complete %} · <span class="is-warn" title="An instance's board could not be read">partial</span>{% endif %}
+{%- endif %}
+</span>
+<span class="front-links">
+<a href="/works">All Works</a>
+{%- if front.quiet %}<a href="/works" data-quiet-link>{{ front.quiet }} quiet {{ "Work" if front.quiet == 1 else "Works" }}</a>{% endif %}
+{%- if work_overview.archived %}<a href="/works?view=archived" data-archived-link>Archived ({{ work_overview.archived }})</a>{% endif %}
+<a class="front-board-open" href="/pollers">Board</a>
+{% if chat_board_shown %}<a href="/chat-board">ChatGPT chats</a>{% endif %}
+<a href="/chats" data-all-chats>All chats</a>
+</span>
+{%- endif %}

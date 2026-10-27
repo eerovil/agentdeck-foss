@@ -1,0 +1,432 @@
+"""Voice mode's speech routes (#3409) and its fast agent's routes (#3444).
+
+The page posts a recorded phrase here and gets its words back, and posts the text it
+will read and gets the audio back. Both are passed on to the host's speech service
+(``scripts/speech_server.py``) over its Unix socket, ``[speech] socket``; audio never
+leaves the host. A 503 means the service is down or restarting: after a few retries
+🎤 dictation falls back to the browser's recognizer, and voice mode turns off (#3470).
+
+While voice mode waits for its wake word, the page posts each phrase to
+``/api/speech/wake`` first, passed on to the wake word detector
+(``scripts/wake_server.py``) over ``[speech] wake_socket`` (#3476), and reports what
+Whisper made of a waiting phrase to ``/api/speech/wake-log``. Both write a line to
+the wake log, joined by the page's phrase id, which ``scripts/wake_report.py`` reads
+to compare the two checks; a phrase either check woke on, or the detector nearly
+did, keeps its audio there for 30 days.
+
+With ``[speech] keep_audio_days`` set, every transcribed phrase also keeps its
+audio and Whisper's words in ``keep_audio_dir`` for that many days, which
+``scripts/speech_bench.py`` runs other speech-to-text models on (#3499).
+
+``/api/voice/heard`` gives a phrase heard in voice mode to the chat's fast agent
+(``voice_helper``) and returns what to say and what to send; a 503 there means the
+page sends the words as heard and says its own acknowledgement.
+``/api/voice/warm`` starts that agent before a phrase needs it (#3507), and with
+``[speech] tts = "chatterbox"`` has ``scripts/tts_server.py`` load its model too.
+
+With ``[speech] tts = "chatterbox"`` (#3519), ``/api/speech/say`` asks Chatterbox
+over ``[speech] tts_socket`` first. A sentence it fails on, gives no audio for
+within ``TTS_TIMEOUT``, or answers "loading" is read by Piper instead, and after a
+failure Piper reads everything for ``TTS_REST`` seconds, so a reply does not flip
+between the two voices.
+``/sessions/{key}/voice-log`` reads back what the fast agent heard and said (#3475).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import io
+import json
+import logging
+import re
+import time
+import uuid
+import wave
+from collections import OrderedDict
+from datetime import datetime
+from pathlib import Path
+
+import httpx
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import HTMLResponse, JSONResponse, Response
+
+from .. import voice_helper
+from .deps import get_config, get_state, get_templates, require_access
+from .routes_actions import _require_same_origin
+
+log = logging.getLogger(__name__)
+router = APIRouter(dependencies=[Depends(require_access)])
+
+# Thirty seconds of 16 kHz 16-bit mono is under 1 MB; the page cuts a phrase there.
+MAX_AUDIO_BYTES = 4 * 1024 * 1024
+MAX_SAY_CHARS = 2000
+# The first phrase after an idle spell starts the service and loads the model.
+TIMEOUT = httpx.Timeout(60.0, connect=5.0)
+LANGUAGES = ("en", "fi")
+# The wake log (#3476): the page names each waiting phrase with an id like this.
+PHRASE_ID = re.compile(r"[A-Za-z0-9-]{1,64}")
+WAKE_LOG = "wake-log.jsonl"
+# A detector score over this keeps the phrase's audio even when it did not wake.
+NEAR_MISS = 0.2
+KEEP_AUDIO_S = 30 * 86400
+# Whisper's answer on a waiting phrase arrives after the detector's: the last few
+# phrases' audio waits here, so one only Whisper woke on is kept too.
+RECENT_PHRASES = 20
+_recent_audio: OrderedDict[str, bytes] = OrderedDict()
+MAX_ID_CHARS = 40
+# Phrases kept for comparing speech-to-text models (#3499).
+KEPT_LOG = "kept.jsonl"
+# Chatterbox (#3519): Piper reads a sentence it has no audio for in this long.
+TTS_TIMEOUT = httpx.Timeout(4.0, connect=1.0)
+# After a Chatterbox failure, Piper reads everything for this many seconds.
+TTS_REST = 300.0
+_tts_down_until = 0.0
+# Warm-ups in flight, held so none is collected before it ends; nothing awaits them.
+_tts_warming: set[asyncio.Task] = set()
+
+
+async def _forward(
+    request: Request, path: str, *, socket: str | None = None, **kwargs
+) -> httpx.Response:
+    if socket is None:
+        socket = get_config(request).speech.socket
+    if not socket:
+        raise HTTPException(status_code=503, detail="no speech service configured")
+    transport = httpx.AsyncHTTPTransport(uds=str(Path(socket).expanduser()))
+    try:
+        async with httpx.AsyncClient(transport=transport, timeout=TIMEOUT) as client:
+            reply = await client.post(f"http://speech{path}", **kwargs)
+    except httpx.HTTPError as exc:
+        log.warning("speech service unreachable: %s", exc)
+        raise HTTPException(status_code=503, detail="speech service unreachable") from exc
+    if reply.status_code != 200:
+        log.warning("speech service %s answered %s: %s", path, reply.status_code, reply.text[:200])
+        raise HTTPException(status_code=503, detail="speech service failed")
+    return reply
+
+
+async def _audio(request: Request) -> bytes:
+    audio = await request.body()
+    if not audio:
+        raise HTTPException(status_code=400, detail="no audio")
+    if len(audio) > MAX_AUDIO_BYTES:
+        raise HTTPException(status_code=413, detail="phrase too long")
+    return audio
+
+
+@router.post("/api/speech/transcribe")
+async def transcribe(request: Request) -> JSONResponse:
+    """A recorded phrase (16-bit WAV) as ``{"text", "language"}``."""
+    _require_same_origin(request)
+    audio = await _audio(request)
+    pinned = get_config(request).speech.language
+    # The language heard last: a phrase too short to tell keeps it.
+    previous = request.query_params.get("language")
+    if pinned in LANGUAGES:
+        path = f"/transcribe?only={pinned}"
+    elif previous in LANGUAGES:
+        path = f"/transcribe?language={previous}"
+    else:
+        path = "/transcribe"
+    started = time.monotonic()
+    reply = await _forward(request, path, content=audio, headers={"Content-Type": "audio/wav"})
+    heard = reply.json()
+    language = pinned if pinned in LANGUAGES else heard.get("language")
+    speech = get_config(request).speech
+    if speech.keep_audio_days > 0:
+        line = {
+            "id": _phrase_id(request.query_params.get("id")) or uuid.uuid4().hex[:12],
+            "text": str(heard.get("text") or ""),
+            "language": heard.get("language"),
+            "only": pinned if pinned in LANGUAGES else "",
+            "seconds": _seconds(audio),
+            "ms": round((time.monotonic() - started) * 1000),
+        }
+        await asyncio.to_thread(
+            _write_log,
+            Path(speech.keep_audio_dir).expanduser(),
+            KEPT_LOG,
+            line,
+            audio,
+            speech.keep_audio_days * 86400,
+        )
+    return JSONResponse(
+        {
+            "text": str(heard.get("text") or ""),
+            "language": language if language in LANGUAGES else "en",
+        }
+    )
+
+
+def _seconds(audio: bytes) -> float:
+    try:
+        with wave.open(io.BytesIO(audio)) as w:
+            return round(w.getnframes() / w.getframerate(), 2)
+    except (wave.Error, EOFError, ZeroDivisionError):
+        return 0.0
+
+
+def _write_wake_log(folder: Path, line: dict, audio: bytes | None) -> None:
+    _write_log(folder, WAKE_LOG, line, audio, KEEP_AUDIO_S)
+
+
+def _write_log(folder: Path, name: str, line: dict, audio: bytes | None, keep_s: float) -> None:
+    """One line of the log ``name``, and the phrase's audio beside it when given.
+
+    Every line also drops audio older than ``keep_s``, so recordings expire
+    whether or not anything new is kept."""
+    folder.mkdir(parents=True, exist_ok=True)
+    if audio is not None and line.get("id"):
+        target = folder / f"{line['id']}.wav"
+        if not target.exists():
+            target.write_bytes(audio)
+    cutoff = time.time() - keep_s
+    for old in folder.glob("*.wav"):
+        try:
+            if old.stat().st_mtime < cutoff:
+                old.unlink(missing_ok=True)
+        except FileNotFoundError:
+            pass
+    with (folder / name).open("a", encoding="utf-8") as log_file:
+        log_file.write(json.dumps({"at": round(time.time(), 3), **line}) + "\n")
+
+
+def _phrase_id(value: object) -> str:
+    text = str(value or "")
+    return text if PHRASE_ID.fullmatch(text) else ""
+
+
+@router.post("/api/speech/wake")
+async def wake(request: Request) -> JSONResponse:
+    """A phrase heard while waiting (16-bit WAV) as the wake word detector's
+    ``{"woken", "score", "speech_after"}`` (#3476). ``?id=`` names the phrase in the
+    wake log."""
+    _require_same_origin(request)
+    audio = await _audio(request)
+    speech = get_config(request).speech
+    if not speech.wake_socket:
+        raise HTTPException(status_code=503, detail="no wake word detector configured")
+    phrase = _phrase_id(request.query_params.get("id"))
+    started = time.monotonic()
+    reply = await _forward(
+        request,
+        f"/wake?threshold={speech.wake_threshold}",
+        socket=speech.wake_socket,
+        content=audio,
+        headers={"Content-Type": "audio/wav"},
+    )
+    found = reply.json()
+    result = {
+        "woken": bool(found.get("woken")),
+        "score": float(found.get("score") or 0.0),
+        "speech_after": bool(found.get("speech_after")),
+    }
+    if phrase:
+        _recent_audio[phrase] = audio
+        while len(_recent_audio) > RECENT_PHRASES:
+            _recent_audio.popitem(last=False)
+    keep = result["woken"] or result["score"] > NEAR_MISS
+    line = {
+        "id": phrase,
+        "check": "detector",
+        "mode": speech.wake,
+        "seconds": _seconds(audio),
+        "ms": round((time.monotonic() - started) * 1000),
+        **result,
+    }
+    await asyncio.to_thread(
+        _write_wake_log, Path(speech.wake_log_dir).expanduser(), line, audio if keep else None
+    )
+    return JSONResponse(result)
+
+
+@router.post("/api/speech/wake-log")
+async def wake_log(request: Request) -> Response:
+    """What Whisper made of a waiting phrase, for the wake log (#3476): ``{"id",
+    "text", "matched", "ms", "detected"}``. ``matched`` is the page's own wake word
+    check, ``ms`` the wait from the phrase's end to the words, ``detected`` that
+    the detector woke on it first. ``{"waiting": "start"|"stop", "spell"}`` marks
+    when a spell of waiting starts and stops instead, so the report counts the time
+    really spent waiting."""
+    _require_same_origin(request)
+    body = await _json_object(request)
+    speech = get_config(request).speech
+    folder = Path(speech.wake_log_dir).expanduser()
+    if "waiting" in body:
+        spell = _phrase_id(body.get("spell"))
+        if body.get("waiting") not in ("start", "stop") or not spell:
+            raise HTTPException(status_code=400, detail="a waiting start or stop and its spell")
+        line = {"check": "waiting", "state": body["waiting"], "spell": spell, "mode": speech.wake}
+        await asyncio.to_thread(_write_wake_log, folder, line, None)
+        return Response(status_code=204)
+    phrase = _phrase_id(body.get("id"))
+    if not phrase:
+        raise HTTPException(status_code=400, detail="no phrase id")
+    matched = bool(body.get("matched"))
+    ms = body.get("ms")
+    line = {
+        "id": phrase,
+        "check": "whisper",
+        "mode": speech.wake,
+        "text": str(body.get("text") or "")[:MAX_SAY_CHARS],
+        "matched": matched,
+        "ms": round(ms) if isinstance(ms, int | float) else None,
+        "detected": bool(body.get("detected")),
+    }
+    audio = _recent_audio.get(phrase) if matched else None
+    await asyncio.to_thread(_write_wake_log, folder, line, audio)
+    return Response(status_code=204)
+
+
+async def _json_object(request: Request) -> dict:
+    try:
+        body = await request.json()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="expected JSON") from exc
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="expected a JSON object")
+    return body
+
+
+@router.post("/api/speech/say")
+async def say(request: Request) -> Response:
+    """``{"text", "language"}`` read aloud, as WAV."""
+    _require_same_origin(request)
+    body = await _json_object(request)
+    text = str(body.get("text") or "").strip()[:MAX_SAY_CHARS]
+    if not text:
+        raise HTTPException(status_code=400, detail="no text")
+    language = body.get("language") if body.get("language") in LANGUAGES else "en"
+    speech = get_config(request).speech
+    if speech.tts == "chatterbox" and speech.tts_socket:
+        wav = await _chatterbox(speech, text, language)
+        if wav is not None:
+            return Response(wav, media_type="audio/wav", headers={"Cache-Control": "no-store"})
+    voice = getattr(speech, f"voice_{language}")
+    speed = getattr(speech, f"speed_{language}")
+    reply = await _forward(
+        request,
+        "/say",
+        json={"text": text, "language": language, "voice": voice, "speed": speed},
+    )
+    return Response(reply.content, media_type="audio/wav", headers={"Cache-Control": "no-store"})
+
+
+async def _chatterbox(speech, text: str, language: str) -> bytes | None:
+    """Chatterbox's WAV for ``text``, or None for Piper to read it (#3519)."""
+    global _tts_down_until
+    if time.monotonic() < _tts_down_until:
+        return None
+    transport = httpx.AsyncHTTPTransport(uds=str(Path(speech.tts_socket).expanduser()))
+    payload = {
+        "text": text,
+        "language": language,
+        "exaggeration": speech.tts_exaggeration,
+        "cfg_weight": getattr(speech, f"tts_cfg_{language}"),
+    }
+    try:
+        async with httpx.AsyncClient(transport=transport, timeout=TTS_TIMEOUT) as client:
+            reply = await client.post("http://tts/say", json=payload)
+    except httpx.HTTPError as exc:
+        log.warning("Chatterbox unreachable or slow, Piper reads: %r", exc)
+        _tts_down_until = time.monotonic() + TTS_REST
+        return None
+    if reply.status_code == 200:
+        return reply.content
+    if reply.status_code == 503 and "loading" in reply.text:
+        return None
+    log.warning("Chatterbox answered %s, Piper reads: %s", reply.status_code, reply.text[:200])
+    _tts_down_until = time.monotonic() + TTS_REST
+    return None
+
+
+async def _warm_chatterbox(speech) -> None:
+    """Have Chatterbox load its model while voice mode listens; run as a task that
+    nothing waits on, so a slow socket never holds up the fast agent's warm-up."""
+    transport = httpx.AsyncHTTPTransport(uds=str(Path(speech.tts_socket).expanduser()))
+    try:
+        async with httpx.AsyncClient(transport=transport, timeout=TTS_TIMEOUT) as client:
+            await client.post("http://tts/warm")
+    except httpx.HTTPError as exc:
+        log.info("Chatterbox warm-up failed: %r", exc)
+
+
+@router.post("/api/voice/heard")
+async def voice_heard(request: Request) -> JSONResponse:
+    """``{"session_key", "text", "aloud"}`` heard in voice mode, as the fast agent's
+    ``{"say", "relay"}``: what to say now and what to send the chat (null: nothing)."""
+    _require_same_origin(request)
+    body = await _json_object(request)
+    key = str(body.get("session_key") or "").strip()
+    text = str(body.get("text") or "").strip()
+    if not key or not text:
+        raise HTTPException(status_code=400, detail="a session key and words are needed")
+    aloud = body.get("aloud") if isinstance(body.get("aloud"), list) else []
+    lines = [str(line) for line in aloud[-5:] if isinstance(line, str)]
+    phrase_id = str(body.get("id") or "").strip()[:MAX_ID_CHARS]
+    run = str(body.get("run") or "").strip()[:MAX_ID_CHARS]
+    answer = await voice_helper.heard(request.app, key, text, lines, phrase_id, run)
+    if answer is None:
+        raise HTTPException(status_code=503, detail="the fast agent has no answer")
+    return JSONResponse({"say": answer.say, "relay": answer.relay})
+
+
+@router.post("/api/voice/sent")
+async def voice_sent(request: Request) -> Response:
+    """``{"session_key", "id", "text", "how"}``: what the page really sent for a phrase
+    (``text`` null: nothing, and ``how`` says why), saved in the voice log (#3475)."""
+    _require_same_origin(request)
+    body = await _json_object(request)
+    key = str(body.get("session_key") or "").strip()
+    phrase_id = str(body.get("id") or "").strip()[:MAX_ID_CHARS]
+    if not key or not phrase_id:
+        raise HTTPException(status_code=400, detail="a session key and a phrase id are needed")
+    text = body.get("text")
+    text = str(text)[: voice_helper.MAX_HEARD_CHARS * 2] if isinstance(text, str) else None
+    how = str(body.get("how") or "")[:MAX_SAY_CHARS]
+    await voice_helper.sent(key, phrase_id, text, how)
+    return Response(status_code=204)
+
+
+@router.post("/api/voice/warm")
+async def voice_warm(request: Request) -> Response:
+    """Voice mode is listening: start the chat's fast agent before a phrase needs it,
+    and Chatterbox's model before a reply does (#3519)."""
+    _require_same_origin(request)
+    body = await _json_object(request)
+    key = str(body.get("session_key") or "").strip()
+    run = str(body.get("run") or "").strip()[:MAX_ID_CHARS]
+    speech = get_config(request).speech
+    if speech.tts == "chatterbox" and speech.tts_socket:
+        task = asyncio.create_task(_warm_chatterbox(speech))
+        _tts_warming.add(task)
+        task.add_done_callback(_tts_warming.discard)
+    if key:
+        await voice_helper.warm(request.app, key, run)
+    return Response(status_code=204)
+
+
+@router.post("/api/voice/end")
+async def voice_end(request: Request) -> Response:
+    """Voice mode turned off: the chat's fast agent and its memory go."""
+    _require_same_origin(request)
+    body = await _json_object(request)
+    key = str(body.get("session_key") or "").strip()
+    run = str(body.get("run") or "").strip()[:MAX_ID_CHARS]
+    if key:
+        await voice_helper.end(key, run)
+    return Response(status_code=204)
+
+
+@router.get("/sessions/{session_key}/voice-log", response_class=HTMLResponse)
+async def voice_log(request: Request, session_key: str) -> HTMLResponse:
+    """The chat's saved voice conversations, newest first: every leg of it (#3475)."""
+    keys = get_state(request).chat_session_keys(session_key)
+    phrases = voice_helper.saved(dict.fromkeys((*keys, session_key)))
+    for phrase in phrases:
+        phrase["when"] = datetime.fromtimestamp(phrase["at"]).strftime("%Y-%m-%d %H:%M:%S")
+    return get_templates(request).TemplateResponse(
+        request,
+        "voice_log.html",
+        {"session_key": session_key, "phrases": phrases, "answered": voice_helper.ANSWERED},
+    )

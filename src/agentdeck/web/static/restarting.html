@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark light">
+<meta name="theme-color" content="#14161a">
+<title>agentdeck — restarting</title>
+<link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+<!--
+  The screen the service worker shows instead of the reverse proxy's raw
+  "502 Bad Gateway" while agentdeck.service is down (issue #606). The deck sits
+  behind `tailscale serve`, which answers 502 for the few seconds a deploy takes
+  to hand over to a new process; on a phone that reads as "the deck is broken".
+
+  Everything this page needs is inline on purpose. It is displayed exactly when
+  the origin is unreachable, so it must not depend on a second request landing —
+  app.css and a sibling script would both be cache-hits at best and a second way
+  to fail at worst. Absolute URLs throughout: the worker serves this body under
+  whatever path the user asked for, so relative ones would resolve against that.
+-->
+<style>
+  :root {
+    --bg: #14161a; --panel: #1c2027; --fg: #e6e8ec; --muted: #8b93a1;
+    --line: #2c313c; --accent: #58a6ff;
+  }
+  @media (prefers-color-scheme: light) {
+    :root { --bg:#f5f6f8; --panel:#fff; --fg:#1b1f27; --muted:#5b6472; --line:#dde1e8; }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; min-height: 100dvh;
+    display: flex; align-items: center; justify-content: center;
+    padding: calc(16px + env(safe-area-inset-top, 0)) 16px
+             calc(16px + env(safe-area-inset-bottom, 0));
+    background: var(--bg); color: var(--fg);
+    font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    -webkit-text-size-adjust: 100%;
+  }
+  .card {
+    width: 100%; max-width: 380px; padding: 22px 20px 18px; text-align: center;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 14px;
+  }
+  .brand {
+    color: var(--muted); font-size: 11px; font-weight: 700;
+    letter-spacing: .12em; text-transform: uppercase;
+  }
+  .spinner {
+    width: 30px; height: 30px; margin: 16px auto 14px;
+    border: 3px solid var(--line); border-top-color: var(--accent);
+    border-radius: 50%; animation: spin .8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) {
+    .spinner { animation-duration: 2.4s; }
+  }
+  h1 { margin: 0 0 6px; font-size: 19px; font-weight: 700; }
+  p { margin: 0; color: var(--muted); font-size: 13px; }
+  .status {
+    margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line);
+    display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  }
+  .status-text { color: var(--muted); font-size: 12px; text-align: left; }
+  button {
+    flex: none; padding: 7px 12px; border: 1px solid var(--line); border-radius: 8px;
+    background: var(--bg); color: var(--fg); font: inherit; font-size: 12px;
+    font-weight: 650; cursor: pointer;
+  }
+  button:hover, button:focus-visible { border-color: var(--accent); color: var(--accent); }
+</style>
+</head>
+<body data-restarting-screen>
+  <main class="card" role="status" aria-live="polite">
+    <div class="brand">agentdeck</div>
+    <div class="spinner" aria-hidden="true"></div>
+    <h1>Restarting</h1>
+    <p>The deck is coming back up. This page reloads itself the moment it does.</p>
+    <div class="status">
+      <span class="status-text" id="status">Waiting for the deck…</span>
+      <button type="button" id="retry">Retry now</button>
+    </div>
+  </main>
+<script>
+(function () {
+  // Poll the app's own liveness endpoint rather than re-fetching this page's
+  // URL: /healthz is the cheapest thing that only answers once the new process
+  // is actually serving, and a failed poll costs nothing while the port is shut.
+  var statusEl = document.getElementById('status');
+  var delay = 800;      // first check is quick — most restarts finish in seconds
+  var timer = null;
+  var checking = false;
+  var reloading = false;
+  var attempts = 0;
+
+  function say(text) { statusEl.textContent = text; }
+
+  function schedule(ms) {
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(check, ms);
+  }
+
+  function check() {
+    if (checking || reloading) return;
+    checking = true;
+    attempts += 1;
+    say('Checking…');
+    // no-store so neither the HTTP cache nor a stale worker can answer for a
+    // process that is still down.
+    fetch('/healthz', { cache: 'no-store' }).then(function (res) {
+      checking = false;
+      if (res && res.ok) {
+        reloading = true;
+        say('Back — reloading…');
+        // This body was served under the URL the user originally asked for, so
+        // a plain reload lands them back on that page, not on some fallback.
+        window.location.reload();
+        return;
+      }
+      down();
+    }).catch(function () {
+      checking = false;
+      down();
+    });
+  }
+
+  function down() {
+    say(attempts > 1 ? 'Still restarting… (checked ' + attempts + ' times)'
+                     : 'Still restarting…');
+    // Back off gently so a long restart doesn't hammer the proxy, but stay
+    // responsive enough that the screen never outlives the outage by much.
+    delay = Math.min(Math.round(delay * 1.4), 5000);
+    schedule(delay);
+  }
+
+  function checkNow() {
+    delay = 800;
+    schedule(0);
+  }
+
+  document.getElementById('retry').addEventListener('click', checkNow);
+  // A phone that was asleep through the whole restart should recover on the
+  // first look, not after the backoff timer next fires.
+  document.addEventListener('visibilitychange', function () {
+    if (document.visibilityState === 'visible') checkNow();
+  });
+  window.addEventListener('online', checkNow);
+
+  schedule(delay);
+})();
+</script>
+</body>
+</html>

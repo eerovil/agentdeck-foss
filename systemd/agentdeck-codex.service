@@ -1,0 +1,19 @@
+[Unit]
+Description=agentdeck persistent Codex runtime
+After=network-online.target
+
+[Service]
+WorkingDirectory=%h/agentdeck
+ExecStart=%h/agentdeck/.venv/bin/agentdeck codex-runtime
+Restart=on-failure
+RestartSec=5
+Environment=AGENTDECK_CONFIG=%h/.config/agentdeck/config.toml
+# Optional centralized error reporting (#1514). Unset, failures stay in the
+# journal exactly as before; set, unhandled failures reach one monitored place.
+#Environment=AGENTDECK_SENTRY_DSN=
+RuntimeDirectory=agentdeck
+RuntimeDirectoryMode=0700
+KillMode=control-group
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,111 @@
+{# One session row. `s` = Session. The transcript owns complete messages; cards
+   intentionally carry bounded previews so a single long turn cannot dominate
+   the page. #}
+{% set card_prompt = s.last_prompt | card_preview %}
+{% set card_text = s.last_text | card_preview %}
+<a class="session {{ s.status }} wt-{{ s.worker_type or 'you' }}{% if selected_session_key == s.key %} selected{% endif %}"
+   href="{{ s.detail_path }}" data-session-key="{{ s.key }}" data-chat-key="{{ s.row_key }}"
+   {# The same fields the chats page's account/project/source filters match on in
+      `render.ChatListQuery` (#2603): the account key is stable while its badge text
+      is not, the project is the identity that prefixes generated titles, and the
+      source is the classification the left stripe is coloured by. #}
+   data-account="{{ s.account_key }}" data-source="{{ s.worker_type or 'you' }}"
+   data-project="{{ s.project_name or '' }}"
+   data-agentdeck-action="open_session"
+   {% set activity_at = s.last_progress or s.last_activity %}
+   {% if activity_at %}data-last-activity-at="{{ activity_at.isoformat() }}"{% endif %}
+   data-working="{{ '1' if s.thinking else '0' }}"{% if selected_session_key == s.key %}
+   aria-current="page"{% endif %}>
+  <div class="session-actions">
+    {% if s.generated_title and s.project_name %}<span class="session-project" title="{{ s.project_name }}">{{ s.project_name }}</span>{% endif %}
+    {% set _kids = (children_of | default({})).get(s.key) %}
+    {% if _kids %}{% set _working = _kids | selectattr('thinking') | list | length %}{% set _waiting = _kids | selectattr('question') | list | length %}<span class="subagent-toggle" data-subagents-toggle data-key="{{ s.key }}" data-parent-chat-key="{{ s.row_key }}" role="button" tabindex="0" aria-expanded="false" aria-label="show sub-agents" title="show sub-agents"><span class="subagent-caret" aria-hidden="true">▸</span>{{ _kids | length }} sub-agent{{ '' if _kids | length == 1 else 's' }}{% if _waiting %}<span class="subagent-hint waiting" title="{{ _waiting }} waiting on your answer">{{ _waiting }} waiting</span>{% elif _working %}<span class="subagent-hint working" title="{{ _working }} working now" aria-label="{{ _working }} working now"></span>{% endif %}</span>{% elif s.subagent_count %}<span class="subagent-badge" title="This chat is running spawned agents">{{ s.subagent_count }} sub-agent{{ '' if s.subagent_count == 1 else 's' }}</span>{% endif %}
+    {% if s.issue_url %}<span class="gh-btn" role="button" tabindex="0" data-href="{{ s.issue_url|issue_href }}" title="Open GitHub issue" aria-label="open GitHub issue"><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M8 0c4.42 0 8 3.58 8 8a8.013 8.013 0 0 1-5.45 7.59c-.4.08-.55-.17-.55-.38 0-.27.01-1.13.01-2.2 0-.75-.25-1.23-.54-1.48 1.78-.2 3.65-.88 3.65-3.95 0-.88-.31-1.59-.82-2.15.08-.2.36-1.02-.08-2.12 0 0-.67-.22-2.2.82-.64-.18-1.32-.27-2-.27-.68 0-1.36.09-2 .27-1.53-1.03-2.2-.82-2.2-.82-.44 1.1-.16 1.92-.08 2.12-.51.56-.82 1.28-.82 2.15 0 3.06 1.86 3.75 3.64 3.95-.23.2-.44.55-.51 1.07-.46.21-1.61.55-2.33-.66-.15-.24-.6-.83-1.23-.82-.67.01-.27.38.01.53.34.19.73.9.82 1.13.16.45.68 1.31 2.69.94 0 .67.01 1.3.01 1.49 0 .21-.15.45-.55.38A7.995 7.995 0 0 1 0 8c0-4.42 3.58-8 8-8Z"/></svg></span>{% endif %}
+    {% if s.deep_link %}<span class="cc-btn" role="button" tabindex="0" data-href="{{ s.deep_link }}" title="{{ s.deep_link_label or 'open session' }}" aria-label="{{ s.deep_link_label or 'open session' }}">{{ s.deep_link_label or 'open' }} ↗</span>{% endif %}
+    {% if s.last_prompt or s.last_text %}<span class="expand-btn" data-expand role="button" tabindex="0" aria-label="expand messages" title="expand">⌄</span>{% endif %}
+    {# Babysit (#824): take a mute lease on this chat, so its ordinary attention
+       pushes stop while somebody is attending it.
+       Same optimistic shape as the Done control beside it — both directions are
+       rendered, CSS shows the one `data-bs-view` names, and `data-bs-state`
+       stays the server's own answer, because these cards swap under SSE and a
+       control that waited for the server would lose its state on the next swap. #}
+    <span class="babysit-control" data-babysit-control
+          data-bs-state="{{ 'on' if s.muted else 'off' }}"
+          data-bs-view="{{ 'on' if s.muted else 'off' }}">
+      <span class="babysit-btn" data-session-babysit data-babysit-action="start" data-bs-when="off"
+            role="button" tabindex="0" aria-label="babysit this chat"
+            title="Babysit: this chat is attended and its pings pause"><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M8 3C4.5 3 1.7 5.1.5 8c1.2 2.9 4 5 7.5 5s6.3-2.1 7.5-5C14.3 5.1 11.5 3 8 3Zm0 8.3A3.3 3.3 0 1 1 8 4.7a3.3 3.3 0 0 1 0 6.6Zm0-5.3a2 2 0 1 0 0 4 2 2 0 0 0 0-4Z"/></svg></span>
+      <span class="babysit-btn is-on" data-session-babysit data-babysit-action="stop" data-bs-when="on"
+            role="button" tabindex="0" aria-label="stop babysitting this chat"
+            title="This chat is being babysat — press to hand it back"><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M8 3C4.5 3 1.7 5.1.5 8c1.2 2.9 4 5 7.5 5s6.3-2.1 7.5-5C14.3 5.1 11.5 3 8 3Zm0 8.3A3.3 3.3 0 1 1 8 4.7a3.3 3.3 0 0 1 0 6.6Zm0-5.3a2 2 0 1 0 0 4 2 2 0 0 0 0-4Z"/></svg></span>
+    </span>
+  </div>
+  <div class="session-main">
+    <span class="dot {{ s.status }}{% if s.thinking %} thinking{% elif s.turn_failed %} failed{% endif %}"
+          title="{{ s.display_state }}"></span>
+    <span class="card-title" title="{{ s.display_title }}">{{ s.generated_title_subject or s.display_title }}</span>
+  </div>
+  {# The row the deleted deferral projection freed (#823). A mute must never be
+     invisible: a chat something claims to be babysitting says so on its own
+     card, so a wrong mute is something the boss can see rather than silence
+     they cannot. Same element and CSS as the question row, relabelled. #}
+  {% if s.question or s.muted %}
+  <div class="card-question{% if s.muted %} muted{% endif %}" title="{% if s.muted %}this chat is being babysat{% else %}the agent is waiting on your answer{% endif %}">
+    <span class="q-dot"></span>{% if s.muted %}<span class="question-state">babysat</span>{% endif %}<span class="q-text"><bdi>{{ s.question or "this chat is being handled" }}</bdi></span>
+  </div>
+  {% endif %}
+  {% set queue = queue_summaries.get(s.key) if queue_summaries else None %}
+  {% if queue %}
+  <div class="card-pending" data-pending-count="{{ queue.count }}"
+       title="This message remains queued after you leave the page">
+    <span class="pending-badge">{{ queue.count }} pending</span>
+    <span class="pending-text">{{ queue.text }}</span>
+  </div>
+  {% endif %}
+  {% if card_prompt %}
+  {# Your own latest message, pinned above the reply window so a long agent
+     reply can never scroll it out of the card (issue #290). #}
+  <div class="card-mine" title="your latest message in this chat">
+    <span class="mine-arrow" aria-hidden="true">↳</span><span class="mine-text">{{ card_prompt }}</span>
+  </div>
+  {% endif %}
+  {% if card_prompt or card_text %}
+  {# Collapsed cards stream the agent side only — the prompt already has the
+     pinned row above. Expanding re-renders the full interleaved feed in JS. #}
+  <div class="card-latest" data-marquee data-prompt="{{ card_prompt }}" data-text="{{ card_text }}" data-latest-role="{{ s.last_role or 'agent' }}"><span class="latest-scroll">
+    {% if card_text %}<span class="latest-line agent"><span class="latest-arrow">⟳</span><span class="lt-text">{{ card_text }}</span></span>{% endif %}
+  </span></div>
+  {% endif %}
+  <div class="session-meta">
+    {# One pill for the whole row (#1690): its words are the work item — the pull
+       request when there is one, else the issue, never both — and its colour is
+       the Deckhand state, which no longer spends words saying "waiting" or
+       "finished". A row with no work item still needs its colour, so it wears the
+       same pill shrunk to a dot.
+       The tick (#2121) is already inside `work.label`, so it rides the pill the
+       row already has rather than adding an element: it says a review passed on
+       the commit this row speaks for *now*, and the title names that commit. It
+       deliberately gets no colour of its own — the colour here is the Deckhand
+       state and stays that. A row with no work item has no pill to tick. #}
+    {% set dh = deckhand_status.get(s.key) %}
+    {% set work = work_item_pill.get(s.key) %}
+    {# One string for both the tooltip and the accessible name, so a pointer and a
+       screen reader are told the same thing. `role="img"` is what makes the name
+       count: a bare span is `role="generic"`, which does not support naming, so an
+       `aria-label` on its own would be dropped. The dot below has done exactly this
+       since #1690. Without it the tick is announced as "check mark" and nothing
+       says which commit it means. #}
+    {% set work_title = work.title ~ (' · ' ~ dh.title if dh else '') if work %}
+    {% if work %}<span class="dh-pill{% if dh %} dh-{{ dh.state }}{% endif %}{% if work.reviewed_sha %} dh-reviewed{% endif %}" data-work-open="{{ 1 if work.is_open else 0 }}"{% if work.reviewed_sha %} data-reviewed-sha="{{ work.reviewed_sha }}"{% endif %} role="img" title="{{ work_title }}" aria-label="{{ work_title }}">{{ work.label }}</span>
+    {% elif dh %}<span class="dh-pill dh-{{ dh.state }} dh-dot" role="img" title="{{ dh.title }}" aria-label="{{ dh.title }}"></span>{% endif %}
+    {% if label %}<span class="acct-badge{% if label_class %} acct-{{ label_class }}{% endif %}">{{ label }}</span>{% endif %}
+    {# A turn whose last word is an authentication error did not answer, whatever its
+       exit said: the account's login is what needs fixing, not the prompt (#298). #}
+    {% if s.last_role == 'agent' and s.last_text | auth_failure %}<span class="st-badge st-closed" title="This chat's account could not authenticate — reconnect it from the usage panel">login expired</span>{% endif %}
+    {% if s.cwd %}<span class="cwd" title="{{ s.cwd }}">{{ s.cwd.name or s.cwd }}</span>{% endif %}
+    {% if s.cwd and s.cwd | is_deploy_checkout %}<span class="live-checkout-badge" title="This chat runs in the live deploy checkout — edits here block or damage deploys (#786)">live checkout</span>{% endif %}
+    {% if s.kind %}<span class="kind">{{ s.kind }}</span>{% endif %}
+    {% if s.context_tokens %}<span class="ctx {{ s.context_tokens | ctx_level }}" title="context window in use ({{ '{:,}'.format(s.context_tokens) }} tokens on the last request)">{{ s.context_tokens | ktok }} ctx</span>{% endif %}
+    {% if s.last_activity %}<span class="ago">{{ s.last_activity | reltime_ago }}</span>{% endif %}
+  </div>
+</a>

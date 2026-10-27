@@ -1,0 +1,47 @@
+{#- Messages sent while this chat's runtime was restarting (#2847). The deck keeps
+    each one and sends it by itself once the runtime is back, so the page may be
+    closed; the row goes when the message is delivered. A retry after a usage limit or
+    a lost connection (#3086) is held the same way until its time. Drawn as the chat's own
+    waiting bubble, just below the transcript, and redrawn over SSE. #}
+<div id="held-messages" class="held-messages"
+     sse-swap="held-messages" hx-swap="outerHTML"
+     {% if held_oob | default(false) %}hx-swap-oob="outerHTML"{% endif %}>
+  {% for item in held_messages %}
+  <div class="ev user pending-message held-message{% if item.state == 'failed' %} unsent-message{% endif %}" data-held-message="{{ item.id }}">
+    <div class="ev-head">
+      <span class="ev-role">user</span>
+      {% if item.state == 'scheduled' %}
+      {% if item.quota_retry %}
+      <span class="message-state">Retrying at <time datetime="{{ item.due_at.isoformat() }}" title="{{ item.due_at | chat_time_title }}">{{ item.due_at | chat_time }}</time> — continues by itself</span>
+      {% else %}
+      <span class="message-state">Waiting for the runtime to restart — sends by itself</span>
+      {% endif %}
+      {% elif item.state == 'dispatching' %}
+      {% if item.quota_retry %}
+      <span class="message-state">Retrying at <time datetime="{{ item.due_at.isoformat() }}" title="{{ item.due_at | chat_time_title }}">{{ item.due_at | chat_time }}</time> — continuing now…</span>
+      {% else %}
+      <span class="message-state">Sending now…</span>
+      {% endif %}
+      {% else %}
+      <span class="message-state failed">Not sent</span>
+      {% endif %}
+      <time class="ev-time" datetime="{{ item.created_at.isoformat() }}" title="{{ item.created_at | chat_time_title }}">{{ item.created_at | chat_time }}</time>
+      {% if item.state != 'dispatching' %}
+      <button type="button" class="pending-dismiss held-message-cancel"
+              aria-label="{{ 'Cancel this message' if item.state == 'scheduled' else 'Remove this unsent message' }}"
+              title="{{ 'Cancel: the message is not sent.' if item.state == 'scheduled' else 'Remove this row. The text goes with it.' }}"
+              hx-post="/sessions/{{ session_key }}/held/{{ item.id }}/cancel"
+              hx-target="#held-messages" hx-swap="outerHTML"
+              hx-disabled-elt="this">✕</button>
+      {% endif %}
+    </div>
+    <div class="ev-text">{{ item.text | display_message }}</div>
+    {% if item.attachments %}
+    <div class="held-message-note">{{ item.attachments | length }} attachment{% if item.attachments | length != 1 %}s{% endif %} kept with it</div>
+    {% endif %}
+    {% if item.state == 'failed' %}
+    <div class="message-error">{% if item.reason %}{{ item.reason[:1] | upper }}{{ item.reason[1:] }}. {% endif %}Copy the text and send it again.</div>
+    {% endif %}
+  </div>
+  {% endfor %}
+</div>

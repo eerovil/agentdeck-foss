@@ -1,0 +1,12 @@
+{#- What became of a message also posted to the issue (#2416). The slot sits above the
+    composer so a sentence and its link have room; a ticked send swaps it in out of band,
+    and the chat page fills it from the ledger when the newest post went wrong lately. #}
+<div id="issue-post-notice" class="issue-post-notice{% if notice %} is-{{ notice.code }}{% endif %}" role="status"
+     {%- if notice_oob %} hx-swap-oob="true"{% endif %}
+     {%- if notice %} data-issue-post-action="{{ notice.action_id }}"{% else %} hidden{% endif %}>
+  {%- if notice %}
+  <span>{{ notice.text }}</span>
+  <a href="{{ notice.link }}" target="_blank" rel="noopener" aria-label="Open issue #{{ notice.target.number }}">↗</a>
+  <button type="button" class="issue-post-notice-dismiss" data-issue-post-dismiss aria-label="Dismiss">×</button>
+  {%- endif %}
+</div>

@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+
+{% block title %}{{ path.name[:32] }}{% endblock %}
+{% block body_class %}local-file-page{% endblock %}
+{% block body_sse %}{% endblock %}
+{#- No page stream here, so the Mac icon keeps its own small one (#2864). #}
+{% block topbar_sse %} sse-connect="/events/topbar"{% endblock %}
+{% block topbar_nav %}<a class="back" href="/" aria-label="back to AgentDeck">←</a>{% endblock %}
+
+{% block content %}
+<article class="local-file-view">
+  <header class="local-file-head">
+    <h1>{{ path.name }}</h1>
+    <div class="local-file-path">{{ path }}</div>
+    {% if markdown %}
+    <a class="local-file-mode" href="?raw=1">source</a>
+    {% endif %}
+  </header>
+
+  {% if markdown %}
+  <div id="local-markdown" class="local-markdown"></div>
+  <script>
+  document.addEventListener('DOMContentLoaded', function () {
+    document.getElementById('local-markdown').innerHTML = mdToHtml({{ content | tojson }});
+  });
+  </script>
+  {% else %}
+  <pre class="local-source" aria-label="{{ path.name }} source">{% for line in lines %}<span id="L{{ loop.index }}"{% if loop.index == line_number %} class="selected"{% endif %}><a href="#L{{ loop.index }}" aria-label="line {{ loop.index }}">{{ loop.index }}</a><code>{{ line }}</code></span>
+{% endfor %}</pre>
+  {% if line_number %}
+  <script>
+  document.addEventListener('DOMContentLoaded', function () {
+    var line = document.getElementById('L{{ line_number }}');
+    if (line) line.scrollIntoView({block: 'center'});
+  });
+  </script>
+  {% endif %}
+  {% endif %}
+</article>
+{% endblock %}

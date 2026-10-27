@@ -1,0 +1,66 @@
+{# The chats page's filters (#2603): one GET form, so the filtered list is an address that
+   can be bookmarked and every filter is applied by the server at page load. Enter in the
+   box or the Filter button submits; `chats_page.js` submits a ticked box at once. #}
+<form class="chat-filters" method="get" action="/chats" role="search"{% if remember_filters %} data-remember-filters{% endif %}>
+<div class="searchbar">
+  <svg class="search-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+       stroke-width="1.6" stroke-linecap="round" aria-hidden="true">
+    <circle cx="7" cy="7" r="4.5"/><line x1="10.6" y1="10.6" x2="14" y2="14"/>
+  </svg>
+  {# The address carries an applied query, so a reload restores it; a query typed but
+     not yet applied is unsent text and holds base.html's service-worker update back. #}
+  <input id="q" name="q" type="search" inputmode="search" autocomplete="off" enterkeyhint="search"
+         value="{{ chat_query.text }}" placeholder="Filter chats…" aria-label="Filter chats">
+</div>
+<div class="filter-row">
+  <label class="toggle-btn{% if chat_query.hide_closed %} on{% endif %}"><input
+         class="filter-box" type="checkbox" name="closed" value="0"
+         {%- if chat_query.hide_closed %} checked{% endif %}>Hide closed</label>
+  {# Account/project/source pickers stay collapsed so the list's default height on a
+     phone is unchanged; the count keeps a filtered list from looking complete. #}
+  <button id="more-filters" type="button" class="toggle-btn"
+          aria-expanded="{{ 'true' if chat_query.panel_count else 'false' }}"
+          aria-controls="filter-panel">Filters{% if chat_query.panel_count %}<span class="filter-count"
+          aria-label="active filters">{{ chat_query.panel_count }}</span>{% endif %}</button>
+  <button type="submit" class="toggle-btn">Filter</button>
+  {#- `?q=` rather than a bare /chats, which reopens with this device's last filters (#3367). #}
+  {% if chat_query.narrowing %}<a class="filter-clear" href="/chats?q=">Clear</a>{% endif %}
+</div>
+<div id="filter-panel" class="filter-panel"{% if not chat_query.panel_count %} hidden{% endif %}>
+  {% if labels | length > 1 %}
+  <div class="filter-group" role="group" aria-label="Filter by account">
+    <span class="filter-label">Account</span>
+    {% for account_key, account_label in labels.items() %}
+    {% set on = account_key in chat_query.accounts %}
+    <label class="toggle-btn filter-chip{% if on %} on{% endif %}"
+           title="Only chats on the {{ account_label }} account"><input class="filter-box"
+           type="checkbox" name="account" value="{{ account_key }}"{% if on %} checked{% endif %}>{{ account_label }}</label>
+    {% endfor %}
+  </div>
+  {% endif %}
+  {% if chat_projects %}
+  <div class="filter-group" role="group" aria-label="Filter by project">
+    <span class="filter-label">Project</span>
+    {% for project in chat_projects %}
+    {% set on = project in chat_query.projects %}
+    <label class="toggle-btn filter-chip{% if on %} on{% endif %}"
+           title="Only chats in {{ project }}"><input class="filter-box" type="checkbox"
+           name="project" value="{{ project }}"{% if on %} checked{% endif %}>{{ project }}</label>
+    {% endfor %}
+  </div>
+  {% endif %}
+  <div class="filter-group" role="group" aria-label="Filter by source">
+    <span class="filter-label">Source</span>
+    {% for value, label, title in (
+         ("you", "Mine", "Chats you started yourself — here or in the CLI"),
+         ("kanban", "Kanban", "Autonomous kanban worker chats"),
+         ("cloud", "Agent", "Cloud chats an agent spawned remotely"),
+       ) %}
+    {% set on = value in chat_query.sources %}
+    <label class="toggle-btn filter-chip{% if on %} on{% endif %}" title="{{ title }}"><input
+           class="filter-box" type="checkbox" name="source" value="{{ value }}"
+           {%- if on %} checked{% endif %}>{{ label }}</label>
+    {% endfor %}
+  </div>
+</div>
+</form>

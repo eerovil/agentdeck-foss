@@ -1,0 +1,81 @@
+{# The poller board in one line, under Deckhand (#1007). Collapsed by default —
+   the mobile vertical-space rule — and `board_strip.js` restores the operator's
+   own open/closed choice, so an SSE swap of the region above cannot reopen or
+   shut it behind their back. Every card except the done column, so an instance
+   whose cards are all parked still appears (#1025). #}
+<details class="board-strip" id="board-strip" data-board-strip>
+  <summary>
+    <span class="board-strip-chev" aria-hidden="true">&#9656;</span>
+    <span class="board-strip-label">Board</span>
+    {% if board_strip.empty and board_strip.complete %}
+    <span class="board-strip-dot">&middot;</span><span class="board-strip-count">clear</span>
+    {% else %}
+    <span class="board-strip-dot">&middot;</span>
+    <span class="board-strip-count">{{ board_strip.card_count }} cards</span>
+    <span class="board-strip-dot">&middot;</span>
+    <span class="board-strip-count">{{ board_strip.review_count }} in review</span>
+    {% endif %}
+    {% if not board_strip.complete %}
+    {# A zero from a read that failed is not "nothing pending" — say which part
+       the deck could not see rather than letting the count speak for it. #}
+    <span class="board-strip-unknown"
+          title="{{ board_strip.unknown | join(', ') or 'the board state could not be read' }}">partial</span>
+    {% endif %}
+    <a class="board-strip-all" href="/pollers">All cards &rarr;</a>
+  </summary>
+  <div class="board-strip-body">
+    {% for entry in board_strip.instances %}
+    <div class="board-strip-instance">{{ entry.instance }}</div>
+    <ul class="board-strip-rows">
+      {% for row in entry.cards %}
+      <li>
+        {# The row is the issue: that is the card, and it is what the operator
+           came to read. The pull request keeps its own link beside it, so both
+           are one press away and neither is a guess about which was meant
+           (#1036). Both open in their own tab, like every outbound GitHub link
+           on the deck. #}
+        <a class="board-strip-issue" href="{{ row.url|issue_href }}" target="_blank" rel="noopener"
+           data-agentdeck-action="open_board_card">
+          <span class="board-strip-num">{{ row.short_identity }}</span>
+          {# No title means the issue list cache has not been filled for this
+             repository yet — name the repository rather than repeating the
+             number the column beside it already shows. #}
+          <span class="board-strip-title">{{ row.title or row.repository }}</span>
+        </a>
+        <span class="pill{% if row.in_review %} board-strip-review{% endif %}">{{ row.status }}</span>
+        {% if row.has_pull %}
+        <a class="pill board-strip-pr" href="{{ row.pull_url }}" target="_blank" rel="noopener"
+           data-agentdeck-action="open_board_pull">PR #{{ row.pull_number }}</a>
+        {% endif %}
+        {% if row.has_session %}
+        {# The newest chat working this card. It opens in the deck rather than a
+           new tab — it is a deck page, not an outbound link — and carries
+           `data-session-key` so `session_navigation.js` swaps it in place like
+           any other chat row (#1694). The pill says only that a chat exists;
+           what it is doing is the chat's own page to answer. #}
+        <a class="pill board-strip-chat" href="{{ row.session_path }}"
+           data-session-key="{{ row.session_key }}"
+           data-agentdeck-action="open_board_chat"
+           title="Open the latest chat on this issue{% if row.session_title %} — {{ row.session_title }}{% endif %}">chat</a>
+        {% endif %}
+      </li>
+      {% endfor %}
+      {% if entry.overflow %}
+      {# A boardless project's board is its whole issue list, so the strip shows
+         the newest few and says how many it left out rather than looking whole
+         (#1691). #}
+      <li class="board-strip-more">
+        <a href="/pollers">{{ entry.overflow }} more issue{{ '' if entry.overflow == 1 else 's' }} &rarr;</a>
+      </li>
+      {% endif %}
+    </ul>
+    {% endfor %}
+    {% if board_strip.empty %}
+    <p class="board-strip-none">
+      {% if board_strip.complete %}No card is on the board.
+      {% else %}The board could not be read, so this is not an answer yet.{% endif %}
+    </p>
+    {% endif %}
+  </div>
+</details>
+<script src="/static/board_strip.js?v={{ asset_ver }}" defer></script>

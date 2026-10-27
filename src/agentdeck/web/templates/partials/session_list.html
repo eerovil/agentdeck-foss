@@ -1,0 +1,20 @@
+{# The chats page's cards (#2603). `rendered_groups` = each admitted card family, already
+   rendered; `sessions` = the same families' top-level Sessions. Load older is a plain link
+   that keeps the filters and widens the window. #}
+<div class="session-list" data-history-limit="{{ history_limit }}"
+     data-history-shown="{{ history_shown }}" data-history-remaining="{{ history_remaining }}">
+  {% for group in rendered_groups %}
+    {{ group | safe }}
+  {% else %}
+    <div class="empty">{% if chat_query.narrowing %}no matching chats{% else %}no active sessions{% endif %}</div>
+  {% endfor %}
+  {% if history_remaining %}
+  <a class="session-history-more" href="{{ history_next_url }}"
+     aria-label="Load {{ history_load_count }} older sessions">
+    Load older <span>{{ history_remaining }} remaining</span>
+  </a>
+  {% endif %}
+  {% if live_window_days and not history_remaining %}
+  <p class="session-history-note">Chats quiet for over {{ live_window_days }} days are not listed. Search finds them.</p>
+  {% endif %}
+</div>

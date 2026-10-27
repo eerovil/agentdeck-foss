@@ -1,0 +1,28 @@
+{# The four groups, in the order they want your attention. Rendered by the page, the
+   fragment and the SSE push alike, so what a swap replaces is exactly what was there. #}
+{% for name in group_order %}
+  {% set rows = groups.get(name, []) %}
+  {% if rows %}
+    <section class="chat-board-group chat-board-{{ name }}" aria-labelledby="chat-group-{{ name }}">
+      <h2 id="chat-group-{{ name }}" class="small">{{ group_title(name) }} <span class="muted">({{ rows|length }})</span></h2>
+      <ul class="chat-board-list">
+        {% for row in rows %}
+          <li class="chat-board-row">
+            <a href="{{ row.url|issue_href }}">
+              <span class="chat-board-number">#{{ row.number }}</span>
+              <span class="chat-board-title">{{ row.title or "(no title)" }}</span>
+            </a>
+            <p class="small muted">
+              {{ row.state_label }}
+              {%- if name == "working" %}, claimed {{ row.claimed_ago(now=now) }}{% endif %}
+              — last activity {{ row.activity_ago(now=now) }}
+            </p>
+          </li>
+        {% endfor %}
+      </ul>
+    </section>
+  {% endif %}
+{% endfor %}
+{% if not groups or not groups.values()|map("length")|sum %}
+  <p class="muted small">No chats yet, as of the last event we saw.</p>
+{% endif %}

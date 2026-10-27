@@ -1,0 +1,62 @@
+{# The deploy pill (#747), rendered at page load and re-pushed over SSE only when
+   the deploy state files actually change (#786) — so a refusal ticking every two
+   minutes turns the pill red on an open tab instead of only on the next reload.
+   The whole <details> is replaced on a push; that is a real state change, so
+   collapsing an open panel then is the honest behavior, and no text input or
+   selection lives inside it. #}
+{% set deployment = deployment_status() %}
+{% if deployment.available %}
+<details class="deployment-status{% if deployment.blocked %} deployment-status-blocked{% elif not deployment.in_sync %} deployment-status-pending{% endif %}{% if deployment.poller_note and not deployment.blocked %} deployment-status-warn{% endif %}">
+  <summary aria-label="Deployment status"
+           title="{% if deployment.blocked %}Deploy blocked: {{ deployment.blocked_reason }}{% elif deployment.in_sync %}Frontend and runtime are in sync{% else %}Runtime deployment pending{% endif %}{% if deployment.poller_note %} · Poller settings not applied{% endif %}">
+    <span class="deployment-status-dot" aria-hidden="true"></span>
+    <span>deploy</span>
+  </summary>
+  <div class="deployment-status-panel">
+    <strong>Deployment</strong>
+    {# A host with no release marker at all only reaches this panel when a
+       deploy is blocked; two 'unknown' rows would bury the one line that
+       matters. #}
+    {% if deployment.frontend_sha or deployment.runtime_sha %}
+    <dl>
+      <dt>Frontend</dt>
+      <dd>{{ deployment.frontend_subject or 'unknown' }}</dd>
+      <dt>Runtime</dt>
+      <dd>{{ deployment.runtime_subject or 'unknown' }}</dd>
+    </dl>
+    {% endif %}
+    {% if deployment.blocked %}
+    <p class="deployment-status-note">Deploy blocked: {{ deployment.blocked_reason }}</p>
+    {% elif deployment.in_sync %}
+    <p class="deployment-status-note">Frontend and runtime are in sync.</p>
+    {% else %}
+    <p class="deployment-status-note">Runtime deployment pending.</p>
+    {% endif %}
+    {# Beside whichever line is above, not instead of it: the code deployed either
+       way, and this names the projects still on older settings (#2555). #}
+    {% if deployment.poller_note %}
+    <p class="deployment-status-note deployment-status-poller">Poller settings not applied: {{ deployment.poller_note }}</p>
+    {% endif %}
+  </div>
+</details>
+{% endif %}
+{# A GitHub identity the deck speaks as, suspended by GitHub (#2682). Its own pill in
+   the same slot, borrowing the deploy pill's geometry, so it collapses to a dot on a
+   phone and costs no width at all while nothing is suspended. The collector's
+   deploy loop republishes this fragment when the set of suspensions changes. #}
+{% set suspended = github_suspensions() %}
+{% if suspended %}
+<details class="deployment-status deployment-status-blocked github-status">
+  <summary aria-label="GitHub account suspended" title="GitHub account suspended">
+    <span class="deployment-status-dot" aria-hidden="true"></span>
+    <span>GitHub suspended</span>
+  </summary>
+  <div class="deployment-status-panel">
+    <strong>GitHub account suspended</strong>
+    {% for item in suspended %}
+    <p class="deployment-status-note">{{ github_suspension_sentence(item) }}{% if item.detail %} GitHub said: “{{ item.detail }}”{% endif %}</p>
+    {% endfor %}
+    <p class="deployment-status-note github-status-fix">Reinstate it, or point these owners at another authority in ~/.config/agentdeck/github-authority.toml. The first call that works clears this.</p>
+  </div>
+</details>
+{% endif %}

@@ -1,0 +1,12 @@
+{# Compact nested subagent row shown under its parent card. `sub` = child Session. #}
+<a class="session subagent-row {{ sub.status }}{% if selected_session_key == sub.key %} selected{% endif %}"
+   href="/sessions/{{ sub.key }}" data-session-key="{{ sub.key }}"
+   data-agentdeck-action="open_session"
+   data-working="{{ '1' if sub.thinking else '0' }}"{% if selected_session_key == sub.key %}
+   aria-current="page"{% endif %}>
+  <span class="subagent-branch" aria-hidden="true">↳</span>
+  <span class="dot {{ sub.status }}{% if sub.thinking %} thinking{% endif %}" title="{{ sub.display_state }}"></span>
+  <span class="card-title" title="{{ sub.display_title }}">{{ sub.display_title }}</span>
+  {% if sub.activity %}<span class="subagent-activity">{{ sub.activity }}</span>{% endif %}
+  {% if sub.last_activity %}<span class="ago">{{ sub.last_activity | reltime_ago }}</span>{% endif %}
+</a>

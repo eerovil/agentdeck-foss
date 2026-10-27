@@ -1,0 +1,34 @@
+{# The chat's model preference (#1665).
+
+   It sits in the chip row rather than the header for the same reason the rename
+   editor does: the header is an SSE-swapped fragment and the next status tick
+   would wipe an open picker.  Collapsed by default so it costs no default height
+   on a phone, and it only opens when someone deliberately opens it. #}
+<details id="session-model-preference" class="session-model-preference"
+         {% if model_preference_open %}open{% endif %}>
+  <summary class="chip" title="Ask this chat to move to another model at its next leg boundary. A preference, not a pin: AgentDeck still chooses accounts on headroom.">⚙ Model{% if model_preference %} · {{ model_preference_label }}{% endif %}</summary>
+  <form class="session-model-preference-form"
+        hx-post="/sessions/{{ session.key }}/model-preference"
+        hx-target="#session-model-preference" hx-swap="outerHTML"
+        hx-disabled-elt="find button">
+    <label for="session-model-preference-select">Prefer</label>
+    <select id="session-model-preference-select" name="model">
+      <option value="">No preference</option>
+      {% for choice in model_preference_choices %}
+      <option value="{{ choice.value }}"
+              {% if choice.value == model_preference %}selected{% endif %}>{{ choice.label }}</option>
+      {% endfor %}
+    </select>
+    <button type="submit">Save</button>
+    <p class="session-model-preference-note">
+      Takes effect at this chat's next leg boundary. The session running now keeps
+      its own model until then.
+    </p>
+    {% if model_preference_saved %}
+    <span class="session-model-preference-saved">{{ model_preference_saved }}</span>
+    {% endif %}
+    {% if model_preference_error %}
+    <span class="session-model-preference-error" role="alert">{{ model_preference_error }}</span>
+    {% endif %}
+  </form>
+</details>

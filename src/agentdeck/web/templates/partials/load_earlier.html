@@ -1,0 +1,9 @@
+{# "load earlier" button; replaces itself with the earlier window + a new button.
+   ``before`` is a chat-level event identity, so the window it asks for can be in
+   an earlier leg of the same chat (#1265). #}
+<button class="load-earlier"
+        hx-get="/partials/sessions/{{ session_key }}/transcript?before={{ before }}"
+        hx-swap="outerHTML"
+        hx-target="this">
+  load earlier
+</button>

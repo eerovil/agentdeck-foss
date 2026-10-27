@@ -1,0 +1,54 @@
+{% if oob | default(false) %}<template hx-swap-oob="beforeend:.transcript">{% endif %}
+{% set unsent = item.state == 'failed' %}
+<div id="pending-message-{{ item.id }}" class="ev user pending-message{% if unsent %} unsent-message{% endif %}" data-pending-message data-queue-id="{{ item.id }}"
+     {% if item.client_action_id %}data-client-action-id="{{ item.client_action_id }}"{% endif %}
+     {#- Redrawn by action id where there is one: the row on the page may be the
+         browser's own optimistic copy, which carries no queue id (#2662). #}
+     {% if replace_oob | default(false) %}hx-swap-oob="outerHTML:{% if item.client_action_id %}.pending-message[data-client-action-id='{{ item.client_action_id }}']{% else %}#pending-message-{{ item.id }}{% endif %}"{% endif %}>
+  <div class="ev-head">
+    <span class="ev-role">user</span>
+    {% if unsent %}
+    <span class="message-state failed">Not sent</span>
+    {% elif item.is_unacknowledged and session_busy | default(false) %}
+    <span class="message-state" title="The chat is in the middle of a turn. This message is with the agent and gets read when the turn reaches it, so its silence so far says nothing.">Sent; waiting for this turn to reach it</span>
+    {% elif item.is_unacknowledged and item.attempts > 1 %}
+    <span class="message-state unacknowledged" title="The deck sent this message twice — the first send left no trace in the transcript, and the agent has not acknowledged the second either. It will not be sent again; that is your call.">Sent twice; the agent never acknowledged it</span>
+    {% elif item.is_unacknowledged %}
+    <span class="message-state unacknowledged" title="The agent took this message but never wrote it to its transcript. It has not been resent — that is your call.">Sent; the agent never acknowledged it</span>
+    {% elif item.is_being_resent %}
+    <span class="message-state">Sending again; the first send left no trace</span>
+    {% else %}
+    <span class="message-state">{{ 'Sent; waiting for transcript' if item.state == 'accepted' else ('Waiting for agent' if item.state == 'running' else 'Queued behind active turn') }}</span>
+    {% endif %}
+    <time class="ev-time" datetime="{{ item.created_at.isoformat() }}" title="{{ item.created_at | chat_time_title }}">{{ item.created_at | chat_time }}</time>
+    {% if item.is_unacknowledged and not session_busy | default(false) %}
+    <button type="button" class="pending-dismiss" data-pending-dismiss
+            aria-label="Remove this unacknowledged message"
+            title="Remove this message. The agent never wrote it down and it will not be sent again, so this only clears the row."
+            hx-post="/sessions/{{ session_key }}/pending/{{ item.id }}/dismiss"
+            hx-target="closest .pending-message" hx-swap="outerHTML"
+            hx-disabled-elt="this">✕</button>
+    {% endif %}
+  </div>
+  <div class="ev-text">{{ item.text | display_message }}</div>
+  {% if unsent %}
+  {# #2662: a failed send keeps its text here, because the composer was cleared
+     the moment it was queued. Sending again reuses the message's own action id,
+     so the runtime can never deliver it twice. #}
+  {#- The button lives inside the error line on purpose: message_collapse.js
+      folds every other child into the clamped body, where a long message would
+      hide it behind "Show more". #}
+  <div class="message-error">{{ item.reason | refusal if item.reason else 'Could not send message.' }}{% if not item | resendable %} Its attachments were not kept, so send it again with them.{% endif %}
+  {%- if item | resendable %}
+  <button type="button" class="unsent-resend"
+          hx-post="/sessions/{{ session_key }}/pending/{{ item.id }}/resend"
+          hx-target="#inject-result" hx-swap="outerHTML"
+          hx-disabled-elt="this">Send again</button>
+  {%- endif %}</div>
+  {% elif item.images %}
+  <div class="ev-images" aria-label="{{ item.images | length }} attached image{% if item.images | length != 1 %}s{% endif %}">
+    {% for image in item.images %}<img class="ev-image" src="/sessions/{{ session_key }}/pending-images/{{ item.id }}/{{ loop.index0 }}" alt="Attached image {{ loop.index }}" loading="lazy">{% endfor %}
+  </div>
+  {% endif %}
+</div>
+{% if oob | default(false) %}</template>{% endif %}

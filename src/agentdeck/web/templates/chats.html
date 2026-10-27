@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+
+{% block title %}Chats · agentdeck{% endblock %}
+{% block body_class %}session-list-page{% endblock %}
+{# The chats no Work owns (#2256): the board strip and the chat list. The list is rendered
+   once per load and filtered by this page's own address (#2603); nothing streams it, and
+   the topbar's reload button (#2240) brings it up to date with the filters kept. The
+   stream below carries only the topbar. #}
+{% block body_sse %}sse-connect="/events"{% endblock %}
+{% block topbar_nav %}<a class="back" href="/" aria-label="back to the Works">←</a>{% endblock %}
+{% block limit_bars %}{% include "partials/limit_bars.html" %}{% endblock %}
+
+{% block content %}
+{% include "partials/session_sidebar_head.html" %}
+{% include "partials/board_strip.html" %}
+{% include "partials/new_chat.html" %}
+<section class="chat-list" id="chat-list" aria-label="Chats outside Works">
+  <div class="chat-list-head">
+    <span class="chat-list-label">Chats outside Works</span>
+    <span class="chat-list-dot">&middot;</span>
+    <span class="chat-list-count">{{ session_total_count }}</span>
+  </div>
+  {% include "partials/session_list_controls.html" %}
+  <div id="sessions">{% include "partials/session_list.html" %}</div>
+</section>
+<script src="/static/chats_page.js?v={{ asset_ver }}" defer></script>
+{% endblock %}

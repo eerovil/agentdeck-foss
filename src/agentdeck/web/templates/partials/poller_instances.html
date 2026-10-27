@@ -1,0 +1,338 @@
+{# One row per Poller Instance: what it last said, and whether that is still believable (#107).
+   The page's stream (#3228) pushes the rows alone (`rows_only`) on a board or runtime change;
+   `keyed-rows` replaces only a row whose `data-rev`, its own markup's digest, moved, and each
+   fold remembers being open (`data-keep-open`). A control's response replaces the whole list,
+   which carries its own `sse-swap` so the next push still lands. #}
+{%- macro keyed(tag, cls, key, data_name="", data_value="") -%}
+{%- set body = caller() -%}
+<{{ tag }} class="{{ cls }}"{% if data_name %} data-{{ data_name }}="{{ data_value }}"{% endif %} data-key="{{ key }}" data-rev="{{ body | digest }}">{{ body }}</{{ tag }}>
+{%- endmacro -%}
+{%- if not rows_only %}
+<div id="poller-instances" class="poller-list" sse-swap="pollers" hx-swap="keyed-rows">
+{%- endif %}
+  {% if builder_runs %}
+    {# Builder runs in flight (#268). Collapsed, and absent entirely when there are none, so it
+       adds no height to the page at rest (AGENTS.md). The summary already says who holds each
+       one, because a run that needs a handover must be visible without opening anything. #}
+    {% call keyed("details", "poller-runs", "builder-runs", "keep-open", "pollers-builder-runs") %}
+      <summary>
+        Builder {{ 'run' if builder_runs|length == 1 else 'runs' }}:
+        {% for view in builder_runs %}<code>{{ view.run.project }}</code> on {{ view.label }}
+          {%- if view.run.holding %} <span class="pill warn">held</span>{% endif %}
+          {%- if not loop.last %}, {% endif %}
+        {% endfor %}
+      </summary>
+      {% for view in builder_runs %}
+      <article class="poller-run" data-project="{{ view.run.project }}">
+        <p class="small">
+          <strong>{{ view.run.project }}</strong> — {{ view.run.detail }}
+          {% if view.session_key %}
+            (<a href="/sessions/{{ view.session_key }}">the chat</a>)
+          {% endif %}
+        </p>
+        <p class="small muted">
+          Manifest <code>{{ view.run.manifest }}</code>,
+          overlay <code>{{ view.run.overlay }}</code>.
+          {% if view.run.fallbacks %}
+            Legacy fallback order:
+            {% for key in view.run.fallbacks %}<code>{{ key }}</code>{% if not loop.last %}, {% endif %}{% endfor %}.
+          {% endif %}
+        </p>
+        {% if view.run.holding %}
+          {# A held Builder run remains visible until it can continue. #}
+          <p class="small warn">Held — {{ view.run.detail }}</p>
+        {% endif %}
+        {% if view.can_hand_over %}
+          <form hx-post="/pollers/builder/{{ view.run.project }}/handover"
+                hx-target="#poller-instances" hx-swap="outerHTML">
+            {# The intent id is rendered from the run, so a double-submitted page presses the
+               same handover rather than starting a second leg on one draft. #}
+            <input type="hidden" name="intent" value="{{ view.run.handover_intent }}">
+            <button type="submit">Continue on {{ view.successor }}</button>
+          </form>
+        {% elif view.working %}
+          <p class="small muted">
+            Its turn is still running — a handover waits for it, so the turn is never lost.
+          </p>
+        {% elif not view.successor %}
+          <p class="small muted">No account is left after {{ view.label }}.</p>
+        {% endif %}
+        {# The Builder stops at a validated draft; only the operator knows when it was taken up. #}
+        <button type="button" class="small" hx-post="/pollers/builder/{{ view.run.project }}/forget"
+                hx-target="#poller-instances" hx-swap="outerHTML">Forget this run</button>
+      </article>
+      {% endfor %}
+    {% endcall %}
+  {% endif %}
+  {% if not instances %}
+    <p class="muted">No Poller Instance is installed on this host yet.</p>
+    <p class="muted small">Looked under <code>{{ poller_root }}</code>.</p>
+  {% endif %}
+  {% for view in instances %}
+  {% call keyed("article", "poller card", "instance-" ~ view.instance, "instance", view.instance) %}
+    <header class="poller-head">
+      <span class="poller-name">{{ view.instance }}</span>
+      {# State and freshness are separate signals, so both are always shown. #}
+      <span class="pill state-{{ view.state_label|replace(' ', '-') }}">{{ view.state_label }}</span>
+      <span class="pill freshness-{{ view.freshness }}" title="last reported {{ view.last_cycle_at or 'never' }}">
+        {{ view.last_seen }}
+      </span>
+      {% if view.paused %}<span class="pill paused">paused</span>{% endif %}
+      {% if view.timer.known and not view.timer.firing %}
+        <span class="pill warn">timer stopped</span>
+      {% elif not view.timer.known %}
+        <span class="pill muted" title="systemd could not be asked">timer unknown</span>
+      {% endif %}
+    </header>
+
+    {% if not view.exists %}
+      <p class="muted small">Nothing has been activated here yet.</p>
+    {% else %}
+      <p class="poller-summary">{{ view.summary }}</p>
+
+      {% if view.reasons %}
+        <ul class="poller-reasons">
+          {% for reason in view.reasons %}
+            <li class="reason">{{ reason }}
+              {#- The bare reason named nothing an operator could act on (#2384). -#}
+              {%- if reason == 'extension-degraded' and view.degraded_extensions %} —
+                {{ view.degraded_extensions|join('; ') }}{% endif %}</li>
+          {% endfor %}
+        </ul>
+      {% endif %}
+
+      {% set board = boards.get(view.instance) %}
+      {% if board %}
+        <details class="poller-board" data-keep-open="pollers-{{ view.instance }}-board">
+          <summary>
+            Board · {{ board.issues|length }} issue{{ '' if board.issues|length == 1 else 's' }}
+            {% if not board.complete %}<span class="pill warn">incomplete</span>{% endif %}
+          </summary>
+          <p class="small muted">
+            Cached GitHub issue titles and card statuses; when that read is incomplete,
+            durable poller state keeps known cards visible.
+          </p>
+          {% if not board.complete %}
+            <p class="small warn">
+              The board could not be read completely{% if board.unknown %} for
+              {% for repository in board.unknown %}<code>{{ repository }}</code>{% if not loop.last %}, {% endif %}{% endfor %}{% endif %}.
+              Missing issues are unknown, not absent.
+            </p>
+          {% endif %}
+          {% if board.issues %}
+            <div class="poller-board-filters" role="group" aria-label="Filter board issues by status">
+              <button type="button" class="pill" data-board-filter="" aria-pressed="true">
+                All <span>{{ board.issues|length }}</span>
+              </button>
+              {% for status, count in board.status_counts %}
+                <button type="button" class="pill" data-board-filter="{{ status }}" aria-pressed="false">
+                  {{ status }} <span>{{ count }}</span>
+                </button>
+              {% endfor %}
+            </div>
+            <p class="small muted poller-board-result" aria-live="polite">
+              Showing all {{ board.issues|length }} issues
+            </p>
+            <ul class="poller-board-issues" data-board-issues>
+              {% for issue in board.issues %}
+                <li data-board-status="{{ issue.status or 'Status unknown' }}">
+                  {% if issue.url %}
+                  <a class="poller-board-issue-link" href="{{ issue.url|issue_href }}"
+                     aria-label="Open {{ issue.identity }} on GitHub">
+                  {% endif %}
+                  <span class="poller-board-issue">
+                    <code title="{{ issue.identity }}">{{ issue.short_identity }}</code>
+                    {% if issue.title %}<span>{{ issue.title }}</span>{% endif %}
+                  </span>
+                  <span class="pill">{{ issue.status or 'Status unknown' }}</span>
+                  {% if issue.url %}</a>{% endif %}
+                </li>
+              {% endfor %}
+            </ul>
+          {% elif board.complete %}
+            <p class="small muted">No issues are currently tracked on this board.</p>
+          {% endif %}
+        </details>
+      {% endif %}
+
+      {% if view.working %}
+        <p class="small"><strong>Working:</strong>
+          {% for card in view.working %}<code>{{ card }}</code>{% if not loop.last %}, {% endif %}{% endfor %}
+        </p>
+      {% endif %}
+
+      {# Absent entirely when nothing waits, so a poller with no dependencies keeps its height. #}
+      {% if view.blocked %}
+        <p class="small"><strong>Blocked:</strong>
+          {% for held in view.blocked %}<code>{{ held.card }}</code>
+            <span class="muted">waits for
+              {%- for ref in held.by %} <code>{{ ref }}</code>{% if not loop.last %},{% endif %}{% endfor %}</span>{% if not loop.last %}; {% endif %}
+          {% endfor %}
+        </p>
+      {% endif %}
+
+      {% if view.queue %}
+        <details class="poller-queue" data-keep-open="pollers-{{ view.instance }}-queue">
+          <summary>{{ view.queue|length }} queued command{{ '' if view.queue|length == 1 else 's' }}</summary>
+          <ol class="small">
+            {% for command in view.queue %}
+              <li><code>{{ command.card }}</code> {{ command.kind }} — {{ command.status }}
+                {% if command.author %}<span class="muted">by {{ command.author }}</span>{% endif %}</li>
+            {% endfor %}
+          </ol>
+        </details>
+      {% endif %}
+
+      {% if view.budget_holding %}
+        <p class="small muted">Token budget is holding queued work — the instance is healthy.</p>
+      {% endif %}
+
+      {% if view.last_error %}
+        {# Dated, and red only while the latest wake is still failing: a failure later wakes
+           ran past is history, and read undated it looked like today's breakage (#2384). #}
+        <p class="small {{ 'error' if view.last_error_current else 'muted' }} poller-last-failure">
+          Last failure{% if view.last_error_when %} {{ view.last_error_when }}{% endif %}: {{ view.last_error }}
+        </p>
+      {% endif %}
+
+      <details class="poller-details" data-keep-open="pollers-{{ view.instance }}-details">
+        <summary>Version and activation</summary>
+        <dl class="small">
+          <dt>contract</dt><dd>{{ view.version.contract if view.version.contract is not none else 'unknown' }}</dd>
+          <dt>config</dt><dd><code>{{ view.version.config[:12] or 'unknown' }}</code></dd>
+          <dt>approved by</dt><dd>{{ view.version.approved_by or 'unknown' }}</dd>
+        </dl>
+      </details>
+
+      {# Controls are collapsed by default so a row keeps its height on mobile. #}
+      <details class="poller-controls" data-keep-open="pollers-{{ view.instance }}-controls">
+        <summary>Controls</summary>
+        <div class="poller-buttons">
+          {% if view.paused %}
+            <button type="button" hx-post="/pollers/{{ view.instance }}/resume"
+                    hx-target="#poller-instances" hx-swap="outerHTML">Resume</button>
+          {% else %}
+            <button type="button" hx-post="/pollers/{{ view.instance }}/pause"
+                    hx-target="#poller-instances" hx-swap="outerHTML">Pause</button>
+          {% endif %}
+        </div>
+        <p class="small muted">
+          Pause and resume take effect at the next wake; a paused instance keeps checking in but
+          starts no work.
+        </p>
+
+        {# The ChatGPT PR-review nudge (#1584). Inside the existing Controls block for the same
+           reason as the worker accounts below, and absent entirely for an instance with no
+           ChatGPT task configured. #}
+        {% set nudge = (chatgpt_nudges|default({}, true)).get(view.instance) %}
+        {% if nudge %}
+          <h4 class="small">ChatGPT PR review</h4>
+          <p class="small muted">
+            Task <code>{{ nudge.task }}</code> — last nudge
+            <span{% if nudge.last_iso %} title="{{ nudge.last_iso }}"{% endif %}>{{ nudge.last_ago }}</span>
+            {%- if nudge.source %} {{ nudge.source }}{% endif %}
+            {%- if nudge.result %}, {{ nudge.result }}{% endif %}.
+          </p>
+          {% if (nudge_errors|default({}, true)).get(view.instance) %}
+            <p class="small error">{{ nudge_errors[view.instance] }}</p>
+          {% endif %}
+          {# Reviews that did not end in a review (#1876). Listed here rather than counted, because
+             the thing a reader has to do something about is the pull request, by name. Absent
+             entirely when every review settled, so an instance at rest gains no height. #}
+          {% if nudge.unresolved %}
+            <p class="small error">Reviewed nothing:</p>
+            <ul class="small poller-review-unresolved">
+              {% for row in nudge.unresolved %}
+                <li>
+                  <code>{{ row.card }}</code> — {{ row.note }}
+                  {%- if row.given_up %}; asked {{ row.attempts }} times, not asking again
+                  {%- else %}; asking again ({{ row.attempts }} so far){% endif %}.
+                </li>
+              {% endfor %}
+            </ul>
+          {% endif %}
+          {# Reviewed, not merged, and nothing pointed at it (#1892). Named rather than counted for
+             the same reason as the list above, and absent entirely when the queue is converging. #}
+          {% if nudge.stalled %}
+            <p class="small error">Parked, nothing will merge it:</p>
+            <ul class="small poller-review-unresolved">
+              {% for row in nudge.stalled %}
+                <li><code>{{ row.card }}</code> — {{ row.note }}.</li>
+              {% endfor %}
+            </ul>
+          {% endif %}
+          {% if nudge.awaiting %}
+            <p class="small muted">
+              Asked for, not answered yet:
+              {% for row in nudge.awaiting %}
+                <code>{{ row.card }}</code> ({{ row.note }}){% if not loop.last %}, {% endif %}
+              {%- endfor %}.
+            </p>
+          {% endif %}
+          {% if nudge.in_flight %}
+            {# Launching is not clicking: the run answers through a receipt minutes later. #}
+            <p class="small muted">A nudge is running now — it reports back when it has clicked.</p>
+          {% elif nudge.runnable %}
+            <button type="button" hx-post="/pollers/{{ view.instance }}/extensions/chatgpt-nudge"
+                    hx-target="#poller-instances" hx-swap="outerHTML">Run the ChatGPT review now</button>
+          {% else %}
+            <p class="small muted">Cannot be run from here — {{ nudge.note }}.</p>
+          {% endif %}
+        {% endif %}
+
+        {# Worker accounts (#901). Inside the existing Controls block on purpose: a settings row
+           of its own would add height to every instance at rest, which mobile cannot spare. #}
+        {% set settings = (worker_accounts|default({}, true)).get(view.instance) %}
+        {% set errors = settings_errors|default({}, true) %}
+        {% if settings %}
+          <h4 class="small">Worker accounts</h4>
+          {% if errors.get(view.instance) %}
+            <p class="small error">{{ errors[view.instance] }}</p>
+          {% endif %}
+          {% if not settings.editable %}
+            <p class="small muted">
+              Not editable here — {{ settings.note or 'no overlay.toml on this host' }}.
+            </p>
+          {% else %}
+            {% set offered = (accounts|default([], true))|map(attribute='key')|list %}
+            {% set rows = offered + (settings.order|reject('in', offered)|list) %}
+            <form class="poller-worker-accounts" hx-post="/pollers/{{ view.instance }}/settings/worker-accounts"
+                  hx-target="#poller-instances" hx-swap="outerHTML">
+              <table class="small">
+                <thead>
+                  <tr><th>account</th><th>primary</th><th>legacy fallback</th></tr>
+                </thead>
+                <tbody>
+                  {% for key in rows %}
+                    <tr>
+                      <td><code>{{ key }}</code>{% if key not in offered %}
+                        <span class="muted">(not on this host)</span>{% endif %}</td>
+                      <td>
+                        <input type="radio" name="account" value="{{ key }}"
+                               aria-label="Run {{ view.instance }} workers on {{ key }}"
+                               {% if key == settings.account %}checked{% endif %}>
+                      </td>
+                      <td>
+                        <input type="checkbox" name="fallbacks" value="{{ key }}"
+                               aria-label="Keep {{ key }} in the legacy fallback order for {{ view.instance }}"
+                               {% if key in settings.fallbacks %}checked{% endif %}>
+                      </td>
+                    </tr>
+                  {% endfor %}
+                </tbody>
+              </table>
+              <button type="submit">Save worker accounts</button>
+            </form>
+            <p class="small muted">
+              Written to this instance's <code>overlay.toml</code> and picked up by the next wake —
+              no re-activation. The primary always leads the order.
+            </p>
+          {% endif %}
+        {% endif %}
+      </details>
+    {% endif %}
+  {% endcall %}
+  {% endfor %}
+{%- if not rows_only %}
+</div>
+{%- endif %}

@@ -1,0 +1,40 @@
+# real Claude data must never enter the tree (this repo lives on a host with
+# real transcripts; these patterns catch strays copied in by accident).
+# The committed codebase guides under .claude/codebase/ are the sole exception.
+.claude/*
+!.claude/codebase/
+.claude/codebase/*
+!.claude/codebase/*.md
+.claude/codebase/*/
+projects/
+sessions/
+history.jsonl
+
+# synthetic test fixtures are explicitly allowed back in
+!tests/fixtures/**
+
+# secrets & local state — NEVER commit, not even under tests/
+config.toml
+*.credentials.json
+.credentials.json
+*.db
+*.db-wal
+*.db-shm
+.env
+
+# python
+.venv/
+__pycache__/
+dist/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# git worktrees created by tooling
+.worktrees/
+
+# kanban poller runtime state (dispatch ledger)
+.kanban/
+
+# Screenshot evidence for a card; the images belong in the project's evidence repository.
+.evidence/

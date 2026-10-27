@@ -1,0 +1,68 @@
+<section id="pending-interaction" class="pending-interaction">
+{%- if interaction %}
+  <h2>{{ interaction.title }}</h2>
+  {% if interaction.message %}<p>{{ interaction.message }}</p>{% endif %}
+  {% if interaction.command %}<pre><code>{{ interaction.command }}</code></pre>{% endif %}
+  {% if interaction.cwd %}<div class="interaction-cwd">{{ interaction.cwd }}</div>{% endif %}
+  {% if interaction.url %}
+  <p><a href="{{ interaction.url }}" target="_blank" rel="noopener">Continue in browser ↗</a></p>
+  {% endif %}
+  <form hx-post="/sessions/{{ session_key }}/interaction"
+        hx-target="#pending-interaction" hx-swap="outerHTML"
+        data-agentdeck-action="interaction" data-interaction-kind="{{ interaction.kind }}"
+        {%- if interaction.dismissible %} data-question-drafts="{{ session_key }}"{% endif %}>
+    <input type="hidden" name="interaction_id" value="{{ interaction.id }}">
+    {% for question in interaction.questions %}
+    <fieldset{% if question.secret %} data-secret{% endif %}>
+      {# The question text sits outside the <legend> so the markdown pass in
+         base.html can enhance it: a rendered question grows lists, code and
+         links, and <legend> takes phrasing content only (#1579). #}
+      <legend><span>{{ question.header }}</span>
+        {%- if interaction.dismissible %}
+        {# Each open question goes on its own (#3451). On the header row, so the box does
+           not grow; ``formnovalidate`` so a half-filled neighbour cannot block it. #}
+        <button class="interaction-dismiss" type="submit" name="decision"
+                value="dismiss:{{ question.id }}" formnovalidate>Dismiss</button>
+        {%- endif %}</legend>
+      <div class="interaction-prompt">{{ question.prompt }}</div>
+      {% for option in question.options %}
+      <label class="interaction-option">
+        <input type="{{ 'checkbox' if question.multiselect else 'radio' }}" name="answer__{{ question.id }}"
+               value="{{ option.value or option.label }}"{% if not interaction.dismissible and not question.allow_other and not question.multiselect %} required{% endif %}>
+        <span><strong>{{ option.label }}</strong>{% if option.description %}<small>{{ option.description }}</small>{% endif %}</span>
+      </label>
+      {% endfor %}
+      {% if question.allow_other or not question.options %}
+      <input class="interaction-other" type="{{ 'password' if question.secret else 'text' }}"
+             name="other__{{ question.id }}" placeholder="Type your answer…"
+             {% if not question.options and not interaction.dismissible %}required{% endif %}>
+      {% endif %}
+    </fieldset>
+    {% endfor %}
+    {% if interaction.kind in ('question', 'mcp_form') %}
+    <button type="submit" name="decision" value="accept">Submit answer</button>
+    {% elif interaction.kind == 'mcp_url' %}
+    <div class="interaction-actions">
+      <button type="submit" name="decision" value="accept">Done, continue</button>
+      <button class="secondary" type="submit" name="decision" value="decline">Decline</button>
+      <button class="danger" type="submit" name="decision" value="cancel">Cancel turn</button>
+    </div>
+    {% elif interaction.kind == 'classifier_block' %}
+    {# Claude's classifier already refused this call; the chat waits for you (#2271). #}
+    <div class="interaction-actions">
+      <button type="submit" name="decision" value="accept">Allow once</button>
+      <button class="secondary" type="submit" name="decision" value="decline">Keep blocked</button>
+    </div>
+    {% else %}
+    <div class="interaction-actions">
+      <button type="submit" name="decision" value="accept">Allow once</button>
+      {% if 'acceptForSession' in interaction.decisions %}
+      <button class="secondary" type="submit" name="decision" value="acceptForSession">Allow for session</button>
+      {% endif %}
+      <button class="secondary" type="submit" name="decision" value="decline">Decline</button>
+      <button class="danger" type="submit" name="decision" value="cancel">Cancel turn</button>
+    </div>
+    {% endif %}
+  </form>
+{% endif -%}
+</section>

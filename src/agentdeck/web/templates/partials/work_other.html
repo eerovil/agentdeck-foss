@@ -1,0 +1,29 @@
+{# Activity no Work owns (#2147): top-level chats in no Work that are working, carded or
+   recent. Listed as they are; the deck never guesses a Work for them. Empty renders
+   nothing, so a deck where every chat has a Work pays no height for it. On the Work-first
+   front page (#2219) it is low on the page and folds like every group there (#2283), and its line still says how many
+   of those chats wait on a person, so a question outside every Work is not lost. #}
+{%- if work_overview.other %}
+{#- Only a chat a person can act on here counts (`OtherChat.needs_you`, #2332): not a finished
+   handoff, and not one whose worktree is gone with nowhere to resume (#2524). #}
+{%- set waiting = work_overview.other | selectattr("needs_you") | list %}
+{#- Open unless the operator folded it: the front page's groups share one fold store (#2283). #}
+<details class="work-other-fold" id="work-other-fold" data-front-collapse="other" open>
+  <summary class="work-other-title">Other activity
+    <span class="work-other-count">{{ work_overview.other | length + work_overview.other_hidden }}</span>
+    {%- if waiting %}<span class="work-other-need" data-other-waiting="{{ waiting | length }}">· {{ waiting | length }} {{ "needs" if waiting | length == 1 else "need" }} you</span>{% endif %}
+  </summary>
+  <ul class="work-other-rows">
+    {%- for chat in work_overview.other %}
+    <li class="work-other-row{% if chat.needs_you %} needs-attention{% endif %}{% if chat.working %} is-working{% endif %}" data-chat-id="{{ chat.chat_id }}">
+      <a href="{{ chat.href }}" data-session-key="{{ chat.session_key }}">{{ chat.title }}</a>
+      <span class="wo-state">{% if chat.attention %}{{ chat.attention | replace("_", " ") }}{% elif chat.working %}working{% else %}idle{% endif %}</span>
+      {%- if chat.last_activity %}<time class="wo-age" datetime="{{ chat.last_activity.isoformat() }}" data-activity-age>{{ chat.last_activity | reltime_ago }}</time>{% endif %}
+    </li>
+    {%- endfor %}
+  </ul>
+  {%- if work_overview.other_hidden %}
+  <p class="work-more"><a href="/chats">{{ work_overview.other_hidden }} more in the chat list &rarr;</a></p>
+  {%- endif %}
+</details>
+{%- endif %}

@@ -1,0 +1,53 @@
+# The AgentDeck Reference Poller Project — Host Overlay TEMPLATE.
+#
+# Copy this to the instance directory the installer created and fill it in. The real file is
+# machine-local and never committed: it holds only what cannot be shared — credentials, the agent
+# account, and paths (#108). It carries the same contract number as the Manifest.
+#
+#   cp poller/reference/overlay.example.toml \
+#      ~/.local/share/agentdeck/poller/instances/agentdeck/overlay.toml
+
+contract = 1
+
+[paths]
+# Durable state, its lock and its acknowledgement receipts all derive from this one path.
+state = "~/.local/share/agentdeck/poller/instances/agentdeck/state.json"
+log = "~/.local/share/agentdeck/poller/instances/agentdeck/cycle.log"
+
+# Where this host keeps the extension programs it shares across instances (#377). Optional: a
+# project's own checkouts are searched first, at their conventional `poller/extensions` folder,
+# and only then this. Name it and a project needs no vendored copy of shared code — which is the
+# difference between onboarding a second project and forking the extensions into it.
+extensions = "~/agentdeck/poller/extensions"
+
+[checkouts]
+# One per repository that holds code. The engine works in these; a code repo with no checkout
+# here is caught by the offline cross-check rather than at the first attempted worktree. A repo
+# that holds no code may not appear here at all, and no two entries may resolve to the same
+# directory: an issue-only repo says where its cards are worked with `workspace` in the Manifest
+# instead of borrowing a path it does not own (#1087).
+agentdeck = "~/agentdeck"
+
+[worker]
+# Which AgentDeck account runs the workers this project dispatches.
+account = "claude_code:main"
+
+# Where the work goes when that account fills up, in order. The primary always leads the order,
+# so listing a fallback can never drop the account named above.
+fallback_accounts = ["codex:codex", "claude_code:alt"]
+
+[credentials]
+# No GitHub credential here (#2289). The engine speaks as the non-human authority its owner
+# maps to in ~/.config/agentdeck/github-authority.toml — the AgentDeck App's installation on
+# the owner's account, organization or personal (#2682) — and hands that same credential to its
+# extensions each wake. Nothing falls back to the host's own `gh` login.
+
+# The machine-local half of an extension's settings (#386). The Manifest enables an extension and
+# states its portable settings; a credential path can only be answered here, which is what keeps
+# the Manifest copyable and keeps rotating a token from being a re-activation.
+#
+
+# Nothing else here for the Reference Project, which enables no extension needing a credential:
+#
+#   [extensions.sentry-autofix]
+#   token_file = "~/.config/agentdeck/sentry-token"

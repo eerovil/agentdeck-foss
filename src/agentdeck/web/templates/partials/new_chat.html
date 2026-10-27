@@ -1,0 +1,98 @@
+{# Starting a chat is its own thing, not a session-list control: on the front
+   page it sits above the collapsed chat list rather than inside it, so it takes
+   one tap instead of two (#1498). The chat page's sidebar includes it in the
+   same place the controls always had it. #}
+{% if new_chat_enabled and new_chat_accounts %}
+<details class="new-chat">
+  <summary>＋ New chat</summary>
+  <form hx-post="/sessions/new" hx-target="#new-session-result" hx-swap="outerHTML"
+        hx-disabled-elt="find button" hx-encoding="multipart/form-data" data-clear-on-send
+        data-async-outcome
+        data-agentdeck-action="new_session" data-model-picker>
+    {# Which account to spend is the one choice worth a glance rather than a tap,
+       so it is a row of buttons carrying each account's own meters instead of a
+       dropdown that hides them behind an interaction (#1912). One button per
+       startable account — the deck's own list, never a fixed three. #}
+    <span class="field-label" id="new-chat-account-label">Account</span>
+    <div class="account-picker" id="new-chat-account" role="radiogroup"
+         aria-labelledby="new-chat-account-label" data-model-picker-account>
+      {% for account in new_chat_accounts %}
+      {% set usage = new_chat_usage.get(account.key) %}
+      <label class="account-choice" for="new-chat-account-{{ loop.index }}">
+        <input type="radio" id="new-chat-account-{{ loop.index }}" name="account_key"
+               value="{{ account.key }}" required{% if loop.first %} checked{% endif %}
+               data-provider="{{ account.provider_id }}"
+               data-default-model="{{ new_chat_defaults[account.key].model }}"
+               data-default-effort="{{ new_chat_defaults[account.key].effort }}">
+        <span class="account-choice-label">{{ account.label }}</span>
+        {# Each provider's own windows, in its own order, exactly as the sticky
+           usage header reads them — no figure here impersonates an overall
+           account percentage. Rendered once with the page: this control holds a
+           selection, so it must never be swapped out from under a tap. That is
+           also why these numbers used to go stale and stay stale — a phone left
+           open across a window reset showed 92% here beside the header's 9%
+           (#2045). `new_chat_usage_mirror.js` now copies the header's fresh
+           figures into the `<b>` below on every usage push, as text only, so no
+           element in this control is ever replaced. #}
+        <span class="account-choice-usage" data-account-key="{{ account.key }}">
+          {% for w in (usage.windows if usage else []) %}
+          <span class="account-choice-window" data-window-kind="{{ w.kind }}">
+            <b class="{% if w.pct is not none and w.pct >= 90 %}crit{% elif w.pct is not none and w.pct >= 70 %}warn{% endif %}">{% if w.pct is not none %}{{ w.pct | round | int }}%{% else %}—{% endif %}</b>
+            <span>{{ w.kind }}</span>
+          </span>
+          {% else %}<span class="account-choice-window"><b>—</b></span>{% endfor %}
+        </span>
+        {% if usage and usage.auth and usage.auth.broken %}<b class="account-choice-auth" title="{{ account.label }} is signed out">!</b>{% endif %}
+      </label>
+      {% endfor %}
+    </div>
+    {# Model and effort are read-only until asked for: almost every chat wants the
+       account default, and two selects cost the phone the space the message box
+       needs. The collapsed line still carries the values, so nothing is hidden —
+       only the means of changing it is (#1912). #}
+    <details class="advanced-settings" id="new-chat-advanced">
+      <summary>
+        <span>Edit advanced</span>
+        <span class="advanced-summary" data-advanced-summary>{{ new_chat_advanced_summary }}</span>
+      </summary>
+      <div class="model-field" id="new-chat-model-field"{% if not new_chat_initial_has_models %} hidden{% endif %} data-model-picker-field>
+        <label for="new-chat-model">Model</label>
+        <select id="new-chat-model" name="model" data-model-picker-select>
+          <option value="">Default ({{ new_chat_defaults[new_chat_accounts[0].key].model }})</option>
+          {% for model in new_chat_models %}
+          <option value="{{ model.value }}" data-provider="{{ model.provider_id }}">{{ model.label }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="model-field" id="new-chat-effort-field"{% if not new_chat_initial_has_efforts %} hidden{% endif %} data-effort-picker-field>
+        <label for="new-chat-effort">Effort</label>
+        <select id="new-chat-effort" name="effort" data-effort-picker-select>
+          <option value="">Default ({{ new_chat_defaults[new_chat_accounts[0].key].effort }})</option>
+          {% for effort in new_chat_efforts %}
+          <option value="{{ effort.value }}" data-provider="{{ effort.provider_id }}">{{ effort.label }}</option>
+          {% endfor %}
+        </select>
+      </div>
+    </details>
+    <label for="new-chat-cwd">Working directory</label>
+    <input id="new-chat-cwd" name="cwd" type="text" list="new-chat-cwds"
+           value="{{ new_chat_default_cwd }}"
+           autocomplete="off" required placeholder="/path/to/project">
+    <datalist id="new-chat-cwds">
+      {% for cwd in new_chat_cwds %}<option value="{{ cwd }}">{% endfor %}
+    </datalist>
+    <label for="new-chat-message">First message</label>
+    <textarea id="new-chat-message" class="send-on-enter" name="message" rows="3"
+              required placeholder="What should Codex work on?"></textarea>
+    <label class="image-picker" for="new-chat-images">＋ Attach file <span class="paste-hint">or paste screenshot</span></label>
+    <input id="new-chat-images" class="image-input" type="file" name="images" multiple>
+    <div class="composer-actions">
+      <span>Enter to send · Shift+Enter for newline</span>
+      {% include "partials/speech_button.html" %}
+      <button type="submit">Start chat</button>
+    </div>
+  </form>
+  <div id="new-session-result" class="inject-result"></div>
+</details>
+<script src="/static/model_picker.js?v={{ asset_ver }}" defer></script>
+{% endif %}

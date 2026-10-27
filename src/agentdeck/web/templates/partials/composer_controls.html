@@ -1,0 +1,10 @@
+{% if can_interrupt %}
+<button class="stop-button" type="submit" form="interrupt-form"
+        aria-label="Stop active turn">Stop</button>
+{% else %}
+{#- Holds Stop's width while no turn runs, so 🎤, 🎧 and the rest of the
+    right-aligned row stay put when Stop comes and goes (#3545). #}
+<button class="stop-placeholder" type="button" tabindex="-1"
+        aria-hidden="true">Stop</button>
+{% endif %}
+<button type="submit">Send</button>

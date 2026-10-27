@@ -1,0 +1,136 @@
+# agentdeck configuration — copy to ~/.config/agentdeck/config.toml
+# (override the path with the AGENTDECK_CONFIG environment variable).
+#
+# This file contains NO secrets. Credentials are read from provider stores or
+# separately permissioned files; only those file paths belong here.
+
+[server]
+# Bind address. Default 127.0.0.1 exposes nothing beyond the local host.
+# For phone access, set this to your Tailscale IP, e.g. "100.101.102.103".
+# NEVER bind 0.0.0.0 on an untrusted LAN — there is no auth in v0.x.
+bind = "127.0.0.1"
+port = 8756
+
+[polling]
+usage_interval_s = 300      # per-account OAuth usage poll; the endpoint is aggressively rate-limited — keep >=120s or you'll get near-constant 429s (data still shows, marked "stale" only once it ages past ~3x this)
+scan_interval_s = 15        # full session rescan
+liveness_interval_s = 10    # /proc pid liveness sweep
+host_interval_s = 30        # aggregate host CPU + memory refresh
+
+[usage]
+# Where usage snapshots are published for other tools to read.
+# Default: $XDG_RUNTIME_DIR/agentdeck (falls back to ~/.cache/agentdeck).
+shared_cache_dir = ""
+
+[history]                   # required SQLite store: usage, sessions, Deckhand, control state
+db_path = "~/.local/share/agentdeck/agentdeck.db"
+usage_retention_days = 30
+
+# Observe records proposed context maintenance while still executing ordinary
+# delivery. This PR proposes enabling `enforce` for negotiated poller workers.
+[context_management]
+mode = "observe"                    # off | observe | enforce
+compact_at_tokens = 90000
+rollover_at_tokens = 120000
+new_generation_rollover_at_tokens = 90000
+compact_rearm_below_tokens = 60000
+handoff_max_chars = 16000
+handoff_recent_messages = 8
+max_previous_summary_chars = 6000
+retention_days = 30
+
+[inject]
+enabled = false             # write-capability kill-switch; opt in only on a trusted bind
+timeout_s = 900
+# max_message_chars = 16000  # optional cap on a sent message; unset means no limit
+
+# Deterministic attention tracking. Sessions report waiting/finished through the
+# local API; unreported completed turns safely fall back to finished.
+[push]
+enabled = false
+# VAPID contact claim — a mailto: or https: URL push services can reach you at.
+# Required by the Web Push spec; not a secret. The VAPID keypair itself is
+# generated once and stored in the DB, never here.
+subject = ""                       # e.g. "mailto:you@example.com"
+
+[assistant]
+enabled = false
+refresh_interval_s = 60
+
+# Deck-owned Claude worker processes (spawned/steered/revived through the
+# runtime service's /claude/... API). Off by default — see docs/WORKER_RUNTIME.md.
+#[claude_workers]
+#enabled = true
+#max_workers = 4                # per account; steering a live worker is exempt
+#permission_mode = "auto"       # default; Claude's classifier reviews risky tool calls, and a call it
+                                # blocks becomes a pending prompt on the chat (Allow once / Keep blocked)
+# Everyday commands (local git, tests, file and text tools) skip the classifier through built-in
+# allow rules. Add more here; one that would let gh, curl, git push or similar through is ignored.
+#classifier_skip_rules = ["Bash(make test *)"]
+#model = ""                    # "" = account default
+#stall_after_s = 3600           # flag a live worker "stalled" after this many silent seconds; 0 disables
+# Each worker runs in a transient systemd scope of its own with this MemoryMax,
+# so a runaway one is killed alone instead of OOM-killing the whole host.
+# Default "8G"; "" spawns uncapped. Ignored where `systemd-run --user` is unusable.
+#memory_max = "8G"
+#state_dir = "~/.local/share/agentdeck/claude-workers"
+# Per-account fields inherit from the base section when omitted.
+#[claude_workers.accounts.alt]
+#permission_mode = "bypassPermissions"
+#max_workers = 3
+
+# Durable opaque-key state for provider-neutral workers such as poller-dispatched Codex threads.
+#[keyed_workers]
+#state_dir = "~/.local/share/agentdeck/keyed-workers"
+#max_kanban_workers = 4         # active kanban roots across every project/provider/account
+
+# Chats to nudge after the next persistent-runtime restart. Agents register
+# themselves (PUT /api/sessions/<key>/restart-nudge, or `agentdeck
+# nudge-on-restart`); the fresh runtime nudges them once on boot and clears the
+# file. Give a second deployment on this host its own path.
+#[restart_nudge]
+#file = "~/.local/share/agentdeck/restart-nudge.json"
+#ttl_s = 86400                   # drop an entry that has waited this long for a restart
+
+# The host-wide queue for heavy commands: `agentdeck job submit --cwd <dir> --
+# pytest -q` returns immediately and the runtime tells the submitting chat when
+# the job ends. One runs at a time by default; `slots = 0` means that default,
+# which `AGENTDECK_HEAVY_SLOTS` also sets for a direct `pytest` with no config to
+# read.
+# Give a second deployment on this host its own state_dir or it will run the same
+# queued commands twice.
+#[jobs]
+#enabled = true
+#state_dir = "~/.local/share/agentdeck/jobs"
+#slots = 0
+
+# Every GitHub webhook that reaches AgentDeck is appended to
+# <state_dir>/<owner>/<repo>.jsonl, one line per delivery, exact original bytes
+# base64-encoded. Nothing consumes these files and receiving one wakes nothing.
+# The shared webhook secret is read from the environment variable named by
+# secret_env, never from this file; when it is unset the private route accepts
+# what reaches it, which is safe only behind a trusted hop.
+# Give a second deployment on this host its own state_dir.
+#[github_webhook]
+#enabled = true
+#state_dir = "~/.local/share/agentdeck/github-webhooks"
+#secret_env = "AGENTDECK_WEBHOOK_SECRET"
+
+
+# One [[accounts]] block per agent-CLI config dir. Labels must be unique,
+# lowercase slug-safe (they appear in URLs and cache filenames).
+[[accounts]]
+provider = "claude_code"
+label = "main"
+config_dir = "~/.claude"
+
+# Codex CLI rollouts under $CODEX_HOME/sessions/YYYY/MM/DD/.
+[[accounts]]
+provider = "codex"
+label = "codex"
+config_dir = "~/.codex"
+
+#[[accounts]]
+#provider = "claude_code"
+#label = "alt"
+#config_dir = "~/.claude2"

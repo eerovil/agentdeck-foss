@@ -1,0 +1,14 @@
+[Unit]
+Description=agentdeck stable web listener
+
+[Socket]
+ListenStream=127.0.0.1:8756
+Accept=no
+FlushPending=no
+Backlog=2048
+NoDelay=true
+FileDescriptorName=web
+Service=agentdeck.service
+
+[Install]
+WantedBy=sockets.target

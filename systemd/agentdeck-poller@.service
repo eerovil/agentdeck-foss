@@ -1,0 +1,22 @@
+[Unit]
+Description=AgentDeck Poller Instance %i (one cycle)
+After=network-online.target
+# Deliberately no dependency on agentdeck.service or agentdeck-codex.service. A Poller
+# Instance keeps cycling while the dashboard is being deployed or the worker backend is
+# unreachable: unavailability degrades delivery, it never stops the instance (#116).
+
+[Service]
+Type=oneshot
+WorkingDirectory=@POLLER_ROOT@/instances/%i
+# One wake: the engine decides, then the host acts on what it decided. The wake script and the
+# engine it runs both come from this checkout, so one AgentDeck deploy selects them together and
+# one rollback returns them together (#2153). Never a per-project engine path.
+ExecStart=@REPO@/.venv/bin/python @REPO@/scripts/poller_wake.py \
+    --root @POLLER_ROOT@ --instance %i
+# A failing cycle is a health fact the engine already records in durable state (#107); the
+# log is a convenience, not the observable surface, so nothing here has to be tailed.
+StandardOutput=append:@POLLER_ROOT@/instances/%i/cycle.log
+StandardError=append:@POLLER_ROOT@/instances/%i/cycle.log
+# A wake that has not finished in ten minutes is stuck; killing it is safe because every
+# durable step is written before its external effect, and the next wake reconciles.
+TimeoutStartSec=600

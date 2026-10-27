@@ -1,0 +1,76 @@
+{# The selected chat's related GitHub work. Issue registration can be explicit or
+   inferred structurally from a poller dispatch; PRs are always explicit. Both
+   ride one signature-gated fragment so the relationship set updates atomically. #}
+{% for issue in issues %}
+<a class="chip issue-link{% if issue.status_kind %} issue-{{ issue.status_kind }}{% endif %}"
+   href="{{ issue.url|issue_href }}" target="_blank" rel="noopener">
+  Issue #{{ issue.number }}{% if issue.status %} · {{ issue.status }}{% endif %}{% if issue.project_status %} · {{ issue.project_status }}{% endif %}
+</a>
+{% endfor %}
+{% macro pull_chip(pull) %}
+<a class="chip pr-link pr-{{ pull.status }}" href="{{ pull.url }}" target="_blank" rel="noopener"
+   title="{{ pull.title }}">
+  PR #{{ pull.number }} · {{ pull.display_status }}
+</a>
+{% endmacro %}
+{% for pull in pull_requests %}{{ pull_chip(pull) }}{% endfor %}
+{# Two or more finished pull requests fold behind one chip (#2711), closed by default so
+   the row gets no taller. `data-keep-open` (work_list.js) keeps it open across a push. #}
+{% if pull_request_fold %}
+<details class="pr-fold" data-keep-open="related-prs:{{ session_key }}">
+  <summary class="chip pr-link pr-{{ pull_request_fold.status }}"
+           title="{% for pull in pull_request_fold.pulls %}#{{ pull.number }} {{ pull.display_status }}{% if not loop.last %}, {% endif %}{% endfor %}">{{ pull_request_fold.label }}</summary>
+  <span class="pr-fold-list">{% for pull in pull_request_fold.pulls %}{{ pull_chip(pull) }}{% endfor %}</span>
+</details>
+{% endif %}
+{# This chat's current commit and whether anything has reviewed it (#1127). The
+   unreviewed state is the only pressable one: a verdict is about a commit, so
+   re-asking the same commit has nothing new to answer. The POST returns this
+   whole fragment, which is also what the stream pushes, so the chip a press
+   leaves behind is the one the next tick would have rendered anyway. #}
+{% if head_review %}
+{% set dirty_note = ' Uncommitted changes are not part of this commit.' if head_review.dirty else '' %}
+{% if head_review.state == 'reviewed' %}
+<span class="chip head-review head-review-{{ head_review.verdict_kind }}"
+      title="{{ head_review.sha }} in {{ head_review.repo }} was reviewed: {{ head_review.verdict }}.{{ dirty_note }}">
+  {{ head_review.label }}
+</span>
+{% elif head_review.state == 'reviewing' %}
+{# The review chat has no name for its first moment or two — the provider is still
+   starting it — so the chip only becomes a link once there is somewhere to go. #}
+{% if head_review.review_session_key %}
+<a class="chip head-review head-review-running" href="/sessions/{{ head_review.review_session_key }}"
+   title="A review of {{ head_review.sha }} is running in this chat.{{ dirty_note }}">
+  {{ head_review.label }}
+</a>
+{% else %}
+<span class="chip head-review head-review-running"
+      title="A review of {{ head_review.sha }} is starting.{{ dirty_note }}">
+  {{ head_review.label }}
+</span>
+{% endif %}
+{% else %}
+{% if head_review.dirty %}
+<span class="chip head-review head-review-refused"
+      title="Commit or discard uncommitted changes before review & fix can start.">
+  {{ head_review.label }}
+</span>
+{% else %}
+<form class="head-review-control" hx-post="/sessions/{{ head_review.session_key }}/review-head"
+      hx-target="#session-related-links" hx-swap="innerHTML" hx-disabled-elt="find button"
+      hx-confirm="Review &amp; fix may edit this checkout, commit and push fixes, and open or update its pull request. Continue?">
+  <button type="submit" class="chip head-review head-review-start"
+          title="{{ head_review.sha }} in {{ head_review.repo }} has no recorded review. Review & fix may edit, commit and push fixes, and open or update its pull request; its verdict is kept against this commit.">
+    {{ head_review.label }}
+  </button>
+</form>
+{% endif %}
+{% endif %}
+{% endif %}
+{# Only the review POST sets this: a refused start says why, in the row that was
+   pressed, instead of leaving a status number nobody sees (#746). The stream never
+   sets it, so the next push clears it. #}
+{% if head_review_refusal %}
+<span class="chip head-review head-review-refused" role="alert"
+      title="{{ head_review_refusal }}">{{ head_review_refusal }}</span>
+{% endif %}

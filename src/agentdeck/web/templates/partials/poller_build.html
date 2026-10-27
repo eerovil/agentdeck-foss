@@ -1,0 +1,38 @@
+{# Launching a Builder session (#181). Collapsed by default: a new control must not add
+   height to the page until the operator deliberately opens it (AGENTS.md). #}
+<details class="poller-build">
+  <summary>Build a Poller Project</summary>
+  <form hx-post="/pollers/build" hx-target="#poller-build-status" hx-swap="innerHTML"
+        class="poller-build-form">
+    <label>Project id
+      <input type="text" name="project" required placeholder="reference"
+             autocapitalize="off" autocomplete="off" spellcheck="false">
+    </label>
+    <label>Draft Manifest path
+      <input type="text" name="manifest" required placeholder="~/agentdeck/poller/poller.toml"
+             autocapitalize="off" autocomplete="off" spellcheck="false">
+    </label>
+    <label>Draft Overlay path
+      <input type="text" name="overlay" required
+             placeholder="~/.local/share/agentdeck/poller/instances/reference/overlay.toml"
+             autocapitalize="off" autocomplete="off" spellcheck="false">
+    </label>
+    <fieldset class="poller-accounts">
+      <legend>Who runs the interview, in order</legend>
+      {# The first with usage left conducts it; the rest are its fallbacks. #}
+      {% for account in accounts %}
+        <label class="chip">
+          <input type="checkbox" name="account_key" value="{{ account.key }}"
+                 {% if loop.first %}checked{% endif %}>
+          {{ account.label }}
+        </label>
+      {% endfor %}
+    </fieldset>
+    <button type="submit">Start the Builder</button>
+  </form>
+  <p class="small muted">
+    The Builder drafts and validates, then stops. A Release Controller activates it separately —
+    approving a draft is not activation.
+  </p>
+  <div id="poller-build-status" aria-live="polite"></div>
+</details>

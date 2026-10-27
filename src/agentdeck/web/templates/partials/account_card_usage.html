@@ -1,0 +1,8 @@
+{#- One account card's usage figures (#730, #3228): one labelled figure per window this
+    account's provider actually meters. The accounts page's stream replaces it whole on a
+    usage change. #}
+<span class="account-card-usage" sse-swap="account-usage-{{ row.account.key }}" hx-swap="outerHTML">
+  {% set metered = row.windows | rejectattr('pct', 'none') | list %}
+  {% for w in metered %}{{ w.kind }} {{ w.pct | round | int }}% {% endfor %}
+  {% if not row.usage or not metered %}Usage unavailable{% endif %}
+</span>

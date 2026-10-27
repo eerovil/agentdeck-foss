@@ -1,0 +1,57 @@
+{# The topbar job-queue pill (#1301): what the host-wide heavy-command queue
+   (#1287) is running and what is waiting for a slot. Rendered at page load and
+   re-pushed over SSE whenever the queue actually changes.
+
+   Nothing at all when the queue is idle — the pill answers "what is the host
+   busy with", and on a phone an always-present "0" costs width for no answer.
+   The panel's open state and its elapsed clocks are kept alive by
+   static/job_queue.js across the swap, because unlike the deploy pill this
+   fragment is replaced whenever any job starts or finishes. #}
+{% set queue = job_queue() %}
+{% if queue.active %}
+<details class="job-queue{% if queue.queued_count %} job-queue-waiting{% endif %}">
+  <summary aria-label="{{ queue.summary }}" title="{{ queue.summary }}">
+    <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
+      <path fill="currentColor" d="M2 3h12v2H2V3Zm0 4h12v2H2V7Zm0 4h8v2H2v-2Z"/>
+    </svg>
+    <span class="job-queue-count job-queue-count-running">{{ queue.running_count }}</span>
+    {% if queue.queued_count %}
+    <span class="job-queue-count job-queue-count-queued">{{ queue.queued_count }}</span>
+    {% endif %}
+  </summary>
+  <div class="job-queue-panel">
+    <strong>Job queue</strong>
+    <p class="job-queue-summary">{{ queue.running_count }} running{% if queue.queued_count %}, {{ queue.waiting_label }}{% endif %}.</p>
+    {# Who holds a heavy slot that is not one of the jobs listed below (#1391).
+       Without it, a slot taken by a direct pytest or an API lease reads as a
+       stalled queue: jobs waiting, nothing running, no explanation anywhere. #}
+    {% for holder in queue.holders %}
+    <p class="job-queue-note job-queue-holder">
+      Slot held outside the queue{% if holder.kind == 'lease' %} (lease){% endif %}:
+      <code title="{{ holder.display }}">{{ holder.display }}</code>
+      {%- if holder.detail %} in <code title="{{ holder.detail }}">{{ holder.detail }}</code>{% endif %}
+      — <span class="job-queue-age" data-job-elapsed="{{ holder.elapsed_s }}">{{ holder.elapsed_label }}</span>
+    </p>
+    {% endfor %}
+    <ul class="job-queue-list">
+      {% for row in queue.panel_rows %}
+      <li class="job-queue-item job-queue-item-{{ row.state }}" data-job-id="{{ row.id }}">
+        <span class="job-queue-head">
+          <span class="job-queue-state">{{ row.state }}</span>
+          <span class="job-queue-age" data-job-elapsed="{{ row.elapsed_s }}">{{ row.elapsed_label }}</span>
+        </span>
+        <span class="job-queue-command" title="{{ row.display }}">{{ row.display }}</span>
+        {% if row.chat_path %}
+        <a class="job-queue-chat" href="{{ row.chat_path }}">{{ row.chat_title or 'chat' }}</a>
+        {% elif row.session_key %}
+        <span class="job-queue-chat">{{ row.session_key }}</span>
+        {% endif %}
+      </li>
+      {% endfor %}
+    </ul>
+    {% if queue.hidden_count %}
+    <p class="job-queue-note">and {{ queue.hidden_count }} more — <code>agentdeck job list</code></p>
+    {% endif %}
+  </div>
+</details>
+{% endif %}

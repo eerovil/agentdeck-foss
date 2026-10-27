@@ -1,0 +1,12 @@
+# The GitHub authority every test sees (#3623): the agent account for eerovil, the
+# owner the fixtures use. With no file at all a deck has no owner, and a test of that
+# points AGENTDECK_GITHUB_AUTHORITY_FILE somewhere absent itself.
+[owners]
+eerovil = "agent"
+
+[agent]
+login = "eerovil-agent"
+
+# An outside reviewer the tests' review flows use (#3623).
+[reviewers]
+logins = ["review-bot[bot]"]

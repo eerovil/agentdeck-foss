@@ -1,0 +1,61 @@
+{# The one row a worker is started through (#1992). Swapped on a press only, and the <details>
+   around it is outside the target on purpose, so pressing Run now never closes the section
+   you are in. #}
+{% if nudge_error %}
+  <p class="small error">{{ nudge_error }}</p>
+{% endif %}
+{% if review_note %}
+  <p class="small">{{ review_note }}</p>
+{% endif %}
+{% if rate_limited %}
+  {# Said for the section rather than under the row: the cooldown is about the account, not
+     about this press (#1945). The row below says only that it cannot be run, and this is why. #}
+  <p class="small error chat-board-rate-limited">{{ rate_limited }}</p>
+{% endif %}
+{% if not nudges %}
+  <p class="muted small">
+    No ChatGPT project is set in <code>[chat_board] project_url</code> in this deck's
+    <code>config.toml</code>, so there is nothing to start a worker in from here.
+  </p>
+{% endif %}
+{% for nudge in nudges %}
+  <div class="chat-board-nudge">
+    <p class="small">
+      <code>{{ nudge.task }}</code> — last nudge
+      <span{% if nudge.last_iso %} title="{{ nudge.last_iso }}"{% endif %}>{{ nudge.last_ago }}</span>
+      {%- if nudge.source %} {{ nudge.source }}{% endif %}
+      {%- if nudge.result %}, {{ nudge.result }}{% endif %}.
+    </p>
+    {% if nudge.in_flight %}
+      {# Launching is not opening a chat: the run answers through a receipt minutes later. #}
+      <p class="small muted">A worker is starting now — it reports back when the chat is open.</p>
+    {% elif nudge.runnable %}
+      <button type="button" hx-post="/chat-board/nudges/{{ nudge.instance }}"
+              hx-target="#chat-board-nudge-rows" hx-swap="innerHTML">Run now</button>
+    {% elif nudge.rate_limited %}
+      {# The reason is the paragraph above, once for the whole section. Repeating a cooldown
+         sentence under every row would push the chats off a phone screen for one fact. #}
+      <p class="small muted">Cannot be run while ChatGPT is rate limiting this account.</p>
+    {% else %}
+      <p class="small muted">Cannot be run from here — {{ nudge.note }}.</p>
+    {% endif %}
+  </div>
+{% endfor %}
+{% if nudges %}
+  {# Check workers is gone with the scheduled tasks it read (#1992). How many workers are
+     running is the `in-progress` count on this very page now, so a browser run to go and
+     ask ChatGPT bought a worse answer at the price that drew #1945's rate limiting. #}
+  <button type="button" hx-get="/partials/chat-board/nudges"
+          hx-target="#chat-board-nudge-rows" hx-swap="innerHTML">Refresh</button>
+{% endif %}
+{# Asking for a new chat, which no button above can do: a worker with an empty queue
+   does nothing at all. One issue per review, so the box takes owner/repo#123 — a pasted
+   issue or pull request URL works too. One line, so the section costs no extra height. #}
+{# The composer that was here is at the top of the page now, in its own swap target: a
+   submit answering with this fragment re-rendered the form and lost what was typed (#1827). #}
+<form class="chat-board-review" hx-post="/chat-board/review"
+      hx-target="#chat-board-nudge-rows" hx-swap="innerHTML">
+  <input type="text" name="target" placeholder="owner/repo#123" autocapitalize="off"
+         autocorrect="off" spellcheck="false" aria-label="issue to review">
+  <button type="submit">Review</button>
+</form>

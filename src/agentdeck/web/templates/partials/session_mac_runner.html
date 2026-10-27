@@ -1,0 +1,66 @@
+{# The Mac command-approval tool's whole presence in the session view (#1865).
+
+   Renders nothing at all when no Mac program is configured, so the include in
+   session.html needs no condition around it.
+
+   The frame is a cross-origin frame from the Mac program's own address, and that
+   is the point: the browser seals it off, so this page cannot read the command it
+   shows or press its buttons, and this deck never carries the answer. It is shut
+   by default, because an open frame would add its whole height to every session
+   page on a phone; the attention card and its push are what tell you something is
+   waiting.
+
+   The switch press swaps only the switch — `hx-select` picks it back out of this
+   same partial — so pressing it cannot close a frame you deliberately opened. #}
+{% if mac_runner.configured %}
+<form id="session-mac-runner" class="session-mac-runner"
+      hx-post="/sessions/{{ mac_runner.session_key }}/mac-runner"
+      hx-trigger="change" hx-target="this" hx-swap="outerHTML"
+      hx-select="#session-mac-runner" hx-disabled-elt="find input">
+  {# Switching on posts the paragraph into a chat already running, because its
+     guide was assembled before you pressed this (#2097). Switching off cannot
+     unsay that, so it only keeps the paragraph out of the next chat's guide —
+     and the tooltip says so, since the two directions are not symmetrical. #}
+  <label class="chip" title="Tell this chat the address of the Mac command-approval program. It controls who gets told, not who is allowed to call it — every command still needs your approval. A chat already running is told as a message; switching off only keeps it out of the next chat.">
+    <input type="checkbox" name="enabled" value="true"
+           {% if mac_runner.enabled %}checked{% endif %}
+           {% if not mac_runner.switchable %}disabled{% endif %}>
+    Mac commands
+  </label>
+  {# Three states, not two. A press whose send is still running is neither a
+     failure to alarm you with nor a telling to let you assume — and nothing
+     retries a press, so silence here reads as "the chat knows" (#2097). #}
+  {% if mac_runner.error %}<span class="mac-runner-error" role="alert">{{ mac_runner.error }}</span>{% endif %}
+  {% if mac_runner.pending %}<span class="mac-runner-pending" role="status">{{ mac_runner.pending }}</span>{% endif %}
+</form>
+{% if mac_runner.approval_url %}
+<details class="session-mac-runner-frame">
+  <summary class="chip">Mac approvals</summary>
+  {# Read-only on purpose, and approving happens on the Mac's own page.
+
+     Sealing the frame stops this page reading it. It does not stop this page
+     deciding where the frame sits, how big it is, or what is drawn on top of
+     it — so an agent that edited these files could put a real approve button
+     under something harmless-looking and collect a click meant for something
+     else. `sandbox` without `allow-forms` or `allow-scripts` is the browser
+     refusing to submit anything from in here, and `pointer-events: none` means
+     clicks never reach it at all.
+
+     None of that is the boundary, because an agent can edit this file too. The
+     Mac program is what enforces it, by refusing approve and deny whenever
+     `window.top !== window.self`. This half exists so that the honest path is
+     also the only convenient one. #}
+  {# Above the frame, not below it: the Mac's own page draws working-looking
+     buttons that do nothing here, so you have to be told before you see them. #}
+  <p class="mac-runner-direct">
+    Read-only preview — the buttons below do nothing here.
+    <a class="mac-runner-open" href="{{ mac_runner.approval_url }}"
+       target="_blank" rel="noopener noreferrer">Open the approval page</a>
+    to approve or deny, and check the address bar says the Mac before you tap.
+  </p>
+  <iframe src="{{ mac_runner.approval_url }}" title="Mac command approvals, read-only"
+          sandbox="allow-same-origin" referrerpolicy="no-referrer" loading="lazy"
+          tabindex="-1" aria-hidden="true"></iframe>
+</details>
+{% endif %}
+{% endif %}

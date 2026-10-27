@@ -1,0 +1,42 @@
+{% set active_sessions = active_subagent_sessions | default(()) %}
+{% set working_count = s.subagent_count + (active_sessions | length) %}
+{% if s.subagents or active_sessions %}
+<section class="subagent-activity{% if working_count %} active{% endif %}" aria-label="Subagent progress">
+  <div class="subagent-activity-head">
+    <span>Subagents</span>
+    {% if working_count %}<span>{{ working_count }} working</span>{% else %}<span>recently finished</span>{% endif %}
+  </div>
+  <div class="subagent-list">
+  {% for agent in s.subagents %}
+    <div class="subagent-row {{ agent.status }}">
+      <span class="subagent-state" aria-hidden="true"></span>
+      <div class="subagent-copy">
+        <div class="subagent-name">
+          <strong>{{ agent.nickname or agent.agent_id[:8] }}</strong>
+          {% if agent.role %}<span>{{ agent.role }}</span>{% endif %}
+          <span class="subagent-status">{{ agent.status }}</span>
+        </div>
+        {% if agent.task %}<div class="subagent-task" title="{{ agent.task }}">{{ agent.task }}</div>{% endif %}
+        {% if agent.result and agent.status not in ('working', 'quiet') %}<div class="subagent-result" title="{{ agent.result }}">{{ agent.result }}</div>{% endif %}
+      </div>
+      {% if agent.updated_at %}<time class="subagent-age" datetime="{{ agent.updated_at.isoformat() }}" title="{{ agent.updated_at | chat_time_title }}">{{ agent.updated_at | reltime_ago }}</time>{% endif %}
+    </div>
+  {% endfor %}
+  {% for child in active_sessions %}
+    <a class="subagent-row working" href="/sessions/{{ child.key }}"
+       data-agentdeck-action="open_session">
+      <span class="subagent-state" aria-hidden="true"></span>
+      <div class="subagent-copy">
+        <div class="subagent-name">
+          <strong>{{ child.display_title }}</strong>
+          {% if child.worker_type or child.kind %}<span>{{ child.worker_type or child.kind }}</span>{% endif %}
+          <span class="subagent-status">working</span>
+        </div>
+        {% if child.activity %}<div class="subagent-task" title="{{ child.activity }}">{{ child.activity }}</div>{% endif %}
+      </div>
+      {% if child.last_activity %}<time class="subagent-age" datetime="{{ child.last_activity.isoformat() }}" title="{{ child.last_activity | chat_time_title }}">{{ child.last_activity | reltime_ago }}</time>{% endif %}
+    </a>
+  {% endfor %}
+  </div>
+</section>
+{% endif %}

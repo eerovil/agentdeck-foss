@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+
+{% block title %}Deck chat · agentdeck{% endblock %}
+{% block body_class %}meta-chat-page{% endblock %}
+{% block topbar_nav %}<a class="back" href="/" aria-label="back to sessions">←</a>{% endblock %}
+
+{#- The deck chat before it exists (#3403). Its first message starts it; from then on
+    /meta redirects to the chat itself. #}
+{% block content %}
+<main class="meta-chat-main">
+  <header class="page-head">
+    <h1>Deck chat</h1>
+  </header>
+  <p class="muted">One always-on chat for steering the deck. After an hour without a
+    message it carries on with a clean context.</p>
+  {% if account %}
+  <form class="inject-form" hx-post="/meta/new" hx-target="#new-session-result" hx-swap="outerHTML"
+        hx-disabled-elt="find button" hx-encoding="multipart/form-data" data-clear-on-send
+        data-agentdeck-action="new_session">
+    <label for="meta-chat-message">Message</label>
+    <textarea id="meta-chat-message" class="send-on-enter" name="message" rows="3" required
+              placeholder="Ask the deck something…" autocomplete="off"></textarea>
+    <div class="composer-actions">
+      <button type="submit">Start</button>
+    </div>
+    {% if starting_token %}
+    <div id="new-session-result" class="inject-result"
+         hx-get="/partials/starting-chat/{{ starting_token }}?result_id=new-session-result"
+         hx-trigger="load" hx-swap="outerHTML"></div>
+    {% else %}
+    <div id="new-session-result" class="inject-result"></div>
+    {% endif %}
+  </form>
+  {% else %}
+  <p role="alert">No account for the deck chat: set <code>[meta_chat] account</code> to a
+    configured account label.</p>
+  {% endif %}
+</main>
+{% endblock %}

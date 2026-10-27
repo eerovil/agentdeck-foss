@@ -1,0 +1,101 @@
+{% extends "base.html" %}
+
+{% block title %}Works · agentdeck{% endblock %}
+{% block body_class %}works-page{% endblock %}
+{# The Works index (#2147, #2201). By default the Active and Recent Works; the Archived Works
+   are a separate, paged and searchable view, and the Hidden Works another (#2238). Plain rows with no Run reads, so it stays cheap
+   however much history there is; each row opens the Work's own page. #}
+{#- The default list and the Hidden list stream their rows (#3228); the archive is a paged
+    search with no stream, so there the top bar's live icons keep their own small one (#2864, #3239). #}
+{% block body_sse %}{% if view == "hidden" %}sse-connect="/events?view=works-hidden"{% elif view != "archived" %}sse-connect="/events?{{ {'view': 'works-index', 'repo': repo} | urlencode }}"{% endif %}{% endblock %}
+{% block topbar_sse %}{% if view == "archived" %} sse-connect="/events/topbar"{% endif %}{% endblock %}
+{% block topbar_nav %}<a class="back" href="{{ '/works' if view == 'archived' else '/' }}" aria-label="{{ 'back to the Works' if view == 'archived' else 'back to the dashboard' }}">←</a>{% endblock %}
+
+{%- macro work_rows(rows) -%}
+  <ul class="wd-rows works-index">
+    {%- for row in rows %}
+    <li class="wd-row" data-work-id="{{ row.work_id }}">
+      <a href="{{ row.href }}">{{ row.title }}</a>
+      <span class="rt-note">{{ row.source_label }}{% if row.work_state %} · {{ row.work_state }}{% endif %} · {{ row.chat_count }} {{ "chat" if row.chat_count == 1 else "chats" }}</span>
+      {%- if row.last_activity %}<time class="wo-age" datetime="{{ row.last_activity.isoformat() }}" data-activity-age>{{ row.last_activity | reltime_ago }}</time>{% endif %}
+    </li>
+    {%- endfor %}
+  </ul>
+{%- endmacro -%}
+
+{% block content %}
+<main class="work-main">
+  {%- if view == "hidden" %}
+  {#- Works hidden from Needs you (#2238): a hide lasts until the Work's issue gets a comment or
+      its card moves, and Bring back ends it now. Rows and controls are the front page's own. #}
+  {%- set hidden_rows = work_overview.front.hidden %}
+  <h1 class="wd-title">Hidden Works <span class="rt-count" data-hidden-count sse-swap="works-hidden-count" hx-swap="innerHTML">{{ hidden_rows | length }}</span></h1>
+  <p class="rt-note">Hidden from Needs you until its issue gets a new comment or its board card moves.</p>
+  <div class="front-rows" id="works-hidden" sse-swap="works-hidden" hx-swap="keyed-works">
+    {%- set part = "hidden" %}{% include "partials/work_front.html" %}
+  </div>
+  <div class="work-action-result" id="work-action-result" aria-live="polite"></div>
+  {%- elif view == "archived" %}
+  <h1 class="wd-title">Archived Works <span class="rt-count" data-archived-count>{{ archived_count }}</span></h1>
+  <p class="rt-note">Nothing current and no activity for a week. Every Work keeps its page and history.</p>
+  <form class="works-search" method="get" action="/works" role="search">
+    <input type="hidden" name="view" value="archived">
+    <input type="search" name="q" value="{{ q }}" placeholder="Search title or issue" aria-label="search Archived Works">
+    {%- if repositories | length > 1 %}
+    <select name="repo" aria-label="repository">
+      <option value="">All repositories</option>
+      {%- for name in repositories %}
+      <option value="{{ name }}"{% if name | lower == repo | lower %} selected{% endif %}>{{ name }}</option>
+      {%- endfor %}
+    </select>
+    {%- endif %}
+    <button type="submit">Search</button>
+  </form>
+  {%- if rows %}
+  <p class="rt-note" data-archive-range>{{ first + 1 }}–{{ first + rows | length }} of {{ matched }}{% if matched != archived_count %} matching{% endif %}</p>
+  {{ work_rows(rows) }}
+  {%- if pages > 1 %}
+  <nav class="works-pages" aria-label="Archived Works pages">
+    {%- if prev_href %}<a href="{{ prev_href }}" rel="prev">&larr; Newer</a>{% endif %}
+    <span class="rt-note">Page {{ page }} of {{ pages }}</span>
+    {%- if next_href %}<a href="{{ next_href }}" rel="next">Older &rarr;</a>{% endif %}
+  </nav>
+  {%- endif %}
+  {%- else %}
+  <p class="rt-note">{{ "No Archived Work matches." if q or repo else "No Archived Work." }}</p>
+  {%- endif %}
+  {%- else %}
+  <div class="works-head">
+    <h1 class="wd-title">Works</h1>
+    {#- The project filter (#2467): folded shut beside the heading so the list starts where it
+        did; its summary names the chosen repository, so a filtered list says so while shut. #}
+    {%- if repositories | length > 1 or repo %}
+    <details class="works-projects">
+      <summary class="toggle-btn filter-chip{% if repo %} on{% endif %}" data-works-project-summary>{{ repo or "All projects" }}</summary>
+      <nav class="filter-row" aria-label="Filter the Works by project">
+        <a class="toggle-btn filter-chip{% if not repo %} on{% endif %}" href="/works"{% if not repo %} aria-current="page"{% endif %}>All</a>
+        {%- for name in repositories %}
+        <a class="toggle-btn filter-chip{% if name == repo %} on{% endif %}" href="/works?{{ {'repo': name} | urlencode }}" data-works-project="{{ name }}"{% if name == repo %} aria-current="page"{% endif %}>{{ name }}</a>
+        {%- endfor %}
+      </nav>
+    </details>
+    {%- endif %}
+  </div>
+  {#- Each bucket's rows and count are their own stream events (#3228). #}
+  {%- for part, label in (("active", "Active"), ("recent", "Recent")) %}
+  {%- set rows = active if part == "active" else recent %}
+  <section class="works-bucket" data-works-bucket="{{ part }}">
+    <h2 class="wd-title-sm">{{ label }} <span class="rt-count" sse-swap="works-index-{{ part }}-count" hx-swap="innerHTML">{{ rows | length }}</span></h2>
+    <ul class="wd-rows works-index" id="works-index-{{ part }}" sse-swap="works-index-{{ part }}" hx-swap="keyed-works">
+      {%- include "partials/works_index.html" %}
+    </ul>
+  </section>
+  {%- endfor %}
+  {%- if repo %}
+  <p class="work-more"><a href="/works?{{ {'view': 'archived', 'repo': repo} | urlencode }}" data-archived-link>Archived Works in {{ repo }} &rarr;</a></p>
+  {%- else %}
+  <p class="work-more"><a href="/works?view=archived" data-archived-link>Archived Works ({{ archived_count }}) &rarr;</a></p>
+  {%- endif %}
+  {%- endif %}
+</main>
+{% endblock %}

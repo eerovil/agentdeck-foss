@@ -1,0 +1,16 @@
+{#- One bucket of the default `/works` list (#3228): `part` is `active` or `recent`, `rows` its
+    rows. Keyed by `data-work-id` and `data-work-rev`, like the front page's rows, so a push
+    replaces only the rows that changed; `row_html`, when the caller gave one, renders each row
+    once per revision for every tab and sends a placeholder for one the reader already shows. #}
+{%- macro index_row(row) -%}
+<li class="wd-row" data-work-id="{{ row.work_id }}" data-work-rev="{{ row.revision }}">
+  <a href="{{ row.href }}">{{ row.title }}</a>
+  <span class="rt-note">{{ row.source_label }}{% if row.work_state %} · {{ row.work_state }}{% endif %} · {{ row.chat_count }} {{ "chat" if row.chat_count == 1 else "chats" }}</span>
+  {%- if row.last_activity %}<time class="wo-age" datetime="{{ row.last_activity.isoformat() }}" data-activity-age>{{ row.last_activity | reltime_ago }}</time>{% endif %}
+</li>
+{%- endmacro -%}
+{%- for row in rows %}
+{% if row_html is defined and row_html %}{{ row_html(index_row, row) }}{% else %}{{ index_row(row) }}{% endif %}
+{%- else %}
+<li class="rt-note works-empty" data-works-empty>{{ "Nothing running, waiting or needing attention." if part == "active" else "No other Work moved this week." }}</li>
+{%- endfor %}

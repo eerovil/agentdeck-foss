@@ -1,0 +1,9 @@
+{# Collapsed by default, so this whole section costs one line of height at rest — a phone
+   opening the board wants the chats, not the machinery that feeds them. #}
+<details class="chat-board-nudges">
+  <summary>ChatGPT workers</summary>
+  <p class="muted small">{{ nudge_cost }}</p>
+  <div id="chat-board-nudge-rows">
+    {% include "partials/chat_board_nudge_rows.html" %}
+  </div>
+</details>

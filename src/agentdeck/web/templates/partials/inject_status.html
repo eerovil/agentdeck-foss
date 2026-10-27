@@ -1,0 +1,33 @@
+{% if inject_status and inject_status.state in ('running', 'queued') %}
+{% set last_item = inject_status.items[-1] if inject_status.items else None %}
+<div id="inject-result" class="inject-result {{ inject_status.state }}"
+     hx-get="/partials/sessions/{{ session_key }}/inject-status"
+     hx-trigger="load delay:2s" hx-swap="outerHTML"
+     aria-live="polite"
+     aria-label="{% if inject_status.state == 'running' %}Sending message{% else %}Message queued{% endif %}{% if last_item %}: {{ last_item.text | display_message }}{% endif %}">
+  <span class="send-spinner" aria-hidden="true"></span>
+</div>
+{% elif inject_status and inject_status.state == 'failed' %}
+<div id="inject-result" class="inject-result failed has-detail" role="alert">
+  <span class="send-error" aria-hidden="true">!</span>
+  <span>{{ inject_failure_message or 'Could not send message.' }}{% if inject_failure_resets_at %}
+    Usage resets in {{ inject_failure_resets_at | reltime }}.{% endif %}</span>
+</div>
+{% else %}
+<div id="inject-result" class="inject-result"></div>
+{% endif %}
+{#- Rows already in the transcript, redrawn where they stand: a failure turns its
+    rows into "Not sent" ones that can be sent again, and a resend turns its row
+    back into a queued one (#2662). #}
+{% for item in replace_items | default([]) %}
+{% set replace_oob = true %}
+{% include "partials/pending_message.html" %}
+{% endfor %}
+{% if queued_item %}
+{% set item = queued_item %}
+{% set oob = true %}
+{% include "partials/pending_message.html" %}
+{% endif %}
+{% if issue_post %}
+{% with notice = issue_post, notice_oob = true %}{% include "partials/issue_post_notice.html" %}{% endwith %}
+{% endif %}

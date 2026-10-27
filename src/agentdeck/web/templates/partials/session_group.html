@@ -1,0 +1,12 @@
+{% set label = chain_labels.get(s.key) or labels.get(s.account_key) %}
+{% set label_class = labels.get(s.account_key) %}
+{% include "partials/session_card.html" %}
+{% set _kids = (children_of | default({})).get(s.key) %}
+{% if _kids %}
+{# Collapsed by default (issue #5); client state reopens this group when needed. #}
+<div class="subagent-children collapsed" data-subagents-of="{{ s.key }}" data-parent-chat-key="{{ s.row_key }}">
+  {% for sub in _kids %}
+    {% include "partials/session_subagent_row.html" %}
+  {% endfor %}
+</div>
+{% endif %}

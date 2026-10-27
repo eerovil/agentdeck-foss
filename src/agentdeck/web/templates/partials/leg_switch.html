@@ -1,0 +1,24 @@
+{# The chat moved to another account or provider here (#1250 shape A). One
+   inline row inside the same scroll: the transcript stays continuous, and the
+   reader can see where the billing and the process changed. Both sides are
+   named, because this row is often met while scrolling up, away from the badge
+   that says which account the chat is on now (#1267).
+
+   A rollover is the other way a chat crosses a leg boundary: context management
+   replaced the provider session, often on the same account, so "continued on
+   another account" would be plainly wrong. It says what happened instead, with
+   the reason in the tooltip so the row stays one line on a phone (#1667). The deck
+   chat's fresh start after an idle hour is drawn the same way (#3403). #}
+<div id="{{ switch.anchor }}" class="ev leg-switch" role="separator"
+     aria-label="{{ switch.rollover_words if switch.is_rollover else 'this chat continued on another ' ~ ('provider' if switch.crosses_provider else 'account') }}">
+  <span class="leg-switch-line" aria-hidden="true"></span>
+  <span class="leg-switch-text">
+    {% if switch.is_rollover %}<span class="leg-switch-reason" title="{{ switch.rollover_words }}">{{ switch.rollover_label }}</span>{% endif %}
+    {% if switch.from_account_label %}<span class="acct-badge acct-{{ switch.from_account_label }}">{{ switch.from_account_label }}</span>{% endif %}
+    {% if switch.crosses_provider %}<span class="leg-switch-provider">{{ switch.from_provider_id | provider_word }}</span>{% endif %}
+    <span class="leg-switch-arrow" aria-hidden="true">→</span>
+    {% if switch.to_account_label %}<span class="acct-badge acct-{{ switch.to_account_label }}">{{ switch.to_account_label }}</span>{% endif %}
+    {% if switch.crosses_provider %}<span class="leg-switch-provider">{{ switch.to_provider_id | provider_word }}</span>{% endif %}
+  </span>
+  <span class="leg-switch-line" aria-hidden="true"></span>
+</div>

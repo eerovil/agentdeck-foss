@@ -1,0 +1,94 @@
+{# One normalized transcript event. Tool calls stay as compact history rows;
+   large tool outputs remain hidden. Empty Codex reasoning events are private
+   liveness heartbeats and update the activity marker without rendering here. #}
+{%- if e.subagent_status -%}
+<details class="ev tool subagent-update {{ e.subagent_status | replace(' ', '-') }}">
+  <summary>
+    <span class="subagent-update-icon" aria-hidden="true"></span>
+    <span class="tool-name">{{ e.subagent_name or 'Subagent' }} {{ e.subagent_status }}</span>
+    {% if e.tool_summary %}<span class="tool-peek">{{ e.tool_summary }}</span>{% endif %}
+    {% if e.ts %}<time class="ev-time" datetime="{{ e.ts.isoformat() }}" title="{{ e.ts | chat_time_title }}">{{ e.ts | chat_time }}</time>{% endif %}
+  </summary>
+  {% if e.text %}<div class="ev-text">{{ e.text | display_message }}</div>{% endif %}
+</details>
+{%- elif e.tool_name == 'reasoning' -%}
+{%- elif e.tool_name and not e.question -%}
+{# `data-tool-key` is what static/tool_call_groups.js merges on: a run of
+   adjacent calls sharing one key renders as a single card with one head. #}
+{% set tool_key = (e.tool_display_name or (e.tool_name | tool_label)) ~ (' · ' ~ e.subagent if e.subagent else '') %}
+{% if e.tool_detail %}
+<details class="ev tool tool-call{% if e.subagent %} sub{% endif %}" data-tool-key="{{ tool_key }}">
+  <summary>
+    <span class="ev-role">tool</span>
+    <span class="tool-name">{{ e.tool_display_name or (e.tool_name | tool_label) }}</span>
+    <span class="tool-run-count" aria-hidden="true"></span>
+    {% if e.tool_summary %}<span class="tool-peek">{{ e.tool_summary }}</span>{% endif %}
+    {% if e.ts %}<time class="ev-time" datetime="{{ e.ts.isoformat() }}" title="{{ e.ts | chat_time_title }}">{{ e.ts | chat_time }}</time>{% endif %}
+  </summary>
+  <div class="ev-text">{{ e.tool_detail }}</div>
+</details>
+{% else %}
+<div class="ev tool tool-call{% if e.subagent %} sub{% endif %}" data-tool-key="{{ tool_key }}">
+  <div class="tool-call-head">
+    <span class="ev-role">tool</span>
+    <span class="tool-name">{{ e.tool_display_name or (e.tool_name | tool_label) }}</span>
+    <span class="tool-run-count" aria-hidden="true"></span>
+    {% if e.tool_summary %}<span class="tool-peek">{{ e.tool_summary }}</span>{% endif %}
+    {% if e.ts %}<time class="ev-time" datetime="{{ e.ts.isoformat() }}" title="{{ e.ts | chat_time_title }}">{{ e.ts | chat_time }}</time>{% endif %}
+  </div>
+</div>
+{% endif %}
+{%- elif deck_label | default(none) or e.notice -%}
+{#- A message the deck sent (#3200), or a background notification that opened a turn
+    (#3377): one grey line with its time, and the full text behind a tap. It keeps its
+    anchor and is a turn boundary for static/tool_call_groups.js, so the reply before it
+    is not folded away as part of the automatic turn after it. #}
+<details id="event-{{ event_id }}" class="ev deck-notice" data-event-seq="{{ e.seq }}" data-event-id="{{ event_id }}" data-event-session-key="{{ session_key }}"{% if observed_message | default(false) %} data-observed-queue-id="{{ observed_message.id }}"{% if observed_message.client_action_id %} data-observed-action-id="{{ observed_message.client_action_id }}"{% endif %}{% endif %}>
+  <summary>
+    <span class="deck-notice-dot" aria-hidden="true">●</span>
+    <span class="deck-notice-label">{{ deck_label or e.notice }}</span>
+    {% if e.ts %}<time class="ev-time" datetime="{{ e.ts.isoformat() }}" title="{{ e.ts | chat_time_title }}">{{ e.ts | chat_time }}</time>{% endif %}
+  </summary>
+  {% if e.text %}<div class="ev-text">{{ e.text | display_message }}</div>{% endif %}
+</details>
+{%- elif e.answer -%}
+<div id="event-{{ event_id }}" class="ev user{% if e.subagent %} sub{% endif %}" data-event-seq="{{ e.seq }}" data-event-id="{{ event_id }}" data-event-session-key="{{ session_key }}"{% if observed_message | default(false) %} data-observed-queue-id="{{ observed_message.id }}"{% if observed_message.client_action_id %} data-observed-action-id="{{ observed_message.client_action_id }}"{% endif %}{% endif %}>
+  <div class="ev-head">
+    <span class="ev-role">you</span>
+    <span class="ev-head-meta">
+      {% if e.ts %}<time class="ev-time" datetime="{{ e.ts.isoformat() }}" title="{{ e.ts | chat_time_title }}">{{ e.ts | chat_time }}</time>{% endif %}
+    </span>
+  </div>
+  {% if e.text %}<div class="ev-text">{{ e.text | display_message }}</div>{% endif %}
+  <div class="ev-text ev-answer" title="your answer to the agent's question"><bdi>{{ e.answer }}</bdi></div>
+</div>
+{%- elif e.role == 'tool' or (not e.text and not e.question and not e.tool_name and not e.image_media_types) -%}
+{%- else -%}
+<div id="event-{{ event_id }}" class="ev {{ e.role }}{% if e.failed %} failed{% endif %}{% if e.subagent %} sub{% endif %}" data-event-seq="{{ e.seq }}" data-event-id="{{ event_id }}" data-event-session-key="{{ session_key }}"{% if observed_message | default(false) %} data-observed-queue-id="{{ observed_message.id }}"{% if observed_message.client_action_id %} data-observed-action-id="{{ observed_message.client_action_id }}"{% endif %}{% endif %}>
+  <div class="ev-head">
+    <span class="ev-role">{{ e.role }}{% if e.subagent %} · {{ e.subagent }}{% endif %}</span>
+    <span class="ev-head-meta">
+      {% if e.model %}<span class="ev-model">{{ e.model }}</span>{% endif %}
+      {% if e.ts %}<time class="ev-time" datetime="{{ e.ts.isoformat() }}" title="{{ e.ts | chat_time_title }}">{{ e.ts | chat_time }}</time>{% endif %}
+      {#- Side chats (#2485). Both stay hidden: `side_chat.js` shows ＋ (start new work
+          from here, #3171) only on a reply that ends a finished turn of a leg the deck
+          can cut, and ↩ only on a side chat's own replies, so neither costs a row or a
+          guess on the server. #}
+      {%- if e.role == 'assistant' and e.text and not e.subagent and not e.failed %}<button type="button" class="fork-toggle" data-fork-toggle data-fork-seq="{{ e.seq }}" data-fork-session-key="{{ session_key }}" hidden
+              aria-label="Start new work from message #{{ event_id }}" title="Start new work from here">＋</button><button type="button" class="send-back-toggle" data-send-back hidden
+              aria-label="Send message #{{ event_id }} to the original chat" title="Send to original chat">↩</button>{% endif %}
+      {#- Roll the chat back to before this message (#3474). Hidden: `rollback.js` shows it
+          only on the leg the chat page can roll back, and while the agent is not working. #}
+      {%- if e.role == 'user' and e.text and not e.subagent %}<button type="button" class="rollback-toggle" data-rollback-toggle data-rollback-seq="{{ e.seq }}" data-rollback-session-key="{{ session_key }}" hidden
+              aria-label="Roll the chat back to before message #{{ event_id }}" title="Roll back to before this message">↶</button>{% endif %}
+    </span>
+  </div>
+  {% if e.text %}<div class="ev-text">{{ e.text | display_message }}</div>{% endif %}
+  {% if e.image_media_types %}
+  <div class="ev-images" aria-label="{{ e.image_media_types | length }} attached image{% if e.image_media_types | length != 1 %}s{% endif %}">
+    {% for media_type in e.image_media_types %}<img class="ev-image" src="/sessions/{{ session_key }}/transcript-images/{{ e.seq }}/{{ loop.index0 }}" alt="Attached image {{ loop.index }}" loading="lazy">{% endfor %}
+  </div>
+  {% endif %}
+  {% if e.question %}<div class="ev-question" title="the agent asked you to choose"><span class="q-dot"></span><span class="q-text"><bdi>{{ e.question }}</bdi></span></div>{% endif %}
+</div>
+{%- endif -%}

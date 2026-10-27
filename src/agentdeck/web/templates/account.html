@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% block title %}{{ account.label }} · agentdeck{% endblock %}
+{% block body_class %}account-page{% endblock %}
+{#- Its limit bars follow the stream (#3228); the defaults form does not. #}
+{% block body_sse %}sse-connect="/events?{{ {'view': 'account', 'key': account.key} | urlencode }}"{% endblock %}
+{% block topbar_nav %}<a class="back" href="/accounts" aria-label="back" data-account-back>←</a>{% endblock %}
+
+{% block content %}
+<section class="account-settings" aria-labelledby="account-title">
+  <header class="account-heading">
+    <div>
+      <p class="account-kicker">{{ account.provider_id | replace('_', ' ') }}</p>
+      <h1 id="account-title">{{ account.label }}</h1>
+    </div>
+    <span class="chip">{{ account.key }}</span>
+  </header>
+
+  <section class="account-section" aria-labelledby="new-chat-defaults-title">
+    <h2 id="new-chat-defaults-title">New chat defaults</h2>
+    <p class="muted">Used when Model or Effort is left on Default in New chat and Continue in new chat.</p>
+    {% include "partials/account_new_chat_defaults.html" %}
+  </section>
+
+  <section class="account-section" aria-labelledby="usage-limits-title">
+    <h2 id="usage-limits-title">Usage limits</h2>
+    {% include "partials/account_capacity.html" %}
+  </section>
+
+  <section class="account-section" aria-labelledby="planned-reset-title">
+    <h2 id="planned-reset-title">Planned reset</h2>
+    <p class="muted">If you will reset this account's usage at a set time, enter it here. Until then the deck sends this account work first and uses its week up to 100%.</p>
+    {% include "partials/account_planned_reset.html" %}
+  </section>
+
+  {% if auth or auth_flow %}
+  <section class="account-section" aria-labelledby="account-login-title">
+    <h2 id="account-login-title">Login</h2>
+    {% with flow = auth_flow %}{% include "partials/account_auth.html" %}{% endwith %}
+  </section>
+  {% endif %}
+</section>
+{% endblock %}

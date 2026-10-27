@@ -1,0 +1,475 @@
+{
+ "account_new_chat_defaults": [
+  "account_key",
+  "model",
+  "effort",
+  "updated_at"
+ ],
+ "assistant_checkpoint": [
+  "singleton",
+  "payload",
+  "updated_at"
+ ],
+ "assistant_handled": [
+  "session_key",
+  "evidence_signature",
+  "kind",
+  "headline",
+  "detail",
+  "handled_at"
+ ],
+ "assistant_pinned": [
+  "session_key",
+  "pinned_at"
+ ],
+ "assistant_snooze": [
+  "session_key",
+  "snoozed_until"
+ ],
+ "assistant_triage_stamps": [
+  "session_key",
+  "triaged_at"
+ ],
+ "board_commands": [
+  "action_id",
+  "command",
+  "repo",
+  "issue_number",
+  "session_key",
+  "reserved_at",
+  "settled_at",
+  "outcome",
+  "result"
+ ],
+ "boss_turn_windows": [
+  "session_key",
+  "opened_at"
+ ],
+ "capacity_history": [
+  "account_key",
+  "window",
+  "changed_at",
+  "capacity_micros",
+  "previous_micros",
+  "reason"
+ ],
+ "capacity_samples": [
+  "account_key",
+  "window",
+  "observed_at",
+  "capacity_micros",
+  "pct_delta",
+  "partial"
+ ],
+ "capacity_scan": [
+  "account_key",
+  "scanned_through"
+ ],
+ "capacity_windows": [
+  "account_key",
+  "window",
+  "anchor_pct",
+  "anchor_resets_at",
+  "anchor_started_at",
+  "accrued_micros",
+  "accrued_unpriced",
+  "accrued_partial",
+  "estimate_micros",
+  "estimate_updated_at",
+  "estimate_last_sample_at",
+  "estimate_sample_count",
+  "estimate_spread_pct",
+  "estimate_low_confidence",
+  "estimate_provisional",
+  "estimate_partial"
+ ],
+ "chat_aliases": [
+  "alias_chat_id",
+  "chat_id"
+ ],
+ "chat_forks": [
+  "token",
+  "source_session_key",
+  "source_seq",
+  "action_id",
+  "reserved_at"
+ ],
+ "chat_legs": [
+  "chat_id",
+  "position",
+  "session_key",
+  "added_at"
+ ],
+ "chat_model_preferences": [
+  "chat_id",
+  "model",
+  "updated_at"
+ ],
+ "chat_review_heads": [
+  "chat_repository",
+  "chat_number",
+  "target_repo",
+  "target_number",
+  "head_sha",
+  "recorded_at"
+ ],
+ "chat_successors": [
+  "source_session_key",
+  "token",
+  "target_session_key",
+  "reserved_at",
+  "linked_at"
+ ],
+ "chats": [
+  "chat_id",
+  "created_at"
+ ],
+ "composer_phrases": [
+  "position",
+  "label",
+  "message",
+  "updated_at"
+ ],
+ "context_deliveries": [
+  "action_id",
+  "attempt",
+  "provider_id",
+  "account_key",
+  "worker_key",
+  "delivery_id",
+  "request_sha256",
+  "chat_id",
+  "source_session_key",
+  "source_session_id",
+  "target_session_key",
+  "runtime_capability_version",
+  "mode",
+  "proposed_action",
+  "executed_action",
+  "reason",
+  "dispatch_generation",
+  "phase_delivery_id",
+  "phase_source_session",
+  "runtime_fingerprint",
+  "delivery_stage",
+  "provider_turn_id",
+  "pre_write_cursor",
+  "post_write_cursor",
+  "evidence_checked",
+  "uncertainty_reason",
+  "resolution_choice",
+  "resolution_rationale",
+  "resolved_at",
+  "source_last_event_seq",
+  "expected_session_id",
+  "expected_last_result_at",
+  "before_tokens",
+  "after_tokens",
+  "maintenance_completed_at",
+  "after_observed_at",
+  "after_observation_version",
+  "rearmed",
+  "handoff_text",
+  "handoff_sha256",
+  "handoff_chars",
+  "effective_cwd",
+  "effective_model",
+  "effective_effort",
+  "effective_permission_mode",
+  "effective_role",
+  "effective_delegated",
+  "preferred_model",
+  "session_token",
+  "final_payload_sha256",
+  "status",
+  "maintenance_result",
+  "provider_write_state",
+  "successor_created",
+  "retryable_same_delivery",
+  "final_accepted",
+  "final_action",
+  "final_reason",
+  "final_session_id",
+  "error",
+  "created_at",
+  "updated_at",
+  "work_id",
+  "run_id"
+ ],
+ "continued_chat_starts": [
+  "token",
+  "source_session_key",
+  "state",
+  "reserved_at"
+ ],
+ "delegated_sessions": [
+  "session_key",
+  "created_at",
+  "parent_session_id"
+ ],
+ "delegations": [
+  "id",
+  "state",
+  "account_key",
+  "session_key",
+  "session_token",
+  "reason",
+  "final_message",
+  "owner_pid",
+  "created_at",
+  "updated_at"
+ ],
+ "delivery_routes": [
+  "delivery_id",
+  "request_fingerprint",
+  "work_id",
+  "run_id",
+  "provider",
+  "account",
+  "worker_key",
+  "decided_at",
+  "refused_at_delivery"
+ ],
+ "dismissed_deliveries": [
+  "action_id",
+  "session_key",
+  "dismissed_at"
+ ],
+ "generated_titles": [
+  "session_key",
+  "title",
+  "evidence_signature",
+  "source",
+  "updated_at"
+ ],
+ "mac_runner_callbacks": [
+  "run_id",
+  "session_key",
+  "outcome",
+  "reserved_at",
+  "settled_at",
+  "state",
+  "detail",
+  "handed_over_at"
+ ],
+ "manual_new_chat_state": [
+  "singleton",
+  "cwd",
+  "updated_at"
+ ],
+ "message_pins": [
+  "session_key",
+  "event_seq",
+  "role",
+  "content",
+  "event_ts",
+  "pinned_at"
+ ],
+ "poller_review_verdicts": [
+  "repo",
+  "sha",
+  "pull_request",
+  "issue_repo",
+  "issue_number",
+  "verdict",
+  "result",
+  "auto",
+  "generation",
+  "reviewed_at",
+  "recorded_at"
+ ],
+ "push_preferences": [
+  "singleton",
+  "finished_mode",
+  "updated_at"
+ ],
+ "push_subscriptions": [
+  "endpoint",
+  "p256dh",
+  "auth",
+  "created_at"
+ ],
+ "push_vapid": [
+  "singleton",
+  "public_key",
+  "private_pem",
+  "created_at"
+ ],
+ "scheduled_messages": [
+  "id",
+  "chat_id",
+  "message",
+  "effort",
+  "due_at",
+  "created_at",
+  "state",
+  "reason",
+  "updated_at"
+ ],
+ "session_attention_reports": [
+  "session_key",
+  "state",
+  "detail",
+  "updated_at"
+ ],
+ "session_budget_defaults": [
+  "kind",
+  "limit_micros",
+  "updated_at"
+ ],
+ "session_budgets": [
+  "session_key",
+  "limit_micros",
+  "spent_micros",
+  "unpriced_tokens",
+  "partial",
+  "boss_granted",
+  "spend_accounting_version",
+  "token_limit",
+  "tokens_used",
+  "updated_at"
+ ],
+ "session_issues": [
+  "session_key",
+  "repository",
+  "number",
+  "added_at"
+ ],
+ "session_last_opened": [
+  "session_key",
+  "opened_at"
+ ],
+ "session_open_questions": [
+  "session_key",
+  "question",
+  "asked_at",
+  "source",
+  "asked_seq",
+  "observed_seq",
+  "answered_seq",
+  "observed_session_key",
+  "answered_session_key"
+ ],
+ "session_permission_prompts": [
+  "session_key",
+  "previous_policy_json",
+  "enabled_at"
+ ],
+ "session_projects": [
+  "account_key",
+  "session_id",
+  "project",
+  "updated_at"
+ ],
+ "session_pull_requests": [
+  "session_key",
+  "repository",
+  "number",
+  "added_at"
+ ],
+ "session_run_bindings": [
+  "session_key",
+  "work_id",
+  "run_id",
+  "first_delivery_id",
+  "bound_at"
+ ],
+ "session_tokens": [
+  "token",
+  "session_key",
+  "created_at"
+ ],
+ "session_work_bindings": [
+  "session_key",
+  "work_id",
+  "evidence",
+  "parent_chat_id",
+  "bound_at"
+ ],
+ "sessions_seen": [
+  "session_key",
+  "account_key",
+  "title",
+  "cwd",
+  "first_seen",
+  "last_seen",
+  "kind"
+ ],
+ "usage_history": [
+  "account_key",
+  "ts",
+  "five_hour_pct",
+  "seven_day_pct",
+  "month_pct"
+ ],
+ "work_actions": [
+  "action_id",
+  "work_id",
+  "action",
+  "reserved_at",
+  "settled_at",
+  "outcome",
+  "result"
+ ],
+ "work_backfills": [
+  "name",
+  "ran_at",
+  "summary"
+ ],
+ "work_hidden": [
+  "work_id",
+  "hidden_at",
+  "comments",
+  "card_mark"
+ ],
+ "work_metadata": [
+  "work_id",
+  "title",
+  "title_updated_at",
+  "problem_summary",
+  "solution_summary",
+  "decision_rationale",
+  "correctness_summary",
+  "resolution_updated_at",
+  "resolution_run_id",
+  "resolution_session_key",
+  "agent_title",
+  "agent_title_updated_at",
+  "agent_title_session_key"
+ ],
+ "work_opened": [
+  "work_id",
+  "opened_at"
+ ],
+ "work_paused": [
+  "work_id",
+  "paused_at"
+ ],
+ "work_side_chats": [
+  "action_id",
+  "work_id",
+  "pull_requests",
+  "created_at"
+ ],
+ "work_signoff": [
+  "work_id",
+  "closed_at",
+  "finished_at"
+ ],
+ "work_stops": [
+  "work_id",
+  "category",
+  "stopped_at",
+  "facts_mark"
+ ],
+ "work_stops_started": [
+  "id",
+  "started_at"
+ ],
+ "works": [
+  "work_id",
+  "source_kind",
+  "source_key",
+  "created_at"
+ ]
+}

@@ -1,0 +1,52 @@
+{# An accepted start, watched where it was pressed (#1799). Starting a chat no
+   longer navigates anywhere: the spawn runs in the background and the chat
+   arrives in the chat list on its own, working, the moment the provider names
+   it. This strip is only the outcome of the *start* — it says when there is a
+   chat to open, and it is where a start refused seconds after acceptance says
+   so. `static/starting_chat.js` releases the composer draft once a chat really
+   exists, and only then (#559). #}
+{% set waiting = starting_state == 'starting' or lost_keep_looking %}
+<div id="{{ result_id }}"
+     class="inject-result start-status {{ 'waiting' if waiting else starting_state }}"
+     data-starting-state="{{ starting_state }}"
+     {% if session_key %}data-session-url="{{ chat_url or ('/sessions/' ~ session_key) }}"{% endif %}
+     {% if draft_key %}data-draft-key="{{ draft_key }}" data-draft-text="{{ start.message }}"{% endif %}
+     {#- Its own target, never an inherited one: inside the composer form the
+         inherited target is #inject-result, and the first poll swapped the whole
+         Continue-message choice for this strip, which then had nothing left to
+         replace and stayed on "Starting" until a reload (#2403). #}
+     hx-target="this"
+     {%- if starting_state == 'starting' %}
+     {# Sub-second, because this delay is most of the wait a person sees (#654). #}
+     hx-get="/partials/starting-chat/{{ token }}?result_id={{ result_id }}"
+     hx-trigger="load delay:250ms" hx-swap="outerHTML"
+     {%- elif lost_keep_looking %}
+     {# The record is gone (a web restart), but the token binding lands in the shared
+        store the moment the provider names a session — keep asking, bounded (#792). #}
+     hx-get="/partials/starting-chat/{{ token }}?checks={{ next_checks }}&result_id={{ result_id }}"
+     hx-trigger="load delay:1s" hx-swap="outerHTML"
+     {%- endif %}>
+  {% set deck_chat = start is not none and start.origin == 'deck_chat' %}
+  {% if starting_state == 'ready' and deck_chat and start.source_session_key %}
+  {#- The deck chat's fresh leg (#3403): this page follows the chat onto it by itself. #}
+  <span role="status">Fresh start · the reply follows here.</span>
+  {% elif starting_state == 'ready' %}
+  <span role="status">
+    The chat started. <a href="{{ chat_url or ('/sessions/' ~ session_key) }}">Open it</a>.
+  </span>
+  {% elif starting_state == 'failed' %}
+  {# The refusal sentences already say the message survived, so this adds nothing
+     but the fact that it never reached a provider. #}
+  <span role="alert">{{ starting_message }} Nothing was sent.</span>
+  {% elif starting_state == 'lost' and lost_keep_looking %}
+  <span role="status">The deck restarted while the chat was starting — still watching for it.</span>
+  {% elif starting_state == 'lost' %}
+  <span role="status">
+    This deck cannot tell which chat that start became. It may well be running — look in the chat list.
+  </span>
+  {% elif deck_chat and start.source_session_key %}
+  <span role="status">Fresh start · an hour since the last message, so a new session with a clean context is starting…</span>
+  {% else %}
+  <span role="status">Starting {{ account_label }}… it appears in the chat list when the agent is up.</span>
+  {% endif %}
+</div>

@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block title %}processes · agentdeck{% endblock %}
+{% block content %}
+<section class="processes">
+  <header class="page-head">
+    <h1>Processes</h1>
+    {# Measured only on a deliberate press: sampling costs CPU, which is what this page watches. #}
+    <button type="button" hx-get="/partials/processes" hx-target="#process-tables"
+            hx-swap="innerHTML" hx-disabled-elt="this">Refresh</button>
+  </header>
+  <p class="muted small">
+    CPU is what each process used during a {{ snapshot.window_s | round(1) }}-second window,
+    as a percent of one core. Owners come from each process's systemd unit, or from the chat
+    whose worker started it.
+  </p>
+  <div id="process-tables">
+    {% include "partials/process_tables.html" %}
+  </div>
+</section>
+{% endblock %}

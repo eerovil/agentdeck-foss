@@ -1,0 +1,75 @@
+{% extends "base.html" %}
+{% block title %}settings · agentdeck{% endblock %}
+{% block body_class %}settings-page{% endblock %}
+{% block topbar_nav %}<a class="back" href="/" aria-label="back" data-account-back>←</a>{% endblock %}
+
+{% block content %}
+<section class="account-settings" aria-labelledby="settings-title">
+  <header class="account-heading">
+    <div>
+      <p class="account-kicker">Deck</p>
+      <h1 id="settings-title">Settings</h1>
+    </div>
+    <a href="/pollers">Pollers →</a>
+    {% if chat_board_shown %}<a href="/chat-board">ChatGPT chats →</a>{% endif %}
+  </header>
+
+  <section class="account-section" aria-labelledby="notification-mode-title">
+    <h2 id="notification-mode-title">Notifications</h2>
+    {# #2886: the phone is told only about a card that waits on your answer. #}
+    <p class="muted">Your phone is notified only when a card moves to Needs More Info.</p>
+    {# Per device, in localStorage (#2742); `work_stop_sound.js` reads and writes it. #}
+    <label class="stop-sound-setting">
+      <input type="checkbox" data-stop-sound-setting checked>
+      Play a sound on this device when a Work stops
+    </label>
+  </section>
+
+  <section class="account-section" aria-labelledby="quick-phrases-title">
+    <h2 id="quick-phrases-title">Quick phrases</h2>
+    {# Only static copy out here: whether this deck is customized is re-rendered on
+       every save, so that sentence lives inside the swapped fragment or it goes
+       stale the moment a phrase is added. #}
+    <p class="muted">The one-tap ⚡ chips under every chat composer.</p>
+    {% include "partials/composer_phrase_settings.html" %}
+  </section>
+
+  <section class="account-section" aria-labelledby="guess-title">
+    <h2 id="guess-title">Guess for me</h2>
+    <p class="muted">A New work guesses its project from what you type — by name for free,
+      else with one small Haiku call on a Claude account's usage — and the chats list
+      reopens with your last filters.</p>
+    {% include "partials/guess_settings.html" %}
+  </section>
+
+  <section class="account-section" aria-labelledby="dictation-title">
+    <h2 id="dictation-title">Dictation</h2>
+    {% if host_speech %}
+    <p class="muted">The 🎤 button under every chat composer. This deck's own speech
+      model does the listening, in the language its <code>[speech] language</code>
+      setting names; the audio never leaves the host. The choice below is used only
+      if the deck's speech service cannot be reached and your browser listens instead.
+      It is kept on this device only.</p>
+    {% else %}
+    <p class="muted">The 🎤 button under every chat composer. Your browser does the
+      listening: Chrome sends the audio to Google and Safari to Apple; none of it
+      reaches the deck. While listening, tap the bubble above 🎤 to switch between
+      Suomi and English. This choice is kept on this device only.</p>
+    {% endif %}
+    <label class="dictation-setting">Language
+      <select data-speech-lang-setting>
+        <option value="fi-FI">Suomi</option>
+        <option value="en-US">English</option>
+        <option value="auto">Browser language</option>
+      </select>
+    </label>
+  </section>
+
+  <section class="account-section" aria-labelledby="settings-accounts-title">
+    <h2 id="settings-accounts-title">Accounts</h2>
+    <p class="muted">New-chat model and effort defaults, usage limits, and login
+      are per account.</p>
+    <p><a href="/accounts">Manage accounts →</a></p>
+  </section>
+</section>
+{% endblock %}

@@ -1,0 +1,20 @@
+{#- One control for one Work action (#2237), the same on the front page's row and the Work page.
+    A link opens a page; a write is a small form that posts only its action id to the Work's
+    one action route, which decides again whether the Work offers it. Hide and Bring back post
+    to the Work's visibility route instead (#2238), which changes only this deck. The answer lands in
+    the next `.work-action-result`, outside every keyed row and swapped section, so a live update
+    never eats it; "next" rather than the id, because a desktop shows the front page and a Work
+    side by side, each with its own (#2290). `data-agentdeck-action` gives each press its client action id.
+    Merge is a write too: the deck's own release of a Work it runs (#2895). -#}
+{%- macro control(card, button) -%}
+{%- if button.href -%}
+<a class="fr-action" href="{{ button.href|issue_href }}"{% if button.external %} target="_blank" rel="noopener"{% endif %} data-front-action="{{ button.action }}">{{ button.label }}</a>
+{%- else -%}
+<form class="op-form" hx-post="{{ card.href }}/{{ button.route }}" hx-target="next .work-action-result" hx-swap="innerHTML"
+      hx-disabled-elt="find button" data-work-action data-agentdeck-action="work_action"
+      {%- if button.confirm %} hx-confirm="{{ button.confirm }}"{% endif %}>
+<input type="hidden" name="action" value="{{ button.action }}">
+{%- if button.confirmed %}<input type="hidden" name="confirmed" value="{{ button.confirmed }}">{% endif -%}
+<button type="submit" class="fr-action" data-front-action="{{ button.action }}">{{ button.label }}</button></form>
+{%- endif -%}
+{%- endmacro -%}

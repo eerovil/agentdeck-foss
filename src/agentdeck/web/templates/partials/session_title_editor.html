@@ -1,0 +1,27 @@
+{# Rename this chat by hand (#1569). It lives in the control row below the header
+   rather than in the header itself, for two reasons: the header is an SSE-swapped
+   fragment and would wipe an open editor on the next status tick, and the header
+   is pinned at a fixed height that the open form does not fit in (#1993).
+   Collapsed by default; it replaces only itself on save, so the transcript,
+   unsent text and scroll position are left alone. #}
+<details id="session-title-editor" class="session-title-editor"
+         {% if title_editor_open %}open{% endif %}>
+  <summary class="chip" title="Give this chat a name of your own">✎ Rename</summary>
+  <form class="session-title-form"
+        hx-post="/sessions/{{ session.key }}/title"
+        hx-target="#session-title-editor" hx-swap="outerHTML">
+    <input id="session-title-input" name="title" type="text" autocomplete="off"
+           aria-label="Chat title"
+           maxlength="{{ title_max_chars }}" value="{{ title_value }}"
+           placeholder="{{ title_placeholder }}">
+    <button type="submit" name="action" value="save">Save</button>
+    {% if title_stored %}
+    <button class="secondary" type="submit" name="action" value="clear">Use the automatic name</button>
+    {% endif %}
+  </form>
+  {% if title_error %}
+  <p class="deck-setting-error" role="alert">{{ title_error }}</p>
+  {% elif title_saved %}
+  <p class="account-save-ok" role="status">{{ title_saved }}</p>
+  {% endif %}
+</details>

@@ -1,0 +1,11 @@
+<form id="session-permission-prompts" class="session-permission-prompts"
+      hx-post="/sessions/{{ session.key }}/permission-prompts"
+      hx-trigger="change" hx-target="this" hx-swap="outerHTML"
+      hx-disabled-elt="find input">
+  <label class="chip" title="Ask you before the agent runs a tool call that needs permission, instead of settling it without you. Questions the agent asks you arrive either way.">
+    <input type="checkbox" name="enabled" value="true"
+           {% if permission_prompts_enabled %}checked{% endif %}>
+    Allow permission prompts{% if permission_prompts_next_turn %} (next turn){% endif %}
+  </label>
+  {% if permission_prompt_error %}<span class="permission-prompt-error" role="alert">{{ permission_prompt_error }}</span>{% endif %}
+</form>

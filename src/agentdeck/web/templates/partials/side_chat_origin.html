@@ -1,0 +1,21 @@
+{# A side chat says where it came from and can send its conclusion back (#2485).
+   Sending goes through the original's own composer: the text waits there as an
+   unsent draft, so the person reads and edits it before the normal Send. #}
+{% if side_chat_source %}
+<div class="side-chat-origin" data-side-chat-origin
+     data-target-url="{{ side_chat_source.target_url }}"
+     data-side-chat-title="{{ session.display_title }}">
+  <span class="chip side-chat-origin-label">↗ Side chat of <a href="{{ side_chat_source.url }}">{{ side_chat_source.title }}</a></span>
+  {% if can_inject %}
+  <form class="side-chat-summarise" hx-post="/sessions/{{ session.key }}/inject"
+        hx-target="#inject-result" hx-swap="outerHTML" hx-disabled-elt="find button"
+        data-agentdeck-action="side_chat_summarise">
+    <input type="hidden" name="message" value="{{ side_chat_summary_prompt }}">
+    <button class="chip" type="submit">Summarise</button>
+  </form>
+  {% endif %}
+  <button type="button" class="chip side-chat-send-latest" data-send-back-latest
+          {% if not side_chat_source.reachable %}disabled title="The original chat cannot take messages from this deck right now."{% else %}title="Put the latest reply in the original chat's message box"{% endif %}>Send to original</button>
+  <span class="side-chat-send-status" data-send-back-status role="status"></span>
+</div>
+{% endif %}
