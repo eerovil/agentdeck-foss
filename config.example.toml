@@ -74,6 +74,8 @@ refresh_interval_s = 60
 #max_workers = 4                # per account; steering a live worker is exempt
 #permission_mode = "auto"       # default; Claude's classifier reviews risky tool calls, and a call it
                                 # blocks becomes a pending prompt on the chat (Allow once / Keep blocked)
+#start_bypassed = false        # true: new chats start with "Bypass permissions" on (no classifier);
+                                # each chat can still switch it off
 # Everyday commands (local git, tests, file and text tools) skip the classifier through built-in
 # allow rules. Add more here; one that would let gh, curl, git push or similar through is ignored.
 #classifier_skip_rules = ["Bash(make test *)"]

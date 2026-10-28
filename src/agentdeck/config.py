@@ -252,6 +252,7 @@ class ClaudeWorkerOverrides(BaseModel):
     idle_after_s: float | None = None
     memory_max: str | None = None
     interactive_prompts: bool | None = None
+    start_bypassed: bool | None = None
 
     @field_validator("max_workers")
     @classmethod
@@ -293,6 +294,10 @@ class ClaudeWorkersConfig(BaseModel):
     # the boss as a pending prompt rather than refused silently (#2271). "" = CLI
     # default.
     permission_mode: str = "auto"
+    # Start each new chat with its "Bypass permissions" switch on (#2319), which
+    # overrides permission_mode until someone switches it off. Off by default, so a
+    # chat runs in the mode named above (#3748); a saved chat keeps its own switch.
+    start_bypassed: bool = False
     # Extra ``Bash(...)`` allow rules, on top of the built-in list in
     # ``providers/claude_code/permission_rules.py``, for commands that should skip
     # the classifier. One list for every account: the settings file they land in

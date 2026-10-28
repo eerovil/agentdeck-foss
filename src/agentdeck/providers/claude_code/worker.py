@@ -116,12 +116,11 @@ CLOSED_QUESTIONS_MAX = 50
 # ``--allow-dangerously-skip-permissions``, which every owned worker gets; that
 # flag makes the mode available without turning it on.
 BYPASS_PERMISSIONS_MODE = "bypassPermissions"
-# Where a new owned chat's switch starts (#2319). Safe as the default because
-# GitHub authority is enforced per owner outside the classifier (#2279), not by
-# it. Only a new record takes it: a saved record keeps its own choice, and one
+# Where a new owned chat's switch starts is the host's ``start_bypassed``
+# (#2319, a setting since #3748 so a public install runs in its configured mode).
+# Only a new record takes it: a saved record keeps its own choice, and one
 # written before #2285 loads as off, the behaviour it was created under.
-DEFAULT_BYPASS_PERMISSIONS = True
-# Modes a new chat keeps even under that default: "plan" is how a read-only
+# Modes a new chat keeps even when it starts bypassed: "plan" is how a read-only
 # delegation stays read-only, and bypass would lift it.
 NO_DEFAULT_BYPASS_MODES = frozenset({"plan"})
 
@@ -362,8 +361,8 @@ class WorkerRecord:
     # Whether the boss switched this chat to BYPASS_PERMISSIONS_MODE (#2285). On,
     # the process runs in that mode; off, in ``permission_mode`` above, which the
     # switch never overwrites, so switching off restores it. Durable so a revive
-    # keeps the choice. A new record starts at DEFAULT_BYPASS_PERMISSIONS.
-    bypass_permissions: bool = DEFAULT_BYPASS_PERMISSIONS
+    # keeps the choice. A new chat's record starts at the host's ``start_bypassed``.
+    bypass_permissions: bool = False
     # Trusted creation provenance. Persist it so a revived worker receives the
     # same orchestration role as the original process.
     delegated: bool = False
@@ -776,6 +775,7 @@ class ClaudeWorkerHost:
         state_dir: Path,
         max_workers: int = 4,
         permission_mode: str | None = "auto",
+        start_bypassed: bool = False,
         model: str | None = None,
         usage_ceiling_pct: float = 0.0,
         usage_cache_dir: Path | None = None,
@@ -800,6 +800,7 @@ class ClaudeWorkerHost:
         self._base_url = base_url
         self.max_workers = max_workers
         self.permission_mode = permission_mode
+        self.start_bypassed = start_bypassed
         self.model = model
         # Whether to spawn with `--permission-prompt-tool stdio` (surfaces
         # AskUserQuestion + permission gates to the user). Config escape hatch:
@@ -2576,7 +2577,7 @@ class ClaudeWorkerHost:
     def _new_chat_bypass(self, permission_mode: str | None) -> bool:
         """Where a new record's bypass switch starts (#2319)."""
         mode = permission_mode or self.permission_mode
-        return DEFAULT_BYPASS_PERMISSIONS and mode not in NO_DEFAULT_BYPASS_MODES
+        return self.start_bypassed and mode not in NO_DEFAULT_BYPASS_MODES
 
     async def set_bypass_permissions(self, key: str, enabled: bool) -> DeliverResult:
         """Switch this chat into BYPASS_PERMISSIONS_MODE, or back to its own mode

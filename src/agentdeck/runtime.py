@@ -463,6 +463,7 @@ class ClaudeWorkerRuntime:
                 state_dir=effective.state_path,
                 max_workers=effective.max_workers,
                 permission_mode=effective.permission_mode or None,
+                start_bypassed=effective.start_bypassed,
                 model=effective.model or None,
                 usage_cache_dir=self._usage_cache_dir,
                 stall_after_s=effective.stall_after_s,

@@ -93,7 +93,10 @@ async def test_runtime_host_applies_account_overrides(tmp_path):
             "claude_workers": {
                 "enabled": True,
                 "state_dir": str(tmp_path),
-                "accounts": {"alt": {"permission_mode": "bypassPermissions"}},
+                "start_bypassed": True,
+                "accounts": {
+                    "alt": {"permission_mode": "bypassPermissions", "start_bypassed": False}
+                },
             },
             "accounts": [
                 {"provider": "claude_code", "label": "main", "config_dir": "~/.claude"},
@@ -104,6 +107,10 @@ async def test_runtime_host_applies_account_overrides(tmp_path):
     app = create_runtime_app(cfg)
     assert app.state.claude_workers.host("alt").permission_mode == "bypassPermissions"
     assert app.state.claude_workers.host("main").permission_mode == "auto"
+    # New chats start bypassed only where start_bypassed is on (#3748).
+    assert app.state.claude_workers.host("main").start_bypassed is True
+    assert app.state.claude_workers.host("alt").start_bypassed is False
+    assert AppConfig().claude_workers.start_bypassed is False
 
 
 @pytest.mark.parametrize(

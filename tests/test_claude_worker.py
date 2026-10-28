@@ -1387,9 +1387,9 @@ async def test_worker_command_includes_configured_flags(tmp_path):
     host, spawned = _host(tmp_path, permission_mode="acceptEdits", model="haiku")
     await host.deliver("issue-1", "start", cwd=str(tmp_path), effort="high", delegated=False)
     args = spawned[0]["args"]
-    # A new chat starts in bypass (#2319); acceptEdits is what switching off restores.
-    assert args[args.index("--permission-mode") + 1] == "bypassPermissions"
-    assert host._base_permission_mode(host._records["issue-1"]) == "acceptEdits"
+    # A new chat runs in the configured mode unless start_bypassed is on (#3748).
+    assert args[args.index("--permission-mode") + 1] == "acceptEdits"
+    assert host.snapshot()["workers"]["issue-1"]["bypass_permissions"] is False
     assert args[args.index("--model") + 1] == "haiku"
     assert args[args.index("--effort") + 1] == "high"
     await host.stop()
@@ -2411,10 +2411,10 @@ def _settings(args) -> dict:
 
 
 async def test_every_auto_chat_gets_the_skip_rules_and_block_hooks(tmp_path):
-    # #2271: not only kanban workers; a person's own chat gets them too. It starts
-    # in bypass (#2319), but the file follows its own auto mode, so switching
+    # #2271: not only kanban workers; a person's own chat gets them too. It may
+    # start in bypass (#2319), but the file follows its own auto mode, so switching
     # bypass off lands in auto with the skip list.
-    host, spawned = _host(tmp_path)
+    host, spawned = _host(tmp_path, start_bypassed=True)
     await host.deliver("issue-1", "start", cwd=str(tmp_path), delegated=False)
     args = spawned[0]["args"]
     assert args[args.index("--permission-mode") + 1] == "bypassPermissions"
@@ -2491,7 +2491,7 @@ def _emit_safety_check(proc, request_id: str) -> None:
 
 
 async def test_a_safety_check_in_bypass_is_refused_with_its_reason(tmp_path):
-    host, spawned = _host(tmp_path)
+    host, spawned = _host(tmp_path, start_bypassed=True)
     await host.deliver("issue-1", "start", cwd=str(tmp_path), delegated=False)
     proc = spawned[0]["process"]
 
@@ -2512,7 +2512,6 @@ async def test_a_safety_check_with_bypass_off_still_asks_the_boss(tmp_path):
     host, spawned = _host(tmp_path)
     await host.deliver("issue-1", "start", cwd=str(tmp_path), delegated=False)
     proc = spawned[0]["process"]
-    await _switch_bypass(host, proc, False)
 
     _emit_safety_check(proc, "s1")
     await _settle()
@@ -3563,8 +3562,8 @@ async def _switch_bypass(host, proc, enabled: bool, key: str = "issue-1"):
 async def test_a_new_worker_starts_in_bypass_and_can_be_switched_out(tmp_path):
     # The CLI refuses a live switch to bypassPermissions unless the process was
     # started with this flag; the flag alone does not turn the mode on, the
-    # new-chat default does (#2319).
-    host, spawned = _host(tmp_path)
+    # start_bypassed setting does (#2319, #3748).
+    host, spawned = _host(tmp_path, start_bypassed=True)
     await host.deliver("issue-1", "start", cwd=str(tmp_path), delegated=False)
 
     args = spawned[0]["args"]
@@ -3580,7 +3579,7 @@ async def test_a_new_worker_starts_in_bypass_and_can_be_switched_out(tmp_path):
 
 
 async def test_a_new_worker_starts_in_bypass(tmp_path):
-    host, spawned = _host(tmp_path)
+    host, spawned = _host(tmp_path, start_bypassed=True)
     await host.deliver("issue-1", "start", cwd=str(tmp_path), delegated=False)
 
     args = spawned[0]["args"]
@@ -3591,8 +3590,8 @@ async def test_a_new_worker_starts_in_bypass(tmp_path):
 
 async def test_a_read_only_delegate_does_not_start_in_bypass(tmp_path):
     # Plan mode is what keeps a read-only delegation read-only; the new-chat
-    # default must not lift it.
-    host, spawned = _host(tmp_path)
+    # setting must not lift it.
+    host, spawned = _host(tmp_path, start_bypassed=True)
     await host.deliver(
         "issue-1", "look", cwd=str(tmp_path), permission_mode="plan", delegated=True
     )
@@ -3604,7 +3603,7 @@ async def test_a_read_only_delegate_does_not_start_in_bypass(tmp_path):
 
 
 async def test_the_bypass_switch_moves_a_live_worker_and_back(tmp_path):
-    host, spawned = _host(tmp_path, permission_mode="acceptEdits")
+    host, spawned = _host(tmp_path, permission_mode="acceptEdits", start_bypassed=True)
     await host.deliver("issue-1", "start", cwd=str(tmp_path), delegated=False)
     proc = spawned[0]["process"]
 
@@ -3627,7 +3626,7 @@ async def test_the_bypass_switch_moves_a_live_worker_and_back(tmp_path):
 
 
 async def test_a_refused_bypass_switch_leaves_the_chat_alone(tmp_path):
-    host, spawned = _host(tmp_path)
+    host, spawned = _host(tmp_path, start_bypassed=True)
     await host.deliver("issue-1", "start", cwd=str(tmp_path), delegated=False)
     proc = spawned[0]["process"]
 
@@ -3664,7 +3663,7 @@ async def _finish_and_exit(proc) -> None:
 
 
 async def test_the_bypass_choice_survives_a_revive(tmp_path):
-    host, spawned = _host(tmp_path)
+    host, spawned = _host(tmp_path, start_bypassed=True)
     await host.deliver("issue-1", "start", cwd=str(tmp_path), delegated=False)
     await _switch_bypass(host, spawned[0]["process"], False)
     await _finish_and_exit(spawned[0]["process"])
@@ -3688,7 +3687,7 @@ async def test_the_bypass_choice_survives_a_revive(tmp_path):
 
 
 async def test_a_parked_worker_records_the_bypass_choice_for_its_next_spawn(tmp_path):
-    host, spawned = _host(tmp_path)
+    host, spawned = _host(tmp_path, start_bypassed=True)
     await host.deliver("issue-1", "start", cwd=str(tmp_path), delegated=False)
     proc = spawned[0]["process"]
     proc.stdout.emit({"type": "result", "subtype": "success"})

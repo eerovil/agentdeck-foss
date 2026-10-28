@@ -73,6 +73,21 @@
     var form = draftForm(event.target);
     if (form) save(form);
   });
+  // Enter in a text field presses the form's first submit button, which in an open-questions
+  // box is the first question's Dismiss: the answer typed was thrown away (#3749). It sends
+  // the answer instead by clicking Submit answer: the form's own checks still run, and htmx
+  // takes the decision from the button last clicked, not from requestSubmit's submitter.
+  document.addEventListener('keydown', function (event) {
+    if (event.key !== 'Enter' || event.shiftKey || event.isComposing) return;
+    var input = event.target;
+    if (!input.matches || !input.matches('input.interaction-other')) return;
+    var form = input.form;
+    if (!form || !form.matches('form[data-agentdeck-action="interaction"]')) return;
+    var submit = form.querySelector('button[name="decision"][value="accept"]');
+    if (!submit) return;
+    event.preventDefault();
+    submit.click();
+  });
   // Any redraw of the box: the page's own submit swaps it, the live update pushes it as an
   // SSE message (which fires no htmx:load). Only empty fields are filled, so a repeat is
   // harmless.

@@ -6188,6 +6188,7 @@ async def test_interaction_selection_survives_live_updates_e2e(tmp_path, monkeyp
     scripts = {
         "/static/htmx.min.js": (static_dir / "htmx.min.js").read_text(),
         "/static/sse.js": (static_dir / "sse.js").read_text(),
+        "/static/question_drafts.js": (static_dir / "question_drafts.js").read_text(),
     }
     requests: list[str] = []
     interaction_asks: list[str] = []
@@ -6274,7 +6275,55 @@ async def test_interaction_selection_survives_live_updates_e2e(tmp_path, monkeyp
         slot = await page.locator("#pending-interaction-slot").inner_html()
         assert "Which cache layer should we use?" in slot
         assert "Which database should we use?" not in slot
-        assert page.url  # keep the page reference alive until here
+
+        # Enter in an open-questions box's text field answers it (#3749). The browser
+        # presses the form's first submit button, a question's Dismiss, which threw
+        # the typed answer away.
+        from urllib.parse import parse_qs
+
+        from agentdeck.models import open_questions_id
+
+        asked = InteractionQuestion(
+            id="r1.0", header="H", prompt="Ship it?",
+            options=(InteractionOption("Yes"), InteractionOption("None of these")),
+            allow_other=True,
+        )
+        box = PendingInteraction(
+            id=open_questions_id(["r1.0"]), kind="question", thread_id="sid", turn_id=None,
+            title="Claude is asking", questions=(asked,), dismissible=True,
+        )
+        await emit(
+            "interaction", render_pending_interaction(app.state.templates, "codex:test:sid", box)
+        )
+        await page.wait_for_selector("text=Ship it?")
+        await page.locator('input[name="answer__r1.0"][value="None of these"]').check()
+        other = page.locator('input[name="other__r1.0"]')
+        await other.fill("Wait for the review")
+        async with page.expect_request(
+            lambda request: request.method == "POST" and "/interaction" in request.url
+        ) as posted:
+            await other.press("Enter")
+        sent = parse_qs((await posted.value).post_data or "")
+        assert sent["decision"] == ["accept"]
+        assert sent["answer__r1.0"] == ["None of these"]
+        assert sent["other__r1.0"] == ["Wait for the review"]
+        # Enter in an empty field of an unanswered question never dismisses it.
+        await emit(
+            "interaction",
+            render_pending_interaction(
+                app.state.templates, "codex:test:sid",
+                replace(box, id=open_questions_id(["r2.0"]),
+                        questions=(replace(asked, id="r2.0", prompt="Merge it?"),)),
+            ),
+        )
+        await page.wait_for_selector("text=Merge it?")
+        async with page.expect_request(
+            lambda request: request.method == "POST" and "/interaction" in request.url
+        ) as posted:
+            await page.locator('input[name="other__r2.0"]').press("Enter")
+        sent = parse_qs((await posted.value).post_data or "")
+        assert sent["decision"] == ["accept"]
+        assert await page.locator("text=Merge it?").is_visible()
         await browser.close()
 
 
