@@ -539,7 +539,10 @@ class Gh:
         rate_limits.bind_authority(store, environment, credential)
         readings = store.read(credential, max_age=max_age)
         if not store.is_bound(credential) or "core" not in readings:
-            self.run("api", "user")
+            # An App installation token cannot read `GET /user`: every probe would be a 403
+            # (#3344, #3711). Its own repository list answers with the same core headers.
+            app = environment.get(github_authority.AUTHORITY_ENV, "").startswith("app:")
+            self.run(*(("api", "installation/repositories?per_page=1") if app else ("api", "user")))
             readings = store.read(credential, max_age=max_age)
         if "graphql" not in readings:
             value = self.json("api", "rate_limit")

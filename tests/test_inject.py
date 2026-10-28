@@ -5014,6 +5014,7 @@ async def test_delegation_into_the_live_deploy_checkout_is_refused(tmp_path, mon
         )
     assert response.status_code != 202
     assert "live deploy checkout" in response.text
+    assert "review-mirrors" in response.text  # says what to pass instead (#3711)
 
 
 async def test_a_delegation_has_no_length_limit_unless_one_is_configured(tmp_path, monkeypatch):
@@ -8641,7 +8642,7 @@ async def test_quick_phrases_send_in_one_tap_and_never_eat_a_draft(tmp_path):
         # A phrase chosen mid-sentence appends and waits; unsent text survives.
         await page.locator("#inject-message").fill("also please")
         await page.locator("form.inject-form [data-quick-phrases] summary").click()
-        await page.locator(".phrase-chip", has_text="Go ahead").click()
+        await page.locator(".phrase-chip", has_text="Progress").click()
         kept = {
             "message": await page.locator("#inject-message").input_value(),
             "submits": await page.evaluate("window.__submits"),
@@ -8668,19 +8669,18 @@ async def test_quick_phrases_send_in_one_tap_and_never_eat_a_draft(tmp_path):
 
     assert closed == {"addedHeight": 0, "panelHeight": 0, "overflow": False}
     assert opened["visible"] and opened["withinViewport"]
-    assert opened["labels"][:2] == ["Status", "Go ahead"]
+    assert opened["labels"][:2] == ["Status", "Progress"]
     # The button label is terse; what it sends spells the intent out.
     assert sent["submits"] == 1
     assert not sent["menuOpen"]
-    assert sent["message"].startswith("Status check, no new work:")
-    assert len(sent["message"]) > 60
+    assert sent["message"] == "Status check"
     assert kept["submits"] == 1
-    assert kept["message"].startswith("also please Yes, go ahead with that.")
+    assert kept["message"].startswith("also please Can we make this progress?")
     assert kept["drafted"] == [kept["message"]]
     assert desktop == {"withinViewport": True, "overflow": False}
 
 
-def test_quick_phrases_are_terse_buttons_carrying_verbose_instructions():
+def test_quick_phrases_are_terse_buttons():
     from agentdeck.composer_phrases import DEFAULT_COMPOSER_PHRASES
 
     phrases = DEFAULT_COMPOSER_PHRASES
@@ -8688,10 +8688,10 @@ def test_quick_phrases_are_terse_buttons_carrying_verbose_instructions():
     labels = [phrase.label for phrase in phrases]
     assert len(set(labels)) == len(labels)
     for phrase in phrases:
-        # A chip has to stay thumb-sized on a phone; the message it sends does
-        # not, and being explicit is the whole reason this exists (#734).
+        # A chip has to stay thumb-sized on a phone (#734). The owner's own set
+        # replaced the spelled-out built-ins (#3623), so a message may be short.
         assert len(phrase.label) <= 12, phrase
-        assert len(phrase.text) >= 40, phrase
+        assert phrase.text, phrase
         assert phrase.text == phrase.text.strip()
 
 

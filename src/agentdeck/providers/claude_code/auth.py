@@ -44,6 +44,8 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
+from ... import claude_env
+
 log = logging.getLogger(__name__)
 
 STATUS_TIMEOUT_S = 15.0
@@ -118,15 +120,20 @@ def _run(command: list[str], *, env: dict[str, str], timeout: float):
 
 
 def _account_env(config_dir: Path) -> dict[str, str]:
-    """The environment that makes the CLI act on *this* account and nothing else."""
-    return {
+    """The environment that makes the CLI act on *this* account and nothing else.
+
+    Built the way the deck's agents are started (``claude_env``): on macOS the default folder
+    is left unset, so the status shown and a Reconnect act on the login the agents read.
+    """
+    env = {
         **os.environ,
-        "CLAUDE_CONFIG_DIR": str(config_dir),
         # The deck may be reached from a phone; a browser opened on the host helps
         # nobody and can block. The URL is what the operator needs, so make the
         # CLI's "open a browser" step a no-op and print it instead.
         "BROWSER": "true",
     }
+    claude_env.point_at(env, config_dir)
+    return env
 
 
 def read_status(
@@ -212,9 +219,7 @@ class LoginFlow:
             return
         launch = spawn or _spawn
         try:
-            self._process = launch(
-                [claude, "auth", "login", "--claudeai"], self.config_dir
-            )
+            self._process = launch([claude, "auth", "login", "--claudeai"], self.config_dir)
         except (OSError, subprocess.SubprocessError) as exc:
             self._fail(f"could not start claude auth login: {exc}")
             return

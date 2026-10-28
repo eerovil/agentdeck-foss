@@ -492,6 +492,12 @@ async def test_a_deck_without_a_reviewer_counts_a_merge_press_as_the_review(
     monkeypatch.setattr(chat_review, "PUBLIC_STUB", True, raising=False)
     app, _gh = _chat_only(tmp_path / "public", monkeypatch)
     assert app.state.work_release.ports.press_is_review is True
+    # A deck-started Claude or Codex reviewer is a reviewer in either edition (#3640).
+    from agentdeck import agent_review
+
+    monkeypatch.setattr(agent_review, "effective", lambda reviewer, review_chats: "claude")
+    app, _gh = _chat_only(tmp_path / "agent", monkeypatch)
+    assert app.state.work_release.ports.press_is_review is False
 
 
 async def test_the_routers_resume_wakes_the_release(tmp_path, monkeypatch):

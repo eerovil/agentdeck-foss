@@ -487,7 +487,7 @@ def test_a_passed_review_reads_as_merging_until_its_pull_request_merges():
     status = work_status(work.__class__(**{**work.__dict__, "outputs": (merged,)}))
 
     assert (status.tone, status.headline, status.next) == (ACTIVE, "Deploying", "deploy")
-    assert status.summary == "Merged eerovil/agentdeck#2300."
+    assert status.summary == "Merged."
     assert _steps(status)["merge"] == ("done", "Merged")
 
     # A second pull request still open means the merge step has not finished.

@@ -15,8 +15,9 @@ Your App's key stays with you, its rate limit is yours, and its webhooks come to
 
 - **Homepage URL:** anything, for example your fork's address.
 - **Webhook:** off for now; step 4 turns it on if you want it.
-- **Repository permissions:** Contents, Issues, Pull requests and Workflows: read and
-  write. Actions, Checks, Commit statuses and Metadata: read only.
+- **Repository permissions:** Contents, Issues and Pull requests: read and write. Actions,
+  Checks, Commit statuses and Metadata: read only. Leave **Workflows** at No access: with it an
+  agent could change a CI file on its own branch and run code with the repository's secrets.
 - **Organization permissions** (only if you will use an organization Project board):
   Projects, read and write.
 - **Where can this App be installed:** only on this account.
@@ -26,8 +27,13 @@ generate a private key. Save the key as `~/.config/agentdeck/github-app.pem`, re
 only by you (`chmod 600`).
 
 Install the App (its page → Install App) on your personal account, your organization, or
-both, and pick the repositories it may use. Open each installation's settings page; the
-number at the end of its URL is the installation ID.
+both. Choose **Only select repositories** and pick the ones the deck should work on, never
+"All repositories": `agentdeck-init` refuses an installation that takes them all. Open each
+installation's settings page; the number at the end of its URL is the installation ID.
+
+On an organization, also protect the branch that deploys: a branch ruleset with **Restrict
+updates**, with the people who merge by hand (and your own deck's App, if it should merge) on its
+bypass list. An App can merge any pull request it can push to, and the ruleset is what stops it.
 
 ## 2. Tell the deck which owner uses which identity
 

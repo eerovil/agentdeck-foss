@@ -609,6 +609,33 @@ class ChatBoardConfig(BaseModel):
         return Path(self.store_file).expanduser()
 
 
+class ReviewConfig(BaseModel):
+    """Who reviews each new ready head of a Work's pull request (#3640).
+
+    ``chatgpt`` is a ChatGPT review chat (``[chat_board]``); an edition without review chats
+    reads it as ``off``, where a person's Merge press stands for the review. ``claude`` and
+    ``codex`` start a deck-owned review chat of that provider in a throwaway checkout of the
+    head (``agent_review``), on ``account`` (empty: the deck's first account of that provider),
+    at most ``max_reviewers`` at once host-wide.
+    """
+
+    reviewer: Literal["chatgpt", "claude", "codex", "off"] = "chatgpt"
+    account: str = ""
+    max_reviewers: int = 2
+    ledger_file: str = "~/.local/share/agentdeck/agent-reviews.json"
+
+    @field_validator("max_reviewers")
+    @classmethod
+    def _one_at_least(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError("review.max_reviewers must be at least one")
+        return value
+
+    @property
+    def ledger_path(self) -> Path:
+        return Path(self.ledger_file).expanduser()
+
+
 class AccountConfig(BaseModel):
     provider: str
     label: str
@@ -773,6 +800,7 @@ class AppConfig(BaseModel):
     poller: PollerConfig = Field(default_factory=PollerConfig)
     github_webhook: GitHubWebhookConfig = GitHubWebhookConfig()
     chat_board: ChatBoardConfig = ChatBoardConfig()
+    review: ReviewConfig = ReviewConfig()
     auto_dream: AutoDreamConfig = AutoDreamConfig()
     meta_chat: MetaChatConfig = MetaChatConfig()
     speech: SpeechConfig = SpeechConfig()

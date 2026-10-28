@@ -53,6 +53,16 @@ enabled = false
 # generated once and stored in the DB, never here.
 subject = ""                       # e.g. "mailto:you@example.com"
 
+# Who reviews each new ready head of a Work's pull request (#3640). "chatgpt" needs a
+# [chat_board] review-chat repository and is read as "off" without one; "off" leaves the
+# review to a person's Merge press. "claude" or "codex" starts a deck-owned review chat in a
+# throwaway checkout of the head, beside the Work chat's checkout, and its verdict and
+# findings reach the Work through `agentdeck deck-request`.
+# [review]
+# reviewer = "claude"
+# account = ""          # empty: the deck's first account of that provider
+# max_reviewers = 2     # host-wide; more wait their turn
+
 [assistant]
 enabled = false
 refresh_interval_s = 60

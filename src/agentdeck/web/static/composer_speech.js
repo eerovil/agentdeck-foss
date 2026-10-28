@@ -214,22 +214,33 @@
   // Set once the host fails: the rest of the page uses the browser's recognizer.
   // With none (Firefox), each tap tries the host again and says if it still fails.
   var hostDown = false;
+  // A phrase not back after this long says so in the bubble, and asks whether the
+  // service is still loading its model after an idle exit (#3722); a warm one
+  // answers in well under a second.
+  var SLOW_MS = 1500;
+  var STATUS_EVERY_S = 5;
 
   // The host's Whisper behind the browser recognizer's shape (start, stop, abort,
   // onresult, onerror, onend), so a session drives either the same way. It listens
   // until stopped; each phrase, cut at a pause, comes back as one final result, in
   // the order spoken. `stop()` still delivers the phrase being spoken and any
-  // still being transcribed before `onend`; `abort()` drops them.
-  function HostRecognition() {
+  // still being transcribed before `onend`; `abort()` drops them. `backlog` is the
+  // audio of phrases an earlier session could not get transcribed, sent first
+  // (#3722); `unheard` holds every phrase's audio until its words come back, so a
+  // failure loses none of them.
+  function HostRecognition(backlog) {
     this.results = [];
     this.pending = Promise.resolve();
     this.lang = 'en-US';
+    this.unheard = [];
+    this.backlog = backlog || [];
   }
 
   HostRecognition.prototype.start = function () {
     var self = this;
     // Made inside the tap, so a phone lets it run.
     var ctx = this.ctx = new Context();
+    this.backlog.forEach(function (body) { self.send(body); });
     navigator.mediaDevices.getUserMedia({
       audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
     }).then(function (stream) {
@@ -263,31 +274,34 @@
       quiet = loud ? 0 : quiet + chunkMs;
       if (quiet >= HOST_PAUSE_MS || phrase.length * chunkMs >= HOST_PHRASE_MAX_MS) {
         if (quiet >= HOST_PAUSE_MS) gate.paused();
-        self.send(phrase);
+        self.send(wav(phrase, cap.rate));
         phrase = [];
       }
     };
     this.cut = function () {
-      if (phrase.length) self.send(phrase);
+      if (phrase.length) self.send(wav(phrase, cap.rate));
       phrase = [];
     };
   };
 
   // Phrases are transcribed one at a time, so their words land in the order spoken.
-  HostRecognition.prototype.send = function (phrase) {
+  HostRecognition.prototype.send = function (body) {
     var self = this;
-    var body = wav(phrase, this.capture.rate);
+    this.unheard.push(body);
     this.pending = this.pending.then(function () {
       if (self.aborted || self.failed) return null;
       // The language heard last, for a phrase too short to tell (`[speech] language
       // = "auto"`); a host listening for one language ignores it.
       var hint = self.heard ? '?language=' + self.heard : '';
+      var done = self.watch();
       return fetch('/api/speech/transcribe' + hint, {
         method: 'POST', headers: { 'Content-Type': 'audio/wav' }, body: body
-      }).then(function (response) {
+      }).then(function (response) { done(); return response; },
+              function (error) { done(); throw error; }).then(function (response) {
         if (!response.ok) throw new Error('speech ' + response.status);
         return response.json();
       }).then(function (heard) {
+        self.unheard.splice(self.unheard.indexOf(body), 1);
         var text = (heard.text || '').trim();
         if (self.aborted || !text) return;
         self.heard = heard.language === 'fi' ? 'fi' : 'en';
@@ -302,6 +316,36 @@
     });
   };
 
+  // Calls `onwait(seconds, starting)` each second a phrase is slow to come back,
+  // `starting` true while the service says its model is not loaded yet, and
+  // `onwait(0)` once it is back. Returns the function that stops the watch.
+  HostRecognition.prototype.watch = function () {
+    var self = this;
+    var began = Date.now();
+    var starting = false;
+    var asked = -STATUS_EVERY_S;
+    var slow = false;
+    var timer = setInterval(function () {
+      var waited = Date.now() - began;
+      if (waited < SLOW_MS || self.aborted) return;
+      var seconds = Math.round(waited / 1000);
+      if (seconds - asked >= STATUS_EVERY_S) {
+        asked = seconds;
+        fetch('/api/speech/status').then(function (response) {
+          return response.ok ? response.json() : null;
+        }).then(function (state) {
+          starting = !!state && state.loaded === false;
+        }, function () { /* the transcription's own answer decides */ });
+      }
+      slow = true;
+      if (self.onwait) self.onwait(seconds, starting);
+    }, 500);
+    return function () {
+      clearInterval(timer);
+      if (slow && self.onwait) self.onwait(0, false);
+    };
+  };
+
   HostRecognition.prototype.release = function () {
     this.done = true;
     if (this.capture) this.capture.close();
@@ -312,6 +356,8 @@
   HostRecognition.prototype.fail = function (error) {
     if (this.failed) return;
     this.failed = true;
+    // The phrase being spoken is kept with the rest.
+    if (this.cut) this.cut();
     this.release();
     if (this.onerror) this.onerror({ error: error });
     this.end();
@@ -372,16 +418,39 @@
     return control && control.querySelector('.speech-status');
   }
 
-  function showStatus(button, text, lasting) {
+  // `bare` leaves out the Retry, for a caller that places it itself.
+  function showStatus(button, text, lasting, bare) {
     var status = statusOf(button);
     if (!status) return;
     clearTimeout(status._hideTimer);
     status.textContent = text;
     status.hidden = !text;
     status.classList.remove('is-listening');
+    if (!bare && offerRetry(button, status, text ? ' · ' : 'Not transcribed · ')) return;
     if (text && !lasting) {
       status._hideTimer = setTimeout(function () { status.hidden = true; }, 4000);
     }
+  }
+
+  // Audio the host could not transcribe stays on its 🎤 (#3722), and the bubble
+  // keeps a Retry on it until a host session gets its words.
+  function unheardOf(button) {
+    var control = button.closest('.speech-control');
+    return (control && control._unheard) || [];
+  }
+
+  function offerRetry(button, status, lead) {
+    var count = unheardOf(button).length;
+    if (!count) return false;
+    status.appendChild(document.createTextNode(lead));
+    var retry = document.createElement('button');
+    retry.type = 'button';
+    retry.setAttribute('data-speech-retry', '');
+    retry.title = 'Send the recording to the speech service again';
+    retry.textContent = 'Retry' + (count > 1 ? ' ' + count + ' phrases' : '');
+    status.appendChild(retry);
+    status.hidden = false;
+    return true;
   }
 
   // While listening the bubble names the language, and a tap on it switches
@@ -396,15 +465,18 @@
       status.classList.add('is-listening');
       return;
     }
-    showStatus(button, '', true);
+    showStatus(button, '', true, true);
     var lang = recognizerLang();
     var name = LANG_NAMES[lang] || lang;
     var cycle = document.createElement('button');
     cycle.type = 'button';
     cycle.setAttribute('data-speech-lang-cycle', '');
     cycle.title = 'Switch dictation language';
+    // With a Retry beside it the note keeps only its reason, so the bubble fits a phone.
+    if (note && unheardOf(button).length) note = note.split(' · ')[0];
     cycle.textContent = (note || 'Listening') + ' · ' + name;
     status.appendChild(cycle);
+    offerRetry(button, status, ' · ');
     status.classList.add('is-listening');
     status.hidden = false;
   }
@@ -566,20 +638,36 @@
     var session = draining;
     draining = null;
     if (!session) return;
+    keepUnheard(session);
     showStatus(session.button, '');
     try { session.rec.abort(); } catch (e) { /* already ended */ }
   }
 
-  function start(button, note) {
+  // An abort drops a host session's late words, never its audio: what it has no
+  // words for yet goes back on its 🎤 for a Retry (#3722), so a send or a locked
+  // screen during a cold start loses nothing.
+  function keepUnheard(session) {
+    var control = session.host && session.button.closest('.speech-control');
+    if (control && session.rec.unheard.length) control._unheard = session.rec.unheard.slice();
+  }
+
+  // `retry` asks the host again even after it failed, for the audio it kept.
+  function start(button, note, retry) {
     var form = button.closest('form');
     var input = form && form.querySelector('textarea[name="message"]');
     if (!input) return;
     dropDraining();
     var control = button.closest('.speech-control');
-    var host = canRecord && (!hostDown || !Recognition) && !!control &&
+    var host = canRecord && (retry || !hostDown || !Recognition) && !!control &&
       control.hasAttribute('data-host-speech');
     if (!host && !Recognition) return;
-    var rec = host ? new HostRecognition() : new Recognition();
+    var rec;
+    if (host) {
+      rec = new HostRecognition(control._unheard);
+      control._unheard = [];
+    } else {
+      rec = new Recognition();
+    }
     var session = { rec: rec, host: host, button: button, input: input, form: form, seen: 0, skip: 0 };
     if (!host) {
       // Auto is the browser's language, not the page's `lang="en"`.
@@ -589,6 +677,18 @@
       if ('unspokenPunctuation' in rec) rec.unspokenPunctuation = true;
     }
     anchor(session);
+
+    // A slow phrase shows it is still on its way (#3722).
+    rec.onwait = function (seconds, starting) {
+      if (active !== session && draining !== session) return;
+      if (!seconds) {
+        if (active === session) showListening(button, true);
+        else showStatus(button, 'Transcribing…', true);
+        return;
+      }
+      showStatus(button, (starting ? 'Starting speech service… ' : 'Transcribing… ') +
+        seconds + ' s', true);
+    };
 
     rec.onresult = function (event) {
       if (active !== session && draining !== session) return;
@@ -621,6 +721,8 @@
     rec.onerror = function (event) {
       // Silence is a pause, not a failure: `end` follows and restarts.
       if (event.error === 'aborted' || event.error === 'no-speech') return;
+      // What the host never transcribed waits for a Retry, whatever stopped it.
+      keepUnheard(session);
       // The host is gone: the browser listens instead, from `end`.
       if (event.error === 'host-failed') {
         hostDown = true;
@@ -702,6 +804,7 @@
     var wasActive = active === session;
     if (!abort && wasActive) close(session);
     end(session);
+    if (abort) keepUnheard(session);
     if (!abort && wasActive && session.host) {
       draining = session;
       showStatus(session.button, 'Transcribing…', true);
@@ -736,6 +839,14 @@
       }
       return;
     }
+    var again = event.target.closest && event.target.closest('[data-speech-retry]');
+    if (again) {
+      event.preventDefault();
+      var mic = again.closest('.speech-control').querySelector('[data-speech-button]');
+      if (active) stop(active, active.button !== mic);
+      start(mic, null, true);
+      return;
+    }
     var button = event.target.closest && event.target.closest('[data-speech-button]');
     if (!button) return;
     event.preventDefault();
@@ -747,7 +858,7 @@
   // Keep the mobile keyboard where it is: the button must not take focus off
   // the textarea, just like the composer's Send button.
   document.addEventListener('mousedown', function (event) {
-    if (event.target.closest && event.target.closest('[data-speech-button], [data-speech-lang-cycle]')) {
+    if (event.target.closest && event.target.closest('[data-speech-button], [data-speech-lang-cycle], [data-speech-retry]')) {
       event.preventDefault();
     }
   });

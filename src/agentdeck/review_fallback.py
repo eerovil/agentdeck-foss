@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from .agent_review import is_reviewer_prompt  # noqa: F401 -- the Work reviewer's chats
+
 PUBLIC_STUB = True
 DEFAULT_HOURS = 6.0
 KINDS = {"claude_code": "Claude", "codex": "Codex"}
@@ -51,10 +53,6 @@ def busy_refusal(note: str) -> bool:
 
 def deck_hooks(config, **kwargs) -> dict:
     return {}
-
-
-def is_reviewer_prompt(prompt: str | None) -> bool:
-    return False
 
 
 def limit_to(path: Path, kind: str, until: float, *, by: str = "", now: float | None = None):

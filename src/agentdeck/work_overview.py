@@ -27,10 +27,10 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from urllib.parse import quote
 
+from .agent_review import is_reviewer_prompt
 from .chat_cwd import cannot_resume
 from .models import BACKGROUND_TASK_ACTIVITY, IssueRef
 from .poller_engine.schedules import LABEL as SCHEDULE_LABEL
-from .review_fallback import is_reviewer_prompt
 from .run_trace import (
     FAILED,
     FINISHED,
@@ -1294,11 +1294,11 @@ def _all_settled(outputs: Sequence[OutputFact], human) -> ReviewSummary | None:
     """Every output merged or closed while the card is open: say which, else None (#2226)."""
     if not outputs or any(not output.settled for output in outputs):
         return None
-    merged = [output.label for output in outputs if output.state == "merged"]
-    if merged:
+    if any(output.state == "merged" for output in outputs):
+        # Which merged is the Work page's pull request list; a card names none (#3720).
         return human(
             REVIEW_HUMAN,
-            f"Merged {', '.join(merged)}; the issue is still open",
+            "Merged; the issue is still open",
             DECIDE_RELEASE,
             cause=CAUSE_MERGED_OPEN,
         )
@@ -1311,15 +1311,14 @@ def _all_settled(outputs: Sequence[OutputFact], human) -> ReviewSummary | None:
 
 
 def _conflict_label(conflicted: Sequence[OutputFact], *, passed: bool = False) -> str:
-    """``Reviewed clean at abc1234, but it conflicts with master``, naming each pull request
-    when there are several (#2332)."""
+    """``Reviewed clean at abc1234, but it conflicts with master``, counting the pull requests
+    when there are several (#2332), never naming them (#3720)."""
     first = conflicted[0]
     base = first.base or "its base branch"
     if len(conflicted) == 1:
         how = "Review passed" if passed else "Reviewed clean"
         return f"{how} at {first.head[:7]}, but it conflicts with {base}"
-    names = ", ".join(output.label for output in conflicted)
-    return f"{names} conflict with their base branches"
+    return f"{len(conflicted)} pull requests conflict with their base branches"
 
 
 def _changes_asked(
@@ -1335,10 +1334,8 @@ def _changes_asked(
     first = sent_back[0]
     label = f"Reviewer asked for changes at {first.head[:7]}"
     if len(open_outputs) > 1:
-        label += f" on {first.label}"
-        others = [output.label for output in open_outputs if clean_at_head(output)]
-        if others:
-            label += f"; {', '.join(others)} reviewed clean"
+        # Counted, never named: the front page names no pull request (#3720).
+        label += f" on {len(sent_back)} of {len(open_outputs)} pull requests"
     moment = now or datetime.now(UTC)
     newest = max(output.review_changes_at for output in sent_back if output.review_changes_at)
     fresh = newest.timestamp() > 0 and moment - newest < CHANGES_GRACE

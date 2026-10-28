@@ -15,6 +15,7 @@ from urllib.parse import urlencode
 from fastapi.templating import Jinja2Templates
 
 from .. import chat_notes, deck_notices, issue_latest_comment
+from ..agent_review import is_reviewer_prompt
 from ..attachments import display_message
 from ..chat_board import ChatBoardService
 from ..chat_transcript import chat_event_id
@@ -40,7 +41,6 @@ from ..models import activity_label as activity_label  # single impl lives in mo
 from ..poller_ops import BoardView
 from ..providers import PROVIDERS
 from ..providers.claude_code.auth import looks_like_auth_failure
-from ..review_fallback import is_reviewer_prompt
 from ..state import AppState, SessionPresentation
 from ..triage import (
     issue_is_closed,

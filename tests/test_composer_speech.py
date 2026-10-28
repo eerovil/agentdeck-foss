@@ -195,6 +195,9 @@ def _speech_server(socket_path):
             self.said.append((text, language, name, speed))
             return b"RIFF-wav"
 
+        def status(self):
+            return {"engine": "parakeet", "loaded": False}
+
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.bind(str(socket_path))
     sock.listen(4)
@@ -262,6 +265,7 @@ async def test_speech_routes_pass_audio_to_the_host_service_and_back(tmp_path):
     try:
         async with httpx.AsyncClient(transport=transport, base_url="http://deck") as client:
             unconfigured = await client.post("/api/speech/say", json={"text": "hi"})
+            no_status = await client.get("/api/speech/status")
             # The wake word detector (#3476): its answer comes back and is logged
             # beside Whisper's, and a phrase either woke on keeps its audio.
             no_detector = await client.post("/api/speech/wake?id=a1", content=b"RIFF")
@@ -307,6 +311,8 @@ async def test_speech_routes_pass_audio_to_the_host_service_and_back(tmp_path):
             old_kept.write_bytes(b"RIFF")
             os.utime(old_kept, (time.time() - 8 * 86400,) * 2)
             heard = await client.post("/api/speech/transcribe?id=k1", content=b"RIFF....WAVE")
+            # Whether a slow phrase is waiting on the model loading (#3722).
+            loading = await client.get("/api/speech/status")
             app.state.config.speech.keep_audio_days = 0
             # The language heard last rides along; anything else is not passed on.
             await client.post("/api/speech/transcribe?language=fi", content=b"RIFF....WAVE")
@@ -324,6 +330,7 @@ async def test_speech_routes_pass_audio_to_the_host_service_and_back(tmp_path):
             )
             app.state.config.speech.socket = str(tmp_path / "gone.sock")
             dead = await client.post("/api/speech/transcribe", content=b"RIFF....WAVE")
+            dead_status = await client.get("/api/speech/status")
     finally:
         server.shutdown()
         server.server_close()
@@ -331,6 +338,8 @@ async def test_speech_routes_pass_audio_to_the_host_service_and_back(tmp_path):
         waker.server_close()
 
     assert unconfigured.status_code == 503
+    assert (no_status.status_code, dead_status.status_code) == (503, 503)
+    assert loading.json() == {"loaded": False}
     assert no_detector.status_code == 503
     assert woke.json() == {"woken": True, "score": 0.9, "speech_after": False}
     assert missed.json()["woken"] is False
@@ -3546,6 +3555,8 @@ async def test_dictation_listens_through_the_host_and_falls_back_to_the_browser(
             if not host["up"]:
                 await route.fulfill(status=503, body="{}", content_type="application/json")
                 return
+            if host.get("hold"):
+                await host["hold"].wait()
             await page.wait_for_timeout(300)
             await route.fulfill(status=200, content_type="application/json", body=json.dumps(
                 {"text": heard[len(phrases) - 1], "language": "en"}))
@@ -3579,9 +3590,20 @@ async def test_dictation_listens_through_the_host_and_falls_back_to_the_browser(
         await mic.click()
         await wait_until(page, "the microphone is recording", "() => !!window.__mic")
         status = await page.locator(bubble).text_content()
+        # A cold start (#3722): a phrase slow to come back says the service is
+        # starting while it loads, and the bubble goes back to listening after.
+        host["hold"] = asyncio.Event()
+        await page.route("**/api/speech/status", lambda route: route.fulfill(
+            status=200, content_type="application/json", body='{"loaded": false}'))
         await speak()
+        await wait_until(page, "the bubble says the service is starting",
+                         f"() => document.querySelector('{bubble}').textContent"
+                         ".startsWith('Starting speech service… ')", timeout=5000)
+        host["hold"].set()
+        host["hold"] = None
         await wait_until(page, "the first phrase landed",
                          draft + " === 'Fix the login bug.'", timeout=5000)
+        listening_again = await page.locator(bubble).text_content()
         # Tapped off mid-phrase: what was being said is still transcribed, and an
         # unpunctuated phrase gets its full stop and capital at once.
         # Two quick phrases, the second landing well inside 0.6 s of the first, each
@@ -3613,16 +3635,43 @@ async def test_dictation_listens_through_the_host_and_falls_back_to_the_browser(
         await mic.click()
         await wait_until(page, "recording again", "() => __mic.stream.active")
         await speak()
-        await wait_until(page, "the failure is shown",
+        await wait_until(page, "the failure is shown with a Retry",
                          f"() => document.querySelector('{bubble}').textContent"
-                         " === 'Speech service unreachable'", timeout=5000)
+                         " === 'Speech service unreachable · Retry'", timeout=5000)
+        # The next tap tries the host again, sending the phrase it kept first (#3722).
         await mic.click()
-        retried = await mic.get_attribute("aria-pressed")
+        await wait_until(page, "the kept phrase was sent again",
+                         "() => document.querySelector('" + bubble + " [data-speech-retry]')",
+                         timeout=5000)
+        retried = len(phrases)
+        # The service is back: Retry lands the lost phrase and listens on.
+        heard[:] = heard + [""] * (len(phrases) - len(heard)) + [
+            "it was lost", "and this too", "sent too soon"]
+        host["up"] = True
+        await page.locator(f"{bubble} [data-speech-retry]").click()
+        await wait_until(page, "the kept phrase landed",
+                         draft + " === 'Fix the login bug. It fails. On mobile. And add a test."
+                         " It was lost.'", timeout=5000)
+        await speak()
+        await wait_until(page, "listening went on",
+                         draft + " === 'Fix the login bug. It fails. On mobile. And add a test."
+                         " It was lost. And this too.'", timeout=5000)
+        recovered = await mic.get_attribute("aria-pressed")
+        # A send while a phrase is still being transcribed (a cold start) drops its
+        # late words but keeps its audio for a Retry.
+        host["hold"] = asyncio.Event()
         await speak()
         for _ in range(50):
-            if len(phrases) == 6:
+            if len(phrases) == 9:
                 break
             await page.wait_for_timeout(100)
+        async with page.expect_response("**/inject"):
+            await page.locator("form.inject-form textarea").press("Enter")
+        kept = await page.locator(bubble).text_content()
+        host["hold"].set()
+        await page.wait_for_timeout(500)
+        after_send = await page.evaluate(draft)
+        host["up"] = False
         await context.close()
 
         # Chrome, with a dead service: the browser's recognizer takes over.
@@ -3644,12 +3693,16 @@ async def test_dictation_listens_through_the_host_and_falls_back_to_the_browser(
         await browser.close()
 
     assert status == "Listening"
+    assert listening_again == "Listening"
     assert pressed == "false"
     assert tracks == ["ended"]
-    assert phrases[:4] == [b"RIFF"] * 4 and len(phrases) == 7
-    assert retried == "true"
-    assert sent == []
-    assert fallback == "Host unreachable · listening · Suomi"
+    assert phrases[:4] == [b"RIFF"] * 4 and len(phrases) == 10
+    assert retried == 6
+    assert recovered == "true"
+    assert len(sent) == 1 and "It was lost. And this too." in sent[0]
+    assert kept == "Not transcribed · Retry"
+    assert after_send == ""
+    assert fallback == "Host unreachable · Suomi · Retry"
     assert typed == "Add a test"
 
 

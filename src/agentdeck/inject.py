@@ -1624,7 +1624,9 @@ class InjectionService:
             return (
                 InjectResult(
                     False,
-                    "refusing to delegate into the live deploy checkout — use a worktree",
+                    "refusing to delegate into the live deploy checkout — pass --cwd a"
+                    " worktree under .worktrees/, or for a read-only review the review"
+                    " mirror ~/.cache/agentdeck/review-mirrors/<owner>/<repo>.git",
                 ),
                 None,
             )

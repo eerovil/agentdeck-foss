@@ -102,8 +102,10 @@ def strip_api_trace(stderr: str, *, now: float | None = None) -> tuple[str, tupl
     """Remove ``GH_DEBUG=api`` traffic and retain its rate-limit headers.
 
     Request traces contain request headers and response bodies, so none of the
-    trace is forwarded to the caller. Ordinary diagnostics outside a request
-    block are preserved verbatim.
+    trace is forwarded to the caller. Debug mode also echoes each ``git`` command
+    `gh` runs as a ``[git …]`` line, which callers read as part of a failure (#3711),
+    so those go too. Ordinary diagnostics outside a request block are preserved
+    verbatim.
     """
     clean: list[str] = []
     readings: list[Reading] = []
@@ -140,6 +142,8 @@ def strip_api_trace(stderr: str, *, now: float | None = None) -> tuple[str, tupl
             if line.startswith("* Request took "):
                 finish_response()
                 tracing = False
+            continue
+        if line.startswith("[git ") and line.rstrip("\r\n").endswith("]"):
             continue
         clean.append(line)
     if tracing:

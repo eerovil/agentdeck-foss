@@ -910,7 +910,17 @@ def failure_hint(
         return ""
     where = f" on {target}" if target else ""
     if authority.startswith(APP_PREFIX):
-        refused = [r for r in api_responses(raw_stderr) if _asks_for_a_permission(r)]
+        responses = api_responses(raw_stderr)
+        if any(r.status == 403 and r.path.split("?", 1)[0] == "/user" for r in responses):
+            # The 403 every App token gets from `GET /user`: no missing permission, and no
+            # sign that anything else in the command failed. Reviewers read it as a failed
+            # write and redid finished work (#3711).
+            return (
+                f"github: an App installation token has no user, so GitHub always refuses"
+                f" GET /user (HTTP 403) for {authority}. It says nothing about any other call"
+                " in this command; a write that already went through still stands"
+            )
+        refused = [r for r in responses if _asks_for_a_permission(r)]
         if not refused:
             return ""
         response = refused[-1]

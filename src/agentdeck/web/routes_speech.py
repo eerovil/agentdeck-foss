@@ -4,7 +4,8 @@ The page posts a recorded phrase here and gets its words back, and posts the tex
 will read and gets the audio back. Both are passed on to the host's speech service
 (``scripts/speech_server.py``) over its Unix socket, ``[speech] socket``; audio never
 leaves the host. A 503 means the service is down or restarting: after a few retries
-🎤 dictation falls back to the browser's recognizer, and voice mode turns off (#3470).
+voice mode turns off (#3470), and 🎤 dictation keeps the phrase's audio for a Retry
+and falls back to the browser's recognizer (#3722).
 
 While voice mode waits for its wake word, the page posts each phrase to
 ``/api/speech/wake`` first, passed on to the wake word detector
@@ -30,6 +31,10 @@ within ``TTS_TIMEOUT``, or answers "loading" is read by Piper instead, and after
 failure Piper reads everything for ``TTS_REST`` seconds, so a reply does not flip
 between the two voices.
 ``/sessions/{key}/voice-log`` reads back what the fast agent heard and said (#3475).
+
+``GET /api/speech/status`` says whether the service has its model loaded yet: 🎤 asks
+when a phrase is slow to come back, so its bubble can say the service is starting
+(#3722).
 """
 
 from __future__ import annotations
@@ -60,9 +65,12 @@ router = APIRouter(dependencies=[Depends(require_access)])
 # Thirty seconds of 16 kHz 16-bit mono is under 1 MB; the page cuts a phrase there.
 MAX_AUDIO_BYTES = 4 * 1024 * 1024
 MAX_SAY_CHARS = 2000
-# The first phrase after an idle spell starts the service and loads the model.
-TIMEOUT = httpx.Timeout(60.0, connect=5.0)
+# The first phrase after an idle spell starts the service and loads the model: on
+# 2026-10-28, with the CPU busy, that took 63 s and a 60 s wait lost the phrase (#3722).
+TIMEOUT = httpx.Timeout(180.0, connect=5.0)
 LANGUAGES = ("en", "fi")
+# A status read answers while a phrase loads the model; a cold start is ~1 s of it.
+STATUS_TIMEOUT = httpx.Timeout(10.0, connect=5.0)
 # The wake log (#3476): the page names each waiting phrase with an id like this.
 PHRASE_ID = re.compile(r"[A-Za-z0-9-]{1,64}")
 WAKE_LOG = "wake-log.jsonl"
@@ -112,6 +120,25 @@ async def _audio(request: Request) -> bytes:
     if len(audio) > MAX_AUDIO_BYTES:
         raise HTTPException(status_code=413, detail="phrase too long")
     return audio
+
+
+@router.get("/api/speech/status")
+async def status(request: Request) -> JSONResponse:
+    """``{"loaded"}``: false while the service is still loading its model (#3722)."""
+    socket = get_config(request).speech.socket
+    if not socket:
+        raise HTTPException(status_code=503, detail="no speech service configured")
+    transport = httpx.AsyncHTTPTransport(uds=str(Path(socket).expanduser()))
+    try:
+        async with httpx.AsyncClient(transport=transport, timeout=STATUS_TIMEOUT) as client:
+            reply = await client.get("http://speech/status")
+        loaded = bool(reply.json().get("loaded")) if reply.status_code == 200 else None
+    except (httpx.HTTPError, ValueError) as exc:
+        log.info("speech status unreadable: %r", exc)
+        loaded = None
+    if loaded is None:
+        raise HTTPException(status_code=503, detail="speech service status unknown")
+    return JSONResponse({"loaded": loaded})
 
 
 @router.post("/api/speech/transcribe")

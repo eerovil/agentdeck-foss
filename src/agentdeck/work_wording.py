@@ -33,9 +33,21 @@ _PLAIN: tuple[tuple[re.Pattern[str], str], ...] = tuple(
         (r"^.*\bdelivery never landed\b.*$", "The worker never started"),
         (r"^The worker never started$", "The worker never started"),
         (r"^The card is in Needs More Info$", "Waiting for your answer on the issue"),
-        # The engine's release parks (#2332).
-        (r"^Auto-merge on `?([\w./-]+#\d+)`? is no longer armed on GitHub\b.*$",
-         r"Auto-merge on \1 was switched off; merge again"),
+        # The engine's release parks (#2332), naming no pull request (#3720).
+        (r"^Auto-merge on `?[\w./-]+#\d+`? is no longer armed on GitHub\b.*$",
+         "Auto-merge was switched off; merge again"),
+        (r"^Auto-merge on `?[\w./-]+#\d+`? did not fire within the time limit\b.*$",
+         "Auto-merge did not fire in time; check GitHub"),
+        (r"^`?[\w./-]+#\d+`? conflicts with (\S+)$", r"Conflicts with \1"),
+        (r"^`?[\w./-]+#\d+`? was closed without merging\b.*$",
+         "Its pull request was closed without merging"),
+        (r"^`?[\w./-]+#\d+`? now conflicts with its base branch, and this release has already "
+         r"spent its repair attempt\b.*$", "Conflicts with its base branch; repair already spent"),
+        (r"^CI on `?[\w./-]+#\d+`? went red after auto-merge was armed\b.*?, and this release "
+         r"has already spent its repair attempt\b.*$", "CI went red after auto-merge; repair "
+         "already spent"),
+        (r"^The repair worker finished without pushing a change, and .* still failing\b.*$",
+         "The repair changed nothing and checks still fail"),
         (r"^\*\*Production deploy failed\.\*\*.*?(; AgentDeck is re-checking the deploy)?$",
          r"Merged; the production deploy failed\1"),
         (r"^Production deploy did not reach a terminal status in time\b.*$",
@@ -44,9 +56,11 @@ _PLAIN: tuple[tuple[re.Pattern[str], str], ...] = tuple(
 )
 # ``owner/repo#n`` → ``repo#n``: the owner is the same on nearly every row.
 _OWNED_REF = re.compile(r"\b[\w.-]+/([\w.-]+#\d+)")
-# The reviewer's grouping of several outputs (``work_attention._reviewer_reason``).
-_ON_REFS = re.compile(r"^(?P<label>.+?) on (?P<refs>[\w.#/-]+(?:(?:, | and )[\w.#/-]+)*)$")
-_MORE = re.compile(r"^(?P<ref>[\w.#/-]+): (?P<label>.+?) \(\+(?P<n>\d+) more\)$")
+# The reviewer's count of several outputs (``work_attention._reviewer_reason``), which names
+# none of them (#3720): ``<label> on 2 of 3 pull requests``, maybe ``(+1 more)``.
+_COUNTED = re.compile(
+    r"^(?P<label>.+?)(?P<tail> on \d+ of \d+ pull requests?(?: \(\+\d+ more\))?)$"
+)
 
 
 def _plain_one(text: str) -> str:
@@ -57,12 +71,9 @@ def _plain_one(text: str) -> str:
 
 
 def _plain_part(part: str) -> str:
-    grouped = _ON_REFS.match(part)
-    if grouped:
-        return f"{_plain_one(grouped['label'])} on {grouped['refs']}"
-    more = _MORE.match(part)
-    if more:
-        return f"{more['ref']}: {_plain_one(more['label'])} (+{more['n']} more)"
+    counted = _COUNTED.match(part)
+    if counted:
+        return f"{_plain_one(counted['label'])}{counted['tail']}"
     return _plain_one(part)
 
 

@@ -215,6 +215,8 @@ def test_real_response_headers_override_the_rate_limit_payload(shim, capsys):
 
 def test_api_debug_trace_is_removed_while_rate_headers_are_kept():
     debug = """ordinary warning before
+[git remote -v]
+[git config --get-regexp ^remote\\..*\\.gh-resolved$]
 * Request at now
 > Authorization: token secret
 < HTTP/2.0 403 Forbidden

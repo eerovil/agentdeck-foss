@@ -699,14 +699,11 @@ def _read_status(card: WorkCard) -> WorkStatus:
     if card.deploy_due and not card.deploying:
         # Merged into a repository that deploys on merge, and the engine has not started
         # watching that deploy yet (#2760): the deploy comes next, not a Finish.
-        pulls = ", ".join(
-            output.label for output in card.outputs if output.state == "merged"
-        )
-        merged = f"Merged {pulls}" if pulls else "Merged"
+        # The summary names no pull request (#3720): the Work page lists them.
         return status(
             ACTIVE,
             "Deploying",
-            f"{merged}; waiting for its deploy to start.",
+            "Merged; waiting for its deploy to start.",
             next="deploy",
             kind=DEPLOYING,
         )
@@ -811,13 +808,10 @@ def _read_status(card: WorkCard) -> WorkStatus:
     if card.deploying:
         # Merged, and the engine watches the deploy (#2332): a review decision, a park or a
         # stopped worker from before the merge is moot now. A chat's own question came first.
-        pulls = ", ".join(
-            output.label for output in card.outputs if output.state == "merged"
-        )
         return status(
             ACTIVE,
             "Deploying",
-            f"Merged {pulls}." if pulls else "Merged.",
+            "Merged.",
             next="deploy",
             kind=DEPLOYING,
         )
@@ -935,11 +929,11 @@ def _read_status(card: WorkCard) -> WorkStatus:
         # is working, and nothing will until a person starts that check or merges by hand.
         first = blocked[0]
         names = ", ".join(first.never_ran)
-        more = f" (and {len(blocked) - 1} more)" if len(blocked) > 1 else ""
+        # Its summary names no pull request (#3720); ``where`` links the first.
         return status(
             ATTENTION,
             "Merge blocked",
-            f"{first.label}{more} waits for {names}, which never ran.",
+            f"Waits for {names}, which never ran.",
             "GitHub merges it by itself once that check passes.",
             next="a required check",
             you="Start the missing check, or merge by hand",
@@ -994,7 +988,8 @@ def _read_status(card: WorkCard) -> WorkStatus:
             )
         checks = ci_state(card.ci)
         if checks:
-            # A pull request whose CI is its verification (#2364), named with its head.
+            # A pull request whose CI is its verification (#2364), named with its head in the
+            # detail only: the summary a card shows names no pull request (#3720).
             unsettled = [c for c in card.ci if c.state != "green"]
             named = ", ".join(f"{c.label}@{c.head[:7]}" for c in unsettled)
             if checks == "failing":
@@ -1004,20 +999,20 @@ def _read_status(card: WorkCard) -> WorkStatus:
                 return status(
                     PROBLEM,
                     "Verification failed",
-                    f"CI failed on {failed}.",
-                    review.label + ".",
+                    "CI failed.",
+                    f"CI failed on {failed}. {review.label}.",
                     next="",
                     you="Look at the CI",
                 )
             if checks == "pending":
                 return status(
-                    ACTIVE, "Verifying", f"CI running on {named}.", review.label + ".",
+                    ACTIVE, "Verifying", "CI running.", f"CI running on {named}. {review.label}.",
                     next=NEXT_VERIFICATION,
                 )
             if checks == "waiting":
                 return status(
-                    ACTIVE, "Verification due", f"No CI reported yet on {named}.",
-                    review.label + ".", next=NEXT_VERIFICATION,
+                    ACTIVE, "Verification due", "No CI reported yet.",
+                    f"No CI reported yet on {named}. {review.label}.", next=NEXT_VERIFICATION,
                 )
         if review.next_expected == NEXT_VERIFICATION:
             # No green run covers the reviewed head, and the engine asks for one itself (#2364).
@@ -1044,8 +1039,7 @@ def _read_status(card: WorkCard) -> WorkStatus:
         if merging and _all_landed(card):
             # Every pull request already merged or closed; what is left is the deploy and
             # closing the card (#2316), so "Merging" would describe a step that has finished.
-            pulls = ", ".join(output.label for output in card.outputs if output.state == "merged")
-            return status(ACTIVE, "Deploying", f"Merged {pulls}.", next="deploy", kind=DEPLOYING)
+            return status(ACTIVE, "Deploying", "Merged.", next="deploy", kind=DEPLOYING)
         return status(
             ACTIVE,
             "Merging" if merging else "Review passed",
@@ -1357,9 +1351,10 @@ def front_row(card: WorkCard, *, current: bool) -> FrontRow:
     """
     story = work_status(card)
     if story.tone == DONE and not card.awaiting_finish:
-        merged = [output.label for output in card.outputs if output.state == "merged"]
-        # The section and its mark already say it finished; only a merge adds anything.
-        reason = f"Merged {', '.join(merged)}" if merged else ""
+        # The section and its mark already say it finished; only a merge adds anything, and
+        # never which pull requests (#3720).
+        merged = any(output.state == "merged" for output in card.outputs)
+        reason = "Merged" if merged else ""
         return FrontRow(card, story, FINISHED, reason)
     if card.paused and story.tone != DONE:
         return FrontRow(card, story, PAUSED, story.summary.rstrip("."))

@@ -42,6 +42,17 @@ def _watched_host(tmp_path, **kwargs):
     return host, spawned, feed
 
 
+def _moved_since(feed: ChangeFeed, revision: int) -> list[str]:
+    """The items bumped after ``revision``, flushing any marks still pending.
+
+    The feed flushes marks itself ``CHECK_COALESCE_S`` after the first one, so on a slow
+    host that timer can run the checks before the test does (#3716): ask the feed what
+    moved, not which run of the checks saw it.
+    """
+    feed.run_checks()
+    return feed.changed_since(revision)
+
+
 async def test_a_held_read_is_answered_by_a_bump_and_names_what_moved():
     feed = ChangeFeed()
     first = await feed.wait(None, None, timeout=5)
@@ -102,14 +113,15 @@ async def test_a_streamed_line_moves_nothing_but_the_turn_ending_does(tmp_path):
     feed.run_checks()
     process = spawned[0]["process"]
 
+    revision = feed.revision
     for _ in range(3):
         process.stdout.emit({"type": "assistant", "message": {"content": []}})
     await _settle()
-    assert feed.run_checks() == []
+    assert _moved_since(feed, revision) == []
 
     process.stdout.emit({"type": "result", "subtype": "success"})
     await _settle()
-    assert feed.run_checks() == [ITEM]
+    assert _moved_since(feed, revision) == [ITEM]
     await host.stop()
 
 
@@ -171,14 +183,16 @@ async def test_the_runtime_serves_its_feed_and_wires_its_sources(tmp_path):
     # #3008: the boot's revival scan ending moves what the deck reads of that account's
     # workers (the revivals owed) with no worker changing, so the feed bumps it.
     feed.run_checks()
+    revision = feed.revision
     nudges = app.state.restart_nudges
     nudges._revival_scanned = True
     nudges._revivals_changed()
     await _settle()
-    assert workers_item("claude_code", "main") in feed.run_checks()
+    assert workers_item("claude_code", "main") in _moved_since(feed, revision)
+    revision = feed.revision
     nudges._revivals_changed()  # nothing moved: no bump
     await _settle()
-    assert feed.run_checks() == []
+    assert _moved_since(feed, revision) == []
 
 
 async def _changes_app(feed: ChangeFeed) -> FastAPI:

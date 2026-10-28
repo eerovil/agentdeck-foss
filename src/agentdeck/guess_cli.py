@@ -13,6 +13,7 @@ import os
 import re
 import shutil
 
+from . import claude_env
 from .models import Account
 
 log = logging.getLogger(__name__)
@@ -52,7 +53,7 @@ def _guess_env(account: Account) -> dict[str, str]:
     for name in list(env):
         if name.startswith("AGENTDECK_"):
             env.pop(name)
-    env["CLAUDE_CONFIG_DIR"] = str(account.root)
+    claude_env.point_at(env, account.root)  # macOS keeps ~/.claude unset
     return env
 
 

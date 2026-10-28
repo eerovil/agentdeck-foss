@@ -37,35 +37,36 @@ Work's own facts. Nothing here is stored and nothing here asks the agent to call
    another chat may close the issue while this Work's pull request still waits for its review
    or Merge;
 5. a registered pull request is ready and a review chat about its head is still open:
-   **In review — PR #N · since 20:17**, from the chat's opening; one whose reviewer gave up
-   while the deck opens the Work's next chat reads **In review — PR #N · the reviewer gave
+   **In review — since 20:17**, from the chat's opening; one whose reviewer gave up
+   while the deck opens the Work's next chat reads **In review — the reviewer gave
    up at 08:32, opening the next review** (#3192); once no reviewer has run on
    it for longer than the fallback reviewer's own retry window, the deck starts a reviewer on
-   it once (**In review — PR #N · waiting for a reviewer since 20:37**, #2960); quiet again
-   after that, **Needs you — no reviewer on PR #N since 20:37** (#2943), an AgentDeck bug,
-   since every ready head is reviewed by itself; **the reviewer stopped on PR #N since 20:37**
+   it once (**In review — waiting for a reviewer since 20:37**, #2960); quiet again
+   after that, **Needs you — no reviewer since 20:37** (#2943), an AgentDeck bug,
+   since every ready head is reviewed by itself; **the reviewer stopped since 20:37**
    when the review chat is labelled blocked, so a reviewer ran and says why there (#2974).
    Before all of these, an open pull request whose newest review chat ended with the reviewer
-   escalating its current head to the owner reads **Needs you — the reviewer escalated PR #N
+   escalating its current head to the owner reads **Needs you — the reviewer escalated it
    to you (review-chats#5914) · 20:19** (#3216): the agent was told to ask the reviewer's
    question in its question box, which rule 1 shows instead once it does;
 6. the deck's merge queue holds one of its pull requests (#3022), behind another one:
-   **In merge queue — PR #N · 3rd of 5**; first in line and waiting on its re-test:
-   **In merge queue — PR #N · first of 5 · re-testing after master moved, round 2**. First in
+   **In merge queue — 3rd of 5**; first in line and waiting on its re-test:
+   **In merge queue — first of 5 · re-testing after master moved, round 2**. First in
    line with nothing running is not a rest: the agent owes that re-test, so the rules below
    apply;
 7. a wake-on or a queued test run is open: **Waiting on …, until 14:20**; a wake-on for
    the Work's own pull request merging is left out once rule 8 holds, since that merge is
    what Ready for merge asks a person for (#3003). When the agent's only wait is its own pull
    request merging, the line says what that pull request waits for, from the release's last
-   answer (#3097): **Waiting on pull request o/r#9 — no test run started, until 14:20**,
+   answer (#3097): **Waiting on its pull request — no test run started, until 14:20**,
    **— review asked for changes at 15:11, sent to the agent** or **… not sent: no chat owns
-   it**. A hold only a person lifts (the spec-only label) is **Needs you — pull request
-   o/r#9 held: spec-only label** at once; any other that nothing moved for ``PR_STALE`` (no
+   it**. A hold only a person lifts (the spec-only label) is **Needs you — its pull
+   request held: spec-only label** at once; any other that nothing moved for ``PR_STALE`` (no
    push, no review, no turn) is **Needs you — … · nothing since 13:02**, Needs retry;
 8. every open pull request is reviewed and tested and only a person's Merge is missing (the
-   deck's release says so): **Ready for merge — PR #N · reviewed clean 13:26
-   (review-chats#5166)** (#2960, #2992), linking that review chat;
+   deck's release says so): **Ready for merge — reviewed clean 13:26
+   (review-chats#5166)** (#2960, #2992), linking that review chat. No line names a pull
+   request (#3720): the Work page lists them;
 9. otherwise the agent ended its turn without a next step: no question, no wait, no review,
    no closed issue. Its pull requests all merged with the issue still open is one of these:
    the agent decides whether work is left and closes the issue if not. That is never a
@@ -223,9 +224,8 @@ class DerivedInputs:
     #: Claude or Codex reviewer, and the owner learns the ChatGPT browser needs them.
     review_start_failed: str = ""
     #: The reviewer escalated an open pull request's current head to the owner (#3216): that
-    #: pull request, its repository when not the issue's own, when, and the review chat.
+    #: pull request, when, and the review chat.
     escalated_pr: int | None = None
-    escalated_repository: str = ""
     escalated_at: datetime | None = None
     escalated_chat: str = ""
     escalated_url: str = ""  # the escalation comment itself, where its question is
@@ -243,9 +243,8 @@ class DerivedInputs:
     last_text: str = ""  # the ended turn's final text
     ended_at: datetime | None = None
     #: The pull request a Ready for merge line names, when the release says only a person's
-    #: Merge is missing (#2960), and its repository when it is not the issue's own.
+    #: Merge is missing (#2960). A line never names it (#3720).
     ready_pr: int | None = None
-    ready_repository: str = ""
     #: The clean review behind it (#2992): when the pass was recorded, and the review chat
     #: (``owner/repo#n``) that passed it, ``""`` when none is known.
     ready_reviewed_at: datetime | None = None
@@ -254,7 +253,6 @@ class DerivedInputs:
     #: is not the issue's own, its place (1 is first), the line's length, and how many times
     #: the deck brought it up to its base while first.
     queue_pr: int | None = None
-    queue_repository: str = ""
     queue_place: int = 0
     queue_size: int = 0
     queue_round: int = 0
@@ -263,10 +261,7 @@ class DerivedInputs:
     nudged_at: datetime | None = None
     nudged_for: datetime | None = None
     asks: bool = False
-    pr: int | None = None  # the Work's pull request a Stopped line names, if any
-    #: That pull request's repository when it is not the issue's own, so the line names it
-    #: in full (``owner/repo#37``) rather than as a bare ``PR #37`` (#2956).
-    pr_repository: str = ""
+    pr: int | None = None  # the Work's pull request, if any; a line never names it (#3720)
     chat_href: str = ""  # the owning chat's page, where its question is answered
     #: The issue is a schedule definition (``scheduled`` label): rule 9 never applies (#2998).
     scheduled: bool = False
@@ -530,8 +525,7 @@ def _first_rule(
         # agent is asked to put the question in its question box, which reads first above.
         when = clock(inputs.escalated_at)
         summary = (
-            f"the reviewer escalated {_pr_label(inputs.escalated_pr, inputs.escalated_repository)}"
-            " to you"
+            "the reviewer escalated it to you"
             + (f" ({inputs.escalated_chat.rpartition('/')[2]})" if inputs.escalated_chat else "")
             + (f" · {when}" if when else "")
         )
@@ -543,7 +537,7 @@ def _first_rule(
     reopen_until = _aware(inputs.review_reopen_until)
     if reopen_until is not None and inputs.review_pr is not None and now < reopen_until:
         when = clock(inputs.review_active)
-        summary = f"PR #{inputs.review_pr} · the reviewer gave up" + (
+        summary = "the reviewer gave up" + (
             f" at {when}" if when else ""
         ) + ", opening the next review"
         return DerivedStatus(
@@ -557,18 +551,14 @@ def _first_rule(
             last = clock(inputs.review_active)
             if not inputs.review_retried:
                 # Not a person's yet: the deck starts a reviewer on it first (#2960).
-                summary = f"PR #{pr} · waiting for a reviewer" + (f" since {last}" if last else "")
+                summary = "waiting for a reviewer" + (f" since {last}" if last else "")
                 return DerivedStatus(
                     REVIEW_QUEUED, f"In review — {summary}", at=inputs.review_active,
                     summary=summary, pr=pr, review_chat=inputs.review_chat,
                 )
             # A reviewer that ran and gave up says why in its chat (#2974): a verdict the deck
             # never answered, say. Only quiet with no such stop means nobody came.
-            what = (
-                f"the reviewer stopped on PR #{pr}"
-                if inputs.review_held
-                else f"no reviewer on PR #{pr}"
-            )
+            what = "the reviewer stopped" if inputs.review_held else "no reviewer"
             summary = what + (f" since {last}" if last else "")
             if inputs.review_held and inputs.review_held_why:
                 summary += f": {inputs.review_held_why}"
@@ -579,22 +569,21 @@ def _first_rule(
                 review_failed=inputs.review_stopped_by_ours or not inputs.review_held,
             )
         since = clock(inputs.review_since)
-        summary = f"PR #{pr}" + (f" · since {since}" if since else "")
+        parts = [f"since {since}"] if since else []
         if inputs.review_start_failed:
-            summary += f" · ChatGPT was not started: {inputs.review_start_failed}"
+            parts.append(f"ChatGPT was not started: {inputs.review_start_failed}")
         elif inputs.review_held and inputs.review_held_why:
             # Not stuck yet: the deck hands the chat to its own reviewer (#3356).
-            summary += f" · the last reviewer stopped: {inputs.review_held_why}"
+            parts.append(f"the last reviewer stopped: {inputs.review_held_why}")
+        summary = " · ".join(parts)
         return DerivedStatus(
-            REVIEW, f"In review — {summary}", at=inputs.review_since, deadline=stuck_at,
+            REVIEW, _headed("In review", summary), at=inputs.review_since, deadline=stuck_at,
             summary=summary, pr=pr,
         )
     if inputs.queue_pr is not None and (
         inputs.queue_place > 1 or inputs.waits or inputs.pr_waits
     ):
-        summary = f"{_pr_label(inputs.queue_pr, inputs.queue_repository)} · " + (
-            f"{_ordinal(inputs.queue_place)} of {inputs.queue_size}"
-        )
+        summary = f"{_ordinal(inputs.queue_place)} of {inputs.queue_size}"
         if inputs.queue_place <= 1 and inputs.queue_round:
             summary += f" · re-testing after master moved, round {inputs.queue_round}"
         return DerivedStatus(
@@ -610,15 +599,15 @@ def _first_rule(
     if inputs.pr_waits:
         return _pr_wait(inputs, now=now, clock=clock)
     if inputs.ready_pr is not None:
-        summary = _pr_label(inputs.ready_pr, inputs.ready_repository)
+        summary = ""
         if inputs.ready_reviewed_at is not None or inputs.ready_review_chat:
             # What made it ready, so a reviewed Ready reads apart from any other (#2992).
             when = clock(inputs.ready_reviewed_at)
-            summary += " · reviewed clean" + (f" {when}" if when else "")
+            summary = "reviewed clean" + (f" {when}" if when else "")
             if inputs.ready_review_chat:
                 summary += f" ({inputs.ready_review_chat.rpartition('/')[2]})"
         return DerivedStatus(
-            READY, f"Ready for merge — {summary}", summary=summary, pr=inputs.ready_pr,
+            READY, _headed("Ready for merge", summary), summary=summary, pr=inputs.ready_pr,
             chat_href=href, review_ref=inputs.ready_review_chat,
         )
     if inputs.spec_posted_at is not None:
@@ -729,7 +718,6 @@ def _unfinished(
     when = clock(inputs.ended_at)
     parts = ["the agent ended without a next step"]
     parts += [f'last said "{quote}"'] if quote else []
-    parts += [_pr_label(inputs.pr, inputs.pr_repository)] if inputs.pr is not None else []
     parts += [when] if when else []
     summary = " · ".join(parts)
     return DerivedStatus(
@@ -744,6 +732,6 @@ def _aware(value: datetime | None) -> datetime | None:
     return value.replace(tzinfo=UTC)
 
 
-def _pr_label(number: int, repository: str) -> str:
-    """``PR #37``, or ``PR owner/repo#37`` for another repository's pull request (#2956)."""
-    return f"PR {repository}#{number}" if repository else f"PR #{number}"
+def _headed(headline: str, summary: str) -> str:
+    """``Headline — summary``, or the headline alone when there is nothing to add."""
+    return f"{headline} — {summary}" if summary else headline

@@ -267,6 +267,14 @@ def test_real_quota_path_shares_users_and_keeps_headers_authoritative(
     assert second["graphql"].remaining == 700
     assert calls.count(["api", "rate_limit"]) == 1
 
+    # An App installation token cannot read `GET /user`; its probe is its own repository
+    # list, which answers with the same core headers (#3711).
+    calls.clear()
+    app = Gh(token="token-c", authority="app:o").current_rate_limits()
+    assert ["api", "user"] not in calls
+    assert ["api", "installation/repositories?per_page=1"] in calls
+    assert app["core"].remaining == 40
+
 
 # --- authorization input ---
 

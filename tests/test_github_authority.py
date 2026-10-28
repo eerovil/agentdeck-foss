@@ -307,6 +307,19 @@ def test_the_permission_header_alone_never_blames_a_missing_permission(trace):
     assert github_authority.failure_hint(trace, _APP, "o/r") == ""
 
 
+def test_an_app_403_on_get_user_says_it_is_expected_and_nothing_else_failed():
+    # Reviewers read this 403 as a failed write and redid finished work (#3711).
+    trace = _trace("200 OK", body='{"id": 1}\n') + _trace(
+        "403 Forbidden",
+        body='{"message": "Resource not accessible by integration"}\n',
+        path="/user",
+    )
+    hint = github_authority.failure_hint(trace, _APP, "o/r")
+    assert "has no user" in hint and "app:o" in hint
+    assert "already went through still stands" in hint
+    assert "lacks a permission" not in hint
+
+
 def test_a_403_the_cached_token_already_covers_is_not_called_a_missing_permission(
     tmp_path, monkeypatch, app, key
 ):

@@ -285,8 +285,7 @@ def operator_attention(card: WorkCard, story: WorkStatus) -> OperatorAttention |
     ):
         # Its issue closed; only a person's Finish lets it go (#2510). With a pull request
         # still open, that pull request's state reads first (#3187).
-        merged = ", ".join(output.label for output in card.outputs if output.state == "merged")
-        return made(ISSUE_CLOSED, f"Merged {merged}" if merged else "", FINISH, ANSWER)
+        return made(ISSUE_CLOSED, "Merged" if _merged_any(card) else "", FINISH, ANSWER)
 
     waiting = waiting_attention(card)
 
@@ -344,8 +343,8 @@ def operator_attention(card: WorkCard, story: WorkStatus) -> OperatorAttention |
         return made(NEEDS_RETRY, verification.label, INSPECT)
     if ci_state(card.ci) == "failing":
         # Red CI on a head whose CI is its verification (#2364): the worker's repair to run.
-        failed = ", ".join(f"{c.label}@{c.head[:7]}" for c in card.ci if c.state == "failing")
-        return made(NEEDS_RETRY, f"CI failed on {failed}", INSPECT)
+        # The front page names no pull request (#3720); the Work page lists which failed.
+        return made(NEEDS_RETRY, "CI failed", INSPECT)
     if review is not None and review.state == REVIEW_PASSED and not verification_covers(
         verification, card.outputs, card.ci
     ):
@@ -364,7 +363,6 @@ def _derived(card: WorkCard, row_reason: str, made) -> OperatorAttention:
     every review by itself.
     """
     kind = card.derived.kind
-    merged = ", ".join(output.label for output in card.outputs if output.state == "merged")
     if kind in {"question", "review_escalated", "spec_wait"}:
         # The reviewer's escalation is a question for the owner too (#3216), and so is a
         # posted spec waiting for approval (#3247).
@@ -391,9 +389,10 @@ def _derived(card: WorkCard, row_reason: str, made) -> OperatorAttention:
     if kind == "stalled":
         return made(NEEDS_RETRY, row_reason, OPEN)
     if kind == "closed":
-        # With what the agent's live check found, which the status line carries (#3141).
-        live = card.derived.summary.partition(" · ")[2]
-        said = " · ".join(part for part in (f"Merged {merged}" if merged else "", live) if part)
+        # With what the agent's live check found, which the status line carries (#3141): its
+        # result words only, and no pull request names (#3720). The Work page has the note.
+        live = card.derived.summary.partition(" · ")[2].partition(": ")[0]
+        said = " · ".join(part for part in ("Merged" if _merged_any(card) else "", live) if part)
         return made(ISSUE_CLOSED, said, FINISH, ANSWER)
     if kind == "live_failed":
         # The merged change failed its live check (#3141): its agent reopens the issue, and
@@ -436,12 +435,16 @@ def _refused(card: WorkCard) -> str:
 
 def _unverified(card: WorkCard) -> str:
     """Why a clean review is not a merge yet: no green run covers its head (#2364)."""
-    heads = ", ".join(
-        f"{output.label}@{output.head[:7]}"
-        for output in _open_outputs(card)
-        if output.head
-    )
-    return f"Verification not run on {heads}" if heads else "Verification not run"
+    return "Verification not run"
+
+
+def _merged_any(card: WorkCard) -> bool:
+    return any(output.state == "merged" for output in card.outputs)
+
+
+def _pull_requests(count: int) -> str:
+    """``1 pull request`` or ``3 pull requests``: a card names none (#3720)."""
+    return f"{count} pull request" + ("" if count == 1 else "s")
 
 
 def _from_review(card: WorkCard, made, needs_more_info) -> OperatorAttention:
@@ -465,13 +468,13 @@ def _from_review(card: WorkCard, made, needs_more_info) -> OperatorAttention:
             return made(WORK_ERROR, reason, INSPECT)
         return _ask(card, card.work_state, made)
     if cause == CAUSE_MERGED_OPEN:
-        merged = ", ".join(output.label for output in card.outputs if output.state == "merged")
+        # The label says it merged; which pull requests is the Work page's (#3720).
         if card.resting in {"blocked", "needs_more_info"}:
             # Parked with a question the merge may have answered: the question still shows,
-            # second, and can still be answered (#2332).
-            asked = f"{merged}; asked: {card.question}" if card.question else merged
+            # and can still be answered (#2332).
+            asked = f"asked: {card.question}" if card.question else ""
             return made(MERGED_ISSUE_OPEN, asked, CLOSE, ANSWER)
-        return made(MERGED_ISSUE_OPEN, merged, CLOSE)
+        return made(MERGED_ISSUE_OPEN, "", CLOSE)
     if cause == CAUSE_CLOSED_UNMERGED:
         return made(CLOSED_UNMERGED, "", CLOSE)
     if cause == CAUSE_NOT_LANDED:
@@ -485,9 +488,12 @@ def _from_review(card: WorkCard, made, needs_more_info) -> OperatorAttention:
     if cause == CAUSE_CONFLICT:
         # Nothing can merge it until the base is brought in.
         conflicted = [output for output in _open_outputs(card) if conflicts(output)]
-        named = ", ".join(output.label for output in conflicted)
         base = next((output.base for output in conflicted if output.base), "its base branch")
-        return made(NEEDS_RETRY, f"{named} conflicts with {base}", REVIEW, INSPECT)
+        if len(conflicted) > 1:
+            said = f"{_pull_requests(len(conflicted))} conflict with {base}"
+        else:
+            said = f"Conflicts with {base}"
+        return made(NEEDS_RETRY, said, REVIEW, INSPECT)
     if cause == CAUSE_CHANGES_ASKED:
         return made(NEEDS_RETRY, review.label, INSPECT, REVIEW)
     if cause == CAUSE_HUMAN_REVIEW:
@@ -512,13 +518,12 @@ def _reviewer_reason(card: WorkCard, label: str) -> str:
     """One line for why the reviewer leaves a Work to a person, never the same label twice.
 
     One open output keeps the review's own label. With several, the ones not reviewed clean
-    are grouped by their label, and those that are reviewed clean are named after it.
+    are counted under their label, never named (#3720): the Work page lists which.
     """
     outputs = _open_outputs(card)
     if len(outputs) < 2:
         return label
     waiting = [output for output in outputs if not _clean_output(output)]
-    clean = [output.label for output in outputs if _clean_output(output)]
     if not waiting:
         # Every output is clean, but the card cannot take a merge (off the board, or in a
         # column the release does not accept): the review's own label says why.
@@ -528,14 +533,8 @@ def _reviewer_reason(card: WorkCard, label: str) -> str:
         for item in waiting
     ]
     if len(set(labels)) == 1:
-        reason = f"{labels[0]} on {_joined([item.label for item in waiting])}"
-    else:
-        reason = f"{waiting[0].label}: {labels[0]} (+{len(waiting) - 1} more)"
-    return f"{reason}; {_joined(clean)} reviewed clean" if clean else reason
-
-
-def _joined(names: list[str]) -> str:
-    return names[0] if len(names) == 1 else f"{', '.join(names[:-1])} and {names[-1]}"
+        return f"{labels[0]} on {len(waiting)} of {_pull_requests(len(outputs))}"
+    return f"{labels[0]} on 1 of {_pull_requests(len(outputs))} (+{len(waiting) - 1} more)"
 
 
 def _passed(head: str, passed: tuple[str, ...]) -> bool:

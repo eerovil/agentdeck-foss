@@ -128,6 +128,10 @@ def _speaker(environment: dict[str, str]) -> tuple[str, dict[str, object]]:
         "authority": authority,
         "credential": credential_identity(environment),
         "token_digest": hashlib.sha256(token.encode()).hexdigest()[:12] if token else "",
+        # Which copy of this code wrote the record: on 2026-10-27 entries only an older copy
+        # could write appeared, and nothing could say where it ran from (#3711).
+        "python": sys.executable,
+        "shim": str(Path(__file__).resolve()),
         **facts,
     }
     words = authority

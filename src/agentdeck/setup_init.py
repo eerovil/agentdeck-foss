@@ -22,6 +22,7 @@ in, and everything after it speaks as the App.
 from __future__ import annotations
 
 import argparse
+import base64
 import getpass
 import html
 import http.server
@@ -59,12 +60,13 @@ DEFAULT_REPO_NAME = "agent-tasks"
 _NAME = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$")
 _REPO = re.compile(r"^([A-Za-z0-9-]+)/([A-Za-z0-9._-]+)$")
 
-# What the deck's App may do: the list in docs/github-setup.md, step 1.
+# What the deck's App may do: the list in docs/github-setup.md, step 1. No `workflows`: with it an
+# agent could change a CI file on its own branch and run code with the repository's secrets, and
+# without it GitHub refuses any push that touches `.github/workflows` (#3623, owner's choice).
 APP_PERMISSIONS = {
     "contents": "write",
     "issues": "write",
     "pull_requests": "write",
-    "workflows": "write",
     "actions": "read",
     "checks": "read",
     "statuses": "read",
@@ -185,9 +187,13 @@ account = "{account}"
 
 
 def app_manifest(login: str, repo_url: str, redirect_url: str) -> dict:
-    """What GitHub's App-manifest flow creates: a private App with the deck's permissions."""
+    """What GitHub's App-manifest flow creates: a private App with the deck's permissions.
+
+    App names are unique across GitHub, so a short random tail keeps a second deck of the same
+    person (or a rerun after deleting an App) from landing on a taken name; GitHub caps it at 34.
+    """
     return {
-        "name": f"AgentDeck {login}"[:34],
+        "name": f"AgentDeck {login}"[:29] + f" {secrets.token_hex(2)}",
         "url": repo_url,
         "redirect_url": redirect_url,
         "public": False,
@@ -217,13 +223,9 @@ def creation_page(action: str, manifest: dict) -> str:
     )
 
 
-def tunnel_hint(port: int) -> str:
+def tunnel_command(port: int) -> str:
     """How a browser on another machine reaches a page this machine serves on 127.0.0.1."""
-    host = socket.gethostname()
-    return (
-        "If the person's browser is on another machine, they first run this there and keep "
-        f"it open: ssh -L {port}:127.0.0.1:{port} {getpass.getuser()}@{host}"
-    )
+    return f"ssh -L {port}:127.0.0.1:{port} {getpass.getuser()}@{socket.gethostname()}"
 
 
 def app_prompt(port: int, wait_minutes: float) -> str:
@@ -233,9 +235,11 @@ def app_prompt(port: int, wait_minutes: float) -> str:
     without one, the address the browser ended on finishes the step on a rerun.
     """
     return (
-        f"PERSON: Ask the person to open http://127.0.0.1:{port}/ and press "
-        "'Create GitHub App' on GitHub. "
-        f"{tunnel_hint(port)}\n"
+        "PERSON: Ask the person to open this link and press 'Create GitHub App' on GitHub. "
+        "If their browser is on another machine, they first run the TUNNEL command there and "
+        "keep it open.\n"
+        f"OPEN: http://127.0.0.1:{port}/\n"
+        f"TUNNEL: {tunnel_command(port)}\n"
         f"WAITING: up to {wait_minutes:g} minutes for GitHub to send the browser back here."
     )
 
@@ -309,6 +313,48 @@ def find_installation(app_id: int, pem: str, owner: str, opener: Opener | None =
     return 0
 
 
+def least_privilege_problems(
+    app_id: int, pem: str, installation_id: int, opener: Opener | None = None
+) -> list[tuple[str, str]]:
+    """What makes this App reach further than the deck needs: each fix, and its settings page.
+
+    The App must not hold ``workflows`` (an App created by hand, or before it was dropped, may),
+    and its installation must list the repositories it may use rather than take them all.
+    """
+    auth = f"Bearer {github_authority.app_jwt(app_id, pem)}"
+    problems = []
+    status, app = _call("GET", "/app", auth=auth, opener=opener)
+    if status != 200 or not isinstance(app, dict):
+        raise SetupError(f"could not read the App's permissions (HTTP {status})")
+    if (app.get("permissions") or {}).get("workflows"):
+        owner = app.get("owner") or {}
+        settings = (
+            f"https://github.com/organizations/{owner.get('login', '')}/settings"
+            if owner.get("type") == "Organization"
+            else "https://github.com/settings"
+        )
+        problems.append(
+            (
+                "set the App's Workflows permission to No access, so agents cannot change CI files",
+                f"{settings}/apps/{app.get('slug', '')}/permissions",
+            )
+        )
+    status, installation = _call(
+        "GET", f"/app/installations/{installation_id}", auth=auth, opener=opener
+    )
+    if status != 200 or not isinstance(installation, dict):
+        raise SetupError(f"could not read the App's installation (HTTP {status})")
+    if installation.get("repository_selection") != "selected":
+        problems.append(
+            (
+                "set the App's installation to 'Only select repositories' and pick only the "
+                "ones the deck should work on",
+                str(installation.get("html_url", "")),
+            )
+        )
+    return problems
+
+
 def owner_is_org(owner: str, opener: Opener | None = None) -> bool:
     status, body = _call("GET", f"/users/{owner}", opener=opener)
     if status != 200 or not isinstance(body, dict):
@@ -338,12 +384,14 @@ class Answers:
 
 
 class NeedsPerson(Exception):  # noqa: N818 — a stop, not an error
-    """A step only a person can do: what to ask them, and what to run once they have."""
+    """A step only a person can do: what to ask them, the links they open (each printed on a
+    line of its own, so an agent can pass it on as a link), and what to run once they have."""
 
-    def __init__(self, ask: str, then: str) -> None:
+    def __init__(self, ask: str, then: str, links: tuple[str, ...] = ()) -> None:
         super().__init__(ask)
         self.ask = ask
         self.then = then
+        self.links = links
 
 
 #: The exit code of a run that stopped at a person's step; 0 is done, 1 is a failure.
@@ -354,8 +402,9 @@ def _say(text: str) -> None:
     print(text, flush=True)
 
 
-def step_config(home: Path) -> str:
-    """Write the deck's config if there is none; return the account that runs the Works."""
+def step_config(home: Path) -> tuple[str, str, str]:
+    """Write the deck's config if there is none; return the account that runs the Works, as
+    its key, provider and folder."""
     from .config import config_path, load_config
 
     path = config_path()
@@ -370,7 +419,8 @@ def step_config(home: Path) -> str:
         configured = loaded.accounts
         if not configured:
             raise SetupError(f"{path} lists no [[accounts]]; add your Claude Code or Codex folder")
-        return f"{configured[0].provider}:{configured[0].label}"
+        first = configured[0]
+        return f"{first.provider}:{first.label}", first.provider, first.config_dir
     accounts = detected_accounts(home)
     if not accounts:
         raise SetupError(
@@ -379,7 +429,8 @@ def step_config(home: Path) -> str:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(config_text((REPO / "config.example.toml").read_text(), accounts))
     _say(f"✓ wrote {path} with {', '.join(f'{p}:{label}' for p, label, _ in accounts)}")
-    return f"{accounts[0][0]}:{accounts[0][1]}"
+    provider, label, folder = accounts[0]
+    return f"{provider}:{label}", provider, folder
 
 
 def new_repository_link(answers: Answers) -> str:
@@ -393,7 +444,9 @@ def step_repository(answers: Answers) -> bool:
     """Create the repository with ``gh`` when it is logged in; ``False`` when that could not
     be done here, so the person is asked to create it with the App's install."""
     gh = shutil.which("gh")
-    if not gh or subprocess.run([gh, "auth", "status"], capture_output=True).returncode != 0:
+    # `gh api user` asks as the active account only; `gh auth status` fails when any stored
+    # account is broken, even an unused one (agentdeck-foss#1).
+    if not gh or subprocess.run([gh, "api", "user"], capture_output=True).returncode != 0:
         return False
     if subprocess.run([gh, "repo", "view", answers.full], capture_output=True).returncode == 0:
         _say(f"✓ {answers.full} exists.")
@@ -447,13 +500,14 @@ def step_app(answers: Answers, *, repository_ready: bool) -> github_authority.Ap
         create = (
             ""
             if repository_ready
-            else f"create the private repository {answers.full} with a README "
-            f"({new_repository_link(answers)}), then "
+            else f"create the private repository {answers.full} (first link), then "
         )
+        install = f"https://github.com/apps/{app.slug}/installations/new"
         raise NeedsPerson(
             f"Ask the person to {create}install the deck's GitHub App on {answers.owner}, "
-            f"giving it {answers.full}: https://github.com/apps/{app.slug}/installations/new",
+            f"choosing 'Only select repositories' and picking {answers.full}.",
             answers.command(),
+            (install,) if repository_ready else (new_repository_link(answers), install),
         )
     if path.exists():
         raise SetupError(
@@ -532,17 +586,26 @@ def _wait_for_code(answers: Answers, pending: Path) -> str:
     if not received:
         raise NeedsPerson(
             "Ask the person for the address their browser ended on after pressing "
-            "'Create GitHub App' (a page that did not load, starting http://127.0.0.1:)",
+            "'Create GitHub App': a page that did not load, whose address starts "
+            "http://127.0.0.1:",
             answers.command(app_code=True),
         )
     return code_from(received["url"], state)
 
 
 def step_access(answers: Answers, app: github_authority.AppConfig) -> None:
-    """The App can read the repository: it exists and the installation was given it."""
-    token, _ = github_authority.mint_installation_token(
-        app, app.installations[answers.owner.lower()]
-    )
+    """The App reaches no further than it needs, and it can read the repository: it exists
+    and the installation was given it."""
+    installation = app.installations[answers.owner.lower()]
+    pem = Path(app.private_key_file).expanduser().read_text()
+    problems = least_privilege_problems(app.app_id, pem, installation)
+    if problems:
+        raise NeedsPerson(
+            "Ask the person to " + "; and to ".join(text for text, _ in problems) + ".",
+            answers.command(),
+            tuple(link for _, link in problems),
+        )
+    token, _ = github_authority.mint_installation_token(app, installation)
     status, _ = _call("GET", f"/repos/{answers.full}", auth=f"Bearer {token}")
     if status == 200:
         # GitHub answers 409 for the commits of an empty repository.
@@ -550,17 +613,65 @@ def step_access(answers: Answers, app: github_authority.AppConfig) -> None:
             "GET", f"/repos/{answers.full}/commits?per_page=1", auth=f"Bearer {token}"
         )
         if commits == 409:
-            raise NeedsPerson(
-                f"Ask the person to add a README to {answers.full} on GitHub (it is empty, and "
-                "agents need a first commit to branch from)",
-                answers.command(),
-            )
+            _first_commit(answers, token)
         return
     raise NeedsPerson(
-        f"Ask the person to create the private repository {answers.full} with a README "
-        f"({new_repository_link(answers)}) if it does not exist, and to give the deck's App "
-        f"access to it: https://github.com/apps/{app.slug}/installations/new",
+        f"Ask the person to create the private repository {answers.full} (first link) if it "
+        "does not exist, and to give the deck's App access to it (second link).",
         answers.command(),
+        (new_repository_link(answers), f"https://github.com/apps/{app.slug}/installations/new"),
+    )
+
+
+def _first_commit(answers: Answers, token: str) -> None:
+    """An empty repository has nothing for an agent to branch from: write its README as the
+    App, rather than send the person back to GitHub for it (agentdeck-foss#1)."""
+    readme = f"# {answers.repo}\n\nTasks for my AgentDeck agents.\n"
+    status, body = _call(
+        "PUT",
+        f"/repos/{answers.full}/contents/README.md",
+        auth=f"Bearer {token}",
+        body={
+            "message": "Add a README",
+            "content": base64.b64encode(readme.encode()).decode(),
+        },
+    )
+    if status not in (200, 201):
+        said = body.get("message") if isinstance(body, dict) else ""
+        raise SetupError(
+            f"{answers.full} is empty and its README could not be written ({status}: {said})"
+        )
+    _say(f"✓ {answers.full} was empty: added a README as its first commit.")
+
+
+def step_claude_login(provider: str, config_dir: str, then: str) -> None:
+    """The deck's Claude agents can log in: asked exactly as a worker would be asked.
+
+    On macOS a person can be logged in to ``claude`` while every process with
+    ``CLAUDE_CONFIG_DIR`` set reads as logged out (``claude_env``); this asks with the
+    environment the deck's own agents get, so setup never ends on a deck that cannot start one.
+    """
+    if provider != "claude_code":
+        return
+    from . import claude_env
+    from .providers.claude_code import auth
+
+    root = Path(config_dir).expanduser()
+    status = auth.read_status(root)
+    if status.logged_in:
+        _say("✓ Claude Code is logged in for the deck's agents.")
+        return
+    if status.logged_in is None:
+        raise SetupError(f"could not ask Claude Code whether it is logged in: {status.detail}")
+    login = (
+        "claude auth login"
+        if claude_env.uses_default_login(root)
+        else f"CLAUDE_CONFIG_DIR={config_dir} claude auth login"
+    )
+    raise NeedsPerson(
+        "Ask the person to log Claude Code in for the deck's agents: in a terminal on this "
+        f"machine, run `{login}` and follow it.",
+        then,
     )
 
 
@@ -700,7 +811,8 @@ def run(argv: list[str]) -> int:
         if not match:
             raise SetupError(f"{chosen!r} is not owner/name")
         answers = Answers(args.login, match[1], match[2], args.app_code, args.wait_minutes)
-        account = step_config(home)
+        account, provider, config_dir = step_config(home)
+        step_claude_login(provider, config_dir, answers.command())
         ready = step_repository(answers)
         app = step_app(answers, repository_ready=ready)
         step_access(answers, app)
@@ -708,16 +820,26 @@ def run(argv: list[str]) -> int:
         instance_id = step_project(answers, checkout, account)
         step_services(instance_id)
     except NeedsPerson as stop:
-        _say(f"PERSON: {stop.ask}\nTHEN: {stop.then}")
+        _say(
+            "\n".join(
+                [
+                    f"PERSON: {stop.ask}",
+                    *(f"OPEN: {link}" for link in stop.links),
+                    f"THEN: {stop.then}",
+                ]
+            )
+        )
         return NEEDS_PERSON
     except (SetupError, github_authority.Refusal) as exc:
         _say(f"FAILED: {exc}\nFinished steps are kept; fix that and run the same command again.")
         return 1
     _say(
-        f"DONE: tell the person to open http://127.0.0.1:8756/ , press New work, pick "
-        f"{answers.full} and write for example 'Add a hello-world script that prints Hello, "
-        "world'. An agent starts on it at once and opens a pull request; they press Merge on "
-        f"its Work page.\n{tunnel_hint(8756)}"
+        f"DONE: tell the person to open the deck, press New work, pick {answers.full} and "
+        "write for example 'Add a hello-world script that prints Hello, world'. An agent starts "
+        "on it at once and opens a pull request; they press Merge on its Work page. If their "
+        "browser is on another machine, they first run the TUNNEL command there.\n"
+        "OPEN: http://127.0.0.1:8756/\n"
+        f"TUNNEL: {tunnel_command(8756)}"
     )
     return 0
 

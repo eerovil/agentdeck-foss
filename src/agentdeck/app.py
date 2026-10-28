@@ -17,6 +17,7 @@ from fastapi.templating import Jinja2Templates
 from jinja2 import BytecodeCache
 
 from . import (
+    agent_review,
     github_suspension,
     live_chats,
     mac_runner,
@@ -432,9 +433,38 @@ def create_app(config: AppConfig) -> FastAPI:
     # reviewer's verdict, and a registered pull request ready at a new head (which starts the
     # reviewer). Only for projects whose manifest sets `works_router`; the rest keep their
     # Poller. Messages ride the scheduled-message path under the delivery's own id.
+    # Who reviews a Work's new ready head (#3640): a ChatGPT review chat, or a deck-started
+    # Claude or Codex reviewer in a throwaway checkout of the head.
+    work_reviewer = agent_review.effective(
+        config.review.reviewer, review_chats=review_refs.reviewer_available()
+    )
+    agent_reviewer = (
+        agent_review.AgentReviewer(
+            kind=work_reviewer,
+            max_reviewers=config.review.max_reviewers,
+            ledger=config.review.ledger_path,
+            digest=review_refs.target_digest,
+            **agent_review.deck_hooks(
+                config,
+                injector=injector,
+                state=state,
+                accounts=config.build_accounts(),
+                providers=PROVIDERS,
+            ),
+        )
+        if work_reviewer in agent_review.PROVIDERS
+        else None
+    )
+
     async def start_work_review(
         pull: str, work: str, *, note: str = "", again: bool = False
     ) -> object:
+        if agent_reviewer is not None:
+            return await agent_reviewer.start(pull, work, note=note, again=again)
+        if work_reviewer == agent_review.OFF:
+            raise review_refs.ReviewError(
+                "this deck has no Work reviewer ([review] reviewer is off); press Merge instead"
+            )
         from .web.routes_chat_board import note_review_head, request_review
 
         outcome = await request_review(
@@ -651,7 +681,7 @@ def create_app(config: AppConfig) -> FastAPI:
             Path(config.github_webhook.path).expanduser().parent / work_release.STORE_FILENAME
         ),
         work_release.Ports(
-            press_is_review=not review_refs.reviewer_available(),
+            press_is_review=work_reviewer == agent_review.OFF,
             switched=switched_repositories,
             paused=release_paused,
             starred=work_starred,

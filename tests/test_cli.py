@@ -43,6 +43,7 @@ class _Response:
     def __init__(self, payload, status_code=200):
         self.payload = payload
         self.status_code = status_code
+        self.text = str(payload)
 
     def raise_for_status(self):
         if self.status_code >= 400:
@@ -249,6 +250,24 @@ def test_delegate_cli_reports_server_side_failure(tmp_path, monkeypatch, capsys)
     captured = capsys.readouterr()
     assert raised.value.code == 1
     assert "AgentDeck delegation failed: runtime disconnected" in captured.err
+
+
+def test_delegate_cli_prints_the_decks_reason_for_a_refusal(tmp_path, monkeypatch, capsys):
+    # httpx's own message drops the deck's detail, so reviewers retried blind (#3711).
+    reason = "refusing to delegate into the live deploy checkout — pass --cwd a worktree"
+
+    class RefusingClient(_Client):
+        def post(self, url, *, json, timeout):
+            return _Response({"detail": reason}, status_code=422)
+
+    monkeypatch.setattr(cli.httpx, "Client", lambda **kwargs: RefusingClient())
+    monkeypatch.setattr(cli.sys, "stdin", io.StringIO("Inspect the change.\n"))
+
+    with pytest.raises(SystemExit) as raised:
+        cli._delegate(["--cwd", str(tmp_path)])
+
+    assert raised.value.code == 1
+    assert f"AgentDeck delegation refused (HTTP 422): {reason}" in capsys.readouterr().err
 
 
 def test_delegate_cli_expired_budget_identifies_live_job(

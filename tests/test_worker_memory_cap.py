@@ -10,8 +10,10 @@ instead of leaving it looking mysteriously stalled.
 from __future__ import annotations
 
 import asyncio
+import os
 import shutil
 import subprocess
+import sys
 
 import pytest
 from worker_harness import claude_host as _host
@@ -262,8 +264,55 @@ def _systemd_scopes_work() -> bool:
         return False
 
 
-@pytest.mark.skipif(
+_REAL_SCOPES = pytest.mark.skipif(
     not _systemd_scopes_work(), reason="host has no usable `systemd-run --user`"
+)
+
+# What a process inside the scope reads back from its own cgroup: the path,
+# then the memory and swap limits the kernel will enforce on it.
+_READ_OWN_LIMITS = """
+import pathlib
+path = pathlib.Path("/proc/self/cgroup").read_text().strip().rsplit(":", 1)[-1]
+cgroup = pathlib.Path("/sys/fs/cgroup" + path)
+print(path)
+print((cgroup / "memory.max").read_text().strip())
+print((cgroup / "memory.swap.max").read_text().strip())
+"""
+
+
+@_REAL_SCOPES
+@pytest.mark.asyncio
+async def test_a_real_scope_carries_the_cap_and_no_swap():
+    """The cap against real systemd, without killing anything (#3717).
+
+    The kernel enforces exactly these two numbers on the cgroup, so reading
+    them back from inside proves the cap is in force. Triggering it here would
+    pop a KDE "Memory Shortage Avoided" notification on the owner's desktop
+    for every test run; the kill itself is the opt-in test below.
+    """
+    unit = worker_limits.scope_unit("test", "cap-readback")
+    process = await asyncio.create_subprocess_exec(
+        *worker_limits.scope_prefix(unit, "64M"),
+        sys.executable,
+        "-c",
+        _READ_OWN_LIMITS,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    out, _ = await asyncio.wait_for(process.communicate(), timeout=30)
+
+    assert process.returncode == 0
+    path, memory_max, swap_max = out.decode().split()
+    assert path.endswith("/" + unit)  # a scope of its own, not the runtime's
+    assert memory_max == str(64 * 1024 * 1024)
+    assert swap_max == "0"
+
+
+@_REAL_SCOPES
+@pytest.mark.skipif(
+    os.environ.get("AGENTDECK_REAL_OOM_TEST") != "1",
+    reason="kills a real process; KDE turns that into a desktop popup (#3717). "
+    "AGENTDECK_REAL_OOM_TEST=1 runs it",
 )
 @pytest.mark.asyncio
 async def test_a_runaway_process_is_killed_alone_and_names_itself():
@@ -271,7 +320,9 @@ async def test_a_runaway_process_is_killed_alone_and_names_itself():
 
     A child that allocates past its cap dies; we are still here to observe it,
     and the scope says *why* — which no exit code can, since an ordinary
-    `kill -9` produces exactly the same `-9`.
+    `kill -9` produces exactly the same `-9`. Opt-in: every real OOM kill in a
+    user unit shows as a KDE notification, and the per-change suite runs on
+    the owner's desktop several times an hour.
     """
     unit = worker_limits.scope_unit("test", "runaway")
     process = await asyncio.create_subprocess_exec(

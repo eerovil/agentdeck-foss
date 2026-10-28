@@ -185,7 +185,7 @@ def test_the_board_names_every_pull_request_a_card_has(board):
         (
             "issues#6",
             {_pull("store", 3402): _row(merged=True)},
-            f"Merged {ORG}/store#3402; the issue is still open",
+            "Merged; the issue is still open",
         ),
     ],
 )
@@ -340,7 +340,7 @@ def test_an_issue_closed_after_the_engine_last_looked_finishes_the_work():
 # --- finished Works: counted right, and saying "Merged" ----------------------------------------
 
 
-def test_a_finished_row_says_which_pull_request_merged_and_the_work_page_agrees():
+def test_a_finished_row_says_merged_and_the_work_page_names_the_pull_request():
     card = BoardCard(
         "eerovil/agentdeck", 2224, status="Done", done=True,
         pull_request_url="https://github.com/eerovil/agentdeck/pull/2225",
@@ -351,7 +351,7 @@ def test_a_finished_row_says_which_pull_request_merged_and_the_work_page_agrees(
         ref, issue=None, title="t", facts=work_facts(ref, card=card, record=CLOSED, rows=rows)
     )
 
-    assert front_row(work, current=False).reason == "Merged eerovil/agentdeck#2225"
+    assert front_row(work, current=False).reason == "Merged"
     story = work_status(work)
     assert story.detail == "Merged eerovil/agentdeck#2225."
     assert [step.note for step in story.milestones if step.key == "merge"] == ["Merged"]
@@ -593,7 +593,7 @@ def test_a_finished_row_whose_card_is_gone_says_merged_from_its_chats_pull_reque
     assert facts.outputs[0].found_by == FOUND_BY_CHAT
     facts = work_facts(ref, record=CLOSED, rows=rows, registered=shared[:2])
     work = build_work_card(ref, issue=None, title="t", facts=facts)
-    assert front_row(work, current=False).reason == "Merged eerovil/agentdeck#2221"
+    assert front_row(work, current=False).reason == "Merged"
     assert work_status(work).detail == "Merged eerovil/agentdeck#2221."
     # A pull request in another repository never counts by branch alone.
     assert work_facts(WorkRef("eerovil/other", 2207), rows=rows, registered=shared).outputs == ()
@@ -765,7 +765,7 @@ def test_a_work_finished_by_a_merged_pull_request_reads_merged_on_both_pages(tmp
 
     _agree(front, page)
     assert front.work_state == "done"
-    assert front_row(front, current=False).reason == "Merged eerovil/agentdeck#2221"
+    assert front_row(front, current=False).reason == "Merged"
     assert work_status(page).detail == "Merged eerovil/agentdeck#2221."
 
 
@@ -788,7 +788,7 @@ def test_a_merged_pull_request_in_another_repository_finishes_its_issue_on_both_
     front, page = _both_pages(app, ref)
 
     _agree(front, page)
-    assert front_row(front, current=False).reason == f"Merged {ORG}/store#3366"
+    assert front_row(front, current=False).reason == "Merged"
 
     # The same chat serving another Work as well cannot say which one store#3366 was for.
     _add(app, chat, ref, WorkRef(f"{ORG}/issues", 999))

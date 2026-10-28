@@ -17,8 +17,9 @@ on it and opens a pull request.
 - `git`, Python 3.12 or newer, and [uv](https://docs.astral.sh/uv/) (uv can fetch the
   Python). Install uv with the person's agreement if it is missing; on macOS `brew install uv`
   or the installer on uv's page. On macOS, `git` comes with the Xcode command line tools.
-- Claude Code or the Codex CLI logged in: `~/.claude` or `~/.codex` exists. The deck's agents
-  use that account and its usage limits.
+- Claude Code or the Codex CLI logged in. The deck's agents use that account and its usage
+  limits. The setup command checks Claude's login the way the deck's agents will see it (on
+  macOS that differs from a folder merely existing) and asks the person to log in if needed.
 
 ## 2. Ask the person one thing
 
@@ -45,22 +46,29 @@ It never prompts. Each run does every step it can, keeps what is done, and ends 
 
 | Exit | Last lines | What you do |
 | --- | --- | --- |
-| 0 | `DONE: …` | Tell the person what the line says. Setup is finished. |
-| 3 | `PERSON: …` then `THEN: …` | Tell the person exactly what `PERSON:` asks, wait until they say it is done, then run the `THEN:` command. |
+| 0 | `DONE: …` | Tell the person what the line says, with its `OPEN:` link. Setup is finished. |
+| 3 | `PERSON: …`, any `OPEN: …`, then `THEN: …` | Tell the person exactly what `PERSON:` asks, wait until they say it is done, then run the `THEN:` command. |
 | 1 | `FAILED: …` | Fix what it names (or tell the person if it needs them), then run the same command again. |
+
+**Pass on every `OPEN:` line as a link of its own**, one per line, written as a Markdown link
+(`[Create the App](http://127.0.0.1:…/)`) so it can be clicked; never bury it inside a
+sentence. Pass a `TUNNEL:` line as a command in a code block.
 
 **Run it in the background and read its output as it goes.** When it creates the deck's
 GitHub App it prints a `PERSON:` line with a local link and then *waits* (up to 15 minutes)
-for the person to press **Create GitHub App** on GitHub, so you must pass that line on while
-it is still running. If the person's browser is on another machine, the line includes the
-`ssh -L …` command they run there first.
+for the person to press **Create GitHub App** on GitHub, so you must pass that line and its
+`OPEN:` link on while it is still running. If the person's browser is on another machine, they
+first run the `TUNNEL:` command there.
 
 If the wait ends first, or GitHub leaves the browser on a page that does not load, the run
 exits 3 asking for the address that page shows; pass it with `--app-code '<address>'` as the
 `THEN:` line says.
 
-Other person steps it may stop at: creating the repository on GitHub (when `gh` is not
-logged in here) and installing the App on the account with that repository.
+Other person steps it may stop at: logging Claude Code in for the deck's agents, creating the
+repository on GitHub (when `gh` is not logged in here; an empty repository gets its README from
+the setup itself) and installing the App on the account with that repository, choosing
+**Only select repositories**. It also stops if the App could change CI files or was given every
+repository, and says what the person should change.
 
 ## 5. Hand over
 

@@ -288,6 +288,42 @@ def test_merge_outcome_and_same_commit():
     assert not same_commit("", HEAD[:7])
 
 
+def test_merge_asks_github_through_the_api_so_a_ruleset_bypass_counts(monkeypatch):
+    """``gh pr merge`` refuses a BLOCKED pull request before asking GitHub (#3728)."""
+    from agentdeck import gh_cli, work_release
+
+    calls: list[list[str]] = []
+    pull = {"merged": False, "ref": "agent/x", "repo": "EeroVil/AgentDeck"}
+
+    async def read(argv, **_kw):
+        calls.append(list(argv))
+        return 0, json.dumps(pull).encode()
+
+    async def write(argv, **_kw):
+        calls.append(list(argv))
+        return 0, b"{}", b""
+
+    monkeypatch.setattr(gh_cli, "run", read)
+    monkeypatch.setattr(gh_cli, "run_once", write)
+    assert asyncio.run(work_release.merge(PR, "squash", HEAD))[0] == MERGED
+    assert not any("pr" in argv for argv in calls)
+    assert calls[1] == [
+        "gh", "api", "-X", "PUT", "repos/eerovil/agentdeck/pulls/9/merge",
+        "-f", "merge_method=squash", "-f", f"sha={HEAD}",
+    ]  # fmt: skip
+    assert calls[2][-1] == "repos/eerovil/agentdeck/git/refs/heads/agent/x"
+
+    # A fork's branch is not ours to delete; an already merged pull request is not merged again.
+    calls.clear()
+    pull["repo"] = "someone/agentdeck"
+    assert asyncio.run(work_release.merge(PR, "merge", HEAD))[0] == MERGED
+    assert len(calls) == 2
+    calls.clear()
+    pull["merged"] = True
+    assert asyncio.run(work_release.merge(PR, "merge", HEAD))[0] == ALREADY_MERGED
+    assert len(calls) == 1
+
+
 def test_release_policies_come_from_switched_manifests(tmp_path):
     path = tmp_path / "instances" / "agentdeck" / "poller.toml"
     path.parent.mkdir(parents=True)

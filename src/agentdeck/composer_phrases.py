@@ -6,10 +6,12 @@ steering nudges rather than new instructions — the transcripts are full of
 also the messages agents most often misread: "ok" alone does not say whether to
 implement, report, or stop.
 
-So the button's label stays as short as the word people would have typed, while
-the text it actually sends spells the intent out. Keep this list short and
-provider-neutral: it is a steering vocabulary, not a command palette (the
-composer's slash/skill autocomplete already covers those).
+So the button's label stays as short as the word people would have typed. The
+built-ins are the owner's own set, used daily (#3623, owner's choice): some spell
+the intent out, and a few ("Continue", "Try again") send the word itself, because
+in a Work's chat the agent already knows what it was doing. Keep the list short:
+it is a steering vocabulary, not a command palette (the composer's slash/skill
+autocomplete already covers those).
 
 What ships here is the *starting* vocabulary: `/settings` edits the list, and a
 saved set replaces the built-ins whole (#743). Saving an empty set is refused so
@@ -30,45 +32,20 @@ class ComposerPhrase:
 
 
 DEFAULT_COMPOSER_PHRASES: tuple[ComposerPhrase, ...] = (
+    ComposerPhrase("Status", "Status check"),
+    ComposerPhrase("Progress", "Can we make this progress? Ask me questions if you have any."),
+    ComposerPhrase("Continue", "Continue"),
+    ComposerPhrase("Bullets", "Post bullets points on what you have done or decided"),
     ComposerPhrase(
-        "Status",
-        "Status check, no new work: in a few sentences tell me what you have "
-        "finished, what you are doing right now, and what is still left.",
+        "Ask",
+        "Ask me here. Give full briefing on related facts, I don't remember anything from "
+        "codebase or past issues.",
     ),
+    ComposerPhrase("Try again", "Try again"),
     ComposerPhrase(
-        "Go ahead",
-        "Yes, go ahead with that. Implement it fully, verify it yourself, and "
-        "report back when it is done — don't stop to confirm each step.",
+        "Good spec", "I approve the spec. Remove possible spec-only label and start implementing."
     ),
-    ComposerPhrase(
-        "Continue",
-        "Continue from where you left off and finish the remaining work.",
-    ),
-    ComposerPhrase(
-        "Explain",
-        "Explain what you just did and why, in plain language. Don't change any "
-        "code while answering this.",
-    ),
-    ComposerPhrase(
-        "Test it",
-        "Run the relevant tests now and show me the real output. Report any "
-        "failure verbatim instead of summarizing it.",
-    ),
-    ComposerPhrase(
-        "Try again",
-        "That didn't work. Find the actual cause before changing anything, then "
-        "take a different approach and tell me what you changed.",
-    ),
-    ComposerPhrase(
-        "Push & PR",
-        "Commit what you have, push the branch, and open a pull request "
-        "describing the change. Never push to the main branch directly.",
-    ),
-    ComposerPhrase(
-        "Wrap up",
-        "Finish what is in flight and then stop. Summarize the outcome, what is "
-        "left undone, and anything I need to decide.",
-    ),
+    ComposerPhrase("Review", "Run review-fix-pr. If you only have a spec, run it on the spec."),
 )
 
 # A chip has to stay thumb-sized on a phone, so the label is capped hard; the
@@ -116,21 +93,15 @@ def normalize_composer_phrases(
             )
         phrases.append(ComposerPhrase(label, text))
     if not phrases:
-        raise ComposerPhraseError(
-            "Keep at least one phrase, or press Reset to defaults."
-        )
+        raise ComposerPhraseError("Keep at least one phrase, or press Reset to defaults.")
     if len(phrases) > MAX_PHRASES:
         raise ComposerPhraseError(
             f"That is {len(phrases)} phrases; keep it to {MAX_PHRASES} or fewer."
         )
     folded = [phrase.label.casefold() for phrase in phrases]
-    duplicate = next(
-        (label for label in folded if folded.count(label) > 1), None
-    )
+    duplicate = next((label for label in folded if folded.count(label) > 1), None)
     if duplicate is not None:
-        raise ComposerPhraseError(
-            "Two phrases share a label; each chip needs its own."
-        )
+        raise ComposerPhraseError("Two phrases share a label; each chip needs its own.")
     return tuple(phrases)
 
 

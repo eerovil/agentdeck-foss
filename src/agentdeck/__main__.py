@@ -1425,6 +1425,18 @@ def _delegate(argv: list[str]) -> None:
                 json=payload,
                 timeout=post_timeout,
             )
+            if 400 <= response.status_code < 500:
+                # The deck's reason is the only actionable part of a refusal; httpx's own
+                # message drops it, and reviewer chats retried blind (#3711).
+                detail = response.text
+                try:
+                    detail = response.json().get("detail", detail)
+                except (ValueError, AttributeError):
+                    pass
+                parser.exit(
+                    1,
+                    f"AgentDeck delegation refused (HTTP {response.status_code}): {detail}\n",
+                )
             response.raise_for_status()
             started = response.json()
             # A server that predates the field says nothing about parentage, so

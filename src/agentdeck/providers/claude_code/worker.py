@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from ... import classifier_grants, gh_shim, github_identity, worker_limits
+from ... import classifier_grants, claude_env, gh_shim, github_identity, worker_limits
 from ...chat_cwd import continued_chat_cwd, cwd_exists
 from ...command_artifacts import (
     ACCOUNT_KEY_ENV,
@@ -3615,7 +3615,7 @@ class ClaudeWorkerHost:
         # this spawn is entitled to.
         env.pop("AGENTDECK_URL", None)
         env.pop("AGENTDECK_SESSION_KEY", None)
-        env["CLAUDE_CONFIG_DIR"] = str(self.account.root)
+        claude_env.point_at(env, self.account.root)  # macOS keeps ~/.claude unset
         env["AGENTDECK_GH_CONSUMER"] = f"{self.account.key}:{key}"
         env[CONTEXT_DIR_ENV] = str(self._artifact_root)
         env[ACCOUNT_KEY_ENV] = self.account.key

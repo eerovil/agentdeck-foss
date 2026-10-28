@@ -538,15 +538,16 @@ def test_a_clean_work_is_never_offered_merge(tmp_path):
 @pytest.mark.parametrize(
     ("reviewer", "reason"),
     [
-        # issues#434: two outputs stalled on the same words read them once, naming both.
+        # issues#434: two outputs stalled on the same words read them once, counting both;
+        # a card names no pull request (#3720).
         (_reviewer(stalled={KEY: UP_TO_DATE, KEY2: UP_TO_DATE}),
-         f"Not merged: {UP_TO_DATE} on {KEY} and {KEY2}"),
+         f"Not merged: {UP_TO_DATE} on 2 of 2 pull requests"),
         (_reviewer([KEY2], stalled={KEY: UP_TO_DATE, KEY2: UP_TO_DATE}),
-         f"Not merged: {UP_TO_DATE} on {KEY}; {KEY2} reviewed clean"),
+         f"Not merged: {UP_TO_DATE} on 1 of 2 pull requests"),
         (_reviewer(stalled={KEY: UP_TO_DATE}),
-         f"{KEY}: Not merged: {UP_TO_DATE} (+1 more)"),
-        (_reviewer([KEY]), f"Reviewed at {HEAD[:7]}; ready for a person to decide on {KEY2}; "
-                           f"{KEY} reviewed clean"),
+         f"Not merged: {UP_TO_DATE} on 1 of 2 pull requests (+1 more)"),
+        (_reviewer([KEY]),
+         f"Reviewed at {HEAD[:7]}; ready for a person to decide on 1 of 2 pull requests"),
     ],
     ids=["same-stalled-label", "one-clean", "different-labels", "one-clean-one-reviewed"],
 )
@@ -556,6 +557,7 @@ def test_several_outputs_waiting_on_the_reviewer_read_as_one_line(tmp_path, revi
     found = operator_attention(work, work_status(work))
 
     assert (found.category, found.reason) == (NEEDS_REVIEW, reason)
+    assert "#" not in found.reason
     # The review's own label, which the technical story reads, is untouched.
     assert work.review.label != reason
 
@@ -910,7 +912,7 @@ def test_a_red_run_on_an_old_head_is_not_a_failure_of_the_new_one(tmp_path):
     assert steps["verify"] == ("attention", "Not run; ask for it")
     found = operator_attention(work, story)
     assert (found.category, found.reason, found.actions) == (
-        NEEDS_RETRY, f"Verification not run on {ORG}/agentdeck#7@{HEAD[:7]}",
+        NEEDS_RETRY, "Verification not run",
         ("inspect", "hide"),
     )
 
@@ -935,7 +937,7 @@ def test_a_red_run_on_the_current_head_still_decides_a_job_verified_work(tmp_pat
         (_ci("green"), "Ready for you to merge", READY_FOR_MERGE,
          "Clean review at the current head; merge it on GitHub"),
         (_ci("failing"), "Verification failed", NEEDS_RETRY,
-         f"CI failed on {ORG}/agentdeck#7@{HEAD[:7]}"),
+         "CI failed"),
         # CI has not answered for this head: the worker's red suite is all there is to go on.
         (_ci("none"), "Verification failed", NEEDS_RETRY,
          f"Verification failed on {ORG}/agentdeck@{HEAD[:7]}"),
@@ -998,7 +1000,7 @@ def test_a_clean_review_no_green_run_covers_is_never_ready_for_merge(
     found = operator_attention(work, story)
     assert (found.category if found else None) == attention
     if found is not None:
-        assert found.reason == f"Verification not run on {ORG}/agentdeck#7@{HEAD[:7]}"
+        assert found.reason == "Verification not run"
         assert "merge" not in found.actions
 
 
@@ -1760,7 +1762,7 @@ def test_a_merged_card_the_engine_is_deploying_says_deploying_whatever_the_revie
     steps = {step.key: step.note for step in story.milestones}
 
     assert (story.headline, story.summary, story.next) == (
-        "Deploying", f"Merged {ORG}/agentdeck#7.", "deploy"
+        "Deploying", "Merged.", "deploy"
     )
     assert steps["merge"] == "Merged"
     assert work.last_activity is not None and work.last_activity.isoformat() == AT
@@ -1803,15 +1805,15 @@ def test_a_parked_card_whose_work_merged_says_so_and_keeps_its_question(tmp_path
 
     found = operator_attention(work, work_status(work))
 
-    assert found.reason == f"{KEY}; asked: Narrow the branch, or rewrite it?"
-    assert work.review.label == f"Merged {KEY}; the issue is still open"
+    assert found.reason == "asked: Narrow the branch, or rewrite it?"
+    assert work.review.label == "Merged; the issue is still open"
 
 
-def test_a_conflicting_head_names_the_pull_request_and_its_base(tmp_path):
+def test_a_conflicting_head_names_its_base(tmp_path):
     work = _work(tmp_path, _record("In review"), reviewer=_reviewer([KEY]), checks=DIRTY)
     story = work_status(work)
 
-    assert operator_attention(work, story).reason == f"{KEY} conflicts with master"
+    assert operator_attention(work, story).reason == "Conflicts with master"
     assert work.review.label == f"Reviewed clean at {HEAD[:7]}, but it conflicts with master"
     assert (story.headline, story.you) == ("Conflicts with its base", "Ask for a rebase")
 
@@ -1899,7 +1901,7 @@ def test_red_ci_is_the_workers_repair(tmp_path):
     work = _work(tmp_path, _record("In review"), reviewer=_reviewer([KEY]), ci=_ci("failing"))
 
     found = operator_attention(work, work_status(work))
-    assert found.reason == f"CI failed on {ORG}/agentdeck#7@{HEAD[:7]}"
+    assert found.reason == "CI failed"
     assert found.actions == ("inspect", "hide")
 
 
@@ -1928,5 +1930,5 @@ def test_a_merged_completion_beside_a_step_still_asks_to_close(tmp_path):
     record = _record("In review", steps_merged=["other#3"])
     work = _work(tmp_path, record, rows={PR.lower(): _row("merged")})
 
-    assert work.review.label == f"Merged {KEY}, {KEY2}; the issue is still open"
+    assert work.review.label == "Merged; the issue is still open"
     assert work.review.cause == "merged_open"

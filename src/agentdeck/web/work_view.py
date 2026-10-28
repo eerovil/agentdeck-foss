@@ -62,7 +62,7 @@ from ..run_trace import (
 from ..runtime_feed import RUNTIME_TOPIC
 from ..staging_deploys import staging_copy
 from ..state import REVIEWS_TOPIC, chat_topic
-from ..wake_on import KIND_PULL_REQUEST, NeedsYouStop, WakeRequest
+from ..wake_on import KIND_PULL_REQUEST, KIND_REVIEW, NeedsYouStop, WakeRequest
 from ..work import Work, WorkRef, work_id_for
 from ..work_actions import (
     BRING_BACK,
@@ -1159,7 +1159,7 @@ def derived_for(
             if own and ready is not None:
                 continue
             until = datetime.fromtimestamp(wait.deadline, UTC) if wait.deadline else None
-            (pr_waits if own else waits).append((wait.target, until))
+            (pr_waits if own else waits).append((_wait_words(wait, own_pulls), until))
     verification = card.verification
     if verification is not None and getattr(verification, "status", "") in {"queued", "running"}:
         waits.append(("its tests", None))
@@ -1306,7 +1306,6 @@ def derived_for(
             )
         ),
         escalated_pr=escalated[0].number if escalated is not None else None,
-        escalated_repository=_other_repository(escalated[0] if escalated else None, ref),
         escalated_at=escalated[1].at if escalated is not None else None,
         escalated_chat=escalated[1].ref if escalated is not None else "",
         escalated_url=escalated[1].url if escalated is not None else "",
@@ -1324,11 +1323,9 @@ def derived_for(
         ),
         ended_at=ended_at,
         ready_pr=ready.number if ready is not None else None,
-        ready_repository=_other_repository(ready, ref),
         ready_reviewed_at=ready_reviewed_at,
         ready_review_chat=ready_review_chat,
         queue_pr=queued.number if queued is not None else None,
-        queue_repository=_other_repository(queued, ref),
         queue_place=queue_place[1] if queue_place else 0,
         queue_size=queue_place[2] if queue_place else 0,
         queue_round=queue_place[3] if queue_place else 0,
@@ -1336,7 +1333,6 @@ def derived_for(
         nudged_for=nudged_for,
         asks=endings is not None,
         pr=pr.number if pr is not None else None,
-        pr_repository=_other_repository(pr, ref),
         chat_href=chat_href,
         scheduled=card.scheduled,
         parked=card.parked_label,
@@ -1473,11 +1469,13 @@ def _open_deck_verification(job: Any, work_id: str) -> bool:
     )
 
 
-def _other_repository(output: Any, ref: WorkRef) -> str:
-    """``output``'s repository when it is not the Work issue's own, else ``""`` (#2956)."""
-    if output is None or output.repository.casefold() == ref.repository.casefold():
-        return ""
-    return output.repository
+def _wait_words(wait: Any, own_pulls: set[tuple[str, int]]) -> str:
+    """What a Work's line says it waits on, never naming a pull request (#3720)."""
+    if wait.kind not in {KIND_PULL_REQUEST, KIND_REVIEW}:
+        return wait.target
+    own = (wait.repository.casefold(), wait.number) in own_pulls
+    what = "its pull request" if own else "another pull request"
+    return what if wait.kind == KIND_PULL_REQUEST else f"the review of {what}"
 
 
 def _pass_marks(app: Any, work_id: str) -> list[tuple[str, str, str]]:

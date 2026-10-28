@@ -21,12 +21,12 @@ from agentdeck.work_wording import QUESTION_LIMIT, blocked_reason, plain_reason,
         ("Reviewed at abc1234; ready for a person to decide", "Reviewed at abc1234 · your call"),
         ("the delivery never landed; an attempt's outcome is unknown", "The worker never started"),
         ("The card is in Needs More Info", "Waiting for your answer on the issue"),
-        # issues#434: one line, the owner dropped from every reference.
-        ("Review stalled: brought forward 3 times and still not merged — nothing here will move "
-         "it again on Northwind/store#3343; Northwind/abacus#1941 reviewed "
-         "clean", "Not merged after 3 update rounds on store#3343; abacus#1941 reviewed clean"),
-        ("acme/app#7: Review stalled: reviewed, up to date with its base, and still not merged "
-         "(+1 more)", "app#7: Reviewed, up to date, not merged (+1 more)"),
+        # issues#434: one line for several outputs, counted rather than named (#3720).
+        ("Not merged: reviewed, up to date with its base, and still not merged on 2 of 2 pull "
+         "requests", "Reviewed, up to date, not merged on 2 of 2 pull requests"),
+        ("Not merged: reviewed, up to date with its base, and still not merged on 1 of 3 pull "
+         "requests (+1 more)",
+         "Reviewed, up to date, not merged on 1 of 3 pull requests (+1 more)"),
         # #2327's prefix: the stall is about the merge.
         ("Not merged: brought forward 3 times and still not merged — nothing here will move "
          "it again", "Not merged after 3 update rounds"),
@@ -109,7 +109,9 @@ def test_a_blocked_card_is_no_longer_called_a_question():
     [
         ("Auto-merge on `store#3369` is no longer armed on GitHub and its checks are not failing, "
          "so nothing will merge it. `/merge` again to re-arm.",
-         "Auto-merge on store#3369 was switched off; merge again"),
+         "Auto-merge was switched off; merge again"),
+        ("Auto-merge on `Northwind/store#3369` did not fire within the time limit — check GitHub "
+         "before closing.", "Auto-merge did not fire in time; check GitHub"),
         ("**Production deploy failed.** The merge is on the base branch but the deploy did not "
          "go green; a broken production deploy needs a human.",
          "Merged; the production deploy failed"),
@@ -118,10 +120,24 @@ def test_a_blocked_card_is_no_longer_called_a_question():
          "deploy", "Merged; the production deploy failed; AgentDeck is re-checking the deploy"),
         (
             "Northwind/abacus#1953 conflicts with master",
-            "abacus#1953 conflicts with master",
+            "Conflicts with master",
         ),
+        # Every release park the engine writes, none naming a pull request (#3720).
+        ("`o/store#9` was closed without merging — stopping.",
+         "Its pull request was closed without merging"),
+        ("`o/store#9` now conflicts with its base branch, and this release has already spent its "
+         "repair attempt — this needs a human. Fix it and `/merge` again.",
+         "Conflicts with its base branch; repair already spent"),
+        ("CI on `o/store#9` went red after auto-merge was armed (`lint`), and this release has "
+         "already spent its repair attempt — this needs a human. Fix it and `/merge` again.",
+         "CI went red after auto-merge; repair already spent"),
+        ("The repair worker finished without pushing a change, and `lint` on `o/store#9` is "
+         "still failing. A check no code change can fix — a deploy service that wants outside "
+         "authorization, say — needs a person. Fix it and `/merge` again.",
+         "The repair changed nothing and checks still fail"),
     ],
-    ids=["auto-merge-off", "deploy-failed", "deploy-failed-rechecking", "conflict"],
+    ids=["auto-merge-off", "auto-merge-timed-out", "deploy-failed", "deploy-failed-rechecking",
+         "conflict", "closed", "conflict-spent", "ci-spent", "repair-unchanged"],
 )
 def test_release_parks_read_plainly(reason, plain):
     assert plain_reason(reason) == plain

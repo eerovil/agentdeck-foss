@@ -9,7 +9,7 @@ Work the Poller carries finishes under the Poller, so the two never both merge o
 request (D17).
 
 **It merges directly, never arms** (operator decision, review round 7). A merge happens only at
-a moment every condition holds at the exact head, as ``gh pr merge --match-head-commit``, so
+a moment every condition holds at the exact head, as a merge pinned to that head (``sha``), so
 GitHub refuses it if the head moved in between. Nothing is left armed that a later push, turn,
 pause or label could make stale, so there is nothing to watch or call off.
 
@@ -63,6 +63,7 @@ import time
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import quote
 
 from .shared_file import SharedFile
 from .watch_retry import Backoff
@@ -448,7 +449,7 @@ def _round_key(entry: dict, plain: str, chat: str | None) -> str:
 
 
 def merge_outcome(code: int, blob: str) -> str:
-    """What ``gh pr merge --match-head-commit`` answered."""
+    """What the merge call (``PUT …/pulls/<n>/merge`` with ``sha``) answered."""
     if code == 0:
         return MERGED
     blob = blob.lower()
@@ -2414,23 +2415,66 @@ async def _write(argv: list[str]) -> tuple[int, str]:
 
 
 async def merge(ref: str, method: str, head: str) -> tuple[str, str]:
-    """Merge ``ref`` now, only at ``head``: GitHub refuses it if the head moved."""
+    """Merge ``ref`` now, only at ``head``: GitHub refuses it if the head moved.
+
+    Through the REST API, not ``gh pr merge`` (#3728): the CLI refuses a pull request GitHub
+    reports as ``BLOCKED`` on its own side, before asking GitHub, so a ruleset the deck's
+    account may bypass blocked every merge. GitHub now decides, and ``sha`` is the same head
+    guard ``--match-head-commit`` was. ``--admin`` would also get through, but it skips every
+    other requirement as well.
+    """
+    from . import gh_cli
+
     repository, _, number = ref.partition("#")
+    # One read first, for what ``gh pr merge`` did on its own side: the already-merged answer
+    # and the head branch to delete. A failed read only skips those two.
+    try:
+        code, out = await gh_cli.run(
+            [
+                "gh",
+                "api",
+                f"repos/{repository}/pulls/{number}",
+                "--jq",
+                "{merged, ref: .head.ref, repo: .head.repo.full_name}",
+            ],
+            timeout=_GH_TIMEOUT_S,
+            repo=repository,
+        )
+        pull = json.loads(out) if code == 0 else {}
+    except (OSError, TimeoutError, ValueError):
+        pull = {}
+    if not isinstance(pull, dict):
+        pull = {}
+    if pull.get("merged") is True:
+        return ALREADY_MERGED, f"Pull request {ref} is already merged"
     code, blob = await _write(
         [
             "gh",
-            "pr",
-            "merge",
-            number,
-            "--repo",
-            repository,
-            f"--{method}",
-            "--match-head-commit",
-            head,
-            "--delete-branch",
+            "api",
+            "-X",
+            "PUT",
+            f"repos/{repository}/pulls/{number}/merge",
+            "-f",
+            f"merge_method={method}",
+            "-f",
+            f"sha={head}",
         ]
     )
-    return merge_outcome(code, blob), blob
+    outcome = merge_outcome(code, blob)
+    branch = str(pull.get("ref") or "")
+    same_repo = str(pull.get("repo") or "").casefold() == repository.casefold()
+    if outcome == MERGED and branch and same_repo:
+        # ``--delete-branch``'s part; a branch already gone (deleted on merge) is fine.
+        await _write(
+            [
+                "gh",
+                "api",
+                "-X",
+                "DELETE",
+                f"repos/{repository}/git/refs/heads/{quote(branch, safe='/')}",
+            ]
+        )
+    return outcome, blob
 
 
 async def update_branch(ref: str) -> bool:
