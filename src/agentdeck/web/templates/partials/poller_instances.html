@@ -155,6 +155,12 @@
         </details>
       {% endif %}
 
+      {% if shared_changes.get(view.instance) %}
+        <p class="small poller-shared-change">Project settings changed in
+          {{ shared_changes[view.instance] }} — run
+          <code>agentdeck-project update {{ view.instance }}</code></p>
+      {% endif %}
+
       {% if view.budget_holding %}
         <p class="small muted">Token budget is holding queued work — the instance is healthy.</p>
       {% endif %}

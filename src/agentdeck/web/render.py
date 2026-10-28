@@ -1366,6 +1366,7 @@ def poller_context(
     *,
     settings_errors: dict | None = None,
     boards: dict | None = None,
+    shared_changes: dict | None = None,
 ) -> dict:
     """The Poller Instance views this host can see, plus what a control may ask for (#182)."""
     from .. import poller_ops, poller_settings
@@ -1389,6 +1390,13 @@ def poller_context(
             for view in instances
         },
         "settings_errors": settings_errors or {},
+        # A joined project whose repository's file moved on since it was applied (#3755). Read
+        # when the page or the fragment is asked for; a live swap reuses that last answer.
+        "shared_changes": (
+            shared_changes
+            if shared_changes is not None
+            else getattr(request.app.state, "poller_shared_changes", None) or {}
+        ),
         "poller_root": root,
         # The Builder launch offers the operator's own accounts, in their order (#181).
         "accounts": list(request.app.state.accounts or []),

@@ -113,9 +113,36 @@ In the App's settings, turn the webhook on, set its URL to the public address fo
 and the same secret, and subscribe to: Issues, Issue comment, Pull request, Pull request
 review, Push, Check run, Check suite, Status and Deployment status.
 
+Then run `agentdeck github-account prove`. It names each repository your projects declare that
+the App is not installed on, so its webhook never reaches the deck. For one the App does cover
+that has simply had no event yet, it creates the repository's empty webhook log, so the poller
+can skip quiet ticks instead of reading GitHub in full every time.
+
 If the gateway is down, nothing breaks: the pollers still find every change on their timer.
 
 ## 5. Optional: sharing a repository with another deck
+
+The easy way is to keep the project's settings in the project itself. Commit its
+`poller.toml` to one of its repositories as `.agentdeck/poller.toml`, and name whose deck is
+the main one:
+
+```toml
+[decks]
+main = "their-login"
+```
+
+Every other person then runs `uv run agentdeck-project join <owner>/<repo>` once (with
+`--instance <name>` and `--checkouts <folder>` if they want other than the owner's name and
+`~/<name>`). It reads the file as the deck's App, finds the clones already under the folder
+(cloning the missing ones), writes the machine's own `overlay.toml` (or adds checkouts for new
+repositories to one already there), turns the project on, and switches on its timer. The main
+deck runs the extensions, so join stops there and says which machine settings (a token, a
+kubeconfig) to add to `overlay.toml` before running it again.
+On a deck that is not the main one, the deck takes only issues assigned to its person and runs
+none of the project's extensions, so nothing is filed twice. A change to the project is a
+commit to that file; the Pollers page then says so, and `uv run agentdeck-project update <name>`
+applies it. The steps below are the same rules written by hand, for a project without a
+shared file.
 
 When someone else's deck watches the same repository, the issue's assignee decides which deck
 works it, so both never start an agent on one issue.

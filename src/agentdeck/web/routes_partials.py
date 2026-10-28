@@ -148,12 +148,17 @@ async def worktree_diff(request: Request, session_key: str) -> HTMLResponse:
 @router.get("/pollers", response_class=HTMLResponse)
 async def poller_instances(request: Request) -> HTMLResponse:
     """The instance list as a fragment, refreshed on a deliberate action — never self-polling."""
+    from .. import project_source
     from .render import poller_context
 
     templates = get_templates(request)
     boards = await request.app.state.issues.resolve_instance_boards(force=True)
+    shared_changes = await project_source.changed_sources(
+        getattr(getattr(request.app.state.config, "poller", None), "root", project_source.ROOT)
+    )
+    request.app.state.poller_shared_changes = shared_changes
     return templates.TemplateResponse(
         request,
         "partials/poller_instances.html",
-        poller_context(request, boards=boards),
+        poller_context(request, boards=boards, shared_changes=shared_changes),
     )

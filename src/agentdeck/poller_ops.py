@@ -446,6 +446,9 @@ class _ManifestFacts:
     # repositories deploy into them. ``None`` when the manifest declares none.
     staging: Any = None
     staging_repos: tuple[str, ...] = ()
+    # ``[decks] main`` (#3755): the login of the deck that takes the unassigned issues of a
+    # project several decks share, lowercased; empty when one deck alone watches it.
+    main_deck: str = ""
     readable: bool = True
 
 
@@ -546,8 +549,14 @@ def _manifest(path: Path) -> _ManifestFacts:
             for entry in (repos if isinstance(repos, list) else [])
             if isinstance(entry, dict) and entry.get("id")
         ),
+        main_deck=_main_deck(raw.get("decks")),
         readable=True,
     )
+
+
+def _main_deck(decks: object) -> str:
+    main = decks.get("main") if isinstance(decks, dict) else None
+    return main.strip().lower() if isinstance(main, str) else ""
 
 
 def _qualified(org: str, repo: str) -> str:
@@ -622,14 +631,20 @@ def work_unassigned_elsewhere(root: str | Path) -> frozenset[str]:
     """The issue repositories whose unassigned issues another deck takes.
 
     Lowercased ``owner/repo`` of each project whose overlay sets ``[claims] unassigned =
-    false`` (#3731): this deck starts only the issues assigned to its own person there. An
-    overlay that cannot be read leaves its project as it was, taking unassigned issues.
+    false`` (#3731), or whose shared manifest names another person's deck as ``[decks] main``
+    (#3755): this deck starts only the issues assigned to its own person there. An overlay
+    that cannot be read leaves its project as it was, taking unassigned issues.
     """
+    from .poller_engine.config import is_main_deck
+
     base_root = Path(root).expanduser() / "instances"
     found: set[str] = set()
     for instance in _instance_names(root):
         facts = _manifest(base_root / instance / "poller.toml")
         if not (facts.readable and facts.org):
+            continue
+        if facts.main_deck and not is_main_deck(facts.main_deck):
+            found.update(_qualified(facts.org, repo).lower() for repo in facts.issue_repos)
             continue
         try:
             with (base_root / instance / "overlay.toml").open("rb") as handle:

@@ -24,8 +24,9 @@ The rules, all pointing the same direction:
   for has no stream file, and its silence proves nothing — a host whose webhook ingress
   was never configured must keep full polling rather than silently stretch to the ceiling.
   The rule stands, but it now names the repository it is waiting for (#1685), so an
-  operator who knows the ingress covers a dormant repository can create the empty stream
-  and an instance that can never skip says so instead of being found by hand.
+  operator who knows the ingress covers a dormant repository can create the empty stream,
+  which `agentdeck github-account prove` now does itself (#3755), and an instance that can
+  never skip says so instead of being found by hand.
 * **A stream is matched without regard to case.** The streams are written under the
   owner and repository spelling GitHub sends; a manifest may spell either differently,
   and on a case-sensitive filesystem that lookup missed silently — the whole feature was
@@ -175,9 +176,9 @@ def _delivery_reason(
         matched, missing = _resolve(tailer, repositories)
         if missing:
             return (
-                f"no webhook stream for {', '.join(sorted(missing))} — configure the hook, "
-                "create the empty stream once you know the ingress covers it, or drop the "
-                "repository from the manifest"
+                f"no webhook stream for {', '.join(sorted(missing))} — run "
+                "`agentdeck github-account prove`: it names a repository the App's webhook "
+                "misses, and creates the empty stream of one it covers"
             )
         landed = False
         for _ in tailer.deliveries(matched):

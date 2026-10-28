@@ -140,6 +140,7 @@ def test_a_missing_stream_is_named_and_a_case_difference_is_not(root):
     assert reason is not None
     assert "Northwind/soi" in reason
     assert "northwind/store" not in reason
+    assert "agentdeck github-account prove" in reason  # what to run about it (#3755)
 
 
 def test_every_not_quiet_answer_carries_its_reason(root):

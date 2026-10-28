@@ -400,6 +400,60 @@ def test_prove_without_host_checks_reads_only_the_installation(tmp_path, monkeyp
     assert not any("graphql" in url for url in urls) and commands == []
 
 
+def test_prove_names_a_repository_the_apps_webhook_misses(tmp_path, monkeypatch):
+    """#3755: not installed fails; installed but quiet gets its empty log once the App's own
+    deliveries are seen reaching this deck, and only a hint before that."""
+    accounts = tmp_path / "github-authority.toml"
+    accounts.write_text(
+        '[owners]\nacmecorp = "app:acmecorp"\n[app]\napp_id = 5\nslug = "s"\n'
+        'private_key_file = "k"\ninstallations = { acmecorp = 9 }\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AGENTDECK_GITHUB_AUTHORITY_FILE", str(accounts))
+    monkeypatch.setattr(github_authority, "installation_token", lambda app, ident, **_: BOT)
+    instance = tmp_path / "poller" / "instances" / "acme"
+    instance.mkdir(parents=True)
+    REPOS = ("bazaar", "soi", "metso")  # noqa: N806
+    (instance / "poller.toml").write_text(
+        'org = "AcmeCorp"\n'
+        + "".join(f'[[repos]]\nid = "{r}"\nholds_issues = true\n' for r in REPOS)
+    )
+    streams = tmp_path / "streams"
+    (streams / "AcmeCorp").mkdir(parents=True)
+    (streams / "AcmeCorp" / "bazaar.jsonl").write_text(
+        json.dumps({"headers": {"X-GitHub-Hook-Installation-Target-Type": "organization"}}) + "\n"
+    )
+    installed = [{"full_name": f"AcmeCorp/{r}"} for r in ("bazaar", "soi")]
+
+    def fetch(token, url, body):
+        return 200, {}, json.dumps({"repositories": installed}).encode()
+
+    def prove():
+        return github_accounts.prove(
+            fetch=fetch, run=lambda argv, env: (0, "", ""), root=tmp_path / "poller",
+            streams=streams,
+        )
+
+    ok, lines = prove()
+    text = "\n".join(lines)
+    assert not ok
+    assert "acmecorp/metso: the App is not installed here" in text
+    assert "AcmeCorp/soi: no webhook log, and no delivery from the App" in text
+    assert "bazaar:" not in text and not (streams / "AcmeCorp" / "soi.jsonl").exists()
+
+    installed.append({"full_name": "AcmeCorp/metso"})
+    with (streams / "AcmeCorp" / "bazaar.jsonl").open("a") as log:
+        headers = {
+            "X-GitHub-Hook-Installation-Target-Type": "integration",
+            "X-GitHub-Hook-Installation-Target-ID": "5",
+        }
+        log.write(json.dumps({"headers": headers}) + "\n")
+    ok, lines = prove()
+    assert ok, lines
+    assert "✓ AcmeCorp/soi: covered by the App's webhook; created its empty webhook log" in lines
+    assert (streams / "AcmeCorp" / "metso.jsonl").read_text() == ""
+
+
 def test_prove_refuses_without_any_app_installation():
     ok, lines = github_accounts.prove(fetch=_fetch, run=lambda argv, env: (0, "", ""))
 

@@ -453,6 +453,9 @@ class Manifest:
     comment_guide: str = ""
     # Whether this project's workers see bounded command output (#2154). Off unless it asks.
     command_output: CommandOutputPolicy = field(default_factory=CommandOutputPolicy)
+    # ``[decks] main`` (#3755): the GitHub login whose deck takes this shared project's
+    # unassigned issues and runs its extensions. Empty when one deck alone watches it.
+    main_deck: str = ""
 
     def repo(self, repo_id: str) -> Repo | None:
         return next((repo for repo in self.repos if repo.id == repo_id), None)
@@ -680,6 +683,11 @@ def parse_manifest(raw: dict, report: Report) -> Manifest:
 
     capabilities = _table(raw, "capabilities", report, "manifest")
     capabilities = _checked_auto_release(capabilities, report)
+    main_deck = _parse_main_deck(raw, report)
+    if main_deck and not is_main_deck(main_deck):
+        # Another person's deck runs the extensions; running them here too would file every
+        # Sentry error and alert twice (#3755).
+        blocks, extension_hooks = {}, {}
     return Manifest(
         contract=contract,
         board=board,
@@ -701,7 +709,36 @@ def parse_manifest(raw: dict, report: Report) -> Manifest:
         proposal_worker_cap=proposal_worker_cap,
         comment_guide=_parse_comment_guide(raw.get("comments"), capabilities, report),
         command_output=_parse_command_output(raw.get("command_output"), report),
+        main_deck=main_deck,
     )
+
+
+_LOGIN = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
+
+
+def _parse_main_deck(raw: dict, report: Report) -> str:
+    """``[decks] main``: the lowercased login of the shared project's main deck, or ``""``."""
+    main = _table(raw, "decks", report, "manifest").get("main", "")
+    main = main.strip().lower() if isinstance(main, str) else main
+    if main == "" or (isinstance(main, str) and _LOGIN.match(main)):
+        return main
+    report.add(
+        "manifest.decks.main",
+        f"{main!r} is not a GitHub login",
+        "name the person whose deck takes unassigned issues and runs the extensions",
+    )
+    return ""
+
+
+def is_main_deck(main: str) -> bool:
+    """Whether this host's deck is the shared project's main one (#3755).
+
+    Compared with ``[deck] person`` in the accounts file. A deck that names no person is not
+    the main one: it must not run the extensions a named person's deck already runs.
+    """
+    from .github_authority import deck_person
+
+    return bool(main) and deck_person() == main.strip().lower()
 
 
 def _retired_poller_phases(raw: dict, report: Report) -> None:

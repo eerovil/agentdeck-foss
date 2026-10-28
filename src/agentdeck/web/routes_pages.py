@@ -299,14 +299,19 @@ async def pollers(request: Request) -> HTMLResponse:
     page is honest about instances that are not running: an overdue instance reads as stale rather
     than as current.
     """
+    from .. import project_source
     from .render import poller_context
 
     templates = get_templates(request)
     boards = await request.app.state.issues.resolve_instance_boards()
+    shared_changes = await project_source.changed_sources(
+        getattr(getattr(request.app.state.config, "poller", None), "root", project_source.ROOT)
+    )
+    request.app.state.poller_shared_changes = shared_changes
     return templates.TemplateResponse(
         request,
         "pollers.html",
-        poller_context(request, boards=boards),
+        poller_context(request, boards=boards, shared_changes=shared_changes),
     )
 
 

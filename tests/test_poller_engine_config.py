@@ -590,6 +590,22 @@ def test_a_deck_may_leave_unassigned_issues_to_another(tmp_path):
     assert "overlay.claims.unassigned" in _locations(wrong)
 
 
+@pytest.mark.parametrize(("person", "main"), [("Eerovil", True), ("coworker", False), ("", False)])
+def test_only_the_main_deck_of_a_shared_project_runs_its_extensions(
+    tmp_path, monkeypatch, person, main
+):
+    """#3755: ``[decks] main`` names the deck that runs them; any other would file twice."""
+    accounts = tmp_path / f"accounts-{person}.toml"
+    accounts.write_text(f'[deck]\nperson = "{person}"\n' if person else "")
+    monkeypatch.setenv("AGENTDECK_GITHUB_AUTHORITY_FILE", str(accounts))
+    draft = _inspect(tmp_path, manifest=_MANIFEST + '\n[decks]\nmain = "EeroVil"\n')
+    assert draft.manifest.main_deck == "eerovil"
+    assert bool(draft.manifest.extensions) is main
+    assert _locations(draft) == []
+    wrong = _inspect(tmp_path, manifest=_MANIFEST + '\n[decks]\nmain = "not a login"\n')
+    assert "manifest.decks.main" in _locations(wrong)
+
+
 def test_each_account_can_name_its_own_usage_ceiling(tmp_path):
     overlay = _inspect(
         tmp_path,

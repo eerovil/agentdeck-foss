@@ -86,6 +86,11 @@ def main() -> None:
         raise SystemExit(_deck_request(sys.argv[2:]))
     if len(sys.argv) > 1 and sys.argv[1] == "review-fallback":
         raise SystemExit(_review_fallback(sys.argv[2:]))
+    if len(sys.argv) > 1 and sys.argv[1] == "project":
+        # Its own command, as `agentdeck-init` is: joining runs the poller engine's activation,
+        # and the deck stays on its side of that boundary (#3755).
+        print("agentdeck project: run `uv run agentdeck-project` instead", file=sys.stderr)
+        raise SystemExit(2)
     if len(sys.argv) > 1 and sys.argv[1] == "github-account":
         from .github_accounts import main as github_account
 

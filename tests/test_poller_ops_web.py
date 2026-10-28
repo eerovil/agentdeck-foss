@@ -193,12 +193,28 @@ def test_the_page_says_nothing_about_engine_promotion(app_client):
     assert "Engine promotion" not in body
 
 
-def test_the_fragment_returns_just_the_list(app_client):
+def test_the_fragment_returns_just_the_list(app_client, monkeypatch):
     client, root = app_client
     _seed(root, at=datetime.now(UTC))
     body = client.get("/partials/pollers").text
     assert body.strip().startswith("<div id=\"poller-instances\"")
     assert "<html" not in body
+    assert "Project settings changed" not in body
+
+    # #3755: a project joined from its repository's file says when that file moved on.
+    from agentdeck import gh_cli
+
+    (root / "instances" / "reference" / "source.json").write_text(
+        json.dumps({"repository": "shop/issues", "path": ".agentdeck/poller.toml", "sha": "a"})
+    )
+
+    async def gh(argv, *, timeout, repo=None, owner=None):
+        return 0, b"b\n"
+
+    monkeypatch.setattr(gh_cli, "run", gh)
+    body = client.get("/partials/pollers").text
+    assert "Project settings changed in\n          shop/issues" in body
+    assert "<code>agentdeck-project update reference</code>" in body
 
 
 def test_the_list_follows_its_stream_not_a_timer(app_client):

@@ -333,8 +333,23 @@ def host_checks() -> dict:
     }
 
 
-def prove(*, fetch: Fetch = _fetch, run: Runner = _run) -> tuple[bool, list[str]]:
-    """The #2289 read-only App proof, one installation at a time."""
+def prove(
+    *,
+    fetch: Fetch = _fetch,
+    run: Runner = _run,
+    root: Path | None = None,
+    streams: Path | None = None,
+) -> tuple[bool, list[str]]:
+    """The #2289 read-only App proof, one installation at a time.
+
+    Also checks each repository this deck's poller projects declare against the App's
+    webhook (#3755): ``root`` is the poller root and ``streams`` the webhook log folder.
+    """
+    from .poller_ops import work_repositories
+    from .poller_quiet import DEFAULT_STREAMS_ROOT
+
+    declared = work_repositories(root or poller_root())
+    streams = Path(streams or DEFAULT_STREAMS_ROOT).expanduser()
     lines: list[str] = []
     try:
         config = github_authority.load_accounts()
@@ -352,15 +367,28 @@ def prove(*, fetch: Fetch = _fetch, run: Runner = _run) -> tuple[bool, list[str]
             ok = False
             lines.append(f"{org}: FAILED — {refusal}")
             continue
-        status, _h, body = fetch(token, f"{_API}/installation/repositories?per_page=100", None)
-        try:
-            repos = sorted(
-                str(row.get("full_name")) for row in json.loads(body).get("repositories", [])
+        repos: list[str] = []
+        for page in range(1, 11):
+            # Paged, so the webhook check below never calls a repository on page two missing.
+            status, _h, body = fetch(
+                token, f"{_API}/installation/repositories?per_page=100&page={page}", None
             )
-        except (ValueError, AttributeError, TypeError):
-            repos = []
+            try:
+                rows = json.loads(body).get("repositories", [])
+                repos.extend(str(row.get("full_name")) for row in rows)
+            except (ValueError, AttributeError, TypeError):
+                rows = []
+            if status != 200 or len(rows) < 100:
+                break
+        repos.sort()
         lines.append(f"{org}: installation repositories (HTTP {status}): {', '.join(repos) or '-'}")
         ok = ok and status == 200 and bool(repos)
+        if status == 200:
+            covered, webhook = _webhook_coverage(
+                org, repos, declared, streams, config.app.app_id
+            )
+            ok = ok and covered
+            lines.extend(webhook)
         number = checks["boards"].get(org)
         if number is not None:
             query = (
@@ -407,6 +435,73 @@ def prove(*, fetch: Fetch = _fetch, run: Runner = _run) -> tuple[bool, list[str]
             ok = ok and code == 0
             detail = "ok" if code == 0 else f"exit {code}: {err.strip().splitlines()[-1:] or ''}"
             lines.append(f"{org}: git ls-remote {org}/{repo}: {detail}")
+    return ok, lines
+
+
+def _app_delivered(owner_dir: Path, app_id: int) -> bool:
+    """Whether any of the owner's webhook logs holds a delivery from this App's own hook."""
+    for stream in sorted(owner_dir.glob("*.jsonl")) if owner_dir.is_dir() else []:
+        try:
+            with stream.open("rb") as handle:
+                start = max(0, stream.stat().st_size - 256 * 1024)
+                handle.seek(start)
+                # A read from the middle starts inside a record: skip that part line.
+                tail = handle.read().splitlines()[1 if start else 0 :]
+        except OSError:
+            continue
+        for line in reversed(tail):
+            try:
+                headers = json.loads(line).get("headers") or {}
+            except (ValueError, AttributeError):
+                continue
+            folded = {str(k).lower(): str(v) for k, v in headers.items()}
+            if (
+                folded.get("x-github-hook-installation-target-type") == "integration"
+                and folded.get("x-github-hook-installation-target-id") == str(app_id)
+            ):
+                return True
+    return False
+
+
+def _webhook_coverage(
+    org: str, installed: list[str], declared: frozenset[str], streams: Path, app_id: int
+) -> tuple[bool, list[str]]:
+    """Each declared repository of ``org`` whose webhook log is missing, and why (#3755).
+
+    A log file appears with a repository's first delivery, and until then the poller cannot
+    trust its silence. A repository the App is not installed on never gets one: that fails.
+    One the App covers, while the App's deliveries already reach this deck, is only quiet:
+    its empty log is created here, which is what the poller's own note asks for.
+    """
+    canonical = {name.lower(): name for name in installed}
+    owner_dirs = [path for path in streams.glob("*") if path.name.lower() == org.lower()]
+    lines: list[str] = []
+    ok = True
+    delivered: bool | None = None
+    for slug in sorted(slug for slug in declared if slug.split("/", 1)[0] == org.lower()):
+        name = canonical.get(slug)
+        if name is None:
+            ok = False
+            lines.append(
+                f"{slug}: the App is not installed here, so its webhook never reaches this deck "
+                "— GitHub → organization settings → GitHub Apps → Configure → Repository access"
+            )
+            continue
+        owner, repo = name.split("/", 1)
+        owner_dir = owner_dirs[0] if owner_dirs else streams / owner
+        if any(path.name.lower() == f"{repo.lower()}.jsonl" for path in owner_dir.glob("*.jsonl")):
+            continue
+        if delivered is None:
+            delivered = _app_delivered(owner_dir, app_id)
+        if not delivered:
+            lines.append(
+                f"{name}: no webhook log, and no delivery from the App has reached this deck "
+                "yet — turn the App's webhook on (docs/github-setup.md, step 4)"
+            )
+            continue
+        owner_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        (owner_dir / f"{repo}.jsonl").touch(mode=0o600, exist_ok=True)
+        lines.append(f"✓ {name}: covered by the App's webhook; created its empty webhook log")
     return ok, lines
 
 

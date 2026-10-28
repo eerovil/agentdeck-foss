@@ -131,6 +131,11 @@ def test_hold_labels_come_from_the_manifest(tmp_path):
     assert work_unassigned_elsewhere(tmp_path) == frozenset()
     (instance / "overlay.toml").write_text("[claims]\nunassigned = false\n")
     assert work_unassigned_elsewhere(tmp_path) == {REPO}
+    # #3755: a shared manifest naming another person's deck as the main one does the same.
+    (instance / "overlay.toml").write_text("")
+    manifest = (instance / "poller.toml").read_text()
+    (instance / "poller.toml").write_text(manifest + '[decks]\nmain = "someone-else"\n')
+    assert work_unassigned_elsewhere(tmp_path) == {REPO}
 
 
 def test_an_issue_another_deck_works_is_not_started():
