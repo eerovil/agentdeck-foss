@@ -132,7 +132,7 @@ def manifest_text(owner: str, repo: str) -> str:
 # poller/reference/poller.toml explains every key.
 contract = 1
 org = "{owner.lower()}"
-ownership_label = "agent"
+ownership_label = ["agent", "claude"]
 spec_only_label = "spec-only"
 paused_label = "paused"
 
@@ -163,6 +163,19 @@ deployment_observation = false
 artifacts = false
 auto_release = false
 """
+
+
+# The line earlier setups wrote, which started Works from `agent` only (#3753).
+_OLD_OWNERSHIP_LINE = 'ownership_label = "agent"\n'
+
+
+def upgrade_manifest(text: str) -> str:
+    """An earlier setup's manifest, made to accept `claude` too; anything else is left alone."""
+    lines = text.splitlines(keepends=True)
+    if _OLD_OWNERSHIP_LINE not in lines:
+        return text
+    lines[lines.index(_OLD_OWNERSHIP_LINE)] = 'ownership_label = ["agent", "claude"]\n'
+    return "".join(lines)
 
 
 def overlay_text(instance: Path, repo: str, checkout: str, account: str) -> str:
@@ -711,6 +724,12 @@ def step_project(answers: Answers, checkout: Path, account: str) -> str:
     manifest.parent.mkdir(parents=True, exist_ok=True)
     if not manifest.exists():
         manifest.write_text(manifest_text(answers.owner, answers.repo))
+    else:
+        current = manifest.read_text()
+        upgraded = upgrade_manifest(current)
+        if upgraded != current:
+            manifest.write_text(upgraded)
+            _say(f"✓ {manifest}: Works now also start from the claude label")
     engine = [sys.executable, str(REPO / "scripts" / "poller_engine.py")]
     applied = subprocess.run(
         [

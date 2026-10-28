@@ -51,6 +51,15 @@ def test_the_written_files_pass_the_deck_and_poller_readers(tmp_path, monkeypatc
     )
     inspected = poller_config.inspect(manifest, overlay)
     assert inspected.ok, inspected.report.render()
+    # Works start from either label, like this deck's own projects (#3753).
+    assert inspected.manifest.board.accepted_ownership_labels == ("agent", "claude")
+    # An earlier setup's file is upgraded on a re-run; a hand-edited one is left alone.
+    old = setup_init.manifest_text("Alice", "agent-tasks").replace(
+        'ownership_label = ["agent", "claude"]', 'ownership_label = "agent"'
+    )
+    assert setup_init.upgrade_manifest(old) == setup_init.manifest_text("Alice", "agent-tasks")
+    edited = old.replace('"agent"\n', '"todo"\n')
+    assert setup_init.upgrade_manifest(edited) == edited
 
 
 def test_the_app_comes_back_from_the_code_github_sends(monkeypatch):
