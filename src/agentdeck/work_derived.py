@@ -82,8 +82,9 @@ Work's own facts. Nothing here is stored and nothing here asks the agent to call
    agent posted its spec on the issue, with no pull request open and nobody commenting since:
    building waits on a person's approval, so it reads **Needs you — approve the spec · posted
    06:35**, linking the spec comment (#3247). Nor is a Work whose issue carries the ``parked``
-   label with no pull request open: a person asked its agent to leave it until they write, so
-   it reads **Parked — waits for your message** (#3560).
+   label with no ready pull request open (a draft on hold does not count, #3733): a person
+   asked its agent to leave it until they write, so it reads **Parked — waits for your
+   message** (#3560).
 
 Since #2944 this is the one status of such a Work: the front page's section, the operator's
 category and the buttons follow it too (``work_story.work_status``). A time not on today's
@@ -191,6 +192,8 @@ class DerivedInputs:
     #: A registered pull request is still open: a closed issue then reads through the pull
     #: request's rules rather than as Issue closed (#3187).
     pr_open: bool = False
+    #: One of those open pull requests is out of draft (#3733).
+    ready_pr_open: bool = False
     #: The deck asked the agent to check its merged change live and no result came yet; else
     #: the result it recorded (``verified``, ``failed``, ``nothing_to_check``, ``not_live``) and
     #: its line (#3141).
@@ -269,8 +272,9 @@ class DerivedInputs:
     #: comment since (#3247): when, and the comment. Rule 9 never applies; a person approves.
     spec_posted_at: datetime | None = None
     spec_url: str = ""
-    #: The issue carries ``PARKED_LABEL`` (#3560): with no pull request open, rule 9 never
-    #: applies; the next person's message starts the agent again.
+    #: The issue carries ``PARKED_LABEL`` (#3560): with no ready pull request open, rule 9
+    #: never applies; the next person's message starts the agent again. A draft left on hold
+    #: does not count against it (#3733).
     parked: bool = False
 
 
@@ -622,7 +626,7 @@ def _first_rule(
         return DerivedStatus(
             SCHEDULED, f"Scheduled — {summary}", summary=summary, chat_href=href
         )
-    if inputs.parked and not inputs.pr_open:
+    if inputs.parked and not inputs.ready_pr_open:
         summary = "waits for your message"
         return DerivedStatus(PARKED, f"Parked — {summary}", summary=summary, chat_href=href)
     return _ended(inputs, now=now, clock=clock)

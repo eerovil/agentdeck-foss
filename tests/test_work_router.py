@@ -24,6 +24,7 @@ from agentdeck.webhook_tailer import WebhookTailer
 from agentdeck.work_release import OWNER_CALL_ASK
 from agentdeck.work_router import (
     ESCALATED_ASK,
+    HANDED_OVER,
     MESSAGE,
     REVIEW,
     ReviewedHeads,
@@ -759,6 +760,25 @@ async def test_a_maps_last_ticket_closing_wakes_the_maps_chat(
     assert f"eerovil/agentdeck#{closer} closed" in message.text
     assert "all 3 are closed" in message.text
     assert "Reach the destination" in message.text
+
+
+async def test_a_handed_over_maps_last_ticket_wakes_no_chat_here(root, harness):
+    """#3731 review: the map went to another deck, whose agent reaches the destination."""
+    harness.issues[("eerovil/agentdeck", 20)] = ("chat-m", "eerovil/agentdeck#20")
+    harness.service.handed_over.add(f"{HANDED_OVER}github_issue:eerovil/agentdeck#20")
+
+    async def read_issue(repository, number):
+        return {"state": "open", "labels": ["wayfinder:map"],
+                "sub_issues_summary": {"total": 3, "completed": 3},
+                "last_closed": "2026-10-27T10:00:05Z", "sub_issues": None}
+
+    harness.service._read_issue = read_issue
+    deliver(root, event="issues", delivery="d1", action="closed", sender=PERSON, issue={
+        "number": 23, "state": "closed", "closed_at": "2026-10-27T10:00:05Z",
+        "parent_issue_url": "https://api.github.com/repos/eerovil/agentdeck/issues/20",
+    })
+    await harness.drain()
+    assert harness.scheduled == []
 
 
 async def test_a_project_that_has_not_switched_is_left_to_its_poller(root, harness):

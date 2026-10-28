@@ -23,8 +23,9 @@ from datetime import datetime
 MAP_LABEL = "wayfinder:map"
 
 # The shared GitHub cache's rows for a map's body and each ticket's "blocked by" list:
-# ``IssueResolver`` reads them, and ``webhook_status_cache`` drops them when GitHub says they
-# changed, so the diagram follows webhooks and never a timer.
+# ``IssueResolver`` reads them and keeps them a day, and ``webhook_status_cache`` marks them out
+# of date when GitHub says they changed, so the diagram follows webhooks and never a timer
+# (#3739: the day only covers a lost delivery).
 ISSUE_BODY_KEY = "issue-body:v1:"
 BLOCKED_BY_KEY = "blocked-by:v1:"
 SUB_ISSUES_KEY = "sub-issues:v2:"  # ``IssueResolver.sub_issues``' rows (#3622), with labels
@@ -34,9 +35,10 @@ def cache_key(prefix: str, repository: str, number: int) -> str:
     return f"{prefix}{repository.lower()}#{number}"
 
 
-# Moves whenever a webhook dropped a map's cached body, sub-issue list or "blocked by" list
-# in this process (#3627). Part of every Work page's build key: those reads are the page's
-# own, so nothing else would tell an open map page to build again.
+# Moves whenever a webhook marked a map's cached body, sub-issue list or "blocked by" list
+# out of date in this process (#3627), or a re-read behind an open page changed one (#3739).
+# Part of every Work page's build key: those reads are the page's own, so nothing else would
+# tell an open map page to build again.
 _generation = 0
 
 
@@ -519,17 +521,22 @@ def _curve(source: Box, target: Box) -> str:
     )
 
 
-def ticket_state(*, closed: bool, section: str | None, waits: bool = False) -> str:
+def ticket_state(
+    *, closed: bool, section: str | None, waits: bool = False, held: bool = False
+) -> str:
     """A ticket's colour from its issue and its Work's front-page row (``FrontRow``).
 
     Closed is done. A Work that needs the owner is Needs you; one an agent works on now is
     Running. Everything else open — not started, blocked, waiting on a review or CI, paused —
-    is Waiting."""
+    is Waiting. ``held`` is a ticket no agent started that still has an open blocker: it waits
+    for that ticket, not for the owner, though its row on its own says Not started (#3736)."""
     from .work_story import IN_PROGRESS
     from .work_story import NEEDS_YOU as NEEDS
 
     if closed:
         return DONE
+    if held:
+        return WAITING
     if section == NEEDS:
         return NEEDS_YOU
     if section == IN_PROGRESS and not waits:
@@ -556,8 +563,15 @@ class Question:
 
     @property
     def line(self) -> str:
-        """``<header>: <question>``, or the question alone when it has no header."""
-        return f"{self.header}: {self.prompt}" if self.header else self.prompt
+        """``<header>: <question>``, or the question alone when it has no header.
+
+        Only the sentence that asks: a ticket's form often spells out what the agent found
+        first, which made a wall of text of the front-page row and the map page (#3736). The
+        form the line opens shows it all."""
+        from .work_derived import question_sentence
+
+        asked = question_sentence(self.prompt)
+        return f"{self.header}: {asked}" if self.header else asked
 
 
 @dataclass(frozen=True)
@@ -611,6 +625,8 @@ def question(row) -> Question | None:
 
     Only a chat that really asks counts (``WorkAttention.asks``): a closed ticket waiting for
     Finish or a stopped chat is not a question (#3656)."""
+    from .work_derived import QUESTION as DERIVED_QUESTION
+    from .work_story import NEEDS_YOU as NEEDS
     from .work_story import waiting_attention
 
     card = row.card
@@ -622,6 +638,19 @@ def question(row) -> Question | None:
                 header=item.header,
                 prompt=item.question,
                 href=f"{item.href}{FORM_ANCHOR}",
+                asked_at=row.stopped_at,
+            )
+    # A deck-run Work reads its question from its own chat, with or without a Deckhand
+    # card (#3503): #902 waited on an answer while its map said nobody asked (#3736).
+    derived = card.derived
+    if row.section == NEEDS and derived is not None and derived.kind == DERIVED_QUESTION:
+        if derived.summary:
+            return Question(
+                work_id=card.work_id,
+                title=card.issue_title or card.title,
+                header="",
+                prompt=derived.summary,
+                href=f"{derived.chat_href}{FORM_ANCHOR}" if derived.chat_href else card.href,
                 asked_at=row.stopped_at,
             )
     return None

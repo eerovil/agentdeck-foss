@@ -288,9 +288,14 @@ def labels_for(target: Target, spec_only: bool) -> list[str]:
     return labels
 
 
-async def _create(target: Target, title: str, body: str, spec_only: bool) -> Outcome:
+async def _create(
+    target: Target, title: str, body: str, spec_only: bool, assignee: str = ""
+) -> Outcome:
     argv = [_gh(), "api", "-X", "POST", f"repos/{target.repository}/issues", "--input", "-"]
-    payload = {"title": title, "body": body, "labels": labels_for(target, spec_only)}
+    payload: dict = {"title": title, "body": body, "labels": labels_for(target, spec_only)}
+    if assignee:
+        # Filed already this deck's, where another deck takes unassigned issues (#3731).
+        payload["assignees"] = [assignee]
     try:
         code, stdout, stderr = await gh_cli.run_once(
             argv,
@@ -329,18 +334,20 @@ async def file(
     attachments: Iterable[Attachment] = (),
     chat_url: str = "",
     on_body: Callable[[str], object] | None = None,
+    assignee: str = "",
 ) -> Outcome:
     """Upload the attachments, then create the issue. Called once per reserved press.
 
     ``on_body`` gets the issue's body just before the create is sent, nothing on a failed
     upload: the caller starts the Work's agent then rather than after GitHub answers.
+    ``assignee`` is filed as the issue's assignee (``work_claims.own_assignee``).
     """
     attachments = tuple(attachments)
     if not attachments:
         body = compose_body(text, chat_url=chat_url)
         if on_body is not None:
             on_body(body)
-        return await _create(target, title, body, spec_only)
+        return await _create(target, title, body, spec_only, assignee)
     async with _ATTACHMENT_FILING:
         uploaded: list[Uploaded] = []
         for attachment in attachments:
@@ -355,4 +362,4 @@ async def file(
         )
         if on_body is not None:
             on_body(body)
-        return await _create(target, title, body, spec_only)
+        return await _create(target, title, body, spec_only, assignee)

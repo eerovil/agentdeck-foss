@@ -406,6 +406,40 @@ async def test_reads_reuse_one_connection_per_thread(tmp_path, monkeypatch):
         assert pool.submit(in_another_thread).result() == 1
 
 
+async def test_resolving_never_touches_sqlite_on_the_event_loop(tmp_path):
+    """#3739: the shared file is in rollback-journal mode, so a claim can wait out another
+    process's write and each store syncs to disk. On the loop, a map's 25 re-reads stalled
+    every page for up to 2.8 s; each statement now runs in a worker thread."""
+    import threading
+
+    cache = GitHubMetadataCache(tmp_path / "github.sqlite3")
+    loop_thread = threading.get_ident()
+    seen = []
+    for name in ("_claim", "_store", "_back_off"):
+        real = getattr(cache, name)
+
+        def spy(*args, _real=real, _name=name, **kwargs):
+            seen.append((_name, threading.get_ident() != loop_thread))
+            return _real(*args, **kwargs)
+
+        setattr(cache, name, spy)
+
+    async def found():
+        return GitHubMetadata({"title": "t"})
+
+    async def failed():
+        return None
+
+    await cache.resolve("issue:v1:o/r#1", found, now=1000.0)
+    await cache.resolve("issue:v1:o/r#2", failed, now=1000.0)
+    assert sorted(seen) == [
+        ("_back_off", True),
+        ("_claim", True),
+        ("_claim", True),
+        ("_store", True),
+    ]
+
+
 async def test_a_sqlite_failure_throws_the_reused_handle_away(tmp_path):
     """A failed statement can leave the handle mid-transaction.
 

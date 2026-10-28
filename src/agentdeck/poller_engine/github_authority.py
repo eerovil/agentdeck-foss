@@ -324,37 +324,53 @@ _lock = threading.Lock()
 _loaded: tuple[object, AccountsConfig | ConfigError] | None = None
 
 
-_reviewers: tuple[object, frozenset[str]] | None = None
+_tables: dict[str, tuple[object, dict]] = {}
 
 
-def reviewer_logins() -> frozenset[str]:
-    """The outside reviewers' logins, lowercased, from the accounts file's ``[reviewers]``.
+def _file_table(name: str) -> dict:
+    """The accounts file's ``[name]`` table, re-read when the file changes.
 
-    Re-read when the file changes, like the owner map; a missing, unreadable or malformed file
-    or table names none (#3623): a grant like this is never guessed at.
+    A missing, unreadable or malformed file or table is an empty one: what these tables grant
+    is never guessed at (#3623).
     """
-    global _reviewers
     path = accounts_path()
     try:
         stat = path.stat()
         key: object = (str(path), stat.st_mtime_ns, stat.st_size)
     except OSError:
-        return frozenset()
+        return {}
     with _lock:
-        if _reviewers is not None and _reviewers[0] == key:
-            return _reviewers[1]
+        cached = _tables.get(name)
+        if cached is not None and cached[0] == key:
+            return cached[1]
     try:
-        table = tomllib.loads(path.read_text(encoding="utf-8")).get("reviewers")
+        table = tomllib.loads(path.read_text(encoding="utf-8")).get(name)
     except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
         table = None
-    listed = table.get("logins") if isinstance(table, dict) else None
-    logins = frozenset(
+    table = table if isinstance(table, dict) else {}
+    with _lock:
+        _tables[name] = (key, table)
+    return table
+
+
+def reviewer_logins() -> frozenset[str]:
+    """The outside reviewers' logins, lowercased, from the accounts file's ``[reviewers]``."""
+    listed = _file_table("reviewers").get("logins")
+    return frozenset(
         str(login).strip().lower() for login in (listed if isinstance(listed, list) else ())
         if isinstance(login, str) and login.strip()
     )
-    with _lock:
-        _reviewers = (key, logins)
-    return logins
+
+
+def deck_person() -> str:
+    """The GitHub login of the person this deck works for, lowercased, or ``""`` (#3731).
+
+    ``[deck] person`` in the accounts file. Two decks on one repository each take only the
+    issues assigned to their own person (``work_claims``); unset, the assignee is ignored.
+    """
+    person = _file_table("deck").get("person")
+    person = person.strip().lower() if isinstance(person, str) else ""
+    return person if _OWNER.match(person) else ""
 
 
 def load_accounts() -> AccountsConfig:
@@ -958,9 +974,9 @@ def failure_hint(
 
 def clear_caches() -> None:
     """Forget every cached config and token in this process. For tests."""
-    global _loaded, _reviewers
+    global _loaded
     with _lock:
         _loaded = None
-        _reviewers = None
+        _tables.clear()
         _memory.clear()
         _failures.clear()

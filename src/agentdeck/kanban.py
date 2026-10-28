@@ -187,7 +187,9 @@ _ISSUE_JQ = (
     # Its own sub-issues' counts (#3622, ``work_tree``), and its GitHub parent issue only when
     # the read names one: GitHub's issue read leaves ``parent_issue_url`` out, so the link
     # comes from a ``sub_issues`` delivery and a read must not erase it (#3654).
-    "subIssues: (.sub_issues_summary // null)}"
+    "subIssues: (.sub_issues_summary // null), "
+    # Its first assignee (#3731): which of two decks on the repository works it.
+    "assignee: (.assignee.login // null)}"
     ' + (if has("parent_issue_url") then {parent: .parent_issue_url} else {} end)'
 )
 

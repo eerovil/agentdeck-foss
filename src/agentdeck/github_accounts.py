@@ -228,6 +228,12 @@ def show(*, root: Path | None = None, fetch: Fetch = _fetch) -> list[str]:
             authority = github_authority.resolve(owner, config)
             lines.append(f"  {owner} -> {authority.name} ({authority.login})")
         lines.append("  every other owner -> refused")
+        person = github_authority.deck_person()
+        lines.append(
+            f"deck person: {person} (an issue assigned to anyone else is left to their deck)"
+            if person
+            else "deck person: not set (the deck ignores who an issue is assigned to)"
+        )
         agent_token = ""
         try:
             agent_token = github_authority.token(

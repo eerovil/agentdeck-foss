@@ -114,3 +114,35 @@ and the same secret, and subscribe to: Issues, Issue comment, Pull request, Pull
 review, Push, Check run, Check suite, Status and Deployment status.
 
 If the gateway is down, nothing breaks: the pollers still find every change on their timer.
+
+## 5. Optional: sharing a repository with another deck
+
+When someone else's deck watches the same repository, the issue's assignee decides which deck
+works it, so both never start an agent on one issue.
+
+1. On each deck, name the person it works for in `github-authority.toml`:
+
+   ```toml
+   [deck]
+   person = "your-login"
+   ```
+
+   `agentdeck github-account show` prints it. A deck then leaves alone every issue assigned to
+   someone else. Only the first assignee counts.
+2. Exactly one deck also takes the issues assigned to nobody. On every other deck, add this to
+   the project's `overlay.toml`:
+
+   ```toml
+   [claims]
+   unassigned = false
+   ```
+
+   That deck's Start agent and New work then assign the issue to its person, and the project
+   must run with `capabilities.works_router = true`, so its poller never moves the shared
+   board's cards.
+3. To hand an issue over, reassign it on GitHub. The deck it now belongs to starts an agent on
+   the same `agent/issue-<n>` branch if it carries the start label; the deck that lost it
+   stops its agent and tells it why. Assigning it back tells the old agent to carry on.
+
+A deck that sees another deck's "started an agent" comment on an issue it works tells its agent
+to stop pushing and ask you who keeps it.

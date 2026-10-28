@@ -6,7 +6,7 @@ import asyncio
 import logging
 
 from agentdeck.issue_context import IssueBacklog, IssueContext, RepositoryIssues
-from agentdeck.poller_ops import works_router_hold_labels
+from agentdeck.poller_ops import works_router_hold_labels, works_router_unassigned_elsewhere
 from agentdeck.work_backstop import MissedStartBackstop
 
 REPO = "eerovil/agentdeck"
@@ -16,8 +16,13 @@ NOW = 1_800_000_000.0
 FRESH = "2027-01-15T07:00:00Z"  # an hour before NOW
 
 
-def _issue(number: int, *labels: str, state: str = "open", updated: str = FRESH) -> IssueContext:
-    return IssueContext(REPO, number, f"#{number}", "", state, labels, updated_at=updated)
+def _issue(
+    number: int, *labels: str, state: str = "open", updated: str = FRESH, assignee: str = ""
+) -> IssueContext:
+    assignees = (assignee,) if assignee else ()
+    return IssueContext(
+        REPO, number, f"#{number}", "", state, labels, assignees, updated_at=updated
+    )
 
 
 class Harness:
@@ -123,6 +128,24 @@ def test_hold_labels_come_from_the_switched_manifest(tmp_path):
         "[capabilities]\nworks_router = true\n"
     )
     assert works_router_hold_labels(tmp_path) == {REPO: frozenset({"paused"})}
+    # #3731: an overlay leaving unassigned issues to another deck names the repository.
+    assert works_router_unassigned_elsewhere(tmp_path) == frozenset()
+    (instance / "overlay.toml").write_text("[claims]\nunassigned = false\n")
+    assert works_router_unassigned_elsewhere(tmp_path) == {REPO}
+
+
+def test_an_issue_another_deck_works_is_not_started():
+    """#3731: the cached assignee skips it with no re-read; a fresh record's decides."""
+    harness = Harness(
+        [_issue(1, "agent", assignee="coworker"), _issue(2, "agent"), _issue(3, "agent")],
+        records={
+            2: {"state": "open", "is_pr": False, "labels": ["agent"], "assignee": "coworker"},
+            3: {"state": "open", "is_pr": False, "labels": ["agent"], "assignee": None},
+        },
+    )
+    harness.backstop._mine = lambda repository, assignee: assignee != "coworker"
+    assert harness.sweep() == ["github_issue:eerovil/agentdeck#3"]
+    assert harness.reread_calls == [(REPO, 2), (REPO, 3)]
 
 
 def test_only_an_issue_updated_in_the_last_day_is_started():

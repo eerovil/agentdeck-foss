@@ -516,6 +516,10 @@ class Overlay:
     # are the two things this file exists to hold. Merged over the Manifest's block at load, so an
     # extension sees one settings dict and needs no idea the split happened.
     extensions: dict = field(default_factory=dict)
+    # Whether this deck starts the project's unassigned issues (``[claims] unassigned``, #3731).
+    # Two decks on one repository each take the issues assigned to their own person, and only
+    # one of them also takes the ones assigned to nobody.
+    claims_unassigned: bool = True
 
 
 def _read_toml(path: Path, label: str, report: Report) -> dict | None:
@@ -1506,7 +1510,22 @@ def parse_overlay(raw: dict, report: Report) -> Overlay:
         env_files=tuple(env_files),
         extensions_dir=extensions_dir,
         extensions=_parse_overlay_extensions(raw.get("extensions"), report),
+        claims_unassigned=_claims_unassigned(raw, report),
     )
+
+
+def _claims_unassigned(raw: dict, report: Report) -> bool:
+    """``[claims] unassigned``: whether this deck starts issues assigned to nobody (#3731)."""
+    unassigned = _table(raw, "claims", report, "overlay").get("unassigned", True)
+    if not isinstance(unassigned, bool):
+        report.add(
+            "overlay.claims.unassigned",
+            "must be true or false",
+            "set it to false on every deck sharing this project but the one that takes "
+            "unassigned issues",
+        )
+        return True
+    return unassigned
 
 
 def _parse_overlay_extensions(raw: object, report: Report) -> dict:
@@ -1557,6 +1576,14 @@ def cross_check(manifest: Manifest, overlay: Overlay, report: Report) -> None:
             "overlay.contract",
             f"contract {overlay.contract} does not match the manifest's {manifest.contract}",
             "regenerate the overlay with the Builder so both files share one contract",
+        )
+    if not overlay.claims_unassigned and manifest.capabilities.get("works_router") is not True:
+        # A deck that shares the project with another must not seed or move board cards for
+        # every labelled issue, the other deck's included (#3731).
+        report.add(
+            "overlay.claims.unassigned",
+            "a deck that leaves unassigned issues to another deck must not run cards itself",
+            "set capabilities.works_router = true in the manifest, or drop [claims]",
         )
     by_id = {repo.id: repo for repo in manifest.repos}
     for repo in manifest.repos:

@@ -297,9 +297,10 @@ class WebhookStatusCacheService:
 
         One rule, the owner's: every ``issues`` delivery may change something a map shows of
         the issue, its title, state, labels (a ticket's type) or body (a map's fog and
-        destination). So any of them drops the issue's own body row and its parent's cached
-        sub-issue list, and a drop that hit a held row redraws the open map pages. The next
-        page read fetches them again, so the diagram follows GitHub without a timer."""
+        destination). So any of them marks the issue's own body row and its parent's cached
+        sub-issue list out of date, and one that hit a held row redraws the open map pages.
+        That redraw reads them again behind the page, so the diagram follows GitHub without
+        a timer."""
         payload = delivery.payload
         issue = payload.get("issue")
         number = issue.get("number") if isinstance(issue, dict) else None
@@ -328,8 +329,8 @@ class WebhookStatusCacheService:
         return held.get("parent") if isinstance(held, dict) else None
 
     def _apply_dependency(self, delivery: Delivery) -> None:
-        """A "blocked by" link added or removed (#3627): drop the blocked issue's cached
-        dependency list, which a wayfinder map's diagram draws as arrows."""
+        """A "blocked by" link added or removed (#3627): mark the blocked issue's cached
+        dependency list out of date, which a wayfinder map's diagram draws as arrows."""
         issue = delivery.payload.get("blocked_issue")
         number = issue.get("number") if isinstance(issue, dict) else None
         if isinstance(number, int):
@@ -339,11 +340,17 @@ class WebhookStatusCacheService:
             )
         else:
             # A payload of another shape: every list this repository's issues hold.
-            self._drop_map_row(f"{wayfinder_map.BLOCKED_BY_KEY}{delivery.stream.lower()}#")
+            self._drop_map_row(
+                f"{wayfinder_map.BLOCKED_BY_KEY}{delivery.stream.lower()}#", prefix=True
+            )
 
-    def _drop_map_row(self, key: str) -> None:
-        """Drop a map's cached read; one that was held moves its open pages (#3627)."""
-        if self._cache.invalidate(key):
+    def _drop_map_row(self, key: str, *, prefix: bool = False) -> None:
+        """Mark a map's cached read out of date; one that was held moves its open pages (#3627).
+
+        One key is kept with its value (#3739): the page draws it at once while it is read
+        again behind it, rather than waiting on GitHub. A prefix, the dependency fallback's,
+        still drops every row under it."""
+        if self._cache.invalidate(key) if prefix else self._cache.expire(key):
             self._map_moved = True
 
     def _notify_pull_change(self) -> None:
@@ -636,6 +643,13 @@ class WebhookStatusCacheService:
                 and not isinstance(issue.get("comments"), bool)
                 else {}
             ),
+            # Its first assignee's login, or None (#3731: which deck works it), as
+            # ``kanban._ISSUE_JQ`` stores it; a payload without the field leaves it out.
+            **(
+                {"assignee": _assignee_login(issue["assignee"])}
+                if "assignee" in issue
+                else {}
+            ),
             # Its parent issue and its sub-issues' counts (#3622, ``work_tree``), as
             # ``kanban._ISSUE_JQ`` stores them; a payload without the fields leaves them out.
             **({"parent": issue["parent_issue_url"]} if "parent_issue_url" in issue else {}),
@@ -661,3 +675,8 @@ class WebhookStatusCacheService:
         if held_at is None or offered_at is None:
             return True
         return offered_at >= held_at
+
+
+def _assignee_login(user: object) -> str | None:
+    login = user.get("login") if isinstance(user, dict) else None
+    return login if isinstance(login, str) and login else None

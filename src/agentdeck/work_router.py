@@ -135,13 +135,17 @@ from .shared_file import SharedFile
 from .wake_on import STOP_SETTLE_S
 from .watch_retry import Backoff
 from .webhook_tailer import Delivery, WebhookTailer, WebhookWatcher
+from .work_claims import assignee_of
 from .work_release import OWNER_CALL_ASK
+from .work_signals import MARKER as START_MARKER
 
 log = logging.getLogger(__name__)
 
 CONSUMER = "work-router"
 STARTED_FILENAME = "work-router-reviews.json"
 PENDING_FILENAME = "work-router-pending.json"
+#: The Works whose issue went to another deck, as ``handed-over:<work id>`` (#3731).
+HANDED_OVER_FILENAME = "work-router-handed-over.json"
 #: A pending action's back-off (``watch_retry.Backoff``): its first wait and its ceiling.
 RETRY_FIRST_S = 60.0
 RETRY_MAX_S = 30 * 60.0
@@ -974,6 +978,28 @@ class SwitchedRepositories:
 #: registered pull request, or ``None`` when no chat does.
 Owner = tuple[str, str]
 
+#: The key prefix of a Work whose issue went to another deck (#3731).
+HANDED_OVER = "handed-over:"
+#: What a Work's chat is told when its issue goes to another deck, or to nobody where this
+#: deck does not take unassigned issues (#3731); it was interrupted just before.
+HANDED_OVER_TEXT = (
+    "AgentDeck: this issue was reassigned to {who}, so it is not this deck's any more: that "
+    "person, or their own AgentDeck on the same branch, works it now. Stop: do not push, "
+    "comment or open anything more. End your turn with one line saying where you left off."
+)
+#: ... and when it comes back to this deck's person.
+TAKEN_BACK_TEXT = (
+    "AgentDeck: this issue is assigned back to this deck's person, so it is yours again. "
+    "Fetch the branch first, since another AgentDeck may have pushed to it, then carry on."
+)
+#: What a Work's chat is told when another deck's start comment lands on its issue (#3731).
+FOREIGN_START_TEXT = (
+    "AgentDeck: another AgentDeck (@{login}) says it started an agent on this issue, so two "
+    "agents may now push the same branch. Do not push until a person has settled who works "
+    "it: ask them in your question box whether to stop, naming @{login}, and suggest they "
+    "assign the issue to the person whose deck should keep it."
+)
+
 
 class WorkRouterService:
     """Tail the streams and hand each switched Work's events to the chat that owns it.
@@ -1034,13 +1060,17 @@ class WorkRouterService:
         write_body: Callable[[str, int, str], Awaitable[bool]] | None = None,
         review_chat: Callable[[str, str], tuple[str, object | None] | None] | None = None,
         wait_review: Callable[[str, str, bool], object] | None = None,
+        mine: Callable[[str, str], bool] = lambda repository, assignee: True,
+        interrupt: Callable[[str], Awaitable[bool]] | None = None,
     ) -> None:
         self._enabled = bool(enabled)
         self._tailer = WebhookTailer(streams_root, consumer=CONSUMER)
         self._watcher = watcher
         self._switched = switched
-        self._owner_of_issue = owner_of_issue
-        self._owner_of_pull = owner_of_pull
+        # Which chat holds an issue's or a pull request's Work at all, even one handed to
+        # another deck; every other path reads ``_owner_of_issue``/``_owner_of_pull`` (#3731).
+        self._chat_of_issue = owner_of_issue
+        self._chat_of_pull = owner_of_pull
         self._schedule = schedule
         self._start_review = start_review
         self._start_work = start_work
@@ -1083,6 +1113,10 @@ class WorkRouterService:
         # asked)``: a ready press at a head under review says where that review is (#3584).
         self._review_chat = review_chat
         self._wait_review = wait_review
+        # Whether an issue assigned to a login ("" for nobody) is this deck's to work, and how
+        # a chat whose issue went to another deck is stopped (#3731).
+        self._mine = mine
+        self._interrupt = interrupt
         self._own_logins = own_logins if callable(own_logins) else frozenset(own_logins)
         self._refusal = refusal
         self._ready_head = ready_head
@@ -1098,6 +1132,10 @@ class WorkRouterService:
         )
         self.pending = pending or PendingActions(
             Path(streams_root).expanduser().parent / PENDING_FILENAME
+        )
+        # Kept apart from the reviewed heads, whose cap would drop them (#3731).
+        self.handed_over = ReviewedHeads(
+            Path(streams_root).expanduser().parent / HANDED_OVER_FILENAME
         )
         self._exists = exists
         self._clock = clock
@@ -1231,7 +1269,8 @@ class WorkRouterService:
             self._start_work is None
             or not isinstance(number, int)
             or not self._switched(repository)
-            or self._owner_of_issue(repository, number) is not None
+            or self._chat_of_issue(repository, number) is not None
+            or not self._mine(repository, assignee := str(entry.get("assignee") or ""))
         ):
             self.pending.discard(key)
             return
@@ -1240,6 +1279,7 @@ class WorkRouterService:
             repository,
             number,
             [str(name) for name in labels] if isinstance(labels, list) else [],
+            assignee,
         )
 
     async def _retry_review(self, key: str, entry: dict) -> None:
@@ -1300,6 +1340,22 @@ class WorkRouterService:
         """Whether ``repository``'s Works hear their own events (manifest ``works_router``)."""
         return bool(self._switched(repository))
 
+    def _owner_of_issue(self, repository: str, number: int) -> Owner | None:
+        """The chat working an issue's Work, or ``None``, also for one handed to another deck."""
+        return self._working(self._chat_of_issue(repository, number))
+
+    def _owner_of_pull(self, repository: str, number: int) -> Owner | None:
+        """The chat working a pull request's Work, as ``_owner_of_issue``."""
+        return self._working(self._chat_of_pull(repository, number))
+
+    def _working(self, owner: Owner | None) -> Owner | None:
+        """``owner``, unless its Work's issue went to another deck (#3731): that deck's agent
+        works it now, so this deck sends its stopped chat nothing and releases nothing until
+        the issue is assigned back (``_maybe_reassigned``)."""
+        if owner is None or f"{HANDED_OVER}{_work_id(owner)}" in self.handed_over:
+            return None
+        return owner
+
     def own_logins(self) -> frozenset[str]:
         logins = self._own_logins() if callable(self._own_logins) else self._own_logins
         return frozenset(login.casefold() for login in logins if login)
@@ -1321,6 +1377,8 @@ class WorkRouterService:
                     )
             if self._start_work is not None:
                 await self._maybe_start(delivery)
+            await self._maybe_reassigned(delivery)
+            self._maybe_foreign_start(delivery)
             if self._reread_issue is not None:
                 self._maybe_reread(delivery)
             self._note_merge_or_reopen(delivery)
@@ -1410,7 +1468,7 @@ class WorkRouterService:
         ):
             return
         repository, number = delivery.stream.lower(), issue["number"]
-        if self._owner_of_issue(repository, number) is not None:
+        if self._chat_of_issue(repository, number) is not None:
             return
         try:
             await self._load_work(repository, number)
@@ -1875,8 +1933,15 @@ class WorkRouterService:
             or isinstance(issue.get("pull_request"), dict)
             or _text(issue.get("state")).lower() == "closed"
             or name not in {item.lower() for item in self._start_labels(repository)}
-            or self._owner_of_issue(repository, number) is not None
+            or self._chat_of_issue(repository, number) is not None
         ):
+            return
+        assignee = assignee_of(issue)
+        if not self._mine(repository, assignee):
+            log.info(
+                "work-router: %s#%s is assigned to %s, whose deck works it",
+                repository, number, assignee or "nobody",
+            )
             return
         labels = issue.get("labels")
         names = (
@@ -1885,17 +1950,115 @@ class WorkRouterService:
             else []
         )
         names = [name for name in names if name]
+        await self._start_on_event(delivery, repository, number, names, assignee)
+
+    async def _start_on_event(
+        self, delivery: Delivery, repository: str, number: int, names: list[str], assignee: str
+    ) -> None:
+        """Start a Work a label or an assignment delivery asks for, unless a filing holds it."""
         if self._filing.get(repository) and not delivery.delivery_id.startswith("deck-filed:"):
             # The deck may be filing this very issue with its agent already running (#3590):
-            # tried again after the back-off, by when that start has spent the Work's.
+            # tried again after the back-off, by when that start has spent the Work's. A New
+            # work filed with its assignee (#3731) sends an assignment delivery too.
             key = f"{START}:github_issue:{repository}#{number}"
             fields = {"kind": START, "repository": repository, "number": number}
-            self.pending.put(key, {**fields, "labels": names}, self._clock())
+            self.pending.put(
+                key, {**fields, "labels": names, "assignee": assignee}, self._clock()
+            )
             log.info("work-router: start of %s#%s waits for a filing", repository, number)
             return
-        await self._start(repository, number, names)
+        await self._start(repository, number, names, assignee)
 
-    async def _start(self, repository: str, number: int, labels: list[str]) -> None:
+    async def _maybe_reassigned(self, delivery: Delivery) -> None:
+        """Start, stop or resume a Work whose issue changed hands between decks (#3731).
+
+        An issue assigned to this deck's person, or left to nobody where this deck takes those,
+        and carrying a start label, starts here when no chat owns it. One this deck works that
+        is now another deck's stops its agent: interrupted, then told who has it, so two agents
+        never push one branch. Given back, the same chat is told to carry on.
+        """
+        payload = delivery.payload
+        if delivery.event != "issues" or _text(payload.get("action")) not in {
+            "assigned",
+            "unassigned",
+        }:
+            return
+        issue = payload.get("issue")
+        if not isinstance(issue, dict) or isinstance(issue.get("pull_request"), dict):
+            return
+        number = issue.get("number")
+        if not isinstance(number, int) or _text(issue.get("state")).lower() == "closed":
+            return
+        repository = delivery.stream.lower()
+        assignee = assignee_of(issue)
+        mine = self._mine(repository, assignee)
+        key = f"{START}:github_issue:{repository}#{number}"
+        owner = self._chat_of_issue(repository, number)
+        if owner is None:
+            if not mine:
+                # A start waiting for its retry is now the other deck's.
+                self.pending.discard(key)
+                self._unwanted_starts.add(key)
+                return
+            starts = {item.lower() for item in self._start_labels(repository)}
+            names = [
+                _text(item.get("name"))
+                for item in issue.get("labels") or ()
+                if isinstance(item, dict) and _text(item.get("name"))
+            ]
+            if self._start_work is not None and any(name.lower() in starts for name in names):
+                await self._start_on_event(delivery, repository, number, names, assignee)
+            return
+        chat_id, _ = owner
+        work = _work_id(owner)
+        handed = f"{HANDED_OVER}{work}"
+        if self._finished(work):
+            return
+        if not mine and handed not in self.handed_over:
+            self.handed_over.add(handed)
+            stopped = False
+            if self._interrupt is not None:
+                try:
+                    stopped = await self._interrupt(chat_id)
+                except Exception:  # noqa: BLE001 - the message still says to stop
+                    log.warning("work-router: interrupting %s failed", chat_id, exc_info=True)
+            log.info(
+                "work-router: %s#%s went to %s; %s %s",
+                repository, number, assignee or "nobody",
+                "interrupted" if stopped else "could not interrupt", chat_id,
+            )
+            self._tell(delivery, owner, HANDED_OVER_TEXT.format(
+                who=f"@{assignee}" if assignee else "nobody"
+            ))
+        elif mine and handed in self.handed_over:
+            self.handed_over.discard(handed)
+            self._tell(delivery, owner, TAKEN_BACK_TEXT)
+
+    def _maybe_foreign_start(self, delivery: Delivery) -> None:
+        """Warn a Work's chat once another deck says it started an agent on its issue (#3731)."""
+        payload = delivery.payload
+        if delivery.event != "issue_comment" or _text(payload.get("action")) != "created":
+            return
+        comment, issue = payload.get("comment"), payload.get("issue")
+        if not isinstance(comment, dict) or not isinstance(issue, dict):
+            return
+        number = issue.get("number")
+        login, _kind = _login(comment, "user")
+        if (
+            START_MARKER not in _text(comment.get("body"))
+            or not isinstance(number, int)
+            or not login
+            or login.casefold() in self.own_logins()
+        ):
+            return
+        owner = self._owner_of_issue(delivery.stream.lower(), number)
+        if owner is None or self._finished(_work_id(owner)):
+            return
+        self._tell(delivery, owner, FOREIGN_START_TEXT.format(login=login))
+
+    async def _start(
+        self, repository: str, number: int, labels: list[str], assignee: str = ""
+    ) -> None:
         """Start the Work's agent; keep a start refused before anything ran for a retry.
 
         ``labels`` are the issue's labels as the delivery showed them, kept with a retry: a
@@ -1903,7 +2066,13 @@ class WorkRouterService:
         """
         key = f"{START}:github_issue:{repository}#{number}"
         self._unwanted_starts.discard(key)
-        fields = {"kind": START, "repository": repository, "number": number, "labels": labels}
+        fields = {
+            "kind": START,
+            "repository": repository,
+            "number": number,
+            "labels": labels,
+            "assignee": assignee,
+        }
         # A later refusal keeps the back-off this start reached, so a full account is not
         # tried every minute (#3006).
         prior = self.pending.entries.get(key) or {}

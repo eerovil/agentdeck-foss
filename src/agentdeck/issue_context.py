@@ -71,6 +71,25 @@ _BLOCKED_BY_JQ = (
     '[.[] | {repository: (.repository_url | split("/") | .[-2:] | join("/")), number}]'
 )
 
+
+def _issue_rows(value: Any) -> tuple[dict, ...] | None:
+    """A cached sub-issue or "blocked by" list's well-formed rows; None when it is no list."""
+    if not isinstance(value, list):
+        return None
+    return tuple(
+        item
+        for item in value
+        if isinstance(item, dict)
+        and isinstance(item.get("repository"), str)
+        and isinstance(item.get("number"), int)
+    )
+
+
+def _body_of(value: Any) -> str | None:
+    body = value.get("body") if isinstance(value, dict) else None
+    return body if isinstance(body, str) else None
+
+
 # ``agent/issue-<n>`` is the branch name the poller dispatches every worker on, so
 # it is the identity a chat carries even before it registers a pull request.
 _ISSUE_BRANCH_RE = re.compile(r"(?:^|/)issue-(\d+)(?:$|[^0-9])")
@@ -1015,8 +1034,9 @@ class IssueResolver:
         """An issue's sub-issues, oldest first, through the shared cache (#3622); None when
         GitHub could not be read, never an empty list for that.
 
-        Each is ``{"repository", "number", "title", "state"}``. One read per issue per the
-        cache's open TTL, shared across processes like every other row here."""
+        Each is ``{"repository", "number", "title", "state"}``. Kept a day (#3739): a
+        ``sub_issues`` or child's ``issues`` delivery marks the row out of date, and the day
+        only covers a lost delivery. Shared across processes like every other row here."""
 
         async def fetch() -> GitHubMetadata | None:
             if self._gh is None:
@@ -1034,23 +1054,33 @@ class IssueResolver:
                 value = json.loads(output)
             except (TypeError, ValueError):
                 return None
-            return GitHubMetadata(value, terminal=False) if isinstance(value, list) else None
+            return GitHubMetadata(value, terminal=True) if isinstance(value, list) else None
 
         lookup = await self._metadata.resolve(
             wayfinder_map.cache_key(wayfinder_map.SUB_ISSUES_KEY, repository, number), fetch
         )
-        value = lookup.value
-        if not isinstance(value, list):
-            return None
-        found = tuple(
-            item
-            for item in value
-            if isinstance(item, dict)
-            and isinstance(item.get("repository"), str)
-            and isinstance(item.get("number"), int)
-        )
-        self._link_children(repository, number, found)
+        found = _issue_rows(lookup.value)
+        if found is not None:
+            self._link_children(repository, number, found)
         return found
+
+    def held_sub_issues(self, repository: str, number: int) -> tuple[tuple[dict, ...] | None, bool]:
+        """``sub_issues``' held value without asking GitHub, and whether it is fresh (#3739):
+        ``(None, False)`` when none is held."""
+        return self._held(wayfinder_map.SUB_ISSUES_KEY, repository, number, _issue_rows)
+
+    def held_blocked_by(self, repository: str, number: int) -> tuple[tuple[dict, ...] | None, bool]:
+        """``blocked_by``' held value without asking GitHub, and whether it is fresh."""
+        return self._held(wayfinder_map.BLOCKED_BY_KEY, repository, number, _issue_rows)
+
+    def held_issue_body(self, repository: str, number: int) -> tuple[str | None, bool]:
+        """``issue_body``' held value without asking GitHub, and whether it is fresh."""
+        return self._held(wayfinder_map.ISSUE_BODY_KEY, repository, number, _body_of)
+
+    def _held(self, prefix: str, repository: str, number: int, parse) -> tuple[Any, bool]:
+        lookup = self._metadata.peek(wayfinder_map.cache_key(prefix, repository, number))
+        value = parse(lookup.value) if lookup.value is not None else None
+        return (value, lookup.complete) if value is not None else (None, False)
 
     def _link_children(self, repository: str, number: int, children: tuple[dict, ...]) -> None:
         """Write this issue as ``parent`` on each listed child's held row (#3654).
@@ -1069,38 +1099,34 @@ class IssueResolver:
         """The issues an issue is blocked by (GitHub's native dependencies), through the
         shared cache (#3627); None when GitHub could not be read.
 
-        Each is ``{"repository", "number"}``. One read per issue per the cache's open TTL; an
-        ``issue_dependencies`` delivery drops the row (``webhook_status_cache``)."""
-        value = await self._cached_api(
-            wayfinder_map.cache_key(wayfinder_map.BLOCKED_BY_KEY, repository, number),
-            f"repos/{repository}/issues/{number}/dependencies/blocked_by?per_page=100",
-            _BLOCKED_BY_JQ,
-        )
-        if not isinstance(value, list):
-            return None
-        return tuple(
-            item
-            for item in value
-            if isinstance(item, dict)
-            and isinstance(item.get("repository"), str)
-            and isinstance(item.get("number"), int)
+        Each is ``{"repository", "number"}``. Kept a day (#3739); an ``issue_dependencies``
+        delivery marks the row out of date (``webhook_status_cache``)."""
+        return _issue_rows(
+            await self._cached_api(
+                wayfinder_map.cache_key(wayfinder_map.BLOCKED_BY_KEY, repository, number),
+                f"repos/{repository}/issues/{number}/dependencies/blocked_by?per_page=100",
+                _BLOCKED_BY_JQ,
+            )
         )
 
     async def issue_body(self, repository: str, number: int) -> str | None:
         """An issue's body, through the shared cache (#3627); None when unreadable.
 
-        A wayfinder map's body names its destination and its fog. An ``issues`` delivery
-        that edits it drops the row (``webhook_status_cache``)."""
-        value = await self._cached_api(
-            wayfinder_map.cache_key(wayfinder_map.ISSUE_BODY_KEY, repository, number),
-            f"repos/{repository}/issues/{number}",
-            '{body: (.body // "")}',
+        A wayfinder map's body names its destination and its fog. Kept a day (#3739); an
+        ``issues`` delivery marks the row out of date (``webhook_status_cache``)."""
+        return _body_of(
+            await self._cached_api(
+                wayfinder_map.cache_key(wayfinder_map.ISSUE_BODY_KEY, repository, number),
+                f"repos/{repository}/issues/{number}",
+                '{body: (.body // "")}',
+            )
         )
-        body = value.get("body") if isinstance(value, dict) else None
-        return body if isinstance(body, str) else None
 
     async def _cached_api(self, key: str, path: str, jq: str) -> Any:
-        """One ``gh api`` read as JSON through the shared cache, or None when it failed."""
+        """One ``gh api`` read as JSON through the shared cache, or None when it failed.
+
+        Stored with the day-long TTL (#3739): its webhooks mark the row out of date, so the
+        TTL is only the backstop for a delivery GitHub never sent."""
 
         async def fetch() -> GitHubMetadata | None:
             if self._gh is None:
@@ -1112,7 +1138,7 @@ class IssueResolver:
                 value = json.loads(output)
             except (TypeError, ValueError):
                 return None
-            return GitHubMetadata(value, terminal=False)
+            return GitHubMetadata(value, terminal=True)
 
         return (await self._metadata.resolve(key, fetch)).value
 

@@ -253,6 +253,20 @@ def test_a_filing_creates_the_issue_with_one_request_and_answers_with_the_link(
     assert press.result == "https://github.com/eerovil/agentdeck/issues/77"
 
 
+def test_a_filing_assigns_this_decks_person_where_another_deck_takes_unassigned(
+    tmp_path, monkeypatch
+):
+    """#3731: filed already this deck's, or the deck that takes unassigned issues starts it."""
+    app, gh = _app(tmp_path, monkeypatch)
+    app.state.deck_claims = lambda repository, assignee: assignee == "me"
+    monkeypatch.setattr("agentdeck.poller_engine.github_authority.deck_person", lambda: "me")
+
+    assert _file(_client(app)).status_code == 200
+
+    ((_argv, stdin, _repo),) = _creates(gh)
+    assert json.loads(stdin)["assignees"] == ["me"]
+
+
 async def _post_and_settle(app, **fields):
     """File through the app's own loop, then let the early start settle (#3590)."""
     import asyncio

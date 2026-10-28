@@ -12,9 +12,10 @@ always leaves a fresh update time, and the owner chose to leave the old labelled
 nobody has touched in days, alone rather than start it all at the first pass after a deploy.
 
 Left alone besides: a closed issue, a pull request, an issue carrying its project's paused
-label, a Work paused on this deck, a Work a Poller card still holds, and a Work whose
-deck start was already spent. A spec-only issue is started like any other, and its agent is
-told to write the spec (#3134). The issue list is the shared cache the refresher keeps warm, so
+label, a Work paused on this deck, a Work a Poller card still holds, a Work whose deck start
+was already spent, and an issue another deck works because it is assigned to that deck's
+person (``work_claims``, #3731). A spec-only issue is started like any other, and its agent
+is told to write the spec (#3134). The issue list is the shared cache the refresher keeps warm, so
 a pass costs no GitHub call; a candidate's own record is re-read once before it is started,
 so a stale list never starts an issue a person has since closed or held back. Each start is
 logged as the backstop's, so a lost delivery stays visible.
@@ -31,6 +32,7 @@ from datetime import datetime
 
 from .issue_context import IssueBacklog
 from .work import WorkRef
+from .work_claims import assignee_of
 
 log = logging.getLogger(__name__)
 
@@ -47,7 +49,8 @@ class MissedStartBackstop:
     ``start_labels()`` and ``hold_labels()`` map a lowercased ``owner/repo`` to its lowercased
     labels. ``backlog()`` is the cached issue lists; ``reread(repository, number)`` refreshes
     one issue's record and ``record(repository, number)`` returns it (``kanban._ISSUE_JQ``'s
-    shape). ``owned``, ``paused`` and ``spent`` say a Work needs no start from here.
+    shape). ``owned``, ``paused`` and ``spent`` say a Work needs no start from here, and
+    ``mine(repository, assignee)`` whether this deck works an issue assigned to ``assignee``.
     """
 
     def __init__(
@@ -62,6 +65,7 @@ class MissedStartBackstop:
         paused: Callable[[str], bool],
         spent: Callable[[str], bool],
         start_work: Callable[[str, int], Awaitable[object]],
+        mine: Callable[[str, str], bool] = lambda repository, assignee: True,
         enabled: bool = True,
         interval_s: float = INTERVAL_S,
         first_pass_s: float = FIRST_PASS_S,
@@ -76,6 +80,7 @@ class MissedStartBackstop:
         self._paused = paused
         self._spent = spent
         self._start_work = start_work
+        self._mine = mine
         self._enabled = bool(enabled)
         self._interval_s = interval_s
         self._first_pass_s = first_pass_s
@@ -137,6 +142,7 @@ class MissedStartBackstop:
                     not issue.is_open
                     or not self._recent(issue.updated_at, now)
                     or not self._labels_start(issue.labels, wanted, holds)
+                    or not self._mine(repository, (issue.assignees or ("",))[0].lower())
                 ):
                     continue
                 work_id = WorkRef(repository, issue.number).work_id
@@ -179,6 +185,7 @@ class MissedStartBackstop:
             or record.get("is_pr")
             or not isinstance(labels, list)
             or not self._labels_start(labels, wanted, holds)
+            or not self._mine(repository, assignee_of(record))
             or self._owned(repository, number)
         ):
             return False

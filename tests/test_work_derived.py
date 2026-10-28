@@ -1424,9 +1424,14 @@ def test_a_parked_work_waits_for_a_person_and_is_never_asked_for_a_next_step(tmp
     assert ask_for_next_steps(app, [replace(task, derived=found)]) == 0 and scheduled == []
     assert front_row(replace(task, derived=found), current=False).section == "active"
     assert derived_story(replace(task, derived=found)).headline == "Parked"
-    # An open pull request, a running turn or a question still reads as itself.
-    pushed = status(parked=True, pr_open=True, last_text="Pushed.", ended_at=AT, asks=True)
+    # A ready pull request, a running turn or a question still reads as itself.
+    pushed = status(
+        parked=True, pr_open=True, ready_pr_open=True, last_text="Pushed.", ended_at=AT, asks=True
+    )
     assert pushed.kind == ENDED
+    # #3733: a draft put on hold with the Work does not unpark it.
+    on_hold = status(parked=True, pr_open=True, last_text="Parked.", ended_at=AT, asks=True)
+    assert on_hold.kind == PARKED
     assert status(parked=True, running=True).kind == WORKING
     assert status(parked=True, question="Which day?").kind == QUESTION
 

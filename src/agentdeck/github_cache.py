@@ -546,7 +546,12 @@ class GitHubMetadataCache:
         max_refreshes: int | None = None,
         ignore_backoff: bool = False,
     ) -> dict[str, GitHubLookup]:
-        """Resolve a batch while optionally bounding its actual GitHub calls."""
+        """Resolve a batch while optionally bounding its actual GitHub calls.
+
+        Every SQLite statement runs in a worker thread, never on the event loop (#3739):
+        the file is shared across processes in rollback-journal mode, so one claim or store
+        can wait up to its busy timeout and each commit syncs to disk. A Work page's map
+        re-reading its 25 rows on the loop stalled every request for up to 2.8 s."""
         checked_at = time.time() if now is None else now
         results: dict[str, GitHubLookup] = {}
         claimed: list[
@@ -559,9 +564,10 @@ class GitHubMetadataCache:
         ] = []
         for key, fetch in dict(requests).items():
             if max_refreshes is not None and len(claimed) >= max_refreshes:
-                results[key] = self.peek(key)
+                results[key] = await asyncio.to_thread(self.peek, key)
                 continue
-            token, cached = self._claim(
+            token, cached = await asyncio.to_thread(
+                self._claim,
                 key,
                 force=force,
                 fresh_after=fresh_after,
@@ -581,17 +587,17 @@ class GitHubMetadataCache:
         ) -> tuple[str, GitHubLookup]:
             metadata = await fetch()
             if metadata is None:
-                self._back_off(key, checked_at, token)
+                await asyncio.to_thread(self._back_off, key, checked_at, token)
                 return (key, cached)
             if not token:
                 return (key, GitHubLookup(metadata.value, True, True, age_s=0.0))
-            if not self._store(key, metadata, checked_at, token):
+            if not await asyncio.to_thread(self._store, key, metadata, checked_at, token):
                 # Our lease ran out mid-fetch. A result a later fetch already stored wins;
                 # otherwise the answer we got is still GitHub's newest answer, and handing
                 # back the row (empty, or older than ours) turned it into "GitHub did not
                 # answer" or a stale value (#3344, #3347 review).
-                if self._fetched_at(key) > checked_at:
-                    return (key, self.peek(key))
+                if await asyncio.to_thread(self._fetched_at, key) > checked_at:
+                    return (key, await asyncio.to_thread(self.peek, key))
                 return (key, GitHubLookup(metadata.value, True, True, age_s=0.0))
             return (key, GitHubLookup(metadata.value, True, True, age_s=0.0))
 

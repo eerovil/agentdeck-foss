@@ -23,10 +23,11 @@ from agentdeck.work_overview import unstarted_issues, work_href
 NOW = datetime.now(UTC)
 
 
-def _issue(number, *, labels=(), age=timedelta(days=1), state="open"):
+def _issue(number, *, labels=(), age=timedelta(days=1), state="open", assignees=()):
     return IssueContext(
         "eerovil/agentdeck", number, f"Issue {number}",
         f"https://github.com/eerovil/agentdeck/issues/{number}", state, labels=tuple(labels),
+        assignees=tuple(assignees),
         created_at=(NOW - age).isoformat() if age is not None else None,
     )
 
@@ -53,6 +54,10 @@ def test_only_recent_open_issues_without_the_label_are_unstarted():
     # A repository with no ownership label has nothing to start one with.
     assert unstarted_issues(_backlog(_issue(1), labels=()), now=NOW) == {}
     assert unstarted_issues(None, now=NOW) == {}
+    # #3731: an issue assigned to another deck's person is that deck's to start.
+    shared = _backlog(_issue(1, assignees=["Coworker"]), _issue(2), _issue(3, assignees=["me"]))
+    mine = lambda repository, assignee: assignee in {"", "me"}  # noqa: E731
+    assert sorted(ref.number for ref in unstarted_issues(shared, now=NOW, mine=mine)) == [2, 3]
 
 
 @pytest.mark.asyncio
@@ -110,3 +115,32 @@ async def test_start_agent_adds_the_ownership_label(tmp_path, monkeypatch):
     assert closed.status_code == 200 and "Closed" in closed.text
     assert gh.calls[-1][0] == ["/usr/bin/gh", "issue", "close", "2147", "--repo",
                                "eerovil/agentdeck", "--reason", "completed"]
+
+
+async def test_start_agent_assigns_this_decks_person_where_another_deck_takes_unassigned(
+    tmp_path, monkeypatch
+):
+    """#3731: assigned first, so the label's delivery already shows whose issue it is."""
+    from fastapi.testclient import TestClient
+
+    from agentdeck.web import routes_works
+
+    app = _app(tmp_path)
+    backlog = _backlog(_issue(WORK.number))
+    app.state.issues.read_board = lambda: backlog.board
+    app.state.issues.cached = lambda: backlog
+    app.state.deck_claims = lambda repository, assignee: assignee == "me"
+    gh = _Gh((0, b"", b""))
+    monkeypatch.setattr(gh_cli, "run_once", gh)
+    monkeypatch.setattr(routes_works.shutil, "which", lambda name: "/usr/bin/gh")
+    monkeypatch.setattr("agentdeck.poller_engine.github_authority.deck_person", lambda: "me")
+
+    pressed = TestClient(app).post(
+        work_href(WORK.work_id) + "/action",
+        data={"action": "start", "client_action_id": "press-0001"},
+    )
+
+    assert pressed.status_code == 200 and "assigned to me" in pressed.text
+    assert [argv[-2:] for argv, _stdin, _repo in gh.calls] == [
+        ["--add-assignee", "me"], ["--add-label", "agent"]
+    ]

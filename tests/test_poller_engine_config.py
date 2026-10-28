@@ -571,6 +571,22 @@ def test_the_fallback_order_always_starts_with_the_primary_account(tmp_path):
     assert overlay.usage_cache == "/run/user/1000/agentdeck"
 
 
+def test_a_deck_leaving_unassigned_issues_to_another_must_not_run_cards(tmp_path):
+    """#3731: ``[claims] unassigned = false`` needs the deck, not the Poller, to start Works,
+    so a second deck's Poller never seeds or moves a shared board's cards."""
+    claims = _OVERLAY + "\n[claims]\nunassigned = false\n"
+    assert _inspect(tmp_path).overlay.claims_unassigned is True
+    refused = _inspect(tmp_path, overlay=claims)
+    assert refused.overlay.claims_unassigned is False
+    assert "overlay.claims.unassigned" in _locations(refused)
+    switched = _MANIFEST.replace("release = true", "release = true\nworks_router = true")
+    assert "overlay.claims.unassigned" not in _locations(
+        _inspect(tmp_path, manifest=switched, overlay=claims)
+    )
+    wrong = _inspect(tmp_path, manifest=switched, overlay=claims.replace("false", '"no"'))
+    assert "overlay.claims.unassigned" in _locations(wrong)
+
+
 def test_each_account_can_name_its_own_usage_ceiling(tmp_path):
     overlay = _inspect(
         tmp_path,

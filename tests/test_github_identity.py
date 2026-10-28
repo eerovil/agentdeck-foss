@@ -148,6 +148,24 @@ def test_a_switch_takes_effect_without_a_restart(tmp_path, monkeypatch):
         github_identity.authority_for(AGENT)
 
 
+@pytest.mark.parametrize(
+    ("text", "person"),
+    [
+        ('[deck]\nperson = " EeroVil "\n', "eerovil"),
+        ("[deck]\n", ""),
+        ('[deck]\nperson = "not a login!"\n', ""),
+        ("[deck]\nperson = 3\n", ""),
+        ("", ""),
+    ],
+)
+def test_the_decks_person_is_read_from_the_accounts_file(tmp_path, monkeypatch, text, person):
+    """#3731: whose issues this deck works when another deck watches the same repository."""
+    from agentdeck.poller_engine import github_authority
+
+    _map(tmp_path, monkeypatch, text)
+    assert github_authority.deck_person() == person
+
+
 # --- the credential and the child environment -----------------------------------------------
 
 

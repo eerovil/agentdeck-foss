@@ -37,6 +37,7 @@ from ..state import REVIEWS_TOPIC
 from ..work import WorkRef
 from ..work_actions import STAR, UNSTAR, WorkActionPress, finish_question
 from ..work_attention import FINISH, HIDE
+from ..work_claims import own_assignee
 from ..work_hidden import UNHIDE
 from ..work_overview import (
     WorkCandidate,
@@ -1414,6 +1415,21 @@ async def _write(
             "--add-label", step.body,
         ]
         done = f"Started {step.issue}: it has the {step.body} label, so an agent starts on it"
+        assignee = own_assignee(step.repository, getattr(request.app.state, "deck_claims", None))
+        if assignee:
+            # Where another deck takes unassigned issues, it would start this one (#3731).
+            # Assigned first, so the label's delivery already shows whose it is.
+            outcome, text = await _run_gh(
+                [
+                    gh, "issue", "edit", str(step.number), "--repo", step.repository,
+                    "--add-assignee", assignee,
+                ],
+                step.repository,
+                label,
+            )
+            if outcome != "done":
+                return outcome, text
+            done += f"; it is assigned to {assignee}"
     elif step.kind == "remove_label":
         argv = [
             gh, "issue", "edit", str(step.number), "--repo", step.repository,
@@ -1432,10 +1448,14 @@ async def _write(
             step.body,
         ]
         done = f"Closed {step.issue}"
+    outcome, text = await _run_gh(argv, step.repository, label)
+    return (outcome, done) if outcome == "done" else (outcome, text)
+
+
+async def _run_gh(argv: list[str], repository: str, label: str) -> tuple[str, str]:
+    """One ``gh`` write of a Work action: ``("done", "")``, or its outcome and why."""
     try:
-        code, _stdout, stderr = await gh_cli.run_once(
-            argv, timeout=_GH_TIMEOUT_S, repo=step.repository
-        )
+        code, _stdout, stderr = await gh_cli.run_once(argv, timeout=_GH_TIMEOUT_S, repo=repository)
     except gh_cli.GitHubRefusal as exc:
         # Refused before anything ran, so pressing again after fixing it is safe.
         return "failed", str(exc)
@@ -1444,7 +1464,7 @@ async def _write(
     if code != 0:
         message = stderr.decode("utf-8", "replace").strip() or f"gh exited {code}"
         return "uncertain", f"{label} did not report success ({message}); it may have landed"
-    return "done", done
+    return "done", ""
 
 
 @router.post("/works/{work_id:path}/action", response_class=HTMLResponse)
@@ -1916,6 +1936,9 @@ async def file_new_work(request: Request) -> HTMLResponse:
             attachments=attachments,
             chat_url=_new_work_chat_url(request, request.query_params.get("from", "")),
             on_body=start_early,
+            assignee=own_assignee(
+                target.repository, getattr(request.app.state, "deck_claims", None)
+            ),
         )
     except BaseException:
         # Cut short (a deploy, a crash in the filing): an early agent only waits.

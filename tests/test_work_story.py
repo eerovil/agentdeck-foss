@@ -2116,6 +2116,75 @@ async def test_a_maps_work_page_draws_its_tickets_from_cached_reads():
 
 
 @pytest.mark.asyncio
+async def test_a_maps_page_draws_held_reads_at_once_and_refreshes_behind_it():
+    """#3739: a map's held rows are drawn even when out of date, so opening it never waits
+    on GitHub; one re-read per Work runs behind the page and redraws open pages only when
+    GitHub's answer moved. A read with nothing held still waits."""
+    import asyncio
+    from types import SimpleNamespace
+
+    from agentdeck import wayfinder_map as wm
+    from agentdeck.web import work_view
+
+    item = {"repository": "eerovil/agentdeck", "number": 11, "title": "Old", "state": "open"}
+    held = {"sub_issues": ((item,), False), "issue_body": ("## Destination\n\nShip.", True),
+            "blocked_by": None}
+    fetched = {"sub_issues": ({**item, "title": "New"},), "issue_body": "## Destination\n\nShip.",
+               "blocked_by": ()}
+    # The page's own read waits on ``gate``; the re-read behind it on ``behind``.
+    calls, gate, behind = [], asyncio.Event(), asyncio.Event()
+
+    def holder(name):
+        return lambda *args: held[name] or (None, False)
+
+    def reader(name):
+        async def read(*args):
+            calls.append(name)
+            await (behind if name == "sub_issues" else gate).wait()
+            return fetched[name]
+
+        return read
+
+    issues = SimpleNamespace(
+        **{f"held_{name}": holder(name) for name in fetched},
+        **{name: reader(name) for name in fetched},
+        cached_issues=lambda refs: {},
+    )
+    published = []
+    app = SimpleNamespace(state=SimpleNamespace(
+        issues=issues, work_overview=None, control_db=None,
+        app_state=SimpleNamespace(bus=SimpleNamespace(publish=published.append)),
+    ))
+    ref = WorkRef("eerovil/agentdeck", 10)
+    record = {"labels": ["wayfinder:map"], "subIssues": {"total": 1, "completed": 0}}
+
+    # Nothing held for #11's "blocked by": that read waits; the rest come from the cache.
+    pending = asyncio.ensure_future(work_view._work_tree(app, ref, record))
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert calls == ["blocked_by"] and not pending.done()
+    gate.set()
+    tree = await pending
+    assert tree.children[0].title == "Old" and tree.diagram is not None
+    assert not tree.diagram.partial
+    held["blocked_by"] = ((), True)  # the cache holds what that read stored
+
+    generation = wm.generation()
+    task = app.state.work_tree_refreshes[ref.work_id]
+    await work_view._work_tree(app, ref, record)  # drawn again at once: no second refresh
+    assert app.state.work_tree_refreshes[ref.work_id] is task and "sub_issues" in calls
+    behind.set()
+    await task
+    assert wm.generation() == generation + 1 and published == ["works"]
+
+    # A re-read that finds nothing new redraws nothing.
+    fetched["sub_issues"] = (item,)
+    await work_view._work_tree(app, ref, record)
+    await app.state.work_tree_refreshes.get(ref.work_id, task)
+    assert wm.generation() == generation + 1 and published == ["works"]
+
+
+@pytest.mark.asyncio
 async def test_a_maps_pages_and_pushes_point_at_its_waiting_questions():
     """#3696: a map's row takes the map issue's title, leads with the question by its header,
     counts questions, work and blocked tickets, and opens the question's chat at its form; its
@@ -2135,7 +2204,9 @@ async def test_a_maps_pages_and_pushes_point_at_its_waiting_questions():
 
     rows, parents = _tree_rows()
     asks = WorkAttention("c:a:t11", "Ticket chat", "waiting", "/chats/t11", asks=True,
-                         question="Which lists does the deck keep?", interaction="question",
+                         question=("Lists: which to keep. Which lists does the deck keep?\n"
+                                   "What I found:\n- The deck keeps three lists. - Two are "
+                                   "never read."), interaction="question",
                          header="Lists")
     rows[10] = front_row(replace(rows[10].card, labels=("agent", "Wayfinder:Map"),
                                  issue_title="Make wayfinder great"), current=False)
@@ -2147,6 +2218,7 @@ async def test_a_maps_pages_and_pushes_point_at_its_waiting_questions():
     assert row.map.title == "Make wayfinder great" and row.map.tickets
     assert row.progress == "1/5 done · 1 asks you · 1 working · 1 blocked"
     [asked] = row.map.questions
+    # Only the sentence that asks, not what the agent found (#3736).
     assert asked.line == "Lists: Which lists does the deck keep?"
     assert asked.href == "/chats/t11#pending-interaction" and asked.title == "Decide lists"
     # A ticket the owner hid keeps its own row for the Hidden list: listed, so not blocked.
@@ -2154,13 +2226,36 @@ async def test_a_maps_pages_and_pushes_point_at_its_waiting_questions():
                          hidden={ticket})
     shown = next(item for item in put if item.card.work_id == map_id)
     assert shown.progress == "1/5 done · 1 working · 1 blocked"
+    # A ticket no agent started waits on the open ones, not on the owner (#3736): it neither
+    # leads the row nor counts as Not started, until it is all that is left.
+    unstarted = front_row(replace(rows[13].card, start_label="agent"), current=False)
+    assert unstarted.attention.category == "unstarted"
+    held = {**rows, 13: unstarted}
+    [row13] = work_tree.fold(list(held.values()), parents=parents, counts={map_id: (1, 5)})
+    assert row13.lead.card.work_id == ticket
+    assert row13.progress == "1/5 done · 1 asks you · 1 working · 2 blocked"
+    # Nor is it a Needs you of its own: no top-bar entry, push or needs-you wake.
+    assert [item.card.work_id for item in front_sections([row13]).needs_you_works] == [ticket]
+    quiet = {10: rows[10], 13: unstarted}
+    [alone] = work_tree.fold(list(quiet.values()), parents=parents, counts={map_id: (1, 5)})
+    assert alone.lead.card.work_id == unstarted.card.work_id
+    # A deck-run ticket asking in its own chat, with no Deckhand card, asks too.
+    from agentdeck.work_derived import QUESTION, DerivedStatus
+
+    chat_asks = front_row(replace(rows[13].card, derived=DerivedStatus(
+        QUESTION, "Needs you — Which?", summary="Which?", chat_href="/chats/t12")),
+        current=True)
+    [derived] = work_tree.fold([rows[10], chat_asks], parents=parents, counts={map_id: (1, 5)})
+    assert [(q.line, q.href) for q in derived.map.questions] == [
+        ("Which?", "/chats/t12#pending-interaction")
+    ]
 
     templates = Jinja2Templates(directory=str(app_mod._TEMPLATES_DIR))
     render_mod.register_filters(templates)
     overview = WorkOverview(front=front_sections([row]))
     html = render_work_front(templates, overview, "needs")
     assert "Make wayfinder great" in html and "Issue 10" not in html
-    assert "Lists: Which lists does the deck keep?" in html
+    assert "Lists: Which lists does the deck keep?" in html and "never read" not in html
     assert 'class="fr-tree" href="/chats/t11#pending-interaction"' in html
     # A parent that is not a map keeps its words.
     plain = work_tree.fold(
@@ -2192,7 +2287,7 @@ async def test_a_maps_pages_and_pushes_point_at_its_waiting_questions():
 
     # The map page: what waits, and a box that says what it asks and opens the form.
     async def blocked_by(repository, number):
-        return []
+        return [{"repository": "eerovil/agentdeck", "number": 11}] if number == 13 else []
 
     async def issue_body(repository, number):
         return "## Destination\n\nShip it.\n"
@@ -2201,12 +2296,14 @@ async def test_a_maps_pages_and_pushes_point_at_its_waiting_questions():
                              cached_issues=lambda refs: {})
     page_app = SimpleNamespace(state=SimpleNamespace(issues=issues, work_overview=None))
     items = [{"repository": "eerovil/agentdeck", "number": n, "title": f"Issue {n}",
-              "state": "open", "labels": ["wayfinder:research"]} for n in (11, 12)]
+              "state": "open", "labels": ["wayfinder:research"]} for n in (11, 12, 13)]
     diagram = await work_view._wayfinder_diagram(
         page_app, WorkRef("eerovil/agentdeck", 10), {"labels": ["wayfinder:map"]}, items,
-        {ticket: rows[11]},
+        {ticket: rows[11], unstarted.card.work_id: unstarted},
     )
     box = {item.key.rsplit("#", 1)[-1]: item for item in diagram.boxes}
+    # Not started, and blocked by #11's open question: it waits, it does not need you.
+    assert unstarted.section == "needs_you" and box["13"].state == "waiting"
     assert " ".join(box["11"].lines) == "Asks: Lists · Issue 11"
     assert box["11"].href == asked.href and box["12"].href.startswith("/works/")
     assert [item.work_id for item in diagram.questions] == [ticket]
@@ -2215,6 +2312,7 @@ async def test_a_maps_pages_and_pushes_point_at_its_waiting_questions():
                         verifications=(), tree=tree)
     section = dict(work_view.render_work_sections(templates, detail))["tree"]
     assert "Waiting for you" in section and f'data-wm-question="{ticket}"' in section
+    assert asked.line in section and "never read" not in section
     assert 'href="/chats/t11#pending-interaction"' in section
 
 

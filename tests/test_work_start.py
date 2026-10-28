@@ -14,14 +14,14 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
-from test_work_router import deliver
+from test_work_router import comment, deliver
 
-from agentdeck import work_signals, work_start
+from agentdeck import work_claims, work_signals, work_start
 from agentdeck.inject import InjectResult
 from agentdeck.poller_ops import works_router_accounts, works_router_start_labels
 from agentdeck.webhook_tailer import WebhookTailer
 from agentdeck.work import WorkRef
-from agentdeck.work_router import WorkRouterService
+from agentdeck.work_router import HANDED_OVER, WorkRouterService
 from agentdeck.work_start import start_action_id, start_work_agent
 
 ISSUE = "eerovil/agentdeck"
@@ -30,31 +30,50 @@ ANNOUNCE_START = work_signals.announce_start
 
 
 def labelled(
-    root, delivery: str, *, label="agent", number=7, state="open", on_pull=False, labels=()
+    root,
+    delivery: str,
+    *,
+    label="agent",
+    number=7,
+    state="open",
+    on_pull=False,
+    labels=(),
+    action="labeled",
+    assignee="",
 ):
-    issue = {"number": number, "state": state, "labels": [{"name": name} for name in labels]}
+    issue = {
+        "number": number,
+        "state": state,
+        "labels": [{"name": name} for name in labels],
+        "assignee": {"login": assignee} if assignee else None,
+    }
     if on_pull:
         issue["pull_request"] = {"url": "x"}
     deliver(
         root,
         event="issues",
         delivery=delivery,
-        action="labeled",
+        action=action,
         issue=issue,
         label={"name": label},
         sender={"login": "eerovil", "type": "User"},
     )
 
 
-async def route(root, *, owners=None, switched=True, labels=None):
-    service, started = router(root, owners=owners, switched=switched, labels=labels)
+def coworkers_deck(repository: str, assignee: str) -> bool:
+    """The rule on a deck whose person is ``eerovil`` and that leaves unassigned issues."""
+    return work_claims.mine(assignee, person="eerovil", takes_unassigned=False)
+
+
+async def route(root, *, owners=None, switched=True, labels=None, **kwargs):
+    service, started = router(root, owners=owners, switched=switched, labels=labels, **kwargs)
     tailer = WebhookTailer(root, consumer="work-router")
     await service.apply(list(tailer.deliveries()))
     tailer.commit()
     return started
 
 
-def router(root, *, owners=None, switched=True, labels=None):
+def router(root, *, owners=None, switched=True, labels=None, **kwargs):
     started: list[tuple[str, int]] = []
 
     async def start_work(repository: str, number: int, **kwargs) -> str:
@@ -71,11 +90,12 @@ def router(root, *, owners=None, switched=True, labels=None):
         switched=lambda repository: switched,
         owner_of_issue=lambda repository, number: (owners or {}).get((repository, number)),
         owner_of_pull=lambda repository, number: None,
-        schedule=lambda message: message,
+        schedule=kwargs.pop("schedule", lambda message: message),
         start_review=start_review,
         own_logins=frozenset(),
         start_work=start_work,
         start_labels=lambda repository: ("Agent",) if repository == ISSUE else (),
+        **kwargs,
     )
     return service, started
 
@@ -101,6 +121,142 @@ async def test_the_ownership_label_on_an_unowned_issue_starts_its_work(root):
 async def test_only_the_ownership_label_on_an_open_issue_starts_anything(root, kwargs):
     labelled(root, "d1", **kwargs)
     assert await route(root) == []
+
+
+@pytest.mark.parametrize(
+    ("assignee", "person", "takes_unassigned", "mine"),
+    [
+        ("coworker", "", False, True),  # no person named: as before #3731
+        ("", "eerovil", True, True),
+        ("", "eerovil", False, False),
+        ("EeroVil", "eerovil", False, True),
+        ("coworker", "eerovil", True, False),
+    ],
+)
+def test_whose_issue_it_is(assignee, person, takes_unassigned, mine):
+    assert work_claims.mine(assignee, person=person, takes_unassigned=takes_unassigned) is mine
+
+
+@pytest.mark.parametrize(
+    ("assignee", "action", "started"),
+    [
+        ("Eerovil", "labeled", True),
+        ("", "labeled", False),
+        ("coworker", "labeled", False),
+        ("eerovil", "assigned", True),
+        ("coworker", "assigned", False),
+        ("", "unassigned", False),
+    ],
+)
+async def test_only_an_issue_assigned_to_this_decks_person_starts_here(
+    root, assignee, action, started
+):
+    """#3731: two decks on one repository; the issue's first assignee says which one works it.
+    An assignment to this deck's person starts an issue that already carries the label."""
+    labelled(root, "d1", labels=("agent",), action=action, assignee=assignee)
+    assert await route(root, mine=coworkers_deck) == ([(ISSUE, 7)] if started else [])
+
+
+async def test_an_assignment_waits_while_the_deck_files_in_its_repository(root):
+    """#3731 review: a New work filed with its assignee sends an assignment delivery, which
+    must wait for the filing like the label's (#3590), not start a second agent."""
+    service, started = router(root, mine=coworkers_deck)
+    labelled(root, "d1", labels=("agent",), action="assigned", assignee="eerovil")
+    tailer = WebhookTailer(root, consumer="work-router")
+
+    with service.filing(ISSUE):
+        await service.apply(list(tailer.deliveries()))
+
+    assert started == []
+    assert service.pending.entries[f"start:github_issue:{ISSUE}#7"]["assignee"] == "eerovil"
+
+
+async def test_a_retried_start_rechecks_whose_issue_it_is(root):
+    """#3731: a start kept for its retry is not made once the issue went to another deck."""
+    service, started = router(root, mine=coworkers_deck)
+    key = f"start:github_issue:{ISSUE}#7"
+    fields = {"kind": "start", "repository": ISSUE, "number": 7, "labels": ["agent"]}
+    service.pending.put(key, {**fields, "assignee": "coworker"}, 0.0)
+    await service._retry_start(key, service.pending.entries[key])
+    assert started == []
+    assert key not in service.pending.entries
+    service.pending.put(key, {**fields, "assignee": "eerovil"}, 0.0)
+    await service._retry_start(key, service.pending.entries[key])
+    assert started == [(ISSUE, 7)]
+
+
+async def test_a_reassigned_work_stops_its_chat_once_and_hears_when_it_comes_back(root):
+    """#3731: the deck that loses an issue interrupts its agent and says who has it; a
+    replayed or second assignment to someone else does neither again, and a person's
+    ``/claude`` meant for the deck that took it over reaches no chat here."""
+    sent: list = []
+    interrupted: list = []
+
+    async def interrupt(chat_id):
+        interrupted.append(chat_id)
+        return True
+
+    async def authorized(repository, login, association):
+        return True
+
+    ports = {
+        "owners": {(ISSUE, 7): ("chat-1", "eerovil/agentdeck#7")},
+        "mine": coworkers_deck,
+        "interrupt": interrupt,
+        "schedule": sent.append,
+        "authorized": authorized,
+    }
+    labelled(root, "d1", labels=("agent",), action="assigned", assignee="coworker")
+    labelled(root, "d2", labels=("agent",), action="assigned", assignee="someone")
+    comment(root, "d3", comment_id=101)
+    assert await route(root, **ports) == []
+    assert interrupted == ["chat-1"]
+    assert [message.chat_id for message in sent] == ["chat-1"]
+    assert "reassigned to @coworker" in sent[0].text
+
+    labelled(root, "d4", labels=("agent",), action="assigned", assignee="eerovil")
+    comment(root, "d5", comment_id=102)
+    await route(root, **ports)
+    assert interrupted == ["chat-1"]
+    assert len(sent) == 3 and "yours again" in sent[1].text
+    assert "please also fix X" in sent[2].text
+
+
+@pytest.mark.parametrize(
+    ("login", "handed_over", "warned"),
+    [
+        ("their-deck[bot]", False, True),
+        ("our-deck[bot]", False, False),
+        ("their-deck[bot]", True, False),  # this deck handed the issue over on purpose
+    ],
+)
+async def test_another_decks_start_comment_warns_the_works_chat(root, login, handed_over, warned):
+    """#3731: another deck says it started an agent on an issue this deck works."""
+    sent: list = []
+    deliver(
+        root,
+        event="issue_comment",
+        delivery="d1",
+        action="created",
+        sender={"login": login, "type": "Bot"},
+        issue={"number": 7},
+        comment={
+            "id": 5,
+            "user": {"login": login, "type": "Bot"},
+            "body": work_signals.start_comment(action_id="work-start-x"),
+        },
+    )
+    service, _ = router(
+        root,
+        owners={(ISSUE, 7): ("chat-1", "eerovil/agentdeck#7")},
+        schedule=sent.append,
+    )
+    service._own_logins = frozenset({"our-deck[bot]"})
+    if handed_over:
+        service.handed_over.add(f"{HANDED_OVER}github_issue:eerovil/agentdeck#7")
+    tailer = WebhookTailer(root, consumer="work-router")
+    await service.apply(list(tailer.deliveries()))
+    assert [f"@{login}" in message.text for message in sent] == ([True] if warned else [])
 
 
 async def test_an_issue_a_chat_already_owns_is_not_started_again(root):

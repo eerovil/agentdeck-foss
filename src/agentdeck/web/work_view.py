@@ -75,7 +75,13 @@ from ..work_actions import (
     pause_refusal,
     star_control,
 )
-from ..work_attention import ISSUE_CLOSED, MERGE, OperatorAttention, operator_attention
+from ..work_attention import (
+    ISSUE_CLOSED,
+    MERGE,
+    UNSTARTED,
+    OperatorAttention,
+    operator_attention,
+)
 from ..work_facts import (
     DEPLOY_GRACE,
     FINISH_SLACK,
@@ -1257,6 +1263,7 @@ def derived_for(
     cut_off = bool(session is not None and getattr(session, "turn_cut_off", False) and not running)
     cut_off_at = getattr(session, "turn_cut_off_at", None) if cut_off else None
     pr_open = any(output.is_open for output in card.outputs)
+    ready_pr_open = any(output.is_open and not output.draft for output in card.outputs)
     # Merged and nothing open (#3578): the live check is due whether or not the issue closed.
     merged = not pr_open and any(output.state == "merged" for output in card.outputs)
     live = _live_state(app, ref.work_id) if card.awaiting_finish or merged else _LiveState()
@@ -1282,6 +1289,7 @@ def derived_for(
         approval_href=approval_href,
         closed=_reads_closed(card),
         pr_open=pr_open,
+        ready_pr_open=ready_pr_open,
         merged=merged,
         live_pending=live.pending,
         live_result=live.result,
@@ -2093,7 +2101,9 @@ def gather_facts(
     cutoff, signoffs = signoff_inputs(app)
     held = deck_paused_ids(app)
     starred = starred_ids(app)
-    unstarted = unstarted_issues(snapshot.backlog, now=now)
+    unstarted = unstarted_issues(
+        snapshot.backlog, now=now, mine=getattr(app.state, "deck_claims", None)
+    )
     found = {}
     for (ref, card, open_pulls, registered), item in zip(inputs, candidates, strict=True):
         facts = work_facts(
@@ -3443,7 +3453,11 @@ async def _work_candidates(app: Any, snapshot: _Pass, queue: Sequence[dict]) -> 
         awaiting_work_ids=await asyncio.to_thread(awaiting_work_ids, app) | held,
         presentation=snapshot.presentation,
         let_go=_let_go_works(app),
-        unstarted=unstarted_issues(snapshot.backlog, now=datetime.now(UTC)),
+        unstarted=unstarted_issues(
+            snapshot.backlog,
+            now=datetime.now(UTC),
+            mine=getattr(app.state, "deck_claims", None),
+        ),
     )
 
 
@@ -4716,13 +4730,9 @@ async def _work_tree(app: Any, ref: WorkRef, record: Any) -> work_tree.WorkTree 
     children: list[work_tree.TreeLine] = []
     items: Sequence[dict] | None = None
     unreadable = False
+    reads = _TreeReads(ref, issues)
     if counts is not None:
-        read = getattr(issues, "sub_issues", None)
-        try:
-            items = await read(ref.repository, ref.number) if read is not None else None
-        except Exception:  # noqa: BLE001 -- said on the page, never an empty list
-            logger.debug("sub-issues of %s unreadable", ref.work_id, exc_info=True)
-            items = None
+        items = await reads.read("sub_issues", ref.repository, ref.number)
         unreadable = items is None
         for item in items or ():
             child = WorkRef.from_issue(IssueRef(item["repository"], item["number"]))
@@ -4736,32 +4746,109 @@ async def _work_tree(app: Any, ref: WorkRef, record: Any) -> work_tree.WorkTree 
                     href=work_href(child.work_id),
                 )
             )
-    diagram = await _wayfinder_diagram(app, ref, record, items or (), rows)
+    diagram = await _wayfinder_diagram(app, ref, record, items or (), rows, reads=reads)
+    if reads.stale:
+        _refresh_tree(app, ref, reads)
     return work_tree.WorkTree(parent_line, tuple(children), counts, unreadable, diagram)
 
 
+class _TreeReads:
+    """A Work page tree's GitHub reads, drawn from what the cache holds (#3739).
+
+    A held value is used even when out of date, so opening a page never waits on GitHub
+    for a map its webhooks keep current; only a read with nothing held waits. Each read is
+    kept, with whether it was out of date, so ``_refresh_tree`` can re-read them afterwards
+    and tell the open pages to redraw only when GitHub's answer moved."""
+
+    def __init__(self, ref: WorkRef, issues: Any) -> None:
+        self.ref = ref
+        self.issues = issues
+        self.drawn: dict[tuple, Any] = {}
+        self.stale = False
+
+    async def read(self, name: str, *args: Any) -> Any:
+        held = getattr(self.issues, f"held_{name}", None)
+        try:
+            value, fresh = held(*args) if held is not None else (None, False)
+        except Exception:  # noqa: BLE001 -- read from GitHub instead
+            logger.debug(
+                "tree %s: held %s%s unreadable", self.ref.work_id, name, args, exc_info=True
+            )
+            value, fresh = None, False
+        if value is None:
+            method = getattr(self.issues, name, None)
+            try:
+                value = await method(*args) if method is not None else None
+            except Exception:  # noqa: BLE001 -- drawn without it, and said so
+                logger.debug(
+                    "tree %s: %s%s unreadable", self.ref.work_id, name, args, exc_info=True
+                )
+                value = None
+            fresh = True
+        self.drawn[(name, *args)] = value
+        self.stale = self.stale or not fresh
+        return value
+
+
+def _refresh_tree(app: Any, ref: WorkRef, reads: _TreeReads) -> None:
+    """Re-read a tree drawn from out-of-date rows in the background, one run per Work at a
+    time, and redraw its open pages when GitHub's answer differs from what was drawn
+    (#3739). The reads go through the shared cache's leases, so two pages or processes still
+    fetch each row once."""
+    running: dict[str, asyncio.Task] | None = getattr(app.state, "work_tree_refreshes", None)
+    if running is None:
+        running = app.state.work_tree_refreshes = {}
+    task = running.get(ref.work_id)
+    if task is not None and not task.done():
+        return
+
+    async def again(name: str, *args: Any) -> Any:
+        method = getattr(reads.issues, name, None)
+        try:
+            return await method(*args) if method is not None else None
+        except Exception:  # noqa: BLE001 -- the next page build reads it again
+            logger.debug("tree %s: %s%s refresh failed", ref.work_id, name, args, exc_info=True)
+            return None
+
+    async def run() -> None:
+        drawn = list(reads.drawn.items())
+        values = await asyncio.gather(*(again(*read) for read, _value in drawn))
+        if any(
+            value is not None and value != held
+            for value, (_read, held) in zip(values, drawn, strict=True)
+        ):
+            wayfinder_map.bump_generation()
+            app.state.app_state.bus.publish(WORKS_TOPIC)
+
+    def forget(done: asyncio.Task) -> None:
+        if running.get(ref.work_id) is done:
+            del running[ref.work_id]
+
+    running[ref.work_id] = asyncio.get_running_loop().create_task(run())
+    running[ref.work_id].add_done_callback(forget)
+
+
 async def _wayfinder_diagram(
-    app: Any, ref: WorkRef, record: Any, items: Sequence[dict], rows: Mapping[str, FrontRow]
+    app: Any,
+    ref: WorkRef,
+    record: Any,
+    items: Sequence[dict],
+    rows: Mapping[str, FrontRow],
+    *,
+    reads: _TreeReads | None = None,
 ) -> wayfinder_map.Diagram | None:
     """A wayfinder map's diagram (#3627): its sub-issues as boxes, their "blocked by" as
     arrows, its body's fog and destination. None unless the issue is labelled a map and has
     sub-issues. Each ticket's title, state and type come from its own cached issue record,
     which webhooks keep current, before the sub-issue list's copy; the body and each ticket's
-    dependencies are cached reads, dropped by their webhooks. Nothing here polls."""
+    dependencies are cached reads, marked out of date by their webhooks and drawn from what
+    is held meanwhile (``_TreeReads``, #3739). Nothing here polls."""
     labels = record.get("labels") if isinstance(record, Mapping) else None
     if not items or not wayfinder_map.is_map(labels if isinstance(labels, list) else ()):
         return None
     issues = getattr(app.state, "issues", None)
     refs = [WorkRef.from_issue(IssueRef(item["repository"], item["number"])) for item in items]
-
-    async def read(name: str, *args: Any) -> Any:
-        method = getattr(issues, name, None)
-        try:
-            return await method(*args) if method is not None else None
-        except Exception:  # noqa: BLE001 -- drawn without it, and said so
-            logger.debug("map %s: %s%s unreadable", ref.work_id, name, args, exc_info=True)
-            return None
-
+    read = (reads or _TreeReads(ref, issues)).read
     body, *blockers = await asyncio.gather(
         read("issue_body", ref.repository, ref.number),
         *(read("blocked_by", child.repository, child.number) for child in refs),
@@ -4771,14 +4858,31 @@ async def _wayfinder_diagram(
         held = lookup([(child.repository, child.number) for child in refs]) if lookup else {}
     except Exception:  # noqa: BLE001 -- the sub-issue list's own copy is drawn instead
         held = {}
+    def closed(child: WorkRef, item: Mapping) -> bool:
+        own = held.get((child.repository, child.number)) or {}
+        return str(own.get("state") or item.get("state") or "").lower() == "closed"
+
+    def key_of(repository: str, number: int) -> str:
+        return WorkRef.from_issue(IssueRef(repository, number)).work_id
+
+    mine = {child.work_id for child in refs}
+    shut = {child.work_id for child, item in zip(refs, items, strict=True) if closed(child, item)}
     tickets = []
     for child, item, blocked in zip(refs, items, blockers, strict=True):
         own = held.get((child.repository, child.number)) or {}
         row = rows.get(child.work_id)
+        blocked_by = wayfinder_map.blocked_keys(blocked or (), key_of)
+        # Not started and still blocked by an open ticket of this map: that ticket's to
+        # finish, not the owner's to start (#3736).
+        waiting_on = [key for key in blocked_by if key in mine and key not in shut]
+        unstarted = row is None or (
+            row.attention is not None and row.attention.category == UNSTARTED
+        )
         state = wayfinder_map.ticket_state(
-            closed=str(own.get("state") or item.get("state") or "").lower() == "closed",
+            closed=child.work_id in shut,
             section=row.section if row is not None else None,
             waits=bool(row.waits) if row is not None else False,
+            held=bool(waiting_on) and unstarted,
         )
         # The ticket's own record first; the sub-issue list's copy for one never read (#3627).
         own_labels = own.get("labels") if "labels" in own else item.get("labels")
@@ -4791,11 +4895,7 @@ async def _wayfinder_diagram(
                 state=state,
                 kind=wayfinder_map.ticket_kind(own_labels if isinstance(own_labels, list) else ()),
                 status=(row.line or row.status.headline) if row is not None else "",
-                blocked_by=wayfinder_map.blocked_keys(
-                    blocked or (), lambda repository, number: WorkRef.from_issue(
-                        IssueRef(repository, number)
-                    ).work_id
-                ),
+                blocked_by=blocked_by,
                 asks=(
                     wayfinder_map.question(row)
                     if row is not None and state == wayfinder_map.NEEDS_YOU

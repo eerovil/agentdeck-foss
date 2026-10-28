@@ -1210,6 +1210,29 @@ def works_router_start_labels(root: str | Path) -> dict[str, frozenset[str]]:
     return found
 
 
+def works_router_unassigned_elsewhere(root: str | Path) -> frozenset[str]:
+    """The switched projects' issue repositories whose unassigned issues another deck takes.
+
+    Lowercased ``owner/repo`` of each project whose overlay sets ``[claims] unassigned =
+    false`` (#3731): this deck starts only the issues assigned to its own person there. An
+    overlay that cannot be read leaves its project as it was, taking unassigned issues.
+    """
+    base_root = Path(root).expanduser() / "instances"
+    found: set[str] = set()
+    for instance in _instance_names(root):
+        facts = _manifest(base_root / instance / "poller.toml")
+        if not (facts.readable and facts.org and facts.works_router):
+            continue
+        try:
+            with (base_root / instance / "overlay.toml").open("rb") as handle:
+                claims = tomllib.load(handle).get("claims")
+        except (OSError, ValueError):
+            continue
+        if isinstance(claims, dict) and claims.get("unassigned") is False:
+            found.update(_qualified(facts.org, repo).lower() for repo in facts.issue_repos)
+    return frozenset(found)
+
+
 def works_router_hold_labels(root: str | Path) -> dict[str, frozenset[str]]:
     """The labels that keep a switched project's Work from starting, by issue repository.
 

@@ -541,8 +541,8 @@ def test_a_sub_issue_link_sets_and_clears_the_parent_whatever_updated_at_says(
 
 def test_a_maps_cached_reads_are_dropped_when_github_says_they_changed(root, cache, service):
     """#3627: a wayfinder map's diagram reads its body, its sub-issue list and each ticket's
-    "blocked by" list through the cache; the deliveries that change them drop those rows, so
-    the next page read fetches them again and nothing polls."""
+    "blocked by" list through the cache; the deliveries that change them mark those rows out
+    of date, so the next page read fetches them again and nothing polls."""
     from agentdeck.github_cache import GitHubMetadata
 
     def held(prefix: str, number: int) -> str:
@@ -570,8 +570,10 @@ def test_a_maps_cached_reads_are_dropped_when_github_says_they_changed(root, cac
     deliver(root, dependency, event="issue_dependencies", delivery="d-4")
     apply_stream(root, service)
 
-    assert cache.peek(body).value is None and cache.peek(sub_issues).value is None
-    assert cache.peek(blocked).value is None and cache.peek(other).value == {"held": True}
+    # Marked out of date, their values kept for the page to draw meanwhile (#3739).
+    for key in (body, sub_issues, blocked):
+        assert cache.peek(key).value == {"held": True} and not cache.peek(key).complete
+    assert cache.peek(other).complete
     # The open map pages build again, their arrows and fog with them.
     assert moved
 
@@ -584,7 +586,7 @@ def test_a_maps_cached_reads_are_dropped_when_github_says_they_changed(root, cac
                                  label={"name": "wayfinder:prototype"}),
                 event="issues", delivery=f"d-{action}")
         apply_stream(root, service)
-        assert cache.peek(sub_issues).value is None and moved
+        assert not cache.peek(sub_issues).complete and moved
     from agentdeck import wayfinder_map
 
     before = wayfinder_map.generation()
@@ -852,3 +854,8 @@ def test_an_issue_row_carries_its_label_names_when_the_payload_has_them():
     )
     assert row["labels"] == ["agent", "Paused"]
     assert "labels" not in WebhookStatusCacheService._issue_value(base)
+    # #3731: its first assignee, which decides which of two decks works it.
+    value = WebhookStatusCacheService._issue_value
+    assert value({**base, "assignee": {"login": "coworker"}})["assignee"] == "coworker"
+    assert value({**base, "assignee": None})["assignee"] is None
+    assert "assignee" not in value(base)

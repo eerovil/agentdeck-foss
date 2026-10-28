@@ -1114,6 +1114,9 @@ class FrontRow:
     # A wayfinder map's row (#3696, ``wayfinder_map.Progress``): its title, counts and the
     # questions its tickets wait on. None for every other row.
     map: Any = None
+    # A map's children that wait on another of its tickets, not on the owner (#3736,
+    # ``work_tree._held_tickets``): folded in, but never a Needs you of their own.
+    held: frozenset[str] = frozenset()
 
     @property
     def revision(self) -> str:
@@ -1428,7 +1431,9 @@ class FrontSections:
                 found.append(row)
                 continue
             found.extend(
-                item for item in (row.own, *row.children) if item.section == NEEDS_YOU
+                item
+                for item in (row.own, *row.children)
+                if item.section == NEEDS_YOU and item.card.work_id not in row.held
             )
         return tuple(found)
 

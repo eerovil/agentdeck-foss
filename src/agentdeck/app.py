@@ -52,6 +52,7 @@ from .live_window import LiveWindow
 from .poller_ops import (
     works_router_hold_labels,
     works_router_start_labels,
+    works_router_unassigned_elsewhere,
 )
 from .poller_wake import KEEPALIVE_S as WEBHOOK_KEEPALIVE_S
 from .poller_wake import PollerWakeService
@@ -779,6 +780,39 @@ def create_app(config: AppConfig) -> FastAPI:
         session_key = session.key if session is not None else chat_id
         wake_on.register(session_key, chat_id, asked=asked, **parse_request(review=pull))
 
+    unassigned_elsewhere: list = [0.0, frozenset()]
+
+    def deck_claims(repository: str, assignee: str) -> bool:
+        # Two decks on one repository: the issue's assignee says which one works it (#3731).
+        # The Work list asks once per issue, so the overlays are read at most every 30 s.
+        from . import work_claims
+        from .poller_engine.github_authority import deck_person
+
+        person = deck_person()
+        if person and not assignee and time.monotonic() - unassigned_elsewhere[0] > 30.0:
+            unassigned_elsewhere[:] = [
+                time.monotonic(),
+                works_router_unassigned_elsewhere(config.poller.root),
+            ]
+        return work_claims.mine(
+            assignee,
+            person=person,
+            takes_unassigned=repository.lower() not in unassigned_elsewhere[1],
+        )
+
+    async def interrupt_chat(chat_id: str) -> bool:
+        # A Work whose issue went to another deck stops its agent's turn (#3731).
+        chat = state.chat_by_id(chat_id)
+        session = state.current_session_for_chat(chat) if chat is not None else None
+        account = next(
+            (item for item in app.state.accounts if session and item.key == session.account_key),
+            None,
+        )
+        if session is None or account is None:
+            return False
+        result = await PROVIDERS[account.provider_id].interrupt(account, session)
+        return bool(result.accepted)
+
     work_router = WorkRouterService(
         config.github_webhook.path,
         switched=switched_repositories,
@@ -838,6 +872,8 @@ def create_app(config: AppConfig) -> FastAPI:
         # ... and the deck keeps its lists from its tickets' answers (#3695).
         read_body=read_map_body,
         write_body=write_map_body,
+        mine=deck_claims,
+        interrupt=interrupt_chat,
     )
     # A verdict about a head the branch left only by merging its base still stands (#3314).
     work_release_service.ports.same_change = work_router.reviewed.same_change
@@ -871,6 +907,7 @@ def create_app(config: AppConfig) -> FastAPI:
         start_work=lambda repository, number, **kwargs: start_work_agent(
             app, repository, number, wait=True, **kwargs
         ),
+        mine=deck_claims,
         enabled=config.github_webhook.enabled,
     )
     # Third webhook consumer (#1807): the issue-as-chat board for the review-chat repository.
@@ -1078,6 +1115,8 @@ def create_app(config: AppConfig) -> FastAPI:
     app.state.poller_wake = poller_wake
     app.state.wake_on = wake_on
     app.state.work_router = work_router
+    # The Work list leaves out an unlabelled issue another deck would work (#3731).
+    app.state.deck_claims = deck_claims
     app.state.missed_start_backstop = missed_start_backstop
     app.state.work_release = work_release_service
     # A deck-run Work's turn that ends without a next step is asked about once (#2960). Off

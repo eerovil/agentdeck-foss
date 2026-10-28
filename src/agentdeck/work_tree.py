@@ -132,6 +132,7 @@ def map_progress(
     children: Sequence[FrontRow],
     counts: tuple[int, int] | None,
     elsewhere: int = 0,
+    held: Collection[str] = frozenset(),
 ) -> wayfinder_map.Progress | None:
     """A wayfinder map's progress from its row and its tickets' rows (#3696), or None when
     ``own`` is not a map.
@@ -140,7 +141,8 @@ def map_progress(
     tickets a Poller card holds back, and every open ticket the front page lists no Work
     for: a map files a blocked ticket with no agent, so no Work starts until its last
     blocker closes (``WAYFINDER.md``). ``elsewhere`` are its open tickets the front page lists
-    as rows of their own (one the owner hid, for the Hidden list): listed, so not blocked."""
+    as rows of their own (one the owner hid, for the Hidden list): listed, so not blocked.
+    ``held`` are listed tickets no agent started that wait on another (``_held_tickets``)."""
     if not wayfinder_map.is_map(own.card.labels):
         return None
     asking = sorted(
@@ -151,7 +153,7 @@ def map_progress(
     open_rows = [
         row for row in children if row.section != FINISHED and not row.card.awaiting_finish
     ]
-    held = [row for row in open_rows if row.card.blocked_by]
+    blocked = [row for row in open_rows if row.card.blocked_by or row.card.work_id in held]
     unlisted = max(0, counts[1] - counts[0] - len(open_rows) - elsewhere) if counts else 0
     working = sum(
         1
@@ -164,7 +166,7 @@ def map_progress(
         href=own.card.href,
         counts=counts,
         working=working,
-        blocked=len(held) + unlisted,
+        blocked=len(blocked) + unlisted,
         questions=questions,
         tickets=tuple(row.card.work_id for row in children),
     )
@@ -217,8 +219,37 @@ def _demoted(own: FrontRow, *, tree_only: bool, open_work: bool) -> FrontRow:
     unstarted = own.attention is not None and own.attention.category == UNSTARTED
     if not (tree_only or (unstarted and open_work)):
         return own
+    return _quiet(own)
+
+
+def _unstarted(row: FrontRow) -> bool:
+    from .work_attention import UNSTARTED
+
+    return row.attention is not None and row.attention.category == UNSTARTED
+
+
+def _held_tickets(own: FrontRow, children: Sequence[FrontRow]) -> frozenset[str]:
+    """A map's tickets no agent started, while another of its tickets is still open (#3736).
+
+    A map files a blocked ticket with no agent and the ticket that unblocks it adds one
+    (``WAYFINDER.md``), so while any other ticket is open these wait on it, not on the owner:
+    their rows on their own say Not started, which made the map lead with a ticket nobody
+    can start yet. With every open ticket unstarted, nothing will start them: they lead."""
+    if not wayfinder_map.is_map(own.card.labels):
+        return frozenset()
+    unstarted = {row.card.work_id for row in children if _unstarted(row)}
+    others = any(
+        row.card.work_id not in unstarted
+        and row.section != FINISHED
+        and not row.card.awaiting_finish
+        for row in children
+    )
+    return frozenset(unstarted) if others else frozenset()
+
+
+def _quiet(row: FrontRow) -> FrontRow:
     return replace(
-        own, section=QUIET, attention=None, action="", rank=0, stopped_at=None, unseen=False
+        row, section=QUIET, attention=None, action="", rank=0, stopped_at=None, unseen=False
     )
 
 
@@ -232,7 +263,10 @@ def _folded(
     elsewhere: int = 0,
 ) -> FrontRow:
     own = _demoted(own, tree_only=tree_only, open_work=_open_work(counts, children))
-    waiting = [row for row in (own, *children) if row.section == NEEDS_YOU]
+    held = _held_tickets(own, children)
+    # Only for where the row stands and what it leads with: each child keeps its own row.
+    standing = [_quiet(row) if row.card.work_id in held else row for row in children]
+    waiting = [row for row in (own, *standing) if row.section == NEEDS_YOU]
     if waiting:
         # ``min`` keeps the first of equals, so the parent's own question leads a tie.
         lead = min(waiting, key=_needs_order)
@@ -243,7 +277,7 @@ def _folded(
     else:
         # D5's order; the parent first among equals, then the newest child.
         lead = min(
-            (own, *sorted(children, key=_stamp, reverse=True)),
+            (own, *sorted(standing, key=_stamp, reverse=True)),
             key=lambda row: _PLACE.get(_place(row), len(_PLACE)),
         )
     activity = [row.card.last_activity for row in (own, *children) if row.card.last_activity]
@@ -255,7 +289,7 @@ def _folded(
     if lead is not own and lead.section == FINISHED:
         # Recently finished goes by when the Work finished: the child's, which the row shows.
         card = replace(card, finished_at=lead.card.finished_at)
-    found = map_progress(own, children, counts, elsewhere)
+    found = map_progress(own, children, counts, elsewhere, held)
     return replace(
         lead,
         card=card,
@@ -264,6 +298,7 @@ def _folded(
         lead=None if lead is own else lead,
         progress=found.line if found is not None else progress(counts, children),
         map=found,
+        held=held,
     )
 
 

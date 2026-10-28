@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import re
-from collections.abc import Collection, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -1864,13 +1864,21 @@ def work_candidates(
 UNSTARTED_WINDOW = timedelta(days=14)
 
 
-def unstarted_issues(backlog: Any, *, now: datetime) -> dict[WorkRef, datetime]:
+def unstarted_issues(
+    backlog: Any,
+    *,
+    now: datetime,
+    mine: Callable[[str, str], bool] | None = None,
+) -> dict[WorkRef, datetime]:
     """Open issues in a Poller repository that no agent works on, by when each was opened.
 
     One carrying none of its repository's ownership labels, opened within
     ``UNSTARTED_WINDOW`` (#3558). A schedule definition stays open with no agent on purpose,
-    so it is not one. Read from the backlog's cached issue lists only; a list
-    read too long ago to say what is still open names none, so a closed issue never shows.
+    so it is not one, and nor is an issue assigned to someone this deck does not work for,
+    which ``mine(repository, assignee)`` says (``work_claims``, #3731). An unassigned one stays
+    even where another deck takes those: Start agent assigns it to this deck's person. Read
+    from the backlog's cached issue lists only; a list read too long ago to say what is still
+    open names none, so a closed issue never shows.
     """
     found: dict[WorkRef, datetime] = {}
     if backlog is None:
@@ -1890,6 +1898,11 @@ def unstarted_issues(backlog: Any, *, now: datetime) -> dict[WorkRef, datetime]:
                 or now - opened > UNSTARTED_WINDOW
                 or any(label.casefold() in labels for label in issue.labels)
                 or issue.has_label(SCHEDULE_LABEL)
+                or (
+                    mine is not None
+                    and issue.assignees
+                    and not mine(entry.repository, issue.assignees[0].lower())
+                )
             ):
                 continue
             found[WorkRef.from_issue(IssueRef(entry.repository, issue.number))] = opened

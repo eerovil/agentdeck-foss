@@ -909,3 +909,15 @@ async def test_reading_a_parents_sub_issues_relinks_a_child_that_lost_its_parent
     held = cache.peek("issue:v1:eerovil/agentdeck#5").value
     assert work_tree.parent_ref(held).work_id == "github_issue:eerovil/agentdeck#9"
     assert cache.peek("issue:v1:eerovil/agentdeck#6").value is None  # never read: left alone
+
+    # #3739: kept a day, since webhooks mark it out of date; the page reads what is held.
+    key = "sub-issues:v2:eerovil/agentdeck#9"
+    with cache._connect() as connection:
+        row = connection.execute(
+            "SELECT terminal FROM github_metadata_v1 WHERE key = ?", (key,)
+        ).fetchone()
+    assert row == (1,)
+    assert resolver.held_sub_issues("eerovil/agentdeck", 9) == (tuple(listed), True)
+    cache.expire(key)
+    assert resolver.held_sub_issues("eerovil/agentdeck", 9) == (tuple(listed), False)
+    assert resolver.held_blocked_by("eerovil/agentdeck", 9) == (None, False)
