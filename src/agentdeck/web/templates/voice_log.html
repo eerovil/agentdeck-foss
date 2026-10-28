@@ -18,6 +18,8 @@
   <section class="voice-log-phrase" data-outcome="{{ phrase.outcome }}">
     <div class="voice-log-when">{{ phrase.when }} · {{ phrase.ms }} ms
       {%- if phrase.fresh %} · new helper{% endif %}
+      {%- if phrase.timing and phrase.timing.voice is defined %} · first voice {{ phrase.timing.voice }} ms after speech{% endif %}
+      {%- if phrase.replaces %} · after more words{% endif %}
       {%- if phrase.outcome != answered %} · <strong>{{ phrase.outcome }}</strong>{% endif %}</div>
     {% for line in phrase.aloud or [] %}
     <p class="voice-log-aloud">🔊 {{ line }}</p>

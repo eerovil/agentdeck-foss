@@ -636,6 +636,8 @@ def test_the_workspace_is_served_only_inside_the_work_page(tmp_path):
         # The staging population report (#2250) reads the built overview; no workspace.
         "/api/works/filed",
         "/api/works/population",
+        # What needs the owner (#3773) reads the same overview; no workspace.
+        "/api/works/needs-you",
         # The status log (#2751) reads this deck's own record of status changes; no workspace.
         "/api/works/status-log",
         "/api/works/status-log/flaps",

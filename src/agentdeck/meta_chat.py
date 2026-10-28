@@ -36,6 +36,10 @@ BRIEF = (
     "answer_with: POST a question_box answer as JSON to its answer_url, and send a chat "
     "message only where it says message. Never answer a question box by chat message, and "
     "never by issue comment; that leaves the box open and the Work stuck on Needs answer. "
+    "When the owner asks whether anything needs them, make one call, GET "
+    "$AGENTDECK_URL/api/works/needs-you (add ?repo=owner/repo for one project), and answer "
+    "from it alone: questions first, then merges, then a count of the rest. In voice mode "
+    "write only the 🔊 paragraph, with nothing after it. "
     "Keep replies short; the owner is often listening, not reading."
 )
 

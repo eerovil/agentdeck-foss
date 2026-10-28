@@ -230,6 +230,39 @@ async def read_parent(repository: str, number: int) -> tuple[str, int] | None:
     return (owner_repo.lower(), parent)
 
 
+async def read_dependencies(repository: str, number: int, kind: str) -> list[dict] | None:
+    """The issues an issue blocks (``kind`` ``blocking``) or waits on (``blocked_by``), read
+    live, each ``{repository, number, state, labels}``; ``None`` if unread.
+
+    The Work router reads them when a wayfinder ticket closes, to start a ticket it blocked
+    once that ticket has no open blocker left (#3764). Live, not from the ``blocked-by`` cache:
+    the close that asks may not have refreshed it yet."""
+    gh = shutil.which("gh")
+    if gh is None:
+        return None
+    try:
+        code, out, _err = await gh_cli.run_once(
+            [
+                gh,
+                "api",
+                f"repos/{repository}/issues/{number}/dependencies/{kind}?per_page=100",
+                "--jq",
+                '[.[] | {repository: (.repository_url | split("/") | .[-2:] | join("/")),'
+                " number, state, labels: [.labels[]?.name]}]",
+            ],
+            timeout=GH_TIMEOUT_S,
+            repo=repository,
+        )
+        found = json.loads(out) if code == 0 else None
+    except Exception:  # noqa: BLE001 - nothing is started this time; Start still can
+        log.warning("work signal: %s of %s#%s unread", kind, repository, number, exc_info=True)
+        return None
+    if not isinstance(found, list):
+        log.warning("work signal: %s of %s#%s unread (gh exit %s)", kind, repository, number, code)
+        return None
+    return [row for row in found if isinstance(row, dict)]
+
+
 async def read_map_body(repository: str, number: int) -> dict | None:
     """A wayfinder map's ``body``, ``state`` and label names, read live; ``None`` if unread.
 

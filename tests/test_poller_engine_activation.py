@@ -186,6 +186,24 @@ def test_an_unauthorized_apply_refuses_before_anything_external(tmp_path, monkey
     assert not (tmp_path / "activation.json").exists()
 
 
+def test_a_deck_that_is_not_the_main_one_is_turned_on_with_work_authority(
+    tmp_path, monkeypatch, capsys
+):
+    """#3755: a coworker's deck on a shared project needs Work, not Release, to turn it on."""
+    cli, manifest, overlay, binding = _activation_cli(tmp_path, monkeypatch)
+    manifest.write_text(_CLI_MANIFEST + '\n[decks]\nmain = "eero"\n')  # coworker has `write`
+    accounts = tmp_path / "github-authority.toml"  # the autouse fixture's file
+    mapped = accounts.read_text()
+
+    accounts.write_text(mapped + '[deck]\nperson = "eero"\n')  # the main deck needs Release
+    assert _apply(cli, manifest, overlay, binding, login="coworker") == 77
+    assert "does not hold Release authority" in capsys.readouterr().err
+
+    accounts.write_text(mapped + '[deck]\nperson = "coworker"\n')
+    assert _apply(cli, manifest, overlay, binding, login="coworker") == 0  # `write` is enough
+    assert binding.exists()
+
+
 def test_an_unreachable_required_repository_fails_before_publish(tmp_path, monkeypatch, capsys):
     board = _FakeDiscovery()
     board.reachability = Reachability.DENIED

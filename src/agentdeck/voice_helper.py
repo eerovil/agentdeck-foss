@@ -22,6 +22,12 @@ web restart close the process and forget that conversation too, by the owner's
 decision on #3444: after a quiet spell a fresh start is fine, and the words still
 reach the chat unchanged; only the fast agent's fixes lose their context.
 
+The page asks as soon as a phrase's words come back, before its one-second send wait
+(#3765), and throws the answer away when more words join the phrase. Its next ask, the
+whole phrase, names the thrown-away one (``drop``): its lines leave the history, and a
+process that answered it is told that answer was never spoken. The process keeps the
+turn in its own transcript; closing it would cost a fresh start (about 1 s).
+
 The page asks for the process (``warm``) when voice mode turns on and while each
 phrase is transcribed, so a phrase rarely waits for one to start: the first saved
 conversations (#3507) showed a fresh process at 2.5 s against 1.5 s warm, most of
@@ -40,8 +46,10 @@ Every phrase is also saved, one JSON line per phrase in a file per chat under
 words heard, the 🔊 lines it was given, its reply as written, what it said and
 proposed to send, and whether it timed out or failed. The page then reports what it
 really sent under the phrase's ``id`` (``sent``): a send by hand meanwhile, an edit
-or a disabled Send changes it. ``/sessions/{key}/voice-log`` shows them. The
-saved file is only read back; the fast agent's memory is still the one above.
+or a disabled Send changes it. It also reports how long after the end of speech the
+words came back, the send went and the first voice was heard (``timed``, #3765).
+``/sessions/{key}/voice-log`` shows them. The saved file is only read back; the fast
+agent's memory is still the one above.
 """
 
 from __future__ import annotations
@@ -80,6 +88,9 @@ NONE = "NONE"
 # The saved voice conversations, one file per chat; past the size, the older half goes.
 LOG_DIR = Path("~/.local/share/agentdeck/voice-log")
 MAX_LOG_BYTES = 2 * 1024 * 1024
+# The page's measured waits for a phrase (#3765), in ms from the end of speech.
+TIMINGS = ("words", "sent", "voice")
+MAX_TIMING_MS = 120_000
 # How a phrase fared: answered, or why the words went to the chat as heard.
 ANSWERED, TIMED_OUT, FAILED, NO_ACCOUNT, ENDED = (
     "answered",
@@ -175,6 +186,10 @@ class _Agent:
     gone: bool = False
     # The process has not been given a phrase yet, so the next one carries the past.
     new: bool = True
+    # The last phrase asked and how many lines it added to ``history``, taken out
+    # again when the page throws its answer away (#3765).
+    last_id: str = ""
+    last_lines: int = 0
 
 
 _agents: dict[str, _Agent] = {}
@@ -252,11 +267,22 @@ def _clip(text: str, limit: int) -> str:
     return flat if len(flat) <= limit else flat[: limit - 1] + "…"
 
 
-def message(heard: str, aloud: list[str], history: list[str] | None = None) -> str:
-    """One phrase as the fast agent is told it; a fresh process also gets the past."""
+UNSPOKEN = (
+    "Your last answer was never spoken: the person went on talking. Below is all they "
+    "said; answer it as one."
+)
+
+
+def message(
+    heard: str, aloud: list[str], history: list[str] | None = None, unspoken: bool = False
+) -> str:
+    """One phrase as the fast agent is told it; a fresh process also gets the past.
+    ``unspoken``: its last answer was thrown away, as more words joined (#3765)."""
     parts = []
     if history:
         parts.append("Earlier in this voice conversation:\n" + "\n".join(history))
+    if unspoken:
+        parts.append(UNSPOKEN)
     if aloud:
         parts.append("Said aloud by the agent since:\n" + "\n".join(aloud))
     parts.append(f"Heard: {heard}")
@@ -380,10 +406,17 @@ async def _tidy(keep: str) -> None:
 
 
 async def heard(
-    app, key: str, text: str, aloud: list[str], phrase_id: str = "", run: str = ""
+    app,
+    key: str,
+    text: str,
+    aloud: list[str],
+    phrase_id: str = "",
+    run: str = "",
+    drop: str = "",
 ) -> Answer | None:
     """The fast agent's answer to ``text`` heard in chat ``key``, or None for none:
-    also for a phrase of a voice mode spell (``run``) already ended."""
+    also for a phrase of a voice mode spell (``run``) already ended. ``drop`` names
+    the phrase asked before whose answer the page threw away (#3765)."""
     text = _clip(text, MAX_HEARD_CHARS)
     if not text or (run and run in _ended_runs):
         return None
@@ -398,8 +431,13 @@ async def heard(
     # Waiting on a start ``warm`` began is part of the wait the person hears.
     started = time.monotonic()
     async with agent.lock:
+        # The thrown-away ask ran first, under this lock: its lines are the last ones.
+        dropped = bool(drop) and drop == agent.last_id and agent.last_lines > 0
+        if dropped:
+            del agent.history[-agent.last_lines :]
+        agent.last_id, agent.last_lines = "", 0
         fresh = not _running(agent)
-        answer, outcome, reply = await _turn(app, agent, text, aloud, question)
+        answer, outcome, reply = await _turn(app, agent, text, aloud, question, dropped)
         await asyncio.to_thread(
             _save,
             key,
@@ -414,6 +452,7 @@ async def heard(
                 "relay": answer.relay if answer else text,
                 "fresh": fresh,
                 "ms": round((time.monotonic() - started) * 1000),
+                **({"replaces": drop} if dropped else {}),
             },
         )
         if agent.gone:
@@ -421,11 +460,13 @@ async def heard(
             await _close(agent)
         # Every phrase heard is the voice conversation, answered or not: the page
         # sent it to the chat either way, and a fresh process needs it for what follows.
-        agent.history += [f"Agent said aloud: {line}" for line in aloud]
-        agent.history.append(f"Person: {text}")
+        added = [f"Agent said aloud: {line}" for line in aloud]
+        added.append(f"Person: {text}")
         if answer is not None and answer.say:
-            agent.history.append(f"You: {answer.say}")
-        agent.history = agent.history[-HISTORY_LINES:]
+            added.append(f"You: {answer.say}")
+        agent.history = (agent.history + added)[-HISTORY_LINES:]
+        if phrase_id:
+            agent.last_id, agent.last_lines = phrase_id, min(len(added), len(agent.history))
         return answer
 
 
@@ -485,14 +526,16 @@ def _asked(agent: _Agent, aloud: list[str]) -> bool:
 
 
 async def _turn(
-    app, agent: _Agent, text: str, aloud: list[str], question: bool = False
+    app, agent: _Agent, text: str, aloud: list[str], question: bool = False, dropped: bool = False
 ) -> tuple[Answer | None, str, str | None]:
-    """The answer, how the phrase fared (``ANSWERED`` and the rest) and the raw reply."""
+    """The answer, how the phrase fared (``ANSWERED`` and the rest) and the raw reply.
+    ``dropped``: the page threw the last answer away; a process that gave it is told."""
     if not _running(agent):
         why = await _start(app, agent)
         if why is not None:
             return None, why, None
-    said = message(text, aloud, agent.history[-HISTORY_LINES:] if agent.new else None)
+    history = agent.history[-HISTORY_LINES:] if agent.new else None
+    said = message(text, aloud, history, unspoken=dropped and not agent.new)
     agent.new = False
     outcome = FAILED
     try:
@@ -534,10 +577,27 @@ async def sent(key: str, phrase_id: str, text: str | None, how: str) -> None:
     await asyncio.to_thread(_save, key, record)
 
 
+async def timed(key: str, phrase_id: str, timing: dict) -> None:
+    """The page's measured waits for phrase ``phrase_id`` (#3765): ms from the end of
+    speech to its words, its send and the first voice heard. Unknown keys go."""
+    kept = {
+        name: round(value)
+        for name, value in timing.items()
+        if name in TIMINGS
+        and isinstance(value, int | float)
+        and not isinstance(value, bool)
+        and 0 <= value <= MAX_TIMING_MS
+    }
+    if kept:
+        record = {"at": time.time(), "timing_for": phrase_id, "timing": kept}
+        await asyncio.to_thread(_save, key, record)
+
+
 def saved(keys) -> list[dict]:
     """Every saved phrase of the chats ``keys``, newest first, each with the page's
-    report of what it sent as ``report`` (None when the page never said)."""
-    records, reports = [], {}
+    report of what it sent as ``report`` (None when the page never said) and its
+    measured waits as ``timing`` (None when not measured)."""
+    records, reports, timings = [], {}, {}
     for key in keys:
         try:
             lines = log_path(key).read_text(encoding="utf-8").splitlines()
@@ -552,10 +612,13 @@ def saved(keys) -> list[dict]:
                 continue
             if record.get("sent_for"):
                 reports[record["sent_for"]] = record
+            elif record.get("timing_for"):
+                timings[record["timing_for"]] = record.get("timing")
             elif "heard" in record:
                 records.append(record)
     for record in records:
         record["report"] = reports.get(record.get("id")) if record.get("id") else None
+        record["timing"] = timings.get(record.get("id")) if record.get("id") else None
     return sorted(records, key=lambda record: record["at"], reverse=True)
 
 

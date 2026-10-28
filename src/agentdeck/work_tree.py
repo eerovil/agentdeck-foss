@@ -140,7 +140,7 @@ def map_progress(
     Asking counts only real questions, the map's own included. Blocked counts the listed
     tickets in ``held`` — no agent started them and they wait on another (``_held_tickets``)
     — and every open ticket the front page lists no Work for: a map files a blocked ticket
-    with no agent, so no Work starts until its last blocker closes (``WAYFINDER.md``).
+    with no agent, and the deck adds one when its last blocker closes (#3764).
     ``elsewhere`` are its open tickets the front page lists as rows of their own (one the
     owner hid, for the Hidden list): listed, so not blocked."""
     if not wayfinder_map.is_map(own.card.labels):
@@ -231,8 +231,8 @@ def _unstarted(row: FrontRow) -> bool:
 def _held_tickets(own: FrontRow, children: Sequence[FrontRow]) -> frozenset[str]:
     """A map's tickets no agent started, while another of its tickets is still open (#3736).
 
-    A map files a blocked ticket with no agent and the ticket that unblocks it adds one
-    (``WAYFINDER.md``), so while any other ticket is open these wait on it, not on the owner:
+    A map files a blocked ticket with no agent and the deck adds one when its last blocker
+    closes (#3764), so while any other ticket is open these wait on it, not on the owner:
     their rows on their own say Not started, which made the map lead with a ticket nobody
     can start yet. With every open ticket unstarted, nothing will start them: they lead."""
     if not wayfinder_map.is_map(own.card.labels):

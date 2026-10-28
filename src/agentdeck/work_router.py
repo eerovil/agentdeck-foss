@@ -26,6 +26,11 @@ deliveries are the deck's own echo):
 * **A wayfinder map's last ticket closed** (#3627): a sub-issue's close, under any login, whose
   parent, read once from GitHub, is an open ``wayfinder:map`` with every sub-issue done. The
   map's own chat is told to reach the destination, so nobody has to wake it.
+* **A wayfinder ticket's last blocker closed** (#3764): a ticket's close, under any login, or
+  a person removing a blocker. Nothing is sent: every open ticket it blocked that is left with
+  no open blocker, read live, gets the Start button's own write (assigned where another deck
+  takes unassigned issues, then the start label), so its Work starts without waiting for the
+  closing chat to remember to start it.
 * **A wayfinder record** (#3695): a ticket's ``**Answer:**`` comment, or an ``**Ideas
   sorted:**`` or ``**Destination redrawn:**`` comment on the map, posted or edited by the deck
   or a person on the repository. Nothing is sent: the deck rebuilds the map's four lists from
@@ -261,6 +266,17 @@ class Event:
 
 def _text(value: object) -> str:
     return value if isinstance(value, str) else ""
+
+
+def _label_name(label: object) -> str:
+    """A label's name, from a webhook's or REST's label object or a bare name."""
+    return _text(label.get("name") if isinstance(label, dict) else label).strip()
+
+
+def _is_ticket(labels: object) -> bool:
+    """A wayfinder ticket and not a map: the labels of a webhook issue or a dependency row."""
+    names = [_label_name(label) for label in labels] if isinstance(labels, list) else []
+    return wayfinder_map.is_ticket(names) and not wayfinder_map.is_map(names)
 
 
 def _login(payload: dict, key: str = "sender") -> tuple[str, str]:
@@ -1055,6 +1071,9 @@ class WorkRouterService:
         load_work: Callable[[str, int], Awaitable[object]] | None = None,
         read_issue: Callable[[str, int], Awaitable[dict | None]] | None = None,
         read_parent: Callable[[str, int], Awaitable[tuple[str, int] | None]] | None = None,
+        read_dependencies: Callable[[str, int, str], Awaitable[list[dict] | None]] | None = None,
+        start_ticket: Callable[[str, int], Awaitable[tuple[str, str]]] | None = None,
+        hold_labels: Callable[[str], Iterable[str]] = lambda repository: (),
         read_body: Callable[[str, int], Awaitable[dict | None]] | None = None,
         write_body: Callable[[str, int, str], Awaitable[bool]] | None = None,
         review_chat: Callable[[str, str], tuple[str, object | None] | None] | None = None,
@@ -1085,6 +1104,11 @@ class WorkRouterService:
         self._latest_comment = latest_comment
         self._read_issue = read_issue
         self._read_parent = read_parent
+        # A wayfinder ticket whose last blocker closed is started (#3764): the tickets an
+        # issue blocks or waits on, read live, and the Start button's own write.
+        self._read_dependencies = read_dependencies
+        self._start_ticket = start_ticket
+        self._hold_labels = hold_labels
         # A wayfinder map's body read and saved again when a record lands (#3695).
         self._read_body = read_body
         self._write_body = write_body
@@ -1384,6 +1408,7 @@ class WorkRouterService:
             # Before the close that follows an answer wakes the map: its chat reads the lists.
             await self._maybe_keep_map_lists(delivery)
             await self._maybe_map_ready(delivery)
+            await self._maybe_start_unblocked(delivery)
             if settled:
                 # The release already told the chat what this verdict comment says, or dropped
                 # it as about a commit the branch left: forwarded too, every pass woke the
@@ -1574,6 +1599,106 @@ class WorkRouterService:
             return
         log.info("work-router: map %s#%s is ready, waking chat %s", *parent, owner[0])
         self._send(delivery, owner, event)
+
+    async def _maybe_start_unblocked(self, delivery: Delivery) -> None:
+        """Start a wayfinder ticket once its last blocker closes (#3764).
+
+        A map files a blocked ticket with no agent; ``WAYFINDER.md`` once left adding it to
+        whoever closed the last blocker, and a chat that never read that (a Work the map
+        adopted) or a person closing it by hand left the ticket unstarted. Here a wayfinder
+        ticket's close, under any login, reads the tickets it blocks; a person removing a
+        blocker (``blocked_by_removed``) checks the one ticket it named. Each candidate's own
+        blockers are read live, and it starts only with every one closed, so a ticket with two
+        blockers waits for both and a re-asked ticket, whose replacement blocks the same
+        tickets before it closes, starts none. A ticket already labelled, held by the paused
+        label, closed, or not a wayfinder ticket is left alone. Best effort: a failed read or
+        write is logged and the delivery moves on; the Start button is still there."""
+        if self._read_dependencies is None or self._start_ticket is None:
+            return
+        payload = delivery.payload
+        action = _text(payload.get("action"))
+        if delivery.event == "issues" and action == "closed":
+            issue = payload.get("issue")
+            if (
+                not isinstance(issue, dict)
+                or not isinstance(issue.get("number"), int)
+                or isinstance(issue.get("pull_request"), dict)
+                or not _is_ticket(issue.get("labels"))
+            ):
+                return
+            repository, number = delivery.stream.lower(), issue["number"]
+            try:
+                candidates = await self._read_dependencies(repository, number, "blocking")
+            except Exception:  # noqa: BLE001 -- nothing started; Start still can
+                log.warning("work-router: %s#%s blocks unread", repository, number, exc_info=True)
+                return
+            if candidates is None:
+                return
+            cause = f"{repository}#{number} closed"
+        elif delivery.event == "issue_dependencies" and action == "blocked_by_removed":
+            blocked = payload.get("blocked_issue")
+            if not isinstance(blocked, dict):
+                return
+            repo = payload.get("blocked_issue_repo")
+            name = repo.get("full_name") if isinstance(repo, dict) else None
+            candidates = [
+                {
+                    "repository": name if isinstance(name, str) else delivery.stream,
+                    "number": blocked.get("number"),
+                    "state": blocked.get("state"),
+                    "labels": blocked.get("labels"),
+                }
+            ]
+            cause = "a blocker removed"
+        else:
+            return
+        for candidate in candidates:
+            await self._start_if_unblocked(candidate, cause)
+
+    async def _start_if_unblocked(self, candidate: dict, cause: str) -> None:
+        repository = _text(candidate.get("repository")).lower()
+        number = candidate.get("number")
+        if not repository or not isinstance(number, int):
+            return
+        ticket = f"{repository}#{number}"
+        names = {_label_name(label).casefold() for label in candidate.get("labels") or ()}
+        starts = {item.casefold() for item in self._start_labels(repository)}
+        holds = {item.casefold() for item in self._hold_labels(repository) if item}
+        why = ""
+        if _text(candidate.get("state")).lower() != "open":
+            why = "it is closed"
+        elif not _is_ticket(candidate.get("labels")):
+            why = "not a wayfinder ticket"
+        elif not starts:
+            why = "its repository starts no Works"
+        elif names & starts:
+            why = "it already has its start label"
+        elif names & holds:
+            why = "it is paused"
+        if why:
+            log.info("work-router: %s, %s not started: %s", cause, ticket, why)
+            return
+        try:
+            blockers = await self._read_dependencies(repository, number, "blocked_by")
+        except Exception:  # noqa: BLE001 -- nothing started; Start still can
+            log.warning("work-router: blockers of %s unread", ticket, exc_info=True)
+            return
+        if blockers is None:
+            return
+        still = [
+            f"#{row.get('number')}"
+            for row in blockers
+            if _text(row.get("state")).lower() != "closed"
+        ]
+        if still:
+            log.info("work-router: %s, %s waits on %s", cause, ticket, ", ".join(still))
+            return
+        try:
+            outcome, text = await self._start_ticket(repository, number)
+        except Exception:  # noqa: BLE001 -- the write may not have landed; Start still can
+            log.warning("work-router: %s, starting %s failed", cause, ticket, exc_info=True)
+            return
+        log.info("work-router: %s, %s has no open blocker: %s %s", cause, ticket, outcome, text)
 
     async def _maybe_keep_map_lists(self, delivery: Delivery) -> None:
         """Rebuild a wayfinder map's lists when one of its records lands (#3695).

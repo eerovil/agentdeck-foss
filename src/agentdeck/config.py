@@ -719,13 +719,18 @@ class SpeechConfig(BaseModel):
     in ``keep_audio_dir`` for that many days, for ``scripts/speech_bench.py`` to
     compare speech-to-text models on (#3499). ``0``, the default, keeps nothing.
 
-    ``engine`` and ``parakeet_model`` are read by the speech service itself when it
-    starts, not by the deck (#3509): ``"parakeet"``, the default, runs the Parakeet
-    TDT model in the folder ``parakeet_model`` (Orukeet, which
-    ``scripts/speech_setup.sh`` downloads) on the CPU, writing each word in the
-    language spoken; ``"whisper"`` is Whisper ``small`` on the graphics card, best
-    with ``language = "en"``. A change takes effect when the
-    service next starts, at most ``--idle-exit`` after its last phrase.
+    ``engine``, ``whisper_model`` and ``parakeet_model`` are read by the speech
+    service itself when it starts, not by the deck (#3509): ``"parakeet"``, the
+    default, runs the Parakeet TDT model in the folder ``parakeet_model`` (Orukeet,
+    which ``scripts/speech_setup.sh`` downloads) on the CPU, writing each word in the
+    language spoken; ``"whisper"`` runs ``whisper_model`` on the graphics card with
+    beam size ``whisper_beam``, and Parakeet hears any phrase Whisper cannot (#3517).
+    The defaults, ``large-v3-turbo`` with beam 1, are the owner's pick on a GTX 1660
+    Super with ``language = "fi"``: the owner's mixed Finnish heard best and fastest,
+    about 0.6 s a phrase, keeping English sentences English; ``large-v3`` forced to
+    Finnish translates them, and ``small`` is best only with ``language = "en"`` (#3517).
+    The service keeps its model loaded (#3766), so a change takes effect when it is
+    restarted (``systemctl --user restart agentdeck-speech.service``).
 
     ``tts`` is who reads replies aloud (#3519): ``"piper"``, the default, is Piper in
     the speech service; ``"chatterbox"`` asks Chatterbox Multilingual on the card
@@ -752,6 +757,8 @@ class SpeechConfig(BaseModel):
     keep_audio_dir: str = "~/.local/share/agentdeck/speech/kept"
     engine: Literal["whisper", "parakeet"] = "parakeet"
     parakeet_model: str = "~/.local/share/agentdeck/speech/models/orukeet"
+    whisper_model: str = Field(default="large-v3-turbo", pattern=r"^[A-Za-z0-9._/~-]+$")
+    whisper_beam: int = Field(default=1, ge=1, le=10)
     tts: Literal["piper", "chatterbox"] = "piper"
     tts_socket: str = ""
     tts_exaggeration: float = Field(default=0.5, ge=0, le=2)

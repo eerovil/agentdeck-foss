@@ -69,6 +69,7 @@ from ..work_actions import (
 from ..work_attention import (
     ISSUE_CLOSED,
     MERGE,
+    NEEDS_ANSWER,
     UNSTARTED,
     OperatorAttention,
     operator_attention,
@@ -82,6 +83,7 @@ from ..work_facts import (
     pull_identity,
     pull_state,
     work_facts,
+    work_finished_at,
 )
 from ..work_hidden import HiddenWork, still_hidden
 from ..work_overview import (
@@ -1212,7 +1214,6 @@ def derived_for(
     cut_off = bool(session is not None and getattr(session, "turn_cut_off", False) and not running)
     cut_off_at = getattr(session, "turn_cut_off_at", None) if cut_off else None
     pr_open = any(output.is_open for output in card.outputs)
-    ready_pr_open = any(output.is_open and not output.draft for output in card.outputs)
     # Merged and nothing open (#3578): the live check is due whether or not the issue closed.
     merged = not pr_open and any(output.state == "merged" for output in card.outputs)
     live = _live_state(app, ref.work_id) if card.awaiting_finish or merged else _LiveState()
@@ -1238,7 +1239,6 @@ def derived_for(
         approval_href=approval_href,
         closed=_reads_closed(card),
         pr_open=pr_open,
-        ready_pr_open=ready_pr_open,
         merged=merged,
         live_pending=live.pending,
         live_result=live.result,
@@ -2020,6 +2020,7 @@ def gather_facts(
     unstarted = unstarted_issues(
         snapshot.backlog, now=now, mine=getattr(app.state, "deck_claims", None)
     )
+    finished_maps = _finished_maps(app, records, signoffs, cutoff)
     found = {}
     for (ref, open_pulls, registered), item in zip(inputs, candidates, strict=True):
         facts = work_facts(
@@ -2033,7 +2034,7 @@ def gather_facts(
         signed = signoffs.get(ref.work_id)
         if awaiting_finish(
             facts.finished_at, signed[1] if signed else None, cutoff
-        ) and not _finishes_by_itself(facts):
+        ) and not _finishes_by_itself(facts, finished_maps):
             facts = replace(facts, awaiting_finish=True)
         if ref.work_id in held:
             facts = replace(facts, deck_paused=True)
@@ -2101,15 +2102,59 @@ def start_signoff_cutoff(control: Any) -> None:
         control.record_work_backfill(SIGNOFF_CUTOFF, json.dumps({"cutoff": stamp}))
 
 
-def _finishes_by_itself(facts: WorkFacts) -> bool:
-    """A closed wayfinder ticket needs no Finish (#3675): its answer is already on its map,
-    and the owner signs the whole map off at its destination. One closed with a pull request
-    still open waits as any Work does, so that pull request is not forgotten (#3187)."""
+def _labels(facts: WorkFacts) -> list:
     record = facts.record
     labels = record.get("labels") if isinstance(record, Mapping) else None
-    return wayfinder_map.is_ticket(labels if isinstance(labels, list) else ()) and not any(
-        output.is_open for output in facts.outputs
-    )
+    return labels if isinstance(labels, list) else []
+
+
+def _finished_maps(
+    app: Any,
+    records: Mapping[str, Any],
+    signoffs: Mapping[str, tuple[datetime, datetime | None]],
+    cutoff: datetime | None,
+) -> frozenset[str]:
+    """The casefolded ids of the wayfinder maps, among the closed records' parents, that a
+    person has finished (#3770). A parent the deck builds no Work for right now is read from
+    the issue cache all the same, in one more local read, so a child finishes with its map
+    on the front page and on its own page alike. A parent with no record finishes nothing."""
+    parents = {}
+    for record in records.values():
+        parent = work_tree.parent_ref(record) if work_finished_at(record) else None
+        if parent is not None:
+            parents[parent.work_id] = parent
+    missing = [
+        SimpleNamespace(ref=ref) for work_id, ref in parents.items() if work_id not in records
+    ]
+    found = {**_cached_issues(app, missing), **records} if missing else records
+    signed_by_id = {key.casefold(): value for key, value in signoffs.items()}
+    finished = set()
+    for work_id in parents:
+        record = found.get(work_id)
+        labels = record.get("labels") if isinstance(record, Mapping) else None
+        closed = work_finished_at(record)
+        signed = signed_by_id.get(work_id.casefold())
+        if (
+            closed is not None
+            and wayfinder_map.is_map(labels if isinstance(labels, list) else ())
+            and not awaiting_finish(closed, signed[1] if signed else None, cutoff)
+        ):
+            finished.add(work_id.casefold())
+    return frozenset(finished)
+
+
+def _finishes_by_itself(facts: WorkFacts, finished_maps: Collection[str] = ()) -> bool:
+    """A closed wayfinder ticket needs no Finish (#3675): its answer is already on its map,
+    and the owner signs the whole map off at its destination. Any other closed sub-issue of a
+    map (a build issue filed under it) finishes with the map's own Finish (#3770), so one press
+    ends the whole map. One closed with a pull request still open, or one whose state the deck
+    has not read yet, waits as any Work does, so that pull request is not forgotten (#3187)."""
+    if not all(output.settled for output in facts.outputs):
+        return False
+    if wayfinder_map.is_ticket(_labels(facts)):
+        return True
+    parent = work_tree.parent_ref(facts.record)
+    return parent is not None and parent.work_id.casefold() in finished_maps
 
 
 def signoff_inputs(
@@ -2785,6 +2830,39 @@ POPULATION_SECTIONS = {
     "folded": "Under its parent",
     "unlisted": "Not listed",
 }
+
+
+def needs_you_rows(overview: WorkOverview, repo: str | None = None) -> list[dict[str, Any]]:
+    """The front page's Needs you section as short rows to answer "do you need me?" from
+    (#3773): one call for the deck chat, in the page's order, hidden Works left out.
+
+    ``question`` is the card's own short line on a ``Needs answer`` row, never the whole
+    question box. ``repo`` keeps one repository, compared case-insensitively.
+
+    A parent row folded over a leading child (#3622) shows the child's attention, so the
+    row names the child (``item.actor``, the Work its controls act on) and its parent as
+    ``under``: a follow-up read of ``ref``'s question box then reads the right Work.
+    """
+    wanted = (repo or "").strip().lower()
+    rows: list[dict[str, Any]] = []
+    for item in overview.front.needs_you:
+        actor = item.actor
+        ref = WorkRef.from_work_id(actor.work_id)
+        if wanted and (ref is None or ref.repository != wanted):
+            continue
+        op = item.attention
+        row = {
+            "ref": ref.source_key if ref is not None else actor.work_id,
+            "title": actor.title,
+            "waits_for": op.label if op is not None else item.status.headline,
+        }
+        if actor.work_id != item.card.work_id:
+            parent = WorkRef.from_work_id(item.card.work_id)
+            row["under"] = parent.source_key if parent is not None else item.card.work_id
+        if op is not None and op.category == NEEDS_ANSWER and op.reason:
+            row["question"] = op.reason
+        rows.append(row)
+    return rows
 
 
 def population_rows(overview: WorkOverview) -> list[dict[str, Any]]:

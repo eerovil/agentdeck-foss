@@ -16,7 +16,9 @@ A message sent while the chat holds something the person has not heard (a reply 
 arrived while they spoke, or a turn not started from their page, such as a wake) also
 carries ``UNHEARD_LINE`` just before the instruction line, naming the last 🔊 line read
 aloud to them, so a short "yes" is not taken as the answer to a question they never
-heard (#3520). A spoken message that is only a yes or a no also carries
+heard (#3520). It also asks the agent to say again what they need of it, since a
+finished turn's reply still unread when such a message goes is no longer read (#3771).
+A spoken message that is only a yes or a no also carries
 ``SHORT_ANSWER_LINE``, asking the agent to confirm before acting on it. The chat view
 hides both with the instruction line. With 🎧 off the page sends no instruction line
 (#3540), so a short-answer line can be the last one, and it is hidden on its own.
@@ -41,9 +43,16 @@ VOICE_MARK = "🎧"
 UNHEARD_LINE = (
     "(Voice mode: when the person said this, they had not heard everything in this chat "
     "since the last line read aloud to them, which was: {heard}. Do not take it as an "
-    "answer to a question they have not heard; if it could be one, ask them first.)"
+    "answer to a question they have not heard; if it could be one, ask them first. What "
+    "they have not heard is not read aloud to them later, so say again in your spoken "
+    "opening what they need of it.)"
 )
 _UNHEARD_HEAD, _UNHEARD_TAIL = UNHEARD_LINE.split("{heard}")
+# Tails older messages carry, still hidden in the chat view.
+_OLD_UNHEARD_TAILS = (
+    ". Do not take it as an answer to a question they have not heard; if it could be "
+    "one, ask them first.)",
+)
 # A spoken message that is only a yes or a no (#3520): a phantom "Yeah." from noise
 # once nearly paused a running batch, so the agent confirms before acting on one.
 SHORT_ANSWER_LINE = (
@@ -64,7 +73,7 @@ def hide_voice_line(text: str) -> str:
             if head.endswith(SHORT_ANSWER_LINE):
                 head = head[: -len(SHORT_ANSWER_LINE)].rstrip()
             start = head.rfind(_UNHEARD_HEAD)
-            if start >= 0 and head.endswith(_UNHEARD_TAIL):
+            if start >= 0 and head.endswith((_UNHEARD_TAIL, *_OLD_UNHEARD_TAILS)):
                 head = head[:start].rstrip()
             return f"{head} {VOICE_MARK}" if head else VOICE_MARK
     return text

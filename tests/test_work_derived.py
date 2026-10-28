@@ -1424,16 +1424,22 @@ def test_a_parked_work_waits_for_a_person_and_is_never_asked_for_a_next_step(tmp
     assert ask_for_next_steps(app, [replace(task, derived=found)]) == 0 and scheduled == []
     assert front_row(replace(task, derived=found), current=False).section == "active"
     assert derived_story(replace(task, derived=found)).headline == "Parked"
-    # A ready pull request, a running turn or a question still reads as itself.
-    pushed = status(
-        parked=True, pr_open=True, ready_pr_open=True, last_text="Pushed.", ended_at=AT, asks=True
-    )
-    assert pushed.kind == ENDED
-    # #3733: a draft put on hold with the Work does not unpark it.
-    on_hold = status(parked=True, pr_open=True, last_text="Parked.", ended_at=AT, asks=True)
-    assert on_hold.kind == PARKED
+    # #3733, #3757: whatever pull request is open, a rule that only waits on the person who
+    # parked it reads Parked too. issues#855 was parked with its ready store#3687 escalated by
+    # the reviewer to the owner, and read Needs answer.
+    for waits_on_you in (
+        dict(pr_open=True, last_text="Parked.", ended_at=AT, asks=True),
+        dict(pr_open=True, escalated_pr=3687, escalated_at=AT),
+        dict(pr_open=True, ready_pr=3687, ready_reviewed_at=AT),
+        dict(pr_open=True, pr_waits=(("its merge", None),), pr_hold="held", pr_hold_person=True),
+        dict(spec_posted_at=AT),
+        dict(nudged_at=AT - NUDGE_GRACE, ended_at=AT),
+    ):
+        assert status(parked=True, **waits_on_you).kind == PARKED, waits_on_you
+    # A running turn, a question or a review in progress still reads as itself.
     assert status(parked=True, running=True).kind == WORKING
     assert status(parked=True, question="Which day?").kind == QUESTION
+    assert status(parked=True, pr_open=True, review_pr=9, review_since=AT).kind == REVIEW
 
 
 def test_a_posted_spec_waits_for_approval_and_is_never_asked_for_a_next_step(tmp_path):

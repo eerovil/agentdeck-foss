@@ -762,6 +762,104 @@ async def test_a_maps_last_ticket_closing_wakes_the_maps_chat(
     assert "Reach the destination" in message.text
 
 
+def _dep(number, state="open", labels=("wayfinder:research",), repository="eerovil/agentdeck"):
+    return {"repository": repository, "number": number, "state": state, "labels": list(labels)}
+
+
+def _unblock_harness(harness, blocking, blockers, *, fail=None):
+    """The router with the dependency reads and the Start write faked (#3764)."""
+    asked, started = [], []
+
+    async def read_dependencies(repository, number, kind):
+        asked.append((kind, number))
+        if fail == kind:
+            raise RuntimeError("gh is down")
+        return blocking.get(number, []) if kind == "blocking" else blockers.get(number, [])
+
+    async def start_ticket(repository, number):
+        started.append((repository, number))
+        return "done", f"Started {repository}#{number}"
+
+    harness.service._read_dependencies = read_dependencies
+    harness.service._start_ticket = start_ticket
+    harness.service._start_labels = lambda repository: ("agent",)
+    harness.service._hold_labels = lambda repository: ("Paused",)
+    return asked, started
+
+
+@pytest.mark.parametrize(
+    ("blocked", "blockers", "closed_labels", "fail", "started", "why"),
+    [
+        # #3705 on map #3697: both blockers closed, the second by the deck's own login.
+        (_dep(30), [_dep(21, "closed"), _dep(22, "closed")], ["wayfinder:research"], None,
+         True, "eerovil/agentdeck#30 has no open blocker: done"),
+        (_dep(30), [_dep(21, "closed"), _dep(22)], ["wayfinder:research"], None,
+         False, "eerovil/agentdeck#30 waits on #22"),
+        (_dep(30, labels=["wayfinder:task", "Agent"]), [], ["wayfinder:research"], None,
+         False, "already has its start label"),
+        (_dep(30, labels=["wayfinder:task", "paused"]), [], ["wayfinder:research"], None,
+         False, "it is paused"),
+        (_dep(30, "closed"), [], ["wayfinder:research"], None, False, "it is closed"),
+        (_dep(30, labels=["bug"]), [], ["wayfinder:research"], None,
+         False, "not a wayfinder ticket"),
+        (_dep(30, labels=["wayfinder:map"]), [], ["wayfinder:research"], None,
+         False, "not a wayfinder ticket"),
+        # An ordinary issue's close reads nothing at all.
+        (_dep(30), [], ["agent"], None, False, None),
+        (_dep(30), [], ["wayfinder:research"], "blocking", False, "blocks unread"),
+        (_dep(30), [], ["wayfinder:research"], "blocked_by", False, "blockers of"),
+    ],
+)
+async def test_a_tickets_last_blocker_closing_starts_it(
+    root, harness, caplog, blocked, blockers, closed_labels, fail, started, why
+):
+    """#3764: a wayfinder ticket waits for every blocker, then gets the Start button's write,
+    whoever closed the last one; a labelled, paused, closed or non-ticket one is left alone,
+    and a failed read starts nothing and stops nothing else."""
+    caplog.set_level("INFO", logger="agentdeck.work_router")
+    asked, starts = _unblock_harness(harness, {22: [blocked]}, {30: blockers}, fail=fail)
+    deliver(
+        root,
+        event="issues",
+        delivery="d1",
+        action="closed",
+        sender={"login": "eerovil-agent", "type": "User"},
+        issue={"number": 22, "state": "closed", "labels": [{"name": n} for n in closed_labels]},
+    )
+    await harness.drain()
+    assert starts == ([("eerovil/agentdeck", 30)] if started else [])
+    if why is None:
+        assert asked == []
+        return
+    logged = [r.getMessage() for r in caplog.records if r.name == "agentdeck.work_router"]
+    assert any(why in line for line in logged), logged
+    # A replay of the delivery reads the ticket again, now labelled, and starts nothing more.
+    if started:
+        blocked["labels"].append("agent")
+        await harness.service.apply(read(root))
+        assert len(starts) == 1
+
+
+async def test_a_blocker_removed_by_hand_starts_a_ticket_left_with_none(root, harness):
+    """#3764: removing a ticket's last open blocker starts it; one with another open does not."""
+    asked, starts = _unblock_harness(harness, {}, {30: [], 31: [_dep(23)]})
+    for delivery, number in (("d1", 30), ("d2", 31)):
+        deliver(
+            root,
+            event="issue_dependencies",
+            delivery=delivery,
+            action="blocked_by_removed",
+            sender=PERSON,
+            blocked_issue={"number": number, "state": "open",
+                           "labels": [{"name": "wayfinder:research"}]},
+            blocked_issue_repo={"full_name": "eerovil/agentdeck"},
+            blocking_issue={"number": 22, "state": "open"},
+        )
+    await harness.drain()
+    assert asked == [("blocked_by", 30), ("blocked_by", 31)]
+    assert starts == [("eerovil/agentdeck", 30)]
+
+
 async def test_a_handed_over_maps_last_ticket_wakes_no_chat_here(root, harness):
     """#3731 review: the map went to another deck, whose agent reaches the destination."""
     harness.issues[("eerovil/agentdeck", 20)] = ("chat-m", "eerovil/agentdeck#20")

@@ -103,12 +103,18 @@ relative path or a guessed domain.
 
 
 # An agent's reply can carry working HTML (#3547): the chat view renders an
-# `html-live` block in an assistant message inside a sandboxed frame.
+# `html-live` block in an assistant message inside a sandboxed frame. An agent once
+# asked "which voice?" pointing at players in its reply, but had not written that
+# reply yet, and wrote the players as bare tags when it did (#3762).
 LIVE_HTML_INSTRUCTIONS = """
 To show the person something markdown cannot — an audio player, a small widget —
 put HTML in a code block whose language is `html-live`; the chat shows it working
-inside your reply, in a sandboxed frame where scripts run. Point `src` at a host
-file by its absolute path, for example `<audio controls src="/var/tmp/a.wav">`.
+inside your reply, in a sandboxed frame where scripts run. HTML outside such a
+block shows as plain text. Point `src` at a host file by its absolute path, for
+example `<audio controls src="/var/tmp/a.wav">`. When a question is about what the
+block shows, write the block as text before you call the question tool: the
+question holds your turn until it is answered, so a reply written after it is not
+there while the person decides.
 """.strip()
 
 
@@ -348,8 +354,10 @@ AgentDeck conventions:{identity}
   and design tools are not prototypes. Post no screenshots of a prototype on the
   issue and open no pull request for it; build the pull request once they pick.
   On a spec-only issue, the spec plans the prototype as the first step after
-  approval. For "live prototype <feature> in <repo>" (a meeting), read
-  `GET $AGENTDECK_URL/api/live-prototype/guide` first and follow it.
+  approval. "Live prototype" in any wording ("live prototype <feature>",
+  "prototype it live", with or without "meeting" or a repo) always means the
+  live meeting prototype: read `GET $AGENTDECK_URL/api/live-prototype/guide`
+  first and follow it, never a plain prototype link alone.
 - When a user decision is genuinely required and a structured user-input tool is
   available, use it instead of ending with an unstructured question. Continue
   with safe in-scope work when input is not actually blocking.

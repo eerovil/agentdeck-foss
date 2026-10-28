@@ -192,6 +192,50 @@ async def test_a_closed_work_waits_in_needs_you_until_a_person_finishes_it(tmp_p
     assert app.state.control_db.work_signoffs()[WORK.work_id][1] is not None
     assert _NoGh.calls == 0
 
+    # #3770: a closed build issue filed under the map is no ticket, yet finishes with the map.
+    from test_work_ui import OTHER, _add
+
+    _add(app, "claude_code:main:worker-3770", OTHER)
+    child = {
+        **record,
+        "labels": ["agent"],
+        "parent": f"https://api.github.com/repos/{WORK.repository}/issues/{WORK.number}",
+    }
+    app.state.issues.cached_issues = lambda refs: {
+        (WORK.repository, WORK.number): record,
+        (OTHER.repository, OTHER.number): child,
+    }
+    await app.state.work_overview.refresh()
+    assert _ids(app.state.work_overview.overview.front.needs_you) == []
+    # A map the deck builds no Work for is read from the issue cache, on the child's page too.
+    from test_work_ui import UNSTARTED
+
+    child["parent"] = child["parent"].replace(str(WORK.number), str(UNSTARTED.number))
+    old_map = {**record, "closedAt": (NOW - timedelta(days=2)).isoformat()}  # before the cutoff
+    app.state.issues.cached_issues = lambda refs: {
+        (WORK.repository, WORK.number): record,
+        (OTHER.repository, OTHER.number): child,
+        (UNSTARTED.repository, UNSTARTED.number): old_map,
+    }
+    await app.state.work_overview.refresh()
+    assert _ids(app.state.work_overview.overview.front.needs_you) == []
+    assert 'value="finish"' not in client.get(work_href(OTHER.work_id)).text
+    # A pull request of the child's own still waits, open or not read yet, under any map.
+    from agentdeck.web.work_view import _finishes_by_itself
+    from agentdeck.work_facts import WorkFacts
+
+    url = "https://github.com/eerovil/agentdeck/pull/9"
+    built = WorkFacts(ref=OTHER, record=child, outputs=(OutputFact(url, "", 9, "issue"),))
+    maps = {UNSTARTED.work_id.casefold()}
+    assert not _finishes_by_itself(built, maps)
+    merged = replace(built, outputs=(OutputFact(url, "", 9, "issue", state="merged"),))
+    assert _finishes_by_itself(merged, maps)
+    old_map["labels"] = ["agent"]  # a parent that is no map finishes nothing
+    assert 'value="finish"' in client.get(work_href(OTHER.work_id)).text
+    child["parent"] = None  # under no map, the same closed issue waits for its own Finish
+    await app.state.work_overview.refresh()
+    assert _ids(app.state.work_overview.overview.front.needs_you) == [OTHER.work_id]
+
 
 @pytest.mark.asyncio
 async def test_a_work_closed_before_the_cutoff_is_finished_as_before(tmp_path, monkeypatch):

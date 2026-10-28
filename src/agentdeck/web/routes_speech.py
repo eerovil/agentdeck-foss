@@ -22,7 +22,12 @@ audio and Whisper's words in ``keep_audio_dir`` for that many days, which
 ``/api/voice/heard`` gives a phrase heard in voice mode to the chat's fast agent
 (``voice_helper``) and returns what to say and what to send; a 503 there means the
 page sends the words as heard and says its own acknowledgement.
-``/api/voice/warm`` starts that agent before a phrase needs it (#3507), and with
+The page asks it as soon as a phrase's words come back (#3765), and names an ask whose
+answer it threw away, as more words joined the phrase, in the next one's ``drop``.
+The short "Mm." the page played while the fast agent answered (#3765) and its
+``/api/voice/filler`` route were removed by the owner's decision on #3780.
+``/api/voice/warm`` starts that agent before a phrase needs it (#3507), has the
+speech service load its speech-to-text model (#3766), and with
 ``[speech] tts = "chatterbox"`` has ``scripts/tts_server.py`` load its model too.
 
 With ``[speech] tts = "chatterbox"`` (#3519), ``/api/speech/say`` asks Chatterbox
@@ -91,6 +96,8 @@ TTS_REST = 300.0
 _tts_down_until = 0.0
 # Warm-ups in flight, held so none is collected before it ends; nothing awaits them.
 _tts_warming: set[asyncio.Task] = set()
+# The speech service's warm-ups (#3766), held the same way.
+_stt_warming: set[asyncio.Task] = set()
 
 
 async def _forward(
@@ -378,6 +385,23 @@ async def _warm_chatterbox(speech) -> None:
         log.info("Chatterbox warm-up failed: %r", exc)
 
 
+async def _warm_speech(socket: str) -> None:
+    """Have the speech service load its speech-to-text model; it answers at once
+    and loads behind the reply. Run as a task nothing waits on (#3766)."""
+    transport = httpx.AsyncHTTPTransport(uds=str(Path(socket).expanduser()))
+    try:
+        async with httpx.AsyncClient(transport=transport, timeout=STATUS_TIMEOUT) as client:
+            await client.post("http://speech/warm")
+    except httpx.HTTPError as exc:
+        log.info("speech service warm-up failed: %r", exc)
+
+
+def _background(warming: set[asyncio.Task], coroutine) -> None:
+    task = asyncio.create_task(coroutine)
+    warming.add(task)
+    task.add_done_callback(warming.discard)
+
+
 @router.post("/api/voice/heard")
 async def voice_heard(request: Request) -> JSONResponse:
     """``{"session_key", "text", "aloud"}`` heard in voice mode, as the fast agent's
@@ -392,7 +416,8 @@ async def voice_heard(request: Request) -> JSONResponse:
     lines = [str(line) for line in aloud[-5:] if isinstance(line, str)]
     phrase_id = str(body.get("id") or "").strip()[:MAX_ID_CHARS]
     run = str(body.get("run") or "").strip()[:MAX_ID_CHARS]
-    answer = await voice_helper.heard(request.app, key, text, lines, phrase_id, run)
+    drop = str(body.get("drop") or "").strip()[:MAX_ID_CHARS]
+    answer = await voice_helper.heard(request.app, key, text, lines, phrase_id, run, drop)
     if answer is None:
         raise HTTPException(status_code=503, detail="the fast agent has no answer")
     return JSONResponse({"say": answer.say, "relay": answer.relay})
@@ -401,13 +426,18 @@ async def voice_heard(request: Request) -> JSONResponse:
 @router.post("/api/voice/sent")
 async def voice_sent(request: Request) -> Response:
     """``{"session_key", "id", "text", "how"}``: what the page really sent for a phrase
-    (``text`` null: nothing, and ``how`` says why), saved in the voice log (#3475)."""
+    (``text`` null: nothing, and ``how`` says why), saved in the voice log (#3475).
+    ``{"session_key", "id", "timing"}`` instead saves the phrase's measured waits
+    (#3765)."""
     _require_same_origin(request)
     body = await _json_object(request)
     key = str(body.get("session_key") or "").strip()
     phrase_id = str(body.get("id") or "").strip()[:MAX_ID_CHARS]
     if not key or not phrase_id:
         raise HTTPException(status_code=400, detail="a session key and a phrase id are needed")
+    if isinstance(body.get("timing"), dict):
+        await voice_helper.timed(key, phrase_id, body["timing"])
+        return Response(status_code=204)
     text = body.get("text")
     text = str(text)[: voice_helper.MAX_HEARD_CHARS * 2] if isinstance(text, str) else None
     how = str(body.get("how") or "")[:MAX_SAY_CHARS]
@@ -417,17 +447,18 @@ async def voice_sent(request: Request) -> Response:
 
 @router.post("/api/voice/warm")
 async def voice_warm(request: Request) -> Response:
-    """Voice mode is listening: start the chat's fast agent before a phrase needs it,
-    and Chatterbox's model before a reply does (#3519)."""
+    """Voice mode is listening: start the chat's fast agent and load the speech
+    model before a phrase needs them (#3766), and Chatterbox's model before a reply
+    does (#3519)."""
     _require_same_origin(request)
     body = await _json_object(request)
     key = str(body.get("session_key") or "").strip()
     run = str(body.get("run") or "").strip()[:MAX_ID_CHARS]
     speech = get_config(request).speech
+    if speech.socket:
+        _background(_stt_warming, _warm_speech(speech.socket))
     if speech.tts == "chatterbox" and speech.tts_socket:
-        task = asyncio.create_task(_warm_chatterbox(speech))
-        _tts_warming.add(task)
-        task.add_done_callback(_tts_warming.discard)
+        _background(_tts_warming, _warm_chatterbox(speech))
     if key:
         await voice_helper.warm(request.app, key, run)
     return Response(status_code=204)

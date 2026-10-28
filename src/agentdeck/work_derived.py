@@ -82,9 +82,11 @@ Work's own facts. Nothing here is stored and nothing here asks the agent to call
    agent posted its spec on the issue, with no pull request open and nobody commenting since:
    building waits on a person's approval, so it reads **Needs you — approve the spec · posted
    06:35**, linking the spec comment (#3247). Nor is a Work whose issue carries the ``parked``
-   label with no ready pull request open (a draft on hold does not count, #3733): a person
-   asked its agent to leave it until they write, so it reads **Parked — waits for your
-   message** (#3560).
+   label: a person asked its agent to leave it until they write, so it reads **Parked —
+   waits for your message** (#3560). The label also stands over the earlier rules that only
+   wait on a person — the reviewer's escalation, Ready for merge, a held pull request, a
+   posted spec — whatever pull request is open (#3757): the person already said they will
+   write. A question, a turn, a death, a wait or a review in progress still reads as itself.
 
 Since #2944 this is the one status of such a Work: the front page's section, the operator's
 category and the buttons follow it too (``work_story.work_status``). A time not on today's
@@ -130,6 +132,10 @@ PARKED = "parked"  # a person asked the agent to leave it until they write (#356
 
 #: The issue label an agent puts on a Work a person asked it to leave until they write.
 PARKED_LABEL = "parked"
+#: What the label stands over: each only waits on the person who parked it (#3757).
+_PARKED_OVER = frozenset(
+    {REVIEW_ESCALATED, READY, PR_HELD, PR_STUCK, SPEC_WAIT, ENDED, NUDGED, UNFINISHED}
+)
 
 #: How long an asked agent may take to start answering before the Work needs a person.
 NUDGE_GRACE = timedelta(minutes=10)
@@ -192,8 +198,6 @@ class DerivedInputs:
     #: A registered pull request is still open: a closed issue then reads through the pull
     #: request's rules rather than as Issue closed (#3187).
     pr_open: bool = False
-    #: One of those open pull requests is out of draft (#3733).
-    ready_pr_open: bool = False
     #: The deck asked the agent to check its merged change live and no result came yet; else
     #: the result it recorded (``verified``, ``failed``, ``nothing_to_check``, ``not_live``) and
     #: its line (#3141).
@@ -272,9 +276,9 @@ class DerivedInputs:
     #: comment since (#3247): when, and the comment. Rule 9 never applies; a person approves.
     spec_posted_at: datetime | None = None
     spec_url: str = ""
-    #: The issue carries ``PARKED_LABEL`` (#3560): with no ready pull request open, rule 9
-    #: never applies; the next person's message starts the agent again. A draft left on hold
-    #: does not count against it (#3733).
+    #: The issue carries ``PARKED_LABEL`` (#3560): rule 9 never applies, nor any rule in
+    #: ``_PARKED_OVER``, whatever pull request is open (#3733, #3757); the next person's
+    #: message starts the agent again.
     parked: bool = False
 
 
@@ -400,6 +404,11 @@ def derived_status(
     rules, nudge and bug report are unchanged: they read ``kind``.
     """
     status = _first_rule(inputs, now=now, clock=clock)
+    if inputs.parked and status.kind in _PARKED_OVER:
+        summary = "waits for your message"
+        status = DerivedStatus(
+            PARKED, f"Parked — {summary}", summary=summary, chat_href=inputs.chat_href
+        )
     if inputs.closed and inputs.pr_open and status.kind != FINISHED:
         # Its pull request still has a step ahead of it (#3187): say the issue closed after.
         return replace(
@@ -626,9 +635,6 @@ def _first_rule(
         return DerivedStatus(
             SCHEDULED, f"Scheduled — {summary}", summary=summary, chat_href=href
         )
-    if inputs.parked and not inputs.ready_pr_open:
-        summary = "waits for your message"
-        return DerivedStatus(PARKED, f"Parked — {summary}", summary=summary, chat_href=href)
     return _ended(inputs, now=now, clock=clock)
 
 

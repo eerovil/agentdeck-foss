@@ -199,8 +199,46 @@
     this.recent = pause;
   };
 
+  // A phrase not back after this long says so in the bubble, and asks whether the
+  // service is still loading its model (#3722); a warm one answers in well under a
+  // second.
+  var SLOW_MS = 1500;
+  var STATUS_EVERY_S = 5;
+
+  // Calls `onwait(seconds, starting)` each second a phrase is slow to come back,
+  // `starting` true while the service says its model is not loaded yet, and
+  // `onwait(0)` once it is back; `aborted()` true skips the calls. Returns the
+  // function that stops the watch. 🎤 and voice mode (#3766) both use it.
+  function watchSlow(aborted, onwait) {
+    var began = Date.now();
+    var starting = false;
+    var asked = -STATUS_EVERY_S;
+    var slow = false;
+    var timer = setInterval(function () {
+      var waited = Date.now() - began;
+      if (waited < SLOW_MS || aborted()) return;
+      var seconds = Math.round(waited / 1000);
+      if (seconds - asked >= STATUS_EVERY_S) {
+        asked = seconds;
+        fetch('/api/speech/status').then(function (response) {
+          return response.ok ? response.json() : null;
+        }).then(function (state) {
+          starting = !!state && state.loaded === false;
+        }, function () { /* the transcription's own answer decides */ });
+      }
+      slow = true;
+      onwait(seconds, starting);
+    }, 500);
+    return function () {
+      clearInterval(timer);
+      if (slow) onwait(0, false);
+    };
+  }
+
   // Voice mode (#3401) records for the host with the same microphone code.
-  window.AgentDeckDictation = { Capture: Capture, wav: wav, loudness: loudness, Gate: Gate };
+  window.AgentDeckDictation = {
+    Capture: Capture, wav: wav, loudness: loudness, Gate: Gate, watchSlow: watchSlow
+  };
 
   if (!Recognition && !canRecord) return;
   // The browser's recognizer shows 🎤 everywhere; recording alone shows it where
@@ -214,12 +252,6 @@
   // Set once the host fails: the rest of the page uses the browser's recognizer.
   // With none (Firefox), each tap tries the host again and says if it still fails.
   var hostDown = false;
-  // A phrase not back after this long says so in the bubble, and asks whether the
-  // service is still loading its model after an idle exit (#3722); a warm one
-  // answers in well under a second.
-  var SLOW_MS = 1500;
-  var STATUS_EVERY_S = 5;
-
   // The host's Whisper behind the browser recognizer's shape (start, stop, abort,
   // onresult, onerror, onend), so a session drives either the same way. It listens
   // until stopped; each phrase, cut at a pause, comes back as one final result, in
@@ -316,34 +348,12 @@
     });
   };
 
-  // Calls `onwait(seconds, starting)` each second a phrase is slow to come back,
-  // `starting` true while the service says its model is not loaded yet, and
-  // `onwait(0)` once it is back. Returns the function that stops the watch.
+  // `watchSlow` for this listener's phrase, told through `onwait`.
   HostRecognition.prototype.watch = function () {
     var self = this;
-    var began = Date.now();
-    var starting = false;
-    var asked = -STATUS_EVERY_S;
-    var slow = false;
-    var timer = setInterval(function () {
-      var waited = Date.now() - began;
-      if (waited < SLOW_MS || self.aborted) return;
-      var seconds = Math.round(waited / 1000);
-      if (seconds - asked >= STATUS_EVERY_S) {
-        asked = seconds;
-        fetch('/api/speech/status').then(function (response) {
-          return response.ok ? response.json() : null;
-        }).then(function (state) {
-          starting = !!state && state.loaded === false;
-        }, function () { /* the transcription's own answer decides */ });
-      }
-      slow = true;
+    return watchSlow(function () { return self.aborted; }, function (seconds, starting) {
       if (self.onwait) self.onwait(seconds, starting);
-    }, 500);
-    return function () {
-      clearInterval(timer);
-      if (slow && self.onwait) self.onwait(0, false);
-    };
+    });
   };
 
   HostRecognition.prototype.release = function () {

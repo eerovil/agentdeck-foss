@@ -30,14 +30,14 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from markupsafe import Markup
 
-from .. import gh_cli, wayfinder_map, work_actions, work_counter
+from .. import wayfinder_map, work_actions, work_counter
 from ..board_watch import BOARD_TOPIC
 from ..models import IssueRef
 from ..state import REVIEWS_TOPIC
 from ..work import WorkRef
 from ..work_actions import STAR, UNSTAR, WorkActionPress, finish_question
 from ..work_attention import FINISH, HIDE
-from ..work_claims import own_assignee
+from ..work_claims import own_assignee, run_gh_write, start_issue
 from ..work_hidden import UNHIDE
 from ..work_overview import (
     WorkCandidate,
@@ -77,6 +77,7 @@ from .work_view import (
     gather_pass,
     load_work_detail,
     mark_sent,
+    needs_you_rows,
     note_work_opened,
     population_rows,
     render_changed_sections,
@@ -410,6 +411,26 @@ async def works_population(request: Request) -> JSONResponse:
             "ready": collector.initial_scans_finished() if collector is not None else True,
             "works": population_rows(overview or WorkOverview()),
             "revision": getattr(request.app.state, "revision", None),
+        },
+        headers={"Cache-Control": "no-cache"},
+    )
+
+
+@router.get("/api/works/needs-you")
+async def works_needs_you(request: Request, repo: str | None = None) -> JSONResponse:
+    """What needs the owner right now, short enough to speak from (#3773): the front page's
+    Needs you section, ``?repo=owner/repo`` for one repository. From the overview already
+    built, like ``/api/works/population``; ``ready`` is that read's flag too.
+    """
+    service = getattr(request.app.state, "work_overview", None)
+    overview = await service.current() if service is not None else None
+    collector = getattr(request.app.state, "collector", None)
+    rows = needs_you_rows(overview or WorkOverview(), repo)
+    return JSONResponse(
+        {
+            "count": len(rows),
+            "works": rows,
+            "ready": collector.initial_scans_finished() if collector is not None else True,
         },
         headers={"Cache-Control": "no-cache"},
     )
@@ -1403,27 +1424,17 @@ async def _write(
     # Only the close and the labels reach here. None carries anyone's authority, so each goes
     # out as the repository owner's non-human authority, like every other deck write.
     if step.kind == "add_label":
-        argv = [
-            gh, "issue", "edit", str(step.number), "--repo", step.repository,
-            "--add-label", step.body,
-        ]
-        done = f"Started {step.issue}: it has the {step.body} label, so an agent starts on it"
-        assignee = own_assignee(step.repository, getattr(request.app.state, "deck_claims", None))
-        if assignee:
-            # Where another deck takes unassigned issues, it would start this one (#3731).
-            # Assigned first, so the label's delivery already shows whose it is.
-            outcome, text = await _run_gh(
-                [
-                    gh, "issue", "edit", str(step.number), "--repo", step.repository,
-                    "--add-assignee", assignee,
-                ],
-                step.repository,
-                label,
-            )
-            if outcome != "done":
-                return outcome, text
-            done += f"; it is assigned to {assignee}"
-    elif step.kind == "remove_label":
+        # The same write a wayfinder ticket gets when its last blocker closes (#3764).
+        return await start_issue(
+            gh,
+            step.repository,
+            step.number,
+            step.body,
+            getattr(request.app.state, "deck_claims", None),
+            label=label,
+            timeout=_GH_TIMEOUT_S,
+        )
+    if step.kind == "remove_label":
         argv = [
             gh, "issue", "edit", str(step.number), "--repo", step.repository,
             "--remove-label", step.body,
@@ -1447,17 +1458,7 @@ async def _write(
 
 async def _run_gh(argv: list[str], repository: str, label: str) -> tuple[str, str]:
     """One ``gh`` write of a Work action: ``("done", "")``, or its outcome and why."""
-    try:
-        code, _stdout, stderr = await gh_cli.run_once(argv, timeout=_GH_TIMEOUT_S, repo=repository)
-    except gh_cli.GitHubRefusal as exc:
-        # Refused before anything ran, so pressing again after fixing it is safe.
-        return "failed", str(exc)
-    except (OSError, TimeoutError) as exc:
-        return "uncertain", f"{label} did not complete ({exc}); it may have landed"
-    if code != 0:
-        message = stderr.decode("utf-8", "replace").strip() or f"gh exited {code}"
-        return "uncertain", f"{label} did not report success ({message}); it may have landed"
-    return "done", ""
+    return await run_gh_write(argv, repository, label, timeout=_GH_TIMEOUT_S)
 
 
 @router.post("/works/{work_id:path}/action", response_class=HTMLResponse)

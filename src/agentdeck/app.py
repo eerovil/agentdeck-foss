@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import secrets
+import shutil
 import subprocess
 import time
 import uuid
@@ -48,6 +49,7 @@ from .issue_latest_comment import LatestCommentService
 from .issue_refresh import IssueRefreshService
 from .live_window import LiveWindow
 from .poller_ops import (
+    read_board,
     work_hold_labels,
     work_start_labels,
     work_unassigned_elsewhere,
@@ -109,6 +111,7 @@ from .web.work_view import (
 from .webhook_status_cache import WebhookStatusCacheService
 from .webhook_tailer import WebhookWatcher
 from .work_backstop import MissedStartBackstop
+from .work_claims import start_issue
 from .work_router import (
     SwitchedRepositories,
     WorkRouterService,
@@ -124,6 +127,7 @@ from .work_router import owner_of_pull as work_owner_of_pull
 from .work_signals import (
     acknowledge_comment,
     latest_comment,
+    read_dependencies,
     read_map,
     read_map_body,
     read_parent,
@@ -795,6 +799,14 @@ def create_app(config: AppConfig) -> FastAPI:
         result = await PROVIDERS[account.provider_id].interrupt(account, session)
         return bool(result.accepted)
 
+    async def start_unblocked_ticket(repository: str, number: int) -> tuple[str, str]:
+        # The Start button's own write and label (#3764): the first ownership label.
+        gh = shutil.which("gh")
+        labels = read_board(config.poller.root).ownership_labels(repository)
+        if gh is None or not labels:
+            return "failed", "no gh or no start label"
+        return await start_issue(gh, repository, number, labels[0], deck_claims)
+
     work_router = WorkRouterService(
         config.github_webhook.path,
         switched=switched_repositories,
@@ -851,6 +863,12 @@ def create_app(config: AppConfig) -> FastAPI:
         # A wayfinder map's chat wakes when its last ticket closes (#3627).
         read_issue=read_map,
         read_parent=read_parent,
+        # ... and a ticket starts once its last blocker closes (#3764).
+        read_dependencies=read_dependencies,
+        start_ticket=start_unblocked_ticket,
+        hold_labels=lambda repository: work_hold_labels(config.poller.root).get(
+            repository.lower(), ()
+        ),
         # ... and the deck keeps its lists from its tickets' answers (#3695).
         read_body=read_map_body,
         write_body=write_map_body,

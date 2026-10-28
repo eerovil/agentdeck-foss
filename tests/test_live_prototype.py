@@ -9,6 +9,7 @@ from agentdeck import live_prototype
 from agentdeck.app import create_app
 from agentdeck.config import AccountConfig, AppConfig, HistoryConfig, InjectConfig
 from agentdeck.models import Capability, Session, SessionStatus
+from agentdeck.providers.instructions import AGENTDECK_SESSION_INSTRUCTIONS
 
 pytestmark = pytest.mark.anyio
 
@@ -56,6 +57,10 @@ async def test_agent_registers_link_records_steps_and_page_shows_them(tmp_path):
         assert "Build no backend" in guide.text
         assert "Never make the room log in" in guide.text
         assert "Do not take screenshots" in guide.text
+        # Every chat's guide sends any "live prototype" ask here (#3760).
+        trigger = " ".join(AGENTDECK_SESSION_INSTRUCTIONS.split())
+        assert '"Live prototype" in any wording' in trigger
+        assert "always means the live meeting prototype" in trigger
 
         # A step before any link has nowhere to show.
         early = await client.post(f"{API}/steps", json={"summary": "x"})

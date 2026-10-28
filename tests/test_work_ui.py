@@ -1454,6 +1454,7 @@ def test_the_older_slices_routes_are_the_work_page_now(tmp_path):
         "/works/seen",  # mark Works read from the top bar's list (#3246)
         "/api/works/filed",  # an issue the deck filed starts its Work now (#3371)
         "/api/works/population",  # read-only rows for staging comparisons (#2250)
+        "/api/works/needs-you",  # what needs the owner, for the deck chat (#3773)
         "/api/works/status-log",  # every logged status change (#2751)
         "/api/works/status-log/flaps",  # the short trips somewhere and back (#2751)
         "/partials/works/{work_id:path}/diff",  # the Work's diff, read on open (#2379)

@@ -604,14 +604,15 @@ def _cmd_activate(args: argparse.Namespace) -> int:
         # Uncertainty is not approval: an unreadable permission has confirmed nothing.
         repos = loaded.manifest.issue_repos()
         permission = adapter.permission(repos[0], args.apply) if repos else None
-        if not auth.holds(
-            policy,
-            auth.Tier.RELEASE,
-            login=args.apply,
-            permission=permission,
-        ):
+        # A deck that is not a shared project's main one runs none of its extensions, takes only
+        # its own person's issues and cannot change what the main deck merges, so turning it on
+        # is Work, not Release (#3755). Merging there still checks Release, merge by merge.
+        main = loaded.manifest.main_deck
+        tier = auth.Tier.WORK if main and not config.is_main_deck(main) else auth.Tier.RELEASE
+        if not auth.holds(policy, tier, login=args.apply, permission=permission):
             who = args.apply or "nobody"
-            print(f"refused: {who} does not hold Release authority", file=sys.stderr)
+            name = "Work" if tier is auth.Tier.WORK else "Release"
+            print(f"refused: {who} does not hold {name} authority", file=sys.stderr)
             return 77  # EX_NOPERM: refused, not broken
     steps = _provision_steps(loaded, adapter, paths)
     installed_manifest = Path(args.binding).with_name("poller.toml")

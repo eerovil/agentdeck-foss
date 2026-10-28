@@ -139,7 +139,8 @@ repositories to one already there), turns the project on, and switches on its ti
 deck runs the extensions, so join stops there and says which machine settings (a token, a
 kubeconfig) to add to `overlay.toml` before running it again.
 On a deck that is not the main one, the deck takes only issues assigned to its person and runs
-none of the project's extensions, so nothing is filed twice. A change to the project is a
+none of the project's extensions, so nothing is filed twice. Turning it on needs only the
+project's Work role (`triage` by default), not the role that merges. A change to the project is a
 commit to that file; the Pollers page then says so, and `uv run agentdeck-project update <name>`
 applies it. The steps below are the same rules written by hand, for a project without a
 shared file.

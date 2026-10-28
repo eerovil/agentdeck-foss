@@ -101,6 +101,9 @@ def test_the_chat_view_hides_the_brief_behind_a_mark():
     assert "/question and follow each question's answer_with" in brief
     assert "chat message only where it says message" in brief
     assert "Never answer a question box by chat message" in brief
+    # #3773: "do you need me?" is one call, answered by the 🔊 paragraph alone.
+    assert "make one call, GET $AGENTDECK_URL/api/works/needs-you" in brief
+    assert "write only the 🔊 paragraph, with nothing after it" in brief
     later = meta_chat.with_brief("And now?", "https://deck/sessions/x/transcript")
     assert display_chat_message(first) == "🎙️ What is running?"
     assert display_chat_message(later) == "🎙️ And now?"
