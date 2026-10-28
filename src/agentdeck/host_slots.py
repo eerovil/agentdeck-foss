@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import fcntl
 import os
+import sys
 import tempfile
 import time
 from collections.abc import Callable, Iterator
@@ -194,6 +195,9 @@ def slot_root() -> Path:
     runtime_dir = Path(f"/run/user/{os.getuid()}")
     if runtime_dir.is_dir():
         return runtime_dir
+    if sys.platform == "darwin":
+        # A launchd job and a Terminal shell get different TMPDIRs on a Mac (#3623).
+        return Path.home() / ".cache" / "agentdeck"
     return Path(tempfile.gettempdir())
 
 
@@ -204,7 +208,7 @@ def slot_directory(name: str) -> Path:
     files are never cleaned: they are lock targets, empty and reused.
     """
     directory = slot_root() / f"agentdeck-{name}-slots-{os.getuid()}"
-    directory.mkdir(mode=0o700, exist_ok=True)
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     return directory
 
 

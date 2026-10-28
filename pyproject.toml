@@ -37,6 +37,8 @@ Homepage = "https://github.com/eerovil/agentdeck-foss"
 
 [project.scripts]
 agentdeck = "agentdeck.__main__:main"
+# Its own command: setup runs the poller engine, which the deck itself never reaches (#3623).
+agentdeck-init = "agentdeck.setup_init:main"
 
 [dependency-groups]
 dev = [

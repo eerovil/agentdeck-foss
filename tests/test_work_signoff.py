@@ -164,11 +164,18 @@ NOW = datetime.now(UTC)
 async def test_a_closed_work_waits_in_needs_you_until_a_person_finishes_it(tmp_path, monkeypatch):
     from test_work_ui import WORK
 
-    app, _card, _record = _deck(
+    app, _card, record = _deck(
         tmp_path, monkeypatch, closed_at=NOW - timedelta(minutes=5), cutoff=NOW - timedelta(days=1)
     )
     client = _client(app)
-    before = await app.state.work_overview.current()
+    # #3675: a wayfinder ticket's answer is already on its map, so its close needs no Finish.
+    record["labels"] = ["agent", "Wayfinder:Research"]
+    ticket = await app.state.work_overview.current()
+    assert _ids(ticket.front.needs_you) == [] and _ids(ticket.front.finished) == [WORK.work_id]
+    assert app.state.control_db.work_signoffs() == {}
+    record["labels"] = ["agent", "wayfinder:map"]  # the map itself still waits, as any Work
+    await app.state.work_overview.refresh()
+    before = app.state.work_overview.overview
 
     (row,) = before.front.needs_you
     assert row.card.work_id == WORK.work_id and _ids(before.front.finished) == []

@@ -27,6 +27,11 @@ deliveries are the deck's own echo):
 * **A wayfinder map's last ticket closed** (#3627): a sub-issue's close, under any login, whose
   parent, read once from GitHub, is an open ``wayfinder:map`` with every sub-issue done. The
   map's own chat is told to reach the destination, so nobody has to wake it.
+* **A wayfinder record** (#3695): a ticket's ``**Answer:**`` comment, or an ``**Ideas
+  sorted:**`` or ``**Destination redrawn:**`` comment on the map, posted or edited by the deck
+  or a person on the repository. Nothing is sent: the deck rebuilds the map's four lists from
+  every record the stored streams hold (``wayfinder_lists``) and saves the map body, with one
+  read of the map and one write, and no write when nothing changed.
 * **The reviewer's verdict** — a ``/reviewed`` or ``/claude`` comment from the reviewer's
   account, or the deck's own reviewer's findings (``/claude Review ...``) or
   ``/reviewed`` posted under the deck's account (#2943).
@@ -121,6 +126,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from . import wayfinder_lists, wayfinder_map
 from .poller_engine import github_authority
 from .poller_engine.authorization import reviewer_logins
 from .review_refs import ReviewBusy, ReviewError
@@ -182,6 +188,8 @@ _VERDICT_RE = re.compile(r"^\s*/(?:reviewed|claude)\b", re.IGNORECASE)
 _API_ISSUE_RE = re.compile(r"^https://api\.github\.com/repos/([^/\s]+)/([^/\s]+)/issues/(\d+)$")
 #: The label of a wayfinder map, whose chat wakes when its last ticket closes (#3627).
 MAP_LABEL = "wayfinder:map"
+#: ``read_map`` reads one page of a map's sub-issues; a full page may not be all of them.
+MAP_PAGE = 100
 #: A person's instruction (#3118): only a comment opening with ``/claude`` is passed on.
 _CLAUDE_RE = re.compile(r"^\s*/claude\b", re.IGNORECASE)
 #: What the deck's own reviewer posts under the deck's account (#2943): its findings, or a
@@ -312,32 +320,65 @@ def _api_issue(url: object) -> tuple[str, int] | None:
     return (f"{match.group(1)}/{match.group(2)}".lower(), int(match.group(3)))
 
 
-def map_ready(delivery: Delivery, parent: tuple[str, int], record: object) -> Event | None:
-    """The message that wakes a wayfinder map's chat, or None (#3627).
+def map_ready(
+    delivery: Delivery, parent: tuple[str, int], record: object
+) -> tuple[Event | None, str]:
+    """The message that wakes a wayfinder map's chat, or None, and why, for the log (#3627).
 
     ``record`` is the map issue as GitHub returns it now, read after a ticket's close: an
     open issue labelled ``wayfinder:map`` whose sub-issues are all closed. ``last_closed``
     is when the last of them closed; it names the message, so every close delivery read
     after the map completed sends the same one, which the store keeps once, while a ticket
-    reopened and closed again completes the map anew."""
-    if not isinstance(record, dict) or _text(record.get("state")).lower() != "open":
-        return None
+    reopened and closed again completes the map anew.
+
+    ``sub_issues_summary`` lags: read within a second of a close it can still count the
+    closing ticket open, and minutes later it still left out tickets filed since (#3671). So
+    the sub-issues' own states decide whenever they were read, with this close's ticket
+    counted closed whatever the list says; the summary decides only without a list."""
+    if not isinstance(record, dict):
+        return None, "map unread"
+    if _text(record.get("state")).lower() != "open":
+        return None, "map is not open"
     labels = record.get("labels")
     names = {
         _text(label.get("name") if isinstance(label, dict) else label).strip().casefold()
         for label in (labels if isinstance(labels, list) else ())
     }
+    if MAP_LABEL not in names:
+        return None, "parent is not a wayfinder map"
     summary = record.get("sub_issues_summary")
-    if MAP_LABEL not in names or not isinstance(summary, dict):
-        return None
+    summary = summary if isinstance(summary, dict) else {}
     total, completed = summary.get("total"), summary.get("completed")
-    if not isinstance(total, int) or not isinstance(completed, int) or total <= 0:
-        return None
-    last = _text(record.get("last_closed"))
-    if completed < total or not last:
-        return None
+    total = total if isinstance(total, int) else 0
+    completed = completed if isinstance(completed, int) else 0
     issue = delivery.payload.get("issue")
-    number = issue.get("number") if isinstance(issue, dict) else "?"
+    issue = issue if isinstance(issue, dict) else {}
+    number = issue.get("number")
+    last = _text(record.get("last_closed"))
+    subs = record.get("sub_issues")
+    listed = [sub for sub in subs if isinstance(sub, dict)] if isinstance(subs, list) else None
+    if listed:
+        stream = delivery.stream.lower()
+        still_open = [
+            sub.get("number")
+            for sub in listed
+            if _text(sub.get("state")).lower() != "closed"
+            and (sub.get("number") != number or _text(sub.get("repository")).lower() != stream)
+        ]
+        if still_open:
+            return None, f"tickets still open: {still_open}"
+        if len(listed) >= MAP_PAGE:
+            return None, f"{len(listed)} tickets listed, more may be unread"
+        total = len(listed)
+        last = max(
+            [_text(sub.get("closed_at")) for sub in listed] + [last, _text(issue.get("closed_at"))]
+        )
+    elif total <= 0:
+        return None, "map has no tickets"
+    elif completed < total:
+        return None, f"summary says {completed} of {total} closed, no ticket list"
+    if not last:
+        return None, "no close time"
     repository = delivery.stream.lower()
     text = (
         f"AgentDeck event: {repository}#{number} closed, and it was the last open ticket of "
@@ -353,7 +394,7 @@ def map_ready(delivery: Delivery, parent: tuple[str, int], record: object) -> Ev
         text=text,
         link=text,
         message_id=f"work-event:map-ready:{parent[0]}#{parent[1]}@{last}",
-    )
+    ), f"all {total} tickets closed"
 
 
 def classify(
@@ -989,6 +1030,8 @@ class WorkRouterService:
         load_work: Callable[[str, int], Awaitable[object]] | None = None,
         read_issue: Callable[[str, int], Awaitable[dict | None]] | None = None,
         read_parent: Callable[[str, int], Awaitable[tuple[str, int] | None]] | None = None,
+        read_body: Callable[[str, int], Awaitable[dict | None]] | None = None,
+        write_body: Callable[[str, int, str], Awaitable[bool]] | None = None,
         review_chat: Callable[[str, str], tuple[str, object | None] | None] | None = None,
         wait_review: Callable[[str, str, bool], object] | None = None,
     ) -> None:
@@ -1013,6 +1056,10 @@ class WorkRouterService:
         self._latest_comment = latest_comment
         self._read_issue = read_issue
         self._read_parent = read_parent
+        # A wayfinder map's body read and saved again when a record lands (#3695).
+        self._read_body = read_body
+        self._write_body = write_body
+        self._streams_root = Path(streams_root).expanduser()
         self._busy = busy
         # When each Work's pull request last merged, so the close that merge made is not news
         # (#3188).
@@ -1277,6 +1324,8 @@ class WorkRouterService:
             if self._reread_issue is not None:
                 self._maybe_reread(delivery)
             self._note_merge_or_reopen(delivery)
+            # Before the close that follows an answer wakes the map: its chat reads the lists.
+            await self._maybe_keep_map_lists(delivery)
             await self._maybe_map_ready(delivery)
             if settled:
                 # The release already told the chat what this verdict comment says, or dropped
@@ -1431,13 +1480,26 @@ class WorkRouterService:
                 log.warning("work-router: parent of %s unread", issue["number"], exc_info=True)
                 return
         if parent is None:
+            log.info(
+                "work-router: %s#%s closed, no parent map",
+                delivery.stream.lower(),
+                issue["number"],
+            )
             return
         try:
             record = await self._read_issue(*parent)
         except Exception:  # noqa: BLE001 -- the map's chat is not woken; a person still can
             log.warning("work-router: map %s#%s unread", *parent, exc_info=True)
             return
-        event = map_ready(delivery, parent, record)
+        event, why = map_ready(delivery, parent, record)
+        log.info(
+            "work-router: %s#%s closed, map %s#%s %s: %s",
+            delivery.stream.lower(),
+            issue["number"],
+            *parent,
+            "ready" if event is not None else "not ready",
+            why,
+        )
         if event is None:
             return
         owner = self._owner_of_issue(event.repository, event.number)
@@ -1451,8 +1513,129 @@ class WorkRouterService:
             log.info("work-router: map %s#%s is ready but has no chat", *parent)
             return
         if self._is_paused(owner) and not await self._unpause(owner):
+            log.info("work-router: map %s#%s is ready but its chat stays paused", *parent)
             return
+        log.info("work-router: map %s#%s is ready, waking chat %s", *parent, owner[0])
         self._send(delivery, owner, event)
+
+    async def _maybe_keep_map_lists(self, delivery: Delivery) -> None:
+        """Rebuild a wayfinder map's lists when one of its records lands (#3695).
+
+        The map is the ticket's parent, which the stored ``sub_issues`` deliveries name; only
+        a ticket they never linked asks GitHub. The records come from the stored streams too,
+        so the only other calls are one live read of the map's body and, when the lists
+        changed, one write of it."""
+        payload = delivery.payload
+        issue, comment = payload.get("issue"), payload.get("comment")
+        if (
+            self._read_body is None
+            or self._write_body is None
+            or delivery.event != "issue_comment"
+            or _text(payload.get("action")) not in {"created", "edited"}
+            or not isinstance(issue, dict)
+            or not isinstance(comment, dict)
+            or not isinstance(issue.get("number"), int)
+            or isinstance(issue.get("pull_request"), dict)
+        ):
+            return
+        kind = wayfinder_lists.record_kind(comment.get("body"))
+        if not kind:
+            return
+        repository, number = delivery.stream.lower(), issue["number"]
+        if not self._trusted_record(comment):
+            log.info("work-router: %s on %s#%s not from a trusted author", kind, repository, number)
+            return
+        labels = [
+            _text(label.get("name") if isinstance(label, dict) else label)
+            for label in issue.get("labels") or ()
+        ]
+        try:
+            # The stream's own case names its file; the facts' keys are lowercased.
+            facts = await asyncio.to_thread(
+                wayfinder_lists.scan, self._streams_root, delivery.stream
+            )
+        except Exception:  # noqa: BLE001 -- the lists wait for the next record
+            log.warning("work-router: streams of %s unread", repository, exc_info=True)
+            return
+        wayfinder_lists.note(facts, delivery.event, payload, repository)
+        if kind == wayfinder_lists.ANSWER:
+            if not wayfinder_map.is_ticket(labels):
+                return
+            parent = facts.parents.get((repository, number))
+            if (repository, number) not in facts.parents and self._read_parent is not None:
+                try:
+                    parent = await self._read_parent(repository, number)
+                except Exception:  # noqa: BLE001 -- the lists wait for the next record
+                    log.warning("work-router: parent of %s#%s unread", repository, number)
+                    return
+                if parent is not None:
+                    facts.parents[(repository, number)] = parent
+        else:
+            parent = (repository, number) if wayfinder_map.is_map(labels) else None
+        if parent is None:
+            log.info("work-router: %s on %s#%s, no map", kind, repository, number)
+            return
+        records = []
+        for held in sorted(
+            (item for item in facts.comments.values() if item is not None),
+            key=lambda item: item["created_at"],
+        ):
+            on_map = held["issue"] == parent
+            if (held["kind"] == wayfinder_lists.ANSWER) == on_map:
+                continue  # answers belong on tickets, the map's records on the map
+            if not on_map and facts.parents.get(held["issue"]) != parent:
+                continue
+            if not self._trusted_record(held):
+                continue
+            record = wayfinder_lists.parse(
+                held["body"],
+                issue=held["issue"],
+                title=held["title"],
+                url=held["url"],
+                created_at=held["created_at"],
+            )
+            if record is not None:
+                records.append(record)
+        try:
+            found = await self._read_body(*parent)
+        except Exception:  # noqa: BLE001 -- the lists wait for the next record
+            log.warning("work-router: map %s#%s body unread", *parent, exc_info=True)
+            return
+        if not isinstance(found, dict) or not isinstance(found.get("body"), str):
+            log.info("work-router: map %s#%s body unread", *parent)
+            return
+        if _text(found.get("state")).lower() != "open" or not wayfinder_map.is_map(
+            [_text(label) for label in found.get("labels") or ()]
+        ):
+            log.info("work-router: %s#%s is not an open wayfinder map", *parent)
+            return
+        body = found["body"]
+        rebuilt = wayfinder_lists.rebuild(body, records)
+        if rebuilt == body:
+            log.info("work-router: map %s#%s lists already hold %d records", *parent, len(records))
+            return
+        try:
+            saved = await self._write_body(*parent, rebuilt)
+        except Exception:  # noqa: BLE001 -- a write is never retried: it may have landed
+            log.warning("work-router: map %s#%s body unsaved", *parent, exc_info=True)
+            return
+        log.info(
+            "work-router: map %s#%s lists rebuilt from %d records%s",
+            *parent,
+            len(records),
+            "" if saved else ", but the write failed",
+        )
+
+    def _trusted_record(self, comment: dict) -> bool:
+        """A record the deck's own login or a person on the repository wrote: anyone else's
+        comment shaped like an answer must not write the map."""
+        user = comment.get("user")
+        login = _text(user.get("login")) if isinstance(user, dict) else _text(comment.get("login"))
+        association = _text(comment.get("author_association") or comment.get("association"))
+        return (
+            login.casefold() in {own.casefold() for own in self.own_logins()}
+            or association.upper() in wayfinder_lists.TRUSTED_ASSOCIATIONS
+        )
 
     async def _closing_comment(self, delivery: Delivery) -> dict | None:
         """The closer's own newest comment on a Work's issue around its close (#3188).

@@ -53,8 +53,10 @@
 {#- A starred Work (#3116) leads its title with a star, inside it so it adds no line. -#}
 {%- set star %}{% if item.card.starred %}<span class="fr-star" role="img" aria-label="starred" title="Starred: goes ahead in every queue">★</span>{% endif %}{% endset -%}
 {#- An unseen Work (#2283) says so with weight and a dot as well as its row's colour. -#}
-{%- if item.unseen and not hidden %}<span class="fr-title-line"><span class="fr-title">{{ diff_icon(item.card) }}{{ star }}{{ item.card.title }}</span><span class="fr-dot" role="img" aria-label="new" title="New since you last opened it"></span></span>
-{%- else %}<span class="fr-title">{{ diff_icon(item.card) }}{{ star }}{{ item.card.title }}</span>{% endif -%}
+{#- A wayfinder map's row (#3696) goes by the map issue's own title, not its chat's name. -#}
+{%- set name = item.map.title if item.map else item.card.title -%}
+{%- if item.unseen and not hidden %}<span class="fr-title-line"><span class="fr-title">{{ diff_icon(item.card) }}{{ star }}{{ name }}</span><span class="fr-dot" role="img" aria-label="new" title="New since you last opened it"></span></span>
+{%- else %}<span class="fr-title">{{ diff_icon(item.card) }}{{ star }}{{ name }}</span>{% endif -%}
 {%- endmacro -%}
 {%- macro row(item, hidden=false, group="", paused=false) -%}
 {%- set card = item.card -%}
@@ -84,7 +86,9 @@
       {#- Staging already runs every open pull request's head (#3180): said before the reason,
           which the row may cut short; the links are on the Work page. -#}
       {%- if card.staging %}<span class="fr-staging" data-work-staging>ready to test</span>{% if item.line %} · {% endif %}{% endif -%}
-      {%- set said = item.line or (op and hidden) or not op %}<span class="fr-reason{% if op and card.question and op.reason == card.question %} fr-asks{% endif %}">{{ item.line }}</span>{{ size(card, lead=said) }}</span>
+      {#- A map leads with the question it waits on first, by the question's own name (#3696). -#}
+      {%- set asked = item.map.questions[0] if item.map and item.map.questions else none -%}
+      {%- set said = item.line or asked or (op and hidden) or not op %}<span class="fr-reason{% if asked or (op and card.question and op.reason == card.question) %} fr-asks{% endif %}">{{ asked.line if asked else item.line }}</span>{{ size(card, lead=said) }}</span>
       {%- if not hidden and not (op and op.category == "issue_closed") %}<span class="fr-when">{{ age(card) }}<span class="fr-source fr-ref">{{ ref(item) }}</span></span>{% endif -%}
     </span>
     {%- endif %}
@@ -92,7 +96,9 @@
   {%- if item.progress %}
   {#- A parent issue's row (#3622): how far its sub-issues are, a line of its own. When the row
       shows a child's state, the line opens that child's Work, one tap from its question. #}
-  {%- if item.lead %}<a class="fr-tree" href="{{ item.lead.card.href }}" data-work-tree="{{ item.lead.card.work_id }}">{{ item.progress }} &rarr;</a>
+  {#- A map's line opens its first waiting question's chat, at its form (#3696). -#}
+  {%- if item.map and item.map.questions %}{% set first = item.map.questions[0] %}<a class="fr-tree" href="{{ first.href }}" data-work-tree="{{ first.work_id }}">{{ item.progress }} &rarr;</a>
+  {%- elif item.lead %}<a class="fr-tree" href="{{ item.lead.card.href }}" data-work-tree="{{ item.lead.card.work_id }}">{{ item.progress }} &rarr;</a>
   {%- else %}<span class="fr-tree" data-work-tree>{{ item.progress }}</span>{% endif %}
   {%- endif %}
   {%- if hidden or paused or item.section == "finished" or (op and op.category in ("issue_closed", "unstarted")) %}

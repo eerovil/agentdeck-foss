@@ -38,6 +38,7 @@ CURSOR_SKILL_DIRS="${CURSOR_SKILL_DIRS:-$HOME/.cursor/skills}"
 
 
 
+
 install_flavour() {  # <skill> <flavour-subdir> <dest-skills-root>
   local skill="$1" flavour="$2" dest_root="$3"
   local src="$SRC_ROOT/$skill/$flavour/SKILL.md"

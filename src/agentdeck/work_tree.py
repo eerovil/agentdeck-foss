@@ -18,6 +18,7 @@ from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Any
 
+from . import wayfinder_map
 from .models import IssueRef
 from .work import WorkRef
 from .work_story import FINISHED, IN_PROGRESS, NEEDS_YOU, PAUSED, QUIET, FrontRow
@@ -126,6 +127,49 @@ def progress(counts: tuple[int, int] | None, children: Sequence[FrontRow]) -> st
     return " · ".join(parts)
 
 
+def map_progress(
+    own: FrontRow,
+    children: Sequence[FrontRow],
+    counts: tuple[int, int] | None,
+    elsewhere: int = 0,
+) -> wayfinder_map.Progress | None:
+    """A wayfinder map's progress from its row and its tickets' rows (#3696), or None when
+    ``own`` is not a map.
+
+    Asking counts only real questions, the map's own included. Blocked counts the listed
+    tickets a Poller card holds back, and every open ticket the front page lists no Work
+    for: a map files a blocked ticket with no agent, so no Work starts until its last
+    blocker closes (``WAYFINDER.md``). ``elsewhere`` are its open tickets the front page lists
+    as rows of their own (one the owner hid, for the Hidden list): listed, so not blocked."""
+    if not wayfinder_map.is_map(own.card.labels):
+        return None
+    asking = sorted(
+        ((row, found) for row in (own, *children) if (found := wayfinder_map.question(row))),
+        key=lambda pair: _needs_order(pair[0]),
+    )
+    questions = tuple(found for _, found in asking)
+    open_rows = [
+        row for row in children if row.section != FINISHED and not row.card.awaiting_finish
+    ]
+    held = [row for row in open_rows if row.card.blocked_by]
+    unlisted = max(0, counts[1] - counts[0] - len(open_rows) - elsewhere) if counts else 0
+    working = sum(
+        1
+        for row in open_rows
+        if row.section == IN_PROGRESS and not row.waits and not row.card.blocked_by
+    )
+    return wayfinder_map.Progress(
+        work_id=own.card.work_id,
+        title=own.card.issue_title or own.card.title,
+        href=own.card.href,
+        counts=counts,
+        working=working,
+        blocked=len(held) + unlisted,
+        questions=questions,
+        tickets=tuple(row.card.work_id for row in children),
+    )
+
+
 def _stamp(row: FrontRow) -> float:
     when = row.card.last_activity
     return when.timestamp() if when is not None else 0.0
@@ -185,6 +229,7 @@ def _folded(
     *,
     tree_only: bool,
     hidden: bool = False,
+    elsewhere: int = 0,
 ) -> FrontRow:
     own = _demoted(own, tree_only=tree_only, open_work=_open_work(counts, children))
     waiting = [row for row in (own, *children) if row.section == NEEDS_YOU]
@@ -210,13 +255,15 @@ def _folded(
     if lead is not own and lead.section == FINISHED:
         # Recently finished goes by when the Work finished: the child's, which the row shows.
         card = replace(card, finished_at=lead.card.finished_at)
+    found = map_progress(own, children, counts, elsewhere)
     return replace(
         lead,
         card=card,
         children=tuple(children),
         own=own,
         lead=None if lead is own else lead,
-        progress=progress(counts, children),
+        progress=found.line if found is not None else progress(counts, children),
+        map=found,
     )
 
 
@@ -256,6 +303,16 @@ def fold(
         root = roots[row.card.work_id]
         if root != row.card.work_id:
             children.setdefault(root, []).append(row)
+    # The open rows under a parent that a hide keeps out of its row (#3696): a map counts
+    # them as listed, never as blocked tickets with no Work.
+    apart: dict[str, int] = {}
+    for row in rows:
+        work_id = row.card.work_id
+        under = root_of(work_id, parents, present)
+        if under in (work_id, roots[work_id]) or row.section == FINISHED:
+            continue
+        if not row.card.awaiting_finish:
+            apart[under] = apart.get(under, 0) + 1
     found = []
     for row in rows:
         work_id = row.card.work_id
@@ -273,7 +330,9 @@ def fold(
             # never-started one, one in another repository, or an archived one. While any is
             # open, they are the work, so no agent on the parent is not a Needs you (D3).
             own = _demoted(row, tree_only=False, open_work=_open_work(count, ()))
-            found.append(replace(own, progress=progress(count, ())))
+            plan = map_progress(own, (), count, apart.get(work_id, 0))
+            line = plan.line if plan is not None else progress(count, ())
+            found.append(replace(own, progress=line, map=plan))
             continue
         found.append(
             _folded(
@@ -282,6 +341,7 @@ def fold(
                 counts.get(work_id),
                 tree_only=work_id in tree_only,
                 hidden=work_id in put,
+                elsewhere=apart.get(work_id, 0),
             )
         )
     return found

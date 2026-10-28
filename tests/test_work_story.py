@@ -2115,6 +2115,109 @@ async def test_a_maps_work_page_draws_its_tickets_from_cached_reads():
     assert "data-wayfinder-map-partial" in section and "Destination" in section
 
 
+@pytest.mark.asyncio
+async def test_a_maps_pages_and_pushes_point_at_its_waiting_questions():
+    """#3696: a map's row takes the map issue's title, leads with the question by its header,
+    counts questions, work and blocked tickets, and opens the question's chat at its form; its
+    page lists what waits and its boxes say what they ask; a ticket's push names the map and
+    the question; a ticket's chat page names its map and the next question."""
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    from fastapi.templating import Jinja2Templates
+
+    from agentdeck import app as app_mod
+    from agentdeck import work_tree
+    from agentdeck.web import render as render_mod
+    from agentdeck.web import work_view
+    from agentdeck.web.work_view import WorkDetail, WorkOverview, render_work_front
+    from agentdeck.work_story import front_row, front_sections
+
+    rows, parents = _tree_rows()
+    asks = WorkAttention("c:a:t11", "Ticket chat", "waiting", "/chats/t11", asks=True,
+                         question="Which lists does the deck keep?", interaction="question",
+                         header="Lists")
+    rows[10] = front_row(replace(rows[10].card, labels=("agent", "Wayfinder:Map"),
+                                 issue_title="Make wayfinder great"), current=False)
+    rows[11] = front_row(replace(rows[11].card, attention=(asks,), issue_title="Decide lists",
+                                 title="Chat named it"), current=True)
+    map_id, ticket = rows[10].card.work_id, rows[11].card.work_id
+    # Five tickets, one done; #11-#13 listed, so the fifth (filed with no agent) is blocked.
+    [row] = work_tree.fold(list(rows.values()), parents=parents, counts={map_id: (1, 5)})
+    assert row.map.title == "Make wayfinder great" and row.map.tickets
+    assert row.progress == "1/5 done · 1 asks you · 1 working · 1 blocked"
+    [asked] = row.map.questions
+    assert asked.line == "Lists: Which lists does the deck keep?"
+    assert asked.href == "/chats/t11#pending-interaction" and asked.title == "Decide lists"
+    # A ticket the owner hid keeps its own row for the Hidden list: listed, so not blocked.
+    put = work_tree.fold(list(rows.values()), parents=parents, counts={map_id: (1, 5)},
+                         hidden={ticket})
+    shown = next(item for item in put if item.card.work_id == map_id)
+    assert shown.progress == "1/5 done · 1 working · 1 blocked"
+
+    templates = Jinja2Templates(directory=str(app_mod._TEMPLATES_DIR))
+    render_mod.register_filters(templates)
+    overview = WorkOverview(front=front_sections([row]))
+    html = render_work_front(templates, overview, "needs")
+    assert "Make wayfinder great" in html and "Issue 10" not in html
+    assert "Lists: Which lists does the deck keep?" in html
+    assert 'class="fr-tree" href="/chats/t11#pending-interaction"' in html
+    # A parent that is not a map keeps its words.
+    plain = work_tree.fold(
+        [replace(rows[10], card=replace(rows[10].card, labels=())), *list(rows.values())[1:]],
+        parents=parents, counts={map_id: (1, 5)},
+    )[0]
+    assert plain.map is None and plain.progress == "1/5 done · 1 waits for you · 1 working"
+
+    # The ticket's push names the map and the question, and opens its form.
+    stopped = replace(overview, front=replace(overview.front, needs_you=(
+        replace(row, children=tuple(
+            replace(child, unseen=True) for child in row.children
+        )),
+    )))
+    sends, _sent = work_view.needs_you_pushes(stopped, set())
+    assert [(push.title, push.body, push.url) for push in sends] == [
+        ("Make wayfinder great asks", asked.line, asked.href)
+    ]
+
+    # The chat page: its map, and where Submit leads on to.
+    app = SimpleNamespace(state=SimpleNamespace(work_overview=SimpleNamespace(
+        overview=overview)))
+    strip = work_view.chat_map_strip(app, ticket)
+    assert strip.map.short == "1/5 done · 1 asks you" and strip.next is None
+    other = work_view.chat_map_strip(app, rows[12].card.work_id)
+    assert other.next == asked
+    assert work_view.chat_map_strip(app, map_id) is None  # the map's own chat
+    assert work_view.chat_map_strip(app, "github_issue:eerovil/agentdeck#99") is None
+
+    # The map page: what waits, and a box that says what it asks and opens the form.
+    async def blocked_by(repository, number):
+        return []
+
+    async def issue_body(repository, number):
+        return "## Destination\n\nShip it.\n"
+
+    issues = SimpleNamespace(blocked_by=blocked_by, issue_body=issue_body,
+                             cached_issues=lambda refs: {})
+    page_app = SimpleNamespace(state=SimpleNamespace(issues=issues, work_overview=None))
+    items = [{"repository": "eerovil/agentdeck", "number": n, "title": f"Issue {n}",
+              "state": "open", "labels": ["wayfinder:research"]} for n in (11, 12)]
+    diagram = await work_view._wayfinder_diagram(
+        page_app, WorkRef("eerovil/agentdeck", 10), {"labels": ["wayfinder:map"]}, items,
+        {ticket: rows[11]},
+    )
+    box = {item.key.rsplit("#", 1)[-1]: item for item in diagram.boxes}
+    assert " ".join(box["11"].lines) == "Asks: Lists · Issue 11"
+    assert box["11"].href == asked.href and box["12"].href.startswith("/works/")
+    assert [item.work_id for item in diagram.questions] == [ticket]
+    tree = work_tree.WorkTree(counts=(1, 5), diagram=diagram)
+    detail = WorkDetail(card=rows[10].card, trace=None, workspace=None, chats=(),
+                        verifications=(), tree=tree)
+    section = dict(work_view.render_work_sections(templates, detail))["tree"]
+    assert "Waiting for you" in section and f'data-wm-question="{ticket}"' in section
+    assert 'href="/chats/t11#pending-interaction"' in section
+
+
 def test_a_parent_row_stands_where_its_most_urgent_member_would():
     """#3622 review: D5's order holds after Needs you too. A working child lifts a parent
     that only waits, and a parent with only a finished child is Recently finished, dated by

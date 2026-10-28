@@ -98,6 +98,11 @@ def main() -> None:
         from .git_credential import main as git_credential
 
         raise SystemExit(git_credential(sys.argv[2:]))
+    if len(sys.argv) > 1 and sys.argv[1] == "init":
+        # Refused rather than run: setup is its own command, because it runs the poller engine
+        # and the deck stays on its side of that boundary; an unknown word starts the server.
+        print("agentdeck init: run `uv run agentdeck-init` instead", file=sys.stderr)
+        raise SystemExit(2)
     if len(sys.argv) > 1 and sys.argv[1] == "nudge-on-restart":
         _nudge_on_restart(sys.argv[2:])
         return
@@ -278,9 +283,9 @@ def _chat_review(argv: list[str]) -> int:
                 # Every target had to open for the launch as a whole to have succeeded, and a
                 # launch is only *refused* when nothing about it is worth asking again.
                 "ok": all(row["ok"] for row in rows) if rows else False,
-                "refused": bool(rows) and all(
-                    row["ok"] or row["refused"] for row in rows
-                ) and not all(row["ok"] for row in rows),
+                "refused": bool(rows)
+                and all(row["ok"] or row["refused"] for row in rows)
+                and not all(row["ok"] for row in rows),
                 "at": time.time(),
                 "target": first.get("target", ""),
                 "detail": first.get("detail", ""),
@@ -301,8 +306,9 @@ def _chat_review(argv: list[str]) -> int:
             # turn a review that happened into one the poller retries.
             pass
 
-    def row(target: str, ok: bool, detail: str, *, refused: bool = False,
-            chat: dict | None = None) -> dict:
+    def row(
+        target: str, ok: bool, detail: str, *, refused: bool = False, chat: dict | None = None
+    ) -> dict:
         return {"target": target, "ok": ok, "refused": refused, "detail": detail, "chat": chat}
 
     base = os.environ.get("AGENTDECK_URL", "").strip() or _local_deck_url()
@@ -365,7 +371,6 @@ def _chat_review(argv: list[str]) -> int:
             + "\n",
         )
     return 0
-
 
 
 #: How long ``agentdeck deck-request`` keeps asking a deck that does not answer (#2974). Under
@@ -544,9 +549,7 @@ def _resolve_context_delivery(argv: list[str]) -> int:
     parser.add_argument("--account", required=True, help="configured account label")
     parser.add_argument("--worker", required=True, help="exact keyed-worker id")
     parser.add_argument("--delivery-id", required=True)
-    parser.add_argument(
-        "--choice", required=True, choices=("accepted", "not_written", "abandoned")
-    )
+    parser.add_argument("--choice", required=True, choices=("accepted", "not_written", "abandoned"))
     parser.add_argument("--rationale", required=True)
     args = parser.parse_args(argv)
     base = os.environ.get("AGENTDECK_URL", "").strip()
@@ -636,9 +639,7 @@ def _artifact(argv: list[str]) -> int:
             "offset": args.offset,
             "max_bytes": args.max_bytes,
         }
-        result = request_artifact(
-            runtime_socket_path(), args.artifact_id, args.subcommand, payload
-        )
+        result = request_artifact(runtime_socket_path(), args.artifact_id, args.subcommand, payload)
     except ArtifactClientError as exc:
         parser.exit(1, f"agentdeck artifact: {exc}\n")
     sys.stdout.buffer.write(base64.b64decode(result["data_base64"], validate=True))
@@ -1206,9 +1207,7 @@ def _session_key_argument(parser: argparse.ArgumentParser, given: str | None) ->
 
 def _nudge_registry() -> RestartNudgeRegistry:
     config = load_config(config_path())
-    return RestartNudgeRegistry(
-        config.restart_nudge.path, ttl_s=config.restart_nudge.ttl_s
-    )
+    return RestartNudgeRegistry(config.restart_nudge.path, ttl_s=config.restart_nudge.ttl_s)
 
 
 def _nudge_on_restart(argv: list[str]) -> None:
@@ -1316,9 +1315,7 @@ def _delegation_parent(args: argparse.Namespace) -> _DelegationParent | None:
     process belongs to.
     """
     if args.parent_session:
-        return _DelegationParent(
-            "parent_session_id", args.parent_session, "--parent-session"
-        )
+        return _DelegationParent("parent_session_id", args.parent_session, "--parent-session")
     if args.parent_session_token:
         return _DelegationParent(
             "parent_session_token",

@@ -3744,10 +3744,8 @@ async def test_the_work_cards_tell_the_live_window_which_chats_to_keep(tmp_path)
 
 
 
-def test_a_sub_issue_and_its_parent_open_as_works_with_no_agent(tmp_path):
-    """#3622: the parent's page lists its sub-issues and each opens, a never-started one
-    included (it is reached only from its parent's page), and it says what it is part of."""
-    parent, child = WorkRef("eerovil/agentdeck", 40), WorkRef("eerovil/agentdeck", 50)
+def _tree_app(tmp_path):
+    """A map issue #40 with one sub-issue #50, neither with an agent (#3622)."""
     api = "https://api.github.com/repos/eerovil/agentdeck/issues/{}"
     records = {
         40: {"title": "The map", "state": "open", "is_pr": False,
@@ -3768,10 +3766,106 @@ def test_a_sub_issue_and_its_parent_open_as_works_with_no_agent(tmp_path):
 
     app.state.issues.refresh_stale_issue_records = unchanged
     app.state.issues.sub_issues = listed
-    client = _client(app)
+    return app
+
+
+def test_a_sub_issue_and_its_parent_open_as_works_with_no_agent(tmp_path):
+    """#3622: the parent's page lists its sub-issues and each opens, a never-started one
+    included (it is reached only from its parent's page), and it says what it is part of.
+    Its arrow, and Back beneath it, lead to the parent's Work; the parent's to `/` (#3691)."""
+    parent, child = WorkRef("eerovil/agentdeck", 40), WorkRef("eerovil/agentdeck", 50)
+    client = _client(_tree_app(tmp_path))
 
     page = client.get(work_href(parent.work_id))
     assert page.status_code == 200
     assert f'data-work-tree-child="{child.work_id}"' in page.text and "A ticket" in page.text
+    assert '<a class="back" href="/"' in page.text and "data-parent-work" not in page.text
     ticket = client.get(work_href(child.work_id))
     assert ticket.status_code == 200 and "Part of" in ticket.text and "#40 The map" in ticket.text
+    parent_href = work_href(parent.work_id)
+    assert f'<a class="back" href="{parent_href}" aria-label="back to #40">' in ticket.text
+    assert f'data-parent-work="{parent_href}"' in ticket.text
+
+
+@pytest.mark.browser
+@pytest.mark.asyncio
+async def test_back_from_a_sub_issues_work_is_its_parents_work(tmp_path):
+    """#3691: on a phone, a sub-issue's Work opened from anywhere steps back to its parent's
+    Work, then the front page; opened from its parent, Back is the parent once, no loop. On a
+    desktop the same history holds across the front page's columns."""
+    from conftest import async_playwright
+    from test_web import _live_server
+
+    app = _tree_app(tmp_path)
+    parent_path = work_href(WorkRef("eerovil/agentdeck", 40).work_id)
+    child_path = work_href(WorkRef("eerovil/agentdeck", 50).work_id)
+    loaded = (
+        "path => location.pathname === path && document.readyState === 'complete'"
+        " && !!document.querySelector('main.work-main')"
+    )
+    async with _live_server(app) as base, async_playwright() as playwright:
+        browser = await playwright.chromium.launch()
+        page = await browser.new_page(viewport={"width": 390, "height": 844},
+                                      service_workers="block")
+        # From a link: the parent's Work is beneath it, and the front page beneath that.
+        await page.goto(base + child_path)
+        await page.wait_for_function(loaded, arg=child_path)
+        assert await page.locator("a.back").get_attribute("href") == parent_path
+        await page.go_back()
+        await page.wait_for_function(loaded, arg=parent_path)
+        assert await page.locator("a.back").get_attribute("href") == "/"
+        await page.go_back()
+        await page.wait_for_function(
+            "location.pathname === '/' && document.readyState === 'complete'"
+        )
+        # The arrow goes to the parent too.
+        await page.goto(base + child_path)
+        await page.wait_for_function(loaded, arg=child_path)
+        await page.locator("a.back").click()
+        await page.wait_for_function(loaded, arg=parent_path)
+
+        # From the parent: Back is the parent, once.
+        await page.goto(base + parent_path)
+        await page.wait_for_function(loaded, arg=parent_path)
+        await page.locator(f'[data-work-tree-child] a[href="{child_path}"]').first.click()
+        await page.wait_for_function(loaded, arg=child_path)
+        await page.go_back()
+        await page.wait_for_function(loaded, arg=parent_path)
+        await page.go_back()
+        await page.wait_for_function(
+            "location.pathname === '/' && document.readyState === 'complete'"
+        )
+
+        # From the front page: the parent's Work, then that front page's own entry, once.
+        await page.goto(base + "/")
+        await page.wait_for_function("document.readyState === 'complete'")
+        await page.evaluate("history.replaceState({marker: 'front'}, '', '/')")
+        await page.evaluate(f"location.href = {child_path!r}")
+        await page.wait_for_function(loaded, arg=child_path)
+        await page.go_back()
+        await page.wait_for_function(loaded, arg=parent_path)
+        await page.go_back()
+        await page.wait_for_function(
+            "location.pathname === '/' && document.readyState === 'complete'"
+        )
+        assert await page.evaluate("history.state && history.state.marker") == "front"
+        await page.close()
+
+        # A desktop: the Work opens beside the front page, and Back walks the same way.
+        page = await browser.new_page(viewport={"width": 1400, "height": 900},
+                                      service_workers="block")
+        await page.goto(base + child_path)
+        await page.wait_for_function(
+            "path => document.querySelector('.front-columns > .work-column')"
+            "?.dataset.workPath === path",
+            arg=child_path,
+        )
+        await page.go_back()
+        await page.wait_for_function(
+            "path => location.pathname === path && document.querySelector("
+            "'.front-columns > .work-column')?.dataset.workPath === path",
+            arg=parent_path,
+        )
+        await page.go_back()
+        await page.wait_for_function("location.pathname === '/'")
+        await browser.close()

@@ -750,7 +750,7 @@ async def _render_session_detail(
     # page and that Work — the columns opening it from the front page builds (#2346); only
     # the full page mounts them, through ``work_column_path``.
     from ..work_overview import work_href
-    from .work_view import chat_work_actions, chat_work_id, note_work_opened
+    from .work_view import chat_map_strip, chat_work_actions, chat_work_id, note_work_opened
 
     work_id = chat_work_id(
         request.app,
@@ -814,6 +814,8 @@ async def _render_session_detail(
             "seen_now": (work_id,) if work_id is not None else (),
             "work_card": work_card,
             "work_buttons": work_buttons,
+            # A wayfinder ticket's chat (#3696): its map above the question form.
+            "map_strip": chat_map_strip(request.app, work_id),
             "pending_messages": pending_injection_messages(
                 request.app.state.injector.status(session.key)
             ),

@@ -4,6 +4,10 @@ AgentDeck reads issues and pull requests, starts a Work for each issue you label
 back as it goes. It never uses your personal `gh` login for that: every repository owner is
 mapped to an identity of its own, and an owner with none is refused. This page sets that up.
 
+`agentdeck-init` does steps 1 to 3 for one repository: it creates the
+App through GitHub's App-manifest flow, writes the file in step 2 and a board-less poller
+project. Use this page for an organization board, more repositories, or webhooks.
+
 ## 1. Create a GitHub App for your deck
 
 Create your own App: GitHub → Settings → Developer settings → GitHub Apps → New GitHub App.

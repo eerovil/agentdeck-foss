@@ -409,6 +409,9 @@ def test_compact_poller_brief_keeps_the_spec_only_guard_and_single_ending(phase_
     assert "never as a ritual" in compact
     assert "`Grill me on the spec`" in compact
     assert "Keep your own copy of the spec" in compact
+    # The spec keeps the person's picks apart from the worker's and goes wide first (#3690).
+    assert "mark only what the person picked or wrote `(chosen)`" in compact
+    assert "each one line under **Ideas**" in compact
     assert "`No open questions — approve, or overrule a decision by number.`" in compact
 
 

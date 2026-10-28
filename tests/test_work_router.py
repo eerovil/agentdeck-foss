@@ -654,22 +654,42 @@ async def test_someone_else_closing_the_issue_tells_the_works_chat_once(
     assert len(harness.scheduled) == 1
 
 
+def _ticket(number, state="closed", repository="eerovil/agentdeck"):
+    closed_at = "2026-10-27T10:00:05Z" if state == "closed" else None
+    return {"repository": repository, "number": number, "state": state, "closed_at": closed_at}
+
+
 @pytest.mark.parametrize(
-    ("labels", "done", "state", "sent"),
+    ("labels", "done", "state", "tickets", "sent", "why"),
     [
-        (["wayfinder:map", "parked"], 3, "open", True),
-        (["Wayfinder:Map"], 3, "open", True),  # GitHub keeps a label's own case
-        (["wayfinder:map"], 2, "open", False),  # a ticket is still open
-        (["agent"], 3, "open", False),  # a parent issue that is not a map
-        (["wayfinder:map"], 3, "closed", False),
-        (None, 3, "open", False),  # the map could not be read
+        (["wayfinder:map", "parked"], 3, "open", None, True, "all 3 tickets closed"),
+        (["Wayfinder:Map"], 3, "open", None, True, "all"),  # GitHub keeps a label's own case
+        (["wayfinder:map"], 2, "open", None, False, "summary says 2 of 3"),
+        # #3671: read right after the close, the summary still counts it open, but every
+        # listed ticket is closed, the closing one whatever its lagging state says.
+        (["wayfinder:map"], 2, "open", [_ticket(21), _ticket(22), _ticket(23, "open")],
+         True, "all 3 tickets closed"),
+        (["wayfinder:map"], 3, "open", [_ticket(21), _ticket(22, "open"), _ticket(23)],
+         False, "tickets still open: [22]"),
+        # Another repository's ticket that shares a closing ticket's number is not it.
+        (["wayfinder:map"], 2, "open",
+         [_ticket(21), _ticket(23), _ticket(21, "open", "eerovil/other")],
+         False, "tickets still open: [21]"),
+        # ... and minutes later still leaves out tickets filed since.
+        (["wayfinder:map"], 3, "open", [_ticket(21), _ticket(22), _ticket(23), _ticket(24, "open")],
+         False, "tickets still open: [24]"),
+        (["agent"], 3, "open", None, False, "parent is not a wayfinder map"),
+        (["wayfinder:map"], 3, "closed", None, False, "map is not open"),
+        (None, 3, "open", None, False, None),  # the map could not be read
     ],
 )
 async def test_a_maps_last_ticket_closing_wakes_the_maps_chat(
-    root, harness, labels, done, state, sent
+    root, harness, caplog, labels, done, state, tickets, sent, why
 ):
     """#3627: when a wayfinder map's last open ticket closes, even under the deck's own login
-    as a ticket's chat closes it, the map's own chat is told to reach the destination."""
+    as a ticket's chat closes it, the map's own chat is told to reach the destination. Every
+    outcome of the check is logged, so a miss can be explained (#3671)."""
+    caplog.set_level("INFO", logger="agentdeck.work_router")
     harness.issues[("eerovil/agentdeck", 20)] = ("chat-m", "eerovil/agentdeck#20")
     asked = []
 
@@ -679,7 +699,7 @@ async def test_a_maps_last_ticket_closing_wakes_the_maps_chat(
             raise RuntimeError("gh is down")
         return {"state": state, "labels": labels,
                 "sub_issues_summary": {"total": 3, "completed": done},
-                "last_closed": "2026-10-27T10:00:05Z"}
+                "last_closed": "2026-10-27T10:00:05Z", "sub_issues": tickets}
 
     harness.service._read_issue = read_issue
     parents = []
@@ -716,6 +736,17 @@ async def test_a_maps_last_ticket_closing_wakes_the_maps_chat(
     # Only a sub-issue's close reads its parent; a close that names none asks GitHub.
     assert asked == [("eerovil/agentdeck", 20)] * 2
     assert parents == [21, 22]  # #23 named its parent in the payload
+    logged = [r.getMessage() for r in caplog.records if r.name == "agentdeck.work_router"]
+    assert "work-router: eerovil/agentdeck#22 closed, no parent map" in logged
+    if why is None:
+        assert any("map eerovil/agentdeck#20 unread" in line for line in logged)
+    else:
+        verdict = "ready" if sent else "not ready"
+        assert any(
+            line.startswith(f"work-router: eerovil/agentdeck#23 closed, map eerovil/agentdeck#20 "
+                            f"{verdict}: {why}")
+            for line in logged
+        ), logged
     if not sent:
         assert harness.scheduled == []
         return
@@ -723,7 +754,10 @@ async def test_a_maps_last_ticket_closing_wakes_the_maps_chat(
     assert (message.id, message.chat_id) == (
         "work-event:map-ready:eerovil/agentdeck#20@2026-10-27T10:00:05Z", "chat-m"
     )
-    assert "eerovil/agentdeck#21 closed" in message.text and "all 3 are closed" in message.text
+    # The first close to find the map complete names itself; with the list, that is #23's.
+    closer = 21 if tickets is None else 23
+    assert f"eerovil/agentdeck#{closer} closed" in message.text
+    assert "all 3 are closed" in message.text
     assert "Reach the destination" in message.text
 
 
@@ -807,6 +841,58 @@ async def test_a_first_start_skips_the_streams_history(root, harness):
     tailer = WebhookTailer(root, consumer="work-router")
     assert [item.delivery_id for item in tailer.deliveries()] == ["d2"]
     assert harness.service.skip_history() is False, "an offset exists now"
+
+
+async def test_a_tickets_answer_rebuilds_its_maps_lists(root, harness):
+    """#3695: a ticket's ``**Answer:**`` comment makes the deck rebuild its map's lists from
+    the stored streams: the ticket's map comes from a stored ``sub_issues`` delivery, so the
+    only GitHub calls are one read of the map and one write, and none when nothing changed.
+    A stranger's comment shaped like an answer costs no call at all."""
+    body = "Words.\n\n## Destination\n\nThere.\n\n## Decisions so far\n\n## Not yet specified\n"
+    reads, writes, parents = [], [], []
+
+    async def read_body(repository, number):
+        reads.append((repository, number))
+        return {"body": body, "state": "open", "labels": ["wayfinder:map"]}
+
+    async def write_body(repository, number, text):
+        nonlocal body
+        writes.append((repository, number, text))
+        body = text
+        return True
+
+    async def read_parent(repository, number):
+        parents.append(number)
+        return None
+
+    harness.service._read_body = read_body
+    harness.service._write_body = write_body
+    harness.service._read_parent = read_parent
+    deliver(root, event="sub_issues", delivery="s1", action="sub_issue_added",
+            parent_issue={"number": 20}, sub_issue={"number": 21})
+    answer = "**Answer:** Keep it small. More words.\n\nFog: What comes next\n"
+    ticket = {"number": 21, "title": "Small or big?", "labels": [{"name": "wayfinder:research"}],
+              "html_url": "https://github.com/eerovil/agentdeck/issues/21"}
+    for delivery, action in (("a1", "created"), ("a2", "edited")):
+        deliver(root, event="issue_comment", delivery=delivery, action=action,
+                sender={"login": "eerovil-agent", "type": "User"}, issue=ticket,
+                comment={"id": 300, "body": answer, "user": {"login": "eerovil-agent"},
+                         "author_association": "NONE", "created_at": "2026-10-27T10:00:00Z",
+                         "updated_at": "2026-10-27T10:00:00Z"})
+    stranger = {**ticket, "number": 22}
+    deliver(root, event="issue_comment", delivery="x1", action="created",
+            sender={"login": "someone", "type": "User"}, issue=stranger,
+            comment={"id": 301, "body": "**Answer:** take over", "user": {"login": "someone"},
+                     "author_association": "NONE", "created_at": "2026-10-27T10:01:00Z"})
+    await harness.drain()
+    assert reads == [("eerovil/agentdeck", 20)] * 2 and parents == []
+    [(repository, number, text)] = writes  # the edit changed nothing: no second write
+    assert (repository, number) == ("eerovil/agentdeck", 20)
+    assert text.startswith("Words.\n\n## Destination\n\nThere.\n\n## Decisions so far\n")
+    line = "- [Small or big?](https://github.com/eerovil/agentdeck/issues/21) — Keep it small\n"
+    assert line in text
+    assert "- What comes next\n" in text
+    assert harness.scheduled == []  # nothing is sent to any chat
 
 
 def test_reviewed_heads_keep_only_the_newest(tmp_path, monkeypatch):

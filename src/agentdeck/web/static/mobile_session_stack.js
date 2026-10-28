@@ -26,7 +26,8 @@
     var layout = document.querySelector('.session-layout');
     var sidebar = document.querySelector('.session-sidebar');
     var detail = document.querySelector('.session-detail');
-    var back = document.querySelector('a.back[href="/"]');
+    // A sub-issue's Work points its arrow at its parent's (#3691).
+    var back = document.querySelector('a.back');
     if (!body.classList.contains('session-page') || !layout || !sidebar || !detail || !back ||
         detail.dataset.mobileStackReady) return;
     if (activeController) activeController.abort();

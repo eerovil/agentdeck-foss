@@ -8,12 +8,16 @@
    (`data-hold-in-use`, work_list.js). The top bar keeps its own small stream. #}
 {% block body_sse %}sse-connect="{{ stream_url }}"{% endblock %}
 {% block topbar_sse %} sse-connect="/events/topbar"{% endblock %}
-{% block topbar_nav %}<a class="back" href="/" aria-label="back to the dashboard">←</a>{% endblock %}
+{#- A sub-issue's arrow, and Back beneath it, lead to its parent's Work (#3691);
+    session_navigation.js reads `data-parent-work` for Back. #}
+{%- set parent = detail.tree.parent if detail.tree else None %}
+{% block topbar_nav %}{% if parent %}<a class="back" href="{{ parent.href }}" aria-label="back to {{ parent.label }}">←</a>{% else %}<a class="back" href="/" aria-label="back to the dashboard">←</a>{% endif %}{% endblock %}
 
 {% block content %}
 {#- A desktop opens the Work's chat beside it (#2345); session_navigation.js reads these. #}
 {%- set open_chat = detail.open_chat %}
 <main class="work-main" data-work-id="{{ detail.card.work_id }}"
+  {%- if parent %} data-parent-work="{{ parent.href }}"{% endif %}
   {%- if open_chat %} data-open-chat-key="{{ open_chat[0] }}" data-open-chat="{{ open_chat[1] }}"{% endif %}>
   {%- for name, html in sections %}
   {%- if name == "message" %}

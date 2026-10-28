@@ -2953,6 +2953,15 @@ details.ev.chat-note > summary .ev-time { margin-left: auto; flex: none; }
 .chat-note-md th, .chat-note-md td { border: 1px solid var(--line); padding: 3px 6px; }
 /* A wayfinder map's diagram (#3627): server-drawn SVG, one box per ticket, coloured by state. */
 .wm { margin: .2rem 0 .4rem; }
+/* A map's waiting questions (#3696): on its page, and its context on a ticket's chat page. */
+.wm-waiting { margin: 0 0 .6rem; }
+.wm-waiting ul { margin: .2rem 0 0; padding: 0; list-style: none; }
+.wm-waiting li { padding: .3rem 0; border-top: 1px solid var(--line); }
+.wm-waiting li > a { display: block; font-weight: 600; }
+.wm-waiting-from { font-size: .8rem; color: var(--muted); }
+.wm-strip { margin: 8px 2px 4px; font-size: 13px; line-height: 1.35; color: var(--muted); }
+.wm-strip p { margin: 0; }
+.wm-strip .wm-next { margin-top: 4px; color: var(--fg); }
 .wm-legend { display: flex; flex-wrap: wrap; gap: .2rem .7rem; margin: 0 0 .35rem; font-size: .75rem; color: var(--muted); }
 .wm-key { display: inline-flex; align-items: center; gap: .3rem; }
 .wm-key > i { width: .7rem; height: .7rem; border-radius: 3px; border: 1.5px solid var(--wm-c); background: color-mix(in srgb, var(--wm-c) 22%, var(--panel)); }

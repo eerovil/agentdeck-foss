@@ -30,7 +30,7 @@ def ticket(key: str, state: str = wm.WAITING, *blocked_by: str) -> wm.Ticket:
     return wm.Ticket(key, f"#{key}", f"Ticket {key}", f"/works/{key}", state, blocked_by=blocked_by)
 
 
-def test_tickets_stand_in_layers_by_blocking_depth_then_fog_then_the_destination():
+def test_tickets_stand_as_trees_down_their_arrows_then_loose_ones_fog_and_destination():
     assert wm.fog(BODY) == ("How a restore works while chats run",)
     assert wm.destination(BODY) == "A spec for the chat store move, approved."
     assert wm.fog("") == () and wm.destination("## Destination\n\n<what reaching…>") == ""
@@ -43,13 +43,36 @@ def test_tickets_stand_in_layers_by_blocking_depth_then_fog_then_the_destination
         ticket("5", wm.WAITING, "4", "3", "gone"),
         ticket("6", wm.WAITING, "7"),
         ticket("7", wm.WAITING, "6"),  # a loop still lays out
+        ticket("10"),  # no arrow at all: apart from the trees, in issue-number order (#3694)
+        ticket("9"),
     ]
-    assert wm.depths(tickets) == {"1": 0, "2": 0, "3": 1, "4": 1, "5": 2, "6": 1, "7": 0}
+    assert wm.depths(tickets) == {
+        "1": 0,
+        "2": 0,
+        "3": 1,
+        "4": 1,
+        "5": 2,
+        "6": 1,
+        "7": 0,
+        "10": 0,
+        "9": 0,
+    }
     diagram = wm.layout(tickets, fog_items=wm.fog(BODY), goal=wm.destination(BODY))
     box = {item.key: item for item in diagram.boxes}
     assert box["1"].y == box["2"].y < box["3"].y == box["4"].y < box["5"].y
+    # Each blocked box stands under the blocker it hangs from (the deepest, then the lowest
+    # number); sibling subtrees stand side by side, the trees in issue-number order.
+    assert box["1"].cx == (box["3"].cx + box["4"].cx) / 2 and box["5"].cx == box["3"].cx
+    assert box["4"].x < box["2"].x < box["7"].x and box["6"].cx == box["7"].cx
+    assert box["5"].y < box["9"].y == box["10"].y and box["9"].x < box["10"].x
+    tickets_only = [item for item in diagram.boxes if item.href]
+    assert not any(
+        a.x < b.x + b.w and b.x < a.x + a.w and a.y < b.y + b.h and b.y < a.y + a.h
+        for index, a in enumerate(tickets_only)
+        for b in tickets_only[index + 1 :]
+    )
     [fog] = wm.fog_keys(wm.fog(BODY))
-    assert box["5"].y < box[fog].y < box["destination"].y
+    assert box["9"].y < box[fog].y < box["destination"].y
     assert diagram.boxes[-1].key == "destination" and not box["destination"].href
     assert box["4"].href == "/works/4" and box[fog].state == wm.FOG
     # One arrow per blocker on the map, top to bottom; the loop's back edge is not drawn.
@@ -61,7 +84,7 @@ def test_tickets_stand_in_layers_by_blocking_depth_then_fog_then_the_destination
         wm.DONE,
         wm.FOG,
     ]
-    # Every box fits the drawing, side by side at most ``COLUMNS``.
+    # Every box fits the drawing, the trees four columns wide.
     assert all(0 < item.x and item.x + item.w <= diagram.width for item in diagram.boxes)
     assert all(item.y + item.h <= diagram.height for item in diagram.boxes)
     long = wm._wrap("word " * 40, 170, 3)

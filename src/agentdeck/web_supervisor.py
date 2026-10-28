@@ -76,6 +76,9 @@ def _pid_file() -> Path:
     if configured:
         return Path(configured).expanduser()
     runtime = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
+    if not runtime.is_dir():
+        # macOS has no per-user runtime folder; the runtime's socket falls back the same way.
+        runtime = Path("~/.cache").expanduser()
     return runtime / "agentdeck-web" / "worker.pid"
 
 

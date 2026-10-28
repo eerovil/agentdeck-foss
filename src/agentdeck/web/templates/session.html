@@ -244,6 +244,18 @@
 {% endif %}
 
 
+{#- A wayfinder ticket's chat (#3696): its map above the question form, drawn once on load
+    and outside the live slot below, so a push never eats it. After the form's Submit,
+    ``wayfinder_map.js`` shows where to go next. #}
+{%- if map_strip %}
+{%- set plan = map_strip.map %}
+<div class="wm-strip" data-wm-strip>
+  <p>Part of <a href="{{ plan.href }}">{{ plan.title }}</a>{% if plan.short %} · {{ plan.short }}{% endif %}</p>
+  <p class="wm-next" data-wm-next hidden>
+    {%- if map_strip.next %}Next on this map: <a href="{{ map_strip.next.href }}">{{ map_strip.next.line }} &rarr;</a>
+    {%- else %}<a href="{{ plan.href }}">Back to the map</a>{% endif %}</p>
+</div>
+{%- endif %}
 <div id="pending-interaction-slot" sse-swap="interaction" hx-swap="innerHTML"
      data-refresh-url="/partials/sessions/{{ session.key }}/interaction">{{ session_fragments["interaction"] | safe }}</div>
 

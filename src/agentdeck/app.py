@@ -122,7 +122,14 @@ from .work_router import (
 )
 from .work_router import owner_of_issue as work_owner_of_issue
 from .work_router import owner_of_pull as work_owner_of_pull
-from .work_signals import acknowledge_comment, latest_comment, read_map, read_parent
+from .work_signals import (
+    acknowledge_comment,
+    latest_comment,
+    read_map,
+    read_map_body,
+    read_parent,
+    write_map_body,
+)
 from .work_start import start_action_id, start_work_agent, work_accounts
 from .worktree_diff import WorktreeDiffReader
 
@@ -798,6 +805,9 @@ def create_app(config: AppConfig) -> FastAPI:
         # A wayfinder map's chat wakes when its last ticket closes (#3627).
         read_issue=read_map,
         read_parent=read_parent,
+        # ... and the deck keeps its lists from its tickets' answers (#3695).
+        read_body=read_map_body,
+        write_body=write_map_body,
     )
     # A verdict about a head the branch left only by merging its base still stands (#3314).
     work_release_service.ports.same_change = work_router.reviewed.same_change

@@ -330,7 +330,7 @@ def _attention(
     for insight in insights:
         session = sessions.get(insight.session_key)
         shown = presentation.display(session) if session is not None and presentation else session
-        asks, question, interaction = _open_question(state, assistant, insight, session)
+        asks, question, interaction, header = _open_question(state, assistant, insight, session)
         retry_id = quota_retry_message_id(session) if session is not None else None
         rows.append(
             WorkAttention(
@@ -341,6 +341,7 @@ def _attention(
                 asks=asks,
                 question=question,
                 interaction=interaction,
+                header=header,
                 recovering=bool(retry_id and retry_id in pending_message_ids),
                 cause=str(getattr(insight, "cause", "") or ""),
             )
@@ -353,8 +354,11 @@ def _attention(
 _QUESTION_INTERACTIONS = frozenset({"question", "mcp_form"})
 
 
-def _open_question(state: Any, assistant: Any, insight: Any, session: Any) -> tuple[bool, str, str]:
-    """``(asks, question, interaction kind)`` for the chat behind a Deckhand card (#2224).
+def _open_question(
+    state: Any, assistant: Any, insight: Any, session: Any
+) -> tuple[bool, str, str, str]:
+    """``(asks, question, interaction kind, header)`` for the chat behind a Deckhand card
+    (#2224); the header is the form question's own short name, "" for a question in text.
 
     The deck's own facts decide it, never the card. A live pending interaction comes first,
     read the way Deckhand reads it, and asks only when it is question-style. Otherwise the
@@ -371,16 +375,19 @@ def _open_question(state: Any, assistant: Any, insight: Any, session: Any) -> tu
         else None
     )
     if pending is not None:
-        asked = next((q.prompt for q in pending.questions if q.prompt.strip()), "")
+        first = next((q for q in pending.questions if q.prompt.strip()), None)
+        asked = first.prompt if first is not None else ""
         text = (asked or pending.message or pending.title or "").strip()
-        return pending.kind in _QUESTION_INTERACTIONS, text, pending.kind or "interaction"
+        header = str(first.header or "").strip() if first is not None else ""
+        kind = pending.kind or "interaction"
+        return pending.kind in _QUESTION_INTERACTIONS, text, kind, header
     finder = getattr(state, "open_question_for", None)
     parked = finder(insight.session_key) if finder is not None else None
     if parked is not None:
         text = parked.question.strip() if parked.answered_seq is None else ""
-        return bool(text), text, ""
+        return bool(text), text, "", ""
     text = str(getattr(session, "question", "") or "").strip()
-    return bool(text), text, ""
+    return bool(text), text, "", ""
 
 
 @dataclass(frozen=True)
@@ -2102,7 +2109,9 @@ def gather_facts(
             chat_holds=snapshot.chat_holds,
         )
         signed = signoffs.get(ref.work_id)
-        if awaiting_finish(facts.finished_at, signed[1] if signed else None, cutoff):
+        if awaiting_finish(
+            facts.finished_at, signed[1] if signed else None, cutoff
+        ) and not _finishes_by_itself(facts):
             facts = replace(
                 facts,
                 awaiting_finish=True,
@@ -2172,6 +2181,17 @@ def start_signoff_cutoff(control: Any) -> None:
     if control.work_backfill(SIGNOFF_CUTOFF) is None:
         stamp = datetime.now(UTC).isoformat()
         control.record_work_backfill(SIGNOFF_CUTOFF, json.dumps({"cutoff": stamp}))
+
+
+def _finishes_by_itself(facts: WorkFacts) -> bool:
+    """A closed wayfinder ticket needs no Finish (#3675): its answer is already on its map,
+    and the owner signs the whole map off at its destination. One closed with a pull request
+    still open waits as any Work does, so that pull request is not forgotten (#3187)."""
+    record = facts.record
+    labels = record.get("labels") if isinstance(record, Mapping) else None
+    return wayfinder_map.is_ticket(labels if isinstance(labels, list) else ()) and not any(
+        output.is_open for output in facts.outputs
+    )
 
 
 def signoff_inputs(
@@ -2690,16 +2710,8 @@ def needs_you_pushes(
         row for stop, row in stops.items()
         if stop not in sent and not (row.card.chat_key and muted(row.card.chat_key))
     ]
-    pushes = [
-        NeedsYouPush(
-            row.card.title,
-            f"{row.attention.label if row.attention else 'Needs you'} · {row.source}",
-            row.card.chat_href or row.card.href,
-            f"work:{row.card.work_id}",
-            (row.card.work_id,),
-        )
-        for row in fresh[:NEEDS_YOU_PUSH_LIMIT]
-    ]
+    maps = wayfinder_maps(overview.front)
+    pushes = [_needs_you_push(row, maps) for row in fresh[:NEEDS_YOU_PUSH_LIMIT]]
     if more := len(fresh) - len(pushes):
         title = "1 more Work needs you" if more == 1 else f"{more} more Works need you"
         rest = tuple(row.card.work_id for row in fresh[NEEDS_YOU_PUSH_LIMIT:])
@@ -2708,6 +2720,70 @@ def needs_you_pushes(
 
 
 NEEDS_YOU_SUMMARY_TAG = "needs-you"
+
+
+def _needs_you_push(row: FrontRow, maps: Sequence[wayfinder_map.Progress]) -> NeedsYouPush:
+    """One Work's push. A wayfinder ticket's question names its map and the question, and
+    opens the ticket's chat at its form (#3696); every other stop says its category."""
+    card = row.card
+    plan = map_for(maps, card.work_id)
+    ticket = plan is not None and plan.work_id != card.work_id
+    asked = wayfinder_map.question(row) if ticket else None
+    if plan is not None and asked is not None:
+        return NeedsYouPush(
+            f"{plan.title} asks", asked.line, asked.href, f"work:{card.work_id}", (card.work_id,)
+        )
+    return NeedsYouPush(
+        card.title,
+        f"{row.attention.label if row.attention else 'Needs you'} · {row.source}",
+        card.chat_href or card.href,
+        f"work:{card.work_id}",
+        (card.work_id,),
+    )
+
+
+def wayfinder_maps(front: Any) -> tuple[wayfinder_map.Progress, ...]:
+    """Every wayfinder map's progress the front page holds (#3696), from its folded rows."""
+    if front is None:
+        return ()
+    found: dict[str, wayfinder_map.Progress] = {}
+    for row in (
+        *front.needs_you, *front.hidden, *front.active, *front.waiting, *front.live,
+        *front.finished, *front.paused,
+    ):
+        plan = getattr(row, "map", None)
+        if plan is not None:
+            found.setdefault(plan.work_id, plan)
+    return tuple(found.values())
+
+
+def map_for(
+    maps: Sequence[wayfinder_map.Progress], work_id: str
+) -> wayfinder_map.Progress | None:
+    """The map a Work is, or is a ticket of, or None."""
+    return next((plan for plan in maps if plan.holds(work_id)), None)
+
+
+@dataclass(frozen=True)
+class MapStrip:
+    """What a wayfinder ticket's chat page shows of its map (#3696): the map, and the
+    question Submit leads on to, None when this was the last one."""
+
+    map: wayfinder_map.Progress
+    next: wayfinder_map.Question | None
+
+
+def chat_map_strip(app: Any, work_id: str | None) -> MapStrip | None:
+    """The chat page's map strip for a ticket's chat, from the refresher's last overview; None
+    for a chat whose Work is not a map's ticket, or before the first overview."""
+    service = getattr(app.state, "work_overview", None)
+    overview = getattr(service, "overview", None)
+    if work_id is None or overview is None:
+        return None
+    plan = map_for(wayfinder_maps(getattr(overview, "front", None)), work_id)
+    if plan is None or plan.work_id == work_id:
+        return None
+    return MapStrip(plan, plan.next_after(work_id))
 
 
 def owner_in_chat(state: Any, request: WakeRequest) -> bool:
@@ -4722,6 +4798,11 @@ async def _wayfinder_diagram(
                         IssueRef(repository, number)
                     ).work_id
                 ),
+                asks=(
+                    wayfinder_map.question(row)
+                    if row is not None and state == wayfinder_map.NEEDS_YOU
+                    else None
+                ),
             )
         )
     control = getattr(app.state, "control_db", None)
@@ -4731,8 +4812,18 @@ async def _wayfinder_diagram(
         goal=wayfinder_map.destination(body or ""),
         moved=control.wayfinder_layout(ref.work_id) if control is not None else None,
     )
+    # "Waiting for you" starts with the question the map's front-page row leads with (#3696).
+    plan = map_for(wayfinder_maps(getattr(_overview(app), "front", None)), ref.work_id)
+    if plan is not None and diagram.questions:
+        place = {item.work_id: index for index, item in enumerate(plan.questions)}
+        ordered = sorted(diagram.questions, key=lambda item: place.get(item.work_id, len(place)))
+        diagram = replace(diagram, questions=tuple(ordered))
     unread = body is None or any(blocked is None for blocked in blockers)
     return replace(diagram, partial=unread) if unread else diagram
+
+
+def _overview(app: Any) -> Any:
+    return getattr(getattr(app.state, "work_overview", None), "overview", None)
 
 
 # --- rendering ------------------------------------------------------------------------------

@@ -296,6 +296,8 @@
     var generation = ++requestGeneration;
     var loading = null;
     var pushed = false;
+    var from = location.pathname;
+    var parent = null;
     try {
       var layout = document.querySelector('.session-layout.front-columns');
       var column = layout && layout.querySelector(':scope > .work-column');
@@ -314,6 +316,13 @@
         var stream = parsed.body.getAttribute('sse-connect');
         if (!incoming) throw new Error('work page missing from response');
         if (generation !== requestGeneration) return settleLoading(loading);
+        // Opened from anywhere but its parent, a sub-issue's Work has the parent's beneath it.
+        parent = parentPath(incoming);
+        if (parent === from || parent === path) parent = null;
+        if (parent && pushed) {
+          history.replaceState(state(WORK_STATE, parent), '', parent);
+          history.pushState(state(WORK_STATE, path), '', path);
+        }
         layout = ensureLayout();
         if (!layout.classList.contains('front-columns')) throw new Error('no front columns');
         var fresh = document.createElement('section');
@@ -342,6 +351,7 @@
       if (title) setTitle(title);
       syncSelectedRows(path, keep ? chat.key : undefined);
       syncOpenWork();
+      if (updateHistory && parent) history.pushState(state(WORK_STATE, parent), '', parent);
       if (updateHistory) history.pushState(state(WORK_STATE, path), '', path);
       if (!keep) switchStream(listLayer().stream);
       dispatchNavigation();
@@ -405,8 +415,19 @@
       loadScripts(sidebar);
       syncOpenWork();
       if (!(history.state && history.state[STATE_KEY] === WORK_STATE)) {
-        history.replaceState(state(LIST_STATE, '/'), '', '/');
-        history.pushState(state(WORK_STATE, path), '', path);
+        var parent = parentPath(work);
+        if (parent && cameFrom(parent)) {
+          // Straight from its parent's Work, that page's own entry is already beneath it.
+          history.replaceState(state(WORK_STATE, path), '', location.href);
+        } else if (parent && cameFrom('/')) {
+          // From the front page, its own entry is beneath: the parent's takes this one.
+          history.replaceState(state(WORK_STATE, parent), '', parent);
+          history.pushState(state(WORK_STATE, path), '', path);
+        } else {
+          history.replaceState(state(LIST_STATE, '/'), '', '/');
+          if (parent) history.pushState(state(WORK_STATE, parent), '', parent);
+          history.pushState(state(WORK_STATE, path), '', path);
+        }
       }
       dispatchNavigation();
       var chat = workChat(column);
@@ -614,10 +635,17 @@
 
   // Whether the entry this page was loaded over is the front page's own. A tab opened on
   // its own has nothing beneath it, whatever its referrer says.
-  function cameFromFrontPage() {
+  function cameFrom(path) {
     if (history.length < 2 || !document.referrer) return false;
     var from = new URL(document.referrer, location.href);
-    return from.origin === location.origin && from.pathname === '/';
+    return from.origin === location.origin && from.pathname === path;
+  }
+
+  // A sub-issue's Work names its parent's (#3691): Back from it is the parent's Work,
+  // whatever led here, and then the front page beneath that.
+  function parentPath(work) {
+    var href = work && work.dataset.parentWork;
+    return href ? new URL(href, location.href).pathname : null;
   }
 
   // `beside`: the chat a Work opened next to itself (#2345). The address and the title stay
@@ -819,13 +847,22 @@
     history.pushState(state(CHAT_STATE, chatPath), '', chatPath);
   } else if (mobile.matches && document.body.classList.contains('work-page') &&
              isWorkPath(location.pathname) && !(history.state && history.state[STATE_KEY]) &&
-             !cameFromFrontPage()) {
+             !cameFrom(parentPath(document.querySelector('main.work-main')) || '/')) {
     // A Work page a phone loads fresh puts the front page beneath itself, so Back is the
-    // front page whatever led here: a chat's header, another Work, a link (#2878). Straight
-    // from the front page, that page's own entry is already beneath it.
-    var ownWork = location.pathname + location.search + location.hash;
-    history.replaceState(state(LIST_STATE, '/'), '', '/');
-    history.pushState(state(WORK_STATE, location.pathname), '', ownWork);
+    // front page whatever led here: a chat's header, another Work, a link (#2878). A
+    // sub-issue's Work puts its parent's between the two (#3691). Straight from the page
+    // Back would reach, that page's own entry is already beneath it.
+    var ownPath = location.pathname;
+    var ownWork = ownPath + location.search + location.hash;
+    var ownParent = parentPath(document.querySelector('main.work-main'));
+    if (ownParent && cameFrom('/')) {
+      // From the front page, its own entry is already beneath: the parent's takes this one.
+      history.replaceState(state(WORK_STATE, ownParent), '', ownParent);
+    } else {
+      history.replaceState(state(LIST_STATE, '/'), '', '/');
+      if (ownParent) history.pushState(state(WORK_STATE, ownParent), '', ownParent);
+    }
+    history.pushState(state(WORK_STATE, ownPath), '', ownWork);
   } else if (!(history.state && history.state[STATE_KEY])) {
     history.replaceState(state(selectedKey(location.pathname) ? CHAT_STATE : LIST_STATE,
       location.pathname), '', location.href);

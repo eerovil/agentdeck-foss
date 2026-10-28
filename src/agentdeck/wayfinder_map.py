@@ -1,10 +1,11 @@
 """A wayfinder map drawn as a diagram on its Work page (#3627, the approved #3621 spec).
 
 A map is an issue labelled ``wayfinder:map`` whose GitHub sub-issues are its tickets
-(``skills/wayfinder/WAYFINDER.md``). The diagram has one box per ticket, laid top to bottom in
-layers by blocking depth (GitHub's native "blocked by" dependencies, drawn as arrows), then a
-dashed box per bullet under the map body's **Not yet specified**, then the destination. Each
-box is coloured by its ticket's state and opens that ticket's Work.
+(``skills/wayfinder/WAYFINDER.md``). The diagram has one box per ticket, laid as trees that
+follow GitHub's native "blocked by" dependencies (drawn as arrows), one layer per blocking
+depth (#3694), then the tickets with no arrow, then a dashed box per bullet under the map
+body's **Not yet specified**, then the destination. Each box is coloured by its ticket's state
+and opens that ticket's Work.
 
 Everything here is pure: the caller reads the sub-issues, their dependencies and their
 front-page rows, and this lays them out as an SVG the server draws. No JavaScript and no
@@ -17,6 +18,7 @@ import hashlib
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
+from datetime import datetime
 
 MAP_LABEL = "wayfinder:map"
 
@@ -69,7 +71,7 @@ STATE_WORDS = {
 # person pans, zooms and drags boxes in (``wayfinder_map.js``), so it may be wider than a phone.
 BOX_W = 168
 PAD = 8
-COLUMNS = 3  # boxes side by side at most in one row of a layer
+COLUMNS = 3  # loose tickets and fog side by side in a row, at least; the trees may be wider
 MIN_COLUMNS = 2  # the drawing is at least this many boxes wide, for the destination's sake
 GAP_X = 14
 GAP_Y = 30  # room between rows for the arrows
@@ -97,6 +99,9 @@ class Ticket:
     kind: str = ""  # its ``wayfinder:<type>``: research, task, prototype, grilling
     status: str = ""  # its Work's front-page line, for the box's tooltip
     blocked_by: tuple[str, ...] = ()  # the keys of the tickets it waits on
+    # The question it waits on the person for (``question``), None for none (#3696): its box
+    # says what it asks, since a phone never shows the tooltip, and opens the chat's form.
+    asks: Question | None = None
 
 
 @dataclass(frozen=True)
@@ -136,6 +141,9 @@ class Diagram:
     width: float = 0.0
     # The body or a ticket's dependencies could not be read from GitHub this time: said.
     partial: bool = False
+    # The tickets' waiting questions, oldest first, which the caller puts in the front-page
+    # row's order when it has one: the map page's "Waiting for you" (#3696).
+    questions: tuple[Question, ...] = ()
 
     @property
     def legend(self) -> tuple[tuple[str, str, int], ...]:
@@ -153,6 +161,11 @@ def ticket_kind(labels: Sequence[str]) -> str:
         if name.casefold().startswith(TYPE_PREFIX) and name.casefold() != MAP_LABEL:
             return name[len(TYPE_PREFIX) :].strip()
     return ""
+
+
+def is_ticket(labels: Sequence[str]) -> bool:
+    """A wayfinder ticket: a ``wayfinder:<type>`` label other than the map's own."""
+    return bool(ticket_kind(labels))
 
 
 def _section(body: str, name: str) -> list[str]:
@@ -276,14 +289,16 @@ def _span(columns: int) -> float:
     return columns * BOX_W + (columns - 1) * GAP_X
 
 
-def _rows(items: Sequence, y: float, width: float, text) -> tuple[list[tuple], float]:
-    """Place ``items`` left to right, ``COLUMNS`` a row, each row centred in ``width``.
+def _rows(
+    items: Sequence, y: float, width: float, text, columns: int = COLUMNS
+) -> tuple[list[tuple], float]:
+    """Place ``items`` left to right, ``columns`` a row, each row centred in ``width``.
 
     ``text(item)`` is the title to wrap. Each frame is ``(item, x, y, height, lines)``; a row is
     as tall as its longest title, so every box in it lines up."""
     frames = []
-    for start in range(0, len(items), COLUMNS):
-        row = items[start : start + COLUMNS]
+    for start in range(0, len(items), columns):
+        row = items[start : start + columns]
         left = (width - _span(len(row))) / 2
         wrapped = [_wrap(text(item), BOX_W, TITLE_LINES) for item in row]
         height = _height(max((len(lines) for lines in wrapped), default=1) or 1)
@@ -293,6 +308,82 @@ def _rows(items: Sequence, y: float, width: float, text) -> tuple[list[tuple], f
     return frames, y
 
 
+_NUMBER = re.compile(r"#(\d+)\s*$")
+
+
+def _order(tickets: Sequence[Ticket]) -> dict[str, tuple]:
+    """Each ticket's place in reading order: by issue number, so a map reads in the order it
+    was charted (#3694); a label with no number after every numbered one, in input order."""
+    order = {}
+    for index, ticket in enumerate(tickets):
+        match = _NUMBER.search(ticket.label)
+        order[ticket.key] = (0, int(match.group(1)), index) if match else (1, 0, index)
+    return order
+
+
+def forest(tickets: Sequence[Ticket]) -> tuple[list[list[str]], dict[str, float], list[str]]:
+    """The tickets as trees that follow the arrows (#3694), and the loose ones with none.
+
+    Each blocked ticket hangs under one blocker a layer above it (its deepest, the lowest
+    number on a tie), so a tree's subtrees stand side by side and never overlap. Returns the
+    trees' roots grouped by connected arrows, each ticket's centre in box columns counted from
+    the left of the trees, and the tickets with no arrow at all, all in reading order."""
+    layer_of = depths(tickets)
+    order = _order(tickets)
+    keys = {ticket.key for ticket in tickets}
+    parent: dict[str, str] = {}
+    children: dict[str, list[str]] = {ticket.key: [] for ticket in tickets}
+    linked: dict[str, set[str]] = {ticket.key: set() for ticket in tickets}
+    for ticket in tickets:
+        above = [
+            key
+            for key in ticket.blocked_by
+            if key in keys and key != ticket.key and layer_of[key] < layer_of[ticket.key]
+        ]
+        for key in above:  # exactly the arrows ``layout`` draws
+            linked[key].add(ticket.key)
+            linked[ticket.key].add(key)
+        if above:
+            parent[ticket.key] = min(above, key=lambda key: (-layer_of[key], order[key]))
+            children[parent[ticket.key]].append(ticket.key)
+    loose = sorted((key for key in linked if not linked[key]), key=order.__getitem__)
+    groups: list[list[str]] = []
+    seen: set[str] = set()
+    for key in sorted((key for key in linked if linked[key]), key=order.__getitem__):
+        if key in seen:
+            continue
+        members, stack = [], [key]
+        seen.add(key)
+        while stack:
+            item = stack.pop()
+            members.append(item)
+            for other in linked[item] - seen:
+                seen.add(other)
+                stack.append(other)
+        groups.append(
+            sorted((item for item in members if item not in parent), key=order.__getitem__)
+        )
+    centre: dict[str, float] = {}
+
+    def place(key: str, left: float) -> float:
+        """Lay ``key``'s subtree from column ``left``; returns the column after it."""
+        kids = sorted(children[key], key=order.__getitem__)
+        if not kids:
+            centre[key] = left + 0.5
+            return left + 1
+        right = left
+        for kid in kids:
+            right = place(kid, right)
+        centre[key] = (centre[kids[0]] + centre[kids[-1]]) / 2
+        return right
+
+    left = 0.0
+    for roots in groups:
+        for root in roots:
+            left = place(root, left)
+    return groups, centre, loose
+
+
 def layout(
     tickets: Sequence[Ticket],
     *,
@@ -300,44 +391,59 @@ def layout(
     goal: str,
     moved: Mapping[str, tuple[float, float]] | None = None,
 ) -> Diagram:
-    """The map's diagram: ticket layers by blocking depth, then the fog, then the destination.
+    """The map's diagram: the tickets as trees down their arrows, then the tickets with no
+    arrow, then the fog, then the destination.
 
-    ``moved`` is where a person dragged boxes to (``ControlDB.wayfinder_layout``), by box key;
-    those boxes stand there instead, and the drawing grows to hold them."""
+    The trees stand side by side in reading order, one layer per blocking depth, each blocked
+    ticket under its blockers (#3694); they may be wider than a phone, since the page pans
+    and zooms. The loose tickets and the fog fill rows as wide as the trees, at least
+    ``COLUMNS``. ``moved`` is where a person dragged boxes to (``ControlDB.wayfinder_layout``),
+    by box key; those boxes stand there instead, and the drawing grows to hold them."""
     layer_of = depths(tickets)
     by_key = {ticket.key: ticket for ticket in tickets}
-    layers: dict[int, list[Ticket]] = {}
-    for ticket in tickets:
-        layers.setdefault(layer_of[ticket.key], []).append(ticket)
-    widest = max((len(row) for row in (*layers.values(), fog_items)), default=0)
-    width = _span(max(MIN_COLUMNS, min(COLUMNS, widest))) + 2 * PAD
+    _groups, centre, loose = forest(tickets)
+    tree_columns = round(max((value + 0.5 for value in centre.values()), default=0))
+    columns = max(COLUMNS, tree_columns)
+    widest = max(tree_columns, min(columns, max(len(loose), len(fog_items))))
+    width = _span(max(MIN_COLUMNS, widest)) + 2 * PAD
     boxes: dict[str, Box] = {}
-    y = float(PAD)
-    for depth in sorted(layers):
-        # Under their blockers: order a layer by where the boxes it waits on stand.
-        def place(ticket: Ticket) -> float:
-            above = [boxes[key].cx for key in ticket.blocked_by if key in boxes]
-            return sum(above) / len(above) if above else 0.0
 
-        ordered = sorted(layers[depth], key=place)
-        frames, y = _rows(ordered, y, width, lambda ticket: ticket.title)
-        for ticket, x, top, height, lines in frames:
-            head = ticket.label + (f" · {ticket.kind}" if ticket.kind else "")
-            boxes[ticket.key] = Box(
-                key=ticket.key,
-                state=ticket.state,
-                x=x,
-                y=top,
-                w=BOX_W,
-                h=height,
-                head=head,
-                lines=lines,
-                href=ticket.href,
-                tip=f"{ticket.label} {ticket.title} — "
-                + (ticket.status or STATE_WORDS.get(ticket.state, "")),
-            )
+    def box(ticket: Ticket, x: float, top: float, height: float, lines: tuple[str, ...]) -> Box:
+        return Box(
+            key=ticket.key,
+            state=ticket.state,
+            x=x,
+            y=top,
+            w=BOX_W,
+            h=height,
+            head=ticket.label + (f" · {ticket.kind}" if ticket.kind else ""),
+            lines=lines,
+            href=ticket.asks.href if ticket.asks is not None else ticket.href,
+            tip=f"{ticket.label} {ticket.title} — "
+            + (
+                ticket.asks.line
+                if ticket.asks is not None
+                else ticket.status or STATE_WORDS.get(ticket.state, "")
+            ),
+        )
+
+    y = float(PAD)
+    layers: dict[int, list[str]] = {}
+    for key in centre:
+        layers.setdefault(layer_of[key], []).append(key)
+    offset = (width - _span(tree_columns)) / 2 if tree_columns else 0.0
+    for depth in sorted(layers):
+        wrapped = {key: _wrap(_box_text(by_key[key]), BOX_W, TITLE_LINES) for key in layers[depth]}
+        height = _height(max(len(lines) for lines in wrapped.values()) or 1)
+        for key, lines in wrapped.items():
+            x = offset + (centre[key] - 0.5) * (BOX_W + GAP_X)
+            boxes[key] = box(by_key[key], x, y, height, lines)
+        y += height + GAP_Y
+    frames, y = _rows([by_key[key] for key in loose], y, width, _box_text, columns)
+    for ticket, x, top, height, lines in frames:
+        boxes[ticket.key] = box(ticket, x, top, height, lines)
     fog_boxes = []
-    frames, y = _rows(list(fog_items), y, width, lambda text: text)
+    frames, y = _rows(list(fog_items), y, width, lambda text: text, columns)
     keys = fog_keys(fog_items)
     for index, (text, x, top, height, lines) in enumerate(frames):
         fog_boxes.append(
@@ -360,12 +466,12 @@ def layout(
         )
         y += height + GAP_Y
     placed = [*boxes.values(), *fog_boxes, *((goal_box,) if goal_box else ())]
-    for index, box in enumerate(placed):
-        at = (moved or {}).get(box.key)
-        if at is not None and (box.x, box.y) != at:
-            placed[index] = replace(box, x=at[0], y=at[1], home=(box.x, box.y))
-            if box.key in boxes:
-                boxes[box.key] = placed[index]
+    for index, item in enumerate(placed):
+        at = (moved or {}).get(item.key)
+        if at is not None and (item.x, item.y) != at:
+            placed[index] = replace(item, x=at[0], y=at[1], home=(item.x, item.y))
+            if item.key in boxes:
+                boxes[item.key] = placed[index]
     arrows = []
     for ticket in tickets:
         target = boxes[ticket.key]
@@ -375,17 +481,30 @@ def layout(
                 continue
             arrows.append(Arrow(_curve(source, target), by_key[key].state, key, ticket.key))
     counts = {}
-    for box in (*boxes.values(), *fog_boxes):
-        counts[box.state] = counts.get(box.state, 0) + 1
+    for item in (*boxes.values(), *fog_boxes):
+        counts[item.state] = counts.get(item.state, 0) + 1
     order = (NEEDS_YOU, RUNNING, WAITING, DONE, FOG)
     height = max(y - GAP_Y + PAD, 2 * PAD)
+    asked = [ticket.asks for ticket in tickets if ticket.asks is not None]
+    epoch = datetime.min
     return Diagram(
+        questions=tuple(
+            sorted(asked, key=lambda item: (item.asked_at is None, (item.asked_at or epoch)))
+        ),
         boxes=tuple(placed),
         arrows=tuple(arrows),
-        height=max([height, *(box.y + box.h + PAD for box in placed)]),
+        height=max([height, *(item.y + item.h + PAD for item in placed)]),
         counts=tuple((state, counts.get(state, 0)) for state in order),
-        width=max([width, *(box.x + box.w + PAD for box in placed)]),
+        width=max([width, *(item.x + item.w + PAD for item in placed)]),
     )
+
+
+def _box_text(ticket: Ticket) -> str:
+    """A box's title: what it asks first, when it asks (#3696)."""
+    if ticket.asks is None:
+        return ticket.title
+    name = ticket.asks.header or "a question"
+    return f"Asks: {name} · {ticket.title}"
 
 
 def _curve(source: Box, target: Box) -> str:
@@ -416,6 +535,96 @@ def ticket_state(*, closed: bool, section: str | None, waits: bool = False) -> s
     if section == IN_PROGRESS and not waits:
         return RUNNING
     return WAITING
+
+
+# --- a map's waiting questions, wherever the deck points at them (#3696) --------------------
+
+# Where a chat page's question form is: a link to a waiting question opens the chat there.
+FORM_ANCHOR = "#pending-interaction"
+
+
+@dataclass(frozen=True)
+class Question:
+    """One question a map's ticket (or the map itself) waits on the person for."""
+
+    work_id: str
+    title: str  # the ticket issue's own title
+    header: str  # the form question's short name; "" for a question in the chat's text
+    prompt: str
+    href: str  # its chat, at the form
+    asked_at: datetime | None = None
+
+    @property
+    def line(self) -> str:
+        """``<header>: <question>``, or the question alone when it has no header."""
+        return f"{self.header}: {self.prompt}" if self.header else self.prompt
+
+
+@dataclass(frozen=True)
+class Progress:
+    """How far a map is, from its front-page row: what every page around a ticket's question
+    shows of the map (#3696). ``questions`` are in Needs you's own order, so the first is the
+    one the front-page row leads with."""
+
+    work_id: str
+    title: str  # the map issue's own title
+    href: str  # the map's Work page
+    counts: tuple[int, int] | None  # GitHub's (done, total) of its tickets
+    working: int = 0
+    blocked: int = 0
+    questions: tuple[Question, ...] = ()
+    tickets: tuple[str, ...] = ()  # the Work ids of the tickets its row folds in
+
+    @property
+    def line(self) -> str:
+        """``5/9 done · 2 ask you · 1 working · 1 blocked``, zero counts left out."""
+        parts = [f"{self.counts[0]}/{self.counts[1]} done"] if self.counts else []
+        if asking := len(self.questions):
+            parts.append(f"{asking} {'asks' if asking == 1 else 'ask'} you")
+        if self.working:
+            parts.append(f"{self.working} working")
+        if self.blocked:
+            parts.append(f"{self.blocked} blocked")
+        return " · ".join(parts)
+
+    @property
+    def short(self) -> str:
+        """The chat page's strip: done and asking only."""
+        parts = [f"{self.counts[0]}/{self.counts[1]} done"] if self.counts else []
+        if asking := len(self.questions):
+            parts.append(f"{asking} {'asks' if asking == 1 else 'ask'} you")
+        return " · ".join(parts)
+
+    def holds(self, work_id: str) -> bool:
+        return work_id == self.work_id or work_id in self.tickets
+
+    def question_of(self, work_id: str) -> Question | None:
+        return next((item for item in self.questions if item.work_id == work_id), None)
+
+    def next_after(self, work_id: str) -> Question | None:
+        """The first waiting question other than ``work_id``'s: where Submit leads on to."""
+        return next((item for item in self.questions if item.work_id != work_id), None)
+
+
+def question(row) -> Question | None:
+    """The question a Work's front-page row waits on the person for, or None.
+
+    Only a chat that really asks counts (``WorkAttention.asks``): a closed ticket waiting for
+    Finish or a stopped chat is not a question (#3656)."""
+    from .work_story import waiting_attention
+
+    card = row.card
+    for item in waiting_attention(card):
+        if item.asks and item.question:
+            return Question(
+                work_id=card.work_id,
+                title=card.issue_title or card.title,
+                header=item.header,
+                prompt=item.question,
+                href=f"{item.href}{FORM_ANCHOR}",
+                asked_at=row.stopped_at,
+            )
+    return None
 
 
 def blocked_keys(items: Sequence[Mapping], work_id) -> tuple[str, ...]:

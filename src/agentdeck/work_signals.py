@@ -137,11 +137,13 @@ async def latest_comment(repository: str, number: int, since: str, login: str) -
 
 
 async def read_map(repository: str, number: int) -> dict | None:
-    """A parent issue's state, label names and sub-issue counts, and when its last sub-issue
-    closed (``last_closed``), read live; ``None`` if unread.
+    """A parent issue's state, label names and sub-issue counts, its sub-issues' own
+    ``repository``/``number``/``state``/``closed_at`` (``sub_issues``), and when the last of
+    them closed (``last_closed``), read live; ``None`` if unread.
 
     The Work router reads a wayfinder map with it after one of its tickets closes (#3627).
-    Two reads: the issue, and its sub-issues for their close times."""
+    Two reads: the issue, and its sub-issues. Right after a close GitHub can still hand back
+    the old ``sub_issues_summary``, so the router trusts each sub-issue's state (#3671)."""
     gh = shutil.which("gh")
     if gh is None:
         return None
@@ -159,6 +161,7 @@ async def read_map(repository: str, number: int) -> dict | None:
         )
         found = json.loads(out) if code == 0 else None
         if not isinstance(found, dict):
+            log.warning("work signal: map %s#%s unread (gh exit %s)", repository, number, code)
             return None
         code, out, _err = await gh_cli.run_once(
             [
@@ -167,17 +170,30 @@ async def read_map(repository: str, number: int) -> dict | None:
                 f"repos/{repository}/issues/{number}/sub_issues?per_page=100",
                 "--jq",
                 # An object, since ``gh --jq`` prints a bare string unquoted.
-                "{last: ([.[].closed_at | select(. != null)] | max)}",
+                "{last: ([.[].closed_at | select(. != null)] | max),"
+                " sub_issues: [.[] | {number, state, closed_at,"
+                ' repository: (.repository_url | split("/") | .[-2:] | join("/"))}]}',
             ],
             timeout=GH_TIMEOUT_S,
             repo=repository,
         )
         held = json.loads(out) if code == 0 else None
-        last = held.get("last") if isinstance(held, dict) else None
+        if not isinstance(held, dict):
+            # The counts alone still decide; a lagging one then waits for the next close.
+            log.warning(
+                "work signal: sub-issues of %s#%s unread (gh exit %s)", repository, number, code
+            )
+            held = {}
+        last = held.get("last")
+        subs = held.get("sub_issues")
     except Exception:  # noqa: BLE001 - the map's chat is not woken this time
         log.warning("work signal: map %s#%s unread", repository, number, exc_info=True)
         return None
-    return {**found, "last_closed": last if isinstance(last, str) else ""}
+    return {
+        **found,
+        "last_closed": last if isinstance(last, str) else "",
+        "sub_issues": subs if isinstance(subs, list) else None,
+    }
 
 
 async def read_parent(repository: str, number: int) -> tuple[str, int] | None:
@@ -212,3 +228,49 @@ async def read_parent(repository: str, number: int) -> tuple[str, int] | None:
     if not isinstance(owner_repo, str) or "/" not in owner_repo or not isinstance(parent, int):
         return None
     return (owner_repo.lower(), parent)
+
+
+async def read_map_body(repository: str, number: int) -> dict | None:
+    """A wayfinder map's ``body``, ``state`` and label names, read live; ``None`` if unread.
+
+    The Work router reads it once before it saves the map's rebuilt lists (#3695)."""
+    gh = shutil.which("gh")
+    if gh is None:
+        return None
+    try:
+        code, out, _err = await gh_cli.run_once(
+            [
+                gh,
+                "api",
+                f"repos/{repository}/issues/{number}",
+                "--jq",
+                "{body, state, labels: [.labels[]?.name]}",
+            ],
+            timeout=GH_TIMEOUT_S,
+            repo=repository,
+        )
+        found = json.loads(out) if code == 0 else None
+    except Exception:  # noqa: BLE001 - the lists wait for the next record
+        log.warning("work signal: map %s#%s body unread", repository, number, exc_info=True)
+        return None
+    if not isinstance(found, dict):
+        log.warning("work signal: map %s#%s body unread (gh exit %s)", repository, number, code)
+        return None
+    if found.get("body") is None:
+        found["body"] = ""
+    return found
+
+
+async def write_map_body(repository: str, number: int, body: str) -> bool:
+    """Save a wayfinder map's body (#3695). Once: a failed write may still have landed."""
+    return await _gh(
+        repository,
+        "api",
+        "-X",
+        "PATCH",
+        f"repos/{repository}/issues/{number}",
+        "--input",
+        "-",
+        "--silent",
+        stdin=json.dumps({"body": body}).encode(),
+    )

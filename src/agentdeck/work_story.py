@@ -1117,6 +1117,9 @@ class FrontRow:
     own: FrontRow | None = None
     lead: FrontRow | None = None
     progress: str = ""
+    # A wayfinder map's row (#3696, ``wayfinder_map.Progress``): its title, counts and the
+    # questions its tickets wait on. None for every other row.
+    map: Any = None
 
     @property
     def revision(self) -> str:

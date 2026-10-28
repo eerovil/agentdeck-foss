@@ -43,6 +43,10 @@ def test_primary_session_guide_covers_agentdeck_action_contracts():
     assert "never invent one" in guide
     assert "structured user-input" in guide
     assert "Never infer approval" in guide
+    # Wayfinder's decision habits, for every agent (#3690).
+    assert "the last is **None of these**" in flat
+    assert "`Changes assumed: <detail> — <why>`" in flat
+    assert "act on it only once the person keeps it" in flat
     assert "assistant response" in guide and "tool output" in guide
     assert "raw-restart the persistent AgentDeck runtime" in guide
     # File links are one line since #1548: the form, the origin, nothing else.

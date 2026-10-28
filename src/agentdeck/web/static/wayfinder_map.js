@@ -390,3 +390,27 @@
     document.addEventListener(name, scan);
   });
 })();
+
+// A wayfinder ticket's chat page (#3696): once its question form is answered and gone, the
+// map strip above it says where to go next — the map's next waiting question, or the map.
+// The answer swaps the form out, so its own events never reach the document: a send is noted
+// when it starts, and the strip is shown once the page settles with no form left.
+(function () {
+  'use strict';
+
+  var sent = false;
+
+  function isAnswer(elt) {
+    return !!(elt && elt.matches && elt.matches('form[data-agentdeck-action="interaction"]'));
+  }
+
+  document.addEventListener('htmx:beforeRequest', function (event) {
+    if (isAnswer(event.detail && event.detail.elt)) sent = true;
+  });
+  document.addEventListener('htmx:afterSettle', function () {
+    if (!sent || document.querySelector('#pending-interaction form')) return;
+    sent = false;
+    var next = document.querySelector('[data-wm-strip] [data-wm-next]');
+    if (next) next.hidden = false;
+  });
+})();

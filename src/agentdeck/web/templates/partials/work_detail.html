@@ -105,6 +105,18 @@
   <p class="rt-note" data-work-tree-unreadable>Sub-issues could not be read from GitHub just now.</p>
   {%- endif %}
   {%- if tree.diagram %}
+  {%- if tree.diagram.questions %}
+  {#- What the map's tickets ask (#3696), each opening that ticket's chat at its form. #}
+  <div class="wm-waiting" data-wm-waiting>
+    <h4 class="wd-title-sm">Waiting for you</h4>
+    <ul>
+      {%- for asked in tree.diagram.questions %}
+      <li data-wm-question="{{ asked.work_id }}"><a href="{{ asked.href }}">{{ asked.line }}</a>
+        <span class="wm-waiting-from">{{ asked.title }}{% if asked.asked_at %} · <time datetime="{{ asked.asked_at.isoformat() }}" data-activity-age>{{ asked.asked_at | reltime_ago }}</time>{% endif %}</span></li>
+      {%- endfor %}
+    </ul>
+  </div>
+  {%- endif %}
   {#- A wayfinder map (#3627): its tickets drawn as a diagram instead of the list. #}
   {%- if tree.diagram.partial %}
   <p class="rt-note" data-wayfinder-map-partial>Part of the map could not be read from GitHub just now.</p>

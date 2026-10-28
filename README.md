@@ -5,6 +5,12 @@ CLI sessions. It reads local sessions from
 [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and Codex CLI
 through a provider abstraction over session sources.
 
+**To set it up, paste this into Claude Code or Codex on macOS or Linux:**
+
+> Set up AgentDeck from github.com/eerovil/agentdeck-foss by following its SETUP.md
+
+The agent does the work; you answer one question and press a few buttons on GitHub.
+
 ## Status & scope
 
 What works today:
@@ -50,6 +56,13 @@ Threat model in one line: anyone who can reach the port is you.
 Requires Python >= 3.12 and [uv](https://docs.astral.sh/uv/). Clone it to `~/agentdeck`:
 the systemd units and some instructions the deck gives its agents expect that path. The
 public copy is [eerovil/agentdeck-foss](https://github.com/eerovil/agentdeck-foss).
+
+The quick way is to have a coding agent follow [SETUP.md](SETUP.md), as above. It runs
+`agentdeck-init --login <you>`, which writes the config, creates your deck's own GitHub App
+(you press "Create" and "Install" on GitHub), creates a private `<you>/agent-tasks`
+repository for your first Works, sets up its poller and starts the services. The command
+never prompts: where only you can act it stops and says what to ask you. The rest of this
+section is the same setup by hand.
 
 ```sh
 git clone https://github.com/eerovil/agentdeck-foss.git ~/agentdeck

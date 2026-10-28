@@ -141,6 +141,9 @@ class WorkAttention:
     asks: bool = False
     question: str = ""
     interaction: str = ""
+    # The form question's own short name (``InteractionQuestion.header``), "" for a question
+    # in the chat's text: a wayfinder map names its waiting questions by it (#3696).
+    header: str = ""
     # The chat is one of this Work's own worker Runs, and the card's current Run ended in a
     # way the engine restarts by itself: a stop there is the engine's to recover (#2235).
     recovering: bool = False
@@ -608,6 +611,9 @@ class WorkCard:
     # The labels on its cached issue, as GitHub spells them: a deck-run Work reads its
     # project's spec-only label from them (#3247).
     labels: tuple[str, ...] = ()
+    # The issue's own title, whatever ``title`` the deck shows: a wayfinder map is named by it
+    # wherever its questions are pointed at (#3696). "" when no record holds it.
+    issue_title: str = ""
     # The one status line of a Work the deck runs itself (``work_derived``, #2895 step 3): a
     # ``works_router`` project's Work no Poller card holds. ``None`` keeps today's status.
     derived: Any = None
@@ -1625,7 +1631,15 @@ def build_work_card(
         scheduled=carries_label(facts.record, SCHEDULE_LABEL),
         parked_label=carries_label(facts.record, PARKED_LABEL),
         labels=_labels(facts.record),
+        issue_title=_issue_title(facts.record),
     )
+
+
+def _issue_title(record: Any) -> str:
+    """The issue's own title on GitHub, "" for none or a pull request's record."""
+    if not isinstance(record, dict) or record.get("is_pr"):
+        return ""
+    return str(record.get("title") or "").strip()
 
 
 def _labels(record: Any) -> tuple[str, ...]:

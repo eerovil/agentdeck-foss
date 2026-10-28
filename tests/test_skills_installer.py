@@ -78,6 +78,8 @@ def test_skill_installer_installs_dream_for_every_provider_account(tmp_path, mon
     (claude_main / "wayfinder" / "agents").mkdir(parents=True)
     (claude_main / "wayfinder" / "agents" / "openai.yaml").write_text("upstream")
     (claude_main / "wayfinder" / "SKILL.md").write_text("upstream")
+    (claude_main / "grilling" / "agents").mkdir(parents=True)
+    (claude_main / "grilling" / "SKILL.md").write_text("upstream")
     env = {
         **os.environ,
         "CLAUDE_SKILL_DIRS": f"{claude_main} {claude_alt}",
@@ -102,6 +104,8 @@ def test_skill_installer_installs_dream_for_every_provider_account(tmp_path, mon
         assert (root / "wayfinder" / "WAYFINDER.md").is_file()
     assert not (claude_main / "wayfinder" / "agents").exists()
     assert "WAYFINDER.md" in (claude_main / "wayfinder" / "SKILL.md").read_text()
+    assert not (claude_main / "grilling" / "agents").exists()
+    assert "GRILLING.md" in (claude_main / "grilling" / "SKILL.md").read_text()
     assert (claude_main / "dream" / "dream.py").is_file()
     assert (claude_main / "dream" / "DREAM.md").is_file()
     assert not (cursor_home / "skills-cursor").exists()
