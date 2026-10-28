@@ -255,11 +255,6 @@ def test_a_finished_handoff_whose_dispatched_item_merged_reads_merged():
 
 
 
-# --- a card the poller still owns is not a handoff (#552) ---
-
-
-
-
 
 
 
@@ -405,43 +400,6 @@ def test_work_item_pill_prefers_the_pull_request_over_the_issue():
     assert "issue" not in pill.label
 
 
-def test_work_item_pill_prefers_the_open_issues_board_column():
-    """An open card says where the work has got to; "pr open" does not (#1696)."""
-    session = _session(issue_status="open", issue_status_kind="open")
-
-    pill = resolve_work_item_pill(
-        session, _git(_pull(7, "open")), board_status="In progress"
-    )
-
-    assert pill is not None
-    assert pill.label == "issue in progress"
-    assert pill.title == "the issue this chat was dispatched for is in progress on the board"
-    assert pill.is_open
-
-
-def test_work_item_pill_leaves_a_closed_issues_column_behind():
-    """A merged issue reads as its pull request, not as a column it has left."""
-    session = _session(issue_status="closed", issue_status_kind="done")
-
-    pill = resolve_work_item_pill(
-        session, _git(_pull(7, "merged")), board_status="Done"
-    )
-
-    assert pill is not None
-    assert pill.label == "pr merged"
-    assert not pill.is_open
-
-
-def test_work_item_pill_ignores_a_board_column_that_says_nothing():
-    """A card with no column is not a pill reading "issue "."""
-    session = _session(issue_status="open", issue_status_kind="open")
-
-    pill = resolve_work_item_pill(session, _git(_pull(7, "open")), board_status="  ")
-
-    assert pill is not None
-    assert pill.label == "pr open"
-
-
 def test_work_item_pill_falls_back_to_the_issue():
     session = _session(issue_status="closed", issue_status_kind="closed")
 
@@ -573,23 +531,16 @@ def test_an_unreviewed_pill_is_exactly_what_it_was_before():
 
 
 def test_the_tick_rides_whichever_work_item_the_pill_names():
-    """Board column and bare issue status are pills too, and a reviewed commit is
-    a fact about the chat rather than about which half won the pill."""
-    column = resolve_work_item_pill(
-        _session(issue_status="open", issue_status_kind="open"),
-        _git(),
-        board_status="In progress",
-        reviewed_sha="abc1234",
-    )
+    """A bare issue status is a pill too, and a reviewed commit is a fact about the
+    chat rather than about which half won the pill."""
     issue = resolve_work_item_pill(
         _session(issue_status="merged", issue_status_kind="done"),
         _git(),
         reviewed_sha="abc1234",
     )
 
-    assert column is not None and column.label == "issue in progress ✓"
     assert issue is not None and issue.label == "issue merged ✓"
-    assert column.reviewed_sha == issue.reviewed_sha == "abc1234"
+    assert issue.reviewed_sha == "abc1234"
 
 
 def test_a_row_with_no_work_item_has_no_pill_to_tick():

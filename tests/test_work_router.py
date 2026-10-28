@@ -19,7 +19,7 @@ from public_copy import private_feature
 from agentdeck import chat_review as _chat_review
 from agentdeck.github_webhook_log import Repository, WebhookLog
 from agentdeck.models import PullRequestRef
-from agentdeck.poller_ops import works_router_repositories
+from agentdeck.poller_ops import work_repositories
 from agentdeck.webhook_tailer import WebhookTailer
 from agentdeck.work_release import OWNER_CALL_ASK
 from agentdeck.work_router import (
@@ -924,7 +924,7 @@ def test_reviewed_heads_keep_only_the_newest(tmp_path, monkeypatch):
     assert "a" not in fresh and all(key in fresh for key in "bcd")
 
 
-# --- the switch ---
+# --- which repositories the router covers ---
 
 
 def _manifest(poller_root, instance: str, body: str) -> None:
@@ -933,12 +933,12 @@ def _manifest(poller_root, instance: str, body: str) -> None:
     path.write_text(body)
 
 
-def test_the_switch_names_every_repository_its_project_declares(tmp_path):
+def test_every_repository_a_project_declares_is_routed(tmp_path):
+    """Every project's Works are the deck's (#3732): no manifest switch decides it any more."""
     _manifest(
         tmp_path,
         "agentdeck",
         'contract = 1\n[board]\norg = "eerovil"\nproject_number = 1\n'
-        "[capabilities]\nworks_router = true\n"
         '[[repos]]\nid = "agentdeck"\nholds_issues = true\n'
         '[[repos]]\nid = "review-chats"\n',
     )
@@ -948,21 +948,13 @@ def test_the_switch_names_every_repository_its_project_declares(tmp_path):
         'contract = 1\n[board]\norg = "Northwind"\nproject_number = 2\n'
         '[[repos]]\nid = "issues"\nholds_issues = true\n',
     )
-    assert works_router_repositories(tmp_path) == {"eerovil/agentdeck", "eerovil/review-chats"}
+    assert work_repositories(tmp_path) == {
+        "eerovil/agentdeck", "eerovil/review-chats", "northwind/issues",
+    }
 
 
-def test_the_switch_is_reread_when_a_manifest_changes(tmp_path):
-    body = 'contract = 1\n[board]\norg = "Eerovil"\nproject_number = 1\n'
-    body += '[[repos]]\nid = "agentdeck"\nholds_issues = true\n'
-    _manifest(tmp_path, "agentdeck", body)
-    switched = SwitchedRepositories(tmp_path)
-    assert not switched("eerovil/agentdeck")
-    _manifest(tmp_path, "agentdeck", body + "[capabilities]\nworks_router = true\n")
-    assert switched("EEROVIL/agentdeck"), "a different size is a different manifest"
-
-
-@pytest.mark.parametrize("value", ['"true"', "1", "false"])
-def test_only_a_true_boolean_switches(tmp_path, value):
+@pytest.mark.parametrize("value", ["true", "false", '"true"'])
+def test_a_manifest_still_naming_the_old_switch_loads_and_is_routed(tmp_path, value):
     _manifest(
         tmp_path,
         "agentdeck",
@@ -970,7 +962,18 @@ def test_only_a_true_boolean_switches(tmp_path, value):
         f"[capabilities]\nworks_router = {value}\n"
         '[[repos]]\nid = "agentdeck"\n',
     )
-    assert works_router_repositories(tmp_path) == frozenset()
+    assert work_repositories(tmp_path) == {"eerovil/agentdeck"}
+
+
+def test_the_repositories_are_reread_when_a_manifest_changes(tmp_path):
+    body = 'contract = 1\n[board]\norg = "Eerovil"\nproject_number = 1\n'
+    body += '[[repos]]\nid = "agentdeck"\nholds_issues = true\n'
+    _manifest(tmp_path, "agentdeck", body)
+    switched = SwitchedRepositories(tmp_path)
+    assert switched("eerovil/agentdeck")
+    assert not switched("eerovil/notes")
+    _manifest(tmp_path, "agentdeck", body + '[[repos]]\nid = "notes"\n')
+    assert switched("EEROVIL/notes"), "a different size is a different manifest"
 
 
 # --- who owns an issue or a pull request ---

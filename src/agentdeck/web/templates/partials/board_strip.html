@@ -1,8 +1,7 @@
 {# The poller board in one line, under Deckhand (#1007). Collapsed by default —
    the mobile vertical-space rule — and `board_strip.js` restores the operator's
    own open/closed choice, so an SSE swap of the region above cannot reopen or
-   shut it behind their back. Every card except the done column, so an instance
-   whose cards are all parked still appears (#1025). #}
+   shut it behind their back. A board-less project's open issues are its rows (#1691). #}
 <details class="board-strip" id="board-strip" data-board-strip>
   <summary>
     <span class="board-strip-chev" aria-hidden="true">&#9656;</span>
@@ -12,8 +11,6 @@
     {% else %}
     <span class="board-strip-dot">&middot;</span>
     <span class="board-strip-count">{{ board_strip.card_count }} cards</span>
-    <span class="board-strip-dot">&middot;</span>
-    <span class="board-strip-count">{{ board_strip.review_count }} in review</span>
     {% endif %}
     {% if not board_strip.complete %}
     {# A zero from a read that failed is not "nothing pending" — say which part
@@ -42,7 +39,7 @@
              number the column beside it already shows. #}
           <span class="board-strip-title">{{ row.title or row.repository }}</span>
         </a>
-        <span class="pill{% if row.in_review %} board-strip-review{% endif %}">{{ row.status }}</span>
+        <span class="pill">{{ row.status }}</span>
         {% if row.has_pull %}
         <a class="pill board-strip-pr" href="{{ row.pull_url }}" target="_blank" rel="noopener"
            data-agentdeck-action="open_board_pull">PR #{{ row.pull_number }}</a>

@@ -89,10 +89,9 @@ refresh_interval_s = 60
 #permission_mode = "bypassPermissions"
 #max_workers = 3
 
-# Durable opaque-key state for provider-neutral workers such as poller-dispatched Codex threads.
+# Durable opaque-key state for provider-neutral keyed workers such as deck-started Codex threads.
 #[keyed_workers]
 #state_dir = "~/.local/share/agentdeck/keyed-workers"
-#max_kanban_workers = 4         # active kanban roots across every project/provider/account
 
 # Chats to nudge after the next persistent-runtime restart. Agents register
 # themselves (PUT /api/sessions/<key>/restart-nudge, or `agentdeck

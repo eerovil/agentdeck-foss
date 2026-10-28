@@ -9,20 +9,31 @@ gave up on the merge.
 from __future__ import annotations
 
 import json
-import time
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
-from test_work_attention import HEAD, ORG, PR, WORK, _card, _record, _row
 
 from agentdeck import merge_checks
-from agentdeck.run_trace import RunTraceFacts, StoredOutcome, build_run_trace
 from agentdeck.webhook_status_cache import WebhookStatusCacheService
+from agentdeck.work import WorkRef
 from agentdeck.work_attention import RELEASE_BLOCKED, operator_attention
 from agentdeck.work_facts import work_facts
 from agentdeck.work_overview import build_work_card
 from agentdeck.work_story import IN_PROGRESS, NEEDS_YOU, front_row, work_status
+
+ORG = "eerovil"
+WORK = WorkRef(f"{ORG}/agentdeck", 5)
+PR = f"https://github.com/{ORG}/agentdeck/pull/7"
+HEAD = "abc1234def5678abc1234def5678abc1234def56"
+
+
+def _row(state: str = "open", *, head: str = HEAD, **extra) -> dict:
+    """The cached pull request row ``git_context`` and the webhook write-through keep."""
+    row = {"state": state, "headRefOid": head, "baseRefName": "master", **extra}
+    if state == "merged":
+        row.update(state="closed", mergedAt="2026-09-25T10:00:00+00:00")
+    return row
 
 ENABLED = datetime(2026, 9, 26, 19, 19, 33, tzinfo=UTC)
 REQUIRED = "continuous-integration/drone/pr"
@@ -156,16 +167,13 @@ def test_auto_merge_turned_off_and_on_again_on_the_same_head_gets_its_own_grace(
 
 
 def _work(tmp_path, *, row: dict, checks: dict | None):
-    card = _card(tmp_path, _record("In progress"))
-    outcomes = (StoredOutcome(card.generation, "ended", "", observed_at=time.time()),)
-    trace = build_run_trace(RunTraceFacts(work=WORK, card=card, outcomes=outcomes))
     facts = work_facts(
         WORK,
-        card=card,
         rows={PR.lower(): row},
+        open_pulls=[{"url": PR, "closes": [WORK.source_key]}],
         checks={PR.lower(): checks} if checks is not None else None,
     )
-    return build_work_card(WORK, issue=None, title="Work", facts=facts, trace=trace)
+    return build_work_card(WORK, issue=None, title="Work", facts=facts)
 
 
 def test_the_store_3368_shape_leaves_working_now_for_release_blocked(tmp_path):
@@ -298,12 +306,8 @@ def test_a_merge_candidate_is_watched_for_its_merge_answer(tmp_path):
     from agentdeck.web.work_view import merge_watch_pulls
 
     plain = _work(tmp_path, row=_row(), checks=None)
-    clean = replace(
-        plain, outputs=tuple(replace(output, review_clean=True) for output in plain.outputs)
-    )
 
     assert merge_watch_pulls([plain]) == ()
-    assert merge_watch_pulls([clean]) == ((f"{ORG}/agentdeck", 7),)
     # A Work the deck runs itself reads Ready for merge from its own release, with no
     # Poller reviewer behind its outputs (#3199): its pull requests are candidates too.
     from agentdeck.work_derived import READY, DerivedStatus

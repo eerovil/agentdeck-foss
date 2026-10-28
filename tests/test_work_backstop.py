@@ -6,7 +6,7 @@ import asyncio
 import logging
 
 from agentdeck.issue_context import IssueBacklog, IssueContext, RepositoryIssues
-from agentdeck.poller_ops import works_router_hold_labels, works_router_unassigned_elsewhere
+from agentdeck.poller_ops import work_hold_labels, work_unassigned_elsewhere
 from agentdeck.work_backstop import MissedStartBackstop
 
 REPO = "eerovil/agentdeck"
@@ -118,20 +118,19 @@ def test_a_repository_that_is_not_switched_is_left_alone():
     assert harness.starts == []
 
 
-def test_hold_labels_come_from_the_switched_manifest(tmp_path):
+def test_hold_labels_come_from_the_manifest(tmp_path):
     instance = tmp_path / "instances" / "deck"
     instance.mkdir(parents=True)
     (instance / "poller.toml").write_text(
         'contract = 1\n[board]\norg = "EeroVil"\nproject_number = 1\n'
         'ownership_label = "agent"\nspec_only_label = "Spec-Only"\npaused_label = "paused"\n'
         '[[repos]]\nid = "AgentDeck"\nholds_issues = true\n'
-        "[capabilities]\nworks_router = true\n"
     )
-    assert works_router_hold_labels(tmp_path) == {REPO: frozenset({"paused"})}
+    assert work_hold_labels(tmp_path) == {REPO: frozenset({"paused"})}
     # #3731: an overlay leaving unassigned issues to another deck names the repository.
-    assert works_router_unassigned_elsewhere(tmp_path) == frozenset()
+    assert work_unassigned_elsewhere(tmp_path) == frozenset()
     (instance / "overlay.toml").write_text("[claims]\nunassigned = false\n")
-    assert works_router_unassigned_elsewhere(tmp_path) == {REPO}
+    assert work_unassigned_elsewhere(tmp_path) == {REPO}
 
 
 def test_an_issue_another_deck_works_is_not_started():

@@ -138,11 +138,11 @@ def map_progress(
     ``own`` is not a map.
 
     Asking counts only real questions, the map's own included. Blocked counts the listed
-    tickets a Poller card holds back, and every open ticket the front page lists no Work
-    for: a map files a blocked ticket with no agent, so no Work starts until its last
-    blocker closes (``WAYFINDER.md``). ``elsewhere`` are its open tickets the front page lists
-    as rows of their own (one the owner hid, for the Hidden list): listed, so not blocked.
-    ``held`` are listed tickets no agent started that wait on another (``_held_tickets``)."""
+    tickets in ``held`` — no agent started them and they wait on another (``_held_tickets``)
+    — and every open ticket the front page lists no Work for: a map files a blocked ticket
+    with no agent, so no Work starts until its last blocker closes (``WAYFINDER.md``).
+    ``elsewhere`` are its open tickets the front page lists as rows of their own (one the
+    owner hid, for the Hidden list): listed, so not blocked."""
     if not wayfinder_map.is_map(own.card.labels):
         return None
     asking = sorted(
@@ -153,12 +153,12 @@ def map_progress(
     open_rows = [
         row for row in children if row.section != FINISHED and not row.card.awaiting_finish
     ]
-    blocked = [row for row in open_rows if row.card.blocked_by or row.card.work_id in held]
+    blocked = [row for row in open_rows if row.card.work_id in held]
     unlisted = max(0, counts[1] - counts[0] - len(open_rows) - elsewhere) if counts else 0
     working = sum(
         1
         for row in open_rows
-        if row.section == IN_PROGRESS and not row.waits and not row.card.blocked_by
+        if row.section == IN_PROGRESS and not row.waits
     )
     return wayfinder_map.Progress(
         work_id=own.card.work_id,

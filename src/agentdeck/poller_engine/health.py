@@ -31,9 +31,8 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum
 
-from . import stop
-from .queue import WAKE_INTERVAL_S
-
+# How often a wake happens (systemd/agentdeck-poller@.timer: OnUnitInactiveSec=120, #3010).
+WAKE_INTERVAL_S = 120
 # Freshness is judged against the timer's own wake interval, so it moves with it (#3010).
 DEFAULT_INTERVAL_S = WAKE_INTERVAL_S
 # An instance is late after a couple of missed wakes and unbelievable after many.
@@ -70,7 +69,6 @@ class HealthReason(Enum):
     EXTENSION_DEGRADED = "extension-degraded"            # an extension was skipped or said degraded
     WORKER_ENDED_WITHOUT_REPORT = "worker-ended-without-report"  # a lease can no longer resolve
     STATE_FALLBACK = "state-fallback"                    # durable state was read from the backup
-    STOP_STALLED = "stop-stalled"                        # a stop past its window still holds a slot
 
 
 @dataclass
@@ -160,9 +158,6 @@ def record_cycle(state: dict, report: CycleReport, *, now: datetime) -> dict:
         "drift": report.drift,
         "extensions": dict(report.extension_health),
         "errors": list(report.errors),
-        # Not something this wake counted: read from the stopping cards themselves, so a wake
-        # that deferred the live read publishes the same answer as the one before it (#2073).
-        "stalled_stops": stop.stalled(state.get("issues") or {}, now=now),
         **{counter: getattr(report, counter) for counter in _COUNTERS},
     }
     if report.ok:
@@ -271,14 +266,6 @@ def evaluate(
         # The card cannot advance on its own from here, and it is invisible otherwise: this is
         # the whole point of noticing in minutes instead of after the stale window (#279).
         reasons.append(HealthReason.WORKER_ENDED_WITHOUT_REPORT)
-    if stop.stalled(state.get("issues") or {}, now=now):
-        # The one reason derived from the cards rather than from the last report, because it is
-        # a fact about durable state and not about a wake: a stop is unresolved until
-        # ``finalize_stop`` clears it, whether or not anything looked (#2073). Degraded, not
-        # failing — the instance is cycling correctly and the wait is the right call. What is
-        # wrong is that a slot and a file claim are held with no deadline, which nothing else
-        # surfaces: an operator sees only the cards queued behind it.
-        reasons.append(HealthReason.STOP_STALLED)
     if any(
         (value or {}).get("state") == "degraded"
         for value in (last.get("extensions") or {}).values()

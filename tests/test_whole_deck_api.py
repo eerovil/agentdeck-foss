@@ -260,46 +260,31 @@ def _history_app(tmp_path):
     return create_app(config)
 
 
-_REVIEW = {
-    "repo": "org/store",
-    "sha": "a" * 40,
-    "verdict": "pass",
-    "result": "release",
-    "pull_request": "org/store#7",
-    "issue_repo": "org/store",
-    "issue_number": 5,
-    "auto": True,
-    "generation": "gen1",
-    "reviewed_at": "2026-07-25T12:00:00+00:00",
-}
+_REVIEW = {"repo": "org/store", "sha": "a" * 40, "verdict": "pass", "pull_request": "org/store#7"}
 
 
-async def test_a_poller_review_verdict_is_stored_and_read_back(tmp_path):
-    """#1122: the record the card throws away when it consumes the verdict."""
+async def test_a_review_verdict_is_stored_and_read_back(tmp_path):
+    """#1122: the record a review leaves about one commit."""
     app = _history_app(tmp_path)
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
-        posted = await client.post("/api/poller/review-verdicts", json=_REVIEW)
+        posted = await client.post("/api/review-verdicts", json=_REVIEW)
         listed = await client.get("/api/poller/review-verdicts")
 
     assert posted.json()["recorded"] is True and posted.json()["stored"] is True
     rows = listed.json()["review_verdicts"]
     assert len(rows) == 1
     assert rows[0]["repo"] == "org/store" and rows[0]["sha"] == "a" * 40
-    assert rows[0]["verdict"] == "pass" and rows[0]["result"] == "release"
-    assert rows[0]["auto"] is True
+    assert rows[0]["verdict"] == "pass" and rows[0]["result"] == "none"
 
 
 async def test_the_same_commit_delivered_twice_stays_one_review(tmp_path):
-    """The poller re-sends a record whose local cleanup failed, so this has to be idempotent."""
+    """A verdict is about a commit, so a second one for it replaces the first."""
     app = _history_app(tmp_path)
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
-        await client.post("/api/poller/review-verdicts", json=_REVIEW)
-        await client.post(
-            "/api/poller/review-verdicts",
-            json={**_REVIEW, "verdict": "changes-needed", "result": "handback"},
-        )
+        await client.post("/api/review-verdicts", json=_REVIEW)
+        await client.post("/api/review-verdicts", json={**_REVIEW, "verdict": "changes-needed"})
         listed = await client.get("/api/poller/review-verdicts")
 
     rows = listed.json()["review_verdicts"]
@@ -310,8 +295,9 @@ async def test_a_review_verdict_without_a_commit_is_refused(tmp_path):
     app = _history_app(tmp_path)
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
-        response = await client.post(
-            "/api/poller/review-verdicts", json={**_REVIEW, "sha": ""}
-        )
+        response = await client.post("/api/review-verdicts", json={**_REVIEW, "sha": ""})
+        # The poller's own hand-off route went with its cards (#3732).
+        retired = await client.post("/api/poller/review-verdicts", json=_REVIEW)
 
     assert response.status_code == 422
+    assert retired.status_code == 405

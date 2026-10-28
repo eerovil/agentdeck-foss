@@ -45,7 +45,6 @@ from .work_attention import (
     ANSWER,
     CHATGPT_REVIEW,
     CLOSE,
-    CLOSED_UNMERGED,
     FINISH,
     HIDE,
     INSPECT,
@@ -196,8 +195,7 @@ def plan(
         # The repository's ownership label: its Poller or the deck starts a Work on it (#3558).
         return Step("add_label", ref.repository, ref.number, card.start_label)
     if action == CLOSE:
-        reason = "not planned" if attention.category == CLOSED_UNMERGED else "completed"
-        return Step("close", ref.repository, ref.number, reason)
+        return Step("close", ref.repository, ref.number, "completed")
     if action in {CHATGPT_REVIEW, AGENT_REVIEW}:
         # The review chat covers the whole Work (#2637): the issue and every open pull request,
         # in this repository or another, so none of them is a reason to refuse or to review a

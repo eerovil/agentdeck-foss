@@ -1,9 +1,8 @@
-"""The deck's GitHub issue read model, and the attention/issue/card join (#821).
+"""The deck's GitHub issue read model, and the attention/issue join (#821).
 
 Deckhand already turns a session's *registered pull requests* into live GitHub
 state (``git_context.py``). This module does the same for the second population
-the desk has to answer for: **issues that have not become a chat yet**, plus the
-poller board card each one sits on.
+the desk has to answer for: **issues that have not become a chat yet**.
 
 Three rules shape everything here.
 
@@ -18,8 +17,8 @@ Three rules shape everything here.
   makes that repository *unknown* — never "nothing pending". A backlog that
   answered a throttled read with an empty list would be worse than one that said
   it could not look, because only the second is visible.
-* **Join on identity, never on prose.** A waiting chat, its issue, and its board
-  card are one item to the boss and three rows to the deck. They are joined on
+* **Join on identity, never on prose.** A waiting chat and its issue are one item to
+  the boss and two rows to the deck. They are joined on
   repository plus issue number, taken from the identities that already carry it:
   a registered issue URL, an ``agent/issue-<n>`` branch, and a registered pull
   request's head branch. Title similarity is not evidence.
@@ -48,7 +47,7 @@ from .github_cache import GitHubMetadata, GitHubMetadataCache
 from .kanban import KanbanRef, KanbanTitleCache
 from .models import AttentionReport, Session
 from .poller_engine.config import role_of_status_labels
-from .poller_ops import BoardCard, BoardView
+from .poller_ops import BoardView
 
 log = logging.getLogger(__name__)
 
@@ -1007,20 +1006,6 @@ class IssueResolver:
             )
             issues.append(issue)
             seen.add(identity(repository, number))
-        if not complete or not scope.complete:
-            for card in scope.cards:
-                if card.identity in seen:
-                    continue
-                issues.append(
-                    InstanceBoardIssue(
-                        repository=card.repository,
-                        number=card.number,
-                        status=card.status,
-                        url=(
-                            f"https://github.com/{card.repository}/issues/{card.number}"
-                        ),
-                    )
-                )
         return InstanceBoard(
             instance=scope.instance,
             issues=tuple(
@@ -1356,12 +1341,11 @@ class SessionRef:
 
 @dataclass(frozen=True)
 class PendingItem:
-    """One unit of pending work: the issue, its board card, and its chats."""
+    """One unit of pending work: the issue and its chats."""
 
     repository: str
     number: int
     issue: IssueContext | None = None
-    card: BoardCard | None = None
     sessions: tuple[SessionRef, ...] = ()
     pull_requests: tuple[dict, ...] = ()
     ownership_label: str = ""
@@ -1376,24 +1360,17 @@ class PendingItem:
 
     @property
     def owned_by_poller(self) -> bool:
-        """The engine holds this card — from the label if the issue was readable,
-        otherwise from what the engine itself last recorded."""
+        """The issue carries its repository's ownership label, when the issue was readable."""
         labels = self.ownership_labels or (
             (self.ownership_label,) if self.ownership_label else ()
         )
         if self.issue is not None and labels:
             return any(self.issue.has_label(label) for label in labels)
-        return bool(self.card and self.card.ownership)
+        return False
 
     @property
     def owned_by_label(self) -> bool:
-        """The engine holds this card *and* the live issue says so.
-
-        The stricter half of ``owned_by_poller``, for a caller that must not act
-        on the card fallback: a card outlives the issue it tracked, so a card
-        left on ``In progress`` by a merged issue reads as owned forever. Only
-        ask this when a stale yes would be the worse mistake (#866).
-        """
+        """The live issue is open and carries an ownership label (#866)."""
         labels = self.ownership_labels or (
             (self.ownership_label,) if self.ownership_label else ()
         )
@@ -1411,7 +1388,6 @@ class PendingItem:
             "number": self.number,
             "identity": self.identity,
             "issue": self.issue.as_json() if self.issue else None,
-            "card": self.card.as_json() if self.card else None,
             "sessions": [session.as_json() for session in self.sessions],
             "pull_requests": list(self.pull_requests),
             "ownership_label": self.ownership_label,
@@ -1431,7 +1407,7 @@ class PendingView:
     board_complete: bool = True
     pulls_complete: bool = True
     # Repositories whose issue list was read too long ago to say what is still
-    # open there. Their cards stay on the list — an unread list is not a closed
+    # open there. Their items stay on the list — an unread list is not a closed
     # issue — and this names why the answer is only part of one (#1115).
     expired_issue_reads: tuple[str, ...] = ()
 
@@ -1489,12 +1465,11 @@ def join_pending(
     attention_report_for: Callable[[str], AttentionReport | None] | None = None,
     repositories: Iterable[str] | None = None,
 ) -> PendingView:
-    """Join open issues, board cards, and the chats working them into one list.
+    """Join open issues, their pull requests, and the chats working them into one list.
 
-    An item is created by any of the three populations, so work that has not
-    become a chat yet, a chat whose issue read failed, and a card the engine is
-    holding all appear. ``repositories`` narrows the join to a declared scope;
-    by default it is every repository the backlog covers.
+    An item is created by any of these populations, so work that has not become
+    a chat yet and a chat whose issue read failed both appear. ``repositories`` narrows
+    the join to a declared scope; by default it is every repository the backlog covers.
     """
     contexts = contexts or {}
     if attention_report_for is None:
@@ -1513,13 +1488,6 @@ def join_pending(
     for issue in backlog.issues:
         spelling.setdefault(issue.repository.lower(), issue.repository)
         issues[issue.identity] = issue
-
-    cards: dict[str, BoardCard] = {}
-    for card in backlog.board.cards.values():
-        if scope and card.repository.lower() not in scope:
-            continue
-        spelling.setdefault(card.repository.lower(), card.repository)
-        cards[card.identity] = card
 
     session_rows: dict[str, list[SessionRef]] = {}
     session_recency: dict[str, float] = {}
@@ -1562,25 +1530,6 @@ def join_pending(
                 if all(row["number"] != pull.number for row in rows):
                     rows.append(pull.as_json())
 
-    # The pull request the worker itself reported, which the engine wrote onto
-    # the card. It is the only source that spans repositories without guessing —
-    # a project files cards in `.../issues` and opens pull requests in `shop` —
-    # but it is a link, not a state, so it counts only while the repository's
-    # cached open list still lists it (#1031).
-    for card in cards.values():
-        reference = pull_reference_from_url(card.pull_request_url)
-        if reference is None:
-            continue
-        pull_repository, pull_number = reference
-        if not backlog.knows_pulls_for(pull_repository):
-            continue
-        pull = backlog.open_pull(pull_repository, pull_number)
-        if pull is None:
-            continue  # merged or closed: nothing is waiting on it
-        known = pulls.setdefault(card.identity, [])
-        if all(row["number"] != pull["number"] for row in known):
-            known.append(dict(pull))
-
     # The repository's own open pull requests, joined by head branch. A chat's
     # git context is the fresher source, so it wins on number collisions; this
     # fills the gap it leaves behind when a worker chat ends (#1012).
@@ -1594,7 +1543,7 @@ def join_pending(
             if all(row["number"] != pull["number"] for row in known):
                 known.append(dict(pull))
 
-    keys = set(issues) | set(cards) | set(session_rows) | set(pulls)
+    keys = set(issues) | set(session_rows) | set(pulls)
     items: list[PendingItem] = []
     for key in keys:
         repo_key, _, raw_number = key.partition("#")
@@ -1604,7 +1553,6 @@ def join_pending(
                 repository=repository,
                 number=int(raw_number),
                 issue=issues.get(key),
-                card=cards.get(key),
                 sessions=tuple(
                     sorted(
                         session_rows.get(key, ()),

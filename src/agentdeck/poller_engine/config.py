@@ -1569,6 +1569,14 @@ def effective_extensions(manifest: Manifest, overlay: Overlay) -> dict:
     return merged
 
 
+# Extensions removed from the engine (#3741). A machine-local Overlay that still carries one's
+# block is left over from before the Manifest dropped it: there is no program left to switch
+# on, so the block is ignored rather than refused. Refusing it would make the retirement need
+# an exact order: the installed Manifest refuses an Overlay without the block (its settings go
+# missing), and the new Manifest one with it, so no Overlay edit fits both sides of a deploy.
+RETIRED_EXTENSIONS = frozenset({"chatgpt-nudge", "deploy-watch", "drone-deploy-watch"})
+
+
 def cross_check(manifest: Manifest, overlay: Overlay, report: Report) -> None:
     """Check the two files against each other — the mistakes neither can see alone."""
     if manifest.contract and overlay.contract and manifest.contract != overlay.contract:
@@ -1576,14 +1584,6 @@ def cross_check(manifest: Manifest, overlay: Overlay, report: Report) -> None:
             "overlay.contract",
             f"contract {overlay.contract} does not match the manifest's {manifest.contract}",
             "regenerate the overlay with the Builder so both files share one contract",
-        )
-    if not overlay.claims_unassigned and manifest.capabilities.get("works_router") is not True:
-        # A deck that shares the project with another must not seed or move board cards for
-        # every labelled issue, the other deck's included (#3731).
-        report.add(
-            "overlay.claims.unassigned",
-            "a deck that leaves unassigned issues to another deck must not run cards itself",
-            "set capabilities.works_router = true in the manifest, or drop [claims]",
         )
     by_id = {repo.id: repo for repo in manifest.repos}
     for repo in manifest.repos:
@@ -1658,7 +1658,7 @@ def cross_check(manifest: Manifest, overlay: Overlay, report: Report) -> None:
                 "a host cannot change which hooks an extension is allowed",
                 f"set hooks under [extensions.{name}] in the Manifest, and remove it here",
             )
-        if name not in manifest.extensions:
+        if name not in manifest.extensions and name not in RETIRED_EXTENSIONS:
             # A host may fill in an extension's credential; it may not switch one on. Enabling is
             # the project's decision, and the Manifest is where a reader looks to see what runs.
             report.add(

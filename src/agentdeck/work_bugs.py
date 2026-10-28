@@ -7,7 +7,7 @@ instance that manages AgentDeck's issues (``poller_engine.bug_reports``), which 
 
 Only a whole pass reports: a source that failed to read can put a Work in the wrong group, and
 a Work that is really stuck is still there on the next whole pass. Writing is idempotent by
-Work, cause and Run, so the pass may offer the same Work every few seconds.
+Work and cause, so the pass may offer the same Work every few seconds.
 """
 
 from __future__ import annotations
@@ -138,7 +138,7 @@ def report(
     written = 0
     for row in rows:
         card = row.card
-        ident = bug_reports.request_id(card.work_id, row.attention.bug, card.run_id)
+        ident = bug_reports.request_id(card.work_id, row.attention.bug, "")
         if sent is not None and ident in sent:
             continue
         chats = getattr(card, "attention", ())
@@ -148,7 +148,6 @@ def report(
                 repo=repo,
                 work_id=card.work_id,
                 cause=row.attention.bug,
-                run_id=card.run_id,
                 reason=row.attention.reason or row.reason,
                 work_url=public_url(card.href) or card.source_url,
                 session_key=chats[0].session_key if chats else "",

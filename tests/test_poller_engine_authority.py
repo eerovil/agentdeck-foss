@@ -73,7 +73,7 @@ def test_host_and_api_are_one_path():
     gh = github.Gh(token="t")
 
     adapter = github.GitHubAdapter(
-        org="eerovil", issue_repos=(), code_repos=(), project_number=1, api=gh
+        org="eerovil", issue_repos=(), project_number=1, api=gh
     )
 
     assert adapter.host is adapter.api is gh
@@ -148,9 +148,9 @@ def test_the_engine_can_never_authorize_itself(agent):
 
 def test_extensions_are_handed_the_instances_credential_in_a_private_file(tmp_path, agent):
     loaded = SimpleNamespace(overlay=SimpleNamespace(state_path=str(tmp_path / "state.json")))
-    nudge = Extension(name="chatgpt-nudge", program=("x",), config={"repos": ["o/r"]})
+    sentry = Extension(name="sentry-autofix", program=("x",), config={"repos": ["o/r"]})
 
-    (handed,) = engine_main._hand_token_to_extensions([nudge], loaded, agent)
+    (handed,) = engine_main._hand_token_to_extensions([sentry], loaded, agent)
 
     path = tmp_path / "github-token"
     assert handed.config == {
@@ -178,91 +178,22 @@ def _org_accounts(tmp_path, monkeypatch):
     github_authority.clear_caches()
 
 
-def test_an_org_instance_is_handed_its_app_and_the_agent_but_no_other_org(tmp_path, monkeypatch):
-    """Bazaar's nudge reads its own pull requests as its installation and the review chats in
-    `eerovil/review-chats` as the agent; Trailhead's installation token is never written."""
+def test_an_org_instance_is_handed_only_its_own_installation(tmp_path, monkeypatch):
+    """No other owner's credential: the review-chat owner's went with chatgpt-nudge (#3741)."""
     _org_accounts(tmp_path, monkeypatch)
+    for leftover in ("github-token-eerovil", "github-token-northwind"):
+        (tmp_path / leftover).write_text("old\n")
     loaded = SimpleNamespace(overlay=SimpleNamespace(state_path=str(tmp_path / "state.json")))
-    nudge = Extension(name="chatgpt-nudge", program=("x",), config={})
+    probe = Extension(name="probe", program=("x",), config={})
 
     (handed,) = engine_main._hand_token_to_extensions(
-        [nudge], loaded, github_authority.authority_for("acmecorp")
+        [probe], loaded, github_authority.authority_for("acmecorp")
     )
 
-    files = handed.config["github_token_files"]
-    assert files == {
-        "acmecorp": str(tmp_path / "github-token"),
-        "eerovil": str(tmp_path / "github-token-eerovil"),
-    }
-    assert handed.config["github_token_file"] == files["acmecorp"]
+    assert handed.config["github_token_files"] == {"acmecorp": str(tmp_path / "github-token")}
+    assert handed.config["github_token_file"] == str(tmp_path / "github-token")
     assert (tmp_path / "github-token").read_text() == "ghs-11\n"
-    assert (tmp_path / "github-token-eerovil").read_text() == "test-agent-token\n"
-    assert (tmp_path / "github-token-eerovil").stat().st_mode & 0o777 == 0o600
-    assert not list(tmp_path.glob("github-token-northwind"))
-
-
-def test_an_org_instance_is_handed_the_review_chat_owner_through_its_app(tmp_path, monkeypatch):
-    """#2682: once `eerovil` speaks through the App, Bazaar's nudge still gets a credential for
-    the review chats in `eerovil/review-chats` — that installation's token, not the agent's."""
-    _org_accounts(tmp_path, monkeypatch)
-    accounts = tmp_path / "github-authority.toml"
-    accounts.write_text(
-        accounts.read_text(encoding="utf-8")
-        .replace('eerovil = "agent"', 'eerovil = "app:eerovil"')
-        .replace("{ acmecorp = 11,", "{ eerovil = 33, acmecorp = 11,"),
-        encoding="utf-8",
-    )
-    github_authority.clear_caches()
-    loaded = SimpleNamespace(overlay=SimpleNamespace(state_path=str(tmp_path / "state.json")))
-    nudge = Extension(name="chatgpt-nudge", program=("x",), config={})
-
-    (handed,) = engine_main._hand_token_to_extensions(
-        [nudge], loaded, github_authority.authority_for("acmecorp")
-    )
-
-    assert handed.config["github_token_files"] == {
-        "acmecorp": str(tmp_path / "github-token"),
-        "eerovil": str(tmp_path / "github-token-eerovil"),
-    }
-    assert (tmp_path / "github-token-eerovil").read_text() == "ghs-33\n"
-    assert not list(tmp_path.glob("github-token-northwind"))
-
-
-def test_a_missing_agent_credential_does_not_stop_an_org_wake(tmp_path, monkeypatch):
-    """Only the instance's own credential is required; without the agent's the chat reads are
-    refused by the extension, and the wake still runs."""
-    _org_accounts(tmp_path, monkeypatch)
-    monkeypatch.setenv("AGENTDECK_AGENT_GITHUB_ENV", str(tmp_path / "absent.env"))
-    stale = tmp_path / "github-token-eerovil"
-    stale.write_text("old\n")
-    loaded = SimpleNamespace(overlay=SimpleNamespace(state_path=str(tmp_path / "state.json")))
-    nudge = Extension(name="chatgpt-nudge", program=("x",), config={})
-
-    (handed,) = engine_main._hand_token_to_extensions(
-        [nudge], loaded, github_authority.authority_for("acmecorp")
-    )
-
-    assert handed.config["github_token_files"] == {
-        "acmecorp": str(tmp_path / "github-token"),
-        # Kept, with no file: the extension reads it as unreadable, never as "no chat there".
-        "eerovil": "",
-    }
-    assert not stale.exists(), "a credential that was not refreshed is not left behind"
-
-
-def test_a_credential_file_for_an_owner_no_longer_handed_is_removed(tmp_path, monkeypatch):
-    _org_accounts(tmp_path, monkeypatch)
-    gone = tmp_path / "github-token-northwind"
-    gone.write_text("old-agent-token\n")
-    loaded = SimpleNamespace(overlay=SimpleNamespace(state_path=str(tmp_path / "state.json")))
-    nudge = Extension(name="chatgpt-nudge", program=("x",), config={})
-
-    engine_main._hand_token_to_extensions(
-        [nudge], loaded, github_authority.authority_for("acmecorp")
-    )
-
-    assert not gone.exists()
-    assert (tmp_path / "github-token-eerovil").exists()
+    assert not list(tmp_path.glob("github-token-*")), "no copy outlives its grant"
 
 
 # --- the wake refuses, and says why -----------------------------------------------------------
@@ -349,6 +280,6 @@ def test_a_credential_that_cannot_be_handed_over_defers_the_wake(tmp_path, agent
     loaded = SimpleNamespace(
         overlay=SimpleNamespace(state_path=str(tmp_path / "missing-dir" / "state.json"))
     )
-    nudge = Extension(name="chatgpt-nudge", program=("x",), config={})
+    probe = Extension(name="probe", program=("x",), config={})
 
-    assert engine_main._hand_token_to_extensions([nudge], loaded, agent) is None
+    assert engine_main._hand_token_to_extensions([probe], loaded, agent) is None

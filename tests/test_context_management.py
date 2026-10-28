@@ -359,7 +359,7 @@ def test_request_hash_uses_image_count_and_summary_hash_not_temporary_paths():
         require_idle=True,
         require_active=False,
         expected_last_result_at=1.0,
-        role="kanban",
+        role="delegated",
         delegated=False,
         caller_session_token="token",
         continues_session_url="https://deck/chats/old",
@@ -419,7 +419,7 @@ def test_a_pre_2194_request_still_hashes_the_same():
             require_idle=False,
             require_active=False,
             expected_last_result_at=None,
-            role="kanban",
+            role="kanban",  # the poller's role when this row was written
             delegated=True,
             caller_session_token=None,
             continues_session_url=None,

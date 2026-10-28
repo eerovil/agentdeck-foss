@@ -2,7 +2,7 @@
 
 A bare `agentdeck` is not on PATH in an owned worker shell, so a worker that follows
 the prose literally burns a failed command and a hunt for the binary before it gets
-anywhere.  Six independent sessions did exactly that.  These tests pin the three places
+anywhere.  Six independent sessions did exactly that.  These tests pin the places
 that hand a worker a command to run.
 """
 
@@ -11,22 +11,10 @@ from pathlib import Path
 
 from public_copy import shipped
 
-from agentdeck.poller_adapter.runner import VERIFICATION_EVIDENCE_BRIEF
 from agentdeck.providers.instructions import agentdeck_session_instructions
 
 ROOT = Path(__file__).resolve().parents[1]
 VENV_CLI = "~/agentdeck/.venv/bin/agentdeck"
-
-
-def test_the_verification_brief_spells_out_the_job_submit_binary():
-    """#2154 replaced the verify-phase packet with one brief section; the rule carries over."""
-    brief = VERIFICATION_EVIDENCE_BRIEF
-
-    assert f"{VENV_CLI} job submit --verification " in brief
-    # The bare form is what sent workers hunting; it must not survive anywhere in the brief.
-    assert "`agentdeck job submit" not in brief
-    assert "\nagentdeck job submit" not in brief
-    assert " agentdeck job submit" not in brief
 
 
 def test_the_primary_session_guide_spells_out_the_delegate_binary():

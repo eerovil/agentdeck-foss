@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """Run the Poller Engine from this checkout (#2153).
 
-The engine deploys with AgentDeck as ordinary software: the wake script, the per-card
-worker-control commands and an operator's diagnosis all run the engine through this file, so
-the engine that answers is always the one in the same checkout as the host adapter that named
-it. There is no separately built or promoted artifact.
+The engine deploys with AgentDeck as ordinary software: the wake script, the deploy's
+activation and an operator's diagnosis all run the engine through this file, so the engine that
+answers is always the one in the same checkout. There is no separately built or promoted
+artifact.
 
     scripts/poller_engine.py inspect --manifest poller.toml --overlay overlay.toml
     scripts/poller_engine.py cycle --manifest … --overlay … --binding binding.json
 
 The engine runs under this checkout's venv (#2597): the launcher re-runs itself there, so every
-caller — the wake, the canary, a card-control script already on disk — gets the same interpreter
+caller — the wake, the deploy, an operator — gets the same interpreter
 the deck uses without naming it.
 """
 

@@ -2295,7 +2295,6 @@ body.local-file-page main { width: min(1100px, 100%); }
   border: 1px solid var(--line); border-radius: 999px; color: var(--muted); }
 /* The column that wants the operator, so it reads as a signal rather than as
    one more grey label (#1025). */
-.board-strip-rows .pill.board-strip-review { border-color: var(--remote); color: var(--remote); }
 .board-strip-rows .pill.board-strip-pr { border-color: var(--live); color: var(--live); }
 /* The way into the chat working the card. Deliberately quiet: it is a door,
    not a signal, and the column beside it is what should catch the eye (#1694). */
@@ -2419,34 +2418,9 @@ body.local-file-page main { width: min(1100px, 100%); }
 .ww-tested code { font-size: .75rem; }
 .ww-tested.is-problem { color: var(--warn); }
 
-/* Run trace (#2141): where the Work's current Run has got to, and what comes next. */
-.run-trace { margin: 0 0 .75rem; font-size: .85rem; }
-.rt-title { display: flex; flex-wrap: wrap; align-items: baseline; gap: .45rem; margin: 0 0 .4rem;
-  font-size: .8rem; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
+/* Small counts and notes beside a Work page's titles and rows. */
 .rt-count { text-transform: none; letter-spacing: 0; }
-.rt-pull { text-transform: none; letter-spacing: 0; color: var(--remote); text-decoration: none; }
-.rt-run { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
-  padding: .45rem .65rem; margin: 0 0 .4rem; min-width: 0; }
-.rt-run-needs_attention, .rt-run-failed, .rt-run-uncertain { border-color: var(--warn); }
-.rt-state-line { display: flex; flex-wrap: wrap; align-items: baseline; gap: .2rem .5rem; margin: 0; }
-.rt-state { font-weight: 600; text-transform: capitalize; }
-.rt-state-running, .rt-state-finished { color: var(--live); }
-.rt-state-needs_attention, .rt-state-failed, .rt-state-uncertain { color: var(--warn); }
-.rt-state-historical { color: var(--muted); }
-.rt-reason, .rt-step, .rt-preflight { overflow-wrap: anywhere; }
-.rt-next { margin: .2rem 0 0; color: var(--fg); }
-.rt-note, .rt-unreadable { color: var(--muted); font-size: .75rem; }
-.rt-unreadable, .rt-preflight { margin: 0 0 .4rem; }
-.rt-unreadable { color: var(--warn); }
-.rt-milestones { list-style: none; margin: .3rem 0 0; padding: 0; }
-.rt-step { display: flex; flex-wrap: wrap; align-items: baseline; gap: .1rem .45rem; }
-.rt-step + .rt-step { margin-top: .15rem; }
-.rt-step.is-problem .rt-step-label { color: var(--warn); }
-.rt-inspector, .rt-previous { margin-top: .3rem; color: var(--muted); font-size: .75rem; }
-.rt-inspector summary, .rt-previous > summary { cursor: pointer; }
-.rt-inspector ul { margin: .2rem 0 0; padding-left: 1rem; }
-.rt-inspector code { font-size: .75rem; overflow-wrap: anywhere; }
-.rt-previous > .rt-run { margin-top: .3rem; font-size: .85rem; }
+.rt-note { color: var(--muted); font-size: .75rem; }
 
 /* Work-first UI (#2147). Mobile-first: every card and section stacks, nothing is a table,
    and long names wrap rather than scroll sideways at 320px. */
@@ -2455,19 +2429,12 @@ body.local-file-page main { width: min(1100px, 100%); }
 /* The Work page's source line: its link, state and age wrap as whole pieces rather than run
    off a 320px screen once the age is a real one, "2d 20h ago" (#2332). */
 .wd-source { display: flex; flex-wrap: wrap; align-items: baseline; gap: .1rem .4rem; }
-.wk-run { display: flex; flex-wrap: wrap; align-items: baseline; gap: .1rem .5rem; margin: .2rem 0 0; }
-.wk-run-state { font-weight: 600; text-transform: capitalize; }
-.wk-run-state-running, .wk-run-state-finished { color: var(--live); }
-.wk-run-state-needs_attention, .wk-run-state-failed, .wk-run-state-uncertain { color: var(--warn); }
-.wk-run-state-none, .wk-run-state-superseded, .wk-run-state-historical { color: var(--muted); }
 .wk-next { margin: .15rem 0 0; }
-.wk-verify, .wk-review { overflow-wrap: anywhere; }
+.wk-verify { overflow-wrap: anywhere; }
 .wk-verify.is-verified { color: var(--live); }
-.wk-verify.is-stale, .wk-verify.is-unproven, .wk-verify.is-failed,
-.wk-verify.is-untested { color: var(--warn); }
+.wk-verify.is-stale, .wk-verify.is-unproven, .wk-verify.is-failed { color: var(--warn); }
 /* A red run on a head the pull request has moved past is history, not a warning (#2460). */
 .wk-verify.is-failed.is-superseded { color: var(--muted); }
-.wk-review.is-passed { color: var(--live); }
 .wk-staging { color: var(--live); }
 .wk-review.is-needs_human, .wk-review.is-blocked, .wk-review.is-failed { color: var(--warn); }
 .work-more { margin: .2rem 0; color: var(--muted); font-size: .8rem; }
@@ -2572,9 +2539,7 @@ button.fr-action:disabled { opacity: .5; cursor: progress; }
 .front-finished:has([data-front-none]) { display: none; }
 .front-board { display: flex; flex-wrap: wrap; align-items: baseline; gap: .15rem .5rem; margin: .5rem 0;
   font-size: .8rem; color: var(--muted); }
-.front-board-label { font-size: .8rem; letter-spacing: .06em; text-transform: uppercase; }
 .front-board a { color: var(--muted); }
-.front-board .is-warn { color: var(--warn); }
 .front-board-open { margin-left: auto; }
 .work-other { margin: .3rem 0 .5rem; }
 .work-other-fold > summary { cursor: pointer; font-size: .8rem; letter-spacing: .06em; text-transform: uppercase;

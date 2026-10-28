@@ -40,7 +40,6 @@ from ...command_artifacts import (
     SESSION_TOKEN_ENV,
     WORKER_KEY_ENV,
     ensure_claude_settings,
-    write_context,
 )
 from ...images import UnsupportedImage, read_supported_image
 from ...models import (
@@ -70,6 +69,7 @@ from ..instructions import (
     agentdeck_session_instructions,
     relocation_notice,
     resolve_session_role,
+    stored_session_role,
 )
 from ..usage import read_shared_cache
 from . import permission_rules, registry
@@ -825,12 +825,11 @@ class ClaudeWorkerHost:
         self._state_path = state_dir / f"{account.label}.json"
         self._artifact_root = artifact_root or state_dir / "command-artifacts"
         allow_rules = permission_rules.allow_rules(classifier_skip_rules or ())
-        # Keyed by (kanban, runs in auto): only an auto chat gets the skip list.
+        # Keyed by whether the chat runs in auto: only an auto chat gets the skip list.
         self._settings_files = {
-            (capture, auto): ensure_claude_settings(
-                self._artifact_root, allow_rules if auto else None, capture=capture
+            auto: ensure_claude_settings(
+                self._artifact_root, allow_rules if auto else None, capture=False
             )
-            for capture in (True, False)
             for auto in (True, False)
         }
         # Answers to classifier blocks the hook has not collected yet, by block id.
@@ -860,22 +859,14 @@ class ClaudeWorkerHost:
                 self._publish_artifact_context(record)
         self._reconcile_orphans()
 
-    def _publish_artifact_context(self, record: WorkerRecord) -> bool:
-        if record.role != "kanban" or not record.session_id or not record.session_token:
-            return str((record.command_artifacts or {}).get("mode") or "off") != "enforce"
-        try:
-            write_context(
-                self._artifact_root,
-                account_key=self.account.key,
-                session_id=record.session_id,
-                worker_key=record.key,
-                session_token=record.session_token,
-                policy=record.command_artifacts,
-            )
-            return True
-        except OSError as exc:
-            log.warning("command artifact context unavailable for %s: %s", record.key, exc)
-            return False
+    @staticmethod
+    def _publish_artifact_context(record: WorkerRecord) -> bool:
+        """Whether this record's command-artifact policy can be honoured.
+
+        Only the poller's ``kanban`` workers ever had a capture context published; that
+        role went in #3741, so an ``enforce`` policy, which needs one, is refused.
+        """
+        return str((record.command_artifacts or {}).get("mode") or "off") != "enforce"
 
     def _key_lock(self, key: str) -> asyncio.Lock:
         """Per-key serialization lock.
@@ -913,18 +904,6 @@ class ClaudeWorkerHost:
             return None
         return snapshot.max_pct()
 
-    def _in_interactive_pool(self, key: str) -> bool:
-        """Whether this worker occupies one of the account's ``max_workers`` slots.
-
-        Kanban roots are admitted by the provider-neutral runtime's global,
-        cross-account pool instead, so they must not *consume* an account-local
-        slot either. Counting them held the asymmetry the other way: a busy
-        kanban fleet filled the interactive pool it is itself exempt from, and
-        every manual new chat on that account was refused ``at_capacity``
-        (#559) — with the live count reading above the cap while it happened.
-        """
-        return self.worker_role(key) != "kanban"
-
     @staticmethod
     def _waiting_on_person(live: _LiveWorker) -> bool:
         """Whether this worker's only activity is a prompt waiting for a person.
@@ -952,7 +931,6 @@ class ClaudeWorkerHost:
             for key, worker in self._live.items()
             if worker is not exclude
             and worker.process.returncode is None
-            and self._in_interactive_pool(key)
             and not self._waiting_on_person(worker)
         ]
 
@@ -969,10 +947,8 @@ class ClaudeWorkerHost:
         The single place the cap's policy lives, so who it binds cannot drift
         between the two admission sites:
 
-        * a kanban root is bounded by the runtime's global pool and is admitted
-          here unconditionally (it holds no slot to begin with);
-        * anything else waits for a free slot, and at the cap gets one reclaimed
-          if an idle or stalled worker can be cleaned up;
+        * every chat waits for a free slot, and at the cap gets one reclaimed if
+          an idle or stalled worker can be cleaned up;
         * a ``primary`` chat is a person pressing Start chat in the deck. It still
           asks the pool first — so an idle worker is reclaimed exactly as before —
           but is never refused. The cap exists to stop machines from filling an
@@ -983,8 +959,6 @@ class ClaudeWorkerHost:
 
         Refusals are logged, so ``at_capacity`` never leaves the journal silent.
         """
-        if role == "kanban":
-            return True
         if len(self._interactive_live(exclude=exclude)) < self.max_workers:
             return True
         if await self._free_admission_slot(key) is not None:
@@ -1040,10 +1014,6 @@ class ClaudeWorkerHost:
         the cap and every later chat is refused ``at_capacity`` until the runtime
         restarts.
 
-        Only workers that hold an account-local slot are candidates: reclaiming a
-        kanban root would not free the slot this admission is waiting for, so
-        counting it as a reclaim would admit one worker past the cap.
-
         Either way the victim's durable record (incl. ``session_id``) survives,
         so its chat revives on the next delivery.
         """
@@ -1085,9 +1055,7 @@ class ClaudeWorkerHost:
             (
                 (key, live)
                 for key, live in self._live.items()
-                if key != admit_key
-                and self._in_interactive_pool(key)
-                and self._is_reclaimable_idle(key, live, now)
+                if key != admit_key and self._is_reclaimable_idle(key, live, now)
             ),
             key=lambda item: -self._quiet_for(item[0], item[1], now),
         )
@@ -1101,7 +1069,7 @@ class ClaudeWorkerHost:
         """
         victims = []
         for key, live in self._live.items():
-            if key == admit_key or not self._in_interactive_pool(key):
+            if key == admit_key:
                 continue
             if not self._is_stalled(key, live, now):
                 continue
@@ -1181,10 +1149,8 @@ class ClaudeWorkerHost:
     def _is_collectable(self, key: str, live: _LiveWorker, now: float) -> bool:
         """Whether this worker has been quiet past ``idle_after_s`` with nothing running.
 
-        Deliberately ignores ``_in_interactive_pool``: that exemption exists so a
-        kanban root does not *consume* an account-local slot, which says nothing
-        about whether an abandoned one should be collected. It was the reason a
-        kanban worker could sit live for 20 days (#1226).
+        Independent of admission pressure: without this timer a worker nobody
+        competes with is never collected, which once left one live for 20 days (#1226).
 
         Claude-native background agents run on past the outer turn's ``result``, so
         an idle-looking worker with live agents is excluded exactly as it is from
@@ -1233,9 +1199,6 @@ class ClaudeWorkerHost:
     def _log_at_capacity(self, admit_key: str) -> None:
         """Say who is holding the slots. ``at_capacity`` is otherwise invisible in
         the journal — it is only ever a field in one HTTP response.
-
-        Only slot holders are named: a kanban root is not one, so listing it made
-        the refusal look like a cap the deck had already exceeded.
         """
         now = time.time()
         holders = [
@@ -1276,6 +1239,8 @@ class ClaudeWorkerHost:
                 # A record from before #2285 never chose; it ran with the switch
                 # off, so the new default must not turn it on (#2319).
                 item.setdefault("bypass_permissions", False)
+                # A chat the poller started under its retired ``kanban`` role (#3741).
+                item["role"] = stored_session_role(item.get("role"))
                 rec = WorkerRecord(**item)
             except TypeError:
                 continue
@@ -1575,13 +1540,6 @@ class ClaudeWorkerHost:
         live = self._live.get(key)
         return live is not None and live.process.returncode is None
 
-    def delivery_is_finalized(self, key: str, delivery_id: str | None) -> bool:
-        if not delivery_id:
-            return False
-        record = self._records.get(key)
-        receipt = record.deliveries.get(delivery_id) if record is not None else None
-        return bool(receipt and receipt.get("action"))
-
     def delivery_receipt(self, key: str, delivery_id: str) -> dict[str, Any] | None:
         rec = self._records.get(key)
         receipt = rec.deliveries.get(delivery_id) if rec is not None else None
@@ -1868,24 +1826,6 @@ class ClaudeWorkerHost:
             "usage_pct": self._usage_reader(),
         }
 
-    def active_role_keys(self, role: SessionRole) -> set[str]:
-        """Worker keys with a top-level or native background turn active under ``role``."""
-        active: set[str] = set()
-        for key, live in self._live.items():
-            record = self._records.get(key)
-            if record is None or record.role != role or live.process.returncode is not None:
-                continue
-            self._sync_background_agents(record, live)
-            if live.turn_active or live.background_agents:
-                active.add(key)
-        return active
-
-    def role_last_result_at(self, key: str, role: SessionRole) -> float:
-        record = self._records.get(key)
-        if record is None or record.role != role:
-            return 0.0
-        return record.last_result_at
-
     def _background_shell_tasks(
         self, rec: WorkerRecord, live: _LiveWorker | None
     ) -> frozenset[str]:
@@ -2042,7 +1982,6 @@ class ClaudeWorkerHost:
             effort=effort,
             permission_mode=permission_mode,
             allow_over_budget=allow_over_budget,
-            role=role,
             operation=(
                 "context_rollover"
                 if context_rollover
@@ -3221,7 +3160,6 @@ class ClaudeWorkerHost:
         delegated: bool = False,
         role: SessionRole | None = None,
         session_token: str | None = None,
-        mcp_config: str | None = None,
         fork_from: ForkFrom | None = None,
         relocated: tuple[str, str] | None = None,
         resume_at: str | None = None,
@@ -3262,19 +3200,11 @@ class ClaudeWorkerHost:
         # Lets the "Bypass permissions" switch move this process into
         # BYPASS_PERMISSIONS_MODE later; on its own it changes nothing (#2285).
         cmd += ["--allow-dangerously-skip-permissions"]
-        if mcp_config:
-            # Kanban worktrees are freshly created and headless, so Claude can never
-            # approve or enable their project-scoped .mcp.json interactively. A
-            # caller authorized to start a kanban worker already authorizes that
-            # trusted-local process to work in this cwd; make its MCP declaration
-            # explicit without mutating Claude's account-wide trust database.
-            cmd += [f"--mcp-config={mcp_config}"]
-        # Every chat gets the block hooks, and an auto chat the skip list too
-        # (#2271); a kanban worker's file also carries its command-capture hooks.
+        # Every chat gets the block hooks, and an auto chat the skip list too (#2271).
         # Chosen by the chat's own mode, not the bypass it may start in, so
         # switching bypass off lands in an auto chat with its skip list (#2319).
         settings_mode = base_permission_mode or effective_permission_mode
-        settings = self._settings_files[(role == "kanban", settings_mode == "auto")]
+        settings = self._settings_files[settings_mode == "auto"]
         cmd += ["--settings", str(settings)]
         if resume_id:
             cmd += ["--resume", resume_id]
@@ -3341,13 +3271,6 @@ class ClaudeWorkerHost:
             raise
         except Exception:  # noqa: BLE001 -- naming a death must never break teardown
             log.exception("could not settle memory scope %s", unit)
-
-    @staticmethod
-    def _kanban_mcp_config(rec: WorkerRecord) -> str | None:
-        if rec.role != "kanban":
-            return None
-        config = Path(rec.cwd) / ".mcp.json"
-        return str(config) if config.is_file() else None
 
     # --- spares: CLIs booted ahead of a new chat (#3420) ---------------------
 
@@ -3650,7 +3573,6 @@ class ClaudeWorkerHost:
             delegated=rec.delegated,
             role=rec.role,
             session_token=rec.session_token,
-            mcp_config=self._kanban_mcp_config(rec),
             fork_from=fork_from,
             relocated=(
                 (rec.relocated_from, rec.cwd) if rec.relocated_from and resume_id else None

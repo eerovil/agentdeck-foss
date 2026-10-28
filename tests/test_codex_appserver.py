@@ -1109,104 +1109,26 @@ async def test_app_server_disconnect_forgets_connection_loaded_threads(tmp_path)
 
 
 
-async def test_kanban_thread_start_receives_kanban_role_block(tmp_path):
+async def test_a_thread_start_receives_its_role_block(tmp_path):
     server = _server(tmp_path)
     server.start = AsyncMock()
     calls = []
 
     async def request(method, params, **kwargs):
         calls.append((method, params))
-        return {"thread": {"id": "thread-kanban", "status": {"type": "idle"}}}
+        return {"thread": {"id": "thread-work", "status": {"type": "idle"}}}
 
     server._request = request
 
-    result = await server.create_thread(tmp_path, role="kanban")
+    result = await server.create_thread(tmp_path, role="work")
 
-    assert result.accepted and result.session_id == "thread-kanban"
+    assert result.accepted and result.session_id == "thread-work"
     assert calls[0][1]["developerInstructions"] == agentdeck_session_instructions(provider="codex",
-        role="kanban"
+        role="work"
     )
-    # No subagent cap of our own: Codex's default applies (#2482), so a kanban
-    # thread with nothing else to configure sends no config at all.
+    # No subagent cap of our own: Codex's default applies (#2482), so a thread with
+    # nothing else to configure sends no config at all.
     assert "config" not in calls[0][1]
-
-
-async def test_enforced_kanban_thread_receives_hooks_cap_and_private_identity(tmp_path):
-    server = CodexAppServer(
-        Account("codex:test", "codex", "test", tmp_path),
-        persistent_backend=False,
-        artifact_root=tmp_path / "artifacts",
-    )
-    server.start = AsyncMock()
-    server._artifact_hooks_trusted = True
-    server._request = AsyncMock(
-        return_value={"thread": {"id": "thread-kanban", "status": {"type": "idle"}}}
-    )
-
-    result = await server.create_thread(
-        tmp_path,
-        role="kanban",
-        worker_key="repo#1484",
-        artifact_root=tmp_path / "artifacts",
-        artifact_policy={"mode": "enforce", "visible_tool_result_chars": 1600},
-    )
-
-    assert result.accepted
-    config = server._request.await_args.args[1]["config"]
-    assert "hooks" not in config
-    assert "tool_output_token_limit" not in config
-    assert config["shell_environment_policy"]["set"]["AGENTDECK_WORKER_KEY"] == "repo#1484"
-
-
-async def test_a_kanban_thread_gets_the_approval_cache_without_command_capture(tmp_path):
-    """#2154: the approval cache (#1738) has its own switch — being a kanban worker, like on
-    Claude — instead of riding on the retired phase setting that turned capture on. The thread
-    carries no capture policy, so the capture hook stays a no-op."""
-    server = CodexAppServer(
-        Account("codex:test", "codex", "test", tmp_path),
-        persistent_backend=False,
-        artifact_root=tmp_path / "artifacts",
-    )
-    server.start = AsyncMock()
-    server._ensure_command_artifact_hooks = AsyncMock(return_value=InjectResult(True))
-    server._request = AsyncMock(
-        return_value={"thread": {"id": "thread-kanban", "status": {"type": "idle"}}}
-    )
-
-    result = await server.create_thread(tmp_path, role="kanban", worker_key="repo#2154")
-
-    assert result.accepted
-    server._ensure_command_artifact_hooks.assert_awaited_once()
-    environment = server._request.await_args.args[1]["config"]["shell_environment_policy"]
-    assert "AGENTDECK_COMMAND_ARTIFACT_MODE" not in str(environment)
-
-
-async def test_an_unavailable_approval_cache_never_refuses_a_thread_without_capture(tmp_path):
-    """Capture still requires its hooks; the cache alone is a convenience, so a busy account
-    that cannot install them yet starts the thread without them."""
-    server = CodexAppServer(
-        Account("codex:test", "codex", "test", tmp_path),
-        persistent_backend=False,
-        artifact_root=tmp_path / "artifacts",
-    )
-    server.start = AsyncMock()
-    busy = InjectResult(False, "generated Codex capture hooks require all threads to be idle")
-    server._ensure_command_artifact_hooks = AsyncMock(return_value=busy)
-    server._request = AsyncMock(
-        return_value={"thread": {"id": "thread-kanban", "status": {"type": "idle"}}}
-    )
-
-    plain = await server.create_thread(tmp_path, role="kanban", worker_key="repo#2154")
-    capturing = await server.create_thread(
-        tmp_path,
-        role="kanban",
-        worker_key="repo#2154",
-        artifact_root=tmp_path / "artifacts",
-        artifact_policy={"mode": "enforce"},
-    )
-
-    assert plain.accepted
-    assert not capturing.accepted and capturing.reason == busy.reason
 
 
 async def test_a_primary_thread_installs_no_worker_hooks(tmp_path):
@@ -1323,7 +1245,7 @@ args = ["exec", "-i", "sentry_mcp", "sentry-mcp"]
 
     server._request = request
 
-    result = await server.create_thread(tmp_path, role="kanban")
+    result = await server.create_thread(tmp_path, role="work")
 
     assert result.accepted and result.session_id == "thread-mcp"
     assert calls[0][1]["config"] == {

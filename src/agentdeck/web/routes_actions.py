@@ -24,7 +24,6 @@ from starlette.datastructures import FormData
 from .. import issue_post as issue_posts
 from .. import live_chats, meta_chat, shutdown
 from ..attachments import ATTACHMENT_HEADER, ATTACHMENT_MARKER, display_message
-from ..chat_answer_relay import answers_parked_card, leave_answer
 from ..chat_cwd import cannot_resume, continued_chat_cwd, cwd_exists
 from ..composer_phrases import (
     ComposerPhrase,
@@ -47,8 +46,7 @@ from ..models import (
 from ..providers import PROVIDERS
 from ..providers.codex.runtime_client import runtime_socket_path
 from ..public_origin import public_origin as deck_public_origin
-from ..run_execution import MAX_CONTINUATIONS, SAFE_STATES
-from ..run_trace import read_outcomes
+from ..run_execution import MAX_CONTINUATIONS, SAFE_STATES, read_outcomes
 from ..scheduled_messages import RUNTIME_HOLD, HeldAttachment, ScheduledMessage
 from ..session_secrets import (
     SecretCommand,
@@ -241,25 +239,17 @@ async def _hold_for_runtime(
     # land on the very file the held row keeps; only the replay's other copies go.
     kept = {item.path for item in held.attachments}
     cleanup_uploaded_files([path for path in uploads.paths if path not in kept])
-    # A parked card's answer is handed to the Poller only once it is delivered, from the
-    # delivery path (``app.py``): a held message may still be cancelled, expire or lose its
-    # files, and the card must not resume on an answer its worker never got (#2847 review).
     posted = None
     if post_target is not None:
-        if await _answers_parked_card(request, session.key):
-            # The Poller posts a parked card's answer itself, after the relay.
-            posted = issue_posts.Outcome(issue_posts.HELD, post_target, action_id=client_action_id)
-        else:
-            # GitHub does not need the runtime, so the post goes now, as for any send.
-            posted = await _post_to_issue(
-                request,
-                session.key,
-                post_target,
-                display_message(message),
-                len(uploads.paths),
-                client_action_id,
-                relay=False,
-            )
+        # GitHub does not need the runtime, so the post goes now, as for any send.
+        posted = await _post_to_issue(
+            request,
+            session.key,
+            post_target,
+            display_message(message),
+            len(uploads.paths),
+            client_action_id,
+        )
         request.state.issue_post_outcome = posted
     response = get_templates(request).TemplateResponse(
         request,
@@ -356,32 +346,6 @@ def _public_chat_url(request: Request, session_key: str) -> str:
     return f"{origin}{chat_path}" if origin and chat_path else ""
 
 
-async def _relay_chat_answer(
-    request: Request, session_key: str, text: str, action_id: str | None
-) -> str:
-    """Hand an accepted message to the card's Poller when it answers a parked worker (#2348).
-
-    The message is already in the chat, so nothing here may fail the send. The answer says
-    whether the Poller took it (``relayed``), the chat is no parked card's (``not_parked``), or
-    that could not be told (``unknown``), which a ticked post to the issue must not guess past.
-    """
-    state = get_state(request)
-    try:
-        left = await asyncio.to_thread(
-            leave_answer,
-            db=getattr(state, "db", None),
-            issues=getattr(request.app.state, "issues", None),
-            session_key=session_key,
-            text=text,
-            request_id=action_id,
-            chat_url=_public_chat_url(request, session_key),
-        )
-    except Exception:  # noqa: BLE001 - the send already succeeded
-        log.exception("could not hand %s's answer to its Poller card", session_key)
-        return "unknown"
-    return "relayed" if left is not None else "not_parked"
-
-
 def _issue_post_refusal(uploads, status_code: int, detail: str) -> HTTPException:
     cleanup_uploaded_files(uploads.paths)
     return HTTPException(status_code=status_code, detail=detail)
@@ -423,19 +387,6 @@ def _issue_post_target(request: Request, session, form, message: str, secret_com
     return actual
 
 
-async def _answers_parked_card(request: Request, session_key: str) -> bool:
-    try:
-        return await asyncio.to_thread(
-            answers_parked_card,
-            db=getattr(get_state(request), "db", None),
-            issues=getattr(request.app.state, "issues", None),
-            session_key=session_key,
-        )
-    except Exception:  # noqa: BLE001 - then the post is not made now either
-        log.exception("could not tell whether %s answers a parked card", session_key)
-        return True
-
-
 async def _post_to_issue(
     request: Request,
     session_key: str,
@@ -443,14 +394,11 @@ async def _post_to_issue(
     text: str,
     attachments: int,
     action_id: str,
-    *,
-    relay: bool = True,
 ):
     """Post one accepted, ticked message to its Work's issue, at most once (#2416).
 
     The ledger is read first, so a retried send reports what its first attempt did and never
-    relays or posts again. A parked card's answer goes to the Poller instead (#2348), which
-    posts it; when that cannot be told, nothing is posted rather than risk two comments.
+    posts again.
     """
     db = get_control_db(request)
     pressed = db.work_action(action_id)
@@ -459,15 +407,6 @@ async def _post_to_issue(
             # The id is already some other press's; it can never also stand for this post.
             return issue_posts.Outcome(issue_posts.UNRECORDED, target, action_id=action_id)
         return issue_posts.from_press(pressed, target)
-    relay = (
-        await _relay_chat_answer(request, session_key, text, action_id)
-        if relay
-        else "not_parked"
-    )
-    if relay == "relayed":
-        return issue_posts.Outcome(issue_posts.RELAYED, target, action_id=action_id)
-    if relay == "unknown":
-        return issue_posts.Outcome(issue_posts.UNKNOWN, target, action_id=action_id)
     if shutdown.is_shutting_down():
         return issue_posts.Outcome(issue_posts.RESTARTING, target, action_id=action_id)
     reserved = db.reserve_work_action(action_id, target.work_id, ISSUE_POST_ACTION)
@@ -1039,10 +978,6 @@ async def inject_message(request: Request, session_key: str) -> HTMLResponse:
         request.state.issue_post_outcome = posted
     with timing_span(request, "render"):
         response = _render_status(request, session.key, status, queued_item, posted)
-    if secret_command is None and post_target is None:
-        # After the render, so the receipt shows the send as it was accepted. Never a secret:
-        # its notice names a ticket, and the value must not reach an issue.
-        await _relay_chat_answer(request, session.key, display_message(message), client_action_id)
     response.status_code = 202
     response.headers["X-AgentDeck-Action-State"] = (
         "queued" if queued_behind_turn else "accepted"
@@ -1360,13 +1295,10 @@ def _render_related_links(
     assistant = request.app.state.assistant
     git_context = assistant.session_context(session)
     pull_requests = session_pull_request_chips(git_context)
-    # One read for both chip sets; the card's pull request is what lets a chat that
-    # registered none of its own still show its card's review (#2043).
-    issue_board = request.app.state.issues.read_board() if session.issues else None
     view = SessionView(
         current=session,
         effective=state.session_presentation().display(session),
-        issues=session_issue_chips(session, issue_board),
+        issues=session_issue_chips(session),
         pull_requests=pull_requests,
         head_review=session_head_review_chip(
             session, git_context, state, get_injector(request)
@@ -2598,29 +2530,6 @@ async def _poller_set_paused(instance: str, request: Request, *, paused: bool) -
         logging.getLogger(__name__).warning("poller control failed for %s: %s", instance, exc)
 
     return _poller_page(request, poller_context(request))
-
-
-@router.post("/pollers/{instance}/extensions/chatgpt-nudge", response_class=HTMLResponse)
-async def poller_chatgpt_nudge(instance: str, request: Request) -> HTMLResponse:
-    """Click "Run now" on this project's ChatGPT PR-review task, by hand (#1584).
-
-    There is nothing for a wake to do here, because the click program is the same one the
-    extension launches and it runs detached. The press therefore starts it here and reports back
-    through a receipt, exactly as a wake's does.
-    """
-    from .. import poller_nudge
-    from .render import poller_context
-
-    error = ""
-    try:
-        poller_nudge.press(_poller_root(request), instance)
-    except poller_nudge.NudgeError as exc:
-        # A refused press is a sentence on the page, not a 500.
-        error = str(exc)
-        logging.getLogger(__name__).warning("chatgpt nudge refused for %s: %s", instance, error)
-    return _poller_page(
-        request, poller_context(request, nudge_errors={instance: error} if error else {})
-    )
 
 
 @router.post("/pollers/{instance}/settings/worker-accounts", response_class=HTMLResponse)

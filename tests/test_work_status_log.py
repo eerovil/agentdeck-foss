@@ -267,7 +267,7 @@ async def test_no_overview_is_built_before_every_accounts_first_scan(monkeypatch
 def _deck(tmp_path, monkeypatch):
     from test_work_hidden import _deck as hidden_deck
 
-    app, _card, _record = hidden_deck(tmp_path, monkeypatch)
+    app, _record = hidden_deck(tmp_path, monkeypatch)
     return app
 
 

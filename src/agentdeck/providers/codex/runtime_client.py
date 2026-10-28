@@ -158,8 +158,6 @@ class CodexRuntimeClient(RuntimeSocketClient):
         *,
         images: list[Path] | None = None,
         effort: str | None = None,
-        require_idle: bool = False,
-        expected_last_result_at: float | None = None,
     ) -> InjectResult:
         payload = {
             "thread_id": thread_id,
@@ -167,18 +165,6 @@ class CodexRuntimeClient(RuntimeSocketClient):
             "images": [str(path) for path in images or []],
             "effort": effort,
         }
-        if require_idle:
-            return await self._post_path(
-                f"/workers/accounts/codex/{self.account.label}/revive-session",
-                {
-                    "session_id": thread_id,
-                    "message": message,
-                    "images": payload["images"],
-                    "effort": effort,
-                    "expected_last_result_at": expected_last_result_at,
-                },
-                fence="client_action_id",
-            )
         return await self._post("queue", payload, fence="client_action_id")
 
     async def wait_for_thread(self, thread_id: str) -> InjectResult:

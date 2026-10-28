@@ -963,8 +963,6 @@ class ClaudeCodeProvider(SessionProvider):
         images: list[Path] | None = None,
         *,
         allow_over_budget: bool = False,
-        require_idle: bool = False,
-        expected_last_result_at: float | None = None,
     ) -> InjectResult:
         client = self._workers.get(account.key)
         if client is None:
@@ -978,9 +976,6 @@ class ClaudeCodeProvider(SessionProvider):
             "delivery_id": client_action_id,
             "allow_over_budget": allow_over_budget,
         }
-        if require_idle:
-            kwargs["require_idle"] = True
-            kwargs["expected_last_result_at"] = expected_last_result_at
         result = await client.send(session.session_id, message, **kwargs)
         if not result.accepted and result.reason == "delivery_id_conflict":
             return InjectResult(False, "client_action_conflict")
@@ -995,8 +990,6 @@ class ClaudeCodeProvider(SessionProvider):
         timeout_s: float,
         images: list[Path] | None = None,
         allow_over_budget: bool = False,
-        require_idle: bool = False,
-        expected_last_result_at: float | None = None,
     ) -> InjectResult:
         return await self._deliver_to_session(
             account,
@@ -1004,16 +997,6 @@ class ClaudeCodeProvider(SessionProvider):
             message,
             images,
             allow_over_budget=allow_over_budget,
-            require_idle=require_idle,
-            expected_last_result_at=expected_last_result_at,
-        )
-
-    async def worker_version(self, account: Account, session: Session) -> float | None:
-        client = self._workers.get(account.key)
-        return (
-            await client.worker_version("claude_code", session.session_id)
-            if client is not None
-            else None
         )
 
     async def delivery_spent(

@@ -256,7 +256,7 @@ def test_worker_deliver_request_carries_provider_policy_fields():
         permission_mode="bypassPermissions",
         allow_over_budget=True,
         require_active=True,
-        role="kanban",
+        role="delegated",
     ).model_dump()
     assert dumped["images"] == ["/shot.png"]
     assert dumped["model"] == "opus"
@@ -264,7 +264,7 @@ def test_worker_deliver_request_carries_provider_policy_fields():
     assert dumped["permission_mode"] == "bypassPermissions"
     assert dumped["allow_over_budget"] is True
     assert dumped["require_active"] is True
-    assert dumped["role"] == "kanban"
+    assert dumped["role"] == "delegated"
 
 
 async def test_web_proxy_forwards_to_runtime_and_surfaces_errors(tmp_path):
@@ -419,7 +419,7 @@ async def test_provider_neutral_codex_delivery_binds_the_session_token():
             require_idle=True,
             require_active=True,
             expected_last_result_at=12.0,
-            role="kanban",
+            role="delegated",
             command_artifacts={"mode": "enforce", "card": "issue-1"},
         ),
     )
@@ -430,7 +430,7 @@ async def test_provider_neutral_codex_delivery_binds_the_session_token():
     assert host.deliver.await_args.kwargs["require_idle"] is True
     assert host.deliver.await_args.kwargs["require_active"] is True
     assert host.deliver.await_args.kwargs["expected_last_result_at"] == 12.0
-    assert host.deliver.await_args.kwargs["role"] == "kanban"
+    assert host.deliver.await_args.kwargs["role"] == "delegated"
     assert host.deliver.await_args.kwargs["command_artifacts"] == {
         "mode": "enforce",
         "card": "issue-1",
@@ -499,7 +499,7 @@ async def test_observe_context_decision_is_frozen_without_runtime_maintenance(
             cwd=str(tmp_path),
             delivery_id="poller:d1",
             context_policy="auto",
-            role="kanban",
+            role="delegated",
         ),
     )
 
@@ -662,7 +662,7 @@ async def test_off_mode_noop_survives_turning_context_maintenance_on(
         cwd=str(tmp_path),
         delivery_id="poller:d1",
         context_policy="auto",
-        role="kanban",
+        role="delegated",
     )
     first = await keyed_deliver(Req, "codex", "codex", body)
 
@@ -939,7 +939,7 @@ async def test_a_capacity_refusal_does_not_poison_its_delivery_id(tmp_path, monk
             cwd=str(tmp_path),
             delivery_id="poller:6c4fcb63",
             context_policy="auto",
-            role="kanban",
+            role="delegated",
         )
 
     refused = await keyed_deliver(
@@ -1008,7 +1008,7 @@ async def test_the_same_request_still_replays_a_clean_refusal(tmp_path, monkeypa
             cwd=str(tmp_path),
             delivery_id="poller:6c4fcb63",
             context_policy="auto",
-            role="kanban",
+            role="delegated",
         )
 
     first = await keyed_deliver(Req, "codex", "codex", directive())
@@ -1071,7 +1071,7 @@ async def test_an_unchanged_retry_of_a_host_state_refusal_is_decided_again(
             cwd=str(tmp_path),
             delivery_id="poller:c0ffee01",
             context_policy="auto",
-            role="kanban",
+            role="delegated",
         )
 
     first = await keyed_deliver(Req, "codex", "codex", directive())
@@ -1131,7 +1131,7 @@ async def test_a_host_state_refusal_that_may_have_written_still_replays(
             cwd=str(tmp_path),
             delivery_id="poller:2136beef",
             context_policy="auto",
-            role="kanban",
+            role="delegated",
         )
 
     first = await keyed_deliver(Req, "codex", "codex", directive())
@@ -1144,42 +1144,6 @@ async def test_a_host_state_refusal_that_may_have_written_still_replays(
     row = db.get_context_delivery("codex", "codex:codex", "agentdeck#2136", "poller:2136beef")
     assert row is not None and row.attempt == 1
     db.close()
-
-
-def test_same_delivery_retries_are_never_frozen_by_the_ledger():
-    """The engine's retry set and the ledger's re-decide set are one decision (#1560).
-
-    `poller_engine` deliberately imports nothing from the package above it, so the two
-    cannot share a constant. They can still be held in step here: every refusal the engine
-    re-sends under the same delivery id must be one the ledger declines to freeze, or that
-    refusal becomes permanent for the card the moment it is written.
-    """
-    from agentdeck.context_delivery import RE_DECIDED_REFUSALS
-    from agentdeck.poller_engine.cycle import SAME_DELIVERY_RETRIES
-
-    # `retryable_same_delivery` is the one exception, and it is deliberate: the provider
-    # asked for that resume and context maintenance still stands behind the row, so
-    # `_resume_context_delivery` owns it rather than deciding it again (#1493).
-    assert SAME_DELIVERY_RETRIES - RE_DECIDED_REFUSALS == {"retryable_same_delivery"}
-    assert RE_DECIDED_REFUSALS < SAME_DELIVERY_RETRIES
-
-
-def test_the_refusal_the_engine_calls_permanent_is_one_the_ledger_never_re_decides():
-    """The mirror of the above, and the other way a card gets stuck (#1886).
-
-    The engine parks a dispatch at the first `delivery_id_conflict` because no later attempt
-    can be answered differently. That is only true while the ledger declines to re-decide it:
-    the day that refusal joins the re-decided set, a card that could have recovered would be
-    parked instead. Held in step here for the same reason the retry set is.
-    """
-    from agentdeck.context_delivery import RE_DECIDED_REFUSALS
-    from agentdeck.poller_engine.cycle import (
-        SAME_DELIVERY_RETRIES,
-        TERMINAL_SAME_DELIVERY_REFUSAL,
-    )
-
-    assert TERMINAL_SAME_DELIVERY_REFUSAL not in RE_DECIDED_REFUSALS
-    assert TERMINAL_SAME_DELIVERY_REFUSAL not in SAME_DELIVERY_RETRIES
 
 
 async def test_an_uncertain_delivery_still_fences_a_re_rendered_retry(tmp_path, monkeypatch):
@@ -1217,7 +1181,7 @@ async def test_an_uncertain_delivery_still_fences_a_re_rendered_retry(tmp_path, 
             cwd=str(tmp_path),
             delivery_id="poller:6c4fcb63",
             context_policy="auto",
-            role="kanban",
+            role="delegated",
         )
 
     await keyed_deliver(Req, "codex", "codex", directive("generation-1"))
@@ -1303,7 +1267,7 @@ async def test_enforced_compaction_executes_once_and_replays_the_frozen_result(
         cwd=str(tmp_path),
         delivery_id="poller:d1",
         context_policy="auto",
-        role="kanban",
+        role="delegated",
     )
     changed = await keyed_deliver(Req, "codex", "codex", body)
     first = await keyed_deliver(Req, "codex", "codex", body)
@@ -1656,7 +1620,7 @@ async def test_frozen_maintenance_retry_ignores_current_mode(
         context_policy="auto",
         model="gpt-5.6-sol",
         effort="high",
-        role="kanban",
+        role="delegated",
     )
     row = db.reserve_context_delivery(
         ContextDelivery(
@@ -1680,7 +1644,7 @@ async def test_frozen_maintenance_retry_ignores_current_mode(
             effective_model="frozen-model",
             effective_effort="medium",
             effective_permission_mode="workspace-write",
-            effective_role="kanban",
+            effective_role="delegated",
             effective_delegated=True,
             session_token="frozen-token",
             handoff_text="frozen handoff" if action == "rollover" else None,
@@ -1906,7 +1870,7 @@ async def test_enforced_rollover_builds_handoff_and_links_the_successor(
         cwd=str(tmp_path),
         delivery_id="poller:d2",
         context_policy="auto",
-        role="kanban",
+        role="delegated",
     )
     with caplog.at_level(logging.INFO, logger="agentdeck.web.routes_api"):
         failed = await keyed_deliver(Req, "claude_code", "main", body)
@@ -2014,7 +1978,7 @@ async def test_uncertain_context_delivery_reconciles_receipt_without_resend(
         cwd=str(tmp_path),
         delivery_id="poller:uncertain",
         context_policy="auto",
-        role="kanban",
+        role="delegated",
     )
     with pytest.raises(HTTPException):
         await keyed_deliver(Req, "codex", "codex", body)
@@ -2405,73 +2369,6 @@ async def test_a_new_run_uses_the_prior_noop_delivery_for_rollover(
     assert posts[1]["context_rollover"] is True
     row = db.get_context_delivery("codex", "codex:codex", "issue-1", "poller:d2")
     assert row is not None and row.reason == "new_generation"
-    db.close()
-
-
-async def test_a_delivery_frozen_before_2194_still_replays(tmp_path, monkeypatch):
-    """Review of #2212: a completed row written before #2194 replays under its delivery id.
-
-    Its request hash was taken with ``dispatch_generation`` and ``phase_delivery_id`` in the
-    payload. The hash below is what that code produced for this exact request.
-    """
-    from agentdeck.web import routes_api
-    from agentdeck.web.routes_api import WorkerDeliverRequest, keyed_deliver
-
-    db = Db(tmp_path / "legacy.db")
-    row = db.reserve_context_delivery(
-        ContextDelivery(
-            action_id="legacy-action",
-            attempt=1,
-            provider_id="codex",
-            account_key="codex:codex",
-            worker_key="agentdeck#1488",
-            delivery_id="poller:legacy",
-            request_sha256="763b8ef41d058358602316d0f22183628ab6d3de01fa1c4ac7a597e3eeb48299",
-            chat_id="chat",
-            source_session_key="codex:codex:thread-1",
-            source_session_id="thread-1",
-            mode="off",
-            proposed_action="none",
-            executed_action="none",
-            reason="disabled",
-        )
-    )
-    assert row is not None
-    assert db.mark_completed(
-        row.action_id, final_accepted=True, final_action="queued", final_session_id="thread-1"
-    )
-    posts = []
-
-    async def proxy(_request, method, path, json=None):
-        posts.append((method, path))
-        return {"workers": {}}
-
-    monkeypatch.setattr(routes_api, "_runtime_proxy", proxy)
-
-    class Req:
-        class app:
-            class state:
-                app_state = AppState(db=db)
-                config = AppConfig.model_validate({})
-                accounts = []
-
-    replay = await keyed_deliver(
-        Req,
-        "codex",
-        "codex",
-        WorkerDeliverRequest(
-            key="agentdeck#1488",
-            message="carry on",
-            cwd="/work",
-            delivery_id="poller:legacy",
-            context_policy="auto",
-            role="kanban",
-        ),
-    )
-
-    assert replay.get("reason") != "delivery_id_conflict"
-    assert (replay["accepted"], replay["action"]) == (True, "queued")
-    assert posts == [], "a frozen answer is replayed without reaching the runtime"
     db.close()
 
 

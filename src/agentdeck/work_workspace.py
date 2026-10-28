@@ -1,6 +1,6 @@
 """A read-only, multi-repository workspace model for one Work (#2143).
 
-A Work is not one cwd. One card can be worked in a borrowed code repository,
+A Work is not one cwd. One Work can be worked in a borrowed code repository,
 commit its screenshots to an artifact repository, and have several chats whose
 directories disagree with each other and with what the poller registered. This
 module gathers what the deck already knows about those places into one
@@ -13,8 +13,8 @@ Evidence, strongest first:
 
 0. the Work's own workspace claims (#2149): the durable fact of which checkout the
    Work owns, whichever Run, provider or account is working in it. They are the only
-   source of the Work's worktrees; a poller card's own list is not read (#2195);
-1. the poller card's pull request and its project's declared repository roles;
+   source of the Work's worktrees (#2195);
+1. its project's declared repository roles;
 2. existing ``GitContext`` facts and any ``WorkspaceSnapshot`` a caller holds;
 3. the Work's own source repository;
 4. the cwd of a session bound to a Run of this Work (``session_run_bindings``);
@@ -63,7 +63,6 @@ class WorkspaceEvidence(StrEnum):
     """Where one workspace fact came from, strongest first."""
 
     WORK_CLAIM = "work_claim"  # the Work's own workspace claim (#2149)
-    POLLER_CARD = "poller_card"
     POLLER_MANIFEST = "poller_manifest"  # a repository the project declares, checkout or not
     GIT_CONTEXT = "git_context"
     WORKSPACE_SNAPSHOT = "workspace_snapshot"
@@ -111,7 +110,7 @@ class WorkspaceIssueKind(StrEnum):
 
 
 # Informational kinds describe a valid state worth seeing; the rest are problems.
-# A vanished session cwd is ordinary history (a merged card's worktree is removed); a
+# A vanished session cwd is ordinary history (a merged Work's worktree is removed); a
 # missing *registered* worktree is not.
 _INFO_KINDS = frozenset(
     {
@@ -535,15 +534,12 @@ class WorkWorkspace:
 
 
 @dataclass(frozen=True)
-class CardWorkspaceFacts:
-    """One poller card for this Work, as the deck's board read model holds it."""
+class ProjectWorkspaceFacts:
+    """The project whose manifest declares this Work's repository, as the board reads it."""
 
     instance: str
-    pull_request_url: str = ""
     artifact_repositories: tuple[str, ...] = ()
     borrowed_repository: str = ""  # code repository the source borrows, if declared
-    # False when no card exists and only the project's manifest names this repository.
-    card: bool = True
 
 
 @dataclass(frozen=True)
@@ -561,11 +557,6 @@ class SessionWorkspaceFacts:
 
 
 _PULL_FIELDS = ("status", "head", "base")
-
-_PULL_URL_RE = re.compile(
-    r"github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/(\d+)", re.IGNORECASE
-)
-
 
 _WORK_ID_RE = re.compile(r"github_issue:([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#(\d+)")
 
@@ -598,7 +589,7 @@ class _Repo:
 def build_work_workspace(
     work: WorkRef,
     *,
-    cards: Iterable[CardWorkspaceFacts] = (),
+    projects: Iterable[ProjectWorkspaceFacts] = (),
     sessions: Iterable[SessionWorkspaceFacts] = (),
     probe: WorkspaceProbe | None = None,
     snapshots: Mapping[str, WorkspaceSnapshot] | None = None,
@@ -732,41 +723,26 @@ def build_work_workspace(
                 )
             )
 
-    # 1. The poller card's pull request and its project's repository roles.
+    # 1. The project's repository roles.
     if poller_unavailable:
-        # An unreadable board is not an empty one: the card's pull request and the project's
-        # roles may both exist and simply could not be read.
+        # An unreadable manifest is not an empty one: the project's roles may exist and
+        # simply could not be read.
         work_issues.append(
             WorkspaceIssue(
                 WorkspaceIssueKind.POLLER_STATE_UNAVAILABLE,
-                f"poller state could not be read ({poller_unavailable}); the card's pull"
-                " request and the project's repositories are unknown, not absent",
+                f"poller state could not be read ({poller_unavailable}); the project's"
+                " repositories are unknown, not absent",
             )
         )
-    for card in cards:
-        declared = WorkspaceProvenance(WorkspaceEvidence.POLLER_MANIFEST, card.instance)
+    for project in projects:
+        declared = WorkspaceProvenance(WorkspaceEvidence.POLLER_MANIFEST, project.instance)
         # Declared repositories are part of the Work whether or not a checkout exists yet.
-        for name in card.artifact_repositories:
+        for name in project.artifact_repositories:
             artifacts.add(name.lower())
             repo(name).provenance.add(declared)
-        if card.borrowed_repository:
-            borrowed.add(card.borrowed_repository.lower())
-            repo(card.borrowed_repository).provenance.add(declared)
-        provenance = WorkspaceProvenance(WorkspaceEvidence.POLLER_CARD, card.instance)
-        match = _PULL_URL_RE.search(card.pull_request_url or "")
-        if match:
-            name, number = match.group(1).lower(), int(match.group(2))
-            target = repo(name)
-            existing = target.pulls.get(number)
-            target.pulls[number] = WorkPullRequest(
-                name,
-                number,
-                card.pull_request_url,
-                status=existing.status if existing else "",
-                head_branch=existing.head_branch if existing else "",
-                base_branch=existing.base_branch if existing else "",
-                provenance=_ranked((provenance, *(existing.provenance if existing else ()))),
-            )
+        if project.borrowed_repository:
+            borrowed.add(project.borrowed_repository.lower())
+            repo(project.borrowed_repository).provenance.add(declared)
 
     # 2-5. Session legs: Run-bound first, then the weaker chat members.
     # Per pull request, the strength that set each of (status, head, base); None = unknown.
@@ -1066,7 +1042,7 @@ class WorkWorkspaceFacts:
     """Everything the builder needs, gathered from one snapshot of the deck."""
 
     work: WorkRef
-    cards: tuple[CardWorkspaceFacts, ...] = ()
+    projects: tuple[ProjectWorkspaceFacts, ...] = ()
     sessions: tuple[SessionWorkspaceFacts, ...] = ()
     poller_unavailable: str = ""  # why poller state that may name this Work was unreadable
     verifications: tuple[RunVerification, ...] = ()
@@ -1076,17 +1052,12 @@ class WorkWorkspaceFacts:
     @property
     def known(self) -> bool:
         """Whether anything ties this Work to the deck, or could and was unreadable."""
-        return bool(
-            any(card.card for card in self.cards)
-            or self.sessions
-            or self.poller_unavailable
-            or self.claims
-        )
+        return bool(self.sessions or self.poller_unavailable or self.claims)
 
     def build(self, probe: WorkspaceProbe | None = None) -> WorkWorkspace:
         return build_work_workspace(
             self.work,
-            cards=self.cards,
+            projects=self.projects,
             sessions=self.sessions,
             probe=probe,
             poller_unavailable=self.poller_unavailable,
@@ -1148,45 +1119,38 @@ def gather_work_workspace(
         for key, chat_id in sorted(legs.items())
     )
 
-    # The card supplies its pull request and its project's roles; its worktree list is not
-    # read, because the Work's claims above are the only source of its worktrees (#2195).
-    cards: list[CardWorkspaceFacts] = []
+    # The project that declares this repository names its roles; the Work's claims above are
+    # the only source of its worktrees (#2195).
+    projects: list[ProjectWorkspaceFacts] = []
     unavailable = ""
     if board is not None:
-        card = board.card(work.repository, work.number)
-        if card is not None:
-            scope = next((item for item in board.scopes if card in item.cards), None)
-        else:
-            # No card: the project that declares this repository still names its roles.
-            scope = next(
-                (
-                    item
-                    for item in board.scopes
-                    if any(repo.lower() == work.repository for repo in item.issue_repositories)
-                ),
-                None,
-            )
-            unavailable = _unreadable_scope(board, work)
-        if card is not None or scope is not None:
-            cards.append(
-                CardWorkspaceFacts(
-                    instance=scope.instance if scope else "",
-                    pull_request_url=card.pull_request_url if card else "",
-                    artifact_repositories=scope.artifact_repositories if scope else (),
+        scope = next(
+            (
+                item
+                for item in board.scopes
+                if any(repo.lower() == work.repository for repo in item.issue_repositories)
+            ),
+            None,
+        )
+        unavailable = _unreadable_scope(board, work)
+        if scope is not None:
+            projects.append(
+                ProjectWorkspaceFacts(
+                    instance=scope.instance,
+                    artifact_repositories=scope.artifact_repositories,
                     borrowed_repository=next(
                         (
                             code
-                            for repo, code in (scope.borrowed_workspaces if scope else ())
+                            for repo, code in scope.borrowed_workspaces
                             if repo.lower() == work.repository
                         ),
                         "",
                     ),
-                    card=card is not None,
                 )
             )
     return WorkWorkspaceFacts(
         work,
-        tuple(cards),
+        tuple(projects),
         facts,
         unavailable,
         run_verifications(jobs, work.work_id),
@@ -1196,19 +1160,19 @@ def gather_work_workspace(
 
 
 def _unreadable_scope(board: BoardView, work: WorkRef) -> str:
-    """Why an instance that might hold this Work's card could not be read, else "".
+    """Why an instance that might declare this Work's repository could not be read, else "".
 
-    ``BoardView`` keeps "an incomplete lookup is not absence": a missing card only means
-    no card when every instance that could hold it was read. One that could is one that
-    declares the repository, or one whose manifest was unreadable and so declares nothing
-    we can rule out.
+    ``BoardView`` keeps "an incomplete lookup is not absence": no project only means none
+    when every instance that could declare it was read. One that could is one that declares
+    the repository, or one whose manifest was unreadable and so declares nothing we can rule
+    out.
     """
     owner = work.repository.partition("/")[0]
     for scope in board.scopes:
         if scope.readable and scope.state_readable:
             continue
         if scope.readable:
-            # The manifest says which repositories this instance holds cards for.
+            # The manifest says which repositories this instance holds issues for.
             declared = {repo.lower() for repo in scope.issue_repositories}
             if work.repository in declared:
                 return f"instance {scope.instance}: state unreadable"

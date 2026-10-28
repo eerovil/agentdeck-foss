@@ -72,10 +72,8 @@ SCRUBBED_TABLES = ("scheduled_messages", "push_subscriptions", "push_vapid", "se
 INSTANCE_FILES = ("poller.toml", "overlay.toml", "state.json", "controls.json", "activation.json")
 INSTANCE_DIRS = ("dispatch-deferrals",)
 # Overlay keys naming a program the staging web could start against a real account (the
-# ChatGPT nudge press). The copy points them at a program that refuses rather than dropping
-# them: the deck reads the reviewer's verdicts only for an instance that names a
-# ``review_program`` (``poller_nudge.read_external_reviews``), so a dropped key would hide
-# every verdict from staging's Work classification.
+# retired ChatGPT nudge press). The copy points them at a program that refuses rather than
+# dropping them, so an overlay that still names one starts nothing from staging.
 PROGRAM_KEYS = ("nudge_program", "review_program")
 REFUSING_PROGRAM = STUB_DIR / "refuse"
 # Config paths staging is meant to share with production: the agent accounts it monitors,

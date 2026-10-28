@@ -9838,38 +9838,6 @@ async def test_related_issue_chip_carries_the_resolved_github_state(tmp_path):
     assert "Issue #2000 ·" not in " ".join(action_bar.split())
 
 
-async def test_related_issue_chip_also_carries_the_project_status(tmp_path):
-    from agentdeck.poller_ops import BoardCard, BoardView
-
-    app = _app_with_state(tmp_path, with_transcript=True)
-    state = app.state.app_state
-    key = "claude_code:test:sid1"
-    state.add_issue(key, IssueRef("eerovil/agentdeck", 1332))
-    state.update_session(
-        replace(
-            state.sessions[key],
-            issue_url="https://github.com/eerovil/agentdeck/issues/1332",
-            issue_status="open",
-            issue_status_kind="open",
-        )
-    )
-    app.state.issues.read_board = lambda: BoardView(
-        cards={
-            "eerovil/agentdeck#1332": BoardCard(
-                repository="eerovil/agentdeck",
-                number=1332,
-                status="In progress",
-            )
-        }
-    )
-
-    async with _client(app) as client:
-        response = await client.get(f"/sessions/{key}")
-
-    action_bar = _session_action_bar(response.text)
-    assert "Issue #1332 · open · In progress" in " ".join(action_bar.split())
-
-
 @pytest.mark.browser
 async def test_related_issue_chip_shows_its_state_in_the_action_bar(tmp_path):
     # The same chip, rendered: the state has to be legible in the real action bar
@@ -9906,68 +9874,6 @@ async def test_related_issue_chip_shows_its_state_in_the_action_bar(tmp_path):
                         / f"issue-1113-issue-chip-state-{viewport_width}.png"
                     )
                 )
-            await page.close()
-        await browser.close()
-
-
-@pytest.mark.browser
-async def test_related_issue_chip_shows_project_status_in_the_action_bar(tmp_path):
-    from agentdeck.poller_ops import BoardCard, BoardView
-
-    app = _app_with_state(tmp_path, with_transcript=True)
-    state = app.state.app_state
-    key = "claude_code:test:sid1"
-    state.add_issue(key, IssueRef("eerovil/agentdeck", 1332))
-    state.update_session(
-        replace(
-            state.sessions[key],
-            issue_url="https://github.com/eerovil/agentdeck/issues/1332",
-            issue_status="open",
-            issue_status_kind="open",
-        )
-    )
-    project = {"status": "In progress"}
-
-    def board():
-        return BoardView(
-            cards={
-                "eerovil/agentdeck#1332": BoardCard(
-                    repository="eerovil/agentdeck",
-                    number=1332,
-                    status=project["status"],
-                )
-            }
-        )
-
-    app.state.issues.read_board = board
-
-    async with _live_server(app) as base, async_playwright() as playwright:
-        browser = await playwright.chromium.launch()
-        for viewport_width in (390, 1100):
-            project["status"] = "In progress"
-            page = await browser.new_page(
-                viewport={"width": viewport_width, "height": 844},
-                service_workers="block",
-            )
-            await page.goto(f"{base}/sessions/{key}")
-            chip = page.locator("#session-related-links .chip.issue-link.issue-open")
-            await chip.wait_for(state="visible")
-            assert await chip.inner_text() == "Issue #1332 · open · In progress"
-            screenshot_dir = os.environ.get("AGENTDECK_SCREENSHOT_DIR")
-            if screenshot_dir:
-                await page.locator("#session-action-bar").screenshot(
-                    path=str(
-                        Path(screenshot_dir)
-                        / f"issue-1332-issue-chip-status-{viewport_width}.png"
-                    )
-                )
-            # The poller state is not written by this process: the board watch
-            # publishes ``board`` when its files move (#2865), and the shared
-            # related-links fragment must repaint without a reload.
-            project["status"] = "In review"
-            app.state.app_state.bus.publish("board")
-            await chip.get_by_text("In review", exact=False).wait_for(state="visible")
-            assert await chip.inner_text() == "Issue #1332 · open · In review"
             await page.close()
         await browser.close()
 
@@ -12353,61 +12259,6 @@ def _app_with_a_checkout(tmp_path):
 
 
 @pytest.mark.skipif(not shutil.which("git"), reason="git is not installed")
-async def test_the_diff_reads_every_checkout_the_chats_card_registered(tmp_path):
-    """A worker is launched in one worktree and often does the work in another it
-    registers later — usually in a second repository. The launch directory alone
-    reports "nothing has changed" for work that plainly exists (#1120)."""
-    import subprocess
-
-    app = _app_with_state(tmp_path, with_transcript=True)
-    key = "claude_code:test:sid1"
-    state = app.state.app_state
-    launched_in = tmp_path / "launched"
-    launched_in.mkdir()
-    for args in (
-        ["init", "--initial-branch=master"],
-        ["config", "user.email", "test@example.com"],
-        ["config", "user.name", "Test"],
-    ):
-        subprocess.run(["git", "-C", str(launched_in), *args], check=True, capture_output=True)
-    (launched_in / "readme.md").write_text("nothing to see\n")
-    for args in (["add", "-A"], ["commit", "-m", "base"]):
-        subprocess.run(["git", "-C", str(launched_in), *args], check=True, capture_output=True)
-    worked_in = _checkout_with_a_change(tmp_path)
-    state.update_session(replace(state.sessions[key], cwd=launched_in))
-
-    poller_root = tmp_path / "poller"
-    instance = poller_root / "instances" / "reference"
-    instance.mkdir(parents=True)
-    (instance / "poller.toml").write_text(
-        '\ncontract = 1\n\n[board]\norg = "shop"\nproject_number = 7\n\n'
-        '[[repos]]\nid = "issues"\nholds_issues = true\n'
-    )
-    (instance / "state.json").write_text(
-        json.dumps(
-            {
-                "issues": {
-                    "issues#170": {
-                        "status": "In review",
-                        "worktrees": [str(launched_in), str(worked_in)],
-                    }
-                }
-            }
-        )
-    )
-    app.state.issues._poller_root = poller_root
-
-    async with _client(app) as client:
-        fragment = await client.get(f"/partials/sessions/{key}/diff")
-
-    body = fragment.text
-    assert "greeting.txt" in body  # the checkout the work is actually in
-    # The clean launch directory is dropped rather than shown as a blank section.
-    assert "Nothing has changed here yet." not in body
-    assert body.count('class="diff-checkout"') == 1
-
-
-@pytest.mark.skipif(not shutil.which("git"), reason="git is not installed")
 async def test_the_diff_reads_the_worktree_the_pull_requests_branch_is_in(tmp_path, monkeypatch):
     """A chat started in a repository's main checkout made its own worktree for the
     branch it opened a pull request from. The main checkout sat on an old, merged branch
@@ -13366,30 +13217,6 @@ async def test_a_review_verdict_only_speaks_the_two_words_a_reviewer_reports(tmp
 
     assert refused.status_code == 422
     assert app.state.app_state.review_verdict("eerovil/agentdeck", _HEAD_SHA) is None
-
-
-async def test_a_poller_verdict_reaches_an_open_commit_chip(tmp_path):
-    # The poller host hands its own verdicts over on a different route. A chip
-    # already showing this commit as unreviewed has to learn from that too (#1122).
-    app = _app_with_a_commit(tmp_path)
-    key = "claude_code:test:sid1"
-
-    async with _client(app) as client:
-        before = await client.get(f"/sessions/{key}")
-        handed_over = await client.post(
-            "/api/poller/review-verdicts",
-            json={
-                "repo": "eerovil/agentdeck",
-                "sha": _HEAD_SHA,
-                "verdict": "pass",
-                "result": "release",
-            },
-        )
-        after = await client.get(f"/sessions/{key}")
-
-    assert handed_over.status_code == 200
-    assert "review &amp; fix?" in _session_action_bar(before.text)
-    assert f"{_HEAD_SHA[:7]} · pass" in " ".join(_session_action_bar(after.text).split())
 
 
 async def test_a_refused_review_says_why_in_the_row_that_was_pressed(

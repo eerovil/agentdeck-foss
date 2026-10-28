@@ -80,7 +80,6 @@ class StatusPoint:
 
 def why(card: Any, status: Any) -> dict[str, Any]:
     """The facts ``work_story`` reads a Work's section from, compactly; empty ones left out."""
-    review = getattr(card, "review", None)
     verification = getattr(card, "verification", None)
     chats = [
         {
@@ -105,41 +104,11 @@ def why(card: Any, status: Any) -> dict[str, Any]:
         "woke_itself": getattr(card, "woke_itself", False),
         "chats": chats,
         "work_state": getattr(card, "work_state", ""),
-        "resting": getattr(card, "resting", ""),
-        "run_state": getattr(card, "run_state", ""),
-        "stuck": getattr(card, "stuck", False),
-        "next_expected": getattr(card, "next_expected", ""),
-        "parked": getattr(card, "parked", ""),
-        "parked_as": getattr(card, "parked_as", ""),
-        "park_reason": getattr(card, "park_reason", ""),
-        "release_parked": getattr(card, "release_parked", ""),
-        "dispatch_failed": getattr(card, "dispatch_failed", False),
-        "dispatch_rearms": getattr(card, "dispatch_rearms", False),
-        "revives": getattr(card, "revives", 0),
-        "deploying": getattr(card, "deploying", False),
         "paused": getattr(card, "paused", False),
-        "blocked_by": list(getattr(card, "blocked_by", ())),
         "awaiting_finish": getattr(card, "awaiting_finish", False),
         "finished": getattr(card, "finished_at", None) is not None,
         "verification": getattr(verification, "status", ""),
-        "ci": [f"{check.label}:{check.state}" for check in getattr(card, "ci", ())],
-        "untested": list(getattr(card, "untested", ())),
-        "unreadable": list(getattr(card, "unreadable", ())),
     }
-    if review is not None:
-        found["review"] = {
-            key: value
-            for key, value in (
-                ("state", review.state),
-                # What the review said, so a short-lived review status can be traced (#2760).
-                ("label", (review.label or "")[:QUESTION_CHARS]),
-                ("needs_human", review.needs_human),
-                ("decision", review.decision),
-                ("cause", review.cause),
-                ("blocker", review.blocker),
-            )
-            if value
-        }
     return {key: value for key, value in found.items() if value}
 
 

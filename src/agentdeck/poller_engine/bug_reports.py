@@ -9,8 +9,8 @@ broken Work here, beside the state of the instance that manages AgentDeck's own 
 wake folds each request into one record per *cause*, and files that record as one labelled
 issue the way it files a forgiven test's fix issue (``cycle._file_bug_issues``).
 
-**A request is a file, not a state edit**, for the reason ``deck_releases`` gives: the web
-process must never wait on the lock a wake holds. **Exactly once**: a request's id is derived
+**A request is a file, not a state edit**: the web process must never wait on the lock a
+wake holds. **Exactly once**: a request's id is derived
 from the Work, the cause and the Run, so the deck writing it again on every pass — or after a
 restart — rewrites one file, and the engine remembers the ids it has taken, so a Work flapping
 in and out of the group is reported once per Run.

@@ -3,23 +3,20 @@
 The Work page leads with a few lines an operator reads at a glance — what is happening, what
 happens next, whether they have to do anything — and a way to send the Work an instruction
 without first picking a chat. Everything here is a *reading* of facts the Work card already
-carries (`work_overview.WorkCard`: the current Run from the Run trace, review from #2216's
-``ReviewSummary``, verification from explicit jobs, workspace from claims or the inspected
-checkouts). Nothing is stored and nothing schedules on it: it is presentation, not a second
-lifecycle.
+carries (`work_overview.WorkCard`: the derived status of a Work the deck runs, verification
+from explicit jobs, workspace from claims or the inspected checkouts). Nothing is stored and
+nothing schedules on it: it is presentation, not a second lifecycle.
 
-The tones are deliberately few. Healthy automation — a Run working, a review queued or
-running, an automatic fix round — is ``active`` and calm. ``attention`` is reserved for a
-genuine human dependency (a chat asking a question, a review or release parked for a person);
-``problem`` is a Run or review that failed or cannot be confirmed; ``done`` is settled.
+The tones are deliberately few. Healthy automation — a turn working, a job running — is
+``active`` and calm. ``attention`` is reserved for a genuine human dependency (a chat asking
+a question); ``problem`` is something that failed or cannot be confirmed; ``done`` is
+settled.
 
 Attention keeps its kind (#2224). Only a chat that really asks — a question-style pending
 interaction or an unanswered open question — reads as **Needs your answer**, and only a
 question in the chat's text, which a message answers, turns the message box into **Answer
 question**; an interaction form, an approval or a browser step is settled on the chat's page.
-A review, a release or a Needs More Info card parked for a person says so in its own words
-and names where the decision is made, and a chat that merely stopped is a chat to look at,
-not a question.
+A chat that merely stopped is a chat to look at, not a question.
 """
 
 from __future__ import annotations
@@ -30,40 +27,14 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any
 
-from .run_trace import (
-    NEXT_BLOCKERS,
-    NEXT_HUMAN,
-    NEXT_RETRY,
-    NEXT_VERIFICATION,
-    PREPARING,
-    RUNNING,
-    WAITING,
-    RunTrace,
-)
 from .work_overview import (
-    DECIDE_CLARIFICATION,
-    DECIDE_FIX,
-    DECIDE_MERGE,
-    DECIDE_REBASE,
-    DECIDE_RELEASE,
     HANDOFF_STATES,
-    NEEDS_MORE_INFO,
     RECENT_WORK,
-    REVIEW_BLOCKED,
-    REVIEW_CHANGES,
-    REVIEW_FAILED,
-    REVIEW_HUMAN,
-    REVIEW_PASSED,
-    REVIEW_PENDING,
-    REVIEW_RUNNING,
     WorkAttention,
     WorkCard,
     WorkChat,
     WorkspaceLine,
-    ci_state,
     continued_at,
-    failed_verification_holds,
-    verification_covers,
 )
 from .work_workspace import WorkWorkspace
 
@@ -94,77 +65,29 @@ MARKS = {
 # What kind of human attention the status is about (``WorkStatus.kind``), so the page never
 # has to guess a question from "needs a person".
 CHAT_QUESTION = "chat_question"
-REVIEW_DECISION = "review_decision"
-RELEASE_DECISION = "release_decision"
-CLARIFICATION = "clarification"
 CHAT_STOPPED = "chat_stopped"
 # A chat blocked on an approval or a browser step: settled on its own page, not answered.
 CHAT_ACTION = "chat_action"
-# The engine's spawn never landed: a person posts a new instruction (#2226).
-DISPATCH_FAILED = "dispatch_failed"
 # Auto-merge waits on a required check that never reported (#2275).
 MERGE_BLOCKED = "merge_blocked"
-# Every open pull request is reviewed clean at its head, and a person merges it (#2327).
-MERGE_DECISION = "merge_decision"
 # What an automatic wait is on (#2573). Nothing needs a person, but the front page lists these
-# Works under Waiting rather than Working now: a job a chat queued, open issues the card is
-# blocked by, or the deploy of what merged.
+# Works under Waiting rather than Working now: a job a chat queued, or the deck's own wait.
 WAITING_JOB = "waiting_job"
-WAITING_BLOCKERS = "waiting_blockers"
-DEPLOYING = "deploying"
-_WAITS = frozenset({WAITING_JOB, WAITING_BLOCKERS, DEPLOYING})
+_WAITS = frozenset({WAITING_JOB})
 # Merged, and the agent checks it live before the Work finishes (#3578): its own front-page
-# group. A Poller card's Deploying is the same step and is listed there too.
+# group.
 LIVE_CHECKING = "live_checking"
-_LIVE = frozenset({LIVE_CHECKING, DEPLOYING})
+_LIVE = frozenset({LIVE_CHECKING})
 # An open issue no agent works on (#3558): a person starts one or handles it themselves.
 NOT_STARTED = "not_started"
-# The readings that say only that a Run is or was going, or that nothing is (#2590): a Work
-# Working over one has nothing more to say about it.
-_TURN_ONLY = frozenset({"Implementing", "Starting", "Not started", "Idle"})
+# The readings that say only that nothing is going (#2590): a Work Working over one has
+# nothing more to say about it.
+_TURN_ONLY = frozenset({"Idle"})
 
-# A review that needs a person, by what it needs: headline, what the deck waits for, and
-# what the operator does.
-_DECISIONS = {
-    DECIDE_RELEASE: (
-        RELEASE_DECISION,
-        "Release needs your decision",
-        "release decision",
-        "Decide the release",
-    ),
-    DECIDE_MERGE: (
-        MERGE_DECISION,
-        "Ready for you to merge",
-        "your merge",
-        "Merge the pull request",
-    ),
-    DECIDE_CLARIFICATION: (
-        CLARIFICATION,
-        "Work needs clarification",
-        "your clarification",
-        "Clarify the Work",
-    ),
-    DECIDE_REBASE: (
-        RELEASE_DECISION,
-        "Conflicts with its base",
-        "a rebase",
-        "Ask for a rebase",
-    ),
-    DECIDE_FIX: (
-        REVIEW_DECISION,
-        "Review findings need a fix",
-        "a fix round",
-        "Ask for the fix round",
-    ),
-}
-_REVIEW = (REVIEW_DECISION, "Review needs your decision", "review decision", "Decide review")
 # How much of a question the status repeats; the chat has the rest.
 _QUESTION_SHOWN = 140
 
 NOTHING_NEEDED = "Nothing needed"
-RETRIES_ITSELF = "Nothing needed; it retries automatically"
-# Run states that mean a Run is still getting going.
-_STARTING = frozenset({PREPARING, WAITING})
 
 
 @dataclass(frozen=True)
@@ -218,68 +141,26 @@ def _all_landed(card: WorkCard) -> bool:
     return _merged(card) and all(output.settled for output in card.outputs)
 
 
-def _covered_heads(card: WorkCard, heads: Sequence[str]) -> tuple[str, ...]:
-    """The open outputs' heads, when ``heads`` holds every one of them; else ()."""
-    passed = {head.casefold() for head in heads}
-    current = tuple(output.head for output in card.outputs if not output.settled)
-    if not passed or not current or not all(h and h.casefold() in passed for h in current):
-        return ()
-    return current
-
-
 def _milestones(card: WorkCard) -> tuple[Milestone, ...]:
-    review = card.review
     verification = card.verification
     done = card.work_state == "done"
-    fixing = review is not None and review.state == REVIEW_CHANGES
-    run_stuck = card.stuck
-    busy = _busy(card)
 
-    # Implement: the current Run's own work, or settled once review or verification exists.
+    # Implement: settled once verification exists.
     if done:
         implement = (STEP_DONE, "Done")
-    elif fixing:
-        implement = (STEP_ACTIVE, "Fixing")
-    elif review is not None and not review.implemented:
-        implement = (STEP_ACTIVE, "Working")
-    elif review is not None or (verification is not None and verification.status != "earlier"):
+    elif verification is not None and verification.status != "earlier":
         implement = (STEP_DONE, "Done")
-    elif busy:
-        # A turn on the Work is running, whatever an earlier Run ended as (#2487).
+    elif _busy(card):
+        # A turn on the Work is running (#2487).
         implement = (STEP_ACTIVE, "Working")
-    elif run_stuck:
-        implement = (STEP_PROBLEM, card.run_label.capitalize())
-    elif card.run_state == RUNNING or card.run_state in _STARTING:
-        implement = (STEP_ACTIVE, "Working" if card.run_state == RUNNING else "Starting")
-    elif card.run_state in {"", "preflight"}:
-        implement = (STEP_IDLE, "Not started")
     else:
-        implement = (STEP_DONE, "Done")
-
-    # Review: #2216's projection, never a chat's say-so.
-    state = review.state if review is not None else ""
+        implement = (STEP_IDLE, "Not started")
 
     # Verify: only the explicit verification jobs speak here (#2148). The final suite runs on
-    # the head a review passed (#2253), so until a review has passed, a run that no longer
-    # covers the checkout is simply not due yet rather than a problem.
+    # the head a review passed (#2253), so a run that no longer covers the checkout is simply
+    # not due yet rather than a problem.
     status = verification.status if verification is not None else ""
-    review_open = state != REVIEW_PASSED and not done
-    checks = ci_state(card.ci)
-    opened = [output for output in card.outputs if not output.settled]
-    if opened and all(output.review_only for output in opened):
-        # No tests exist for these repositories: the review is the whole proof (#2729), so
-        # there is never a run to ask for (#2832).
-        covered = verification_covers(verification, card.outputs, card.ci)
-        verify = (STEP_DONE if covered else STEP_WAITING, "Review is the check")
-    elif checks == "failing":
-        verify = (STEP_PROBLEM, "CI failed")
-    elif checks == "pending":
-        verify = (STEP_ACTIVE, "CI running")
-    elif checks == "waiting":
-        verify = (STEP_WAITING, "Waiting for CI")
-    elif checks == "green" and verification_covers(verification, card.outputs, card.ci):
-        verify = (STEP_DONE, "CI passed")
-    elif status == "verified" and verification.superseded and verification.tested_at:
+    if status == "verified" and verification.superseded and verification.tested_at:
         # Green, on a commit GitHub has since moved the pull request past (#2327).
         verify = (STEP_DONE, f"Passed at {verification.tested_at}")
     elif status == "verified":
@@ -290,21 +171,10 @@ def _milestones(card: WorkCard) -> tuple[Milestone, ...]:
         # A red run on a head the pull request has moved past falls through to what its
         # current head is waiting on (#2460).
         verify = (STEP_PROBLEM, "Failed")
-    elif status == "stale" and review_open:
+    elif status == "stale" and not done:
         verify = (STEP_WAITING, "After review")
     elif status in {"stale", "unproven"}:
         verify = (STEP_PROBLEM, status.capitalize())
-    elif fixing:
-        verify = (STEP_WAITING, "After review")
-    elif state == REVIEW_PASSED and not done and not verification_covers(
-        verification, card.outputs, card.ci
-    ):
-        # A clean review no green run covers is not a merge yet (#2364), so the step says when
-        # its run comes and who starts it, as the status above it does (#2360).
-        if review.next_expected == NEXT_VERIFICATION:
-            verify = (STEP_WAITING, "Next, by AgentDeck")
-        else:
-            verify = (STEP_ATTENTION, "Not run; ask for it")
     elif status == "earlier":
         verify = (STEP_WAITING, "Earlier Run")
     elif status == "failed":
@@ -316,47 +186,15 @@ def _milestones(card: WorkCard) -> tuple[Milestone, ...]:
     else:
         verify = (STEP_IDLE, "Not run")
 
-    if state == REVIEW_PASSED:
-        check = (STEP_DONE, "Passed")
-    elif state == REVIEW_RUNNING:
-        check = (STEP_ACTIVE, "Running")
-    elif state == REVIEW_PENDING:
-        check = (STEP_WAITING, "Queued")
-    elif state == REVIEW_CHANGES:
-        check = (STEP_WAITING, "Changes asked")
-    elif state == REVIEW_FAILED:
-        check = (STEP_WAITING, "Waiting") if busy else (STEP_PROBLEM, "Failed")
-    elif state in {REVIEW_HUMAN, REVIEW_BLOCKED} and not done:
-        check = (STEP_ATTENTION, "Needs you")
-    elif done:
-        # A finished Work asks nobody anything: a card the engine has not closed yet may still
-        # say its merged pull request waits for a person, which is the issue's close, not a
-        # review (#2411). A ChatGPT review of what merged is still worth saying.
-        check = (STEP_DONE, "ChatGPT reviewed") if card.chatgpt_reviewed else (STEP_IDLE, "None")
-    elif _covered_heads(card, card.passed_heads):
-        # Waiting on a blocker hides the review summary, not the engine's reading of it (#2367).
-        check = (STEP_DONE, "Passed")
-    elif kept := _covered_heads(card, card.kept_pass_heads):
-        # The kept pass names the commits it was recorded at. The diff that would merge also
-        # moves with the base, which only a fresh reading can check, so this says where the
-        # pass was, never that it still covers what would merge (#2367 review).
-        check = (STEP_DONE, "Passed at " + ", ".join(head[:7] for head in kept))
-    elif card.chatgpt_reviewed:
-        # A review chat opened by hand, which the instance's reviewer never recorded (#2411).
-        # Its verdict is in the chat, not here, so this says a review ran, never that it passed.
+    if card.chatgpt_reviewed:
+        # A review chat on the chat board covered the result (#2411). Its verdict is in the
+        # chat, not here, so this says a review ran, never that it passed.
         check = (STEP_DONE, "ChatGPT reviewed")
     else:
-        check = (STEP_IDLE, "Not yet")
+        check = (STEP_IDLE, "None") if done else (STEP_IDLE, "Not yet")
 
-    # Merge: a done card, a merged output, or a merge the engine is deploying is "merged".
-    if card.deploying:
-        merge = (STEP_DONE, "Merged")
-    elif done or _all_landed(card):
+    if done or _all_landed(card):
         merge = (STEP_DONE, "Merged" if _merged(card) else "Done")
-    elif state == REVIEW_PASSED and review is not None and review.next_expected == "merge":
-        merge = (STEP_ACTIVE, "Merging")
-    elif review is not None and review.needs_human and review.decision == DECIDE_MERGE:
-        merge = (STEP_ATTENTION, "Needs you")
     else:
         merge = (STEP_WAITING, "Waiting")
 
@@ -373,24 +211,11 @@ def _short(text: str) -> str:
     return text if len(text) <= _QUESTION_SHOWN else text[: _QUESTION_SHOWN - 1].rstrip() + "…"
 
 
-def _review_place(card: WorkCard) -> tuple[str, str]:
-    """Where a review or release decision is made: its pull request, else the Work's issue."""
-    review = card.review
-    pull = review.pull_request if review is not None else ""
-    if pull:
-        label = next(
-            (output.label for output in card.outputs if output.url.lower() == pull.lower()),
-            "",
-        )
-        return (f"PR {label}" if label else "the pull request"), pull
-    return card.source_label, card.source_url
-
-
 def work_status(card: WorkCard) -> WorkStatus:
     """What the Work is doing, in the order an operator asks: now, next, and me?
 
     While a chat on the Work is mid-turn, it is Working, whatever else is true (#2590): a
-    question, a park, a review decision or a stopped chat elsewhere on it included. What it
+    question or a stopped chat elsewhere on it included. What it
     would otherwise say is in the detail and shows again when the turn ends. Only a finished
     Work and a paused one are not Working.
 
@@ -600,7 +425,7 @@ def _paused(card: WorkCard, story: WorkStatus) -> WorkStatus:
         else "Nothing new starts until you resume it."
     )
     if card.deck_paused and not card.label_paused:
-        # Paused on this deck (#2559): no Poller card holds it, so the deck's refusal is all.
+        # Paused on this deck (#2559): the deck's refusal is all.
         summary = (
             "The current turn will finish first; after it the deck sends nothing to its chats."
             if _busy(card)
@@ -615,17 +440,6 @@ def _paused(card: WorkCard, story: WorkStatus) -> WorkStatus:
         you="Resume it when the work should go on",
         milestones=story.milestones,
     )
-
-
-def _short_refs(refs: Sequence[str], source_label: str) -> list[str]:
-    """``#n`` for an issue in the Work's own repository, the full ref for any other."""
-    own = source_label.rpartition("#")[0].casefold()
-    shown = []
-    for ref in refs:
-        repository, mark, number = ref.rpartition("#")
-        same = mark and own and repository.casefold() == own
-        shown.append(f"#{number}" if same else ref)
-    return shown
 
 
 # How much of a job's command a status line shows.
@@ -652,11 +466,7 @@ def _job_line(job: Any, now: datetime | None = None) -> str:
 
 
 def _busy(card: WorkCard) -> bool:
-    """A turn is running on the Work: a chat on it is thinking (#2590).
-
-    A Run the trace calls running whose chat stalled is not mid-turn: the stopped chat is
-    what the Work then says (#2235).
-    """
+    """A turn is running on the Work: a chat on it is thinking (#2590)."""
     return bool(card.working_count)
 
 
@@ -677,10 +487,8 @@ def _working_chats(card: WorkCard) -> tuple[str, str, str]:
 
 
 def _read_status(card: WorkCard) -> WorkStatus:
-    review = card.review
     verification = card.verification
     steps = _milestones(card)
-    next_up = card.next_expected
 
     def status(tone: str, headline: str, summary: str, detail: str = "", **fields: str):
         return WorkStatus(
@@ -688,7 +496,7 @@ def _read_status(card: WorkCard) -> WorkStatus:
             headline=headline,
             summary=summary,
             detail=detail,
-            next=fields.get("next", next_up),
+            next=fields.get("next", ""),
             you=fields.get("you", NOTHING_NEEDED),
             milestones=steps,
             kind=fields.get("kind", ""),
@@ -696,17 +504,6 @@ def _read_status(card: WorkCard) -> WorkStatus:
             where_href=fields.get("where_href", ""),
         )
 
-    if card.deploy_due and not card.deploying:
-        # Merged into a repository that deploys on merge, and the engine has not started
-        # watching that deploy yet (#2760): the deploy comes next, not a Finish.
-        # The summary names no pull request (#3720): the Work page lists them.
-        return status(
-            ACTIVE,
-            "Deploying",
-            "Merged; waiting for its deploy to start.",
-            next="deploy",
-            kind=DEPLOYING,
-        )
     if card.work_state == "done":
         if card.awaiting_finish and any(output.is_open for output in card.outputs):
             # Another chat closed the issue with a pull request still open (#3187): that pull
@@ -728,21 +525,12 @@ def _read_status(card: WorkCard) -> WorkStatus:
     waiting = waiting_attention(card)
     asking = [item for item in waiting if item.asks]
     acting = [item for item in waiting if item.interaction and not item.asks]
-    # A worker chat the Poller restarts by itself is not a chat for a person to look at.
+    # A chat that restarts by itself is not a chat for a person to look at.
     stopped = [
-        item
-        for item in waiting
-        if not (item.asks or item.interaction or item.recovering)
+        item for item in waiting if not (item.asks or item.interaction or item.recovering)
     ]
-    deciding = review is not None and review.needs_human
-    decision = _DECISIONS.get(review.decision, _REVIEW) if review is not None else _REVIEW
-    # A card parked in Needs More Info waits on a person by itself, review or no review.
-    clarifying = not deciding and card.parked == NEEDS_MORE_INFO
-    if clarifying:
-        decision = _DECISIONS[DECIDE_CLARIFICATION]
-    then = decision[3][0].lower() + decision[3][1:]
 
-    def also(*, acting_from: int = 0, stopped_from: int = 0, card_too: bool = True) -> str:
+    def also(*, acting_from: int = 0, stopped_from: int = 0) -> str:
         """What else waits on a person, each in its own words."""
         parts = []
         if acting[acting_from:]:
@@ -751,10 +539,6 @@ def _read_status(card: WorkCard) -> WorkStatus:
         if stopped[stopped_from:]:
             names = ", ".join(item.chat_title for item in stopped[stopped_from:])
             parts.append(f"Also stopped: {names}.")
-        if card_too and deciding and review is not None:
-            parts.append(f"{decision[1]} too: {review.label}.")
-        elif card_too and clarifying:
-            parts.append(f"{decision[1]} too: the card is in {card.work_state}.")
         return " ".join(parts)
 
     if asking:
@@ -764,11 +548,6 @@ def _read_status(card: WorkCard) -> WorkStatus:
         more = len(asking) - 1
         who = first.chat_title + (
             f" (and {more} more {'question' if more == 1 else 'questions'})" if more else ""
-        )
-        answer = (
-            "Answer the question"
-            if first.answered_by_message
-            else "Answer the question on the chat's page"
         )
         return status(
             ATTENTION,
@@ -780,7 +559,11 @@ def _read_status(card: WorkCard) -> WorkStatus:
             ),
             also(),
             next="your answer",
-            you=f"{answer}, then {then}" if deciding or clarifying else answer,
+            you=(
+                "Answer the question"
+                if first.answered_by_message
+                else "Answer the question on the chat's page"
+            ),
             kind=CHAT_QUESTION,
             where=first.chat_title,
             where_href=first.href,
@@ -789,34 +572,22 @@ def _read_status(card: WorkCard) -> WorkStatus:
         # An approval or a browser step: a decision the chat's own page takes, not an answer.
         first = acting[0]
         what = _short(first.question) if first.question else "a pending request"
-        act = (
-            "Continue in the browser from the chat's page"
-            if first.interaction == "mcp_url"
-            else "Approve or decline on the chat's page"
-        )
         return status(
             ATTENTION,
             "Chat is waiting on you",
             f"{first.chat_title} is waiting on: {what}",
             also(acting_from=1),
             next="your approval",
-            you=f"{act}, then {then}" if deciding or clarifying else act,
+            you=(
+                "Continue in the browser from the chat's page"
+                if first.interaction == "mcp_url"
+                else "Approve or decline on the chat's page"
+            ),
             kind=CHAT_ACTION,
             where=first.chat_title,
             where_href=first.href,
         )
-    if card.deploying:
-        # Merged, and the engine watches the deploy (#2332): a review decision, a park or a
-        # stopped worker from before the merge is moot now. A chat's own question came first.
-        return status(
-            ACTIVE,
-            "Deploying",
-            "Merged.",
-            next="deploy",
-            kind=DEPLOYING,
-        )
-
-    def chat_stopped() -> WorkStatus:
+    if stopped:
         first = stopped[0]
         what = first.state.replace("_", " ")
         return status(
@@ -828,100 +599,6 @@ def _read_status(card: WorkCard) -> WorkStatus:
             kind=CHAT_STOPPED,
             where=first.chat_title,
             where_href=first.href,
-        )
-
-    if card.dispatch_failed and card.dispatch_rearms:
-        # Every attempt was refused before any write, and the park's one free retry is still
-        # due: the engine starts the worker again by itself (#2235). A chat that stopped is
-        # still its own look.
-        if stopped:
-            return chat_stopped()
-        return status(
-            ACTIVE,
-            "Retrying the start",
-            "The worker never started; AgentDeck retries it once by itself.",
-            card.run_reason,
-            next=NEXT_RETRY,
-            you=RETRIES_ITSELF,
-        )
-    if card.dispatch_failed:
-        # No worker ever ran (#2226): not a question it asked, and not a Run to look at.
-        return status(
-            ATTENTION,
-            "Worker never started",
-            "The worker never started; press Retry to start it again.",
-            also(card_too=False),
-            next="a new instruction",
-            # Retry asks the Poller for the instruction itself (#2419); nothing to paste.
-            you="Press Retry",
-            kind=DISPATCH_FAILED,
-            where=card.source_label,
-            where_href=card.source_url,
-        )
-    if deciding and review is not None:
-        kind, headline, waits, act = decision
-        where, where_href = (
-            (card.source_label, card.source_url) if kind == CLARIFICATION else _review_place(card)
-        )
-        return status(
-            ATTENTION,
-            headline,
-            review.label + ".",
-            also(card_too=False),
-            next=waits,
-            you=act,
-            kind=kind,
-            where=where,
-            where_href=where_href,
-        )
-    if clarifying:
-        kind, headline, waits, act = decision
-        return status(
-            ATTENTION,
-            headline,
-            f"The card is in {card.work_state}: the worker needs more information to go on.",
-            also(card_too=False),
-            next=waits,
-            you=act,
-            kind=kind,
-            where=card.source_label,
-            where_href=card.source_url,
-        )
-    if stopped:
-        return chat_stopped()
-    if card.parked:
-        # The worker handed the card back to a person (#2219): nothing moves it until they do.
-        info = card.parked == "needs_more_info"
-        where = "The card waits in " + (card.work_state or card.parked.replace("_", " ")) + "."
-        return status(
-            ATTENTION,
-            "Needs your input" if info else "Blocked",
-            f"Blocked: {card.park_reason}." if card.park_reason and not info else where,
-            next=NEXT_HUMAN,
-            you="Answer on the issue" if info else "Unblock the card",
-        )
-    if card.blocked_by and card.run_state not in {RUNNING, *_STARTING}:
-        # The card waits on other issues, and the engine starts or resumes it by itself when
-        # they close (#2573): no person is needed, and nothing is idle either.
-        return status(
-            IDLE,
-            "Waiting on other work",
-            "Blocked by " + ", ".join(_short_refs(card.blocked_by, card.source_label)) + ".",
-            next=NEXT_BLOCKERS,
-            kind=WAITING_BLOCKERS,
-        )
-    # A failed reviewer Run is the review's to report, retry included (#2235).
-    reviewer_failed = (
-        review is not None and review.state == REVIEW_FAILED and review.run_id == card.run_id
-    )
-    if card.stuck and not reviewer_failed:
-        retry = next_up == NEXT_RETRY
-        return status(
-            PROBLEM,
-            "Run needs a look",
-            f"The current Run is {card.run_label}.",
-            card.run_reason,
-            you=RETRIES_ITSELF if retry else "Look at the Run",
         )
     blocked = [output for output in card.outputs if output.never_ran]
     if blocked:
@@ -941,111 +618,6 @@ def _read_status(card: WorkCard) -> WorkStatus:
             where=first.label,
             where_href=first.url,
         )
-    if review is not None and review.state == REVIEW_CHANGES:
-        running = card.run_state == RUNNING
-        return status(
-            ACTIVE,
-            "Fixing review findings",
-            review.label + ".",
-            "The fix Run is working." if running else "AgentDeck starts the fix Run itself.",
-            next=next_up or review.next_expected,
-        )
-    if review is not None and review.state == REVIEW_FAILED:
-        retry = review.next_expected == NEXT_RETRY
-        return status(
-            PROBLEM,
-            "Review stopped",
-            review.label + ".",
-            next=review.next_expected,
-            you=RETRIES_ITSELF if retry else "Look at the review Run",
-        )
-    if review is not None and review.state == REVIEW_RUNNING:
-        detail = "Implementation is done"
-        if verification is not None and verification.status == "verified":
-            detail += " and verified"
-        return status(
-            ACTIVE,
-            "Reviewing",
-            "Automated review in progress." if review.run_id else review.label + ".",
-            detail + ".",
-            next="review result",
-        )
-    if review is not None and review.state == REVIEW_PENDING and review.implemented:
-        return status(ACTIVE, "Review queued", review.label + ".", next=review.next_expected)
-    if review is not None and review.state == REVIEW_PASSED:
-        if verification is not None and verification.status in {"running", "queued"}:
-            # The final selected suite on the head the review passed (#2253).
-            return status(ACTIVE, "Verifying", verification.label + ".", review.label + ".")
-        if failed_verification_holds(verification, card.run_id, card.ci):
-            # A red suite on the reviewed head is not a merge to ask for (#2352).
-            return status(
-                PROBLEM,
-                "Verification failed",
-                verification.label + ".",
-                review.label + ".",
-                next="",
-                you="Look at the verification",
-            )
-        checks = ci_state(card.ci)
-        if checks:
-            # A pull request whose CI is its verification (#2364), named with its head in the
-            # detail only: the summary a card shows names no pull request (#3720).
-            unsettled = [c for c in card.ci if c.state != "green"]
-            named = ", ".join(f"{c.label}@{c.head[:7]}" for c in unsettled)
-            if checks == "failing":
-                failed = ", ".join(
-                    f"{c.label}@{c.head[:7]}" for c in card.ci if c.state == "failing"
-                )
-                return status(
-                    PROBLEM,
-                    "Verification failed",
-                    "CI failed.",
-                    f"CI failed on {failed}. {review.label}.",
-                    next="",
-                    you="Look at the CI",
-                )
-            if checks == "pending":
-                return status(
-                    ACTIVE, "Verifying", "CI running.", f"CI running on {named}. {review.label}.",
-                    next=NEXT_VERIFICATION,
-                )
-            if checks == "waiting":
-                return status(
-                    ACTIVE, "Verification due", "No CI reported yet.",
-                    f"No CI reported yet on {named}. {review.label}.", next=NEXT_VERIFICATION,
-                )
-        if review.next_expected == NEXT_VERIFICATION:
-            # No green run covers the reviewed head, and the engine asks for one itself (#2364).
-            return status(
-                ACTIVE,
-                "Verification due",
-                "No green verification run covers the current head.",
-                review.label + ".",
-                next=NEXT_VERIFICATION,
-            )
-        if not review.next_expected and not verification_covers(
-            verification, card.outputs, card.ci
-        ):
-            # ...and nothing here will ask for one: not a merge to offer (#2364).
-            return status(
-                PROBLEM,
-                "Verification not run",
-                "No green verification run covers the current head.",
-                review.label + ".",
-                next="",
-                you="Ask for a verification",
-            )
-        merging = review.next_expected == "merge"
-        if merging and _all_landed(card):
-            # Every pull request already merged or closed; what is left is the deploy and
-            # closing the card (#2316), so "Merging" would describe a step that has finished.
-            return status(ACTIVE, "Deploying", "Merged.", next="deploy", kind=DEPLOYING)
-        return status(
-            ACTIVE,
-            "Merging" if merging else "Review passed",
-            review.label + ".",
-            next=review.next_expected,
-        )
     if verification is not None and verification.status in {"running", "queued"}:
         return status(ACTIVE, "Verifying", verification.label + ".")
     if card.jobs:
@@ -1060,15 +632,7 @@ def _read_status(card: WorkCard) -> WorkStatus:
             kind=WAITING_JOB,
         )
     # Below, nothing but the turn itself (``_TURN_ONLY``): a chat mid-turn says Working (#2590).
-    if card.run_state == RUNNING:
-        return status(ACTIVE, "Implementing", "The current Run is working.", card.run_reason)
-    if card.run_state in _STARTING:
-        return status(ACTIVE, "Starting", f"The Run is {card.run_label}.", card.run_reason)
-    if card.run_state == "preflight":
-        return status(IDLE, "Not started", card.run_reason or "No Run has started yet.")
-    if card.run_state:
-        return status(IDLE, "Idle", f"The last Run is {card.run_label}.", card.run_reason)
-    return status(IDLE, "Idle", "Nothing is running.", next="")
+    return status(IDLE, "Idle", "Nothing is running.")
 
 
 # --- the front page (#2219) ----------------------------------------------------------------------
@@ -1231,26 +795,14 @@ class FrontRow:
         return GLYPHS.get(self.attention.category, "") if self.attention is not None else ""
 
     @property
-    def awaits_review(self) -> bool:
-        """An automatic review is queued or running, and nothing else is working (#2254)."""
-        review = self.card.review
-        return (
-            self.section == IN_PROGRESS
-            and review is not None
-            and review.state in {REVIEW_PENDING, REVIEW_RUNNING}
-            and self.card.run_state != RUNNING
-            and not self.card.working_count
-        )
-
-    @property
     def live(self) -> bool:
         """Listed under Live checking: merged, before its live check is recorded (#3578)."""
         return self.section == IN_PROGRESS and self.status.kind in _LIVE
 
     @property
     def waits(self) -> bool:
-        """Listed under Waiting: an automatic review, or a job, blockers or a deploy (#2573)."""
-        return self.awaits_review or (self.section == IN_PROGRESS and self.status.kind in _WAITS)
+        """Listed under Waiting: an automatic wait such as a job (#2573)."""
+        return self.section == IN_PROGRESS and self.status.kind in _WAITS
 
 
 @dataclass(frozen=True)
@@ -1273,9 +825,8 @@ class FrontGroup:
 def _needs_you(card: WorkCard, story: WorkStatus) -> tuple[str, str, int]:
     """(reason, action, rank) of a Work waiting on a person, or ("", "", -1) if it is not.
 
-    A question a chat asks is the strongest, then a review, release or card parked for a
-    person, then a Run nothing will retry. A Run that retries itself is not a person's job.
-    A Work whose issue closed waits on a person too, until someone finishes it (#2510).
+    A question a chat asks is the strongest, then anything else that waits on a person, then
+    a problem. A Work whose issue closed waits on a person too, until someone finishes it (#2510).
     """
     if story.kind == NOT_STARTED:
         return "No agent works on this issue", "Open", 3
@@ -1300,7 +851,7 @@ def _needs_you(card: WorkCard, story: WorkStatus) -> tuple[str, str, int]:
         return reason, "Open", 0
     if story.tone == ATTENTION:
         return story.summary.rstrip("."), "Open", 1
-    if story.tone == PROBLEM and story.you != RETRIES_ITSELF:
+    if story.tone == PROBLEM:
         reason = story.summary.rstrip(".")
         return (f"{reason}: {story.detail}" if story.detail else reason), "Open", 2
     return "", "", -1
@@ -1399,8 +950,8 @@ class FrontSections:
     one_repository: bool = True
     # Needs you rows the operator hid (#2238), in Needs you's own order: the Hidden list.
     hidden: tuple[FrontRow, ...] = ()
-    # Current Works waiting only on something automatic, kept out of ``active``: a review
-    # (#2254), a job, blockers or a deploy (#2573).
+    # Current Works waiting only on something automatic, kept out of ``active``: a job or the
+    # deck's own wait (#2573).
     waiting: tuple[FrontRow, ...] = ()
     # The Needs you rows that most recently stopped, newest first (#2283): each is also in
     # its category, so this is a shortcut to where it landed, never a move.
@@ -1468,9 +1019,7 @@ class FrontSections:
     def summary(self) -> tuple[tuple[str, int, str], ...]:
         """``(key, count, words)`` for the counts line at the top, zero counts left out."""
         from .work_attention import (
-            CLOSED_UNMERGED,
             ISSUE_CLOSED,
-            MERGED_ISSUE_OPEN,
             NEEDS_ANSWER,
             NEEDS_RETRY,
             NEEDS_REVIEW,
@@ -1486,9 +1035,7 @@ class FrontSections:
             ("merge", counts.get(READY_FOR_MERGE, 0), "to merge"),
             ("stuck", sum(counts.get(c, 0) for c in (NEEDS_RETRY, RELEASE_BLOCKED, WORK_ERROR)),
              "stuck"),
-            ("cleanup",
-             sum(counts.get(c, 0) for c in (MERGED_ISSUE_OPEN, CLOSED_UNMERGED, ISSUE_CLOSED)),
-             "cleanup"),
+            ("cleanup", counts.get(ISSUE_CLOSED, 0), "cleanup"),
             ("answer", counts.get(NEEDS_ANSWER, 0),
              summary_words("answer", counts.get(NEEDS_ANSWER, 0))),
             ("review", counts.get(NEEDS_REVIEW, 0),
@@ -1529,7 +1076,7 @@ def front_sections(
     Needs you: the most recent Work activity first, never cut; the page groups it by
     category, and each category keeps that order (#2267). Active: the most recent Work
     activity, the first ``max_active`` listed and the rest counted. Live checking (#3578): the
-    in-progress Works merged and checked live, or a Poller card's deploy, never cut.
+    in-progress Works merged and checked live, never cut.
     Finished: the newest ``MAX_FINISHED`` by when the Work finished (its issue's
     ``closed_at``), within ``RECENT_WORK`` of ``now``; one that finished before that is not
     called recent and is only counted as quiet. A done Work whose chat carried on well after
@@ -1688,8 +1235,8 @@ class MessageTarget:
 
     ``answer`` is true only when a message to that chat is the answer to its question
     (``WorkAttention.answered_by_message``), so the page offers **Answer question** rather
-    than a plain message. A review or release waiting on a person, or an interaction form
-    or approval on the chat's own page, never sets it (#2224).
+    than a plain message. An interaction form or approval on the chat's own page never sets
+    it (#2224).
     """
 
     session_key: str
@@ -1701,25 +1248,22 @@ class MessageTarget:
 
 def message_target(
     card: WorkCard,
-    trace: RunTrace | None,
     chats: Sequence[WorkChat],
     can_send: Callable[[str], bool],
 ) -> MessageTarget | None:
     """Which chat takes a message sent to this Work, or None when none can.
 
     In order: a chat whose question is the Work's attention; a chat waiting on its own page;
-    a chat that stopped and is the Work's attention; the current Run's chat
-    (from the Run trace, never the newest session); a working chat; the most recently
+    a chat that stopped and is the Work's attention; a working chat; the most recently
     active chat. Only a chat that can take a message now (``can_send``) is chosen.
     """
 
-    def chat_of(session_key: str, chat_id: str = "") -> WorkChat | None:
+    def chat_of(session_key: str) -> WorkChat | None:
         return next(
             (
                 chat
                 for chat in chats
-                if (chat_id and chat.chat_id == chat_id)
-                or chat.session_key == session_key
+                if chat.session_key == session_key
                 or session_key in chat.legs
             ),
             None,
@@ -1739,8 +1283,8 @@ def message_target(
 
     answering = [item for item in card.attention if item.answered_by_message]
     waiting = [item for item in card.attention if item.interaction]
-    # The status's own test (#2327): a chat that handed off, or one the Poller restarts
-    # itself, has not stopped for a look.
+    # The status's own test (#2327): a chat that handed off, or one that restarts by itself,
+    # has not stopped for a look.
     stopped = [
         item
         for item in waiting_attention(card)
@@ -1754,18 +1298,6 @@ def message_target(
             item.href,
             answer=item.answered_by_message,
             why=why(item),
-        )
-        if found is not None:
-            return found
-    current = trace.current if trace is not None else None
-    for session in reversed(current.sessions if current is not None else ()):
-        chat = chat_of(session.session_key, session.chat_id)
-        found = target(
-            chat,
-            session.session_key,
-            session.session_key,
-            f"/sessions/{session.session_key}",
-            why="it runs the current Run",
         )
         if found is not None:
             return found

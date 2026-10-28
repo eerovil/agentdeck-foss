@@ -1,6 +1,6 @@
 """A Work's one status line, derived from what the deck already holds (#2895 step 3, D7).
 
-For a Work the deck runs itself (a ``works_router`` project, no Poller card), the status is
+For a Work the deck runs itself (every project's, since #3732), the status is
 not a column a Poller wrote: it is read, first match wins, from the owning chat and the
 Work's own facts. Nothing here is stored and nothing here asks the agent to call a tool.
 

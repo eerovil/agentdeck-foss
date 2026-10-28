@@ -1,6 +1,6 @@
 """The deck starts a switched project's Work itself (#2895 step 5b, ADR 0008 D2).
 
-On a project whose manifest sets ``works_router``, the Poller makes no new card (step 5a), so
+The Poller makes no card (step 5a, and since #3732 it has no cards at all), so
 the ownership label landing on an issue no chat owns is the Work's start: the router calls
 ``start_work_agent``, which starts one Claude chat with the ``work`` role in a checkout of the
 issue's repository. It is a Work side chat underneath (#2388): saved under its action id
@@ -163,7 +163,7 @@ def work_accounts(app: Any, repository: str = "") -> list[Any] | None:
     (``None``). Only Claude: a Codex start cannot take the Work role yet (#2895). Work start
     and the usage move (#3362) both choose from this list.
     """
-    from .poller_ops import works_router_accounts
+    from .poller_ops import work_accounts
     from .providers import PROVIDERS
 
     inject = getattr(app.state.config, "inject", None)
@@ -174,7 +174,7 @@ def work_accounts(app: Any, repository: str = "") -> list[Any] | None:
     poller = getattr(app.state.config, "poller", None)
     if repository and poller is not None:
         try:
-            choices = works_router_accounts(poller.root)
+            choices = work_accounts(poller.root)
         except Exception:  # noqa: BLE001 - no configured answer must fail closed
             log.warning("work start: could not read the account choice", exc_info=True)
             return None
@@ -244,9 +244,56 @@ def _merge_text(app: Any, repository: str) -> str:
     return " ".join(texts)
 
 
+# A spec-only Work waits for its approval whatever the spec says, and a standing "grill me"
+# instruction reads that wait as a call for questions. #2424's spec asked four, and three had
+# answers the worker had already given itself (#2427). A question costs the person a round trip
+# on a spec they read in full before anything is built, so choices go in a numbered list they can
+# overrule instead. The one deliberate exception is disagreement (#3234): on #3228 the owner
+# asked to be grilled on their own choices, and arguing against them caught five real problems,
+# so a worker that doubts a choice now challenges it unasked, with no cap, while the spec is open.
+SPEC_ONLY_QUESTION_RULE = (
+    "The person reviewing this spec reads every decision in it before anything is built, so a "
+    "question only adds a round trip. Decide everything you can, and list each choice as a "
+    "numbered **Decisions** item (D1, D2, …) right after the summary, one line each with its "
+    "reason; they can overrule any of them by number while approving. These are assumed, "
+    "not chosen: mark only what the person picked or wrote `(chosen)`. Approving the spec "
+    "does not make the rest chosen, so the build may change a wrong one and say so in its "
+    "pull request (#3690). In a chat reply, never "
+    "cite a decision or question by its number alone: restate it in a few words (#2779). Ask "
+    "a question only for a preference only the person holds and nothing you can read reveals: "
+    "extra cost (API calls, "
+    "tokens, money), accepting a known gap or risk, or a conflict with another requester's "
+    "recent work. Give your recommendation with each question. Scope beyond what the issue "
+    "asked for is not a question: leave it out, or mention it in one line. Go wide before "
+    "you narrow: up to three other ways your research turned up to meet the issue, not doing "
+    "it included, each one line under **Ideas** with where it came from; none is built unless "
+    "the person keeps it. "
+    "The one other question is a challenge, asked without being asked to (#3234): while the "
+    "spec is still open, grill the person on anything in it you think is not a good idea, "
+    "whether a choice they made, one of yours they accepted, or an earlier choice of theirs "
+    "the spec reverses. Do it only when you really disagree or doubt, never as a ritual. Ask "
+    "each challenge as one question in your structured question tool (where you have none, "
+    "as an open question in the spec), worded `You chose X. I think Y is better, because "
+    "<fact>. Which do you want?`, with your recommended option first. Ask up to four a "
+    "round, and keep asking rounds while you still disagree with something; never re-ask a "
+    "choice the person has answered. Write each answer into the spec comment at once, "
+    "marked as the owner's choice, before the next round. Keep your own copy of the spec and "
+    "edit that copy, because re-reading the comment through `gh` can return a stale cached "
+    "copy that overwrites your earlier edits. Once the spec is approved, build it rather "
+    "than reopen its choices. Whenever your question tool asks whether the spec is ready, "
+    "include the option `Grill me on the spec`; if it is chosen, challenge every choice you "
+    "have any doubt about. "
+    "Most specs have no questions; then write `No open questions — approve, or overrule a "
+    "decision by number.` "
+    "Keep the summary, the Decisions and the questions (or that line) open, and put the "
+    "detailed spec — files, wording, tests, steps — inside one collapsed `Details` block. "
+    "This brief takes precedence over any standing instruction to question the requester "
+    "before starting."
+)
+
+
 def _spec_only_text(app: Any, repository: str, number: int, labels: Iterable[str]) -> str:
     """The spec-only brief when ``labels`` hold the project's spec-only label, else empty."""
-    from .poller_adapter.worker import SPEC_ONLY_QUESTION_RULE
     from .poller_ops import release_policies
 
     poller = getattr(app.state.config, "poller", None)
@@ -270,13 +317,13 @@ def _spec_only_text(app: Any, repository: str, number: int, labels: Iterable[str
 def _evidence_text(app: Any, repository: str, number: int) -> str:
     """Where this Work's screenshots go, for the first message; empty when its project names
     no evidence repository, so the role's guide has them committed beside the code."""
-    from .poller_ops import works_router_evidence_repositories
+    from .poller_ops import work_evidence_repositories
 
     poller = getattr(app.state.config, "poller", None)
     if poller is None:
         return ""
     try:
-        evidence = works_router_evidence_repositories(poller.root).get(repository.lower())
+        evidence = work_evidence_repositories(poller.root).get(repository.lower())
     except Exception:  # noqa: BLE001 - a missing line must never stop the start
         log.warning("work start: could not read the evidence repository", exc_info=True)
         return ""

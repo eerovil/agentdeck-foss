@@ -3273,29 +3273,6 @@ async def test_a_quota_retry_row_names_its_reset_instead_of_a_runtime_restart(tm
     assert "Waiting for the runtime to restart" not in page.text
 
 
-async def test_a_cancelled_held_answer_never_reaches_the_parked_card(tmp_path, monkeypatch):
-    # #2847 review: the Poller hears of an answer only once it reached the worker.
-    app = _web_app(tmp_path, max_message_chars=1000)
-    _restarting_runtime(app, monkeypatch)
-    left = []
-    monkeypatch.setattr(
-        "agentdeck.web.routes_actions.leave_answer", lambda **kwargs: left.append(kwargs)
-    )
-    headers = {"origin": "http://test", "x-agentdeck-action-id": "held-answer"}
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        held = await client.post(
-            "/sessions/codex:test:sid/inject", data={"message": "Yes, go ahead"}, headers=headers
-        )
-        assert held.status_code == 202
-        cancelled = await client.post(
-            "/sessions/codex:test:sid/held/held-answer/cancel",
-            headers={"origin": "http://test"},
-        )
-        assert cancelled.status_code == 200
-    assert left == []
-    assert _held_rows(app) == ()
-
-
 async def test_a_restart_holds_nothing_it_cannot_keep(tmp_path, monkeypatch):
     app = _web_app(tmp_path, max_message_chars=1000)
     _restarting_runtime(app, monkeypatch)

@@ -1,4 +1,5 @@
-"""#1007: the front page's board strip — what it counts, and what it refuses to claim."""
+"""#1007, #1691: the board strip — a board-less project's open issues, and what it refuses
+to claim. The Poller's own cards were removed (#3741)."""
 
 from __future__ import annotations
 
@@ -7,10 +8,10 @@ from fastapi.testclient import TestClient
 
 from agentdeck.board_strip import build_strip
 from agentdeck.issue_context import IssueContext, PendingItem, PendingView
-from agentdeck.poller_ops import BoardCard, BoardScope
+from agentdeck.poller_ops import BoardScope
 
 
-def _scope(instance="reference", *repositories, boardless=False):
+def _scope(instance="reference", *repositories, boardless=True):
     return BoardScope(
         instance=instance,
         org="shop",
@@ -23,13 +24,9 @@ def _item(
     number,
     *,
     repository="shop/store",
-    status="In progress",
-    in_review=False,
-    done=False,
     sessions=(),
     pulls=(),
-    card=True,
-    title="A card",
+    title="An issue",
 ):
     return PendingItem(
         repository=repository,
@@ -40,19 +37,6 @@ def _item(
             title=title,
             url=f"https://github.com/{repository}/issues/{number}",
             state="open",
-        ),
-        card=(
-            BoardCard(
-                repository=repository,
-                number=number,
-                status=status,
-                in_review=in_review,
-                done=done,
-                ownership=True,
-                started=True,
-            )
-            if card
-            else None
         ),
         sessions=tuple(sessions),
         pull_requests=tuple(pulls),
@@ -78,78 +62,37 @@ def _view(*items, complete=True, board_complete=True, unknown=()):
     )
 
 
-def test_a_card_in_review_with_an_open_pull_request_is_shown_for_review():
-    item = _item(11, status="In review", in_review=True, pulls=[_pull(7)])
+def test_an_issue_with_an_open_pull_request_carries_it():
+    item = _item(11, pulls=[_pull(7)])
     strip = build_strip(_view(item), [_scope()])
-    assert strip.review_count == 1
     row = strip.instances[0].cards[0]
     assert row.pull_number == 7
     assert row.pull_url.endswith("/pull/7")
-    # The row itself is the issue: that is the card the operator came to read.
+    # The row itself is the issue.
     assert row.url.endswith("/issues/11")
 
 
-def test_a_card_in_review_with_no_open_pull_request_is_still_shown():
-    """Parked in review with nothing opened is the case that most wants a look."""
-    item = _item(11, status="In review", in_review=True, pulls=[_pull(7, "merged")])
-    strip = build_strip(_view(item), [_scope()])
-    assert strip.review_count == 1
-    row = strip.instances[0].cards[0]
+def test_a_merged_pull_request_is_not_carried():
+    item = _item(11, pulls=[_pull(7, "merged")])
+    row = build_strip(_view(item), [_scope()]).instances[0].cards[0]
     assert row.has_pull is False
-    assert row.url.endswith("/issues/11")
 
 
-def test_a_parked_card_is_listed_with_the_column_it_sits_in():
-    """An instance whose cards are all parked must still appear (#1025)."""
-    strip = build_strip(_view(_item(11, status="Blocked")), [_scope()])
-    assert strip.card_count == 1
-    assert strip.review_count == 0
-    assert strip.instances[0].cards[0].status == "Blocked"
-
-
-def test_a_card_in_the_done_column_is_finished_business():
-    """Otherwise the strip grows forever as cards land (#1025)."""
-    strip = build_strip(_view(_item(11, status="Done", done=True)), [_scope()])
-    assert strip.empty
-
-
-def test_in_review_cards_sort_above_the_rest():
-    """The column that wants the operator reads first."""
-    view = _view(
-        _item(11, status="Blocked"),
-        _item(12, status="In review", in_review=True),
-    )
-    strip = build_strip(view, [_scope()])
-    assert [row.number for row in strip.instances[0].cards] == [12, 11]
-
-
-def test_an_issue_with_no_card_is_not_on_the_strip():
-    """A project with a board shows cards: an issue nobody put on it is not one."""
-    item = _item(11, card=False, pulls=[_pull(7)])
-    strip = build_strip(_view(item), [_scope()])
+def test_a_project_with_a_board_lists_no_issue():
+    """Only a board-less project's issues are its board."""
+    strip = build_strip(_view(_item(11, pulls=[_pull(7)])), [_scope(boardless=False)])
     assert strip.empty
 
 
 def test_a_boardless_project_shows_the_issue_itself():
-    """#1691: no Project means the open issue is the card, so it gets a row."""
-    item = _item(11, card=False)
+    """#1691: no Project means the open issue is the board, so it gets a row."""
+    item = _item(11)
     strip = build_strip(_view(item), [_scope(boardless=True)])
     row = strip.instances[0].cards[0]
     assert row.identity == "shop/store#11"
     assert row.status == "Status unknown"
     assert row.url.endswith("/issues/11")
     assert strip.instances[0].overflow == 0
-
-
-def test_a_boardless_project_still_shows_the_cards_it_has():
-    """A `status:*` label is a card, and it keeps its column beside the rest."""
-    view = _view(_item(11, status="In review", in_review=True), _item(12, card=False))
-    strip = build_strip(view, [_scope(boardless=True)])
-    assert [row.status for row in strip.instances[0].cards] == [
-        "In review",
-        "Status unknown",
-    ]
-    assert strip.review_count == 1
 
 
 def test_a_boardless_project_leaves_out_a_closed_issue():
@@ -172,7 +115,7 @@ def test_a_boardless_backlog_is_cut_to_a_readable_strip():
     extra = 3
     view = _view(
         *(
-            _item(number, card=False)
+            _item(number)
             for number in range(100, 100 + BOARDLESS_ROW_LIMIT + extra)
         )
     )
@@ -185,41 +128,26 @@ def test_a_boardless_backlog_is_cut_to_a_readable_strip():
     assert min(row.number for row in entry.cards) == 100 + extra
 
 
-def test_a_boardless_projects_cards_are_not_cut_by_the_issue_limit():
-    """The limit is for the repository's backlog, not for tracked work."""
-    from agentdeck.board_strip import BOARDLESS_ROW_LIMIT
-
-    view = _view(
-        *(
-            _item(number, status="In progress")
-            for number in range(100, 100 + BOARDLESS_ROW_LIMIT + 4)
-        )
-    )
-    strip = build_strip(view, [_scope(boardless=True)])
-    assert len(strip.instances[0].cards) == BOARDLESS_ROW_LIMIT + 4
-    assert strip.instances[0].overflow == 0
-
-
-def test_a_card_no_scope_claims_is_dropped_rather_than_guessed():
-    item = _item(11, repository="other/repo", in_review=True)
+def test_an_issue_no_scope_claims_is_dropped_rather_than_guessed():
+    item = _item(11, repository="other/repo")
     strip = build_strip(_view(item), [_scope()])
     assert strip.empty
 
 
-def test_cards_group_under_the_instance_that_declares_the_repository():
+def test_issues_group_under_the_instance_that_declares_the_repository():
     view = _view(
-        _item(11, in_review=True, pulls=[_pull(7)]),
-        _item(12, repository="shop/abacus", in_review=True),
+        _item(11, pulls=[_pull(7)]),
+        _item(12, repository="shop/abacus"),
     )
     strip = build_strip(
         view, [_scope("alpha", "shop/store"), _scope("beta", "shop/abacus")]
     )
     assert [entry.instance for entry in strip.instances] == ["alpha", "beta"]
-    assert strip.review_count == 2
+    assert strip.card_count == 2
 
 
 def test_an_instance_with_nothing_to_show_is_left_out():
-    view = _view(_item(11, status="Done", done=True))
+    view = _view(PendingItem(repository="shop/store", number=11, issue_closed=True))
     strip = build_strip(view, [_scope("alpha", "shop/store"), _scope("beta", "shop/abacus")])
     assert strip.instances == ()
 
@@ -234,10 +162,10 @@ def test_an_unread_board_is_reported_rather_than_shown_as_a_zero():
 
 def test_a_stale_issue_list_alone_does_not_warn():
     """It costs a row its title, which the row already falls back from (#1017)."""
-    item = _item(11, in_review=True, pulls=[_pull(7)])
+    item = _item(11, pulls=[_pull(7)])
     strip = build_strip(_view(item, complete=False, unknown=("shop/store",)), [_scope()])
     assert strip.complete is True
-    assert strip.review_count == 1
+    assert strip.card_count == 1
 
 
 def test_an_unreadable_board_makes_the_strip_incomplete():
@@ -279,7 +207,7 @@ def test_the_dashboard_carries_the_strip_and_it_starts_shut(app_client):
 
 
 def test_a_row_opens_the_issue_and_the_pull_request_separately(app_client):
-    """The row is the card; the pull request keeps its own press beside it (#1036)."""
+    """The row is the issue; the pull request keeps its own press beside it (#1036)."""
     from agentdeck.board_strip import BoardStrip, InstanceStrip, StripRow
 
     row = StripRow(
@@ -287,8 +215,7 @@ def test_a_row_opens_the_issue_and_the_pull_request_separately(app_client):
         number=11,
         title="A card",
         url="https://github.com/shop/store/issues/11",
-        status="In review",
-        in_review=True,
+        status="Status unknown",
         pull_number=7,
         pull_url="https://github.com/shop/store/pull/7",
     )
@@ -447,26 +374,35 @@ def _backlog_pull(number=7, *, branch="agent/issue-11", repository="shop/store")
     }
 
 
-def test_a_repositorys_own_open_pull_requests_join_by_branch():
-    """The card keeps its review row after the worker chat is gone (#1012)."""
-    from agentdeck.issue_context import IssueBacklog, RepositoryPulls, join_pending
-    from agentdeck.poller_ops import BoardScope, BoardView
+def _open_issue_list(*numbers, repository="shop/store"):
+    from agentdeck.issue_context import RepositoryIssues
 
-    scope = BoardScope(
-        instance="reference", org="shop", issue_repositories=("shop/store",)
+    return RepositoryIssues(
+        repository,
+        tuple(
+            IssueContext(
+                repository=repository, number=number, title="", url="", state="open"
+            )
+            for number in numbers
+        ),
+        present=True,
+        age_s=0.0,
     )
-    card = BoardCard(
-        repository="shop/store", number=11, status="In review", in_review=True
-    )
+
+
+def test_a_repositorys_own_open_pull_requests_join_by_branch():
+    """The issue keeps its pull request after the worker chat is gone (#1012)."""
+    from agentdeck.issue_context import IssueBacklog, RepositoryPulls, join_pending
+    from agentdeck.poller_ops import BoardView
+
+    scope = _scope()
     backlog = IssueBacklog(
-        board=BoardView(cards={card.identity: card}, scopes=(scope,)),
+        board=BoardView(scopes=(scope,)),
+        repositories=(_open_issue_list(11),),
         pulls=(RepositoryPulls("shop/store", (_backlog_pull(7),)),),
     )
 
-    view = join_pending(backlog, [])
-    strip = build_strip(view, [scope])
-
-    assert strip.review_count == 1
+    strip = build_strip(join_pending(backlog, []), [scope])
     assert strip.instances[0].cards[0].pull_number == 7
 
 
@@ -487,26 +423,22 @@ def test_an_unread_pull_request_list_makes_the_strip_partial():
     assert strip.complete is False
 
 
-def test_a_pull_request_on_an_unrelated_branch_is_not_joined_to_a_card():
+def test_a_pull_request_on_an_unrelated_branch_is_not_joined_to_an_issue():
     """Only an `issue-<n>` branch names an issue; nothing else is guessed."""
     from agentdeck.issue_context import IssueBacklog, RepositoryPulls, join_pending
-    from agentdeck.poller_ops import BoardScope, BoardView
+    from agentdeck.poller_ops import BoardView
 
-    scope = BoardScope(
-        instance="reference", org="shop", issue_repositories=("shop/store",)
-    )
-    card = BoardCard(
-        repository="shop/store", number=11, status="In review", in_review=True
-    )
+    scope = _scope()
     backlog = IssueBacklog(
-        board=BoardView(cards={card.identity: card}, scopes=(scope,)),
+        board=BoardView(scopes=(scope,)),
+        repositories=(_open_issue_list(11),),
         pulls=(
             RepositoryPulls("shop/store", (_backlog_pull(7, branch="feat/rewrite"),)),
         ),
     )
 
     strip = build_strip(join_pending(backlog, []), [scope])
-    # The card is still listed — it just carries no pull request, because none
+    # The issue is still listed — it just carries no pull request, because none
     # was matched rather than because one was guessed.
     assert strip.card_count == 1
     assert strip.instances[0].cards[0].has_pull is False
@@ -543,217 +475,20 @@ def test_an_absent_pull_request_cache_is_still_unknown(tmp_path):
     assert entry.reason == "GitHub pull requests are not cached"
 
 
-def _card_with_link(number=11, *, url, repository="shop/store"):
-    return BoardCard(
-        repository=repository,
-        number=number,
-        status="In review",
-        in_review=True,
-        pull_request_url=url,
-    )
-
-
-def test_the_pull_request_the_worker_reported_is_used_across_repositories():
-    """The engine wrote it from the worker's own words — no API, no guess (#1031)."""
-    from agentdeck.issue_context import IssueBacklog, RepositoryPulls, join_pending
-    from agentdeck.poller_ops import BoardScope, BoardView
-
-    scope = BoardScope(
-        instance="reference",
-        org="shop",
-        issue_repositories=("shop/issues", "shop/store"),
-    )
-    card = _card_with_link(
-        91, url="https://github.com/shop/store/pull/2889", repository="shop/issues"
-    )
-    backlog = IssueBacklog(
-        board=BoardView(cards={card.identity: card}, scopes=(scope,)),
-        pulls=(
-            RepositoryPulls("shop/issues", ()),
-            RepositoryPulls(
-                "shop/store",
-                (_backlog_pull(2889, branch="claude/whatever", repository="shop/store"),),
-            ),
-        ),
-    )
-
-    strip = build_strip(join_pending(backlog, []), [scope])
-    row = strip.instances[0].cards[0]
-    assert row.pull_number == 2889
-    assert row.pull_url.endswith("/pull/2889")
-
-
-def test_a_reported_pull_request_that_closed_is_not_shown():
-    """The card keeps the link forever; only the open list decides (#1031)."""
-    from agentdeck.issue_context import IssueBacklog, RepositoryPulls, join_pending
-    from agentdeck.poller_ops import BoardScope, BoardView
-
-    scope = BoardScope(
-        instance="reference",
-        org="shop",
-        issue_repositories=("shop/issues", "shop/store"),
-    )
-    card = _card_with_link(
-        91, url="https://github.com/shop/store/pull/2889", repository="shop/issues"
-    )
-    backlog = IssueBacklog(
-        board=BoardView(cards={card.identity: card}, scopes=(scope,)),
-        pulls=(RepositoryPulls("shop/issues", ()), RepositoryPulls("shop/store", ())),
-    )
-
-    strip = build_strip(join_pending(backlog, []), [scope])
-    assert strip.instances[0].cards[0].has_pull is False
-
-
-def test_a_reported_pull_request_is_not_claimed_from_an_unread_list():
-    """An unread list is unknown, so absence there proves nothing (#1031)."""
-    from agentdeck.issue_context import IssueBacklog, RepositoryPulls, join_pending
-    from agentdeck.poller_ops import BoardScope, BoardView
-
-    scope = BoardScope(
-        instance="reference", org="shop", issue_repositories=("shop/issues",)
-    )
-    card = _card_with_link(
-        91, url="https://github.com/shop/store/pull/2889", repository="shop/issues"
-    )
-    backlog = IssueBacklog(
-        board=BoardView(cards={card.identity: card}, scopes=(scope,)),
-        pulls=(
-            RepositoryPulls("shop/issues", ()),
-            RepositoryPulls("shop/store", (), False, "not cached"),
-        ),
-    )
-
-    strip = build_strip(join_pending(backlog, []), [scope])
-    assert strip.instances[0].cards[0].has_pull is False
-    assert strip.complete is False
-
-
-def test_a_card_whose_issue_is_closed_is_not_listed():
-    """The board outlived the work — issues#138 sat in In progress, closed (#1033)."""
-    from agentdeck.issue_context import IssueBacklog, RepositoryIssues, join_pending
-    from agentdeck.poller_ops import BoardScope, BoardView
-
-    scope = BoardScope(
-        instance="reference", org="shop", issue_repositories=("shop/store",)
-    )
-    card = BoardCard(repository="shop/store", number=11, status="In progress")
-    backlog = IssueBacklog(
-        board=BoardView(cards={card.identity: card}, scopes=(scope,)),
-        # Read whole and just now, and 11 is not in it, so 11 is closed.
-        repositories=(RepositoryIssues("shop/store", (), present=True, age_s=0.0),),
-    )
-
-    strip = build_strip(join_pending(backlog, []), [scope])
-    assert strip.empty
-
-
-def test_an_unreadable_issue_list_does_not_retire_a_card():
-    """Absence from a list nobody could read is unknown, not closed (#1033)."""
-    from agentdeck.issue_context import IssueBacklog, RepositoryIssues, join_pending
-    from agentdeck.poller_ops import BoardScope, BoardView
-
-    scope = BoardScope(
-        instance="reference", org="shop", issue_repositories=("shop/store",)
-    )
-    card = BoardCard(repository="shop/store", number=11, status="In progress")
-    backlog = IssueBacklog(
-        board=BoardView(cards={card.identity: card}, scopes=(scope,)),
-        repositories=(RepositoryIssues("shop/store", (), False, "not cached"),),
-    )
-
-    strip = build_strip(join_pending(backlog, []), [scope])
-    assert strip.card_count == 1
-
-
-def test_a_truncated_issue_list_does_not_retire_a_card():
-    """The list stops at 100 open issues; number 101 is not closed (#1033)."""
-    from agentdeck.issue_context import (
-        IssueBacklog,
-        IssueContext,
-        IssueResolver,
-        RepositoryIssues,
-        join_pending,
-    )
-    from agentdeck.poller_ops import BoardScope, BoardView
-
-    scope = BoardScope(
-        instance="reference", org="shop", issue_repositories=("shop/store",)
-    )
-    card = BoardCard(repository="shop/store", number=11, status="In progress")
-    full_page = tuple(
-        IssueContext(
-            repository="shop/store",
-            number=number,
-            title="",
-            url="",
-            state="open",
-        )
-        for number in range(1000, 1000 + IssueResolver.MAX_ISSUES)
-    )
-    backlog = IssueBacklog(
-        board=BoardView(cards={card.identity: card}, scopes=(scope,)),
-        repositories=(
-            RepositoryIssues("shop/store", full_page, True, "", True, True, 0.0),
-        ),
-    )
-
-    strip = build_strip(join_pending(backlog, []), [scope])
-    assert strip.card_count == 1
-
-
-def test_a_minutes_old_issue_list_still_retires_a_closed_card():
-    """Only the 15-minute sweep refreshes a 5-minute cache, so waiting for a
-    fresh list would leave the card up for most of every cycle (#1035)."""
-    from agentdeck.issue_context import IssueBacklog, RepositoryIssues, join_pending
-    from agentdeck.poller_ops import BoardScope, BoardView
-
-    scope = BoardScope(
-        instance="reference", org="shop", issue_repositories=("shop/store",)
-    )
-    card = BoardCard(repository="shop/store", number=11, status="In progress")
-    stale = RepositoryIssues(
-        "shop/store", (), False, "GitHub issue cache is stale", False, True, 600.0
-    )
-    backlog = IssueBacklog(
-        board=BoardView(cards={card.identity: card}, scopes=(scope,)),
-        repositories=(stale,),
-    )
-
-    strip = build_strip(join_pending(backlog, []), [scope])
-    assert strip.empty
-
-
 def _rotten_backlog(age_s: float):
-    """A board with one live card and an issue list that old."""
+    """A board-less project whose issue list is that old."""
     from agentdeck.issue_context import IssueBacklog, RepositoryIssues
-    from agentdeck.poller_ops import BoardScope, BoardView
+    from agentdeck.poller_ops import BoardView
 
-    scope = BoardScope(
-        instance="reference", org="shop", issue_repositories=("shop/store",)
-    )
-    card = BoardCard(repository="shop/store", number=11, status="In progress")
+    scope = _scope()
     return scope, IssueBacklog(
-        board=BoardView(cards={card.identity: card}, scopes=(scope,)),
+        board=BoardView(scopes=(scope,)),
         repositories=(
             RepositoryIssues(
                 "shop/store", (), False, "GitHub issue cache is stale", False, True, age_s
             ),
         ),
     )
-
-
-def test_a_days_old_issue_list_does_not_retire_a_card():
-    """The live deck's whole agentdeck instance vanished this way: the refresher
-    was off, the lists went days old, and every card filed since read as a closed
-    issue (#1115)."""
-    from agentdeck.issue_context import join_pending
-
-    scope, backlog = _rotten_backlog(5 * 24 * 3600.0)
-
-    strip = build_strip(join_pending(backlog, []), [scope])
-    assert strip.card_count == 1
-    assert strip.instances[0].instance == "reference"
 
 
 def test_a_days_old_issue_list_makes_the_strip_say_partial():
@@ -768,19 +503,7 @@ def test_a_days_old_issue_list_makes_the_strip_say_partial():
     assert any("shop/store" in entry for entry in strip.unknown)
 
 
-def test_an_hour_old_issue_list_is_the_boundary():
-    """Well past any normal refresh cycle, well short of no longer being evidence."""
-    from agentdeck.issue_context import IssueBacklog, join_pending
-
-    horizon = IssueBacklog.CLOSURE_HORIZON_S
-    scope, inside = _rotten_backlog(horizon - 1)
-    assert build_strip(join_pending(inside, []), [scope]).empty
-
-    scope, outside = _rotten_backlog(horizon + 1)
-    assert build_strip(join_pending(outside, []), [scope]).card_count == 1
-
-
-# --- the way into the chat working a card (#1694) ------------------------
+# --- the way into the chat working an issue (#1694) ------------------------
 
 
 def _session(key, title="working it"):
@@ -809,8 +532,8 @@ def _render_strip(row):
     )
 
 
-def test_a_card_with_a_chat_carries_the_way_into_it():
-    """#1694: the chat working a card is one press from the card."""
+def test_an_issue_with_a_chat_carries_the_way_into_it():
+    """#1694: the chat working an issue is one press from it."""
     item = _item(11, sessions=[_session("claude_code:main:abc")])
     row = build_strip(_view(item), [_scope()]).instances[0].cards[0]
     assert row.has_session is True
@@ -819,7 +542,7 @@ def test_a_card_with_a_chat_carries_the_way_into_it():
     assert row.session_title == "working it"
 
 
-def test_a_card_with_no_chat_offers_nothing_to_open():
+def test_an_issue_with_no_chat_offers_nothing_to_open():
     row = build_strip(_view(_item(11)), [_scope()]).instances[0].cards[0]
     assert row.has_session is False
     assert row.session_path == ""
@@ -845,13 +568,6 @@ def test_the_chat_link_comes_from_the_callers_own_resolver():
     )
     row = strip.instances[0].cards[0]
     assert row.session_path == "/chats/chat-for-claude_code:main:abc"
-
-
-def test_a_boardless_projects_own_issue_rows_carry_their_chat_too():
-    """The issue is the card there, so it gets the same way in (#1691, #1694)."""
-    item = _item(11, card=False, sessions=[_session("claude_code:main:abc")])
-    row = build_strip(_view(item), [_scope(boardless=True)]).instances[0].cards[0]
-    assert row.session_path == "/sessions/claude_code:main:abc"
 
 
 def test_the_dashboard_resolves_chat_links_from_one_snapshot(app_client):

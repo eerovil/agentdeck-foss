@@ -207,20 +207,15 @@ def _index_rows(
         )
         if item.work is not None:
             source = f"{item.work.issue.repository}#{item.work.issue.number}"
-        elif item.card is not None:
-            source = f"{item.card.repository}#{item.card.number}"
         else:  # only the durable inventory still names it
             source = item.ref.source_key
-        status = ""
-        if item.card is not None:
-            status = "done" if item.card.done else str(item.card.status or "")
         row = WorkIndexRow(
             work_id=item.ref.work_id,
             href=work_href(item.ref.work_id),
             title=title or source,
             source_label=source,
             repository=source.rpartition("#")[0],
-            work_state=status or issue_state,
+            work_state=issue_state,
             chat_count=len(members),
             last_activity=item.last_activity,
         )
@@ -360,9 +355,7 @@ async def works_index(
     buckets = bucket_works(candidates, now=datetime.now(UTC))
     context: dict = {"view": view}
     # Only this view reads the whole inventory: it is what the operator asked to see.
-    archived = archived_works(
-        buckets, work_inventory(snapshot.state.db), board=snapshot.board
-    )
+    archived = archived_works(buckets, work_inventory(snapshot.state.db))
     context["archived_count"] = len(archived)
     rows = _index_rows(snapshot, archived, records=_cached_issues(request.app, archived))
     repositories = sorted({row.repository for row in rows}, key=str.casefold)
@@ -2296,7 +2289,7 @@ async def work_visibility(request: Request, work_id: str) -> HTMLResponse:
                 state="refused",
                 status_code=409,
             )
-        done = db.hide_work(ref.work_id, detail.card.comments, detail.card.card_mark)
+        done = db.hide_work(ref.work_id, detail.card.comments)
         text = (
             "Archived from Recently finished."
             if finished

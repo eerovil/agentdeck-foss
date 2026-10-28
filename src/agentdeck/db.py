@@ -555,8 +555,8 @@ CREATE TABLE IF NOT EXISTS work_actions (
 CREATE INDEX IF NOT EXISTS idx_work_actions_work ON work_actions(work_id, reserved_at);
 -- One row per Work the operator hid from Needs you (#2238). A display preference of this
 -- deck only: nothing on GitHub or the board changes. ``comments`` is the source issue's
--- comment count and ``card_mark`` the Poller card's fingerprint (``work_hidden.card_mark``)
--- when it was hidden; either moving on expires the row. NULL is "not known then".
+-- comment count when it was hidden; a new comment expires the row. NULL is "not known then".
+-- ``card_mark`` was a Poller card's fingerprint (#3741 removed the cards): no longer written.
 CREATE TABLE IF NOT EXISTS work_hidden (
     work_id TEXT PRIMARY KEY,
     hidden_at TEXT NOT NULL,
@@ -3681,14 +3681,14 @@ class Db:
             return ()
         return tuple(self._work_action_press(row) for row in rows)
 
-    def hide_work(self, work_id: str, comments: int | None, card_mark: str | None) -> bool:
+    def hide_work(self, work_id: str, comments: int | None) -> bool:
         """Hide a Work from Needs you (#2238); hiding it again re-marks it. False on failure."""
         try:
             with self._lock, self._conn:
                 self._conn.execute(
-                    "INSERT OR REPLACE INTO work_hidden (work_id, hidden_at, comments, card_mark)"
-                    " VALUES (?, ?, ?, ?)",
-                    (work_id, datetime.now(UTC).isoformat(), comments, card_mark),
+                    "INSERT OR REPLACE INTO work_hidden (work_id, hidden_at, comments)"
+                    " VALUES (?, ?, ?)",
+                    (work_id, datetime.now(UTC).isoformat(), comments),
                 )
         except sqlite3.Error as exc:
             log.debug("work hide failed: %s", exc)
@@ -3728,7 +3728,7 @@ class Db:
         try:
             with self._lock:
                 rows = self._conn.execute(
-                    "SELECT work_id, hidden_at, comments, card_mark FROM work_hidden"
+                    "SELECT work_id, hidden_at, comments FROM work_hidden"
                 ).fetchall()
         except sqlite3.Error as exc:
             log.debug("work hide read failed: %s", exc)
@@ -3738,7 +3738,6 @@ class Db:
                 str(row[0]),
                 str(row[1]),
                 int(row[2]) if row[2] is not None else None,
-                str(row[3]) if row[3] is not None else None,
             )
             for row in rows
         }

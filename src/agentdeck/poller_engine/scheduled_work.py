@@ -29,7 +29,7 @@ import hashlib
 from datetime import datetime, timedelta
 
 from . import authorization as auth
-from . import queue, schedules
+from . import schedules
 from .ports import CommentBody, Effect, EffectKind, EnginePort
 from .state import StateStore
 
@@ -120,7 +120,7 @@ def _writer_verdict(policy: auth.Policy, port: EnginePort, task: schedules.TaskI
         return auth.Verdict.DENIED
     if policy.bot and login in {policy.bot, policy.bot.removesuffix("[bot]")}:
         return auth.Verdict.AUTHORIZED
-    if queue.is_bot_login(login):
+    if auth.is_bot_login(login):
         return auth.Verdict.DENIED
     return auth.decide(
         policy, auth.Tier.WORK, login=login, permission=port.permission(task.repo, login)

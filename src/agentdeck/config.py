@@ -62,7 +62,7 @@ class PollerConfig(BaseModel):
 
     root: str = Field(default_factory=_default_poller_root)
     # The wake interval instance freshness is judged against: the poller timer's
-    # `OnUnitInactiveSec` (`poller_engine.queue.WAKE_INTERVAL_S`, 120 s since #3010).
+    # `OnUnitInactiveSec` (`poller_engine.health.WAKE_INTERVAL_S`, 120 s since #3010).
     interval_s: int = 120
     # How often the deck refreshes the declared repositories' issue and pull
     # request lists into the shared GitHub cache. The board strip reads that
@@ -307,8 +307,7 @@ class ClaudeWorkersConfig(BaseModel):
     )
     # Collect a live worker that has been quiet this long, whatever its role; 0
     # disables. Unlike max_workers this is not admission pressure — nothing has to
-    # want the slot — so it is the only thing that ever collects a kanban root,
-    # which holds no account-local slot and is never an admission victim (#1226).
+    # want the slot — so it collects a worker nobody competes with (#1226).
     # The worker's durable record survives, so its chat revives on next delivery.
     idle_after_s: float = 6 * 60 * 60
     # Spawn workers with `--permission-prompt-tool stdio` so AskUserQuestion and
@@ -389,7 +388,6 @@ class KeyedWorkersConfig(BaseModel):
 
     state_dir: str = "~/.local/share/agentdeck/keyed-workers"
     usage_ceiling_pct: float = 0.0
-    max_kanban_workers: int = 4
     # Opt-in: run each Codex app-server as a persistent `--listen` backend reached
     # through a `codex app-server proxy`, so in-flight interactions survive a runtime
     # restart. Off by default because that proxy/--listen path currently hangs on
@@ -415,13 +413,6 @@ class KeyedWorkersConfig(BaseModel):
     def _usage_ceiling_range(cls, value: float) -> float:
         if not 0 <= value <= 100:
             raise ValueError("keyed_workers.usage_ceiling_pct must be between 0 and 100")
-        return value
-
-    @field_validator("max_kanban_workers")
-    @classmethod
-    def _non_negative_max_kanban_workers(cls, value: int) -> int:
-        if value < 0:
-            raise ValueError("keyed_workers.max_kanban_workers must be non-negative")
         return value
 
     @property

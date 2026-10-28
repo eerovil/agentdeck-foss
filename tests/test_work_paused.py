@@ -1,9 +1,9 @@
-"""A paused Work (#2548): a person's Pause puts the Poller's paused label on the issue.
+"""A paused Work (#2548): its issue carries its project's paused label, or the deck holds it.
 
-The label is the whole state. The engine reads it on its next wake and starts nothing on the
-card; the deck reads it from its cached issue (the webhook keeps it current within seconds),
-falling back to the engine's own reading, and lists the Work under Paused until Resume takes
-the label off. A closed issue wins over a pause.
+The label is the whole state. The deck reads it from its cached issue (the webhook keeps it
+current within seconds) and lists the Work under Paused until Resume takes the label off. A
+Work paused on the deck itself (#2559) is held in the control DB instead. A closed issue wins
+over a pause.
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ from dataclasses import replace
 
 import pytest
 from test_work_actions import _Gh
-from test_work_ui import WORK, _app, _board, _card
+from test_work_ui import WORK, _app
 
 from agentdeck import gh_cli
 from agentdeck.work_actions import (
@@ -25,30 +25,26 @@ from agentdeck.work_actions import (
     pause_refusal,
     plan,
 )
-from agentdeck.work_overview import is_paused, work_href
+from agentdeck.work_overview import work_href
 from agentdeck.work_story import PAUSED, front_sections
 
 LABEL = "paused"
 
 
-def _board_card(**fields):
-    fields.setdefault("status_role", "in_progress")
-    fields.setdefault("generation", "gen-2")
-    fields.setdefault("started", True)
-    fields.setdefault("paused_label", LABEL)
-    return _card(**fields)
+def _deck(tmp_path, monkeypatch, *, labels=None, gh=None):
+    """A Work whose project's manifest names ``LABEL`` as its paused label (#2944), read
+    through the deck's own cached issue record."""
+    from agentdeck.web import routes_works, work_view
 
-
-def _deck(tmp_path, monkeypatch, *, labels=None, gh=None, **fields):
-    """A Work read through the deck's own board and cached issue record."""
-    from agentdeck.web import routes_works
-
-    card = _board_card(**fields)
-    app = _app(tmp_path, board=_board(card))
+    app = _app(tmp_path)
+    monkeypatch.setattr(work_view, "_deck_paused_label", lambda _app, _repository: LABEL)
     record = {"title": "Pause me", "state": "open", "is_pr": False, "comments": 1}
     if labels is not None:
         record["labels"] = labels
     app.state.issues.cached_issues = lambda refs: {(WORK.repository, WORK.number): record}
+    from test_work_ui import _add
+
+    _add(app, "claude_code:test:worker", WORK, thinking=True)
     gh = gh or _Gh((0, b"", b""))
     monkeypatch.setattr(gh_cli, "run_once", gh)
     monkeypatch.setattr(routes_works.shutil, "which", lambda name: "/usr/bin/gh")
@@ -73,26 +69,6 @@ def _ids(rows):
 
 
 # --- reading it ----------------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    ("record", "engine", "label", "expected"),
-    [
-        ({"labels": ["agent", "Paused"]}, False, LABEL, True),  # the cache is read first
-        ({"labels": ["agent"]}, True, LABEL, False),  # ...and a removed label resumes at once
-        ({"title": "cached before labels were"}, True, LABEL, True),  # the engine's reading
-        ({"title": "cached before labels were"}, False, LABEL, False),
-        ({"labels": ["paused"]}, True, "", False),  # an instance with no label pauses nothing
-        (None, True, LABEL, True),
-    ],
-)
-def test_the_cached_issue_says_whether_a_work_is_paused(record, engine, label, expected):
-    card = _board_card(paused=engine, paused_label=label)
-    assert is_paused(card, record) is expected
-
-
-def test_no_card_is_never_paused():
-    assert is_paused(None, {"labels": [LABEL]}) is False
 
 
 # --- through the deck ----------------------------------------------------------------------------
@@ -212,13 +188,14 @@ async def test_any_unfinished_work_may_be_paused_on_the_deck(tmp_path, monkeypat
 
 @pytest.mark.asyncio
 async def test_a_closed_issue_wins_over_a_pause(tmp_path, monkeypatch):
-    app, record, _gh = _deck(tmp_path, monkeypatch, labels=[LABEL], done=True)
+    app, record, _gh = _deck(tmp_path, monkeypatch, labels=[LABEL])
     record.update(state="closed", closedAt="2026-09-30T10:00:00Z")
 
     overview = await app.state.work_overview.current()
 
     assert overview.front.paused == ()
-    assert all(not row.card.paused for row in (*overview.front.needs_you, *overview.front.finished))
+    rows = (*overview.front.needs_you, *overview.front.finished)
+    assert [row.status.tone for row in rows] == ["done"]
 
 
 def test_paused_rows_leave_every_other_section(tmp_path, monkeypatch):

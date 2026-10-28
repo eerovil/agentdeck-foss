@@ -46,7 +46,6 @@ fallback_accounts = ["codex:codex", "claude_code:alt"]
 # states its portable settings; a credential path can only be answered here, which is what keeps
 # the Manifest copyable and keeps rotating a token from being a re-activation.
 #
-
 # Nothing else here for the Reference Project, which enables no extension needing a credential:
 #
 #   [extensions.sentry-autofix]

@@ -465,10 +465,17 @@ def test_the_host_may_override_a_setting_but_not_enable_an_extension(tmp_path):
 
     # Enabling is the project's decision — a host block for an extension the Manifest never
     # enabled would switch something on that nobody reading the Manifest can see.
-    unknown = _OVERLAY + '\n[extensions.deploy-watch]\nservice = "x.service"\n'
+    unknown = _OVERLAY + '\n[extensions.made-up]\nservice = "x.service"\n'
     draft = _inspect(tmp_path, overlay=unknown)
-    assert "overlay.extensions.deploy-watch" in _locations(draft)
-    assert "deploy-watch" not in config.effective_extensions(draft.manifest, draft.overlay)
+    assert "overlay.extensions.made-up" in _locations(draft)
+    assert "made-up" not in config.effective_extensions(draft.manifest, draft.overlay)
+
+    # A retired extension's leftover host block (#3741) switches nothing on, so it is ignored:
+    # the Manifest that dropped it still applies over an Overlay not yet cleaned.
+    leftover = _OVERLAY + '\n[extensions.chatgpt-nudge]\nstate_file = "~/s.json"\n'
+    draft = _inspect(tmp_path, overlay=leftover)
+    assert draft.ok, draft.report.render()
+    assert "chatgpt-nudge" not in config.effective_extensions(draft.manifest, draft.overlay)
 
 
 def test_an_extension_validates_the_settings_it_will_actually_run_with(tmp_path):
@@ -571,19 +578,15 @@ def test_the_fallback_order_always_starts_with_the_primary_account(tmp_path):
     assert overlay.usage_cache == "/run/user/1000/agentdeck"
 
 
-def test_a_deck_leaving_unassigned_issues_to_another_must_not_run_cards(tmp_path):
-    """#3731: ``[claims] unassigned = false`` needs the deck, not the Poller, to start Works,
-    so a second deck's Poller never seeds or moves a shared board's cards."""
+def test_a_deck_may_leave_unassigned_issues_to_another(tmp_path):
+    """#3731: ``[claims] unassigned = false`` needs no manifest switch since #3732, because no
+    deck's Poller runs cards any more; only a value that is not a boolean is refused."""
     claims = _OVERLAY + "\n[claims]\nunassigned = false\n"
     assert _inspect(tmp_path).overlay.claims_unassigned is True
-    refused = _inspect(tmp_path, overlay=claims)
-    assert refused.overlay.claims_unassigned is False
-    assert "overlay.claims.unassigned" in _locations(refused)
-    switched = _MANIFEST.replace("release = true", "release = true\nworks_router = true")
-    assert "overlay.claims.unassigned" not in _locations(
-        _inspect(tmp_path, manifest=switched, overlay=claims)
-    )
-    wrong = _inspect(tmp_path, manifest=switched, overlay=claims.replace("false", '"no"'))
+    accepted = _inspect(tmp_path, overlay=claims)
+    assert accepted.overlay.claims_unassigned is False
+    assert "overlay.claims.unassigned" not in _locations(accepted)
+    wrong = _inspect(tmp_path, overlay=claims.replace("false", '"no"'))
     assert "overlay.claims.unassigned" in _locations(wrong)
 
 

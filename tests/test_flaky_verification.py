@@ -17,14 +17,9 @@ import sys
 from pathlib import Path
 
 import pytest
-from poller_engine_fakes import NOW as _NOW
-from poller_engine_fakes import FakePort, run_wake, store_for
 
 from agentdeck.jobs import VERIFICATION
 from agentdeck.poller_engine import flaky
-from agentdeck.poller_engine.cycle import _forgiven_on
-from agentdeck.poller_engine.ports import EffectKind
-from agentdeck.poller_engine.reconcile import CardSnapshot
 from agentdeck.poller_engine.verification import credited_head, forgiven_tests
 from agentdeck.run_evidence import RunEvidenceLedger
 from agentdeck.work_overview import summarize_verification
@@ -398,92 +393,6 @@ def test_the_queue_reads_which_failing_tests_the_merge_base_already_has(tmp_path
     assert _failures_present_on_base(
         SimpleNamespace(log_path=str(log), cwd=str(repo), tested_workspace={})
     ) is None
-
-
-# --- the poller credits it; the runtime quarantines and files (#3055) ------------------
-
-
-def _card_port(jobs: dict, **kwargs) -> FakePort:
-    return FakePort(snapshots={"store#5": CardSnapshot(status="In progress")}, jobs=jobs,
-                    **kwargs)
-
-
-def _card_state(extra=None) -> dict:
-    rec = {"status": "In progress", "generation": "gen-1", "processing": ["9"]}
-    rec.update(extra or {})
-    return {
-        "issues": {"store#5": rec},
-        "controls": {"9": {"id": "9", "repo": "store", "number": 5, "kind": "claude",
-                           "payload": "do the thing", "status": "processing",
-                           "created_at": "x"}},
-    }
-
-
-def test_the_poller_credits_a_forgiven_run_and_files_no_issue_itself(tmp_path):
-    port = _card_port({"v": _verification_row(), "r": _rerun_row()}, opened=[77])
-    store = store_for(tmp_path, _card_state())
-
-    outcome = run_wake(store, port, now=_NOW)
-
-    state = store.read()
-    rec = state["issues"]["store#5"]
-    assert "h" in rec["release_tests_pass"]
-    assert _forgiven_on(port, rec, key="store#5", heads={"store#6": "h"})[0]["test"] == FLAKE
-    assert any("forgiven 1 failing test(s)" in line for line in outcome.log)
-    # The runtime's quarantine files the fix issue now, for Works and cards alike.
-    assert port.opened_calls == []
-    assert "test_fix_issues" not in state
-
-
-# --- a card parked on an issue nobody works on says so --------------------------------
-
-
-def test_a_card_blocked_on_an_unlabelled_open_issue_says_nothing_is_working_on_it(tmp_path):
-    state = {
-        "issues": {"store#5": {"status": "Blocked", "blocked_until": ["store#9"]}},
-    }
-    port = FakePort(
-        snapshots={"store#5": CardSnapshot(status="Blocked")},
-        ref_states={"store#9": "OPEN"},
-    )
-    store = store_for(tmp_path, state)
-
-    run_wake(store, port, now=_NOW)
-    run_wake(store, port, now=_NOW)
-
-    notes = [
-        effect for effect in port.applied
-        if effect.kind is EffectKind.COMMENT and "Nothing is working on" in str(effect.value)
-    ]
-    assert len(notes) == 1, "said once, not every wake"
-    assert "`store#9`" in str(notes[0].value)
-    labels = [effect for effect in port.applied if effect.kind is EffectKind.ADD_OWNERSHIP]
-    assert labels == [], "the engine never labels someone else's issue"
-
-
-def test_a_card_blocked_on_a_card_the_poller_holds_gets_no_such_note(tmp_path):
-    state = {
-        "issues": {
-            "store#5": {"status": "Blocked", "blocked_until": ["store#9"]},
-            "store#9": {"status": "In progress"},
-        },
-    }
-    port = FakePort(
-        snapshots={
-            "store#5": CardSnapshot(status="Blocked"),
-            "store#9": CardSnapshot(status="In progress"),
-        },
-        ref_states={"store#9": "OPEN"},
-    )
-    store = store_for(tmp_path, state)
-
-    run_wake(store, port, now=_NOW)
-
-    assert not any(
-        "Nothing is working on" in str(effect.value)
-        for effect in port.applied
-        if effect.kind is EffectKind.COMMENT
-    )
 
 
 # --- the queue brings the evidence itself (review of #2386) ---------------------------
@@ -906,18 +815,3 @@ def test_a_pinned_checkout_is_made_detached_and_removed_again(tmp_path, prefix):
     assert repo.exists()
     with pytest.raises(JobError):
         _pinned_checkout(str(repo), sha, "issue-")
-
-
-def test_the_release_comment_reads_the_forgiven_tests_off_the_verification_that_made_it_green():
-    port = FakePort(jobs={
-        "v": _verification_row(),
-        "r": _rerun_row(),
-        "other": _verification_row(id="other", run_id="gen-0", work_id="github_issue:org/x#1"),
-    })
-    rec = {"generation": "gen-1"}
-
-    forgiven = _forgiven_on(port, rec, key="store#5", heads={"store#6": "h"})
-
-    assert [item["test"] for item in forgiven] == [FLAKE]
-    assert "flaky: a rerun on the same commit h passed it (job r)" in flaky.describe(forgiven)
-    assert _forgiven_on(port, rec, key="store#5", heads={"store#6": "moved"}) == []

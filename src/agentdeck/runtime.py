@@ -10,7 +10,7 @@ import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
@@ -22,20 +22,6 @@ from . import work_workspace_claims as work_claims
 from .command_artifacts import ArtifactError, ArtifactStore
 from .config import AppConfig, owned_session_base_url
 from .db import Db, open_db
-from .delivery_scheduling import (
-    ROUTING_UNAVAILABLE,
-    Placement,
-    Selector,
-    deliver_scheduled,
-)
-from .ensure_delivery import (
-    ENSURE_DELIVERY_CONTRACT,
-    ENSURE_DELIVERY_PATH,
-    PRIOR_RUN_EXECUTING,
-    EnsureDeliveryRequest,
-    ensure_delivery,
-    resumes_behind_its_chat,
-)
 from .flaky_quarantine import FILENAME as QUARANTINE_FILENAME
 from .flaky_quarantine import Quarantine
 from .host_slots import MemoryGate, describe_heavy_slots, heavy_slot_paths
@@ -62,7 +48,7 @@ from .providers.delivery import (
     SessionDeliveryFence,
     delivery_participated,
 )
-from .providers.instructions import SessionRole, resolve_session_role
+from .providers.instructions import SessionRole
 from .providers.usage import shared_cache_dir
 from .restart_nudge import (
     NUDGE_MESSAGE,
@@ -393,15 +379,6 @@ class ClaudeBlockRequest(BaseModel):
     reason: str = ""
 
 
-class WorkerSessionReviveRequest(ActionRequest):
-    session_id: str
-    message: str
-    images: list[str] = Field(default_factory=list)
-    effort: str | None = None
-    delivery_id: str | None = None
-    expected_last_result_at: float
-
-
 class WorkerAnswerRequest(ActionRequest):
     key: str
     interaction_id: str
@@ -431,10 +408,9 @@ class ClaudeWorkerRuntime:
     async def start(self) -> None:
         """Begin collecting idle workers on a timer.
 
-        A worker is only ever reclaimed under admission pressure, which never
-        arrives for a kanban root (it holds no account-local slot). Without a timer
-        nothing collects one at all — 39 of them sat live for up to 20 days holding
-        ~300 MB each (#1226).
+        A worker is otherwise only ever reclaimed under admission pressure, which a
+        fleet nobody competes with never feels. Without a timer nothing collects one
+        at all — 39 of them sat live for up to 20 days holding ~300 MB each (#1226).
         """
         if self._collect_task is None and self.settings.enabled:
             self._collect_task = asyncio.create_task(
@@ -875,214 +851,33 @@ class CodexWorkerRuntime:
         return {label: self.host(label) for label in self.runtime.accounts}
 
 
-# Host-wide admission for one chosen target, with the lock already held.
-Admit = Callable[
-    [str, str, DeliverRequest, Callable[[], Awaitable[DeliverResult]]], Awaitable[DeliverResult]
-]
+class WorkerDeliveries:
+    """Every keyed-worker host this runtime drives, and the lock deliveries take (#2159).
 
+    A delivery that names no Run of its own — a restart revival, a job notice — checks the
+    Run stop fence and writes under this lock, and a Run stop parks its worker under it too,
+    so such a delivery either lands before the park or sees the stop and is refused.
+    Once also the host-wide ceiling on the poller's ``kanban`` roots, removed in #3741.
+    """
 
-class KanbanCapacity:
-    """Race-safe host-wide admission for active provider-neutral kanban roots."""
-
-    def __init__(
-        self,
-        *,
-        limit: int,
-        workers: dict[str, Any],
-    ) -> None:
-        self.limit = limit
-        # provider_id -> a worker runtime exposing ``all_hosts()``. Keyed rather
-        # than one named argument per provider: the ceiling is host-wide and
-        # provider-neutral by definition, so adding a provider must not mean
-        # editing an admission signature (#722).
+    def __init__(self, *, workers: dict[str, Any]) -> None:
+        # provider_id -> a worker runtime exposing ``all_hosts()``. Keyed rather than one
+        # named argument per provider, so adding a provider changes no signature (#722).
         self.workers = workers
         self._lock = asyncio.Lock()
-        # An uncertain provider result may have started a turn that is not observable yet.
-        # Retain that slot until positive activity, terminal, release, or forget evidence
-        # resolves the ambiguity. Time alone is unsafe: a delayed write may still start.
-        self._reservations: dict[tuple[str, str, str], float] = {}
 
-    def _hosts(self) -> dict[tuple[str, str], KeyedWorkerHost]:
+    def hosts(self) -> dict[tuple[str, str], KeyedWorkerHost]:
+        """Every account host a delivery can reach, keyed ``(provider, label)``."""
         return {
             (provider, label): host
             for provider, runtime in self.workers.items()
             for label, host in runtime.all_hosts().items()
         }
 
-    @staticmethod
-    def _active(
-        hosts: dict[tuple[str, str], KeyedWorkerHost],
-    ) -> set[tuple[str, str, str]]:
-        return {
-            (provider, label, key)
-            for (provider, label), host in hosts.items()
-            for key in host.active_role_keys("kanban")
-        }
-
-    def _reconcile_reservations(
-        self,
-        hosts: dict[tuple[str, str], KeyedWorkerHost],
-        active: set[tuple[str, str, str]],
-        *,
-        now: float,
-    ) -> None:
-        for identity, reserved_at in list(self._reservations.items()):
-            provider, label, key = identity
-            if identity in active:
-                self._reservations.pop(identity, None)
-                continue
-            host = hosts.get((provider, label))
-            if host is None or host.role_last_result_at(key, "kanban") >= reserved_at:
-                self._reservations.pop(identity, None)
-
-    @staticmethod
-    def _active_reason(host: KeyedWorkerHost, key: str) -> str:
-        worker = host.snapshot().get("workers", {}).get(key, {})
-        background_count = int(worker.get("background_agent_count") or 0)
-        if background_count:
-            return f"background_agents={background_count}"
-        if worker.get("turn_active"):
-            return "turn"
-        return "active"
-
-    def _holder_descriptions(
-        self,
-        hosts: dict[tuple[str, str], KeyedWorkerHost],
-        active: set[tuple[str, str, str]],
-        *,
-        now: float,
-    ) -> list[str]:
-        holders = []
-        for provider, label, key in sorted(active | set(self._reservations)):
-            identity = (provider, label, key)
-            if identity in active:
-                reason = self._active_reason(hosts[(provider, label)], key)
-            else:
-                age_s = max(0.0, now - self._reservations[identity])
-                reason = f"reservation={age_s:.0f}s"
-            holders.append(f"{provider}:{label}:{key}({reason})")
-        return holders
-
-    async def deliver(
-        self,
-        provider: str,
-        label: str,
-        body: DeliverRequest,
-        send: Callable[[], Awaitable[DeliverResult]],
-    ) -> DeliverResult:
+    async def serialized(self, send: Callable[[], Awaitable[DeliverResult]]) -> DeliverResult:
+        """Run one delivery or lifecycle write under the shared lock."""
         async with self._lock:
-            return await self._admit(provider, label, body, send)
-
-    def hosts(self) -> dict[tuple[str, str], KeyedWorkerHost]:
-        """Every account host a delivery can reach, keyed ``(provider, label)``."""
-        return self._hosts()
-
-    async def schedule(self, run: Callable[[Admit], Awaitable[Any]]) -> Any:
-        """Hold admission while the scheduler selects, freezes and delivers (#2146).
-
-        ``run`` receives the admission check itself, to call once it has chosen a target. Taking
-        the choice and the slot under one lock is what keeps two deliveries from both being
-        placed against the last free slot.
-        """
-        async with self._lock:
-            return await run(self._admit)
-
-    async def _admit(
-        self,
-        provider: str,
-        label: str,
-        body: DeliverRequest,
-        send: Callable[[], Awaitable[DeliverResult]],
-    ) -> DeliverResult:
-        """Admission with the lock already held."""
-        if resolve_session_role(delegated=body.delegated, role=body.role) != "kanban":
             return await send()
-
-        identity = (provider, label, body.key)
-        hosts = self._hosts()
-        active = self._active(hosts)
-        now = time.time()
-        self._reconcile_reservations(hosts, active, now=now)
-        host = hosts.get((provider, label))
-        if host is None:
-            # A provider whose runtime is disabled reports no hosts, so its
-            # kanban roots cannot hold or be admitted to a slot; the caller's
-            # own route already 404s an unknown one.
-            return await send()
-        if host.delivery_is_finalized(body.key, body.delivery_id):
-            # A finalized replay returns its cached result and starts no new work.
-            return await send()
-        occupied = active | set(self._reservations)
-        if identity not in occupied and len(occupied) >= self.limit:
-            holders = self._holder_descriptions(hosts, active, now=now)
-            log.warning(
-                "at_capacity: refused %s:%s:%s; %d/%d kanban slots held by %s",
-                provider,
-                label,
-                body.key,
-                len(occupied),
-                self.limit,
-                ", ".join(holders) or "none (limit is zero)",
-            )
-            return DeliverResult(False, "rejected", reason="at_capacity")
-
-        created_reservation = identity not in self._reservations
-        reserved_at = self._reservations.setdefault(identity, time.time())
-        result = await send()
-        if (
-            not result.accepted
-            and created_reservation
-            and self._reservations.get(identity) == reserved_at
-        ):
-            self._reservations.pop(identity, None)
-        elif result.accepted:
-            active_after = self._active(hosts)
-            if identity in active_after or host.role_last_result_at(
-                body.key, "kanban"
-            ) >= reserved_at:
-                self._reservations.pop(identity, None)
-        return result
-
-    async def release(
-        self,
-        provider: str,
-        label: str,
-        key: str,
-        send: Callable[[], Awaitable[DeliverResult]],
-        inactive: Callable[[], bool] | None = None,
-    ) -> DeliverResult:
-        """Serialize lifecycle release with admission and return any reserved slot."""
-        async with self._lock:
-            return await self.release_held(provider, label, key, send, inactive)
-
-    async def release_held(
-        self,
-        provider: str,
-        label: str,
-        key: str,
-        send: Callable[[], Awaitable[DeliverResult]],
-        inactive: Callable[[], bool] | None = None,
-    ) -> DeliverResult:
-        """``release`` for a caller already holding the admission lock (#2159)."""
-        result = await send()
-        if result.accepted or (inactive is not None and inactive()):
-            self._reservations.pop((provider, label, key), None)
-        return result
-
-    async def forget(
-        self,
-        provider: str,
-        label: str,
-        key: str,
-        send: Callable[[], Awaitable[DeliverResult]],
-        known: Callable[[], bool],
-    ) -> DeliverResult:
-        """Serialize lineage removal with admission."""
-        async with self._lock:
-            result = await send()
-            if result.accepted or not known():
-                self._reservations.pop((provider, label, key), None)
-            return result
 
 
 class RestartNudges:
@@ -1112,7 +907,7 @@ class RestartNudges:
         *,
         session_runtimes: dict[str, Any],
         workers: dict[str, Any],
-        kanban_capacity: KanbanCapacity,
+        deliveries: WorkerDeliveries,
         budget_db: Any = None,
     ) -> None:
         self.registry = RestartNudgeRegistry(
@@ -1135,7 +930,7 @@ class RestartNudges:
         # no worker key. Each exposes nudge_session(label, session_id, entry).
         self._session_runtimes = session_runtimes
         self._workers = workers
-        self._kanban_capacity = kanban_capacity
+        self._deliveries = deliveries
         # Whether a worker row's Run has had a stop requested (#2159). Set once the Run
         # executions exist; a keyed delivery that names no Run of its own is refused for
         # such a worker, so a revival or a notice cannot resume a Run the Runtime stopped.
@@ -1777,15 +1572,8 @@ class RestartNudges:
         message: str,
         delivery_id: str,
     ) -> DeliverResult:
-        body = DeliverRequest(
-            key=key,
-            message=message,
-            delivery_id=delivery_id,
-            delegated=True,
-            role=role,
-        )
         async def send() -> DeliverResult:
-            # Checked under the admission lock, immediately before the write, which is the
+            # Checked under the delivery lock, immediately before the write, which is the
             # same lock a Run stop parks under: this delivery lands before the park, or it
             # sees the stop and is refused (#2159).
             fence = self.stop_fence
@@ -1805,7 +1593,7 @@ class RestartNudges:
                 automated=True,
             )
 
-        return await self._kanban_capacity.deliver(provider, label, body, send)
+        return await self._deliveries.serialized(send)
 
 
 def _paths(values: list[str]) -> list[Path]:
@@ -1971,15 +1759,12 @@ def create_runtime_app(config: AppConfig) -> FastAPI:
         "claude_code": claude_workers,
         "codex": codex_workers,
     }
-    kanban_capacity = KanbanCapacity(
-        limit=config.keyed_workers.max_kanban_workers,
-        workers=worker_runtimes,
-    )
+    deliveries = WorkerDeliveries(workers=worker_runtimes)
     restart_nudges = RestartNudges(
         config,
         session_runtimes={"codex": runtime},
         workers=worker_runtimes,
-        kanban_capacity=kanban_capacity,
+        deliveries=deliveries,
         budget_db=budget_db,
     )
     session_secrets = SessionSecretStore()
@@ -2010,22 +1795,14 @@ def create_runtime_app(config: AppConfig) -> FastAPI:
     # Run execution outcome and stop (#2159): whether a Run's concrete worker is still
     # running is this process's fact, keyed by the Work/Run the Poller already records.
     async def _park(provider: str, label: str, key: str) -> DeliverResult:
-        return await kanban_capacity.release(
-            provider, label, key, lambda: _worker_host(provider, label).park_worker(key)
-        )
-
-    async def _park_held(provider: str, label: str, key: str) -> DeliverResult:
-        """The same park, for a stop made while the admission lock is already held."""
-        return await kanban_capacity.release_held(
-            provider, label, key, lambda: _worker_host(provider, label).park_worker(key)
-        )
+        return await deliveries.serialized(lambda: _worker_host(provider, label).park_worker(key))
 
     try:
         if stray_state == "failed":
             raise RuntimeError("the stray control database has not been merged")
         executions: run_execution.RunExecutions | None = run_execution.RunExecutions(
             run_execution.OutcomeStore(config.history.db_path),
-            hosts=kanban_capacity.hosts,
+            hosts=deliveries.hosts,
             db=budget_db,
             park=_park,
         )
@@ -2039,103 +1816,6 @@ def create_runtime_app(config: AppConfig) -> FastAPI:
         if executions is not None
         else run_execution.serves_a_run
     )
-
-    async def _prior_run_in_the_way(
-        request: EnsureDeliveryRequest, provider: str, label: str, own_token: str | None
-    ) -> DeliverResult | None:
-        """Supersede, stop, then admit — decided inside the admission lock (#2159).
-
-        Called once the target account is known, immediately before the route is frozen and
-        the provider written, so no other delivery can be placed between this check and the
-        write. Stops made here use the lock-free park. ``None`` means the write may go ahead.
-        Without Run execution state there is no proof an older Run stopped, so a Work/Run
-        delivery is refused rather than admitted blind.
-        """
-        if executions is None:
-            log.warning(
-                "ensure_delivery %s refused: run execution state is unavailable",
-                request.delivery_id,
-            )
-            return DeliverResult(False, "rejected", reason=PRIOR_RUN_EXECUTING)
-        try:
-            blocking = await executions.admit(
-                request.work_id,
-                request.run_id,
-                worker_key=request.worker_key,
-                target=(provider, label),
-                park=_park_held,
-                own_token=own_token,
-            )
-        except Exception:  # noqa: BLE001 -- unreadable is not "nothing running"
-            log.exception("could not read the other Runs of %s", request.work_id)
-            return DeliverResult(False, "rejected", reason=PRIOR_RUN_EXECUTING)
-        if blocking is None:
-            return None
-        log.info(
-            "ensure_delivery %s refused: Run %s of %s is %s",
-            request.delivery_id, blocking.run_id, request.work_id, blocking.execution_state,
-        )
-        return DeliverResult(False, "rejected", reason=PRIOR_RUN_EXECUTING)
-
-    def _fresh_if_behind_its_chat(
-        request: EnsureDeliveryRequest, delivery: DeliverRequest, provider: str, label: str
-    ) -> DeliverRequest:
-        """Start the keyed worker fresh when it holds a leg its chat has moved past (#2884).
-
-        A resume into a chat a person continued would otherwise land on the Run's own
-        worker, still on the old leg, and pick the work up from before the continuation. A
-        worker mid-turn, or a steer, is left as asked: replacing it would end that turn.
-        """
-        if delivery.fresh or delivery.require_active:
-            return delivery
-        try:
-            snapshot = _worker_host(provider, label).snapshot()
-        except Exception:  # noqa: BLE001 -- unreadable keeps the delivery as it was asked
-            log.exception("could not read %s:%s workers for %s", provider, label, delivery.key)
-            return delivery
-        row = (snapshot.get("workers") or {}).get(delivery.key)
-        if not isinstance(row, dict) or row.get("turn_active"):
-            return delivery
-        leg = f"{provider}:{label}:{row.get('session_id')}" if row.get("session_id") else ""
-        if not resumes_behind_its_chat(
-            budget_db, request.continues_session_url, delivery.session_token, leg
-        ):
-            return delivery
-        log.info(
-            "ensure_delivery %s starts %s fresh: its leg %s is behind its chat",
-            request.delivery_id, delivery.key, leg,
-        )
-        return delivery.model_copy(update={"fresh": True})
-
-    def _continued_since(
-        request: EnsureDeliveryRequest, since: datetime, own_token: str | None
-    ) -> DeliverResult | None:
-        """Refuse a just-frozen delivery a deck Continue raced (#2862).
-
-        Admission looked before the freeze; a Continue of this Work's chat reserved in
-        between was not there to see. A Continue fences its reservation on its Run still
-        being the newest, in one transaction, so whichever wrote first, one side sees the
-        other: either the Continue is refused, or this asks after the freeze and finds it.
-        Unreadable is refused too. The caller releases the route; the Poller retries.
-        """
-        read = getattr(budget_db, "continuations_reserved_since", None)
-        if read is None or not request.work_id:
-            return None
-        try:
-            raced = read(
-                request.work_id, since, max_legs=run_execution.MAX_CONTINUATIONS,
-                excluding=own_token,
-            )
-        except Exception:  # noqa: BLE001 -- unreadable is not "nobody continued it"
-            log.exception("could not read the continued chats of %s", request.work_id)
-            raced = ["unreadable"]
-        if not raced:
-            return None
-        log.info(
-            "ensure_delivery %s refused: a Continue of %s raced it (%s)",
-            request.delivery_id, request.work_id, ", ".join(raced),
-        )
-        return DeliverResult(False, "rejected", reason=PRIOR_RUN_EXECUTING)
 
     def _execution_active():
         """Whether a Work's workspace may still be written, by path (#2149, #2159).
@@ -2361,7 +2041,7 @@ def create_runtime_app(config: AppConfig) -> FastAPI:
     app.state.claude_workers = claude_workers
     app.state.codex_workers = codex_workers
     app.state.restart_nudges = restart_nudges
-    app.state.kanban_capacity = kanban_capacity
+    app.state.worker_deliveries = deliveries
     app.state.command_artifacts = artifact_store
     app.state.budget_db = budget_db
     app.state.session_secrets = session_secrets
@@ -2617,7 +2297,7 @@ def create_runtime_app(config: AppConfig) -> FastAPI:
 
     @app.get("/activity")
     async def activity() -> dict[str, Any]:
-        """Restart-safety signal for host automation such as the kanban poller.
+        """Restart-safety signal for host automation such as the deploy timer.
 
         ``active`` answers "is a turn running right now". The counts beside it
         answer the wider question the idle web watchdog asks before letting this
@@ -2690,9 +2370,7 @@ def create_runtime_app(config: AppConfig) -> FastAPI:
         *,
         action: str,
     ) -> DeliverResult:
-        return await kanban_capacity.deliver(
-            provider, label, body, _worker_send(provider, label, body, action=action)
-        )
+        return await deliveries.serialized(_worker_send(provider, label, body, action=action))
 
     def _worker_send(
         provider: str,
@@ -2701,7 +2379,7 @@ def create_runtime_app(config: AppConfig) -> FastAPI:
         *,
         action: str,
     ) -> Callable[[], Awaitable[DeliverResult]]:
-        """The keyed-worker write for one delivery, for admission to call once it admits."""
+        """The keyed-worker write for one delivery, for the delivery lock to run."""
         host = _worker_host(provider, label)
         correlation = (
             DeliveryCorrelation.of(body.work_id, body.run_id) if body.delivery_id else None
@@ -2770,48 +2448,6 @@ def create_runtime_app(config: AppConfig) -> FastAPI:
             return result
 
         return send
-
-    async def _deliver_idle_worker_session(
-        provider: str,
-        label: str,
-        session_id: str,
-        message: str,
-        *,
-        images: list[str],
-        effort: str | None,
-        delivery_id: str | None,
-        expected_last_result_at: float,
-    ) -> InjectResult:
-        """Address one keyed worker by session id and refuse an active turn.
-
-        A revival arrives session-addressed from the web model, while the atomic
-        idle fence lives on the keyed worker host. Resolve the durable key here,
-        inside the persistent runtime, and use that existing fence rather than
-        trusting a collector snapshot from the web process.
-        """
-        host = _worker_host(provider, label)
-        key = host.find_key_by_session(session_id)
-        role = host.worker_role(key) if key is not None else None
-        if key is None or role != "kanban":
-            return InjectResult(False, "this session is not an addressable owned worker")
-        result = await _deliver_worker(
-            provider,
-            label,
-            DeliverRequest(
-                key=key,
-                message=message,
-                images=images,
-                effort=effort,
-                delivery_id=delivery_id,
-                client_action_id=delivery_id,
-                require_idle=True,
-                expected_last_result_at=expected_last_result_at,
-                delegated=role != "primary",
-                role=role,
-            ),
-            action="routine_revival",
-        )
-        return InjectResult(result.accepted, result.reason, result.session_id)
 
     @app.get("/workers/accounts/{provider}/{label}/workers")
     async def workers_state(
@@ -2895,96 +2531,12 @@ def create_runtime_app(config: AppConfig) -> FastAPI:
         )
         return _deliver_result(result)
 
-    @app.get("/workers/accounts/{provider}/{label}/session-version")
-    async def worker_session_version(
-        provider: str, label: str, session_id: str
-    ) -> dict[str, Any]:
-        host = _worker_host(provider, label)
-        key = host.find_key_by_session(session_id)
-        role = host.worker_role(key) if key is not None else None
-        if key is None or role not in {"kanban", "primary"}:
-            raise HTTPException(status_code=404, detail="addressable owned worker not found")
-        worker = host.snapshot().get("workers", {}).get(key, {})
-        return {"last_result_at": float(worker.get("last_result_at", 0.0))}
-
     @app.post("/workers/accounts/{provider}/{label}/deliver")
     async def worker_deliver(
         provider: str, label: str, body: DeliverRequest
     ) -> dict[str, Any]:
         result = await _deliver_worker(provider, label, body, action="worker_deliver")
         return _deliver_result(result)
-
-    @app.post(ENSURE_DELIVERY_PATH)
-    async def ensure_delivery_route(body: EnsureDeliveryRequest) -> dict[str, Any]:
-        """The Poller's direct machine delivery, with no web process in the path (#2144)."""
-
-        async def schedule(
-            request: EnsureDeliveryRequest, fields: dict[str, Any]
-        ) -> tuple[DeliverResult, Placement]:
-            """Choose the target, take the slot and freeze the route under one lock (#2146)."""
-            delivery = DeliverRequest(**fields)
-
-            async def run(admit: Admit) -> tuple[DeliverResult, Placement]:
-                async def deliver_to(
-                    provider: str, label: str, freeze: Callable[[], bool]
-                ) -> DeliverResult:
-                    here = await asyncio.to_thread(
-                        _fresh_if_behind_its_chat, request, delivery, provider, label
-                    )
-                    send = _worker_send(provider, label, here, action="ensure_delivery")
-
-                    async def frozen_send() -> DeliverResult:
-                        # A second of slack: the reservation's clock is the web process's.
-                        looked_at = datetime.now(UTC) - timedelta(seconds=1)
-                        # Before the freeze: a refusal here leaves no route behind.
-                        refused = await _prior_run_in_the_way(
-                            request, provider, label, delivery.session_token
-                        )
-                        if refused is not None:
-                            return refused
-                        if not freeze():
-                            return DeliverResult(False, "rejected", reason=ROUTING_UNAVAILABLE)
-                        raced = await asyncio.to_thread(
-                            _continued_since, request, looked_at, delivery.session_token
-                        )
-                        if raced is not None:
-                            # Nothing was written: the route goes, and the next try decides.
-                            budget_db.release_delivery_route(request.delivery_id)
-                            return raced
-                        return await send()
-
-                    return await admit(provider, label, here, frozen_send)
-
-                return await deliver_scheduled(
-                    request,
-                    request.requirements,
-                    selector=Selector(
-                        hosts=kanban_capacity.hosts(),
-                        db=budget_db,
-                        usage_cache=shared_cache_dir(config.usage.shared_cache_dir),
-                    ),
-                    deliver_to=deliver_to,
-                    receipt_of=lambda provider, label: _worker_host(
-                        provider, label
-                    ).delivery_receipt(request.worker_key, request.delivery_id),
-                )
-
-            return await kanban_capacity.schedule(run)
-
-        result, session_key, placement = await ensure_delivery(
-            body,
-            db=budget_db,
-            context_mode=config.context_management.mode,
-            schedule=schedule,
-        )
-        payload = _deliver_result(result)
-        payload["contract"] = ENSURE_DELIVERY_CONTRACT
-        if session_key:
-            payload["session_key"] = session_key
-        if placement is not None:
-            # The Run trace's view of where this delivery went, or why nowhere (#2146).
-            payload["schedule"] = placement.trace()
-        return payload
 
     @app.post("/workers/accounts/{provider}/{label}/deliver-command-artifacts-v1")
     async def worker_deliver_with_command_artifacts(
@@ -2999,23 +2551,6 @@ def create_runtime_app(config: AppConfig) -> FastAPI:
         )
         return _deliver_result(result)
 
-    @app.post("/workers/accounts/{provider}/{label}/revive-session")
-    async def worker_revive_session(
-        provider: str, label: str, body: WorkerSessionReviveRequest
-    ) -> dict[str, Any]:
-        return _result(
-            await _deliver_idle_worker_session(
-                provider,
-                label,
-                body.session_id,
-                body.message,
-                images=body.images,
-                effort=body.effort,
-                delivery_id=body.delivery_id or body.client_action_id,
-                expected_last_result_at=body.expected_last_result_at,
-            )
-        )
-
     @app.post("/workers/accounts/{provider}/{label}/release")
     async def worker_release(
         provider: str, label: str, body: WorkerKeyRequest
@@ -3023,11 +2558,8 @@ def create_runtime_app(config: AppConfig) -> FastAPI:
         # The Run this worker last served, read before the record goes: once released, the
         # worker row that proved its identity is gone (#2159).
         row = _worker_host(provider, label).snapshot().get("workers", {}).get(body.key)
-        result = await kanban_capacity.release(
-            provider,
-            label,
-            body.key,
-            lambda: _worker_host(provider, label).release_worker(body.key),
+        result = await deliveries.serialized(
+            lambda: _worker_host(provider, label).release_worker(body.key)
         )
         if result.accepted and executions is not None and isinstance(row, dict):
             work_id, run_id = row.get("work_id"), row.get("run_id")
@@ -3121,24 +2653,13 @@ def create_runtime_app(config: AppConfig) -> FastAPI:
     @app.post("/claude/accounts/{label}/stop")
     async def claude_stop(label: str, body: WorkerKeyRequest) -> dict[str, Any]:
         host = claude_workers.host(label)
-        result = await kanban_capacity.release(
-            "claude_code",
-            label,
-            body.key,
-            lambda: host.stop_worker(body.key),
-            inactive=lambda: not host.has_live_worker(body.key),
-        )
+        result = await deliveries.serialized(lambda: host.stop_worker(body.key))
         return _deliver_result(result)
 
     @app.post("/claude/accounts/{label}/rewind")
     async def claude_rewind(label: str, body: WorkerRewindRequest) -> dict[str, Any]:
-        result = await kanban_capacity.release(
-            "claude_code",
-            label,
-            body.key,
-            lambda: claude_workers.host(label).rewind_worker(
-                body.key, body.at, since=body.since
-            ),
+        result = await deliveries.serialized(
+            lambda: claude_workers.host(label).rewind_worker(body.key, body.at, since=body.since)
         )
         if result.accepted and body.since is not None and config.jobs.enabled:
             await jobs.silence(body.session_keys or [], body.since)
@@ -3146,34 +2667,22 @@ def create_runtime_app(config: AppConfig) -> FastAPI:
 
     @app.post("/claude/accounts/{label}/park")
     async def claude_park(label: str, body: WorkerKeyRequest) -> dict[str, Any]:
-        result = await kanban_capacity.release(
-            "claude_code",
-            label,
-            body.key,
-            lambda: claude_workers.host(label).park_worker(body.key),
+        result = await deliveries.serialized(
+            lambda: claude_workers.host(label).park_worker(body.key)
         )
         return _deliver_result(result)
 
     @app.post("/claude/accounts/{label}/release")
     async def claude_release(label: str, body: WorkerKeyRequest) -> dict[str, Any]:
-        result = await kanban_capacity.release(
-            "claude_code",
-            label,
-            body.key,
-            lambda: claude_workers.host(label).release_worker(body.key),
+        result = await deliveries.serialized(
+            lambda: claude_workers.host(label).release_worker(body.key)
         )
         return _deliver_result(result)
 
     @app.post("/claude/accounts/{label}/forget")
     async def claude_forget(label: str, body: WorkerKeyRequest) -> dict[str, Any]:
         host = claude_workers.host(label)
-        result = await kanban_capacity.forget(
-            "claude_code",
-            label,
-            body.key,
-            lambda: host.forget(body.key),
-            lambda: host.has_worker(body.key),
-        )
+        result = await deliveries.serialized(lambda: host.forget(body.key))
         return {
             "removed": result.accepted,
             **({"reason": result.reason} if result.reason else {}),

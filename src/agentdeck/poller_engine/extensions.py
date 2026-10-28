@@ -368,18 +368,6 @@ FIXTURE_CONTEXT = {
     # that reports nothing for a build the engine is waiting on would stall a release forever.
     "builds": {"store": {"sha": "0" * 40}},
     "since": "2026-07-25T12:00:00+00:00",
-    "cards": [
-        {
-            "ref": "store#7",
-            "status": "In review",
-            "owned": True,
-            "merged": ["store#9"],
-            "repos": ["store"],
-            # A card a worker has already handed back twice, so a hook keyed on rounds
-            # rather than on a pull request head has a non-zero count to reason about.
-            "reports": 2,
-        }
-    ],
     "board": {"org": "example", "project_number": 1},
     "budget": {"dispatch_ok": True},
 }

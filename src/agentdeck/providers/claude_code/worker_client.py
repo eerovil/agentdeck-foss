@@ -380,26 +380,11 @@ class ClaudeWorkerClient(RuntimeSocketClient):
         images: list[str] | None = None,
         delivery_id: str | None = None,
         allow_over_budget: bool = False,
-        require_idle: bool = False,
-        expected_last_result_at: float | None = None,
     ) -> InjectResult:
         """Deliver a follow-up to an already-owned worker, addressed by session id."""
         key = self._key_for(session_id)
         if key is None:
             return InjectResult(False, "this session is not a deck-owned worker")
-        if require_idle:
-            return await self._post_path(
-                f"/workers/accounts/claude_code/{self.account.label}/revive-session",
-                {
-                    "session_id": session_id,
-                    "message": message,
-                    "images": images or [],
-                    "effort": None,
-                    "delivery_id": delivery_id,
-                    "expected_last_result_at": expected_last_result_at,
-                },
-                fence="delivery_id",
-            )
         return await self.deliver(
             key,
             message,

@@ -12,7 +12,6 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-from ...command_artifacts import write_context
 from ...models import (
     RUNTIME_BOOTED_AT,
     SNAPSHOT_BOOTED_AT_KEY,
@@ -29,6 +28,7 @@ from ..instructions import (
     agentdeck_session_instructions,
     resolve_session_role,
     session_guide_fingerprint,
+    stored_session_role,
     wrap_session_guide,
 )
 from .appserver import CodexAppServer
@@ -138,22 +138,14 @@ class CodexWorkerHost:
             {record.session_id for record in self._records.values() if record.session_id}
         )
 
-    def _publish_artifact_context(self, record: CodexWorkerRecord) -> bool:
-        if record.role != "kanban" or not record.session_id or not record.session_token:
-            return str((record.command_artifacts or {}).get("mode") or "off") != "enforce"
-        try:
-            write_context(
-                self._artifact_root,
-                account_key=self.account.key,
-                session_id=record.session_id,
-                worker_key=record.key,
-                session_token=record.session_token,
-                policy=record.command_artifacts,
-            )
-            return True
-        except OSError as exc:
-            log.warning("command artifact context unavailable for %s: %s", record.key, exc)
-            return False
+    @staticmethod
+    def _publish_artifact_context(record: CodexWorkerRecord) -> bool:
+        """Whether this record's command-artifact policy can be honoured.
+
+        Only the poller's ``kanban`` workers ever had a capture context published; that
+        role went in #3741, so an ``enforce`` policy, which needs one, is refused.
+        """
+        return str((record.command_artifacts or {}).get("mode") or "off") != "enforce"
 
     def _key_lock(self, key: str) -> asyncio.Lock:
         return self._key_locks.setdefault(key, asyncio.Lock())
@@ -168,6 +160,8 @@ class CodexWorkerHost:
                 record = CodexWorkerRecord(**item)
             except TypeError:
                 continue
+            # A thread the poller started under its retired ``kanban`` role (#3741).
+            record.role = stored_session_role(record.role)
             self._records[record.key] = record
 
     def _save_state(self) -> None:
@@ -265,7 +259,6 @@ class CodexWorkerHost:
             effort=effort,
             permission_mode=permission_mode,
             allow_over_budget=allow_over_budget,
-            role=role,
             operation=(
                 "context_rollover"
                 if context_rollover
@@ -544,16 +537,6 @@ class CodexWorkerHost:
             created_thread = False
             if record.session_id is None:
                 try:
-                    artifact_args: dict[str, Any] = {}
-                    if str((record.command_artifacts or {}).get("mode") or "off") in {
-                        "observe",
-                        "enforce",
-                    }:
-                        artifact_args = {
-                            "worker_key": record.key,
-                            "artifact_root": self._artifact_root,
-                            "artifact_policy": record.command_artifacts,
-                        }
                     created = await self.client.create_thread(
                         Path(record.cwd),
                         model=record.model,
@@ -561,7 +544,6 @@ class CodexWorkerHost:
                             delegated=record.delegated, role=record.role
                         ),
                         session_token=record.session_token,
-                        **artifact_args,
                     )
                 except Exception as exc:
                     log.exception(
@@ -976,13 +958,6 @@ class CodexWorkerHost:
         record = self._records.get(key)
         return record.role if record is not None else None
 
-    def delivery_is_finalized(self, key: str, delivery_id: str | None) -> bool:
-        if not delivery_id:
-            return False
-        record = self._records.get(key)
-        receipt = record.deliveries.get(delivery_id) if record is not None else None
-        return bool(receipt and receipt.get("action"))
-
     def delivery_receipt(self, key: str, delivery_id: str) -> dict[str, Any] | None:
         record = self._records.get(key)
         receipt = record.deliveries.get(delivery_id) if record is not None else None
@@ -1011,24 +986,6 @@ class CodexWorkerHost:
                 record.pending_context_maintenance_reason = None
             self._save_state()
             return result
-
-    def active_role_keys(self, role: SessionRole) -> set[str]:
-        """Worker keys currently executing a turn under ``role``."""
-        return {
-            key
-            for key, record in self._records.items()
-            if record.role == role
-            and record.session_id is not None
-            and self.client.owns(record.session_id)
-            and self.client.active_turn(record.session_id) is not None
-        }
-
-    def role_last_result_at(self, key: str, role: SessionRole) -> float:
-        record = self._records.get(key)
-        if record is None or record.role != role:
-            return 0.0
-        self._sync_result(record)
-        return record.last_result_at
 
     async def park_worker(self, key: str) -> DeliverResult:
         """End this key's running turn and keep its thread, so a later delivery resumes it.

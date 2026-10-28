@@ -111,8 +111,8 @@ CREATE TABLE IF NOT EXISTS run_execution_outcomes (
     PRIMARY KEY (work_id, run_id)
 );
 -- The outcomes that may still be executing, so asking which Works are current reads only
--- those rows and never the retained history (#2201). ``run_trace.read_current_executions``
--- repeats this WHERE clause word for word: SQLite uses a partial index only then.
+-- those rows and never the retained history (#2201). ``open_runs`` repeats this WHERE clause
+-- word for word: SQLite uses a partial index only then.
 CREATE INDEX IF NOT EXISTS run_execution_outcomes_open
     ON run_execution_outcomes (work_id, run_id)
     WHERE stopped_at IS NULL
@@ -237,8 +237,7 @@ class OutcomeStore:
         return [str(row[0]) for row in rows]
 
     def open_runs(self) -> list[tuple[str, str]]:
-        """``(work_id, run_id)`` of every current Run whose last observation is still open:
-        the same rows ``run_trace.read_current_executions`` reads as executing."""
+        """``(work_id, run_id)`` of every current Run whose last observation is still open."""
         with self._lock:
             routed = self._conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'delivery_routes'"
@@ -985,3 +984,67 @@ class StopExecutionRequest(BaseModel):
         if self.run_id != self.run_id.strip():
             raise ValueError("run_id must be sent exactly as saved")
         return self
+
+
+@dataclass(frozen=True)
+class StoredOutcome:
+    """One row of ``run_execution_outcomes``: the Runtime's last recorded observation."""
+
+    run_id: str
+    execution_state: str
+    reason_code: str = ""
+    last_activity_at: float | None = None
+    terminal_result_at: float | None = None
+    stop_requested_at: float | None = None
+    stop_reason: str = ""
+    stopped_at: float | None = None
+    observed_at: float = 0.0
+
+
+_OUTCOME_COLUMNS = (
+    "run_id, execution_state, reason_code, last_activity_at, terminal_result_at,"
+    " stop_requested_at, stop_reason, stopped_at, observed_at"
+)
+
+
+def read_outcomes(db_path: Path | str, work_id: str) -> list[StoredOutcome] | None:
+    """This Work's recorded Run outcomes, read-only, from the web process.
+
+    Read straight from the table rather than through the Runtime's ``/executions`` route,
+    because that route records a fresh observation on every read and this must not write.
+    ``[]`` when nothing was ever recorded; None when the store could not be read, which is
+    unknown, never "not running".
+    """
+    path = Path(db_path).expanduser()
+    if not path.exists():
+        return []
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+    except sqlite3.Error:
+        return None
+    try:
+        rows = conn.execute(
+            f"SELECT {_OUTCOME_COLUMNS} FROM run_execution_outcomes WHERE work_id = ?"
+            " ORDER BY observed_at DESC",
+            (work_id,),
+        ).fetchall()
+    except sqlite3.OperationalError as exc:
+        return [] if "no such table" in str(exc) else None
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+    return [
+        StoredOutcome(
+            run_id=str(row[0]),
+            execution_state=str(row[1]),
+            reason_code=str(row[2] or ""),
+            last_activity_at=row[3],
+            terminal_result_at=row[4],
+            stop_requested_at=row[5],
+            stop_reason=str(row[6] or ""),
+            stopped_at=row[7],
+            observed_at=float(row[8] or 0.0),
+        )
+        for row in rows
+    ]

@@ -16,9 +16,7 @@ from pathlib import Path
 import pytest
 
 from agentdeck import work_workspace_claims as claims
-from agentdeck.poller_adapter import work_workspaces as adapter_claims
 from agentdeck.poller_engine import github as engine_github
-from agentdeck.poller_engine.ports import WorktreeCleanup
 from agentdeck.run_evidence import RunEvidenceLedger
 
 WORK = "github_issue:example/store#7"
@@ -884,28 +882,6 @@ def test_another_works_claim_is_never_released_through_this_one(service, checkou
     assert service.store.active(WORK)[0].path == first.claim.path
 
 
-def test_stale_cleanup_for_one_card_never_deletes_another_works_worktree(
-    monkeypatch, adapter, service, checkout
-):
-    """The engine hand-off end to end: a card record naming another Work's claimed path."""
-    theirs = service.ensure(_request(checkout)).claim.path  # WORK's live worktree
-    (Path(theirs) / "unsaved.txt").write_text("live work\n")
-
-    def post(_socket, path, body, **_kwargs):
-        assert path == claims.RELEASE_PATH
-        outcomes, unclaimed = service.release(body["work_id"], body["paths"])
-        return 200, {"released": [item.as_json() for item in outcomes], "unclaimed": unclaimed}
-
-    monkeypatch.setattr(engine_github, "runtime_post", post)
-    # Card #8 is OTHER_WORK; its stale record wrongly still names #7's worktree.
-    result = adapter.release_worktrees("store", 8, [theirs])
-
-    assert result.landed and result.retained == ()
-    assert Path(theirs, "unsaved.txt").exists()
-    (held,) = service.store.active()
-    assert held.work_id == WORK and not held.release_pending
-
-
 def test_read_claims_is_read_only_and_says_unknown_when_unreadable(tmp_path, service, checkout):
     first = service.ensure(_request(checkout))
 
@@ -917,95 +893,10 @@ def test_read_claims_is_read_only_and_says_unknown_when_unreadable(tmp_path, ser
     assert claims.read_claims(broken, WORK) is None
 
 
-# --- exactly one destructive owner ---------------------------------------------------
-
-
-@pytest.fixture
-def adapter():
-    made = object.__new__(engine_github.GitHubAdapter)
-    made.org = "example"
-    made.runtime_socket = "/run/agentdeck.sock"
-    return made
-
-
-def test_the_engine_hands_every_path_to_the_work_and_deletes_none_itself(
-    monkeypatch, adapter, tmp_path
-):
-    """The Work is the one destructive owner (#2195): the card never removes a path itself.
-
-    A path no Work claims that is still on disk is retained, which releases the card and says
-    which directory was left for the reaper; one already gone needs nothing at all.
-    """
-    sent: list[dict] = []
-    removed: list[list[str]] = []
-    loose = tmp_path / ".worktrees" / "legacy"
-    loose.mkdir(parents=True)
-    gone = str(tmp_path / ".worktrees" / "gone")
-
-    def post(_socket, path, body, **_kwargs):
-        sent.append({"path": path, **body})
-        return 200, {"released": [], "unclaimed": [str(loose), gone]}
-
-    monkeypatch.setattr(engine_github, "runtime_post", post)
-    monkeypatch.setattr(
-        engine_github.GitHubAdapter,
-        "remove_worktrees",
-        staticmethod(lambda paths: removed.append(list(paths)) or WorktreeCleanup()),
-    )
-
-    result = adapter.release_worktrees("store", 7, ["/c/.worktrees/issue-7", str(loose), gone])
-
-    assert result.landed
-    assert sent == [
-        {
-            "path": claims.RELEASE_PATH,
-            "work_id": WORK,
-            "paths": ["/c/.worktrees/issue-7", str(loose), gone],
-        }
-    ]
-    assert removed == []
-    assert [path for path, _reason in result.retained] == [str(loose)]
-
-
-@pytest.mark.parametrize("answer", [(0, None), (500, {"detail": "boom"}), (200, {"odd": 1})])
-def test_an_unanswered_release_deletes_nothing_and_retries(monkeypatch, adapter, answer):
-    removed: list[list[str]] = []
-    monkeypatch.setattr(engine_github, "runtime_post", lambda *_a, **_k: answer)
-    monkeypatch.setattr(
-        engine_github.GitHubAdapter,
-        "remove_worktrees",
-        staticmethod(lambda paths: removed.append(list(paths)) or WorktreeCleanup()),
-    )
-
-    result = adapter.release_worktrees("store", 7, ["/c/.worktrees/issue-7"])
-
-    assert result.failed == ("/c/.worktrees/issue-7",)
-    assert removed == []
-
-
-@pytest.mark.parametrize("socket", ["", "/run/agentdeck.sock"])
-def test_a_runtime_without_claims_leaves_every_path_pending(monkeypatch, adapter, socket):
-    """No socket, or a runtime from before claims: nothing here may delete, so nothing does."""
-    removed: list[list[str]] = []
-    adapter.runtime_socket = socket
-    monkeypatch.setattr(engine_github, "runtime_post", lambda *_a, **_k: (404, None))
-    monkeypatch.setattr(
-        engine_github.GitHubAdapter,
-        "remove_worktrees",
-        staticmethod(lambda paths: removed.append(list(paths)) or WorktreeCleanup()),
-    )
-
-    result = adapter.release_worktrees("store", 7, ["/c/.worktrees/issue-7"])
-
-    assert result.failed == ("/c/.worktrees/issue-7",)
-    assert removed == []
-
-
-def test_the_route_spellings_agree_across_the_three_sides():
+def test_the_route_spellings_agree_across_both_sides():
     assert engine_github.WORK_WORKSPACE_ENSURE_PATH == claims.ENSURE_PATH
     assert engine_github.WORK_WORKSPACE_RELEASE_PATH == claims.RELEASE_PATH
     assert engine_github.WORK_WORKSPACE_CLAIMS_PATH == claims.CLAIMS_PATH
-    assert adapter_claims.ENSURE_PATH == claims.ENSURE_PATH
 
 
 # --- the runtime owns the service ------------------------------------------------------

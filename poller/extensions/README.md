@@ -4,30 +4,30 @@ An extension is a **separate program**, not an import. The engine runs it at a n
 a JSON payload on stdin and reads a JSON object on stdout:
 
 ```
-$ ./deploy_watch.py release-gate <<< '{"hook":"release-gate","mode":"live","config":{…},"context":{…}}'
-{"requests":[{"kind":"release-status","payload":{"repo":"agentdeck","status":"ok"}}]}
+$ ./screenshots.py health <<< '{"hook":"health","mode":"live","config":{"default_routes":["/"]},"context":{}}'
+{"health": {"state": "ok", "routes": 1}}
 ```
 
-The engine only ever receives **requests** and runs each one through the same ownership,
-authorization, queue, lease and release rules as any other input, so an extension can ask for
-work but can never bypass a lease or skip a gate (#112). That includes `open-work`, which asks for
-a *card to exist*: the extension supplies a repo, a stable key and a title, and the engine decides
-whether to open anything — exactly once, because a duplicate issue is not undoable (#393). A crash, timeout or malformed answer
+The engine only ever receives **requests** and decides each one itself, so an extension can ask
+for work but never act on its own authority (#112). The one request a wake honours is
+`open-work`, which asks for an *issue to exist*: the extension supplies a repo, a stable key and a
+title, and the engine decides whether to open anything — exactly once, because a duplicate issue
+is not undoable (#393). The issue is labelled at creation, so the deck starts its Work. A crash, timeout or malformed answer
 skips that extension and marks it health-degraded — it never fails the cycle.
 
 An `open-work` payload may also say `"spec_only": true`. The engine then opens the issue with the
-project's `spec_only_label` beside the ownership label, in the same write, and the card's first
-worker gets the spec-only brief: it writes a plan and nothing is built until a person approves it
+project's `spec_only_label` beside the ownership label, in the same write, and the deck starts its
+Work as a specification: it writes a plan and nothing is built until a person approves it
 (#2874). A project that names no `spec_only_label` refuses such a request rather than opening it
 as an ordinary build.
 
-An `observe` hook's `context` carries two things: `cards`, this project's cards with their status
-and queue depth, and `settled`, the proposal keys this extension has already had decided — opened,
-in the control ledger, or staged. Both are namespaced to the asking extension, and neither exposes
-a lease or a dispatch. An extension that bounds how much it proposes per wake **must** subtract
-`settled` before spending that bound: its own source usually keeps reporting work that already has
-a card, and re-asking spends every slot on proposals the engine drops as already-seen, so nothing
-new is ever proposed (#1709).
+An `observe` hook's `context` carries `settled`, the proposal keys this extension has already had
+decided — opened or staged — namespaced to the asking extension; its `memory` (below); and
+`quiet`, whether this wake asked GitHub nothing, in which case an extension reading GitHub should
+not either. The card-era `cards` list and `works_router` flag are gone (#3741). An extension that
+bounds how much it proposes per wake **must** subtract `settled` before spending that bound: its
+own source usually keeps reporting work that already has an issue, and re-asking spends every slot
+on proposals the engine drops as already-seen, so nothing new is ever proposed (#1709).
 
 An `observe` answer may also carry `memory`: one JSON object (at most 64 KiB) that the engine
 keeps in its own state and hands back as `context.memory` on the next wake, and to `propose`.
@@ -54,19 +54,21 @@ project's Manifest allows — a shared program gets no more authority than a ven
 Check a program against the protocol before enabling it:
 
 ```
-scripts/poller_engine.py contract-test --name deploy-watch --hook release-gate --hook health \
-    -- ./poller/extensions/deploy_watch.py
+scripts/poller_engine.py contract-test --name screenshots --hook validate-config --hook health \
+    -- ./poller/extensions/screenshots.py
 ```
 
 ## The shipped extensions
 
-`deploy_watch.py`, `sentry_autofix.py` and `screenshots.py` are #113's references.
+`sentry_autofix.py` and `screenshots.py` are what is left of #113's references. `deploy_watch.py`,
+`drone_deploy_watch.py` and `chatgpt_nudge.py`, and the `/shot` command of `screenshots.py`, were
+retired in #3741: they gated a card's release, queued work on a card, or reviewed a card's pull
+request, and the engine holds no cards since #3732.
 
 | Extension | Hooks | What it does |
 | --- | --- | --- |
-| `deploy_watch.py` | validate-config, release-gate, health | After a merge, reports whether this host's deployed commit contains it (or, unconfigured, whether the service restarted) and the service answers healthy, so the guarded release only finishes on an observed deploy. |
-| `sentry_autofix.py` | validate-config, observe, health | Proposes work for unresolved Sentry incidents. Known infrastructure signatures are denied and short same-repository bursts with similar titles become one card. A proposal has a stable identity, so it is deduplicated and subject to every normal rule. |
-| `screenshots.py` | validate-config, command, health | Declares `/shot` and turns it into queued work. Taking the screenshots is a **worker-side** procedure (#112): it runs inside the worker session, behind the lease the worker already holds, so it needs no separate boundary. |
+| `sentry_autofix.py` | validate-config, observe, health | Proposes work for unresolved Sentry incidents. Known infrastructure signatures are denied and short same-repository bursts with similar titles become one issue. A proposal has a stable identity, so it is deduplicated and subject to every normal rule. |
+| `screenshots.py` | validate-config, health | Checks the project's `default_routes`, the pages worth shooting, and reports how many there are. |
 
 
 ## Policy is applied; code is deployed
@@ -101,9 +103,8 @@ resolved is shown as `source` in the health record. What an extension can *ask f
 bounded by the engine's fixed request kinds and core authorization, whatever build is deployed.
 
 An extension that is missing, will not say what it implements, or lacks an allowed hook is not a
-silent hole. The wake carries on, the extension answers no hook, its instance reads *degraded* on
-the deck, and a refused release gate reports no deploy state at all, so the releases it gates keep
-waiting rather than finishing on evidence the gate never gave.
+silent hole. The wake carries on, the extension answers no hook, and its instance reads
+*degraded* on the deck.
 
 An instance applied before #2158 has a Manifest with no `hooks` lists; until its next apply, the
 hook sets recorded in its binding stand in for them, and the code hash beside them is ignored.
@@ -132,11 +133,6 @@ a re-activation, which it would be if the path lived in the fingerprinted Manife
 The Manifest half, then:
 
 ```toml
-[extensions.deploy-watch]
-service = "agentdeck.service"
-health_url = "http://127.0.0.1:8756/healthz"
-grace_seconds = 900
-
 [extensions.sentry-autofix]
 host = "https://us.sentry.io"
 org = "example-org"
@@ -173,73 +169,6 @@ and the host's half, in that instance's `overlay.toml`, naming only what the Man
 [extensions.sentry-autofix]
 token_file = "~/.config/agentdeck/example-sentry-token"
 ```
-
-### The one that acts outside GitHub
-
-`chatgpt_nudge` is the only shipped extension whose effect is not a request. There is no request
-kind for "press a button", the click is not queued work, and its request list is empty every wake
-— what it does instead is start a program the operator named in their own overlay, which drives a
-browser against this host's ChatGPT login.
-
-That makes two things load-bearing. The hook is killed at 20 seconds and a browser run takes
-longer, so the click is launched as its own transient user service and the hook returns at once:
-a new process session alone would still be killed with the poller's one-shot service control
-group. A nudge still running is not a hook still running. And because nothing upstream bounds it,
-`min_interval_minutes` is the whole budget — a branch pushed five times in a minute is one review,
-not five.
-
-All of that is the **blind sweep click**, which is the path a project takes when it names a `task`
-and no `review_program`. A project that names `review_program` does something else entirely, and
-since #2069 it neither presses nor waits: it runs `agentdeck chat-review --no-start` over every
-pull request that went ready this wake, which writes one issue per pull request in the chat
-repository and starts nothing. Pressing was then the deck's own `chat_auto_nudge` (removed in #2864: `/api/chat-review` now always starts the worker), which held one
-fleet-wide ceiling (six starts an hour, six workers in flight) rather than a per-project clock.
-
-The reason for the split is that opening a chat and starting a worker on it cost different
-things. A budget written for the expensive half had been applied to both, so a second pull
-request going ready inside the window got no chat either — and then had nothing for a worker to
-be started onto when the budget came round. `min_interval_minutes` therefore no longer applies to
-a scoped review at all, and none of the shipped manifests sets it. What stops a branch pushed
-five times becoming five reviews is unchanged and was never the clock: it is the head SHA and the
-card's round count, and one open review chat per card.
-
-A launch that carries several pull requests gets one receipt with a row per target, because they
-do not share a fate: a run can open two chats and be told the third reference is malformed, and
-settling one verdict over all three would either lose two reviews or claim one that never
-happened. Each head is settled against its own row.
-
-Detached also means the extension cannot watch the run, so the run answers for itself. Each nudge
-is handed a one-off **receipt** path in `CHATGPT_NUDGE_RECEIPT` — a file beside the extension's
-own state file — and the changed head SHAs wait in `pending` rather than in `seen` until a later
-wake reads a receipt saying the button was pressed. `chatgpt-nudge-run.sh` writes
-`{"ok": …, "status": …}` there from the click's exit status, so an expired login, a control that
-moved, a task that is not there, a browser that would not start and a lock it waited out all come
-back as `ok: false`. So does a click the page accepted without starting anything: `Run now` opens
-the task's conversation, so `chatgpt_run_now.py` exits zero only once that navigation has
-happened, and clicked-but-never-started is an exit status of its own. A failed run, and a run
-that never reports back within twenty minutes, both leave their SHAs unrecorded, so that pull
-request is nudged again instead of being counted as reviewed. Three consecutive missing receipts
-for one head stop further nudges for that head and make the extension unhealthy; a new head resets
-the count. This bounds failures that no shell can report, such as SIGKILL or a dead host. While a
-launched run is still unanswered the extension holds off rather than starting a second browser on
-the same profile lock. An operator's own `nudge_program` that ignores the variable therefore stops
-after the same bounded retries.
-
-The login is established once, by hand, with `scripts/chatgpt_run_now.py --login`. The poller never
-authenticates and never sees a password; it only reuses a browser profile that is already logged
-in. A click does not touch the task's own schedule — the once-an-hour cap is on the timer, not on
-the task (#1816) — so `min_interval_minutes` is a budget a clicking project sets for itself rather
-than one ChatGPT enforces. A reviewing project sets none.
-
-### Which deploy gate
-
-Both answer `release-gate`, and a project enables exactly one. `deploy_watch` observes a service on
-*this* host — right when the thing being deployed is the host's own service, as it is for AgentDeck.
-`drone_deploy_watch` observes a CI promotion — right when the deploy happens somewhere the host
-cannot see, as it does for a project deployed to a Kubernetes cluster by CI.
-
-Enabling neither while `capabilities.deployment_observation` is on is the one combination to avoid:
-the release then has no source of deploy truth, and waits forever rather than finishing.
 
 ### Suppressing noise
 

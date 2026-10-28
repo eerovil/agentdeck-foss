@@ -44,31 +44,6 @@ def test_a_close_after_the_cutoff_waits_until_a_finish_after_it(closed, signed, 
     assert awaiting_finish(closed, signed, cutoff) is waits
 
 
-def test_a_merge_that_deploys_waits_for_its_deploy_before_asking_for_a_finish():
-    """#2760: the issue closed on a merge into a repository that deploys on merge; for about a
-    minute, until the engine started watching the deploy, it asked a person to finish it."""
-    from types import SimpleNamespace
-
-    from agentdeck.work_facts import DEPLOY_GRACE, MERGED, OutputFact, deploy_due
-
-    closed = datetime(2026, 10, 9, 9, 20, tzinfo=UTC)
-    card = SimpleNamespace(deploy_repos=("eerovil/agentdeck",))
-    url = "https://github.com/eerovil/agentdeck/pull/2758"
-    merged = (OutputFact(url, "EeroVil/AgentDeck", 2758, "card", MERGED),)
-    soon = closed + timedelta(minutes=1)
-
-    assert deploy_due(card, merged, closed, soon)
-    assert not deploy_due(card, merged, closed, closed + DEPLOY_GRACE), "past the grace"
-    assert not deploy_due(card, merged, closed, closed - timedelta(seconds=5)), "clock skew"
-    assert not deploy_due(None, merged, closed, soon), "no Poller card"
-    assert not deploy_due(card, merged, None, soon), "the issue is open"
-    assert not deploy_due(SimpleNamespace(deploy_repos=()), merged, closed, soon)
-    still_open = (replace(merged[0], state="open"),)
-    assert not deploy_due(card, still_open, closed, soon), "nothing merged"
-    elsewhere = (replace(merged[0], repository="eerovil/homr"),)
-    assert not deploy_due(card, elsewhere, closed, soon), "merged where nothing deploys"
-
-
 def test_sign_offs_are_durable_and_a_stale_close_never_moves_one_back(tmp_path):
     from agentdeck.db import Db
 
@@ -99,15 +74,13 @@ class _NoGh:
 
 
 def _deck(tmp_path, monkeypatch, *, closed_at: datetime, cutoff: datetime, active=None):
-    """A Work whose Poller card finished and whose issue closed at ``closed_at``, with its
+    """A Work whose issue closed at ``closed_at``, with its
     worker's chat last active at ``active`` (ten minutes ago by default)."""
-    from test_work_hidden import _board_card
-    from test_work_ui import WORK, _add, _app, _board
+    from test_work_ui import WORK, _add, _app
 
     from agentdeck.web.work_view import SIGNOFF_CUTOFF
 
-    card = replace(_board_card(), done=True, status="Done", dispatch_failed=False)
-    app = _app(tmp_path, board=_board(card))
+    app = _app(tmp_path)
     _add(app, "claude_code:main:worker-2510", WORK,
          last_activity=active or datetime.now(UTC) - timedelta(minutes=10))
     # The deck recorded its cutoff when it started; move it to where this case needs it.
@@ -124,7 +97,7 @@ def _deck(tmp_path, monkeypatch, *, closed_at: datetime, cutoff: datetime, activ
     }
     app.state.issues.cached_issues = lambda refs: {(WORK.repository, WORK.number): record}
     monkeypatch.setattr(gh_cli, "run_once", _NoGh())
-    return app, card, record
+    return app, record
 
 
 def _client(app):
@@ -164,7 +137,7 @@ NOW = datetime.now(UTC)
 async def test_a_closed_work_waits_in_needs_you_until_a_person_finishes_it(tmp_path, monkeypatch):
     from test_work_ui import WORK
 
-    app, _card, record = _deck(
+    app, record = _deck(
         tmp_path, monkeypatch, closed_at=NOW - timedelta(minutes=5), cutoff=NOW - timedelta(days=1)
     )
     client = _client(app)
@@ -224,7 +197,7 @@ async def test_a_closed_work_waits_in_needs_you_until_a_person_finishes_it(tmp_p
 async def test_a_work_closed_before_the_cutoff_is_finished_as_before(tmp_path, monkeypatch):
     from test_work_ui import WORK
 
-    app, _card, _record = _deck(
+    app, _record = _deck(
         tmp_path, monkeypatch, closed_at=NOW - timedelta(hours=2), cutoff=NOW - timedelta(hours=1)
     )
     overview = await app.state.work_overview.current()
@@ -238,7 +211,7 @@ async def test_a_work_closed_before_the_cutoff_is_finished_as_before(tmp_path, m
 async def test_a_reopened_work_closed_again_waits_for_a_new_finish(tmp_path, monkeypatch):
     from test_work_ui import WORK
 
-    app, _card, record = _deck(
+    app, record = _deck(
         tmp_path, monkeypatch, closed_at=NOW - timedelta(hours=3), cutoff=NOW - timedelta(days=1)
     )
     await app.state.work_overview.current()
@@ -255,7 +228,7 @@ async def test_a_waiting_work_stays_however_long_it_is_quiet(tmp_path, monkeypat
     """Once seen waiting, a Work stays a candidate after its card is forgotten (#2510)."""
     from test_work_ui import WORK, _board
 
-    app, _card, _record = _deck(
+    app, _record = _deck(
         tmp_path, monkeypatch, closed_at=NOW - timedelta(days=30), cutoff=NOW - timedelta(days=60),
         active=NOW - timedelta(days=30),
     )
@@ -272,7 +245,7 @@ async def test_a_waiting_work_stays_however_long_it_is_quiet(tmp_path, monkeypat
 async def test_finish_clears_a_hide_so_the_work_lands_in_recently_finished(tmp_path, monkeypatch):
     from test_work_ui import WORK
 
-    app, _card, _record = _deck(
+    app, _record = _deck(
         tmp_path, monkeypatch, closed_at=NOW - timedelta(minutes=5), cutoff=NOW - timedelta(days=1)
     )
     client = _client(app)
@@ -320,7 +293,7 @@ async def test_finish_takes_the_row_away_on_the_press_and_a_refusal_puts_it_back
     from test_web import _live_server
     from test_work_ui import WORK
 
-    app, _card, _record = _deck(
+    app, _record = _deck(
         tmp_path, monkeypatch, closed_at=NOW - timedelta(minutes=5), cutoff=NOW - timedelta(days=1)
     )
     _releases(monkeypatch)

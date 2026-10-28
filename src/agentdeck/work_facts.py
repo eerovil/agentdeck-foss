@@ -2,19 +2,14 @@
 
 Every Work surface — the front page, the Work page and whatever comes after them — reads a
 Work through ``WorkFacts``, built once per pass by ``work_facts`` from local reads only: the
-Poller card as the engine holds it, the issue's cached record, the cached pull request rows,
-the cached open pull request list and the pull requests the Work's chats registered. No
+issue's cached record, the cached pull request rows, the cached open pull request list and the
+pull requests the Work's chats registered. No
 GitHub call is made here, and nothing is stored: it is a read of facts the deck already has,
 not a lifecycle of its own.
 
-Which pull requests are the Work's outputs is decided here and nowhere else. The Poller card
-is the explicit answer. A card that names none — or a Work with no card — takes the discovery
+Which pull requests are the Work's outputs is decided here and nowhere else, by the discovery
 the deck can make without asking GitHub, in a fixed order; each output records how it was
-found (``OutputFact.found_by``) so a reader can tell an explicit output from an inferred one.
-
-Review is exact-head evidence: each open output carries the instance reviewer's verdict for
-its current head (``poller_nudge.ExternalReviews.judge``), read once here rather than again by
-each page.
+found (``OutputFact.found_by``).
 
 Each output also carries its size and target branch from the same cached row (#2236):
 ``gh pr view`` stores the per-file ``files`` list beside the changed-file count, so
@@ -41,15 +36,11 @@ from .work import WorkRef
 from .worktree_diff import KIND_SOURCE, classify_path
 
 # How an output was found (``OutputFact.found_by``), strongest first.
-FOUND_BY_CARD = "poller_card"  # the worker's ``comment_links`` link or the engine's ``review_prs``
 FOUND_BY_CLOSING = "closing_reference"  # GitHub's ``closingIssuesReferences``, any repository
-# LEGACY(epic:work): an ``issue-<n>`` head branch in the issue's own repository. Only a card
-# whose worker reported no link, from before every dispatch recorded its pull request, needs it.
+# An open pull request in the cached list that names no issue it closes.
 FOUND_BY_BRANCH = "branch"
-# LEGACY(epic:work): an open or merged pull request a Work's chat registered (#2228, #2286).
-# It exists because a card may name no pull request — the engine drops a finished card, and a
-# worker whose pull request only says "Part of" never links one — so the chat's registration is
-# the only link the deck holds; a Run output fact would replace it.
+# An open or merged pull request a Work's chat registered (#2228, #2286): a pull request that
+# only says "Part of" never links its issue, so the chat's registration is the only link.
 FOUND_BY_CHAT = "chat_registration"
 
 MERGED = "merged"
@@ -79,35 +70,12 @@ def pull_state(record: Mapping[str, Any] | None) -> str:
     return state if state in {"open", CLOSED} else ""
 
 
-def card_pull_requests(card: Any) -> tuple[str, ...]:
-    """Every pull request the Poller card names: the worker's link, then ``review_prs``, then
-    the ones the engine recorded as merged (#2332)."""
-    found = tuple(getattr(card, "pull_requests", ()) or ())
-    first = str(getattr(card, "pull_request_url", "") or "")
-    if first and first.lower() not in {url.lower() for url in found}:
-        found = (first, *found)
-    known = {url.lower() for url in found}
-    extra = [url for url in engine_merged(card) if url.lower() not in known]
-    return (*found, *dict.fromkeys(extra))
-
-
-def engine_merged(card: Any) -> tuple[str, ...]:
-    """The pull requests the engine itself recorded as merged for this card (#2332)."""
-    return tuple(getattr(card, "merged", ()) or ())
-
-
 @dataclass(frozen=True)
 class OutputFact:
-    """One pull request the Work produced, with its current head, state and review.
+    """One pull request the Work produced, with its current head and state.
 
     ``state`` and ``head`` are the cached row's ("" when the deck never resolved it: unknown,
-    never a guess). ``review`` is the instance reviewer's verdict for that head, with its
-    ``review_detail`` (``ExternalReviews.judge``); "" when no reviewer is in play or the output
-    is merged or closed. ``review_clean`` says the reviewer recorded a clean review of exactly
-    that head (``ExternalReviews.clean_at``, #2254), and ``draft`` is the cached row's.
-
-    ``review`` is ``held`` where the reviewer awaits a chat that waits on a person (#2442):
-    ``review_detail`` still names the chat, and ``review_held`` the labels it carries.
+    never a guess), and so is ``draft``.
     """
 
     url: str
@@ -116,8 +84,6 @@ class OutputFact:
     found_by: str
     state: str = ""
     head: str = ""
-    review: str = ""
-    review_detail: str = ""
     base: str = ""  # the branch it merges into, "" unknown
     # Its source files' size, from the cached row's ``files``; None when the row does not
     # carry a complete per-file list (#2236, #2331).
@@ -128,14 +94,11 @@ class OutputFact:
     # does not say for every one (#3617).
     new_lines: int | None = None
     new_files: int | None = None
-    review_clean: bool = False
     draft: bool = False
     # GitHub auto-merge is on for it, per the cached row (#2275).
     auto_merge: bool = False
     # Required checks its auto-merge has waited on too long with no report (#2275), sorted.
     never_ran: tuple[str, ...] = ()
-    # When the reviewer sent exactly this head back for changes (#2332), None when it did not.
-    review_changes_at: datetime | None = None
     # GitHub's merge answer for exactly this head (``merge_checks``, #2332): ``mergeable``
     # (``MERGEABLE``/``CONFLICTING``/``UNKNOWN``) and ``merge_state`` (``CLEAN``, ``DIRTY``,
     # ``BEHIND``…), "" when the deck holds none for this head.
@@ -144,11 +107,6 @@ class OutputFact:
     # The cached row's per-file list is as complete as a re-read could make it — every file,
     # or cut at gh's limit — so a backfill has nothing more to fetch for it (#2331).
     file_list: bool = False
-    # The chat board's labels on the awaited review chat that wait on a person (#2442).
-    review_held: tuple[str, ...] = ()
-    # Its repository has no tests, so a clean review of its head is its verification
-    # (``verification = "review_only"``, #2729, #2832).
-    review_only: bool = False
     # When its head commit was made, from the ``merge_checks`` row for exactly that head
     # (#3199); None when the deck holds no such row.
     head_at: datetime | None = None
@@ -340,15 +298,11 @@ class WorkFacts:
     """What every Work surface reads about one Work, gathered once per pass."""
 
     ref: WorkRef | None = None
-    card: Any = None  # the Poller card exactly as the engine holds it, or None
     record: Mapping[str, Any] | None = None  # the issue's cached record
     outputs: tuple[OutputFact, ...] = ()
     finished_at: datetime | None = None
     # The issue closed and no person has finished the Work since (#2510, ``awaiting_finish``).
     awaiting_finish: bool = False
-    # It closed on a merge into a repository that deploys on merge, under ``DEPLOY_GRACE`` ago
-    # (``deploy_due``, #2760): the deploy comes next, so it does not ask for a Finish yet.
-    deploy_due: bool = False
     # A person paused the Work on this deck rather than with its Poller's label (#2559).
     deck_paused: bool = False
     # A person starred the Work (#3116): it goes ahead of unstarred Works in every line.
@@ -372,26 +326,17 @@ def _stamp(value: Any) -> datetime | None:
     return when if when.tzinfo is not None else when.replace(tzinfo=UTC)
 
 
-def work_finished_at(card: Any, issue: Mapping[str, Any] | None) -> datetime | None:
+def work_finished_at(issue: Mapping[str, Any] | None) -> datetime | None:
     """When the Work finished, or None while it has not or the time is unknown (#2219).
 
     GitHub's own ``closed_at`` for the Work's issue, from the cached issue record. Never
     ``updatedAt``: a comment on an issue closed long ago moves that, and must not make the
     Work newly finished. A record cached before it carried ``closedAt`` has no finish time
-    until it is next refreshed. A Poller card still on the board and not done means the
-    Work is open unless the issue closed after the engine last looked at the card: the
-    engine moves it on its next pass, and the Work is finished now (#2226).
+    until it is next refreshed.
     """
     if not issue or issue.get("state") != "closed" or issue.get("is_pr"):
         return None
-    when = _stamp(issue.get("closedAt"))
-    if when is None:
-        return None
-    if card is not None and not getattr(card, "done", False):
-        checked = _stamp(getattr(card, "last_live_check", ""))
-        if checked is None or when <= checked:
-            return None  # the engine saw the close, or never said when it looked
-    return when
+    return _stamp(issue.get("closedAt"))
 
 
 # How far a deck-side Finish may trail GitHub's own close time and still count for that close:
@@ -416,30 +361,6 @@ def awaiting_finish(
     if finished_at is None or cutoff is None or finished_at <= cutoff:
         return False
     return signed_off_at is None or signed_off_at < finished_at - FINISH_SLACK
-
-
-# How long a closed issue whose Work merged into a repository that deploys on merge waits for
-# the engine's deploy watch before it asks a person to finish the Work (#2760). The watch starts
-# on the engine's next wake, a minute or so after the merge closed the issue.
-DEPLOY_GRACE = timedelta(minutes=5)
-
-
-def deploy_due(
-    card: Any,
-    outputs: Sequence[OutputFact],
-    finished_at: datetime | None,
-    now: datetime,
-) -> bool:
-    """The issue closed under ``DEPLOY_GRACE`` ago, and the Work merged into one of its Poller
-    card's repositories that deploys on merge: a deploy comes next, not a person (#2760)."""
-    if card is None or finished_at is None:
-        return False
-    if not timedelta(0) <= now - finished_at < DEPLOY_GRACE:
-        return False
-    deploys = {name.casefold() for name in getattr(card, "deploy_repos", ()) or ()}
-    return any(
-        output.state == MERGED and output.repository.casefold() in deploys for output in outputs
-    )
 
 
 def _issue_key(ref: WorkRef) -> str:
@@ -469,23 +390,18 @@ def _registered_output(ref: WorkRef, item: Registration, row: Mapping[str, Any] 
 
 def _discover(
     ref: WorkRef | None,
-    card: Any,
     open_pulls: Sequence[Mapping[str, Any]],
     registered: Sequence[Registration],
     rows: Mapping[str, Mapping[str, Any]],
 ) -> list[tuple[str, str]]:
     """``(url, found_by)`` for every output, by the one precedence every surface shares.
 
-    The card's own pull requests, when it names any, are the whole answer. Otherwise the
-    cached open pull request list says which open ones close the issue, and the Work's
+    The cached open pull request list says which open ones close the issue, and the Work's
     chats' registrations add theirs. Both speak together (#2286): the open list is re-read
     on its own clock, so a pull request opened a minute ago is only a registration yet, and
     a Work with pull requests in two repositories would otherwise lose the ones the list
     does not join to its issue.
     """
-    explicit = card_pull_requests(card)
-    if explicit:
-        return [(url, FOUND_BY_CARD) for url in explicit]
     if ref is None:
         return []
     key = _issue_key(ref)
@@ -508,35 +424,23 @@ def _discover(
 
 def discovery_urls(
     ref: WorkRef | None,
-    card: Any,
     open_pulls: Sequence[Mapping[str, Any]] = (),
     registered: Sequence[Registration] = (),
 ) -> tuple[str, ...]:
     """Every pull request whose cached row ``work_facts`` may read for this Work."""
-    urls = [*card_pull_requests(card), *(str(pull.get("url") or "") for pull in open_pulls)]
+    urls = [str(pull.get("url") or "") for pull in open_pulls]
     urls += [item.url for item in registered]
     return tuple(dict.fromkeys(url for url in urls if url))
-
-
-def _changes_at(reviewer: Any, where: tuple[str, int], head: str) -> datetime | None:
-    """When the reviewer sent this head back (#2332); the epoch of 0 an unknown time."""
-    reader = getattr(reviewer, "changes_at", None)
-    at = reader(*where, head) if reader is not None else None
-    if at is None:
-        return None
-    return datetime.fromtimestamp(at, UTC) if at > 0 else datetime.fromtimestamp(0, UTC)
 
 
 def work_facts(
     ref: WorkRef | None,
     *,
-    card: Any = None,
     record: Mapping[str, Any] | None = None,
     rows: Mapping[str, Mapping[str, Any]] | None = None,
     open_pulls: Sequence[Mapping[str, Any]] = (),
     registered: Sequence[Registration] = (),
     checks: Mapping[str, Mapping[str, Any]] | None = None,
-    chat_holds: Mapping[str, Sequence[str]] | None = None,
 ) -> WorkFacts:
     """One Work's facts. Pure: every input is a local read the caller made once per pass.
 
@@ -544,19 +448,13 @@ def work_facts(
     cached open pull requests joined to this issue (``IssueBacklog.pulls_for_work``);
     ``registered`` the pull requests the Work's chats registered; and ``checks`` the cached
     ``merge_checks`` row of each armed or mergeable-candidate pull request, by lowercased URL.
-    ``chat_holds`` are the labels each open chat waits on a person with, by casefolded
-    ``owner/repo#number`` (#2442).
     """
     rows = rows or {}
-    chat_holds = chat_holds or {}
     checks = checks or {}
-    reviewer = getattr(card, "reviewer", None)
-    finished_at = work_finished_at(card, record)
-    merged_by_engine = {url.lower() for url in engine_merged(card)}
-    review_only = {str(name).casefold() for name in getattr(card, "review_only_repos", ()) or ()}
+    finished_at = work_finished_at(record)
     seen: set[str] = set()
     outputs = []
-    discovered = _discover(ref, card, open_pulls, registered, rows)
+    discovered = _discover(ref, open_pulls, registered, rows)
     for url, found_by in discovered:
         if url.lower() in seen:
             continue
@@ -564,19 +462,7 @@ def work_facts(
         row = rows.get(url.lower()) or {}
         where = pull_identity(url)
         state = pull_state(row)
-        if url.lower() in merged_by_engine:
-            # The engine merged it itself: a row still saying open, or no row, is stale.
-            state = MERGED
         head = str(row.get("headRefOid") or "")
-        review, detail, clean, changes_at = "", "", False, None
-        held: tuple[str, ...] = ()
-        if reviewer is not None and where is not None and state not in _SETTLED:
-            review, detail = reviewer.judge(*where, head=head)
-            if review == "awaiting" and detail:
-                held = tuple(chat_holds.get(detail.casefold(), ()))
-                review = "held" if held else review
-            clean = reviewer.clean_at(*where, head)
-            changes_at = _changes_at(reviewer, where, head)
         mergeable, merge_state = (
             merge_answer(checks.get(url.lower()), head) if state not in _SETTLED else ("", "")
         )
@@ -591,26 +477,20 @@ def work_facts(
                 found_by,
                 state,
                 head,
-                review,
-                detail,
                 base=str(row.get("baseRefName") or ""),
                 additions=additions,
                 deletions=deletions,
                 files=files,
                 new_lines=new_lines,
                 new_files=new_files,
-                review_clean=clean,
                 draft=bool(row.get("isDraft")),
                 auto_merge=state not in _SETTLED and armed(row),
                 never_ran=(
                     never_ran(row, checks.get(url.lower())) if state not in _SETTLED else ()
                 ),
-                review_changes_at=changes_at,
                 mergeable=mergeable,
                 merge_state=merge_state,
                 file_list=_complete_file_list(row),
-                review_held=held,
-                review_only=bool(repository) and repository.casefold() in review_only,
                 head_at=(
                     head_committed_at(checks.get(url.lower()), head)
                     if state not in _SETTLED
@@ -620,7 +500,6 @@ def work_facts(
         )
     return WorkFacts(
         ref=ref,
-        card=card,
         record=record,
         outputs=tuple(outputs),
         finished_at=finished_at,

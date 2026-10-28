@@ -719,9 +719,6 @@ async def _render_session_detail(
     with timing_span(request, "git_context"):
         git_context = assistant.session_context(session)
     pull_requests = session_pull_request_chips(git_context)
-    # One read for both chip sets. Only a chat with registered issues can have a
-    # card, and the board is the engine's own durable state rather than a query.
-    issue_board = request.app.state.issues.read_board() if session.issues else None
     interaction = provider.pending_interaction(account, session)
     fragment_view = SessionView(
         current=session,
@@ -731,7 +728,7 @@ async def _render_session_detail(
         age=age,
         active_child_sessions=presentation.active_child_sessions(session),
         interaction=interaction,
-        issues=session_issue_chips(session, issue_board),
+        issues=session_issue_chips(session),
         pull_requests=pull_requests,
         head_review=session_head_review_chip(session, git_context, state),
     )

@@ -320,21 +320,7 @@ def test_view_and_insight_remain_importable_from_assistant():
     assert replace(view, state="idle").state == "idle"
 
 
-# --- a card its poller is still going to release is not a handoff (#552) ---
-
-def _poller_card(root, key, card, *, org="eerovil", instance="agentdeck"):
-    """One installed Poller Instance holding exactly this card record."""
-    from agentdeck.poller_engine.state import EnginePaths, StateStore
-
-    base = root / "instances" / instance
-    base.mkdir(parents=True, exist_ok=True)
-    (base / "poller.toml").write_text(
-        f'contract = 1\n\n[board]\norg = "{org}"\nproject_number = 1\n'
-    )
-    store = StateStore(EnginePaths.from_base(base / "state.json"))
-    with store.transaction() as state:
-        state["issues"] = {key: card}
-
+# --- the row's work-item pill ---
 
 def _worker_service(tmp_path, state, poller_root):
     from agentdeck.config import PollerConfig
@@ -1349,28 +1335,8 @@ async def test_absent_unread_child_follows_an_absent_old_parent_leg(tmp_path):
     assert assistant.view.insights == ()
 
 
-def test_the_row_pill_says_the_open_issues_board_column(tmp_path):
-    """A card still in a column is read through that column, not its GitHub state.
-
-    "issue in progress" says how far the work has got; "issue open" and "pr open"
-    both leave the reader to guess (#1696). The column comes from the poller's own
-    state file, so no row costs a GitHub call.
-    """
-    poller_root = tmp_path / "poller"
-    _poller_card(poller_root, "agentdeck#549", {"status": "In progress"})
-    state = AppState()
-    session = _kanban_worker(tmp_path, issue_status="open", issue_status_kind="open")
-    state.update_session(session)
-    assistant = _worker_service(tmp_path, state, poller_root)
-
-    pill = assistant.work_item_pills([session])[session.key]
-
-    assert pill.label == "issue in progress"
-    assert pill.is_open
-
-
 def test_the_row_pill_survives_a_poller_that_is_not_there(tmp_path):
-    """No board is not a broken row: the pill falls back to the issue's own state."""
+    """The pill is the issue's own state; no poller board is read for it (#3741)."""
     state = AppState()
     session = _kanban_worker(tmp_path, issue_status="open", issue_status_kind="open")
     state.update_session(session)
@@ -1616,161 +1582,6 @@ def test_the_row_pill_reads_the_verdict_word_however_it_is_cased(tmp_path):
     _reviewed(state, "eerovil/agentdeck", "a" * 40, verdict="  PASS ")
 
     assert assistant.work_item_pills([session])[session.key].reviewed_sha == "aaaaaaa"
-
-
-def _bits_card(*, review_passed, heads, status="In review"):
-    """A poller card record carrying one published release-bits reading."""
-    return {
-        "status": status,
-        "release_bits": {
-            "bits": {
-                "rebase-current": True,
-                "review-passed": review_passed,
-                "tests-pass": True,
-            },
-            "heads": heads,
-            "at": "2026-09-22T10:00:00+00:00",
-        },
-    }
-
-
-def test_the_row_pill_keeps_its_tick_across_a_rebase(tmp_path):
-    """The whole point of reading the engine's own reading (#2121).
-
-    The engine carries a clean verdict across a rebase by comparing the diff, not
-    the commit — so after a rebase there is no verdict recorded against the new
-    head, and a commit-keyed lookup goes quiet exactly where the poller still
-    holds the review as passed. This repo rebases immediately before every
-    validation, so that is the normal path and not an edge.
-    """
-    poller_root = tmp_path / "poller"
-    rebased = "b" * 40
-    _poller_card(
-        poller_root,
-        "agentdeck#549",
-        _bits_card(review_passed=True, heads={"eerovil/agentdeck#4321": rebased}),
-    )
-    state = AppState()
-    session = _kanban_worker(tmp_path)
-    state.update_session(session)
-    assistant = _worker_service(tmp_path, state, poller_root)
-    assistant._contexts.update({session.key: _pr_context_at(rebased)})
-    # The verdict on file is about the commit the rebase replaced, and nothing
-    # has been recorded against the new head at all.
-    _reviewed(state, "eerovil/agentdeck", "a" * 40)
-
-    pill = assistant.work_item_pills([session])[session.key]
-
-    assert pill.reviewed_sha == "bbbbbbb"
-    assert pill.label.endswith("✓")
-
-
-def test_a_red_or_unknown_review_bit_is_not_a_tick(tmp_path):
-    """Unknown is never green anywhere else in the release bits, and not here."""
-    for value in (False, None, "yes", 1):
-        poller_root = tmp_path / f"poller-{value}"
-        head = "b" * 40
-        _poller_card(
-            poller_root,
-            "agentdeck#549",
-            _bits_card(
-                review_passed=value, heads={"eerovil/agentdeck#4321": head}
-            ),
-        )
-        state = AppState()
-        session = _kanban_worker(tmp_path)
-        state.update_session(session)
-        assistant = _worker_service(tmp_path, state, poller_root)
-        assistant._contexts.update({session.key: _pr_context_at(head)})
-
-        pill = assistant.work_item_pills([session])[session.key]
-
-        assert pill.reviewed_sha == "", value
-
-
-def test_a_bits_reading_taken_before_this_head_says_nothing(tmp_path):
-    """A reading covers the commits it read. The head moved after it was taken,
-    so the green bit is about a commit that is no longer what would merge."""
-    poller_root = tmp_path / "poller"
-    _poller_card(
-        poller_root,
-        "agentdeck#549",
-        _bits_card(review_passed=True, heads={"eerovil/agentdeck#4321": "a" * 40}),
-    )
-    state = AppState()
-    session = _kanban_worker(tmp_path)
-    state.update_session(session)
-    assistant = _worker_service(tmp_path, state, poller_root)
-    assistant._contexts.update({session.key: _pr_context_at("b" * 40)})
-
-    assert assistant.work_item_pills([session])[session.key].reviewed_sha == ""
-
-
-def test_a_malformed_bits_reading_does_not_break_a_row(tmp_path):
-    """Engine state on disk can be shaped by a rollback or an older engine, and a
-    row must fall back to the verdict record rather than crash."""
-    head = "a" * 40
-    for record in ({}, {"bits": "green"}, {"bits": {"review-passed": True}},
-                   {"bits": {"review-passed": True}, "heads": ["x"]}, "green"):
-        poller_root = tmp_path / f"poller-{abs(hash(str(record)))}"
-        _poller_card(
-            poller_root,
-            "agentdeck#549",
-            {"status": "In review", "release_bits": record},
-        )
-        state = AppState()
-        session = _kanban_worker(tmp_path)
-        state.update_session(session)
-        assistant = _worker_service(tmp_path, state, poller_root)
-        assistant._contexts.update({session.key: _pr_context_at(head)})
-
-        pill = assistant.work_item_pills([session])[session.key]
-        assert pill.reviewed_sha == "", record
-
-        # The deck's own verdict record still answers for this commit.
-        _reviewed(state, "eerovil/agentdeck", head)
-        assert assistant.work_item_pills([session])[session.key].reviewed_sha == "aaaaaaa"
-
-
-def test_the_board_column_still_reaches_the_pill_beside_the_review_bit(tmp_path):
-    """Both facts now come off one card lookup; neither may have cost the other."""
-    poller_root = tmp_path / "poller"
-    head = "a" * 40
-    _poller_card(
-        poller_root,
-        "agentdeck#549",
-        _bits_card(
-            review_passed=True,
-            heads={"eerovil/agentdeck#4321": head},
-            status="In progress",
-        ),
-    )
-    state = AppState()
-    session = _kanban_worker(tmp_path, issue_status="open", issue_status_kind="open")
-    state.update_session(session)
-    assistant = _worker_service(tmp_path, state, poller_root)
-    assistant._contexts.update({session.key: _pr_context_at(head)})
-
-    assert assistant.work_item_pills([session])[session.key].label == (
-        "issue in progress ✓"
-    )
-
-
-def test_the_row_pill_matches_the_published_head_however_it_is_cased(tmp_path):
-    """Two independently-sourced spellings of one commit meet in that comparison."""
-    poller_root = tmp_path / "poller"
-    _poller_card(
-        poller_root,
-        "agentdeck#549",
-        _bits_card(review_passed=True, heads={"eerovil/agentdeck#4321": "B" * 40}),
-    )
-    state = AppState()
-    session = _kanban_worker(tmp_path)
-    state.update_session(session)
-    assistant = _worker_service(tmp_path, state, poller_root)
-    assistant._contexts.update({session.key: _pr_context_at("b" * 40)})
-
-    assert assistant.work_item_pills([session])[session.key].reviewed_sha == "bbbbbbb"
 
 
 async def test_opening_a_chat_lets_the_page_go_out_before_the_pass_runs(tmp_path, monkeypatch):

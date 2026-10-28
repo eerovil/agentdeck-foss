@@ -463,17 +463,9 @@ class SessionProvider(ABC):
         images: list[Path] | None = None,
         effort: str | None = None,
         allow_over_budget: bool = False,
-        require_idle: bool = False,
-        expected_last_result_at: float | None = None,
     ) -> InjectResult:
         """Append one turn to a safely injectable session."""
         return InjectResult(False, "this provider does not support injection")
-
-    async def worker_version(
-        self, account: Account, session: Session
-    ) -> float | None:
-        """Durable keyed-worker result version for an optimistic idle write."""
-        return None
 
     async def start_session(
         self,

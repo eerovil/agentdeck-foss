@@ -327,35 +327,19 @@ def pill_review_commit(git: GitContext | None) -> tuple[str, str] | None:
 def resolve_work_item_pill(
     session: Session,
     git: GitContext | None = None,
-    board_status: str | None = None,
     reviewed_sha: str = "",
 ) -> WorkItemPill | None:
     """Resolve one row's work-item pill from its pull requests and its issue.
 
     Every half comes from state the deck has already resolved — the git context
-    the webhook-fed status cache keeps warm, the poller's durable board snapshot,
-    and the same ``issue_status`` field the row's badge read before — so a row
-    never costs a GitHub call to draw.
-
-    While the dispatched issue is still open and its board card names a column,
-    that column is the pill: *issue in progress* says where the work has got to,
-    which *pr open* does not (#1696). The pull request takes the pill back once
-    the issue is no longer an open card — a merged issue reads better as
-    *pr merged* than as a column it has left.
+    the webhook-fed status cache keeps warm, and the same ``issue_status`` field
+    the row's badge read before — so a row never costs a GitHub call to draw.
 
     ``reviewed_sha`` is the short commit a review passed on, when that commit is
     still the one this row speaks for (#2121). It only ever adds a tick and a
     clause to what the pill already said: which work item the row wears, and
     whether that item is open, are the same with it and without it.
     """
-    state = (board_status or "").strip().casefold()
-    if state and session.issue_status_kind == "open":
-        return _work_item_pill(
-            label=f"issue {state}",
-            title=f"the issue this chat was dispatched for is {state} on the board",
-            is_open=True,
-            reviewed_sha=reviewed_sha,
-        )
     pull = _preferred_pull(git)
     if pull is not None:
         state = "draft" if pull.is_open and pull.draft else pull.status

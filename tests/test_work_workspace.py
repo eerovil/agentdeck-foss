@@ -10,11 +10,11 @@ from agentdeck.db import Db
 from agentdeck.git_context import GitContext, PullRequestContext
 from agentdeck.models import IssueRef, Session, SessionStatus
 from agentdeck.poller_engine.workspace import WorkspaceSnapshot, _digest, _normalize_remote
-from agentdeck.poller_ops import BoardCard, BoardScope, BoardView
+from agentdeck.poller_ops import BoardScope, BoardView
 from agentdeck.state import AppState
 from agentdeck.work import WorkRef, work_id_for
 from agentdeck.work_workspace import (
-    CardWorkspaceFacts,
+    ProjectWorkspaceFacts,
     RepositoryRole,
     SessionWorkspaceFacts,
     WorkspaceEvidence,
@@ -73,8 +73,8 @@ def git():
     return FakeGit()
 
 
-def _card(**fields) -> CardWorkspaceFacts:
-    return CardWorkspaceFacts("agentdeck", **fields)
+def _project(**fields) -> ProjectWorkspaceFacts:
+    return ProjectWorkspaceFacts("agentdeck", **fields)
 
 
 def _held(git, *paths, purpose="implementation", work=WORK):
@@ -160,7 +160,7 @@ def test_the_artifact_repository_is_labelled_and_never_primary(tmp_path, git):
     workspace = build_work_workspace(
         WORK,
         claims=_held(git, code, evidence),
-        cards=[_card(artifact_repositories=("eerovil/agent-evidence",))],
+        projects=[_project(artifact_repositories=("eerovil/agent-evidence",))],
         probe=WorkspaceProbe(git),
     )
 
@@ -171,15 +171,15 @@ def test_the_artifact_repository_is_labelled_and_never_primary(tmp_path, git):
 
 
 def test_a_borrowed_checkout_keeps_source_and_code_repositories_apart(tmp_path, git):
-    """Trailhead: `issues` holds the cards and the evidence; `docker` holds the code."""
+    """Trailhead: `issues` holds the issues and the evidence; `docker` holds the code."""
     work = WorkRef("eerovil/issues", 42)
     code = git.add(tmp_path / "issue-42-issues", "https://github.com/eerovil/docker")
     evidence = git.add(tmp_path / "evidence", "https://github.com/eerovil/issues")
     workspace = build_work_workspace(
         work,
         claims=[*_held(git, code, work=work), *_held(git, evidence, purpose="artifact", work=work)],
-        cards=[
-            _card(
+        projects=[
+            _project(
                 artifact_repositories=("eerovil/issues",),
                 borrowed_repository="eerovil/docker",
             )
@@ -373,7 +373,7 @@ def test_pull_requests_attach_to_their_own_repository(tmp_path, git):
     context = GitContext("eerovil/agentdeck", "agent/issue-2143", False, (pull,))
     workspace = build_work_workspace(
         WORK,
-        claims=_held(git, tree), cards=[_card(pull_request_url="https://github.com/eerovil/agentdeck/pull/2180")],
+        claims=_held(git, tree),
         sessions=[_leg("k:a:1", tree, git_context=context, exclusive=True)],
         probe=WorkspaceProbe(git),
     )
@@ -381,10 +381,7 @@ def test_pull_requests_attach_to_their_own_repository(tmp_path, git):
     (repo,) = workspace.repositories
     (found,) = repo.pull_requests
     assert (found.number, found.status, found.base_branch) == (2180, "open", "master")
-    assert {p.evidence for p in found.provenance} == {
-        WorkspaceEvidence.POLLER_CARD,
-        WorkspaceEvidence.GIT_CONTEXT,
-    }
+    assert {p.evidence for p in found.provenance} == {WorkspaceEvidence.GIT_CONTEXT}
     assert repo.base_refs == ("master",)
 
 
@@ -492,27 +489,26 @@ def test_a_chat_in_two_works_lends_each_only_its_own_run(tmp_path, state, git):
     ]
 
 
-def test_gather_reads_the_card_and_its_manifest_roles(tmp_path, state, git):
-    code = git.add(tmp_path / "code", "https://github.com/eerovil/docker")
-    card = BoardCard("eerovil/issues", 42, worktrees=(str(code),))
+def test_gather_reads_the_projects_manifest_roles(tmp_path, state, git):
     board = BoardView(
-        cards={card.identity: card},
         scopes=(
             BoardScope(
                 "trailhead",
                 org="eerovil",
+                issue_repositories=("eerovil/issues",),
                 artifact_repositories=("eerovil/issues",),
                 borrowed_workspaces=(("eerovil/issues", "eerovil/docker"),),
-                cards=(card,),
             ),
         ),
     )
     facts = gather_work_workspace(state, WorkRef("eerovil/issues", 42), board=board)
-    assert facts.known
+    (project,) = facts.projects
+    assert (project.instance, project.borrowed_repository) == ("trailhead", "eerovil/docker")
     workspace = facts.build(WorkspaceProbe(git))
     docker = workspace.repository("eerovil/docker")
     assert RepositoryRole.BORROWED in docker.roles
-    assert not gather_work_workspace(state, WorkRef("eerovil/issues", 43), board=board).known
+    # A repository no project declares gets no roles.
+    assert not gather_work_workspace(state, WorkRef("eerovil/other", 43), board=board).projects
 
 
 # --- the routes and the rendered section ---------------------------------------
@@ -549,11 +545,6 @@ def workspace_app(tmp_path):
     ref = IssueRef("eerovil/agentdeck", 2143)
     state.set_issues(worker, (ref,))
     state.set_issues(review, (ref,))
-    card = BoardCard(
-        "eerovil/agentdeck",
-        2143,
-        pull_request_url="https://github.com/eerovil/agentdeck/pull/2180",
-    )
     # The Work's claims are the only source of its worktrees (#2195).
     from agentdeck.work_workspace_claims import ClaimStore
 
@@ -567,13 +558,12 @@ def workspace_app(tmp_path):
         store.confirm(claim)
     store.close()
     board = BoardView(
-        cards={card.identity: card},
         scopes=(
             BoardScope(
                 "agentdeck",
                 org="eerovil",
+                issue_repositories=("eerovil/agentdeck",),
                 artifact_repositories=("eerovil/agent-evidence",),
-                cards=(card,),
             ),
         ),
     )
@@ -666,7 +656,6 @@ async def test_the_section_renders_stacked_repositories_with_problems_visible(tm
     assert html.count('<article class="ww-repo') == 2
     assert 'data-ww-issue="missing_worktree"' in html
     assert 'data-ww-issue="cwd_outside_worktree"' in html
-    assert "/pull/2180" in html
     # Session ids stay in the collapsed inspector, not in the compact view.
     compact, _, inspector = html.partition('<details class="ww-inspector">')
     repo_compact = compact.split('data-ww-repo="eerovil/agentdeck"', 1)[1]
@@ -891,8 +880,8 @@ def test_the_unknown_bucket_is_only_warning_styled_for_a_real_problem(tmp_path, 
 def test_declared_repositories_appear_before_any_checkout_exists(tmp_path, git):
     workspace = build_work_workspace(
         WorkRef("eerovil/issues", 42),
-        cards=[
-            _card(
+        projects=[
+            _project(
                 artifact_repositories=("eerovil/Agent-Evidence",),
                 borrowed_repository="eerovil/docker",
             )
@@ -916,10 +905,8 @@ def test_declared_repositories_appear_before_any_checkout_exists(tmp_path, git):
     assert git.calls == []
 
 
-def _board_with(*scopes, cards=()) -> BoardView:
-    return BoardView(
-        cards={card.identity: card for card in cards}, scopes=tuple(scopes), complete=False
-    )
+def _board_with(*scopes) -> BoardView:
+    return BoardView(scopes=tuple(scopes), complete=False)
 
 
 def test_unreadable_poller_state_is_unknown_not_absent(tmp_path, state):
@@ -930,7 +917,7 @@ def test_unreadable_poller_state_is_unknown_not_absent(tmp_path, state):
         state_readable=False,
     )
     facts = gather_work_workspace(state, WORK, board=_board_with(broken))
-    assert facts.known  # no chat names it, but the card could exist unread
+    assert facts.known  # no chat names it, but the project's roles could exist unread
     assert facts.poller_unavailable == "instance agentdeck: state unreadable"
     workspace = facts.build(WorkspaceProbe(FakeGit()))
     (issue,) = workspace.issues
@@ -947,7 +934,7 @@ def test_unreadable_poller_state_is_unknown_not_absent(tmp_path, state):
     assert not gather_work_workspace(state, WORK, board=_board_with(readable)).known
 
 
-def test_a_declared_repository_without_a_card_still_gets_its_roles(tmp_path, state):
+def test_a_declared_repository_gets_its_roles(tmp_path, state):
     scope = BoardScope(
         "agentdeck",
         org="eerovil",
@@ -956,8 +943,8 @@ def test_a_declared_repository_without_a_card_still_gets_its_roles(tmp_path, sta
     )
     facts = gather_work_workspace(state, WORK, board=_board_with(scope))
     assert not facts.known  # a manifest alone is not a Work
-    (card,) = facts.cards
-    assert card.card is False
+    (project,) = facts.projects
+    assert project.instance == "agentdeck"
     workspace = facts.build(WorkspaceProbe(FakeGit()))
     assert workspace.repository("eerovil/agent-evidence").roles == (RepositoryRole.ARTIFACT,)
 
@@ -1027,7 +1014,6 @@ def test_equal_strength_pull_request_disagreement_is_reported(tmp_path, git):
     two = GitContext("eerovil/agentdeck", "b", False, (_pull("merged"),))
     workspace = build_work_workspace(
         WORK,
-        cards=[_card(pull_request_url="https://github.com/eerovil/agentdeck/pull/2180")],
         sessions=[
             _leg("k:a:1", tree, runs=("g",), git_context=one),
             _leg("k:a:2", tree, runs=("g",), git_context=two),

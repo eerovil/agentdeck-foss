@@ -87,50 +87,6 @@ async def test_worker_client_forwards_client_action_id(tmp_path):
     assert seen["payload"]["effort"] == "high"
 
 
-async def test_idle_only_send_uses_the_dedicated_runtime_fence(tmp_path):
-    delivered: list[dict[str, object]] = []
-
-    async def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path.endswith("/workers"):
-            return httpx.Response(
-                200,
-                json={
-                    "workers": {
-                        "issue": {"session_id": "sid-1", "role": "kanban"},
-                        "chat": {"session_id": "sid-2", "role": "interactive"},
-                    }
-                },
-            )
-        if request.url.path.endswith("/revive-session"):
-            delivered.append(json.loads(request.content))
-            accepted = delivered[-1]["session_id"] == "sid-1"
-            return httpx.Response(
-                200,
-                json={
-                    "accepted": accepted,
-                    "reason": None if accepted else "this session is not an owned kanban worker",
-                    "session_id": delivered[-1]["session_id"],
-                },
-            )
-        raise AssertionError(request.url.path)
-
-    client = ClaudeWorkerClient(_account(tmp_path), transport=httpx.MockTransport(handler))
-    await client.refresh()
-
-    accepted = await client.send(
-        "sid-1", "continue", require_idle=True, expected_last_result_at=12.0
-    )
-    refused = await client.send(
-        "sid-2", "continue", require_idle=True, expected_last_result_at=12.0
-    )
-
-    assert accepted.accepted
-    assert refused.reason == "this session is not an owned kanban worker"
-    assert len(delivered) == 2
-    assert delivered[0]["session_id"] == "sid-1"
-    assert delivered[1]["session_id"] == "sid-2"
-
-
 async def test_worker_client_preserves_effective_background_activity(tmp_path):
     async def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path.endswith("/workers")

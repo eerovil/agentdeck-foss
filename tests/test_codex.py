@@ -2114,7 +2114,7 @@ def test_codex_guide_refresh_prefix_is_not_shown_as_the_user_turn(tmp_path):
     """A refreshed turn reaches Codex as guide + message, and the rollout is the
     only record of it. Every reader — transcript, title, last prompt — must see
     the operator's own words, not 13k characters of instructions."""
-    guide = agentdeck_session_instructions(provider="codex", role="kanban")
+    guide = agentdeck_session_instructions(provider="codex", role="work")
     path = tmp_path / "rollout.jsonl"
     lines = [
         _message("user", wrap_session_guide(guide, "rebase onto master")),

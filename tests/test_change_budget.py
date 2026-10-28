@@ -12,7 +12,7 @@ from dataclasses import replace
 from datetime import UTC, datetime
 
 import pytest
-from test_work_ui import OTHER, WORK, _add, _app, _board, _card, _overview
+from test_work_ui import OTHER, WORK, _add, _app, _board, _overview
 
 from agentdeck import work_counter
 from agentdeck.models import Session, SessionStatus
@@ -70,7 +70,7 @@ async def test_one_chat_change_builds_only_its_own_works_cards(tmp_path, monkeyp
 
     # The once-a-minute full check is the net under silent inputs, not part of this budget.
     monkeypatch.setattr(work_view, "FULL_CHECK_S", 1e9)
-    app = _app(tmp_path, board=_board(_card(WORK.number), _card(OTHER.number)))
+    app = _app(tmp_path, board=_board())
     mine = _add(app, "claude_code:test:mine", WORK)
     _add(app, "claude_code:test:theirs", OTHER)
     first = await _overview(app)
@@ -280,9 +280,10 @@ async def test_one_work_change_renders_its_row_once_for_every_tab(tmp_path):
     and each tab is sent only that row: the others go as placeholders it already holds."""
     import agentdeck.web.routes_sse as sse
 
-    app = _app(tmp_path, board=_board(_card(WORK.number), _card(OTHER.number)))
-    _add(app, "claude_code:test:mine", WORK)
-    _add(app, "claude_code:test:theirs", OTHER)
+    app = _app(tmp_path, board=_board())
+    # Both working, so both are listed rows.
+    _add(app, "claude_code:test:mine", WORK, thinking=True)
+    _add(app, "claude_code:test:theirs", OTHER, thinking=True)
     await app.state.work_overview.refresh()
     tabs = [sse._stream(_EventsRequest(app, view="works")) for _ in range(2)]
     # A page that shows no Works neither receives them nor keeps the overview rebuilding.
@@ -296,7 +297,7 @@ async def test_one_work_change_renders_its_row_once_for_every_tab(tmp_path):
     assert app.state.app_state.bus.subscribers("works") == 2
 
     with work_counter.counting() as spent:
-        _add(app, "claude_code:test:mine", WORK, thinking=True)
+        _add(app, "claude_code:test:mine", WORK, thinking=True, title="Renamed")
         await app.state.work_overview.refresh()
         pushed = [await _until(tab, "event: works-") for tab in tabs]
     assert spent[work_counter.WORK_ROW] == 1
@@ -326,7 +327,7 @@ async def test_a_pass_asks_the_router_once_per_repository(tmp_path):
     stat, and a pass asked it once or twice per Work. It is asked once per repository."""
     from types import SimpleNamespace
 
-    app = _app(tmp_path, board=_board(_card(WORK.number), _card(OTHER.number)))
+    app = _app(tmp_path, board=_board())
     _add(app, "claude_code:test:mine", WORK)
     _add(app, "claude_code:test:theirs", OTHER)
     asked: list[str] = []

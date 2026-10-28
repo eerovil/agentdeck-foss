@@ -38,7 +38,6 @@ from ..models import (
     detailed_activity_label,
 )
 from ..models import activity_label as activity_label  # single impl lives in models
-from ..poller_ops import BoardView
 from ..providers import PROVIDERS
 from ..providers.claude_code.auth import looks_like_auth_failure
 from ..state import AppState, SessionPresentation
@@ -993,46 +992,38 @@ def render_chat_transcript(
 
 @dataclass(frozen=True)
 class IssueChip:
-    """One related-issue chip below the transcript, with its GitHub and Project state.
+    """One related-issue chip below the transcript, with its GitHub state.
 
     ``status`` is the badge text the session card already shows (``open`` /
     ``closed`` / ``merged``) and ``status_kind`` its CSS modifier. Both are None
     for an issue whose state the deck has not resolved — a registered issue that
     is not this chat's dispatched one has no cached lookup behind it, so the chip
-    reads as it always did rather than guessing. ``project_status`` comes from
-    the poller's durable board snapshot, so showing it costs no GitHub call.
+    reads as it always did rather than guessing.
     """
 
     number: int
     url: str
     status: str | None = None
     status_kind: str | None = None
-    project_status: str | None = None
 
 
-def session_issue_chips(
-    session: Session, board: BoardView | None = None
-) -> tuple[IssueChip, ...]:
+def session_issue_chips(session: Session) -> tuple[IssueChip, ...]:
     """This session's issue chips, carrying the states the deck already knows.
 
     The state comes from the same resolved badge as the session card
     (``issue_status``), so the bottom of the transcript and the row in the list
-    never disagree (#1113). Project status comes independently from the
-    poller's durable card read, when that issue is on a configured board
-    (#1332). Unknown states stay absent rather than being guessed.
+    never disagree (#1113). Unknown states stay absent rather than being guessed.
     """
     dispatched = IssueRef.parse(session.issue_url or "")
     chips = []
     for issue in session.issues:
         known = dispatched is not None and issue.identity == dispatched.identity
-        card = board.card(issue.repository, issue.number) if board is not None else None
         chips.append(
             IssueChip(
                 number=issue.number,
                 url=issue.url,
                 status=session.issue_status if known else None,
                 status_kind=session.issue_status_kind if known else None,
-                project_status=card.status if card is not None and card.status else None,
             )
         )
     return tuple(chips)
@@ -1375,10 +1366,9 @@ def poller_context(
     *,
     settings_errors: dict | None = None,
     boards: dict | None = None,
-    nudge_errors: dict | None = None,
 ) -> dict:
     """The Poller Instance views this host can see, plus what a control may ask for (#182)."""
-    from .. import poller_nudge, poller_ops, poller_settings
+    from .. import poller_ops, poller_settings
 
     config = request.app.state.config
     settings = getattr(config, "poller", None)
@@ -1399,10 +1389,6 @@ def poller_context(
             for view in instances
         },
         "settings_errors": settings_errors or {},
-        # When this project's ChatGPT PR-review task was last nudged, and whether it can be
-        # nudged by hand right now (#1584). Read fresh: a wake owns the extension's state file.
-        "chatgpt_nudges": poller_nudge.read_all(root, [view.instance for view in instances]),
-        "nudge_errors": nudge_errors or {},
         "poller_root": root,
         # The Builder launch offers the operator's own accounts, in their order (#181).
         "accounts": list(request.app.state.accounts or []),

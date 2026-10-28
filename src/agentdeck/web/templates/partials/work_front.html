@@ -236,17 +236,6 @@
 {%- endfor %}
 
 {%- elif part == "board" %}
-{%- set board = work_overview.board %}
-<span class="front-board-line">
-{%- if board is not none %}
-<span class="front-board-label">Board</span>
-<span data-board-count="cards">{{ board.cards }} {{ "card" if board.cards == 1 else "cards" }}</span>
-{%- if board.in_review %} · <span data-board-count="in_review">{{ board.in_review }} in review</span>{% endif %}
-{%- if board.blocked %} · <span class="is-warn" data-board-count="blocked">{{ board.blocked }} blocked</span>{% endif %}
-{%- if board.needs_info %} · <span class="is-warn" data-board-count="needs_info">{{ board.needs_info }} need info</span>{% endif %}
-{%- if not board.complete %} · <span class="is-warn" title="An instance's board could not be read">partial</span>{% endif %}
-{%- endif %}
-</span>
 <span class="front-links">
 <a href="/works">All Works</a>
 {%- if front.quiet %}<a href="/works" data-quiet-link>{{ front.quiet }} quiet {{ "Work" if front.quiet == 1 else "Works" }}</a>{% endif %}

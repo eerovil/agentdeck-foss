@@ -24,8 +24,6 @@ from ...chat_cwd import continued_chat_cwd, cwd_exists
 from ...command_artifacts import (
     ACCOUNT_KEY_ENV,
     CONTEXT_DIR_ENV,
-    POLICY_MODE_ENV,
-    SESSION_TOKEN_ENV,
     hook_groups,
 )
 from ...models import (
@@ -1182,29 +1180,10 @@ class CodexAppServer:
         delegated: bool = False,
         role: SessionRole | None = None,
         session_token: str | None = None,
-        worker_key: str = "",
-        artifact_root: Path | None = None,
-        artifact_policy: dict[str, Any] | None = None,
         fork_from: ForkFrom | None = None,
     ) -> InjectResult:
         resolved_role = resolve_session_role(delegated=delegated, role=role)
-        artifact_mode = str((artifact_policy or {}).get("mode") or "off")
-        capture = artifact_mode in {"observe", "enforce"}
-        if resolved_role == "kanban" and (capture or self._artifact_root is not None):
-            # The generated hooks carry two independent things: command-output capture, which
-            # only a capture policy switches on, and the per-account approval cache (#1738),
-            # which every kanban worker gets — the same as a Claude kanban worker, whose
-            # settings always carry it. They used to be installed only when capture was on, so
-            # the cache silently depended on a phase setting (#2154). Capture still requires
-            # the hooks; the cache alone is a convenience and never refuses a thread.
-            prepared = await self._ensure_command_artifact_hooks()
-            if not prepared.accepted:
-                if capture:
-                    return prepared
-                log.info("Codex approval-cache hooks unavailable: %s", prepared.reason)
-                await self.start()
-        else:
-            await self.start()
+        await self.start()
         async with self._backend_lifecycle_lock:
             if not await self._refresh_persistent_backend_if_idle():
                 return InjectResult(
@@ -1223,26 +1202,6 @@ class CodexAppServer:
                 "ephemeral": False,
                 "threadSource": "agentdeck",
             }
-            if resolved_role == "kanban":
-                # No subagent cap: Codex's own default applies, as for any
-                # thread (#2482). A cap, if ever wanted again, belongs under
-                # `features.multi_agent_v2`, never `agents.<name>` (#492).
-                private_environment = {
-                    name: value
-                    for name, value in {
-                        "AGENTDECK_WORKER_KEY": worker_key,
-                        SESSION_TOKEN_ENV: str(session_token or ""),
-                        POLICY_MODE_ENV: (
-                            artifact_mode if artifact_mode in {"observe", "enforce"} else ""
-                        ),
-                    }.items()
-                    if value
-                }
-                if private_environment:
-                    shell_environment = thread_config.setdefault(
-                        "shell_environment_policy", {"set": {}}
-                    )
-                    shell_environment.setdefault("set", {}).update(private_environment)
             if thread_config:
                 params["config"] = thread_config
             if sandbox is not None:

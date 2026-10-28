@@ -71,11 +71,3 @@ def test_web_and_runtime_open_the_store_one_way():
     assert "open_db" in _imported_names(SOURCE / "runtime.py")
     assert not (SOURCE / "migrating_db.py").exists()
     assert not (SOURCE / "state_persistence.py").exists()
-
-
-def test_release_policy_stays_independent_of_cycle_and_io_ports():
-    imports = _imports(SOURCE / "poller_engine" / "release.py")
-    assert ".cycle" not in imports
-    assert ".ports" not in imports
-    assert "agentdeck.poller_engine.cycle" not in imports
-    assert "agentdeck.poller_engine.ports" not in imports

@@ -112,7 +112,7 @@ id = "agentdeck"
 holds_issues = true
 holds_code = true
 verification = "agentdeck_job"  # required on every code repository; see below (#2832)
-auto_deploys = true  # deploy-watch observes the deployed commit + /healthz below
+auto_deploys = true
 
 # Where this project's screenshot evidence is committed (#1791). This change proposes a fourth
 # role: `holds_artifacts = true` on exactly one repository sends every worker's screenshots
@@ -231,23 +231,12 @@ artifacts = true
 #   stop = "**Stop the work:** `/claude stop`"
 #   merge = "**Approve and release finished work:** `/merge` *(only from In review)*"
 #   merge_review = "**Review before releasing:** `/merge review`"
-#   shot = "**Ask for screenshots:** `/shot`"
 
 # Each extension validates its own settings through its own hook; the core loader knows nothing
 # about what is in these blocks (#112/#179).
-[extensions.deploy-watch]
-hooks = ["validate-config", "release-gate", "health"]   # what this project allows it (#2158)
-service = "agentdeck.service"
-health_url = "http://127.0.0.1:8756/healthz"
-# The Overlay names where the deploy records its live commit (`deployed_commit_file`,
-# `repo_path`): a web deploy hot-reloads rather than restarting, so the restart stamp alone no
-# longer moves on deploy (#2308).
-grace_seconds = 900
-
 [extensions.screenshots]
-hooks = ["validate-config", "command", "health"]   # what this project allows it (#2158)
+hooks = ["validate-config", "health"]   # what this project allows it (#2158)
 default_routes = ["/", "/pollers"]
-
 
 # sentry-autofix is deliberately left out of the Reference Project: it needs a Sentry
 # organization and a token this project does not have. The extension itself is shipped and

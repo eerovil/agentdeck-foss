@@ -162,7 +162,6 @@ merge_review = true
 deployment_observation = false
 artifacts = false
 auto_release = false
-works_router = true
 """
 
 

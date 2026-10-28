@@ -1499,8 +1499,6 @@ class CodexProvider(SessionProvider):
         images: list[Path] | None = None,
         effort: str | None = None,
         allow_over_budget: bool = False,
-        require_idle: bool = False,
-        expected_last_result_at: float | None = None,
     ) -> InjectResult:
         del allow_over_budget
         client = self._clients.get(account.key)
@@ -1525,11 +1523,9 @@ class CodexProvider(SessionProvider):
                 transcript_expected=False,
             )
         if client is not None and client.owns(session.session_id):
-            kwargs = {"images": images, "effort": effort}
-            if require_idle:
-                kwargs["require_idle"] = True
-                kwargs["expected_last_result_at"] = expected_last_result_at
-            result = await client.queue_turn(session.session_id, message, **kwargs)
+            result = await client.queue_turn(
+                session.session_id, message, images=images, effort=effort
+            )
             if not result.accepted and result.reason == "delivery_id_conflict":
                 return InjectResult(False, "client_action_conflict")
             return result
@@ -1543,14 +1539,6 @@ class CodexProvider(SessionProvider):
             message,
             timeout_s=timeout_s,
             images=images,
-        )
-
-    async def worker_version(self, account: Account, session: Session) -> float | None:
-        client = self._clients.get(account.key)
-        return (
-            await client.worker_version("codex", session.session_id)
-            if client is not None
-            else None
         )
 
     async def delivery_spent(

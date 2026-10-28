@@ -16,7 +16,6 @@ from poller_engine_fakes import NOW, FakePort, run_wake, store_for
 from agentdeck import work_bugs
 from agentdeck.poller_engine import bug_reports
 from agentdeck.poller_engine.ports import EffectKind
-from agentdeck.poller_engine.reconcile import CardSnapshot
 from agentdeck.work_attention import NEEDS_ANSWER, NEEDS_RETRY, NOTES
 from agentdeck.work_overview import WorkAttention
 
@@ -24,12 +23,11 @@ REPOS = frozenset({"agentdeck"})
 
 
 def _row(work_id="github_issue:eerovil/bazaar#9", *, bug="worker_died", category=NEEDS_RETRY,
-         stopped=timedelta(minutes=5), run_id="gen-1"):
+         stopped=timedelta(minutes=5)):
     card = SimpleNamespace(
-        work_id=work_id, run_id=run_id, href="/works/x", source_url="https://github.com/x",
+        work_id=work_id, href="/works/x", source_url="https://github.com/x",
         attention=(WorkAttention("claude_code:main:w", "Worker", "waiting", "/chats/w",
                                  question="the secret is hunter2"),),
-        review=None,
         verification=None,
     )
     return SimpleNamespace(
@@ -113,26 +111,15 @@ def test_the_wait_counts_from_the_move_into_needs_retry_not_from_a_later_change(
     assert work_bugs.track_entries(None, entered) is None
 
 
-def test_a_new_run_of_the_same_work_is_a_new_report(tmp_path):
-    state_path = tmp_path / "agentdeck" / "state.json"
-    board = _board(state_path)
-
-    work_bugs.report([_row(run_id="gen-1")], board, now=NOW)
-    work_bugs.report([_row(run_id="gen-2")], board, now=NOW)
-
-    assert len(_reports(state_path)) == 2
-
-
 # --- the Poller --------------------------------------------------------------------------------
 
 
 def _state() -> dict:
-    # One card the wake reads live, so the filing step runs as it does on a real full wake.
-    return {"issues": {"agentdeck#5": {"status": "In progress", "generation": "gen-1"}}}
+    return {}
 
 
 def _port(**kwargs) -> FakePort:
-    return FakePort(snapshots={"agentdeck#5": CardSnapshot(status="In progress")}, **kwargs)
+    return FakePort(**kwargs)
 
 
 def _write(state_path, work_id, cause="worker_died", repo="agentdeck", run_id="gen-1"):

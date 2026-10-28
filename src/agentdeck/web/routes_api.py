@@ -48,7 +48,7 @@ from ..models import (
 )
 from ..providers import PROVIDERS, pending_interaction_for
 from ..providers.delivery import DeliveryCorrelation, DeliveryReceipts, delivery_participated
-from ..providers.instructions import SessionRole
+from ..providers.instructions import SessionRole, stored_session_role
 from ..public_origin import public_origin
 from ..restart_nudge import NUDGE_MESSAGE, RestartNudgeRegistry
 from ..state import OPERATOR_PRESENCE_IDLE_AFTER_S
@@ -106,8 +106,8 @@ class DelegationRequest(BaseModel):
     model: str | None = None
     effort: Literal["low", "medium", "high", "xhigh", "max", "ultra"] | None = None
     # Codex approval policy. Human-initiated delegations default to "on-request"
-    # (Codex asks before commands it deems risky); an autonomous caller (e.g. the
-    # kanban worker) passes "never" so it runs unattended without prompts.
+    # (Codex asks before commands it deems risky); an autonomous caller (e.g. an
+    # unattended worker) passes "never" so it runs without prompts.
     approval_policy: Literal["untrusted", "on-failure", "on-request", "never"] = "on-request"
     # Who started this delegation, so the child nests under it instead of
     # becoming its own top-level chat and its own Deckhand handoff.
@@ -233,59 +233,6 @@ async def list_sessions(request: Request) -> JSONResponse:
     )
 
 
-class ReviewVerdictBody(BaseModel):
-    """One consumed poller merge-review verdict, as the poller host hands it over."""
-
-    repo: str = Field(min_length=1, max_length=200)
-    sha: str = Field(min_length=7, max_length=64)
-    verdict: str = Field(min_length=1, max_length=40)
-    result: str = Field(min_length=1, max_length=40)
-    pull_request: str = Field(default="", max_length=200)
-    issue_repo: str = Field(default="", max_length=200)
-    issue_number: int = 0
-    auto: bool = False
-    generation: str = Field(default="", max_length=100)
-    reviewed_at: str = Field(default="", max_length=64)
-
-
-@router.post("/poller/review-verdicts")
-async def record_poller_review_verdict(request: Request, body: ReviewVerdictBody) -> dict:
-    """Keep what a poller merge review decided about one commit (#1122).
-
-    The poller engine decides this but cannot write here — it is the stdlib-only artifact —
-    so its host drains one record per reviewed commit into this route. Keyed by repository
-    and commit, so a record handed over twice replaces its row instead of doubling it, which
-    is what lets the host retry a delivery whose local cleanup failed.
-    """
-    reviewed_at = None
-    if body.reviewed_at:
-        try:
-            reviewed_at = datetime.fromisoformat(body.reviewed_at)
-        except ValueError:
-            reviewed_at = None
-    # Always true since the store became required (#2601); the field stays because the
-    # poller host reads it. `recorded` is only "stop holding this".
-    stored = True
-    # Through the state store rather than straight at the table, so a session chip
-    # already showing this commit as unreviewed learns that it is not (#1127).
-    get_state(request).record_review_verdict(
-        PollerReviewVerdict(
-            repo=body.repo,
-            sha=body.sha,
-            verdict=body.verdict,
-            result=body.result,
-            pull_request=body.pull_request,
-            issue_repo=body.issue_repo,
-            issue_number=body.issue_number,
-            auto=body.auto,
-            generation=body.generation,
-            reviewed_at=reviewed_at,
-            recorded_at=datetime.now(UTC),
-        )
-    )
-    return {"recorded": True, "stored": stored, "repo": body.repo, "sha": body.sha}
-
-
 class SessionReviewVerdictBody(BaseModel):
     """A verdict from a review the deck started for one commit (#1127)."""
 
@@ -299,8 +246,8 @@ class SessionReviewVerdictBody(BaseModel):
 async def record_review_verdict(request: Request, body: SessionReviewVerdictBody) -> dict:
     """Keep what a review the deck started decided about one commit (#1127).
 
-    The same record and the same table as a poller merge review: a verdict is about a
-    commit, and where the review came from does not change which commit it read. What
+    The same record and the same table a poller merge review used until #3732: a verdict is
+    about a commit, and where the review came from does not change which commit it read. What
     differs is ``result`` — nothing released or handed back on the strength of this
     one, so it records ``none`` rather than borrowing a release word it did not earn.
 
@@ -1751,9 +1698,8 @@ async def poller_job(request: Request, job_id: str) -> dict:
     return await _runtime_proxy(request, "GET", f"/jobs/{job_id}")
 
 
-# The Poller no longer delivers here: it calls the runtime's `ensure_delivery` directly
-# (#2144), and its phase fields are gone (#2194). This stays the external machine-dispatcher
-# surface and the only home of web-side context maintenance until #2209 decides its fate.
+# The external machine-dispatcher surface, and the only home of web-side context maintenance
+# until #2209 decides its fate. The Poller's phase fields are gone (#2194).
 @router.post("/workers/accounts/{provider}/{label}/deliver")
 async def keyed_deliver(
     request: Request,
@@ -2340,9 +2286,6 @@ async def _prepare_context_delivery(
             else body.permission_mode
         ),
         allow_over_budget=body.allow_over_budget,
-        role=effective_role
-        if decision.executed_action is ContextAction.ROLLOVER
-        else body.role,
         operation=(
             "context_rollover"
             if decision.executed_action is ContextAction.ROLLOVER
@@ -2466,7 +2409,8 @@ def _resume_context_delivery(
             model=frozen.effective_model,
             effort=frozen.effective_effort,
             permission_mode=frozen.effective_permission_mode,
-            role=frozen.effective_role,
+            # A row frozen under the retired ``kanban`` role (#3741) resumes as primary.
+            role=stored_session_role(frozen.effective_role),
             delegated=frozen.effective_delegated,
         )
     if frozen.preferred_model:
@@ -2539,7 +2483,6 @@ def _freeze_disabled_context_delivery(
             effort=body.effort,
             permission_mode=body.permission_mode,
             allow_over_budget=body.allow_over_budget,
-            role=body.role,
             require_idle=body.require_idle,
             require_active=body.require_active,
         ),

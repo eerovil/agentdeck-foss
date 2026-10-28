@@ -30,11 +30,9 @@ from . import (
 )
 from .action_context import client_action_context
 from .assistant import AssistantService
-from .attachments import display_message
 from .auth_watch import AuthWatch
 from .auto_dream import AutoDream, settled
 from .board_watch import BoardWatch
-from .chat_answer_relay import leave_answer
 from .chat_board import TOPIC as CHAT_BOARD_TOPIC
 from .chat_board import ChatBoardService
 from .chat_notes import TOPIC as CHAT_NOTES_TOPIC
@@ -50,16 +48,15 @@ from .issue_latest_comment import LatestCommentService
 from .issue_refresh import IssueRefreshService
 from .live_window import LiveWindow
 from .poller_ops import (
-    works_router_hold_labels,
-    works_router_start_labels,
-    works_router_unassigned_elsewhere,
+    work_hold_labels,
+    work_start_labels,
+    work_unassigned_elsewhere,
 )
 from .poller_wake import KEEPALIVE_S as WEBHOOK_KEEPALIVE_S
 from .poller_wake import PollerWakeService
 from .providers import PROVIDERS, delivery_target_for
 from .providers.codex.runtime_client import runtime_socket_path
 from .providers.usage import read_shared_cache, shared_cache_dir, warm_usage_state
-from .public_origin import public_origin as deck_public_origin
 from .public_origin import record_public_origin
 from .push import PushService
 from .quota_retry import QuotaRetryService
@@ -301,27 +298,12 @@ def create_app(config: AppConfig) -> FastAPI:
         state.note_boss_turn(session_key, message)
         assistant.handle_boss_turn(session_key)
 
-    def relay_held_answer(session_key: str, message) -> None:
-        # A message held while the runtime restarted reached the agent: if it answers a
-        # parked card, hand it to the Poller now, as an ordinary send does on acceptance.
-        chat_path = state.chat_path_for_session(session_key)
-        origin = deck_public_origin()
-        leave_answer(
-            db=getattr(state, "db", None),
-            issues=issues,
-            session_key=session_key,
-            text=display_message(message.text),
-            request_id=message.id,
-            chat_url=f"{origin}{chat_path}" if origin and chat_path else "",
-        )
-
     scheduled_messages = ScheduledMessageService(
         db,
         injector,
         resolve_scheduled_target,
         on_change=lambda chat_id: state.sessions_changed((chat_id,)),
         on_delivered=note_scheduled_boss_turn,
-        on_held_delivered=relay_held_answer,
         # A due row waiting on its chat (no target yet, runtime restarting) is retried on
         # the next chat change rather than on a one-second tick (#2865).
         bus=state.bus,
@@ -432,8 +414,8 @@ def create_app(config: AppConfig) -> FastAPI:
     )
     # A Work hears its own GitHub events (#2895, ADR 0008): a person's comment or review, the
     # reviewer's verdict, and a registered pull request ready at a new head (which starts the
-    # reviewer). Only for projects whose manifest sets `works_router`; the rest keep their
-    # Poller. Messages ride the scheduled-message path under the delivery's own id.
+    # reviewer), for every repository a poller manifest declares. Messages ride the
+    # scheduled-message path under the delivery's own id.
     # Who reviews a Work's new ready head (#3640): a ChatGPT review chat, or a deck-started
     # Claude or Codex reviewer in a throwaway checkout of the head.
     work_reviewer = agent_review.effective(
@@ -792,7 +774,7 @@ def create_app(config: AppConfig) -> FastAPI:
         if person and not assignee and time.monotonic() - unassigned_elsewhere[0] > 30.0:
             unassigned_elsewhere[:] = [
                 time.monotonic(),
-                works_router_unassigned_elsewhere(config.poller.root),
+                work_unassigned_elsewhere(config.poller.root),
             ]
         return work_claims.mine(
             assignee,
@@ -830,7 +812,7 @@ def create_app(config: AppConfig) -> FastAPI:
         start_work=lambda repository, number, **kwargs: start_work_agent(
             app, repository, number, **kwargs
         ),
-        start_labels=lambda repository: works_router_start_labels(config.poller.root).get(
+        start_labels=lambda repository: work_start_labels(config.poller.root).get(
             repository.lower(), ()
         ),
         # Removing it from a Work's issue approves the spec its agent wrote (#3134).
@@ -893,8 +875,8 @@ def create_app(config: AppConfig) -> FastAPI:
         return press is not None and press.outcome != "failed"
 
     missed_start_backstop = MissedStartBackstop(
-        start_labels=lambda: works_router_start_labels(config.poller.root),
-        hold_labels=lambda: works_router_hold_labels(config.poller.root),
+        start_labels=lambda: work_start_labels(config.poller.root),
+        hold_labels=lambda: work_hold_labels(config.poller.root),
         backlog=issues.cached,
         reread=lambda repository, number: issues.refresh_issue_records(
             [(repository, number)], limit=1

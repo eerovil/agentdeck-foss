@@ -1,10 +1,9 @@
-"""One poller delivery, followed from its Work to the session that took it (#2142).
+"""One delivery, followed from its Work to the session that took it (#2142).
 
-``work_id`` is the source-derived id of #2140 and ``run_id`` is the poller generation. Neither
-is minted, inferred or looked up anywhere: the engine records the Run on its durable dispatch,
-the host derives the Work with the canonical function, the deck and the runtime freeze both on
-the delivery's receipts before any provider write, and the session that takes the delivery is
-bound to them. None of it changes what is delivered, to whom, or whether.
+``work_id`` is the source-derived id of #2140 and ``run_id`` the Run. Neither is minted,
+inferred or looked up anywhere: the deck and the runtime freeze both on the delivery's receipts
+before any provider write, and the session that takes the delivery is bound to them. The
+Poller's half (its durable dispatch and worker dispatcher) went with its cards (#3732).
 """
 
 from __future__ import annotations
@@ -23,18 +22,7 @@ from worker_harness import HARNESSES, settle
 from agentdeck.app import create_app
 from agentdeck.config import AccountConfig, AppConfig, HistoryConfig, InjectConfig
 from agentdeck.db import Db
-from agentdeck.models import SNAPSHOT_RUN_CORRELATION, IssueRef
-from agentdeck.poller_adapter.worker import (
-    DeliveryOutcome,
-    WorkerDispatcher,
-    delivery_correlation,
-)
-from agentdeck.poller_engine import dispatch
-from agentdeck.poller_engine.github import receipt_path
-from agentdeck.poller_engine.refusal_policy import (
-    EngineRetryDisposition,
-    refusal_disposition,
-)
+from agentdeck.models import SNAPSHOT_RUN_CORRELATION
 from agentdeck.providers.delivery import (
     DeliverResult,
     DeliveryCorrelation,
@@ -44,7 +32,6 @@ from agentdeck.providers.delivery import (
 from agentdeck.runtime import create_runtime_app
 from agentdeck.state import AppState
 from agentdeck.web.routes_api import WorkerDeliverRequest
-from agentdeck.work import work_id_for
 
 pytestmark = pytest.mark.anyio
 
@@ -55,256 +42,6 @@ NOW = datetime(2026, 9, 23, 12, 0, tzinfo=UTC)
 adapters = pytest.mark.parametrize(
     "build_harness", [h for _, h in HARNESSES], ids=[name for name, _ in HARNESSES]
 )
-
-
-# --- the engine: the Run is the generation ----------------------------------
-
-
-def test_the_durable_dispatch_names_its_run_and_it_is_the_generation():
-    rec: dict = {}
-    attempt = dispatch.new_dispatch(rec, "new")
-
-    directive = dispatch.build_directive(
-        rec, attempt, repo="agentdeck", number=2142, ref="agentdeck#2142"
-    )
-
-    assert attempt["run_id"] == attempt["generation"]
-    assert directive["run_id"] == directive["generation"] == attempt["generation"]
-
-
-def test_a_retry_of_one_dispatch_stays_in_its_run():
-    """The runtime freezes a delivery id's Run, so a retry must present the same one (#2824)."""
-    rec: dict = {}
-    attempt = dispatch.new_dispatch(rec, "new")
-    dispatch.stamp_work(attempt, owner="eerovil", repo="agentdeck", number=1)
-    first = dispatch.build_directive(rec, attempt, repo="agentdeck", number=1, ref="agentdeck#1")
-
-    dispatch.next_attempt(rec, attempt)
-    second = dispatch.build_directive(rec, attempt, repo="agentdeck", number=1, ref="agentdeck#1")
-
-    assert second["run_id"] == first["run_id"] == second["generation"]
-    assert first["dispatch_id"] == second["dispatch_id"]
-    ref = "eerovil/agentdeck#1"
-    assert delivery_correlation(first, ref)["work_id"] == delivery_correlation(second, ref)[
-        "work_id"
-    ]
-
-
-def test_the_engine_names_a_card_by_its_lowercased_issue():
-    assert dispatch.work_id(" Eerovil", "AgentDeck ", 2142) == "github_issue:eerovil/agentdeck#2142"
-
-
-def test_the_durable_dispatch_names_its_work_and_every_run_keeps_it():
-    rec: dict = {}
-    attempt = dispatch.new_dispatch(rec, "new")
-    dispatch.stamp_work(attempt, owner="Eerovil", repo="agentdeck", number=2142)
-    first = dispatch.build_directive(rec, attempt, repo="agentdeck", number=2142, ref="x")
-
-    dispatch.next_attempt(rec, attempt)
-    second = dispatch.build_directive(rec, attempt, repo="agentdeck", number=2142, ref="x")
-    attempt = dispatch.new_dispatch(rec, "work")
-    dispatch.stamp_work(attempt, owner="Eerovil", repo="agentdeck", number=2142)
-    third = dispatch.build_directive(rec, attempt, repo="agentdeck", number=2142, ref="x")
-
-    assert first["work_id"] == second["work_id"] == third["work_id"] == WORK
-    assert first["run_id"] != third["run_id"]
-
-
-def test_a_project_with_no_owner_names_no_work():
-    rec: dict = {}
-    attempt = dispatch.new_dispatch(rec, "new")
-
-    dispatch.stamp_work(attempt, owner="", repo="agentdeck", number=1)
-
-    assert "work_id" not in dispatch.build_directive(rec, attempt, repo="a", number=1, ref="a#1")
-
-
-def test_a_dispatch_with_no_recorded_run_is_never_given_one():
-    """The Run is read from the durable dispatch, not derived from its generation (#2150)."""
-    rec: dict = {}
-    attempt = dispatch.new_dispatch(rec, "new")
-    attempt.pop("run_id")
-
-    directive = dispatch.build_directive(rec, attempt, repo="a", number=1, ref="a#1")
-
-    assert directive["run_id"] == ""
-
-
-def test_a_steer_stays_in_the_run_it_joins():
-    rec: dict = {}
-    first = dispatch.new_dispatch(rec, "new")
-
-    steer = dispatch.new_steer(rec, ["c1"])
-
-    assert steer["run_id"] == first["run_id"]
-
-
-def test_a_correlation_conflict_is_as_permanent_as_a_delivery_id_conflict():
-    disposition = refusal_disposition("delivery_correlation_conflict")
-
-    assert disposition.engine is EngineRetryDisposition.TERMINAL
-
-
-# --- the host adapter: the canonical Work, carried and receipted -------------
-
-
-def _dispatcher(tmp_path, script: str) -> WorkerDispatcher:
-    fake = tmp_path / "curl"
-    fake.write_text("#!/bin/sh\n" + script)
-    fake.chmod(0o755)
-    return WorkerDispatcher(
-        receipts_dir=tmp_path / "dispatch-acks",
-        curl=str(fake),
-        runtime_socket=tmp_path / "rt.sock",
-        candidates=("claude_code:main",),
-    )
-
-
-def _accepting(tmp_path, seen=None) -> str:
-    """A runtime that accepts, optionally writing down the request it was sent."""
-    answer = tmp_path / "answer"
-    answer.write_text(
-        json.dumps({
-            "contract": "ensure-delivery-v1",
-            "accepted": True,
-            "schedule": {"account": "claude_code:main"},
-        })
-        + "\n200"
-    )
-    record = f'printf "%s\\n" "$@" > {seen}\n' if seen is not None else ""
-    return f"{record}cat {answer}\n"
-
-
-_DIRECTIVE = {
-    "action": "new",
-    "repo": "agentdeck",
-    "number": 2142,
-    "ref": "Eerovil/AgentDeck#2142",
-    "generation": "gen-1",
-    "run_id": "gen-1",
-    "work_id": WORK,
-    "dispatch_id": "d1",
-    "messages": [{"payload": "do it", "author": "eero"}],
-}
-
-
-def test_the_delivery_carries_the_canonical_work_and_the_generation_as_run(tmp_path):
-    seen = tmp_path / "seen.json"
-    subject = _dispatcher(tmp_path, _accepting(tmp_path, seen))
-
-    assert subject.deliver(_DIRECTIVE, now=NOW).outcome is DeliveryOutcome.DELIVERED
-
-    payload = _payload(seen.read_text())
-    # Every spelling of the issue is one Work (#2140): the owner's case is folded.
-    assert payload["work_id"] == WORK == work_id_for(IssueRef.parse(KEY))
-    assert payload["run_id"] == "gen-1"
-    # No duplicate transport of the same value under its lease name (#2150).
-    assert "dispatch_generation" not in payload
-    # Machine metadata only: the model never reads it.
-    assert "github_issue:" not in payload["message"]
-    assert "gen-1" not in payload["message"]
-
-
-def _payload(curl_args: str) -> dict:
-    lines = curl_args.splitlines()
-    return json.loads(lines[lines.index("--data-binary") + 1])
-
-
-def test_the_accepted_delivery_receipt_names_its_work_and_run(tmp_path):
-    subject = _dispatcher(tmp_path, _accepting(tmp_path))
-
-    subject.deliver(_DIRECTIVE, now=NOW)
-
-    receipt = json.loads(
-        receipt_path(tmp_path / "dispatch-acks", "agentdeck", 2142, "d1").read_text()
-    )
-    assert receipt["work_id"] == WORK
-    assert receipt["run_id"] == "gen-1"
-
-
-def test_a_directive_naming_no_work_is_refused_not_guessed_from_its_card(tmp_path):
-    """The Work is the engine's to name (#2142); the host never derives one from the ref."""
-    seen = tmp_path / "seen.json"
-    subject = _dispatcher(tmp_path, _accepting(tmp_path, seen))
-    directive = {k: v for k, v in _DIRECTIVE.items() if k != "work_id"}
-
-    delivery = subject.deliver(directive, now=NOW)
-
-    assert (delivery.outcome, delivery.reason) == (DeliveryOutcome.REFUSED, "correlation_required")
-    assert not seen.exists()  # nothing was sent
-
-
-def test_the_engines_work_is_carried_even_when_the_ref_is_short(tmp_path):
-    """The engine's durable dispatch is the source; the short board ref cannot drop it."""
-    seen = tmp_path / "seen.json"
-    subject = _dispatcher(tmp_path, _accepting(tmp_path, seen))
-
-    subject.deliver({**_DIRECTIVE, "ref": "agentdeck#2142", "work_id": WORK}, now=NOW)
-
-    payload = _payload(seen.read_text())
-    assert (payload["work_id"], payload["run_id"]) == (WORK, "gen-1")
-
-
-@pytest.mark.parametrize(
-    "named",
-    [
-        "github_issue:eerovil/agentdeck#9",  # another card's Work
-        "github_issue:Eerovil/agentdeck#2142",  # not the canonical spelling
-        "gitlab_issue:eerovil/agentdeck#2142",
-    ],
-)
-def test_the_adapter_refuses_a_work_that_is_not_this_cards(tmp_path, named):
-    seen = tmp_path / "seen.json"
-    subject = _dispatcher(tmp_path, _accepting(tmp_path, seen))
-
-    delivery = subject.deliver({**_DIRECTIVE, "work_id": named}, now=NOW)
-
-    assert delivery.outcome is DeliveryOutcome.REFUSED
-    assert delivery.reason == "correlation_mismatch"
-    assert not seen.exists()  # nothing was sent
-
-
-def test_the_adapter_reads_the_explicit_run_and_refuses_one_that_is_not_the_lease(tmp_path):
-    seen = tmp_path / "seen.json"
-    subject = _dispatcher(tmp_path, _accepting(tmp_path, seen))
-
-    delivery = subject.deliver({**_DIRECTIVE, "work_id": WORK, "run_id": "gen-other"}, now=NOW)
-
-    assert delivery.reason == "correlation_mismatch"
-    assert not seen.exists()
-
-
-def test_a_directive_without_generation_is_correlated_by_its_run_alone(tmp_path):
-    """After #2150 drops `generation`, the durable pair is all there is."""
-    seen = tmp_path / "seen.json"
-    subject = _dispatcher(tmp_path, _accepting(tmp_path, seen))
-    directive = {k: v for k, v in _DIRECTIVE.items() if k != "generation"}
-
-    subject.deliver({**directive, "work_id": WORK, "run_id": "gen-7"}, now=NOW)
-
-    payload = _payload(seen.read_text())
-    assert (payload["work_id"], payload["run_id"]) == (WORK, "gen-7")
-
-
-def test_a_directive_naming_no_run_is_refused_not_given_its_generation(tmp_path):
-    seen = tmp_path / "seen.json"
-    subject = _dispatcher(tmp_path, _accepting(tmp_path, seen))
-    directive = {k: v for k, v in _DIRECTIVE.items() if k != "run_id"}
-
-    delivery = subject.deliver(directive, now=NOW)
-
-    assert (delivery.outcome, delivery.reason) == (DeliveryOutcome.REFUSED, "correlation_required")
-    assert not seen.exists()
-
-
-def test_the_directive_carries_the_run_the_durable_dispatch_recorded():
-    rec: dict = {}
-    attempt = dispatch.new_dispatch(rec, "new")
-    attempt["run_id"] = "recorded"  # what state.json says, not a recomputation
-
-    directive = dispatch.build_directive(rec, attempt, repo="a", number=1, ref="a#1")
-
-    assert directive["run_id"] == "recorded"
 
 
 # --- the receipt: frozen before the write, never in the fingerprint ---------
@@ -846,7 +583,7 @@ def _poller_body(run_id: str = "gen-1", delivery_id: str = "poller:d1", **extra)
         "key": KEY,
         "message": "carry on",
         "delivery_id": delivery_id,
-        "role": "kanban",
+        "role": "delegated",
         "context_policy": "auto",
         "issue_ref": KEY,
         "work_id": WORK,

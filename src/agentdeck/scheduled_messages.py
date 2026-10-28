@@ -136,7 +136,6 @@ class ScheduledMessageService:
         on_change: Callable[[str], None] | None = None,
         on_delivering: Callable[[str], None] | None = None,
         on_delivered: Callable[[str, str], None] | None = None,
-        on_held_delivered: Callable[[str, ScheduledMessage], None] | None = None,
         bus=None,
     ) -> None:
         self._store = store
@@ -147,7 +146,6 @@ class ScheduledMessageService:
         # A held send is a person's message, so a parked card's answer is relayed from
         # here, once it reached the agent, never when it was held (#2847 review). Run in a
         # thread: it reads the board and writes the instance's state file.
-        self._on_held_delivered = on_held_delivered
         self._on_delivered = on_delivered or (
             lambda _session_key, _message: None
         )
@@ -391,13 +389,6 @@ class ScheduledMessageService:
             else:
                 self._store.settle_scheduled_message(message.id, "delivered")
                 self._on_delivered(target.session.key, message.text)
-                if message.held_for_runtime and self._on_held_delivered is not None:
-                    try:
-                        await asyncio.to_thread(
-                            self._on_held_delivered, target.session.key, message
-                        )
-                    except Exception:  # noqa: BLE001 -- the message is already delivered
-                        log.exception("could not relay held message %s", message.id)
             self._on_change(chat_id)
         return True
 

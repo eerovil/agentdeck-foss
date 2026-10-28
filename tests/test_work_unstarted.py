@@ -54,10 +54,13 @@ def test_only_recent_open_issues_without_the_label_are_unstarted():
     # A repository with no ownership label has nothing to start one with.
     assert unstarted_issues(_backlog(_issue(1), labels=()), now=NOW) == {}
     assert unstarted_issues(None, now=NOW) == {}
-    # #3731: an issue assigned to another deck's person is that deck's to start.
+    # #3731: an issue another deck works is that deck's to start: one assigned to its person,
+    # and an unassigned one where that deck takes those.
     shared = _backlog(_issue(1, assignees=["Coworker"]), _issue(2), _issue(3, assignees=["me"]))
-    mine = lambda repository, assignee: assignee in {"", "me"}  # noqa: E731
-    assert sorted(ref.number for ref in unstarted_issues(shared, now=NOW, mine=mine)) == [2, 3]
+    takes = lambda repository, assignee: assignee in {"", "me"}  # noqa: E731
+    assert sorted(ref.number for ref in unstarted_issues(shared, now=NOW, mine=takes)) == [2, 3]
+    leaves = lambda repository, assignee: assignee == "me"  # noqa: E731
+    assert sorted(ref.number for ref in unstarted_issues(shared, now=NOW, mine=leaves)) == [3]
 
 
 @pytest.mark.asyncio
@@ -126,7 +129,8 @@ async def test_start_agent_assigns_this_decks_person_where_another_deck_takes_un
     from agentdeck.web import routes_works
 
     app = _app(tmp_path)
-    backlog = _backlog(_issue(WORK.number))
+    # Only an issue assigned to this deck's person is listed there, so it is one.
+    backlog = _backlog(_issue(WORK.number, assignees=["me"]))
     app.state.issues.read_board = lambda: backlog.board
     app.state.issues.cached = lambda: backlog
     app.state.deck_claims = lambda repository, assignee: assignee == "me"

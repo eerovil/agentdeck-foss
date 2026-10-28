@@ -4,7 +4,7 @@
 {% for issue in issues %}
 <a class="chip issue-link{% if issue.status_kind %} issue-{{ issue.status_kind }}{% endif %}"
    href="{{ issue.url|issue_href }}" target="_blank" rel="noopener">
-  Issue #{{ issue.number }}{% if issue.status %} · {{ issue.status }}{% endif %}{% if issue.project_status %} · {{ issue.project_status }}{% endif %}
+  Issue #{{ issue.number }}{% if issue.status %} · {{ issue.status }}{% endif %}
 </a>
 {% endfor %}
 {% macro pull_chip(pull) %}

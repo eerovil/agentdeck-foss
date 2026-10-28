@@ -1,4 +1,4 @@
-"""The deck's issue read model and the attention/issue/card join (#821)."""
+"""The deck's issue read model and the attention/issue join (#821)."""
 
 from __future__ import annotations
 
@@ -107,76 +107,6 @@ def test_scope_is_the_repositories_the_manifest_marks_as_holding_issues(tmp_path
     assert board.issue_repositories == ("eerovil/agentdeck",)
     assert board.ownership_label("eerovil/agentdeck") == "agent"
     assert board.complete is True
-
-
-def test_board_status_comes_from_the_engines_own_durable_state(tmp_path):
-    root = _poller_root(
-        tmp_path,
-        state={
-            "issues": {
-                "agentdeck#821": {
-                    "status": "In progress",
-                    "engine_labeled": True,
-                    "started": True,
-                    "worktrees": ["/work/agentdeck/.worktrees/issue-821"],
-                }
-            }
-        },
-    )
-    board = poller_ops.read_board(root)
-    card = board.card("eerovil/agentdeck", 821)
-    assert card is not None
-    assert (card.status, card.ownership) == ("In progress", True)
-    # The engine names a card `repo#number`; the deck holds the owner too, so a
-    # same-named repository under another owner cannot collide with it.
-    assert card.identity == "eerovil/agentdeck#821"
-
-
-def test_board_status_roles_follow_the_manifests_display_names(tmp_path):
-    root = tmp_path / "poller"
-    manifest = _MANIFEST.replace(
-        'ownership_label = "agent"',
-        'ownership_label = "agent"\n\n[board.statuses]\nin_review = "Awaiting approval"',
-    )
-    _install(
-        root,
-        "agentdeck",
-        manifest=manifest,
-        state={
-            "issues": {
-                "agentdeck#906": {"status": "Awaiting approval"},
-                "agentdeck#907": {"status": "In review"},
-            }
-        },
-    )
-
-    board = poller_ops.read_board(root)
-
-    assert board.card("eerovil/agentdeck", 906).in_review is True
-    assert board.card("eerovil/agentdeck", 907).in_review is False
-
-
-def test_each_scope_keeps_its_own_cards_when_instances_watch_the_same_repository(tmp_path):
-    root = tmp_path / "poller"
-    _install(
-        root,
-        "first",
-        manifest=_MANIFEST,
-        state={"issues": {"agentdeck#985": {"status": "Todo"}}},
-    )
-    _install(
-        root,
-        "second",
-        manifest=_MANIFEST,
-        state={"issues": {"agentdeck#985": {"status": "In progress"}}},
-    )
-
-    board = poller_ops.read_board(root)
-
-    scopes = {scope.instance: scope for scope in board.scopes}
-    assert scopes["first"].cards[0].status == "Todo"
-    assert scopes["second"].cards[0].status == "In progress"
-    assert all(scope.complete for scope in scopes.values())
 
 
 async def test_instance_board_paginates_the_project_inventory(tmp_path):
@@ -303,7 +233,7 @@ def test_an_unreadable_state_file_makes_the_board_incomplete(tmp_path):
     assert board.scopes[0].complete is False
 
 
-def test_an_invalid_project_number_keeps_known_cards_visible_but_incomplete(tmp_path):
+def test_an_invalid_project_number_leaves_the_board_incomplete(tmp_path):
     root = _poller_root(tmp_path, state={"issues": {"agentdeck#985": {"status": "Todo"}}})
     manifest = root / "instances" / "agentdeck" / "poller.toml"
     manifest.write_text(_MANIFEST.replace("project_number = 3", "project_number = 0"))
@@ -311,7 +241,8 @@ def test_an_invalid_project_number_keeps_known_cards_visible_but_incomplete(tmp_
     resolver = _resolver(root, gh=None)
     board = resolver.cached_instance_boards()["agentdeck"]
     assert board.complete is False
-    assert [(issue.number, issue.status) for issue in board.issues] == [(985, "Todo")]
+    # An old card record in state is not shown in place of the board (#3741).
+    assert board.issues == ()
 
 
 def test_a_project_that_names_no_ownership_label_still_reports_the_engine_default(tmp_path):
@@ -568,11 +499,8 @@ async def _backlog(tmp_path, *, rows=None, state=None):
     return await resolver.resolve()
 
 
-async def test_a_chat_its_issue_and_its_card_join_into_one_item(tmp_path):
-    backlog = await _backlog(
-        tmp_path,
-        state={"issues": {"agentdeck#821": {"status": "In progress", "engine_labeled": True}}},
-    )
+async def test_a_chat_and_its_issue_join_into_one_item(tmp_path):
+    backlog = await _backlog(tmp_path)
     session = _session(
         issue_url="https://github.com/eerovil/agentdeck/issues/821",
         question="Which shape should I use?",
@@ -581,8 +509,7 @@ async def test_a_chat_its_issue_and_its_card_join_into_one_item(tmp_path):
 
     assert [item.identity for item in view.items] == ["eerovil/agentdeck#821"]
     item = view.items[0]
-    assert item.issue is not None and item.card is not None
-    assert item.card.status == "In progress"
+    assert item.issue is not None
     assert [ref.key for ref in item.sessions] == [session.key]
     assert item.sessions[0].matched_on == "issue_url"
     assert item.waiting is True
@@ -722,25 +649,6 @@ async def test_any_ownership_alias_decides_what_the_poller_holds(tmp_path):
     assert item.owned_by_poller is True
 
 
-async def test_a_card_outliving_its_issue_is_owned_by_the_poller_but_not_by_label(tmp_path):
-    """#866: `owned_by_label` is the half that a stale card cannot answer yes.
-
-    The card fallback exists so an unreadable issue does not lose the engine's
-    own record. But a card stays on the board after its issue is merged, so a
-    caller that must not act on a leftover asks the stricter question.
-    """
-    backlog = await _backlog(
-        tmp_path,
-        rows=[],  # the issue is closed, so the open-issue read does not carry it
-        state={"issues": {"agentdeck#821": {"status": "In progress", "engine_labeled": True}}},
-    )
-    item = join_pending(backlog, []).items[0]
-
-    assert item.issue is None
-    assert item.owned_by_poller is True
-    assert item.owned_by_label is False
-
-
 async def test_owned_by_label_needs_the_live_open_issue_to_carry_it(tmp_path):
     backlog = await _backlog(tmp_path, rows=[_issue_row(821, labels=("agent",))])
     assert join_pending(backlog, []).items[0].owned_by_label is True
@@ -824,7 +732,7 @@ async def test_the_local_api_serves_the_read_model_and_the_join(tmp_path):
     assert len(pending["items"]) == 1
     item = pending["items"][0]
     assert item["identity"] == "eerovil/agentdeck#821"
-    assert item["card"]["status"] == "In progress"
+    assert "card" not in item
     assert item["owned_by_poller"] is True
     assert [ref["key"] for ref in item["sessions"]] == [session.key]
 

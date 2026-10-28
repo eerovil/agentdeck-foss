@@ -1,11 +1,11 @@
 """Say when the poller board moved, so nothing re-reads it on a clock (#2865).
 
-The board is what every installed poller instance publishes: its manifest, its state files
-and its reviewer's state file (`poller_ops.read_board`). The engines republish those on
-their own wakes, from another process, so no in-process write can announce them. Each open
-chat page used to re-read the board every five seconds and the Work overview rebuilt every
-ten to catch a card move. This watches the files instead and publishes ``board`` when
-their fingerprint — the same one `read_board` reuses its decode on — actually moved.
+The board is what every installed poller instance publishes: its manifest and its state
+files (`poller_ops.read_board`). The engines republish those on their own wakes, from another
+process, so no in-process write can announce them. Each open chat page used to re-read the
+board every five seconds and the Work overview rebuilt every ten to catch a card move. This
+watches the files instead and publishes ``board`` when their fingerprint — the same one
+`read_board` reuses its decode on — actually moved.
 
 A file watch can miss a write. The catch-up is the fingerprint itself (ADR 0007): every
 event compares the whole fingerprint, not just the file it named, and a page reads the
@@ -29,19 +29,9 @@ BOARD_TOPIC = "board"
 
 
 def _watch_paths(root: Path) -> tuple[str, ...]:
-    """The instances tree, and the directory of each instance's reviewer state file."""
+    """The instances tree."""
     instances = root / "instances"
-    paths = {str(instances)} if instances.is_dir() else set()
-    for instance in poller_ops._instance_names(root):
-        try:
-            from . import poller_nudge  # imports poller_ops: resolved at call time
-
-            path = poller_nudge.external_review_state_file(root, instance)[1]
-        except Exception:  # noqa: BLE001 -- a bad instance must not stop the watch
-            continue
-        if path is not None and path.parent.is_dir() and not path.is_relative_to(instances):
-            paths.add(str(path.parent))
-    return tuple(sorted(paths))
+    return (str(instances),) if instances.is_dir() else ()
 
 
 class BoardWatch:
@@ -86,7 +76,7 @@ class BoardWatch:
     async def _watch(self) -> None:
         """Watch the current set of paths until it changes; raise if the watch fails."""
         paths = _watch_paths(self._root)
-        # A new instance or reviewer path means a new set to watch: restart on it.
+        # A new instance means a new set to watch: restart on it.
         changed_paths = asyncio.Event()
         if not paths:
             # Nothing installed yet. Watch the nearest directory that exists, not

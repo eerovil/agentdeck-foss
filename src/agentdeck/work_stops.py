@@ -48,8 +48,7 @@ class WorkStop:
 def facts_mark(card: Any) -> str:
     """The facts a Work's category is read from, in one short string (#2332).
 
-    Its Poller card's board state (``work_hidden.card_mark``), each output's state, head and
-    reviewer verdict, the chats' attention states and the current Run's state. A category that
+    Each output's state and head, and the chats' attention states. A category that
     changes while this does not was changed by how the deck reads the facts — a deploy of new
     classification code — not by anything that happened to the Work.
     """
@@ -58,18 +57,13 @@ def facts_mark(card: Any) -> str:
             output.label,
             output.state,
             output.head,
-            output.review,
-            output.review_clean,
-            output.review_changes_at is not None,
             output.conflicting,
         )
         for output in getattr(card, "outputs", ())
     )
     parts = (
-        str(getattr(card, "card_mark", "") or ""),
         repr(outputs),
         ",".join(sorted(item.state for item in getattr(card, "attention", ()))),
-        str(getattr(card, "run_state", "") or ""),
     )
     return hashlib.sha1("|".join(parts).encode(), usedforsecurity=False).hexdigest()[:16]
 

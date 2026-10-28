@@ -29,17 +29,11 @@ def test_owned_session_base_url_defaults_to_loopback_web_port(monkeypatch):
     assert owned_session_base_url(config) == "http://127.0.0.1:9000"
 
 
-def test_keyed_workers_default_to_four_active_kanban_roots():
-    assert KeyedWorkersConfig().max_kanban_workers == 4
+def test_a_config_naming_the_retired_kanban_pool_still_loads():
+    """The live config.toml still says ``max_kanban_workers = 10`` (#3741)."""
+    config = KeyedWorkersConfig(max_kanban_workers=10)
 
-
-def test_keyed_workers_allow_disabling_kanban_on_a_shared_canary():
-    assert KeyedWorkersConfig(max_kanban_workers=0).max_kanban_workers == 0
-
-
-def test_keyed_workers_reject_a_negative_kanban_limit():
-    with pytest.raises(ValidationError, match="max_kanban_workers must be non-negative"):
-        KeyedWorkersConfig(max_kanban_workers=-1)
+    assert not hasattr(config, "max_kanban_workers")
 
 
 def test_owned_session_base_url_honors_env_override(monkeypatch):

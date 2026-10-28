@@ -1,6 +1,6 @@
 """Start the labelled Works a lost webhook delivery never started (#2951).
 
-On a ``works_router`` project a Work starts only when the deck hears the issue's "label
+A Work starts only when the deck hears the issue's "label
 added" delivery (``WorkRouterService._maybe_start``). A delivery lost after the relay's last
 try (#2950), or while it restarts, leaves the issue labelled and nobody working it. A minute
 after start and then every 15 minutes this looks at each switched repository's cached open

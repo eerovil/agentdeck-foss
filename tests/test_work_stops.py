@@ -221,7 +221,7 @@ def test_stops_and_opens_are_durable_and_an_open_never_moves_back(tmp_path):
 def _deck(tmp_path, monkeypatch):
     from test_work_hidden import _deck as hidden_deck
 
-    app, _card, _record = hidden_deck(tmp_path, monkeypatch)
+    app, _record = hidden_deck(tmp_path, monkeypatch)
     return app
 
 
@@ -291,8 +291,10 @@ async def test_a_work_that_stops_again_is_new_until_its_page_is_opened(tmp_path,
     await asyncio.gather(*service._push_tasks)
     (stop,) = app.state.control_db.load_needs_you_pushed()
     (told,) = service.overview.front.needs_you
+    # The Work's stopped chat is where the push opens (#2512).
+    assert told.card.chat_href
     assert phone == [(
-        told.card.title, f"Needs retry · {told.source}", work_href(WORK.work_id),
+        told.card.title, f"Needs retry · {told.source}", told.card.chat_href,
         f"work:{WORK.work_id}",
     )]
     await service.refresh()
@@ -312,10 +314,11 @@ async def test_a_work_that_stops_again_is_new_until_its_page_is_opened(tmp_path,
 
     client = TestClient(app)
     page = client.get("/", params={"chats": "0"}).text
-    # Every page's top bar lists it, linking to the Work, whose opening marks it seen.
+    # Every page's top bar lists it, linking to its stopped chat (#3263), whose opening marks
+    # it seen.
     top_bar = page.split('id="needs-you-slot"', 1)[1].split("</details>", 1)[0]
     assert 'data-new="1"' in top_bar and 'aria-label="1 new Work needs you"' in top_bar
-    assert f'href="{work_href(WORK.work_id)}"' in top_bar and "Needs retry" in top_bar
+    assert f'href="{row.card.chat_href}"' in top_bar and "Needs retry" in top_bar
     # A Work with a chat links straight to it (#3263); opening the chat marks it seen too.
     chatty = replace(row, card=replace(row.card, chat_href="/chats/abc?work=w"))
     globals_ = app.state.templates.env.globals

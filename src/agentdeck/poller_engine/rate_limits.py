@@ -33,12 +33,12 @@ READING_MAX_AGE_S = 30.0
 # under-reports the budget: it can make the gate refuse while there is really room — a cheap,
 # self-correcting mistake — and cannot make it permit while there is not.
 #
-# That argument holds only while every spender records what it spent, and one does not. The
-# `chatgpt-nudge` extension reads GitHub over raw `urllib` and throws the `x-ratelimit-*` response
-# headers away; it is a separate stdlib-only program with no way to reach this store. So a stale
-# reading is offered **only to a wake that has already decided to be webhook-quiet**, which is
-# exactly the wake where that extension returns without asking GitHub anything. A full wake goes
-# back to `READING_MAX_AGE_S` and probes. That keeps nearly all of the saving — quiet wakes are
+# That argument holds only while every spender records what it spent. An extension is a separate
+# program that may read GitHub over its own HTTP client and throw the `x-ratelimit-*` response
+# headers away — `chatgpt-nudge` did, until it was retired (#3741) — with no way to reach this
+# store. So a stale reading is offered **only to a wake that has already decided to be
+# webhook-quiet**, the wake an extension is told to ask GitHub nothing on. A full wake goes back to
+# `READING_MAX_AGE_S` and probes. That keeps nearly all of the saving — quiet wakes are
 # roughly 670 an hour against 84 full ones — and makes the contract above true rather than nearly
 # true.
 GATE_MAX_AGE_S = 300.0

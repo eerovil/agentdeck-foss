@@ -3,9 +3,8 @@
 Before this, every GitHub event reached a Work through its Poller: the engine read the
 board on a 30-second timer, decided a status, and handed the worker an instruction — or
 refused, or waited. This consumer of the raw webhook streams sends the event straight to
-the chat that owns the Work instead, for every project whose manifest switches it on
-(``[capabilities] works_router = true``). A project that has not switched is left to its
-Poller exactly as before.
+the chat that owns the Work instead, for every repository a poller manifest declares
+(every project runs its Works this way since #3732).
 
 What it acts on, and nothing else (the filter is the point: about 99% of agentdeck's
 deliveries are the deck's own echo):
@@ -967,9 +966,9 @@ class SwitchedRepositories:
     def __call__(self, repository: str) -> bool:
         signature = self._current_signature()
         if signature != self._signature:
-            from .poller_ops import works_router_repositories
+            from .poller_ops import work_repositories
 
-            self._repositories = works_router_repositories(self.root)
+            self._repositories = work_repositories(self.root)
             self._signature = signature
         return repository.lower() in self._repositories
 
@@ -1337,7 +1336,7 @@ class WorkRouterService:
             return False
 
     def switched(self, repository: str) -> bool:
-        """Whether ``repository``'s Works hear their own events (manifest ``works_router``)."""
+        """Whether ``repository``'s Works hear their own events: a poller manifest declares it."""
         return bool(self._switched(repository))
 
     def _owner_of_issue(self, repository: str, number: int) -> Owner | None:
@@ -2464,7 +2463,7 @@ class WorkRouterService:
         if owner is None:
             raise AgainRefused(f"no Work's chat registered {pull}")
         if not self._switched(repository):
-            raise AgainRefused(f"{repository} does not route its Works' events (works_router)")
+            raise AgainRefused(f"{repository} is not a repository any poller project declares")
         head = await self._live_ready_head(repository, number)
         if not head:
             raise AgainRefused(

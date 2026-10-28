@@ -101,10 +101,10 @@ class _NoGh:
 
 
 def _deck(tmp_path, monkeypatch):
-    from test_work_hidden import _board_card
-    from test_work_ui import WORK, _app, _board
+    from test_work_ui import WORK, _add, _app
 
-    app = _app(tmp_path, board=_board(_board_card()))
+    app = _app(tmp_path)
+    _add(app, "claude_code:test:worker", WORK, thinking=True)
     app.state.issues.cached_issues = lambda refs: {
         (WORK.repository, WORK.number): {"title": "From GitHub", "state": "open", "is_pr": False}
     }

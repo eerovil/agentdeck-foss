@@ -90,9 +90,9 @@ def test_a_session_guide_carries_the_address(tmp_path, monkeypatch):
     monkeypatch.setenv(ORIGIN_FILE_ENV, str(store))
     record_public_origin("https://deck.example", path=store)
 
-    resolved = agentdeck_session_instructions(role="kanban", provider="claude_code")
+    resolved = agentdeck_session_instructions(role="work", provider="claude_code")
     stated = agentdeck_session_instructions(
-        role="kanban", provider="claude_code", origin="https://other.example"
+        role="work", provider="claude_code", origin="https://other.example"
     )
 
     assert "https://deck.example/home/me/project/worker.py:42" in resolved

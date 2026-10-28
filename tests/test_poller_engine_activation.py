@@ -414,7 +414,6 @@ class _ThrottledRepos(_FakeDiscovery):
         self._adapter = GitHubAdapter(
             org="acme",
             issue_repos=("store",),
-            code_repos=("store",),
             project_number=7,
             api=_ThrottledGh(),
             host=_ThrottledGh(),

@@ -205,7 +205,7 @@ def test_a_finished_work_stays_finished_until_a_message_wakes_it():
 
 
 def card(**fields):
-    built = build_work_card(WORK, issue=None, title="A Work", facts=work_facts(WORK), trace=None)
+    built = build_work_card(WORK, issue=None, title="A Work", facts=work_facts(WORK))
     return replace(built, **fields)
 
 
@@ -450,7 +450,7 @@ def test_the_work_page_reads_the_same_status_as_its_row():
     from agentdeck.web.work_view import WorkDetail
 
     derived = card(derived=status(last_text="All done.", ended_at=AT))
-    detail = WorkDetail(card=derived, trace=None, workspace=None, chats=(), verifications=())
+    detail = WorkDetail(card=derived, workspace=None, chats=(), verifications=())
     assert detail.line == detail.status == derived_story(derived)
     assert detail.attention == front_row(derived, current=True).attention
     assert [b.label for b in detail.buttons] == ["Message", "Open", "Hide"]
@@ -466,7 +466,7 @@ def test_the_rendered_status_box_shows_the_derived_line():
     templates = Jinja2Templates(directory=str(app_mod._TEMPLATES_DIR))
     render_mod.register_filters(templates)
     derived = card(derived=status(last_text="All done.", ended_at=AT))
-    detail = WorkDetail(card=derived, trace=None, workspace=None, chats=(), verifications=())
+    detail = WorkDetail(card=derived, workspace=None, chats=(), verifications=())
     box = dict(render_work_sections(templates, detail))["status"]
     assert 'data-wd-derived="unfinished"' in box and "last said" in box and "All done." in box
     # The category line above the box does not repeat that line (#2944).
@@ -1384,7 +1384,7 @@ def test_a_schedule_definition_is_never_asked_for_a_next_step(tmp_path):
     from agentdeck.web.work_view import ask_for_next_steps, derived_for
 
     facts = replace(work_facts(WORK), record={"labels": ["Scheduled "]})
-    task = build_work_card(WORK, issue=None, title="Weekly SEO audit", facts=facts, trace=None)
+    task = build_work_card(WORK, issue=None, title="Weekly SEO audit", facts=facts)
     assert task.scheduled
     assert not card().scheduled
     app, scheduled, _ = _asking_app(tmp_path, _state(_session(last_text="Filed the run.")))
@@ -1413,7 +1413,7 @@ def test_a_parked_work_waits_for_a_person_and_is_never_asked_for_a_next_step(tmp
     from agentdeck.web.work_view import ask_for_next_steps, derived_for
 
     facts = replace(work_facts(WORK), record={"labels": ["Parked"]})
-    task = build_work_card(WORK, issue=None, title="Box suggestions", facts=facts, trace=None)
+    task = build_work_card(WORK, issue=None, title="Box suggestions", facts=facts)
     assert task.parked_label and not card().parked_label
     app, scheduled, _ = _asking_app(tmp_path, _state(_session(last_text="OK, no new cards.")))
     app.state.work_router = SimpleNamespace(switched=lambda repository: True)
@@ -1459,7 +1459,7 @@ def test_a_posted_spec_waits_for_approval_and_is_never_asked_for_a_next_step(tmp
     start = note(10, body="AgentDeck started an agent.\n<!-- agentdeck-work-start id=x -->")
     notes = [start, note(30)]
     facts = replace(work_facts(WORK), record={"labels": ["agent", "Spec-Only"]})
-    spec = build_work_card(WORK, issue=None, title="A spec", facts=facts, trace=None)
+    spec = build_work_card(WORK, issue=None, title="A spec", facts=facts)
     session = _session(last_text="The spec is on the issue.")
     app, scheduled, _ = _asking_app(tmp_path, _state(session))
     app.state.work_router = SimpleNamespace(switched=lambda repository: True)
@@ -1926,8 +1926,7 @@ def test_a_manifests_paused_label_is_part_of_the_cached_cards_key(monkeypatch):
 
     def key():
         return work_view._card_inputs(
-            _app(), snapshot, WORK, None, jobs=[], outcomes=None, claims=None,
-            facts=work_facts(WORK), evidence_since=None, current_trace=None,
+            _app(), snapshot, WORK, None, jobs=[], claims=None, facts=work_facts(WORK)
         )[0]
 
     before = key()

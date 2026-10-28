@@ -137,9 +137,10 @@ works it, so both never start an agent on one issue.
    unassigned = false
    ```
 
-   That deck's Start agent and New work then assign the issue to its person, and the project
-   must run with `capabilities.works_router = true`, so its poller never moves the shared
-   board's cards.
+   That deck's Not started list then shows only issues assigned to its person (assign yourself
+   on GitHub to pick one up), and its Start agent and New work assign the issue to its person.
+   Its poller never
+   moves the shared board's cards: no poller holds cards since #3732.
 3. To hand an issue over, reassign it on GitHub. The deck it now belongs to starts an agent on
    the same `agent/issue-<n>` branch if it carries the start label; the deck that lost it
    stops its agent and tells it why. Assigning it back tells the old agent to carry on.

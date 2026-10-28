@@ -12,7 +12,7 @@ import re
 
 import pytest
 
-from agentdeck.poller_ops import BoardCard, BoardScope, BoardView
+from agentdeck.poller_ops import BoardScope, BoardView
 from agentdeck.work import WorkRef
 from agentdeck.work_overview import work_href, work_project
 
@@ -52,23 +52,26 @@ def test_a_works_project_is_the_instance_that_declares_its_repository():
 def test_the_counts_line_is_counted_per_project_too(tmp_path):
     from dataclasses import replace
 
-    from test_work_attention import _record, _work
-
+    from agentdeck.work_overview import WorkAttention, build_work_card
     from agentdeck.work_story import front_row, front_sections
 
-    review = _work(tmp_path, _record("In review"))
+    asking = WorkAttention(
+        "claude_code:main:worker", "Worker chat", "waiting", "/chats/w",
+        asks=True, question="Which branch?",
+    )
+    question = build_work_card(DECK, issue=None, title="Work", attention=(asking,))
     rows = [
-        front_row(replace(review, project="agentdeck"), current=True),
-        front_row(replace(review, work_id="github_issue:acmecorp/bazaar#88", project="bazaar"),
+        front_row(replace(question, project="agentdeck"), current=True),
+        front_row(replace(question, work_id="github_issue:acmecorp/bazaar#88", project="bazaar"),
                   current=True),
-        front_row(replace(review, work_id="github_issue:acmecorp/bazaar#89", project="bazaar"),
+        front_row(replace(question, work_id="github_issue:acmecorp/bazaar#89", project="bazaar"),
                   current=True),
     ]
     front = front_sections(rows)
 
-    assert ("review", 3, "reviews") in front.summary
-    assert front.summary_by_project["review"] == {"agentdeck": 1, "bazaar": 2}
-    assert front.summary_plurals["review"] == ("review", "reviews")
+    assert ("answer", 3, "questions") in front.summary
+    assert front.summary_by_project["answer"] == {"agentdeck": 1, "bazaar": 2}
+    assert front.summary_plurals["answer"] == ("question", "questions")
 
 
 def _deck(tmp_path):
@@ -76,13 +79,7 @@ def _deck(tmp_path):
 
     from test_work_ui import NOW, _add, _app
 
-    cards = (
-        BoardCard(DECK.repository, DECK.number, status="In progress", ownership=True),
-        BoardCard(BAZAAR.repository, BAZAAR.number, status="In progress", ownership=True),
-        BoardCard(STORE.repository, STORE.number, status="In progress", ownership=True),
-    )
-    app = _app(tmp_path, board=BoardView(cards={card.identity: card for card in cards},
-                                         scopes=_scopes()))
+    app = _app(tmp_path, board=BoardView(scopes=_scopes()))
     # Each project last active at its own time, so the tabs are not in name order (#3399).
     for index, work in enumerate((DECK, BAZAAR, STORE)):
         _add(app, f"claude_code:test:worker{index}", work, thinking=True,

@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import hashlib
-from typing import Literal
+from typing import Literal, get_args
 
 from ..mac_runner import session_instructions as mac_runner_instructions
 from ..public_origin import public_origin
 
-SessionRole = Literal["primary", "delegated", "kanban", "work"]
+SessionRole = Literal["primary", "delegated", "work"]
+SESSION_ROLES: frozenset[str] = frozenset(get_args(SessionRole))
 # The provider a guide is assembled for (#1548). The conventions block is built
 # per provider so a provider-specific paragraph reaches only the sessions it is
 # true for — the Codex sandbox envelope used to be sent to every Claude
@@ -454,44 +455,6 @@ runtime metadata labels this session as a root session.
 """.strip()
 
 
-KANBAN_SESSION_ROLE_INSTRUCTIONS = """
-Session role: kanban worker. Complete the assigned issue directly and return
-evidence to the poller. For delegation purposes, this role is the top-level
-coordinator for its issue even though poller automation started it. Generic
-workspace rules that classify every automation-started session as a subagent do
-not reclassify this role; only a child spawned or delegated by this worker is a
-subagent. The poller dispatch owns the issue workflow. Do not invoke a generic
-repository or manual issue-management skill merely because the repository and
-issue match its description; treat that match as a trigger only when the issue or
-request explicitly names the skill. You may use subagents for independent,
-bounded, read-heavy investigations such as codebase exploration, test discovery,
-log analysis, documentation verification, or code review. Judge that by how many
-tool calls the investigation will take, not by whether it only reads: every call
-you make in this thread re-sends the whole conversation, so a twenty-command
-investigation costs far less in a subagent that starts empty. Run independent
-subagents together in one message, and when a skill or procedure says how many
-reviewers to spawn, spawn that many.
-Keep synthesis, final decisions, and code changes in this thread. Subagents must
-not spawn or delegate again. Do not use the cross-account `agentdeck delegate`
-bridge.
-
-Batch the calls you do keep here. Issue independent tool calls together in one
-message rather than one per turn, and put commands that would repeat the same
-`cd` prefix into a single shell call. Two greps of one file, or two `git`
-queries about one directory, are one call and not two.
-
-End every dispatch turn with the worker-control terminal report that turn owes.
-Waiting on
-CI, a queued suite, a review, or anything else is not an exception to that, and
-the no-polling rule's "end the turn, naming what you are waiting for" is not
-permission to skip it. The poller cannot tell a turn that ended quietly from one
-that crashed: it hands the work out again, and after a couple of silent endings
-it parks the card for a person, so committed and pushed work still reads as
-abandoned. Report what is done and name the outstanding check inside that
-report; the next dispatch brings you back to its result.
-""".strip()
-
-
 # The two forms of the line a reviewer looks for (#2919). The poller's implementation brief
 # and the Work role both quote these, so a Work chat is told the same line the reviewer checks
 # (#3338: 39 Work chats lost a review round to never being told).
@@ -500,8 +463,9 @@ USE_CASE_WALKTHROUGH_NOT_APPLICABLE = "`Use-case walkthrough: not applicable —
 
 
 # The Work role (#2895 step 4, ADR 0008): the agent of a Work on a project that switched
-# the Work router on. It replaces the kanban worker role there, so it names no poller
-# dispatch, control command or terminal report; each line below is what the deck reads.
+# the Work router on. It replaced the poller's kanban worker role (removed in #3741), so it
+# names no poller dispatch, control command or terminal report; each line below is what the
+# deck reads.
 WORK_SESSION_ROLE_INSTRUCTIONS = (
     """
 Session role: Work agent. This chat owns one Work, its issue and its pull
@@ -602,9 +566,23 @@ description; use one only when the issue or a person names it.
 )
 
 
+def stored_session_role(role: object) -> SessionRole | None:
+    """A role read back from a durable record, mapped onto the roles this version has.
+
+    A worker record written while the poller's ``kanban`` role existed (removed in #3741)
+    still carries it. That role was the top-level coordinator of its issue, so such a chat
+    resumes as a ``primary`` one rather than failing to load or to compose its guide.
+    """
+    if not role:
+        return None
+    if isinstance(role, str) and role in SESSION_ROLES:
+        return role  # type: ignore[return-value]
+    return "primary"
+
+
 def resolve_session_role(*, delegated: bool, role: SessionRole | None) -> SessionRole:
     """Bridge legacy provenance callers onto the explicit role seam."""
-    return role or ("delegated" if delegated else "primary")
+    return stored_session_role(role) or ("delegated" if delegated else "primary")
 
 
 def agentdeck_session_instructions(
@@ -633,9 +611,8 @@ def agentdeck_session_instructions(
     role_instructions = {
         "primary": _primary_role_instructions(provider),
         "delegated": DELEGATED_SESSION_ROLE_INSTRUCTIONS,
-        "kanban": KANBAN_SESSION_ROLE_INSTRUCTIONS,
         "work": WORK_SESSION_ROLE_INSTRUCTIONS,
-    }[role]
+    }[stored_session_role(role) or "primary"]
     identity = (
         "\n" + SESSION_TOKEN_INSTRUCTIONS.format(token=session_token) if session_token else ""
     )

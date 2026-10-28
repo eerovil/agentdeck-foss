@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
-
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import HTMLResponse
 
@@ -87,11 +85,9 @@ async def worktree_diff(request: Request, session_key: str) -> HTMLResponse:
     Deliberately not a live fragment: reading a diff runs git in someone's
     checkout, so it happens when a person asks for it and not on every push.
 
-    The chat's launch directory is only where it *started*: a kanban worker
-    registers further worktrees on its card, often in another repository, and
-    the work is in those. Every checkout the card knows about is read, and an
-    empty one beside a changed one is dropped rather than shown as a blank
-    section (#1120).
+    The chat's launch directory is read, and so is the worktree of each of its
+    registered pull requests' branches; an empty one beside a changed one is
+    dropped rather than shown as a blank section (#1120).
 
     The base branch is refreshed in the background, so this answers from the refs
     already on disk and comes back in milliseconds. When a refresh is genuinely
@@ -104,9 +100,6 @@ async def worktree_diff(request: Request, session_key: str) -> HTMLResponse:
     if context is not None:
         pull = context.reviewable_pull or next(iter(context.pull_requests), None)
     checkouts: list[object] = [session.cwd]
-    if session.cwd is not None:
-        board = await asyncio.to_thread(request.app.state.issues.read_board)
-        checkouts.extend(board.worktrees_beside(session.cwd))
     reader = request.app.state.worktree_diff
     wait = request.query_params.get("refresh") == "wait"
     diffs = await reader.read_many(

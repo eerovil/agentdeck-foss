@@ -3,7 +3,7 @@
 The engine runs from the checkout under its venv (#2153), so it may import the deck's shared
 modules and third-party packages. It must never import ``agentdeck.web`` or ``agentdeck.app``,
 directly or through another module: the app may import the engine, never the reverse. Loading
-it must not load ``agentdeck.providers`` either, because every worker-control call pays the
+it must not load ``agentdeck.providers`` either, because every engine command pays the
 engine's import time and that package alone costs over half a second.
 """
 

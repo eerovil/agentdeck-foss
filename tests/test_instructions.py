@@ -1,17 +1,17 @@
-import re
 from typing import get_args
 
 import pytest
 
 from agentdeck.providers.instructions import (
-    KANBAN_SESSION_ROLE_INSTRUCTIONS,
     SESSION_GUIDE_OPEN,
     USE_CASE_WALKTHROUGH_LINE,
     USE_CASE_WALKTHROUGH_NOT_APPLICABLE,
     WORK_SESSION_ROLE_INSTRUCTIONS,
     SessionRole,
     agentdeck_session_instructions,
+    resolve_session_role,
     session_guide_fingerprint,
+    stored_session_role,
     strip_session_guide,
     wrap_session_guide,
 )
@@ -147,7 +147,7 @@ def test_no_session_guide_asks_an_agent_to_report_attention(provider):
     # agent must not spend a tool call duplicating that state (#1713 follow-up).
     full_guides = [
         agentdeck_session_instructions(provider=provider, role=role)
-        for role in ("primary", "delegated", "kanban")
+        for role in ("primary", "delegated", "work")
     ]
     for guide in full_guides:
         flat = " ".join(guide.split())
@@ -330,106 +330,14 @@ def test_delegated_session_guide_forbids_recursive_delegation():
     assert "primary user-facing coordinator" not in guide
 
 
-def test_kanban_session_guide_allows_one_level_without_cross_account_bridge():
-    guide = agentdeck_session_instructions(provider="claude_code", role="kanban")
-    flat = " ".join(guide.split())
-
-    assert KANBAN_SESSION_ROLE_INSTRUCTIONS in guide
-    assert "Session role: kanban worker" in guide
-    assert "top-level coordinator for its issue" in flat
-    assert "Generic workspace rules" in flat
-    assert "do not reclassify this role" in flat
-    assert "only a child spawned or delegated by this worker is a subagent" in flat
-    assert "The poller dispatch owns the issue workflow" in flat
-    assert "Do not invoke a generic repository or manual issue-management skill" in flat
-    assert "only when the issue or request explicitly names the skill" in flat
-    # No fixed subagent limit (#2482): a worker spawns what a procedure asks for.
-    assert not re.search(r"up to \S+ concurrent subagents", flat)
-    assert "spawn that many" in flat
-    assert "Subagents must not spawn or delegate again" in flat
-    assert "read-heavy investigations" in guide
-    # Delegation is triggered by how many calls the work takes, not by whether it writes:
-    # the cost is turns x context, and bash sequences are what actually run up the bill.
-    assert "how many tool calls the investigation will take" in flat
-    assert "starts empty" in flat
-    # And whatever stays in this thread should arrive in as few turns as possible.
-    assert "Issue independent tool calls together in one message" in flat
-    assert "single shell call" in flat
-    assert "code changes in this thread" in guide
-    assert "Subagents must not spawn or delegate again" in flat
-    assert "Do not use the cross-account `agentdeck delegate` bridge" in flat
-    assert "primary user-facing coordinator" not in guide
-    assert "Session role: delegated worker" not in guide
-    assert "must not spawn or delegate to subagents" not in guide
-
-
-def test_kanban_session_guide_requires_a_report_even_while_waiting():
-    """#1857: a worker ended three dispatches saying "waiting for CI" and posted no
-    worker-control call. The poller revived it twice and parked the card, with the
-    work committed and pushed the whole time. The role brief has to name the call
-    each turn owes, and say the no-polling rule is not a way out of it."""
-    guide = agentdeck_session_instructions(provider="claude_code", role="kanban")
-    flat = " ".join(guide.split())
-
-    assert "End every dispatch turn with the worker-control terminal report that turn owes" in flat
-    # #2154: there is no mid-lane checkpoint left to owe instead.
-    assert "checkpoint" not in flat
-    # The exact excuse this worker used, and the exact rule it used to justify it.
-    assert "Waiting on CI, a queued suite, a review, or anything else is not an exception" in flat
-    assert 'the no-polling rule\'s "end the turn, naming what you are waiting for"' in flat
-    assert "not permission to skip it" in flat
-    # What silence actually costs, so the rule is not just an order.
-    assert "cannot tell a turn that ended quietly from one that crashed" in flat
-    assert "parks the card for a person" in flat
-    assert "committed and pushed work still reads as abandoned" in flat
-    # And the way out: report now, name the check that is still open.
-    assert "name the outstanding check inside that report" in flat
-
-    # Only a kanban worker takes dispatches, so only that role carries this.
-    for role in ("primary", "delegated"):
-        other = " ".join(
-            agentdeck_session_instructions(provider="claude_code", role=role).split()
-        )
-        assert "End every dispatch turn with the worker-control call" not in other
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+def test_a_stored_kanban_role_composes_the_primary_guide():
+    """#3741: the poller's kanban role is gone, but worker records still carry it."""
+    assert stored_session_role("kanban") == "primary"
+    assert stored_session_role(None) is None
+    assert stored_session_role("work") == "work"
+    assert resolve_session_role(delegated=True, role="kanban") == "primary"  # type: ignore[arg-type]
+    legacy = agentdeck_session_instructions(provider="claude_code", role="kanban")  # type: ignore[arg-type]
+    assert legacy == agentdeck_session_instructions(provider="claude_code", role="primary")
 
 
 def test_guide_tells_a_session_how_to_register_related_work_and_title():
@@ -514,7 +422,7 @@ def test_session_guide_wire_wrapper_roundtrips_and_versions():
     """One shared wrapper: Cursor prefixes every Nth turn, Codex prefixes a turn
     when its thread's copy of the guide is out of date. Both need the prefix to
     come back off cleanly, and Codex needs to tell one guide text from another."""
-    guide = agentdeck_session_instructions(provider="claude_code", role="kanban")
+    guide = agentdeck_session_instructions(provider="claude_code", role="work")
     wired = wrap_session_guide(guide, "rebase onto master")
 
     assert wired.startswith(SESSION_GUIDE_OPEN)
@@ -534,13 +442,12 @@ def test_session_guide_wire_wrapper_roundtrips_and_versions():
 
 def test_work_session_guide_says_what_the_deck_reads_and_names_no_poller():
     """#2895 step 4: a Work agent on a switched project has no poller dispatch, so its
-    role names what the deck reads from it and none of the kanban worker's poller duties."""
+    role names what the deck reads from it and none of the poller's duties."""
     for provider in ("claude_code", "codex"):
         guide = agentdeck_session_instructions(provider=provider, role="work")
         flat = " ".join(guide.split())
 
         assert WORK_SESSION_ROLE_INSTRUCTIONS in guide
-        assert KANBAN_SESSION_ROLE_INSTRUCTIONS not in guide
         assert "Session role: Work agent" in guide
         # The status line is the first sentence of the final reply (work_derived).
         assert "Open every final reply with its outcome in one plain sentence" in flat

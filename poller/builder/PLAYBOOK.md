@@ -67,11 +67,11 @@ were given, and remind the operator it is not committed.
 
 ### 6. Extensions
 
-
-Offer the other built-ins as a short list with what each one does — deploy-watch (does a merge
-actually reach the host), sentry-autofix (propose work for unresolved production errors),
-screenshots (`/shot`). For each one the operator enables, ask only that extension's settings, and
-run `scripts/poller_engine.py contract-test` on it before you accept it.
+Offer the built-ins as a short list with what each one does — sentry-autofix (propose work for
+unresolved production errors) and screenshots (check the routes worth shooting). For each one the
+operator enables, ask only that extension's settings, and run `scripts/poller_engine.py
+contract-test` on it before you accept it. The ChatGPT review needs no extension: the deck's Work
+router asks for it (ADR 0008).
 
 ### 7. Validate until clean
 

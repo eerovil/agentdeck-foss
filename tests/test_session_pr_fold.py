@@ -12,7 +12,6 @@ from test_web import _app_with_state, _client, _live_server, _session_action_bar
 
 from agentdeck.git_context import GitContext, PullRequestContext
 from agentdeck.models import IssueRef
-from agentdeck.poller_ops import BoardCard, BoardView
 from agentdeck.web.render import fold_pull_requests
 
 KEY = "claude_code:test:sid1"
@@ -116,14 +115,6 @@ async def test_an_opened_fold_stays_open_through_a_push(tmp_path, monkeypatch):
 
     # The stream re-resolves the chat's git context; keep it the one above, not this host's.
     monkeypatch.setattr(app.state.assistant.context_resolver, "resolve", resolve)
-    project = {"status": "In progress"}
-    app.state.issues.read_board = lambda: BoardView(
-        cards={
-            "eerovil/issues#502": BoardCard(
-                repository="eerovil/issues", number=502, status=project["status"]
-            )
-        }
-    )
     shots = os.environ.get("AGENTDECK_SCREENSHOT_DIR")
 
     async with _live_server(app) as base, async_playwright() as playwright:
@@ -165,14 +156,4 @@ async def test_an_opened_fold_stays_open_through_a_push(tmp_path, monkeypatch):
         assert await merged.count() == 3
         if shots:
             await bar.screenshot(path=str(Path(shots) / "issue-2711-opened.png"))
-
-        project["status"] = "In review"
-        # The board watch announces a card move (#2865); the page does not re-read on a tick.
-        app.state.app_state.bus.publish("board")
-        issue = page.locator("#session-related-links .chip.issue-link")
-        await issue.get_by_text("In review", exact=False).wait_for(state="visible")
-        assert await page.locator("#session-related-links details.pr-fold").evaluate(
-            "el => el.open"
-        )
-        await merged.first.wait_for(state="visible")
         await browser.close()

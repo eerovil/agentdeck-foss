@@ -155,34 +155,6 @@
         </details>
       {% endif %}
 
-      {% if view.working %}
-        <p class="small"><strong>Working:</strong>
-          {% for card in view.working %}<code>{{ card }}</code>{% if not loop.last %}, {% endif %}{% endfor %}
-        </p>
-      {% endif %}
-
-      {# Absent entirely when nothing waits, so a poller with no dependencies keeps its height. #}
-      {% if view.blocked %}
-        <p class="small"><strong>Blocked:</strong>
-          {% for held in view.blocked %}<code>{{ held.card }}</code>
-            <span class="muted">waits for
-              {%- for ref in held.by %} <code>{{ ref }}</code>{% if not loop.last %},{% endif %}{% endfor %}</span>{% if not loop.last %}; {% endif %}
-          {% endfor %}
-        </p>
-      {% endif %}
-
-      {% if view.queue %}
-        <details class="poller-queue" data-keep-open="pollers-{{ view.instance }}-queue">
-          <summary>{{ view.queue|length }} queued command{{ '' if view.queue|length == 1 else 's' }}</summary>
-          <ol class="small">
-            {% for command in view.queue %}
-              <li><code>{{ command.card }}</code> {{ command.kind }} — {{ command.status }}
-                {% if command.author %}<span class="muted">by {{ command.author }}</span>{% endif %}</li>
-            {% endfor %}
-          </ol>
-        </details>
-      {% endif %}
-
       {% if view.budget_holding %}
         <p class="small muted">Token budget is holding queued work — the instance is healthy.</p>
       {% endif %}
@@ -220,65 +192,6 @@
           Pause and resume take effect at the next wake; a paused instance keeps checking in but
           starts no work.
         </p>
-
-        {# The ChatGPT PR-review nudge (#1584). Inside the existing Controls block for the same
-           reason as the worker accounts below, and absent entirely for an instance with no
-           ChatGPT task configured. #}
-        {% set nudge = (chatgpt_nudges|default({}, true)).get(view.instance) %}
-        {% if nudge %}
-          <h4 class="small">ChatGPT PR review</h4>
-          <p class="small muted">
-            Task <code>{{ nudge.task }}</code> — last nudge
-            <span{% if nudge.last_iso %} title="{{ nudge.last_iso }}"{% endif %}>{{ nudge.last_ago }}</span>
-            {%- if nudge.source %} {{ nudge.source }}{% endif %}
-            {%- if nudge.result %}, {{ nudge.result }}{% endif %}.
-          </p>
-          {% if (nudge_errors|default({}, true)).get(view.instance) %}
-            <p class="small error">{{ nudge_errors[view.instance] }}</p>
-          {% endif %}
-          {# Reviews that did not end in a review (#1876). Listed here rather than counted, because
-             the thing a reader has to do something about is the pull request, by name. Absent
-             entirely when every review settled, so an instance at rest gains no height. #}
-          {% if nudge.unresolved %}
-            <p class="small error">Reviewed nothing:</p>
-            <ul class="small poller-review-unresolved">
-              {% for row in nudge.unresolved %}
-                <li>
-                  <code>{{ row.card }}</code> — {{ row.note }}
-                  {%- if row.given_up %}; asked {{ row.attempts }} times, not asking again
-                  {%- else %}; asking again ({{ row.attempts }} so far){% endif %}.
-                </li>
-              {% endfor %}
-            </ul>
-          {% endif %}
-          {# Reviewed, not merged, and nothing pointed at it (#1892). Named rather than counted for
-             the same reason as the list above, and absent entirely when the queue is converging. #}
-          {% if nudge.stalled %}
-            <p class="small error">Parked, nothing will merge it:</p>
-            <ul class="small poller-review-unresolved">
-              {% for row in nudge.stalled %}
-                <li><code>{{ row.card }}</code> — {{ row.note }}.</li>
-              {% endfor %}
-            </ul>
-          {% endif %}
-          {% if nudge.awaiting %}
-            <p class="small muted">
-              Asked for, not answered yet:
-              {% for row in nudge.awaiting %}
-                <code>{{ row.card }}</code> ({{ row.note }}){% if not loop.last %}, {% endif %}
-              {%- endfor %}.
-            </p>
-          {% endif %}
-          {% if nudge.in_flight %}
-            {# Launching is not clicking: the run answers through a receipt minutes later. #}
-            <p class="small muted">A nudge is running now — it reports back when it has clicked.</p>
-          {% elif nudge.runnable %}
-            <button type="button" hx-post="/pollers/{{ view.instance }}/extensions/chatgpt-nudge"
-                    hx-target="#poller-instances" hx-swap="outerHTML">Run the ChatGPT review now</button>
-          {% else %}
-            <p class="small muted">Cannot be run from here — {{ nudge.note }}.</p>
-          {% endif %}
-        {% endif %}
 
         {# Worker accounts (#901). Inside the existing Controls block on purpose: a settings row
            of its own would add height to every instance at rest, which mobile cannot spare. #}

@@ -1,33 +1,17 @@
-"""The front page's one-line read of the poller board (#1007, #1025).
+"""The chats page's one-line read of the poller projects' open issues (#1007, #1691).
 
-Every card the engine is tracking except the ones that reached the project's own
-done column, each with the column it sits in and its pull request when the deck
-knows of one. Cards come from the engine's durable state and pull requests from
-the shared metadata cache, so rendering the dashboard makes no GitHub call.
+A project with no GitHub Project board keeps its status in a ``status:*`` label (#1481),
+so its open issues are its board: each gets a row with its pull request when the deck knows
+of one. Issues come from the shared metadata cache, so rendering the page makes no GitHub
+call. The Poller's own cards were removed (#3741), so only these rows are left.
 
-It used to answer a second question — which cards nothing was working — by
-reading each chat's state. That group never worked: a session is `thinking`,
-`idle`, `remote` or `failed`, and `idle` means *no live process*, so a finished
-chat read as one still working the card. What the operator saw was the window
-after a restart when the collector had not scanned yet (#1014). The column is
-the answer the strip shows instead, and it still derives nothing from a chat's
-state.
+A row whose issue has a chat gets a link to the newest one, so the chat working an issue is
+one press from it rather than something to go and find in the list (#1694). That is
+identity only — which chat, and where it lives — never a claim about what the chat is doing.
 
-What it does carry is a way in: a row whose issue has a chat gets a link to the
-newest one, so the chat working a card is one press from the card rather than
-something to go and find in the list (#1694). That is identity only — which
-chat, and where it lives — never a claim about what the chat is doing.
-
-The honesty rule the rest of the issue read model follows applies here too: an
-incomplete read is not an empty board. ``complete`` false means the strip is
-showing part of the answer, and the bar says so rather than showing a zero.
-
-A project with no GitHub Project board keeps its card status in a ``status:*``
-label instead (#1481), so until an issue carries one the engine tracks no card
-for it and the whole project used to be missing from the strip. There the open
-issue *is* the card, so a boardless project's cardless open issues get rows of
-their own (#1691). Only that project: elsewhere an issue nobody put on the board
-is genuinely not a card, and the strip must not invent one.
+The honesty rule the rest of the issue read model follows applies here too: an incomplete
+read is not an empty board. ``complete`` false means the strip is showing part of the
+answer, and the bar says so rather than showing a zero.
 """
 
 from __future__ import annotations
@@ -45,14 +29,13 @@ BOARDLESS_ROW_LIMIT = 10
 
 @dataclass(frozen=True)
 class StripRow:
-    """One card on the strip, already resolved to what its row shows."""
+    """One issue on the strip, already resolved to what its row shows."""
 
     repository: str
     number: int
     title: str
     url: str
-    status: str  # the board column the engine last wrote
-    in_review: bool = False
+    status: str  # "Status unknown": nothing records a column any more
     pull_number: int = 0
     pull_url: str = ""
     # The newest chat working this card, when the deck knows of one: its leg key
@@ -92,10 +75,6 @@ class InstanceStrip:
     overflow: int = 0
 
     @property
-    def review_count(self) -> int:
-        return sum(1 for row in self.cards if row.in_review)
-
-    @property
     def empty(self) -> bool:
         return not self.cards
 
@@ -113,10 +92,6 @@ class BoardStrip:
         return sum(len(entry.cards) for entry in self.instances)
 
     @property
-    def review_count(self) -> int:
-        return sum(entry.review_count for entry in self.instances)
-
-    @property
     def empty(self) -> bool:
         return not self.instances
 
@@ -125,7 +100,6 @@ class BoardStrip:
             "complete": self.complete,
             "unknown": list(self.unknown),
             "cards": self.card_count,
-            "review": self.review_count,
             "instances": [
                 {
                     "instance": entry.instance,
@@ -160,7 +134,6 @@ def _row(
     session_path: Callable[[str], str] = _chat_page,
 ) -> StripRow:
     issue = item.issue
-    card = item.card
     # Already newest first: the join sorts an item's chats by start/activity
     # time, so the head is the latest chat that named this issue.
     session = item.sessions[0] if item.sessions else None
@@ -170,8 +143,7 @@ def _row(
         title=(issue.title if issue else "") or "",
         url=(issue.url if issue else "")
         or f"https://github.com/{item.repository}/issues/{item.number}",
-        status=(card.status if card else "") or "Status unknown",
-        in_review=bool(card and card.in_review),
+        status="Status unknown",
         pull_number=int(pull.get("number", 0)) if pull else 0,
         pull_url=str(pull.get("url", "")) if pull else "",
         session_key=session.key if session else "",
@@ -186,11 +158,11 @@ def build_strip(
     *,
     session_path: Callable[[str], str] = _chat_page,
 ) -> BoardStrip:
-    """Group the joined pending view into per-instance card lists.
+    """Group the joined pending view into per-instance issue lists.
 
     ``scopes`` are the board's own ``BoardScope`` rows: they map a repository to
     the instance that declares it, which is the only place that mapping exists.
-    A card whose repository no scope claims is dropped rather than guessed into
+    An issue whose repository no scope claims is dropped rather than guessed into
     an instance.
 
     ``session_path`` turns a chat's leg key into the page that opens it. The
@@ -211,71 +183,39 @@ def build_strip(
         for repository in getattr(scope, "issue_repositories", ()) or ():
             owner.setdefault(repository.lower(), instance)
 
-    cards: dict[str, list[StripRow]] = {}
     uncarded: dict[str, list[StripRow]] = {}
     for item in view.items:
-        card = item.card
         instance = owner.get(item.repository.lower())
         if not instance:
             continue
-        if card is None:
-            # No card is the whole point for a boardless project: its issues are
-            # its board, and one that has not been given a `status:*` label yet
-            # is still work the operator should see (#1691). It has to be an
-            # issue the deck read as open — an item that exists only because a
-            # chat or a pull request named it is not evidence of an open issue.
-            if (
-                instance not in boardless
-                or item.issue is None
-                or not item.issue.is_open
-                or item.issue_closed
-            ):
-                continue
-            uncarded.setdefault(instance, []).append(
-                _row(item, _open_pull(item), session_path)
-            )
+        # A boardless project's issues are its board, and one that has not been given a
+        # `status:*` label yet is still work the operator should see (#1691). It has to be
+        # an issue the deck read as open — an item that exists only because a chat or a
+        # pull request named it is not evidence of an open issue.
+        if (
+            instance not in boardless
+            or item.issue is None
+            or not item.issue.is_open
+            or item.issue_closed
+        ):
             continue
-        # Only the cards still on the board: a card in the project's own done
-        # column is finished business, and leaving it here would grow the strip
-        # forever (#1025). Neither is a card whose issue is already closed while
-        # the column never moved — the board outlived the work, and the strip is
-        # not the place to read about it (#1033).
-        if card.done or item.issue_closed:
-            continue
-        cards.setdefault(instance, []).append(
-            _row(item, _open_pull(item), session_path)
-        )
+        uncarded.setdefault(instance, []).append(_row(item, _open_pull(item), session_path))
 
     instances = []
     for instance in order:
-        rows = list(cards.get(instance, []))
         spare = sorted(uncarded.get(instance, []), key=lambda row: -row.number)
         overflow = max(0, len(spare) - BOARDLESS_ROW_LIMIT)
-        rows.extend(spare[:BOARDLESS_ROW_LIMIT])
-        if rows:
+        if spare:
             instances.append(
                 InstanceStrip(
-                    instance=instance,
-                    # In review first — it is the column that wants the operator —
-                    # then newest first within each column.
-                    cards=tuple(
-                        sorted(
-                            rows,
-                            key=lambda row: (
-                                not row.in_review,
-                                row.status.casefold(),
-                                -row.number,
-                            ),
-                        )
-                    ),
-                    overflow=overflow,
+                    instance=instance, cards=tuple(spare[:BOARDLESS_ROW_LIMIT]), overflow=overflow
                 )
             )
 
     return BoardStrip(
         instances=tuple(instances),
-        # Only what a row actually depends on: the cards, and the pull requests
-        # that decide which cards are here. A stale issue list costs a title,
+        # Only what a row actually depends on: the issues, and the pull requests
+        # beside them. A stale issue list costs a title,
         # which the row already falls back from — counting it would put the
         # warning back on permanently, which is what #1016 removed (#1017).
         #

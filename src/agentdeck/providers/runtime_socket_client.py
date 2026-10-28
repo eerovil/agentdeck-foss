@@ -163,18 +163,6 @@ class RuntimeSocketClient:
                     raise
                 await asyncio.sleep(self._RESTART_POLL_S)
 
-    async def worker_version(self, provider: str, session_id: str) -> float | None:
-        try:
-            response = await self._client().get(
-                f"/workers/accounts/{provider}/{self.account.label}/session-version",
-                params={"session_id": session_id},
-            )
-            response.raise_for_status()
-            value = response.json().get("last_result_at")
-            return float(value) if isinstance(value, (int, float)) else None
-        except (httpx.HTTPError, TypeError, ValueError):
-            return None
-
     async def delivery_spent(self, provider: str, session_id: str, delivery_id: str) -> bool:
         """Whether the runtime already holds a durable receipt for this delivery.
 

@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from agentdeck import run_execution, run_trace, stray_db
+from agentdeck import run_execution, stray_db
 from agentdeck import work_workspace_claims as claims
 
 RAW = "~/.local/share/agentdeck/agentdeck.db"
@@ -91,7 +91,7 @@ def test_the_stores_and_readers_open_the_expanded_path(home, cwd, monkeypatch):
     conn.close()
 
     assert [c.path for c in claims.read_claims(RAW, "w1")] == ["/wt/1"]
-    assert [o.run_id for o in run_trace.read_outcomes(RAW, "w1")] == ["r1"]
+    assert [o.run_id for o in run_execution.read_outcomes(RAW, "w1")] == ["r1"]
     assert not (cwd / "~").exists()
 
 

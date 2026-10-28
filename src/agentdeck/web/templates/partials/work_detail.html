@@ -1,12 +1,12 @@
 {# One section of the Work page (#2147, laid out by #2218), chosen by `section`. Each is its
    own stream event, so a change swaps only the section it touched. Top to bottom: what the
    Work is and what it is doing now, the Work-level message box, the milestones, the result,
-   the workspace in a line per repository, and then — collapsed — the Runs, the chats and the
-   technical details. Nothing here is a new lifecycle: `status` is `work_story.work_status`,
+   the workspace in a line per repository, and then — collapsed — the chats and the technical
+   details. Nothing here is a new lifecycle: `status` is `work_story.work_status`,
    a reading of the card's own facts. #}
 {%- set card = detail.card -%}
 {#- A Work the deck runs itself (#2895 step 3, D1) keeps the status line, the question, the
-    message box, the result and the details; its column chip, milestones, Runs and Chats go. #}
+    message box, the result and the details; its state chip, milestones and Chats go. #}
 {%- set derived = card.derived -%}
 {%- from "partials/work_actions.html" import control -%}
 {%- if section == "status" %}
@@ -23,7 +23,7 @@
       aria-label="Rename this Work">✎</button></h1>
 </header>
 <section class="wd-status is-{{ status.tone }}" id="work-status" data-wd-tone="{{ status.tone }}"
-         data-wk-run-state="{{ card.run_state or 'none' }}"{% if derived %} data-wd-derived="{{ derived.kind }}"{% endif %}{% if card.review %} data-wd-review="{{ card.review.state }}"{% endif %}{% if status.kind %} data-wd-attention-kind="{{ status.kind }}"{% endif %}>
+         {%- if derived %} data-wd-derived="{{ derived.kind }}"{% endif %}{% if status.kind %} data-wd-attention-kind="{{ status.kind }}"{% endif %}>
   {#- The operator's category, the same one the front page's row names (#2236), with the same
       actions it offers (#2237); the technical story stays under it. #}
   {%- set op = detail.attention %}
@@ -180,12 +180,6 @@
     {%- if card.verification %}
     <li class="wk-verify is-{{ card.verification.status }}{% if card.verification.status == "failed" and card.verification.superseded %} is-superseded{% endif %}" data-wk-verification="{{ card.verification.status }}">{{ card.verification.label }}</li>
     {%- endif %}
-    {%- if card.untested %}
-    <li class="wk-verify is-untested" data-wk-untested>No green run yet on {{ card.untested | join(", ") }}. Each pull request needs its own verification job, run in its own checkout.</li>
-    {%- endif %}
-    {%- if card.review and card.review.state == "passed" %}
-    <li class="wk-review is-passed" data-wd-review-result="passed">{{ card.review.label }}</li>
-    {%- endif %}
   </ul>
   {%- if not card.outputs and not card.verification %}
   <p class="rt-note" data-wk-verification="none">No pull request or verification job names this Work yet.</p>
@@ -245,19 +239,6 @@
   {%- endif %}
   {%- if card.workspace_note %}<p class="rt-note">{{ card.workspace_note }}</p>{% endif %}
 </section>
-{%- elif section == "runs" and derived %}
-<div id="work-runs" hidden></div>
-{%- elif section == "runs" %}
-{%- set runs = ((1 if detail.trace and detail.trace.current else 0) + (detail.trace.previous | length if detail.trace else 0)) %}
-<details class="wd-section wd-fold" id="work-runs" data-keep-open="work-runs:{{ card.work_id }}">
-  <summary>Runs <span class="rt-count">{{ runs }}</span>{% if card.run_state %}<span class="wd-fold-note">current: {{ card.run_label }}</span>{% endif %}</summary>
-  {%- if detail.trace %}
-  {{ run_html | safe }}
-  {{ history_html | safe }}
-  {%- else %}
-  <p class="rt-note" data-wd-no-run>No Run: no Poller card, delivery or Runtime record names this Work. Its chats were started by hand.</p>
-  {%- endif %}
-</details>
 {%- elif section == "chats" and derived %}
 <div id="work-chats" hidden></div>
 {%- elif section == "chats" %}
@@ -297,7 +278,7 @@
 {%- elif section == "inspector" %}
 <details class="wd-section wd-fold wd-inspector" id="work-inspector" data-keep-open="work-inspector:{{ card.work_id }}">
   <summary>Technical details</summary>
-  <p class="rt-note">work <code>{{ card.work_id }}</code>{% if card.run_id %} · run <code>{{ card.run_id }}</code>{% endif %}</p>
+  <p class="rt-note">work <code>{{ card.work_id }}</code></p>
   <h4 class="wd-title-xs">Sessions and providers</h4>
   <ul class="wd-rows">
     {%- for chat in detail.chats %}
@@ -308,16 +289,6 @@
     </li>
     {%- endfor %}
     {%- endfor %}
-    {%- if detail.trace %}
-    {%- for run in ([detail.trace.current] if detail.trace.current else []) + detail.trace.previous | list %}
-    {%- for session in run.sessions %}
-    <li class="wd-row" data-wd-run-leg="{{ session.session_key }}">
-      <a href="/sessions/{{ session.session_key }}"><code>{{ session.session_key }}</code></a>
-      <span class="rt-note">run <code>{{ run.run_id }}</code> · {{ session.provider }} · {{ session.account }}</span>
-    </li>
-    {%- endfor %}
-    {%- endfor %}
-    {%- endif %}
   </ul>
   {%- if detail.verifications %}
   <h4 class="wd-title-xs">Verification jobs</h4>
@@ -328,13 +299,10 @@
       {%- for name, snapshot in check.tested %}
       <span class="ww-tested{% if not snapshot.clean %} is-problem{% endif %}">{{ name }}@<code>{{ snapshot.head[:7] or "?" }}</code>{% if not snapshot.provable %} unprovable{% elif not snapshot.clean %} dirty{% endif %}</span>
       {%- endfor %}
-      <span class="ww-note">{% if check.run_id == card.run_id %}current Run{% else %}earlier Run{% endif %} · job <code>{{ check.job_id }}</code></span>
+      <span class="ww-note">job <code>{{ check.job_id }}</code></span>
     </li>
     {%- endfor %}
   </ul>
-  {%- endif %}
-  {%- if card.review %}
-  <p class="rt-note" data-wd-review-detail="{{ card.review.state }}">review: {{ card.review.label }}{% if card.review.next_expected %} · next: {{ card.review.next_expected }}{% endif %}</p>
   {%- endif %}
   {%- if workspace_html %}
   <h4 class="wd-title-xs">Workspace evidence</h4>

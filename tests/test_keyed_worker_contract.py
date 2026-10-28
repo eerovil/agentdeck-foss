@@ -47,9 +47,6 @@ def test_the_protocol_covers_exactly_the_provider_neutral_operations():
         "park_worker",
         "find_key_by_session",
         "worker_role",
-        "active_role_keys",
-        "role_last_result_at",
-        "delivery_is_finalized",
         "delivery_receipt",
         "resolve_context_delivery",
     }
@@ -117,7 +114,6 @@ async def test_idle_delivery_rejects_a_changed_worker_version(build_harness, tmp
         require_idle=True,
         expected_last_result_at=99.0,
         delegated=True,
-        role="kanban",
     )
 
     assert not changed.accepted

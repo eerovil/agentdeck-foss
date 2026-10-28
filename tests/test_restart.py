@@ -159,7 +159,6 @@ def _runtime(
     *,
     claude=True,
     codex=False,
-    max_kanban_workers=12,
 ):
     accounts = []
     if claude:
@@ -171,10 +170,7 @@ def _runtime(
     config = AppConfig.model_validate(
         {
             "claude_workers": {"enabled": claude, "state_dir": str(tmp_path)},
-            "keyed_workers": {
-                "state_dir": str(tmp_path),
-                "max_kanban_workers": max_kanban_workers,
-            },
+            "keyed_workers": {"state_dir": str(tmp_path)},
             "restart_nudge": {
                 "file": str(tmp_path / "restart-nudge.json"),
                 "ttl_s": TTL_S,
@@ -216,34 +212,6 @@ async def test_boot_nudges_a_claude_worker_session_and_clears_the_registry(tmp_p
     assert args[1] == NUDGE_MESSAGE
     assert kwargs["delivery_id"] == entry.delivery_id
     assert nudges.registry.entries() == []
-
-
-async def test_boot_nudges_kanban_workers_through_global_capacity(tmp_path):
-    state = _runtime(tmp_path, max_kanban_workers=1)
-    host = _claude_host()
-    active: set[str] = set()
-    host.find_key_by_session.side_effect = ["issue-1", "issue-2"]
-    host.worker_role.return_value = "kanban"
-    host.active_role_keys.side_effect = lambda role: set(active)
-    host.role_last_result_at.return_value = 0.0
-    host.delivery_is_finalized.return_value = False
-
-    async def deliver(key, *_args, **_kwargs):
-        active.add(key)
-        return DeliverResult(True, "revived", session_id=f"sid-{key[-1]}")
-
-    host.deliver.side_effect = deliver
-    state.claude_workers.hosts["main"] = host
-    nudges = state.restart_nudges
-    # The refused second nudge is retried after a sleep (#3009); do not wait it out.
-    nudges.retry_interval_s = 0
-    nudges.registry.register("claude_code:main:sid-1")
-    nudges.registry.register("claude_code:main:sid-2")
-
-    await nudges.deliver_all()
-
-    assert host.deliver.await_count == 1
-    assert active == {"issue-1"}
 
 
 async def test_boot_queues_a_nudge_onto_an_owned_codex_thread(tmp_path):

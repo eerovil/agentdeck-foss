@@ -16,11 +16,9 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
 
-from . import poller_ops
 from .config import AppConfig
 from .git_context import GitContext, GitContextResolver, GitContexts
 from .models import (
-    IssueRef,
     PendingInteraction,
     Session,
 )
@@ -77,10 +75,6 @@ class AssistantService:
         self.config = config.assistant
         self.state = state
         self.accounts = config.build_accounts()
-        # Where this host keeps its Poller Instances, so triage can read which cards a
-        # poller is still going to release on its own (#552). Reading their durable state
-        # is the only channel a oneshot poller has — see ``poller_ops``.
-        self._poller_root = config.poller.root
         self.context_resolver = context_resolver or GitContextResolver()
         # The one writer of session git context; see ``GitContexts``. Everything
         # outside this service reads it through the ``contexts`` view below.
@@ -792,114 +786,39 @@ class AssistantService:
     def work_item_pills(self, sessions: Iterable[Session]) -> dict[str, WorkItemPill]:
         """One work-item pill per given session; absent key = no work item.
 
-        Reads only state the deck already holds — the resolved git context, the
-        poller's durable board snapshot, and the session's own issue status — so
-        drawing the row costs no GitHub call. The board is read once for the
-        whole batch, and ``read_board`` reuses its result while the engine's
-        files are untouched, so a row costs no file read of its own either.
+        Reads only state the deck already holds — the resolved git context and the
+        session's own issue status — so drawing the row costs no GitHub call.
         """
-        board = self._board_snapshot()
         pills: dict[str, WorkItemPill] = {}
         for session in sessions:
             context = self._contexts.get(session.key)
-            card = self._card(board, session)
             pill = resolve_work_item_pill(
-                session,
-                context,
-                board_status=(card.status or None) if card is not None else None,
-                reviewed_sha=self._reviewed_head_sha(context, card),
+                session, context, reviewed_sha=self._reviewed_head_sha(context)
             )
             if pill is not None:
                 pills[session.key] = pill
         return pills
 
-    def _reviewed_head_sha(
-        self, context: GitContext | None, card: poller_ops.BoardCard | None
-    ) -> str:
+    def _reviewed_head_sha(self, context: GitContext | None) -> str:
         """The short commit this row may claim passed review, or "" (#2121).
 
-        One condition throughout: whatever says a review passed has to be about
-        the commit the row speaks for *now*. A head that has moved drops the
-        claim rather than carrying a stale one forward, because a row saying
-        "reviewed" about a commit nobody would merge is worse than a row saying
-        nothing.
+        Whatever says a review passed has to be about the commit the row speaks for
+        *now*: the deck's own record (``poller_review_verdicts``, the same one the
+        chat page's commit chip reads, #1127) is keyed by commit, so a head that has
+        moved drops the claim rather than carrying a stale one forward. It costs no
+        GitHub call: the verdict is cached in this process.
 
-        Two things can say it, and they answer different halves of the question.
-
-        The deck's own record (``poller_review_verdicts``, the same one the chat
-        page's commit chip reads, #1127) is keyed by commit, so it answers "was
-        this exact commit reviewed". It is the only source for a chat whose card
-        the poller does not run — and, being commit-keyed, it goes quiet the
-        moment a rebase moves the head, even though nothing anybody reviewed
-        changed.
-
-        The poller's own published reading of its release bits covers exactly
-        that gap. The engine carries a clean verdict across a rebase by comparing
-        the diff rather than the commit (``release.review_pass_fresh``), and
-        since #2121 it writes down what it concluded and which heads it
-        concluded it against. That is a fact this process cannot re-derive: the
-        digests it turns on come from GitHub reads the engine has already paid
-        for and a row must never make. So the row reads the engine's answer
-        instead of guessing at it, and a rebased branch keeps its tick from the
-        first wake that re-reads the card.
-
-        Neither costs a GitHub call: the verdict is cached in this process, and
-        the board snapshot is already loaded once for the whole batch.
-
-        The verdict word is compared case-insensitively because only one of the
-        two intake routes constrains it: a session-started review is a
-        ``Literal["pass", "changes-needed"]``, while the poller host hands its
-        own verdict over as free text (``ReviewVerdictBody.verdict``). The
-        engine spells it lowercase today, but nothing at this end enforces that,
-        and a row that silently never ticked would be a hard bug to see.
+        The verdict word is compared case-insensitively: a session-started review is
+        a ``Literal["pass", "changes-needed"]``, while the other intake route hands
+        its verdict over as free text.
         """
         commit = pill_review_commit(context)
         if commit is None:
             return ""
-        sha = commit[1]
-        # Two independently-sourced spellings of one commit meet here — the head
-        # GitHub gave the git context, and the head GitHub gave the engine — and
-        # a commit is the same commit whichever case it arrives in.
-        if card is not None and any(
-            sha.casefold() == head.casefold() for head in card.review_passed_heads
-        ):
-            return sha[:7]
         verdict = self.state.review_verdict(*commit)
         if verdict is None or verdict.verdict.strip().casefold() != "pass":
             return ""
-        return sha[:7]
-
-    def _board_snapshot(self) -> poller_ops.BoardView | None:
-        """The poller's cards, or None when they cannot be read.
-
-        A broken or absent poller must not break a row: an unreadable board
-        leaves every pill exactly as it was before this read existed.
-        """
-        try:
-            return poller_ops.read_board(self._poller_root)
-        except Exception as exc:  # noqa: BLE001 -- a poller must not break the list
-            log.debug("Poller board unreadable: %s", exc)
-            return None
-
-    @staticmethod
-    def _card(
-        board: poller_ops.BoardView | None, session: Session
-    ) -> poller_ops.BoardCard | None:
-        """The poller's card for the issue this chat was dispatched for, if any.
-
-        Only the dispatched issue counts. A chat can register other issues it
-        merely touched, and those say nothing about what this chat is doing.
-
-        The row takes two things from this card — the column its pill says, and
-        the engine's own reading of whether the review bit is green (#2121) — so
-        it is looked up once per row rather than once per question.
-        """
-        if board is None:
-            return None
-        issue = IssueRef.parse(session.issue_url or "")
-        if issue is None:
-            return None
-        return board.card(issue.repository, issue.number)
+        return commit[1][:7]
 
     # --- loop ----------------------------------------------------------
 

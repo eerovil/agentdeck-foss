@@ -83,7 +83,6 @@ async def test_rejected_delivery_does_not_change_live_artifact_policy(tmp_path):
         "issue-1",
         "work it",
         cwd=str(tmp_path),
-        role="kanban",
         delegated=False,
         session_token="opaque-session-token",
         command_artifacts={"mode": "observe"},
@@ -94,60 +93,18 @@ async def test_rejected_delivery_does_not_change_live_artifact_policy(tmp_path):
         "issue-1",
         "stale update",
         expected_session_id="not-the-current-session",
-        role="kanban",
         delegated=False,
         command_artifacts={"mode": "enforce"},
     )
 
     assert not rejected.accepted and rejected.reason == "worker_changed"
     assert host._records["issue-1"].command_artifacts == {"mode": "observe"}
-    context = load_context(artifact_root, "claude_code:test", started.session_id)
-    assert context is not None and context["policy"] == {"mode": "observe"}
+    # Only the poller's kanban workers ever had a capture context published (#3741).
+    assert load_context(artifact_root, "claude_code:test", started.session_id) is None
     await host.stop()
 
 
-async def test_kanban_spawn_and_resume_keep_role_block(tmp_path, monkeypatch):
-    # A kanban worker running this suite carried the old cap in its own environment.
-    monkeypatch.delenv("CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY", raising=False)
-    mcp_config = tmp_path / ".mcp.json"
-    mcp_config.write_text('{"mcpServers": {"abacus": {"type": "http"}}}')
-    host, spawned = _host(tmp_path)
-    await host.deliver(
-        "owner/repo#1", "inspect", cwd=str(tmp_path), role="kanban", delegated=False
-    )
-    first = spawned[0]
-    # No subagent cap of our own; Claude Code's default applies (#2482).
-    assert "CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY" not in first["kwargs"]["env"]
-    assert f"--mcp-config={mcp_config}" in first["args"]
-    assert first["args"][first["args"].index("--append-system-prompt") + 1] == (
-        agentdeck_session_instructions(provider="claude_code",
-            role="kanban", session_token=host._records["owner/repo#1"].session_token
-        )
-    )
-    first["process"].stdout.emit(
-        {"type": "system", "subtype": "init", "session_id": "sid-kanban"}
-    )
-    first["process"].stdout.emit({"type": "result", "subtype": "success"})
-    await _settle()
-    first["process"].returncode = 0
-    first["process"].stdout.queue.put_nowait(b"")
-    await _settle()
-
-    await host.deliver("owner/repo#1", "continue", delegated=False)
-
-    second = spawned[1]
-    assert "CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY" not in second["kwargs"]["env"]
-    assert f"--mcp-config={mcp_config}" in second["args"]
-    assert second["args"][second["args"].index("--append-system-prompt") + 1] == (
-        agentdeck_session_instructions(provider="claude_code",
-            role="kanban", session_token=host._records["owner/repo#1"].session_token
-        )
-    )
-    assert host._records["owner/repo#1"].role == "kanban"
-    await host.stop()
-
-
-async def test_non_kanban_spawn_does_not_explicitly_trust_project_mcp_config(tmp_path):
+async def test_a_spawn_does_not_explicitly_trust_project_mcp_config(tmp_path):
     (tmp_path / ".mcp.json").write_text(
         '{"mcpServers": {"untrusted": {"command": "arbitrary"}}}'
     )
@@ -248,7 +205,6 @@ async def test_poller_continuation_adopts_an_existing_background_shell_task(tmp_
         "owner/repo#1",
         "start",
         cwd=str(tmp_path),
-        role="kanban",
         delegated=False,
     )
     process = spawned[0]["process"]
@@ -285,7 +241,6 @@ async def test_poller_continuation_finds_a_launch_before_the_bounded_scan_window
         "owner/repo#1",
         "start",
         cwd=str(tmp_path),
-        role="kanban",
         delegated=False,
     )
     process = spawned[0]["process"]
@@ -890,60 +845,6 @@ async def test_capacity_rejects_new_spawns_but_not_steering(tmp_path):
     await host.stop()
 
 
-async def test_kanban_workers_use_the_runtime_global_pool_not_the_account_pool(tmp_path):
-    host, spawned = _host(tmp_path, max_workers=1)
-
-    first = await host.deliver(
-        "issue-1", "start", cwd=str(tmp_path), role="kanban", delegated=False
-    )
-    second = await host.deliver(
-        "issue-2", "start", cwd=str(tmp_path), role="kanban", delegated=False
-    )
-
-    assert first.accepted and second.accepted
-    assert len(spawned) == 2
-    await host.stop()
-
-
-async def test_kanban_workers_do_not_consume_the_account_interactive_pool(tmp_path):
-    # A kanban root is admitted by the runtime's global pool, so it must not hold
-    # an account-local slot either. Counting it filled the interactive pool it is
-    # exempt from and refused every manual new chat on that account (#559).
-    host, spawned = _host(tmp_path, max_workers=1)
-    await host.deliver(
-        "agentdeck#556", "work it", cwd=str(tmp_path), role="kanban", delegated=False
-    )
-
-    admitted = await host.deliver("chat-88a8", "start", cwd=str(tmp_path), delegated=False)
-
-    assert admitted.accepted and admitted.action == "spawned"
-    assert len(spawned) == 2
-    snap = host.snapshot()
-    assert snap["workers"]["agentdeck#556"]["live"] is True  # mid-turn, untouched
-    await host.stop()
-
-
-async def test_a_kanban_worker_is_never_reclaimed_to_admit_another_worker(tmp_path):
-    # The mirror of the rule above: since a kanban root holds no account slot,
-    # reclaiming one would free nothing and would admit a worker past the cap.
-    host, spawned = _host(tmp_path, max_workers=1)
-    await host.deliver(
-        "agentdeck#556", "work it", cwd=str(tmp_path), role="kanban", delegated=False
-    )
-    spawned[0]["process"].stdout.emit({"type": "result", "subtype": "success"})
-    await _settle()
-    await host.deliver("chat-ba83", "start", cwd=str(tmp_path), delegated=False)
-
-    rejected = await host.deliver(
-        "delegate-1", "work it", cwd=str(tmp_path), role="delegated", delegated=False
-    )
-
-    assert not rejected.accepted and rejected.reason == "at_capacity"
-    snap = host.snapshot()
-    assert snap["workers"]["agentdeck#556"]["live"] is True  # idle, but not ours to take
-    await host.stop()
-
-
 async def test_a_person_starting_a_chat_is_never_refused_but_a_machine_is(tmp_path):
     # "Don't allow getting at_capacity here" (#559): the cap exists to stop
     # machines from filling an account. A person's explicit start is admitted.
@@ -1007,24 +908,6 @@ async def test_a_worker_given_a_message_moments_ago_is_not_reclaimed_as_idle(tmp
 def _age_delivery(host, key: str) -> None:
     """Move a worker's last delivery out of the idle-reclaim grace."""
     host._records[key].last_delivery_at -= IDLE_RECLAIM_GRACE_S + 1
-
-
-async def test_a_refusal_counts_only_the_workers_that_hold_a_slot(tmp_path, caplog):
-    host, _ = _host(tmp_path, max_workers=1)
-    await host.deliver(
-        "agentdeck#556", "work it", cwd=str(tmp_path), role="kanban", delegated=False
-    )
-    await host.deliver("chat-ba83", "start", cwd=str(tmp_path), delegated=False)
-    with caplog.at_level("WARNING", logger="agentdeck.providers.claude_code.worker"):
-        rejected = await host.deliver(
-            "delegate-1", "work it", cwd=str(tmp_path), role="delegated", delegated=False
-        )
-    assert not rejected.accepted and rejected.reason == "at_capacity"
-    # The log said "2/1 slots" while it refused, which read as a cap the deck had
-    # already blown through rather than a kanban root that never held a slot.
-    assert "1/1 slots held by chat-ba83(turn=y" in caplog.text
-    assert "agentdeck#556" not in caplog.text
-    await host.stop()
 
 
 async def test_idle_worker_is_evicted_to_admit_new_chat(tmp_path):
@@ -1240,15 +1123,12 @@ async def _go_idle(spawned, index):
     await _settle()
 
 
-async def test_a_quiet_kanban_worker_is_collected_though_nothing_wants_its_slot(tmp_path):
-    # The #1226 bug. A kanban root holds no account-local slot, so admission
-    # pressure never reclaims it, and with no timed sweep nothing collected one
-    # at all: 39 sat live for up to 20 days. Collection must ignore the pool
-    # exemption, which is about consuming a slot, not about being abandoned.
-    host, spawned = _host(tmp_path, max_workers=1, idle_after_s=3600.0)
-    await host.deliver(
-        "agentdeck#556", "work it", cwd=str(tmp_path), role="kanban", delegated=False
-    )
+async def test_a_quiet_worker_is_collected_though_nothing_wants_its_slot(tmp_path):
+    # The #1226 bug. With nobody competing for a slot, admission pressure never
+    # reclaims a worker, and with no timed sweep nothing collected one at all:
+    # 39 sat live for up to 20 days.
+    host, spawned = _host(tmp_path, max_workers=4, idle_after_s=3600.0)
+    await host.deliver("agentdeck#556", "work it", cwd=str(tmp_path), delegated=False)
     await _go_idle(spawned, 0)
 
     collected = await host.collect_idle(now=time.time() + 7200)
@@ -1348,8 +1228,7 @@ async def test_collection_takes_every_eligible_worker_not_just_one(tmp_path):
     # waiting another interval per worker.
     host, spawned = _host(tmp_path, max_workers=4, idle_after_s=3600.0)
     for index, key in enumerate(("agentdeck#556", "chat-ba83", "delegate-1")):
-        role = "kanban" if key.startswith("agentdeck#") else None
-        await host.deliver(key, "start", cwd=str(tmp_path), role=role, delegated=False)
+        await host.deliver(key, "start", cwd=str(tmp_path), delegated=False)
         await _go_idle(spawned, index)
 
     collected = await host.collect_idle(now=time.time() + 7200)
@@ -1435,23 +1314,35 @@ async def test_snapshot_excludes_exited_worker_before_reader_cleanup(tmp_path):
 
 
 async def test_state_persists_across_host_restarts(tmp_path):
-    mcp_config = tmp_path / ".mcp.json"
-    mcp_config.write_text('{"mcpServers": {"abacus": {"type": "http"}}}')
+    (tmp_path / ".mcp.json").write_text('{"mcpServers": {"abacus": {"type": "http"}}}')
     host, spawned = _host(tmp_path)
-    await host.deliver(
-        "issue-1", "start", cwd=str(tmp_path), role="kanban", delegated=False
-    )
+    await host.deliver("issue-1", "start", cwd=str(tmp_path), delegated=True)
     spawned[0]["process"].stdout.emit(
         {"type": "system", "subtype": "init", "session_id": "sid-xyz"}
     )
     await _settle()
     await host.stop()
+    # A record written while the poller's kanban role existed (#3741) still loads, and the
+    # chat resumes as a primary one: it was its issue's top-level coordinator.
+    state = tmp_path / "state" / "test.json"
+    saved = json.loads(state.read_text())
+    saved["workers"][0]["role"] = "kanban"
+    state.write_text(json.dumps(saved))
 
     reloaded, spawned2 = _host(tmp_path)
+    assert reloaded.worker_role("issue-1") == "primary"
     result = await reloaded.deliver("issue-1", "resume me", delegated=False)
     assert result.accepted and result.action == "revived"
-    assert "--resume" in spawned2[0]["args"]
-    assert f"--mcp-config={mcp_config}" in spawned2[0]["args"]
+    args = spawned2[0]["args"]
+    assert "--resume" in args
+    assert not any(arg.startswith("--mcp-config") for arg in args)
+    assert args[args.index("--append-system-prompt") + 1].startswith(
+        agentdeck_session_instructions(
+            provider="claude_code",
+            role="primary",
+            session_token=reloaded._records["issue-1"].session_token,
+        )
+    )
     await reloaded.stop()
 
 
@@ -2539,20 +2430,6 @@ async def test_every_auto_chat_gets_the_skip_rules_and_block_hooks(tmp_path):
     await host.stop()
 
 
-async def test_a_kanban_worker_keeps_command_capture_next_to_the_block_hooks(tmp_path):
-    host, spawned = _host(tmp_path)
-    await host.deliver("issue-1", "start", cwd=str(tmp_path), role="kanban", delegated=False)
-    settings = _settings(spawned[0]["args"])
-    assert "Bash(pytest *)" in settings["permissions"]["allow"]
-    assert {"PermissionDenied", "PreToolUse", "PostToolUse"} <= set(settings["hooks"])
-    commands = [
-        hook["command"] for group in settings["hooks"]["PreToolUse"] for hook in group["hooks"]
-    ]
-    assert any(c.endswith("command_output_hook.py") for c in commands)
-    assert any(c.endswith("claude_permission_hook.py") for c in commands)
-    await host.stop()
-
-
 async def test_a_chat_outside_auto_mode_gets_the_block_hooks_but_no_skip_list(tmp_path):
     # A read-only delegate runs in plan mode; an allow rule for `git commit` or
     # `cp` would let it write.
@@ -2570,7 +2447,7 @@ def test_configured_skip_rules_are_added_and_guarded_ones_dropped(tmp_path):
     host, _ = _host(
         tmp_path, classifier_skip_rules=["Bash(make test *)", "Bash(gh pr view *)", "Bash(*)"]
     )
-    allow = json.loads(host._settings_files[(False, True)].read_text())["permissions"]["allow"]
+    allow = json.loads(host._settings_files[True].read_text())["permissions"]["allow"]
     assert "Bash(make test *)" in allow
     assert "Bash(gh pr view *)" not in allow and "Bash(*)" not in allow
 
@@ -3702,9 +3579,9 @@ async def test_a_new_worker_starts_in_bypass_and_can_be_switched_out(tmp_path):
     await host.stop()
 
 
-async def test_a_new_poller_worker_starts_in_bypass(tmp_path):
+async def test_a_new_worker_starts_in_bypass(tmp_path):
     host, spawned = _host(tmp_path)
-    await host.deliver("issue-1", "start", cwd=str(tmp_path), role="kanban", delegated=False)
+    await host.deliver("issue-1", "start", cwd=str(tmp_path), delegated=False)
 
     args = spawned[0]["args"]
     assert args[args.index("--permission-mode") + 1] == "bypassPermissions"

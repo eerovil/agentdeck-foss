@@ -2,9 +2,9 @@
 
 Before this, every merge went through a Poller: the deck left a request file and the engine
 read it on its next wake, checked the release bits on its card record, armed GitHub's
-auto-merge and watched it, all on a 30-second timer. For a project whose manifest switches
-the Work router on (``[capabilities] works_router = true``), this module merges in the web
-process instead, for any Work **no Poller card holds** (read live from the Poller's board). A
+auto-merge and watched it, all on a 30-second timer. For every project (#3732) this module
+merges in the web process instead, for any Work **no Poller card holds** (read live from the
+Poller's board). A
 Work the Poller carries finishes under the Poller, so the two never both merge one pull
 request (D17).
 

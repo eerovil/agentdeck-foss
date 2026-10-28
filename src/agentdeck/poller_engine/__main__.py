@@ -10,20 +10,12 @@ whole entry point. It exposes the host operations:
 * ``cycle`` — one wake (#176).
 * ``propose`` — stage one operator-supplied reference through an extension for the next wake.
 * ``contract-test`` — check an extension program against the hook protocol (#179).
-* ``dispatch-ack`` — compatibility receipt writer for host integrations.
-* ``worker-control`` — generation-bound completion and merge-review verdicts, the only
-  lifecycle a worker drives (#2155), plus ``enabled`` as a diagnostic. Stopping a worker is the
-  Runtime's, not a worker verb (#2159).
-* ``register-worktree`` — generation-bound registration of a worktree a worker created by
-  hand outside the Work's own workspace, which the runtime then claims for the Work.
 * ``reap-worktrees`` — list, and only on request release, the host worktrees no Work
   claims. Operator-driven and dry-run by default; no wake ever calls it.
 
 ``cycle`` composes the pieces: the config layer loads what was activated and proves it has not
-drifted, the GitHub adapter supplies the reads and performs the effects, and the wake's
-directives are written to stdout for the app-side dispatcher to deliver. The engine never
-delivers to a worker itself — it records the send intent durably and hands out a directive, which
-is what keeps delivery at-most-once (#176).
+drifted, and the GitHub adapter supplies the reads and performs the effects. The engine holds no
+cards and starts no workers: the deck runs every Work (#3732).
 """
 
 from __future__ import annotations
@@ -41,7 +33,6 @@ from pathlib import Path
 
 from . import authorization as auth
 from . import config, extensions, github, github_authority, reaper
-from . import paths as path_identity
 
 _ADAPTER_MISSING = (
     "this engine has no host adapter installed, so {op} cannot run.\n"
@@ -172,25 +163,17 @@ def _policy(manifest, authority: github_authority.Authority) -> auth.Policy:
     return replace(policy, bot=login)
 
 
-# The owner of the repository the review chats live in (``chat_board.repository``). Every
-# instance's chatgpt-nudge opens and reads its chats there, so every instance is handed this
-# owner's credential beside its own (#2682).
-REVIEW_CHAT_OWNER = "eerovil"
-
-
 def _hand_token_to_extensions(installed: list, loaded, authority) -> list | None:
-    """Give every extension one credential per owner it may read, and nothing wider (#2289).
+    """Give every extension the instance's own credential, and nothing wider (#2289).
 
-    Each is a 0600 file beside the instance's state, rewritten each wake so an
-    installation token in it is always fresh. ``github_token_files`` maps a case-folded
-    owner to its file, and an extension picks the one for the repository a request is
-    about; an owner with no entry is refused. ``github_token_file`` is the instance's own.
+    One 0600 file beside the instance's state, rewritten each wake so an installation token in
+    it is always fresh. ``github_token_file`` names it, and ``github_token_files`` maps the
+    instance's case-folded owner to the same file. No human token is ever exposed to an
+    extension.
 
-    The map holds the instance's owner and ``REVIEW_CHAT_OWNER``, where the review chats
-    live (``chat_board.repository``), whichever authority speaks for it — the agent account
-    until #2682, the App's installation on the personal account since. An organization
-    instance never holds another organization's installation token. No human token is ever
-    exposed to an extension.
+    Until #3741 the map also held the owner of the review-chat repository, for the
+    ``chatgpt-nudge`` extension that read its chats; that extension is retired, so no instance
+    holds another owner's credential any more.
     """
     state = Path(loaded.overlay.state_path)
     path = state.with_name("github-token")
@@ -203,32 +186,10 @@ def _hand_token_to_extensions(installed: list, loaded, authority) -> list | None
               file=sys.stderr)
         return None
     files = {authority.owner: str(path)}
-    try:
-        accounts = github_authority.load_accounts()
-    except github_authority.ConfigError:
-        accounts = None  # the instance's own authority resolved, so this is a race; skip
-    for owner in sorted(accounts.owners if accounts else {}):
-        if owner in files or owner != REVIEW_CHAT_OWNER:
-            continue
-        extra = state.with_name(f"github-token-{owner}")
-        try:
-            _write_credential(
-                extra, github_authority.token(github_authority.resolve(owner, accounts))
-            )
-        except (OSError, github_authority.Refusal) as exc:
-            # Best effort: the wake still runs, and the owner stays in the map with no
-            # file, so the extension reads it as "unreadable just now" rather than as
-            # an owner with nothing there — a missing chat would be a wrong verdict.
-            print(f"github: no credential handed for owner {owner}: {exc}", file=sys.stderr)
-            extra.unlink(missing_ok=True)
-            files[owner] = ""
-            continue
-        files[owner] = str(extra)
-    # A file for an owner no longer handed (left the map, or moved to an App) is removed,
-    # so no copy of a credential outlives its grant.
+    # A file for another owner (the review-chat owner's, before #3741) is removed, so no copy
+    # of a credential outlives its grant.
     for stale in state.parent.glob("github-token-*"):
-        if str(stale) not in files.values():
-            stale.unlink(missing_ok=True)
+        stale.unlink(missing_ok=True)
     return [
         replace(
             ext,
@@ -252,70 +213,24 @@ def _write_credential(path: Path, credential: str) -> None:
         raise
 
 
-def _adapter(
-    loaded: config.PollerConfig, *, paths=None, agentdeck_url: str = ""
-) -> github.GitHubAdapter:
+def _adapter(loaded: config.PollerConfig) -> github.GitHubAdapter:
     """The GitHub adapter for this project, speaking only as the instance's authority."""
     gh = _instance_gh(loaded.manifest)
     return github.GitHubAdapter(
         org=loaded.manifest.board.org,
         issue_repos=loaded.manifest.issue_repos(),
-        code_repos=loaded.manifest.code_repos(),
         project_number=loaded.manifest.board.project_number,
-        status_names=dict(loaded.manifest.board.status_names),
         ownership_label=loaded.manifest.board.ownership_label,
-        ownership_labels=loaded.manifest.board.accepted_ownership_labels,
-        spec_only_label=loaded.manifest.board.spec_only_label,
-        paused_label=loaded.manifest.board.paused_label,
         comment_guide=loaded.manifest.comment_guide,
-        merge_method=loaded.manifest.merge_method,
-        release_bits=config.verify_turn(loaded.manifest.capabilities),
         api=gh,
         host=gh,
-        binding=loaded.binding,
-        receipts=paths,
-        agentdeck_url=agentdeck_url,
-        worker_accounts=loaded.overlay.accounts,
-        usage_ceilings=loaded.overlay.usage_ceilings,
-        usage_cache=(
-            Path(loaded.overlay.usage_cache).expanduser() if loaded.overlay.usage_cache else None
-        ),
         graphql_reserve=loaded.manifest.graphql_reserve,
         core_reserve=loaded.manifest.core_reserve,
     )
 
 
-def _ready_to_merge(binding: config.Binding) -> str | None:
-    """The optional *Ready to merge* column, but only when this board actually has one (#1099).
-
-    The role name is never the question: every project has one by default. Whether activation
-    bound a board option for it is, because a status write to an unbound role fails, and a
-    failed effect is retried every wake forever rather than dropped.
-    """
-    return (
-        config.Role.READY_TO_MERGE.value
-        if binding.option_id(config.Role.READY_TO_MERGE)
-        else None
-    )
-
-
-def _human_review_pending(binding: config.Binding) -> str | None:
-    """The optional *Human review pending* column, when this board actually has one (#1465).
-
-    Nothing automatic ever writes this column: a person moves a card into it, or a worker is
-    explicitly asked to report it. The binding is still the question, for the same reason as
-    above — an unbound role cannot be written, and a worker's finish would land its terminal
-    marker and then fail to move the board.
-    """
-    return (
-        config.Role.HUMAN_REVIEW_PENDING.value
-        if binding.option_id(config.Role.HUMAN_REVIEW_PENDING)
-        else None
-    )
-
-
 def _cmd_cycle(args: argparse.Namespace) -> int:
-    """One wake: load what was activated, run the cycle, print the directives it produced."""
+    """One wake: load what was activated, run the cycle, and log what it did."""
     from .cycle import WEBHOOK_QUIET_ENV, run_cycle
     from .state import EnginePaths, StateStore
 
@@ -370,41 +285,22 @@ def _cmd_cycle(args: argparse.Namespace) -> int:
 
     paths = EnginePaths.from_base(loaded.overlay.state_path)
     store = StateStore(paths)
-    adapter = _adapter(loaded, paths=paths)
-    adapter.agentdeck_url = args.agentdeck_url
-    adapter.runtime_socket = getattr(args, "runtime_socket", "")
+    adapter = _adapter(loaded)
     outcome = run_cycle(
         store,
         adapter,
         now=datetime.now(UTC),
-        cap=loaded.manifest.worker_cap,
-        auto_deploy_repos=loaded.manifest.auto_deploy_repos(),
         issue_repos=frozenset(loaded.manifest.issue_repos()),
         enabled_extensions=installed,
         policy=policy,
-        placeholder_titles=loaded.manifest.placeholder_titles,
-        terminal_recheck_s=loaded.manifest.terminal_recheck_s,
         proposal_daily_cap=loaded.manifest.proposal_daily_cap,
-        proposal_worker_cap=loaded.manifest.proposal_worker_cap,
-        ready_to_merge=_ready_to_merge(loaded.binding),
-        command_output=loaded.manifest.command_output,
         webhook_skip_s=loaded.manifest.webhook_skip_s,
-        ownership_label=loaded.manifest.board.accepted_ownership_labels,
-        auto_release=bool(loaded.manifest.capabilities.get(config.AUTO_RELEASE)),
-        verify_turn=config.verify_turn(loaded.manifest.capabilities),
-        works_router=loaded.manifest.capabilities.get("works_router") is True,
-        ci_repos=loaded.manifest.ci_verified_repos(),
-        review_only_repos=loaded.manifest.review_only_repos(),
         spec_only_label=loaded.manifest.board.spec_only_label,
-        parallel_review=parallel_review(loaded.manifest, loaded.overlay),
         # The host's quiet hint arrives as an environment variable (#1631).
         webhook_quiet=os.environ.get(WEBHOOK_QUIET_ENV) == "1",
     )
     for line in outcome.log:
         print(line, file=sys.stderr)
-    for directive in outcome.directives:
-        # stdout is the directive stream the dispatcher consumes, one JSON object per line.
-        print(json.dumps(directive))
     return 0 if not outcome.halted else 75
 
 
@@ -459,9 +355,17 @@ def _cmd_propose(args: argparse.Namespace) -> int:
         for problem in response.problems:
             print(f"{problem.location}: {problem.what}; {problem.fix}", file=sys.stderr)
         return 65
+    if any(r.kind is extensions.RequestKind.QUEUE_WORK for r in response.requests):
+        # It asked for work on a card; the engine holds none since #3732.
+        print(
+            f"extension {args.extension!r} asked to queue work on a card, and the deck runs "
+            "every Work; only an issue to open (open-work) can be proposed",
+            file=sys.stderr,
+        )
+        return 65
     requests = tuple(
         request for request in response.requests
-        if request.kind in (extensions.RequestKind.QUEUE_WORK, extensions.RequestKind.OPEN_WORK)
+        if request.kind is extensions.RequestKind.OPEN_WORK
     )
     if not requests:
         print(f"extension {args.extension!r} proposed no work", file=sys.stderr)
@@ -477,8 +381,7 @@ def _cmd_propose(args: argparse.Namespace) -> int:
     refused = [
         str(request.payload.get("repo") or "")
         for request in requests
-        if request.kind is extensions.RequestKind.OPEN_WORK
-        and str(request.payload.get("repo") or "") not in allowed
+        if str(request.payload.get("repo") or "") not in allowed
     ]
     if refused:
         print(f"refused issue repository: {refused[0]!r}", file=sys.stderr)
@@ -515,146 +418,6 @@ def _record_drift(args: argparse.Namespace, exc) -> None:
         run_cycle(store, None, now=datetime.now(UTC), drift=detail)
     except OSError as write_failure:  # an unwritable state dir is already its own symptom
         print(f"could not record the drift refusal: {write_failure}", file=sys.stderr)
-
-
-def _cmd_receipt(args: argparse.Namespace) -> int:
-    """Write a dispatcher's acknowledgement receipt."""
-    from .state import EnginePaths
-
-    paths = EnginePaths.from_base(args.state)
-    path = github.write_receipt(
-        paths.dispatch_ack_dir, args.repo, int(args.number), args.token, now=datetime.now(UTC),
-        worktrees=getattr(args, "worktree", None) or (),
-    )
-    print(f"{args.command}: {args.repo}#{args.number} {args.token} -> {path}")
-    return 0
-
-
-def _cmd_register_worktree(args: argparse.Namespace) -> int:
-    """Persist a worker-created host worktree while its generation still owns the card.
-
-    With ``--work-id`` the worktree also becomes that Work's claim (#2195), so the runtime's
-    release is its one owner and nothing card-level ever deletes it. The card registers it
-    first, under the generation fence, because the runtime adopts only a worktree the card
-    registered; a claim the runtime refuses takes the registration back and says why, so a
-    worker never edits in a directory nothing owns.
-    """
-    from . import reconcile
-    from .state import EnginePaths, StateStore
-
-    path = path_identity.resolve(str(Path(args.path).expanduser()))
-    _repo_root, present = github.registered_worktree(path)
-    if not present and not Path(path).exists():
-        # The brief says create, then register; a worker that reads it the other way round
-        # needs to hear that the directory is missing, not that it is in the wrong place.
-        print(
-            "refused: no worktree exists at that path yet; create it first with "
-            "`git -C <checkout> worktree add <checkout>/.worktrees/<name> -b <branch>`, "
-            "then register it",
-            file=sys.stderr,
-        )
-        return 64
-    if not present:
-        print(
-            "refused: path is not a registered direct child of a checkout's .worktrees",
-            file=sys.stderr,
-        )
-        return 64
-    key = f"{args.repo}#{int(args.number)}"
-    store = StateStore(EnginePaths.from_base(args.state))
-    with store.transaction() as state:
-        before = (state.get("issues") or {}).get(key)
-        # Only a registration this call adds is this call's to take back.
-        added = path not in reconcile.worktrees(before if isinstance(before, dict) else {})
-        accepted = reconcile.register_generation_worktrees(
-            state,
-            args.repo,
-            int(args.number),
-            args.generation,
-            [path],
-        )
-        if not accepted:
-            print(
-                f"refused: {args.repo}#{args.number} no longer holds generation "
-                f"{args.generation}",
-                file=sys.stderr,
-            )
-            return 75
-        registered = reconcile.worktrees(state["issues"][key])
-    if args.work_id:
-        refusal = _claim_worktree(args.runtime_socket, args.work_id, path, registered)
-        if refusal:
-            if added:
-                with store.transaction() as state:
-                    rec = (state.get("issues") or {}).get(key)
-                    # Fenced like the registration: while the runtime was asked, a newer
-                    # generation may have taken the card and registered this same path, and
-                    # that registration is not this stale command's to erase.
-                    if isinstance(rec, dict) and rec.get("generation") == args.generation:
-                        rec["worktrees"] = [
-                            item for item in reconcile.worktrees(rec) if item != path
-                        ]
-            print(f"refused: {refusal}", file=sys.stderr)
-            return 65
-    print(f"registered: {args.repo}#{args.number} {path}")
-    return 0
-
-
-def _claim_worktree(socket_path: str, work_id: str, path: str, registered: list[str]) -> str:
-    """Make ``path`` the Work's claim on its repository; "" when it is, else why not (#2195)."""
-    import subprocess
-
-    from .workspace import github_repository
-
-    def git(*argv: str) -> str:
-        try:
-            done = subprocess.run(
-                ["git", "-C", path, *argv],
-                capture_output=True, text=True, timeout=30, check=False,
-            )
-        except (OSError, subprocess.SubprocessError):
-            return ""
-        return done.stdout.strip() if done.returncode == 0 else ""
-
-    if not socket_path:
-        return "no runtime socket to claim the worktree through"
-    repository = (github_repository(git("remote", "get-url", "origin")) or "").lower()
-    if not repository:
-        return f"{path} has no GitHub origin remote to claim it under"
-    branch = git("symbolic-ref", "--short", "HEAD")
-    if not branch:
-        return f"{path} is not on a branch; check one out before registering it"
-    base = git("symbolic-ref", "--short", "refs/remotes/origin/HEAD").removeprefix("origin/")
-    status, answer = github.runtime_post(
-        socket_path,
-        github.WORK_WORKSPACE_ENSURE_PATH,
-        {
-            "work_id": work_id,
-            "repository": repository,
-            "purpose": "implementation",
-            "checkout": str(Path(path).parent.parent),
-            "path": path,
-            "branch": branch,
-            "base_ref": base or "master",
-            "legacy_paths": registered,
-        },
-        timeout=github.WORK_WORKSPACE_RELEASE_TIMEOUT_S,
-    )
-    if status != 200 or not isinstance(answer, dict):
-        detail = answer.get("detail") if isinstance(answer, dict) else ""
-        return f"the runtime did not claim it: {detail or status or 'no answer'}"
-    claim = answer.get("claim") if isinstance(answer.get("claim"), dict) else {}
-    raw = str(claim.get("path") or "")
-    # Resolved only when named: an empty path would resolve to this process's cwd.
-    claimed = path_identity.resolve(raw) if raw else ""
-    if answer.get("outcome") in {"adopted", "reused"} and claimed == path:
-        return ""
-    if claimed and claimed != path:
-        return (
-            f"this Work already has its {repository} worktree at {claimed}; work there"
-            " instead, and remove the new one"
-        )
-    return f"the runtime did not claim it: {answer.get('outcome')}: {answer.get('detail') or ''}"
 
 
 def _format_size(size: int | None) -> str:
@@ -760,104 +523,6 @@ def _cmd_reap_worktrees(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_worker_control(args: argparse.Namespace) -> int:
-    """Run one worker operation against the exact Poller Instance that was activated."""
-    from .state import EnginePaths, StateStore
-    from .worker_control import WorkerControl
-
-    try:
-        loaded = config.load(
-            args.manifest,
-            args.overlay,
-            args.binding,
-        )
-    except config.DriftError as exc:
-        print(exc.report.render(), file=sys.stderr)
-        return 75
-    except config.ConfigError as exc:
-        print(exc.report.render(), file=sys.stderr)
-        return 78
-
-    paths = EnginePaths.from_base(loaded.overlay.state_path)
-    store = StateStore(paths)
-    adapter = _adapter(loaded, paths=paths)
-    adapter.agentdeck_url = args.agentdeck_url
-    adapter.runtime_socket = getattr(args, "runtime_socket", "")
-    control = WorkerControl(
-        store,
-        adapter,
-        human_review_pending=_human_review_pending(loaded.binding),
-        spec_only_label=loaded.manifest.board.spec_only_label,
-        parallel_review=parallel_review(loaded.manifest, loaded.overlay),
-        review_only_repos=loaded.manifest.review_only_repos(),
-        works_router=loaded.manifest.capabilities.get("works_router") is True,
-    )
-    operation = args.worker_operation
-    try:
-        body = _worker_body(args)
-    except OSError as exc:
-        print(f"could not read worker comment body: {exc}", file=sys.stderr)
-        return 66
-
-    if operation == "enabled":
-        result = control.enabled(args.repo, args.number, args.generation)
-    elif operation == "ready-for-review":
-        result = control.ready_for_review(
-            args.repo, args.number, args.generation, head=getattr(args, "head", "") or ""
-        )
-    elif operation == "reopen":
-        result = control.reopen(args.repo, args.number, args.generation, body)
-    elif operation == "start-implementation":
-        result = control.start_implementation(args.repo, args.number, args.generation, body)
-    elif operation == "finish":
-        result = control.finish(
-            args.repo,
-            args.number,
-            args.generation,
-            args.status,
-            body,
-            blocked_by=tuple(getattr(args, "blocked_by", ()) or ()),
-            spec_approved=bool(getattr(args, "spec_approved", False)),
-        )
-    else:
-        result = control.review(
-            args.repo, args.number, args.generation, args.verdict, body
-        )
-    print(result.reason)
-    return 0 if result.ok else 1
-
-
-def parallel_review(manifest, overlay=None) -> bool:
-    """Whether this project reviews a head beside its worker's verification (#2350).
-
-    Both halves have to be there: the poller merging on its own release bits, and an outside
-    reviewer — an extension that runs a ``review_program``. Without the second, the review is
-    the engine's own merge-review turn, which cannot run while the worker still holds the card,
-    so the card keeps the order it had.
-
-    ``review_program`` is a host fact, so it is normally in the Overlay, not the Manifest.
-    Reading the Manifest alone left this off on every host that configured it (#2475).
-    """
-    if not manifest.capabilities.get(config.AUTO_RELEASE):
-        return False
-    extensions = (
-        config.effective_extensions(manifest, overlay)
-        if overlay is not None
-        else manifest.extensions
-    )
-    return any(
-        isinstance(block, dict) and block.get("review_program")
-        for block in extensions.values()
-    )
-
-
-def _worker_body(args: argparse.Namespace) -> str:
-    body_file = getattr(args, "body_file", None)
-    if body_file:
-        return Path(body_file).read_text()
-    return " ".join(getattr(args, "body", ()) or ())
-
-
 def activation_plan(manifest) -> dict:
     """What an apply of this Manifest touches on the board side, for the dry run to show."""
     return {
@@ -933,7 +598,7 @@ def _cmd_activate(args: argparse.Namespace) -> int:
         return 78
 
     paths = EnginePaths.from_base(loaded.overlay.state_path)
-    adapter = _adapter(loaded, paths=paths)
+    adapter = _adapter(loaded)
     if args.apply is not None:
         # The one gate, taken after the read-only lookups and before anything is written.
         # Uncertainty is not approval: an unreadable permission has confirmed nothing.
@@ -962,32 +627,16 @@ def _cmd_activate(args: argparse.Namespace) -> int:
                 scratch,
                 _ShadowPort(adapter),
                 now=now,
-                cap=loaded.manifest.worker_cap,
-                auto_deploy_repos=loaded.manifest.auto_deploy_repos(),
                 issue_repos=frozenset(loaded.manifest.issue_repos()),
                 enabled_extensions=installed,
                 policy=policy,
-                placeholder_titles=loaded.manifest.placeholder_titles,
-                terminal_recheck_s=loaded.manifest.terminal_recheck_s,
                 proposal_daily_cap=loaded.manifest.proposal_daily_cap,
-                proposal_worker_cap=loaded.manifest.proposal_worker_cap,
-                ready_to_merge=_ready_to_merge(loaded.binding),
-                ownership_label=loaded.manifest.board.accepted_ownership_labels,
-                auto_release=bool(loaded.manifest.capabilities.get(config.AUTO_RELEASE)),
-                verify_turn=config.verify_turn(loaded.manifest.capabilities),
-                works_router=loaded.manifest.capabilities.get("works_router") is True,
-                        ci_repos=loaded.manifest.ci_verified_repos(),
-                        review_only_repos=loaded.manifest.review_only_repos(),
-                        spec_only_label=loaded.manifest.board.spec_only_label,
-                        parallel_review=parallel_review(loaded.manifest, loaded.overlay),
+                spec_only_label=loaded.manifest.board.spec_only_label,
                 mode=Mode.SHADOW,
             )
         shadow_summary = {
             "would_apply": [effect.kind.value for effect in shadow.effects],
-            "would_dispatch": [directive["ref"] for directive in shadow.directives],
         }
-        if shadow.suppressed:
-            shadow_summary["would_suppress"] = shadow.suppressed
         print(json.dumps({
             "dry_run": {
                 "instance": args.instance,
@@ -1096,13 +745,8 @@ def _adapter_for_draft(draft) -> github.GitHubAdapter:
     return github.GitHubAdapter(
         org=draft.manifest.board.org,
         issue_repos=draft.manifest.issue_repos(),
-        code_repos=draft.manifest.code_repos(),
         project_number=draft.manifest.board.project_number,
-        status_names=dict(draft.manifest.board.status_names),
         ownership_label=draft.manifest.board.ownership_label,
-        ownership_labels=draft.manifest.board.accepted_ownership_labels,
-        spec_only_label=draft.manifest.board.spec_only_label,
-        paused_label=draft.manifest.board.paused_label,
         api=gh,
         host=gh,
     )
@@ -1124,11 +768,7 @@ def _provision_steps(loaded, adapter, paths) -> list:
         return ProvisionStep(f"{step}:{repo}", apply)
 
     def ensure_dirs() -> bool:
-        for directory in (
-            paths.state.parent,
-            paths.dispatch_ack_dir,
-            paths.dispatch_defer_dir,
-        ):
+        for directory in (paths.state.parent,):
             try:
                 Path(directory).mkdir(parents=True, exist_ok=True)
             except OSError:
@@ -1277,6 +917,8 @@ def build_parser() -> argparse.ArgumentParser:
     activate.set_defaults(handler=_cmd_activate)
     cycle = with_config("cycle", "run one wake")
     cycle.add_argument("--binding", required=True, help="path to the frozen resolved binding")
+    # Accepted and unused since the engine stopped asking the deck about workers (#3741):
+    # `scripts/poller_wake.py` still passes both, and an unknown flag would refuse every wake.
     cycle.add_argument("--agentdeck-url", default="", help=argparse.SUPPRESS)
     cycle.add_argument("--runtime-socket", default="", help=argparse.SUPPRESS)
     cycle.set_defaults(handler=_cmd_cycle)
@@ -1286,38 +928,8 @@ def build_parser() -> argparse.ArgumentParser:
     propose.add_argument("reference", help="extension-specific reference to propose")
     propose.set_defaults(handler=_cmd_propose)
 
-    for name, token_help in (("dispatch-ack", "the dispatch id that was delivered"),):
-        receipt = subcommands.add_parser(name, help=f"record {name}")
-        receipt.add_argument("--state", required=True, help="the instance's durable state path")
-        receipt.add_argument("repo")
-        receipt.add_argument("number")
-        receipt.add_argument("token", help=token_help)
-        if name == "dispatch-ack":
-            receipt.add_argument(
-                "--worktree",
-                action="append",
-                help="a worktree this delivery created, so the engine can release it later; "
-                     "repeat for more than one",
-            )
-        receipt.set_defaults(handler=_cmd_receipt)
-
-    register = subcommands.add_parser(
-        "register-worktree",
-        help="register a host worktree to the card's active generation",
-    )
-    register.add_argument("--state", required=True, help="the instance's durable state path")
-    register.add_argument("--generation", required=True, help="the worker's active generation")
-    register.add_argument("repo")
-    register.add_argument("number")
-    register.add_argument("path", help="absolute path of the registered host worktree")
-    register.add_argument(
-        "--work-id", default="", help="the Work that claims it through the runtime (#2195)"
-    )
-    register.add_argument("--runtime-socket", default="", help=argparse.SUPPRESS)
-    register.set_defaults(handler=_cmd_register_worktree)
-
     reap = with_config(
-        "reap-worktrees", "list host worktrees no tracked card claims (dry run by default)"
+        "reap-worktrees", "list host worktrees no Work claims (dry run by default)"
     )
     reap.add_argument(
         "--min-age-days",
@@ -1338,83 +950,6 @@ def build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--dry-run", action="store_true", help="report only (the default)")
     mode.add_argument("--apply", action="store_true", help="actually release the listed worktrees")
     reap.set_defaults(handler=_cmd_reap_worktrees)
-
-    worker = with_config(
-        "worker-control", "generation-bound control operations for a dispatched worker"
-    )
-    worker.add_argument("--binding", required=True, help="path to the frozen resolved binding")
-    worker.add_argument("--agentdeck-url", default="", help=argparse.SUPPRESS)
-    worker.add_argument("--runtime-socket", default="", help=argparse.SUPPRESS)
-    operations = worker.add_subparsers(dest="worker_operation", required=True)
-
-    def card_operation(name: str, help_text: str) -> argparse.ArgumentParser:
-        operation = operations.add_parser(name, help=help_text)
-        operation.add_argument("repo")
-        operation.add_argument("number", type=int)
-        operation.add_argument("generation")
-        return operation
-
-    def with_body(operation: argparse.ArgumentParser) -> None:
-        operation.add_argument("--body-file", help="read the comment body from this file")
-        operation.add_argument("body", nargs="*", help="inline comment body")
-
-    card_operation(
-        "enabled", "diagnostic: whether this exact generation may still act (not required)"
-    )
-    finish = card_operation("finish", "post a terminal marker, then move the board")
-    finish.add_argument(
-        "status",
-        choices=(
-            "in_review",
-            "needs_more_info",
-            "human_review_pending",
-            "blocked",
-            "resolved",
-        ),
-    )
-    finish.add_argument(
-        "--blocked-by",
-        action="append",
-        default=[],
-        metavar="REF",
-        help=(
-            "with `blocked`: an issue or pull request that must land first (#12, repo#12, "
-            "owner/repo#12, or a GitHub URL). Repeatable. The card resumes on its own once "
-            "every named reference is closed or merged."
-        ),
-    )
-    finish.add_argument(
-        "--spec-approved",
-        action="store_true",
-        help=(
-            "with `needs_more_info`, from the worker that wrote a spec: a person approved it "
-            "and the label is off, so the poller starts the build once the card rests (#2773)."
-        ),
-    )
-    with_body(finish)
-    review = card_operation("review", "post a generation-bound merge-review verdict")
-    review.add_argument("verdict", choices=("pass", "changes-needed"))
-    with_body(review)
-    ready = card_operation(
-        "ready-for-review",
-        "offer the pull request head for review and keep working: verify it next (#2350)",
-    )
-    ready.add_argument(
-        "--head",
-        default="",
-        help="the commit you pushed; unavailable until an open pull request is at it",
-    )
-    reopen = card_operation(
-        "reopen",
-        "take back this Run's own resolved finish and carry on in the same chat (#2522)",
-    )
-    with_body(reopen)
-    start = card_operation(
-        "start-implementation",
-        "build the spec a person approved in your chat yourself, in the same Run (#2716)",
-    )
-    with_body(start)
-    worker.set_defaults(handler=_cmd_worker_control)
 
     contract = subcommands.add_parser(
         "contract-test", help="check an extension program against the hook protocol"

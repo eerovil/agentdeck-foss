@@ -6,9 +6,9 @@ the deck post that message on the issue, quoted and verbatim, as the owner's non
 authority, at most once per action id. The message reaches the agent whatever becomes of the
 post.
 
-The quote comes from the same helper as the Poller's #2348 relay, so typed text can never read
-as a control command or forge a lease marker. The ledger is ``work_actions`` under its own
-action name: an unsettled row may have landed and is never repeated.
+The words are quoted (``quote_operator_text``), so typed text can never read as a control
+command or forge a marker. The ledger is ``work_actions`` under its own action name: an
+unsettled row may have landed and is never repeated.
 """
 
 from __future__ import annotations
@@ -21,8 +21,6 @@ from typing import Any
 
 from . import gh_cli
 from .models import IssueRef
-from .poller_engine.chat_answers import quote_operator_text
-from .poller_engine.ready_review import FINDINGS_MARKER
 from .work import WorkRef
 
 log = logging.getLogger(__name__)
@@ -32,16 +30,34 @@ GH_TIMEOUT_S = 15.0
 NOTICE_MAX_AGE = timedelta(hours=24)
 MARKER = "<!-- agentdeck-chat-post id="
 REVIEWER_MARKER = "<!-- agentdeck-reviewer-comment id="
+# The ChatGPT reviewer's handoff comments end with this marker (#2167).
+FINDINGS_MARKER = "<!-- chatgpt-review -->"
+# The longest message quoted whole; past it the quote is cut with a note.
+MAX_TEXT = 20_000
 
 DONE = "done"
 FAILED = "failed"
 UNCERTAIN = "uncertain"
+# Handed to a parked Poller card (#2348, #2847). Nothing makes these since #3732; a notice
+# recorded just before still reads right for its NOTICE_MAX_AGE.
 RELAYED = "relayed"
-# A parked card's answer held while the runtime restarts: relayed once delivered (#2847).
 HELD = "held"
 UNKNOWN = "unknown"
 RESTARTING = "restarting"
 UNRECORDED = "unrecorded"
+
+
+def quote_operator_text(text: str, *, cut_note: str = "the whole answer is in the chat") -> str:
+    """A person's words as a Markdown quote that is safe to post as the bot.
+
+    Quoted so no line of it reads as a control command, and with every HTML comment opener
+    neutralised so typed text can never forge a marker.
+    """
+    text = text.strip()
+    if len(text) > MAX_TEXT:
+        text = text[:MAX_TEXT].rstrip() + f"\n\n[… cut here; {cut_note}]"
+    lines = text.replace("<!--", "&lt;!--").splitlines()
+    return "\n".join(f"> {line}" if line.strip() else ">" for line in lines)
 
 
 def issue_post_target(state: Any, session_key: str) -> WorkRef | None:

@@ -46,7 +46,7 @@ async def test_a_stopping_web_process_refuses_a_delivery_instead_of_risking_it(t
         cwd=str(tmp_path),
         delivery_id="poller:2b6a413d",
         context_policy="auto",
-        role="kanban",
+        role="delegated",
     )
 
     shutdown.signal_shutdown()
@@ -61,12 +61,10 @@ async def test_a_stopping_web_process_refuses_a_delivery_instead_of_risking_it(t
     db.close()
 
 
-def test_the_shutdown_refusal_is_one_the_poller_retries():
-    """Refusing is only better than an uncertain row if the card comes back (#1560)."""
+def test_the_shutdown_refusal_is_one_the_ledger_decides_again():
+    """Refusing is only better than an uncertain row if the delivery can come back (#1560)."""
     from agentdeck.context_delivery import RE_DECIDED_REFUSALS
-    from agentdeck.poller_engine.cycle import SAME_DELIVERY_RETRIES
 
-    assert "host_shutting_down" in SAME_DELIVERY_RETRIES
     assert "host_shutting_down" in RE_DECIDED_REFUSALS
 
 

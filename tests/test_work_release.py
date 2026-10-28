@@ -331,7 +331,7 @@ def test_release_policies_come_from_switched_manifests(tmp_path):
         'contract = 1\n[board]\norg = "Eerovil"\nproject_number = 1\n'
         'spec_only_label = "spec-only"\n'
         '[policy]\nmerge_method = "squash"\n'
-        "[capabilities]\nworks_router = true\nauto_release = true\n"
+        "[capabilities]\nauto_release = true\n"
         '[authorization.release]\nallow = ["Review-Bot[bot]"]\n'
         '[[repos]]\nid = "agentdeck"\nholds_issues = true\n'
         '[[repos]]\nid = "review-chats"\nverification = "review_only"\n'
@@ -519,13 +519,13 @@ async def test_the_router_hands_a_reviewer_verdict_and_pull_events_to_the_releas
 
 def test_merge_on_a_work_the_deck_releases_is_a_deck_merge(tmp_path):
 
-    from test_work_actions import GREEN, _passed, _record, _work
+    from test_work_actions import _ready
 
     from agentdeck.work_actions import plan
     from agentdeck.work_attention import operator_attention
     from agentdeck.work_story import work_status
 
-    work = _work(tmp_path, _record("Ready to merge", **_passed()), verifications=GREEN)
+    work = _ready()
     step = plan("merge", work, operator_attention(work, work_status(work)), deck_release=True)
     assert step.kind == "deck_merge"
 

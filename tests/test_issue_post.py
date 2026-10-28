@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -14,8 +13,6 @@ from agentdeck.app import create_app
 from agentdeck.config import AccountConfig, AppConfig, HistoryConfig, InjectConfig
 from agentdeck.db import ISSUE_POST_ACTION, Db
 from agentdeck.models import Capability, InjectResult, IssueRef, Session, SessionStatus
-from agentdeck.poller_engine import chat_answers
-from agentdeck.web import routes_actions
 from agentdeck.work import WorkRef
 from agentdeck.work_actions import WorkActionPress
 
@@ -71,31 +68,11 @@ def test_the_poller_never_reads_a_posted_message_as_a_command(words):
 
 
 def test_a_long_message_is_cut_before_it_is_quoted_and_attachments_are_named_not_posted():
-    body = issue_post.body("a" * (chat_answers.MAX_TEXT + 50), action_id=ACTION, attachments=2)
+    body = issue_post.body("a" * (issue_post.MAX_TEXT + 50), action_id=ACTION, attachments=2)
 
     assert "[… cut here; the whole message is in the chat]" in body
     assert all(line.startswith(">") for line in body.split("\n\n")[1].splitlines())
     assert "(2 attachments not posted)" in body
-
-
-def test_the_poller_answer_comment_is_unchanged_by_the_shared_quote():
-    answer = chat_answers.Answer(
-        id="press-0001abcd", key="store#5", generation="g1", text="Option (a)\n\nThanks",
-        session_url="https://deck.example/chats/abc", requested_at="2026-09-30T00:00:00Z",
-    )
-
-    assert chat_answers.comment_body(answer, marker="<!-- m -->") == (
-        "**Answered in the [worker chat](https://deck.example/chats/abc):**\n"
-        "\n"
-        "> Option (a)\n"
-        ">\n"
-        "> Thanks\n"
-        "\n"
-        "The card is back In progress; the worker carries on in that chat.\n"
-        "\n"
-        f"{chat_answers.answer_marker('press-0001abcd')}\n"
-        "<!-- m -->"
-    )
 
 
 # --- which issue ---------------------------------------------------------------------------
@@ -283,13 +260,8 @@ async def _send(app, data, *, action_id=ACTION):
         return await client.post(f"/sessions/{SESSION}/inject", data=data, headers=headers)
 
 
-@pytest.fixture
-def no_relay(monkeypatch):
-    monkeypatch.setattr(routes_actions, "leave_answer", lambda **kwargs: None)
-
-
 @pytest.mark.anyio
-async def test_a_ticked_message_reaches_the_agent_and_posts_once(tmp_path, gh, no_relay):
+async def test_a_ticked_message_reaches_the_agent_and_posts_once(tmp_path, gh):
     calls = gh((0, b"https://github.com/org/store/issues/5#issuecomment-9\n", b""))
     app = _app(tmp_path)
     data = {"message": "Keep the old API.", "post_to_issue": "org/store#5"}
@@ -306,7 +278,7 @@ async def test_a_ticked_message_reaches_the_agent_and_posts_once(tmp_path, gh, n
 
 
 @pytest.mark.anyio
-async def test_an_unticked_message_posts_nothing(tmp_path, gh, no_relay):
+async def test_an_unticked_message_posts_nothing(tmp_path, gh):
     calls = gh((0, b"", b""))
     sent = await _send(_app(tmp_path), {"message": "Just for the agent."})
 
@@ -325,7 +297,7 @@ async def test_an_unticked_message_posts_nothing(tmp_path, gh, no_relay):
     ],
 )
 async def test_a_ticked_send_that_cannot_post_is_refused_before_anything_is_sent(
-    tmp_path, gh, no_relay, data, action_id, status, words
+    tmp_path, gh, data, action_id, status, words
 ):
     calls = gh((0, b"", b""))
     app = _app(tmp_path)
@@ -339,7 +311,7 @@ async def test_a_ticked_send_that_cannot_post_is_refused_before_anything_is_sent
 
 
 @pytest.mark.anyio
-async def test_a_chat_in_no_work_cannot_post(tmp_path, gh, no_relay):
+async def test_a_chat_in_no_work_cannot_post(tmp_path, gh):
     gh((0, b"", b""))
     app = _app(tmp_path, issues=())
     refused = await _send(app, {"message": "hi", "post_to_issue": "org/store#5"})
@@ -348,27 +320,7 @@ async def test_a_chat_in_no_work_cannot_post(tmp_path, gh, no_relay):
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize(
-    "relay, code",
-    [(lambda **kwargs: Path("/tmp/answer.json"), "relayed"), (None, "unknown")],
-)
-async def test_a_parked_cards_answer_goes_to_the_poller_and_a_doubt_posts_nothing(
-    tmp_path, gh, monkeypatch, relay, code
-):
-    def broken(**kwargs):
-        raise OSError("board unreadable")
-
-    monkeypatch.setattr(routes_actions, "leave_answer", relay or broken)
-    calls = gh((0, b"", b""))
-
-    sent = await _send(_app(tmp_path), {"message": "Option (a)", "post_to_issue": "org/store#5"})
-
-    assert (sent.status_code, sent.headers["x-agentdeck-issue-post"]) == (202, code)
-    assert calls == []
-
-
-@pytest.mark.anyio
-async def test_a_deck_that_is_restarting_does_not_start_a_post(tmp_path, gh, no_relay, monkeypatch):
+async def test_a_deck_that_is_restarting_does_not_start_a_post(tmp_path, gh, monkeypatch):
     monkeypatch.setattr(shutdown, "is_shutting_down", lambda: True)
     calls = gh((0, b"", b""))
 
@@ -539,30 +491,7 @@ def _restarting(app, monkeypatch):
 
 
 @pytest.mark.anyio
-async def test_a_held_parked_answer_is_neither_relayed_nor_posted_until_delivered(
-    tmp_path, gh, monkeypatch
-):
-    # #2847 review: the Poller posts a parked card's answer after its relay, which waits
-    # for delivery; a cancelled held message must leave both the card and the issue alone.
-    left = []
-    monkeypatch.setattr(routes_actions, "leave_answer", lambda **kwargs: left.append(kwargs))
-    monkeypatch.setattr(routes_actions, "answers_parked_card", lambda **kwargs: True)
-    calls = gh((0, b"", b""))
-    app = _app(tmp_path)
-    _restarting(app, monkeypatch)
-
-    sent = await _send(app, {"message": "Option (a)", "post_to_issue": "org/store#5"})
-
-    assert (sent.status_code, sent.headers["x-agentdeck-issue-post"]) == (202, "held")
-    assert "once the runtime is back" in sent.text
-    assert calls == [] and left == [] and app.state.sent_messages == []
-
-
-@pytest.mark.anyio
-async def test_a_held_message_in_an_ordinary_chat_posts_now(tmp_path, gh, monkeypatch):
-    left = []
-    monkeypatch.setattr(routes_actions, "leave_answer", lambda **kwargs: left.append(kwargs))
-    monkeypatch.setattr(routes_actions, "answers_parked_card", lambda **kwargs: False)
+async def test_a_held_message_posts_now(tmp_path, gh, monkeypatch):
     calls = gh((0, b"https://github.com/org/store/issues/5#issuecomment-9\n", b""))
     app = _app(tmp_path)
     _restarting(app, monkeypatch)
@@ -570,5 +499,5 @@ async def test_a_held_message_in_an_ordinary_chat_posts_now(tmp_path, gh, monkey
     sent = await _send(app, {"message": "Keep the old API.", "post_to_issue": "org/store#5"})
 
     assert (sent.status_code, sent.headers["x-agentdeck-issue-post"]) == (202, "done")
-    assert len(calls) == 1 and left == []
+    assert len(calls) == 1
     assert app.state.sent_messages == []

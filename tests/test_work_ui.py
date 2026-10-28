@@ -1,8 +1,8 @@
 """Work is the dashboard's primary object (#2147).
 
-One card per Work however many chats, legs or Runs it has; the current Run from the Run
-trace, never from session recency; attention, workspace, verification and outputs at Work
-level; chats and sessions kept reachable but secondary; activity no Work owns kept visible.
+One card per Work however many chats or legs it has; attention, workspace, verification and
+outputs at Work level; chats and sessions kept reachable but secondary; activity no Work owns
+kept visible.
 """
 
 from __future__ import annotations
@@ -29,8 +29,7 @@ from agentdeck.models import (
     SessionStatus,
 )
 from agentdeck.poller_engine.workspace import WorkspaceSnapshot
-from agentdeck.poller_ops import BoardCard, BoardDispatch, BoardScope, BoardView
-from agentdeck.run_trace import NEXT_BLOCKERS
+from agentdeck.poller_ops import BoardScope, BoardView
 from agentdeck.triage import AssistantInsight, AssistantView
 from agentdeck.work import WorkRef
 from agentdeck.work_overview import (
@@ -54,7 +53,7 @@ from agentdeck.work_workspace_claims import WorkspaceClaim
 
 WORK = WorkRef("eerovil/agentdeck", 2147)
 OTHER = WorkRef("eerovil/agentdeck", 2150)
-UNSTARTED = WorkRef("eerovil/agentdeck", 2160)  # a Poller card no chat has joined yet
+UNSTARTED = WorkRef("eerovil/agentdeck", 2160)  # an open issue no agent works on yet
 NOW = datetime.now(UTC)
 _EMPTY = hashlib.sha256(b"").hexdigest()
 
@@ -66,17 +65,8 @@ def _session(key: str, **fields) -> Session:
     return Session(key=key, account_key=account, session_id=session_id, **fields)
 
 
-def _card(number: int = 2147, **fields) -> BoardCard:
-    fields.setdefault("status", "In progress")
-    fields.setdefault("ownership", True)
-    return BoardCard("eerovil/agentdeck", number, **fields)
-
-
-def _board(*cards: BoardCard) -> BoardView:
-    return BoardView(
-        cards={card.identity: card for card in cards},
-        scopes=(BoardScope("agentdeck", org="eerovil", cards=tuple(cards)),),
-    )
+def _board() -> BoardView:
+    return BoardView(scopes=(BoardScope("agentdeck", org="eerovil"),))
 
 
 def _app(tmp_path, *, board: BoardView | None = None):
@@ -260,7 +250,7 @@ async def test_a_job_its_chat_queued_lists_the_work_under_waiting(tmp_path, monk
     chat's does not."""
     from agentdeck.web import work_view
 
-    app = _app(tmp_path, board=_board(_card(), _card(2150)))
+    app = _app(tmp_path, board=_board())
     mine = _add(app, "claude_code:test:mine", WORK, title="Implement it")
     _add(app, "claude_code:test:other", OTHER, title="Something else")
     stamp = NOW.timestamp()
@@ -282,6 +272,12 @@ async def test_a_job_its_chat_queued_lists_the_work_under_waiting(tmp_path, monk
     # No Runtime here: the queue is what both the classification and the hydration read.
     monkeypatch.setattr(work_view, "runtime_queue", live_queue)
     monkeypatch.setattr(work_view, "runtime_jobs", with_evidence)
+
+    async def current(_app, _queue):
+        # Its turn ended: something current keeps a Work the deck does not run itself listed.
+        return frozenset({WORK.work_id})
+
+    monkeypatch.setattr(work_view, "current_work_ids", current)
     overview = await _overview(app)
 
     work = _card_of(overview, WORK)
@@ -298,7 +294,7 @@ async def test_a_pass_reads_the_deckhand_states_once_for_every_card(tmp_path, mo
     not once per card — and each card still gets its own chat's attention."""
     from agentdeck.web import render
 
-    app = _app(tmp_path, board=_board(_card(), _card(2150), _card(2151)))
+    app = _app(tmp_path, board=_board())
     mine = _add(app, "claude_code:test:mine", WORK, title="Implement it")
     theirs = _add(app, "claude_code:test:theirs", OTHER, title="Something else")
     _add(app, "claude_code:test:third", WorkRef("eerovil/agentdeck", 2151), title="Third")
@@ -326,7 +322,7 @@ async def test_a_pass_reads_files_and_databases_off_the_event_loop(tmp_path, mon
 
     from agentdeck.web import work_view
 
-    app = _app(tmp_path, board=_board(_card()))
+    app = _app(tmp_path, board=_board())
     _add(app, "claude_code:test:mine", WORK, title="Implement it")
     loop_thread = threading.get_ident()
     read_on: list[int] = []
@@ -341,39 +337,6 @@ async def test_a_pass_reads_files_and_databases_off_the_event_loop(tmp_path, mon
 
     assert read_on and loop_thread not in read_on
     assert _card_of(overview, WORK).title == "Implement it"
-
-
-@pytest.mark.asyncio
-async def test_a_card_nobody_has_joined_yet_is_a_no_run_preflight(tmp_path):
-    card = _card(blocked_by=("eerovil/agentdeck#2141",))
-    app = _app(tmp_path, board=_board(card))
-
-    overview = await _overview(app)
-
-    work = _card_of(overview, WORK)
-    assert work.chat_count == 0
-    assert (work.run_state, work.run_label) == ("preflight", "not started")
-    assert work.run_reason == "blocked by eerovil/agentdeck#2141"
-    assert work.next_expected == NEXT_BLOCKERS
-    assert work.work_state == "In progress"
-
-
-@pytest.mark.asyncio
-async def test_the_current_run_is_the_cards_not_the_newest_sessions(tmp_path):
-    app = _app(tmp_path, board=_board(_card(
-        generation="gen-2",
-        dispatch=BoardDispatch(id="d-2", run_id="gen-2", work_id=WORK.work_id),
-    )))
-    state = app.state.app_state
-    # The busiest, newest chat is bound to the old Run; it must not become "current".
-    old = _add(app, "claude_code:test:old-run", WORK, thinking=True, last_activity=NOW)
-    state.bind_session_run(old, WORK.work_id, "gen-1")
-
-    work = _card_of(await _overview(app), WORK)
-
-    assert work.run_id == "gen-2"
-    assert work.run_state == "preparing"
-    assert work.next_expected == "Runtime acceptance"
 
 
 @pytest.mark.asyncio
@@ -550,7 +513,6 @@ def test_outputs_are_the_works_facts_whether_or_not_a_workspace_was_inspected():
     requests stay in the workspace's own section."""
     from agentdeck.work_facts import work_facts
 
-    card = _card(pull_request_url="https://github.com/eerovil/agentdeck/pull/2200")
     claimed = WorkPullRequest(
         "eerovil/agent-evidence", 7, "https://github.com/eerovil/agent-evidence/pull/7",
         provenance=(WorkspaceProvenance(WorkspaceEvidence.WORK_CLAIM, WORK.work_id),),
@@ -559,7 +521,10 @@ def test_outputs_are_the_works_facts_whether_or_not_a_workspace_was_inspected():
         "eerovil/agentdeck", 9, "https://github.com/eerovil/agentdeck/pull/9",
         provenance=(WorkspaceProvenance(WorkspaceEvidence.CHAT_SESSION, "claude_code:test:x"),),
     )
-    facts = work_facts(WORK, card=card)
+    open_pulls = [
+        {"url": "https://github.com/eerovil/agentdeck/pull/2200", "closes": [WORK.source_key]}
+    ]
+    facts = work_facts(WORK, open_pulls=open_pulls)
     inspected = build_work_card(
         WORK, issue=None, title="t", facts=facts, workspace=_workspace(pulls=(claimed, chat_only))
     )
@@ -587,13 +552,12 @@ async def test_a_chat_local_pull_request_is_the_chats_not_the_works(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_the_card_reads_verification_per_work_and_never_lends_an_earlier_run(tmp_path):
+async def test_the_card_reads_verification_per_work_and_names_the_newest_job(tmp_path):
     from test_run_workspace_evidence import _job as verified_job
     from test_run_workspace_evidence import _snap as evidence_snap
 
-    card = _card(generation="gen-2")
-    app = _app(tmp_path, board=_board(card))
-    _add(app, "claude_code:test:worker", WORK)
+    app = _app(tmp_path, board=_board())
+    _add(app, "claude_code:test:worker", WORK, thinking=True)
     asked: list[str] = []
     evidence = {WORK.work_id: [verified_job(evidence_snap("eerovil/agentdeck", "c" * 40),
                                             id="j-old", work_id=WORK.work_id, run_id="gen-1")]}
@@ -618,8 +582,9 @@ async def test_the_card_reads_verification_per_work_and_never_lends_an_earlier_r
         id="j-new", work_id=WORK.work_id, run_id="gen-2", submitted_at=2.0,
     ))
     work = _card_of(await _overview(app), WORK)
-    assert (work.verification.status, work.verification.job_id) == ("verified", "j-new")
-    assert work.verification.label == "Verified eerovil/agentdeck@ddddddd"
+    # No Run is current any more (#3741): the newest job speaks only for the commit it tested.
+    assert (work.verification.status, work.verification.job_id) == ("earlier", "j-new")
+    assert work.verification.label == "An earlier Run verified eerovil/agentdeck@ddddddd"
 
 
 @pytest.mark.asyncio
@@ -631,7 +596,7 @@ async def test_the_work_page_reads_only_its_own_rows_of_the_queue(tmp_path):
 
     from agentdeck.web.work_view import load_work_detail, runtime_queue
 
-    app = _app(tmp_path, board=_board(_card(generation="gen-2")))
+    app = _app(tmp_path, board=_board())
     _add(app, "claude_code:test:worker", WORK)
     mine = verified_job(evidence_snap("eerovil/agentdeck", "c" * 40),
                         id="j-mine", work_id=WORK.work_id, run_id="gen-2")
@@ -776,15 +741,9 @@ def test_an_ambiguous_delegation_is_shown_not_placed_on_each_candidate_work(tmp_
 
 
 def test_the_work_page_answers_the_operators_questions_in_order(tmp_path):
-    card = _card(
-        generation="gen-2",
-        pull_request_url="https://github.com/eerovil/agentdeck/pull/2200",
-        dispatch=BoardDispatch(id="d-2", run_id="gen-2", work_id=WORK.work_id),
-    )
-    app = _app(tmp_path, board=_board(card))
+    app = _app(tmp_path, board=_board())
     state = app.state.app_state
     worker = _add(app, "claude_code:test:worker", WORK, title="Worker chat")
-    state.bind_session_run(worker, WORK.work_id, "gen-1")
     state.sessions[worker].question = "Merge now?"
     _attention(app, _insight(worker))
 
@@ -797,25 +756,21 @@ def test_the_work_page_answers_the_operators_questions_in_order(tmp_path):
         'id="work-sec-lifecycle"',
         'id="work-sec-result"',
         'id="work-sec-workspace"',
-        'id="work-sec-runs"',
         'id="work-sec-chats"',
         'id="work-sec-inspector"',
     ]
     positions = [html.index(marker) for marker in order]
     assert positions == sorted(positions)
-    assert 'data-rt-run="current" data-run-id="gen-2"' in html
-    # gen-1 is history: a previous Run, not a second Work.
-    assert 'data-rt-run="previous" data-run-id="gen-1"' in html
-    assert html.count('id="run-trace"') == 1 and 'id="run-history"' in html
+    # The Runs section went with the Poller's Runs (#3741).
+    assert 'id="work-sec-runs"' not in html and 'id="run-trace"' not in html
     assert f'data-wd-attention="{worker}"' in html
     # A chat's question is the Work's human dependency: said at the top, not in a folded chat.
     status = html.split('id="work-sec-status"', 1)[1].split('id="work-sec-message"', 1)[0]
     assert 'data-wd-tone="attention"' in status and "Worker chat asked: Merge now?" in status
-    # Runs, Chats and Technical details are folded shut by default.
-    for fold in ("work-runs", "work-chats", "work-inspector"):
+    # Chats and Technical details are folded shut by default.
+    for fold in ("work-chats", "work-inspector"):
         opening = re.search(rf'<details[^>]*id="{fold}"[^>]*>', html)
         assert opening is not None and " open" not in opening.group(0), fold
-    assert 'data-wd-output="https://github.com/eerovil/agentdeck/pull/2200"' in html
     # Session deep links: the chat row and the inspector reach the leg.
     session = state.sessions[worker]
     assert f'href="{session.detail_path}"' in html
@@ -830,16 +785,12 @@ def test_the_work_page_answers_the_operators_questions_in_order(tmp_path):
             break
         visible = shut
     text = re.sub(r"<[^>]+>", " ", visible.split("<main", 1)[1])  # what a reader sees
-    assert worker not in text and "gen-1" not in text
+    assert worker not in text
 
 
 def test_the_front_page_is_work_first(tmp_path):
-    # Blocked on another issue: the engine releases it by itself, so nobody is needed.
-    parked = _card(
-        2150, status="Blocked", status_role="blocked", blocked_by=("eerovil/agentdeck#1",)
-    )
-    app = _app(tmp_path, board=_board(_card(), parked))
-    _add(app, "claude_code:test:worker", WORK)
+    app = _app(tmp_path, board=_board())
+    _add(app, "claude_code:test:worker", WORK, thinking=True)
     manual = _add(app, "claude_code:test:manual", thinking=True)
     client = _client(app)
 
@@ -870,8 +821,8 @@ def test_the_front_page_is_work_first(tmp_path):
     for absent in ('id="assistant-panel"', 'id="chat-list"', 'id="sessions"', 'id="board-strip"'):
         assert absent not in html, absent
     board = html.split('id="front-board"', 1)[1].split("</p>", 1)[0]
-    assert 'data-board-count="cards">2 cards' in board
-    assert 'data-board-count="blocked">1 blocked' in board and 'href="/pollers"' in board
+    # No card counts any more (#3741): only the links off the page.
+    assert "data-board-count" not in board and 'href="/pollers"' in board
     # Nothing is waiting on a person: one calm line, not an empty card.
     needs = html.split('id="works-needs"', 1)[1].split("</div>", 1)[0]
     assert "data-front-empty" in needs and "Nothing needs you" in needs
@@ -990,7 +941,7 @@ def _visible_text(html: str) -> str:
 
 
 def test_all_chats_lists_only_chats_outside_every_work(tmp_path):
-    app = _app(tmp_path, board=_board(_card()))
+    app = _app(tmp_path, board=_board())
     worker = _add(app, "claude_code:test:worker", WORK, show_when_idle=True)
     manual = _add(app, "claude_code:test:manual", show_when_idle=True)
     # Deckhand still triages both, but the old attention panel is shown for neither.
@@ -1082,30 +1033,12 @@ def _section_of(overview, work: WorkRef) -> str:
 
 @pytest.mark.asyncio
 async def test_each_work_is_in_one_section_by_its_human_dependency(tmp_path):
-    from agentdeck.work_story import FINISHED, IN_PROGRESS, NEEDS_YOU
+    from agentdeck.work_story import FINISHED, NEEDS_YOU
 
-    question, review, fixing, done, info, handoff, waits = (
-        WorkRef("eerovil/agentdeck", n) for n in range(3001, 3008)
-    )
-    app = _app(
-        tmp_path,
-        board=_board(
-            _card(3002, review_mode="merge-review"),
-            _card(3003, review_offer="rejected"),
-            _card(3004, status="Done", done=True),
-            _card(3005, status="Needs More Info", status_role="needs_more_info", ownership=False),
-            _card(
-                3007,
-                status="Blocked",
-                status_role="blocked",
-                ownership=False,
-                blocked_by=("eerovil/agentdeck#3001",),
-            ),
-        ),
-    )
+    question, done, handoff = (WorkRef("eerovil/agentdeck", n) for n in (3001, 3004, 3006))
+    app = _app(tmp_path, board=_board())
     asker = _add(app, "claude_code:test:asker", question)
-    for ref in (review, fixing, done, info, waits):
-        _add(app, f"claude_code:test:w{ref.number}", ref)
+    _add(app, f"claude_code:test:w{done.number}", done)
     finisher = _add(app, "claude_code:test:finisher", handoff)
     # A chat that really asks: a waiting card alone is not a question (#2224).
     app.state.app_state.sessions[asker].question = "Which branch should this go on?"
@@ -1114,25 +1047,13 @@ async def test_each_work_is_in_one_section_by_its_human_dependency(tmp_path):
 
     overview = await _overview(app)
 
-    # A question, and a card handed back for more information, wait on a person.
     assert _section_of(overview, question) == NEEDS_YOU
-    assert _section_of(overview, info) == NEEDS_YOU
-    # A review queued and a worker's fix round are healthy progress; the queued
-    # review is listed apart, under Waiting (#2254, #2573).
-    assert _section_of(overview, review) == IN_PROGRESS
-    assert review.work_id in {row.card.work_id for row in overview.front.waiting}
-    assert _section_of(overview, fixing) == IN_PROGRESS
     assert _section_of(overview, done) == FINISHED
-    # A finished turn nobody acknowledged is not a dependency, nor is waiting on another issue.
+    # A finished turn nobody acknowledged is not a dependency.
     assert _section_of(overview, handoff) != NEEDS_YOU
-    assert _section_of(overview, waits) != NEEDS_YOU
     needs = {row.card.work_id: row for row in overview.front.needs_you}
-    # The question outranks the parked card, and is answered rather than opened.
-    assert [row.card.work_id for row in overview.front.needs_you] == [
-        question.work_id,
-        info.work_id,
-    ]
-    assert needs[question.work_id].action == "Answer" and needs[info.work_id].action == "Open"
+    assert list(needs) == [question.work_id]
+    assert needs[question.work_id].action == "Answer"
 
     page = _client(app).get("/").text
     rows = re.findall(r'<article class="fr fr-(\w+)[^"]*"\s+data-work-id="([^"]+)"', page)
@@ -1142,8 +1063,6 @@ async def test_each_work_is_in_one_section_by_its_human_dependency(tmp_path):
     assert {work_id for section, work_id in rows if section == "stopped"} == set(needs)
     # Recently stopped is listed last (#3578): everything before it lists each Work once.
     html = page.split('id="works-stopped"', 1)[0]
-    fix_row = html.split(f'data-work-id="{fixing.work_id}"', 1)[1].split("</article>", 1)[0]
-    assert "Fixing review findings" in fix_row and 'data-wd-tone="active"' in fix_row
     # Rows never name the chat or session that raised the question.
     ask_row = html.split(f'data-work-id="{question.work_id}"', 1)[1].split("</article>", 1)[0]
     # ...and sit under the operator's category (#2236, grouped by #2254).
@@ -1154,33 +1073,11 @@ async def test_each_work_is_in_one_section_by_its_human_dependency(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_a_blocked_work_with_a_chat_mid_turn_is_working(tmp_path):
-    """#2572: the Work said Blocked and Unblock the card while its chat was mid-turn. What
-    the deck sees running outweighs the column; the park waits in the detail."""
-    from agentdeck.work_story import IN_PROGRESS, NEEDS_YOU
-
-    parked = WorkRef("eerovil/agentdeck", 3201)
-    app = _app(
-        tmp_path,
-        board=_board(_card(3201, status="Blocked", status_role="blocked", ownership=False)),
-    )
-    worker = _add(app, "claude_code:test:parked", parked)
-    assert _section_of(await _overview(app), parked) == NEEDS_YOU
-
-    _add(app, worker, parked, thinking=True)
-    assert _section_of(await _overview(app), parked) == IN_PROGRESS
-
-    page = _client(app).get("/works/" + quote(parked.work_id, safe=":")).text
-    assert "When it finishes: Blocked" in page
-    assert "Unblock the card" not in page
-
-
-@pytest.mark.asyncio
 async def test_recently_finished_is_bounded_and_newest_first(tmp_path):
     from agentdeck.work_story import MAX_FINISHED
 
     refs = [WorkRef("eerovil/agentdeck", 3100 + n) for n in range(MAX_FINISHED + 2)]
-    app = _app(tmp_path, board=_board(*(_card(r.number, status="Done", done=True) for r in refs)))
+    app = _app(tmp_path, board=_board())
     for age, ref in enumerate(refs):
         # Chat activity runs the other way round, so only the close time can give this order.
         # Every chat went quiet before its close: a later one would be continued (#2357).
@@ -1207,18 +1104,14 @@ async def test_an_old_question_is_not_crowded_out_by_newer_automation(tmp_path):
 
     busy = [WorkRef("eerovil/agentdeck", 3200 + n) for n in range(MAX_DASHBOARD_WORKS + 5)]
     parked = WorkRef("eerovil/agentdeck", 3199)
-    app = _app(
-        tmp_path,
-        board=_board(
-            _card(parked.number, status="Needs More Info", status_role="needs_more_info",
-                  ownership=False)
-        ),
-    )
+    app = _app(tmp_path, board=_board())
     for age, ref in enumerate(busy):
         _add(app, f"claude_code:test:b{ref.number}", ref, thinking=True,
              last_activity=NOW - timedelta(minutes=age + 1))
     # Older than every busy Work: ranked last by raw activity, past the 20th place.
-    _add(app, "claude_code:test:parked", parked, last_activity=NOW - timedelta(days=2))
+    asker = _add(app, "claude_code:test:parked", parked, last_activity=NOW - timedelta(days=2))
+    app.state.app_state.sessions[asker].question = "Which branch?"
+    _attention(app, _insight(asker, "waiting"))
 
     overview = await _overview(app)
 
@@ -1238,11 +1131,10 @@ async def test_only_rendered_rows_are_hydrated_and_an_old_question_is_still_foun
     tmp_path, monkeypatch
 ):
     """#2223 review: sectioning is one cheap pass, and every expensive Work-scoped reader —
-    the full Run trace (routes, bindings, deferral), the stored outcomes, the workspace claims
-    and the retained job evidence — runs only for the rows the page renders. With far more
+    the workspace claims and the retained job evidence — runs only for the rows the page
+    renders. With far more
     Works than the Active limit, the old parked Work past the raw recency boundary is still
     found, and the healthy Works the page does not list are never hydrated."""
-    import agentdeck.run_trace as run_trace
     import agentdeck.web.work_view as work_view
     from agentdeck.work_overview import MAX_DASHBOARD_WORKS
     from agentdeck.work_story import NEEDS_YOU
@@ -1250,14 +1142,7 @@ async def test_only_rendered_rows_are_hydrated_and_an_old_question_is_still_foun
     busy = [WorkRef("eerovil/agentdeck", 3400 + n) for n in range(MAX_DASHBOARD_WORKS + 20)]
     quiet = [WorkRef("eerovil/agentdeck", 3500 + n) for n in range(15)]
     parked = WorkRef("eerovil/agentdeck", 3399)
-    app = _app(
-        tmp_path,
-        board=_board(
-            _card(parked.number, status="Needs More Info", status_role="needs_more_info",
-                  ownership=False),
-            *(_card(ref.number, generation=f"g{ref.number}") for ref in busy),
-        ),
-    )
+    app = _app(tmp_path, board=_board())
     for age, ref in enumerate(busy):
         _add(app, f"claude_code:test:e{ref.number}", ref, thinking=True,
              last_activity=NOW - timedelta(minutes=age + 1))
@@ -1265,20 +1150,11 @@ async def test_only_rendered_rows_are_hydrated_and_an_old_question_is_still_foun
         _add(app, f"claude_code:test:q{ref.number}", ref,
              last_activity=NOW - timedelta(hours=age + 1))
     # Older than every busy and quiet Work: past the 20th place by raw recency.
-    _add(app, "claude_code:test:parked", parked, last_activity=NOW - timedelta(days=2))
-    # The Runtime says every busy Run is executing: healthy, not a Run that needs a look.
-    from pathlib import Path
+    asker = _add(app, "claude_code:test:parked", parked, last_activity=NOW - timedelta(days=2))
+    app.state.app_state.sessions[asker].question = "Which branch?"
+    _attention(app, _insight(asker, "waiting"))
 
-    from agentdeck.run_execution import ExecutionOutcome, OutcomeStore
-
-    store = OutcomeStore(Path(app.state.config.history.db_path))
-    for ref in busy:
-        store.record(ExecutionOutcome(ref.work_id, f"g{ref.number}", "running",
-                                      observed_at=NOW.timestamp()))
-    store.close()
-
-    reads: dict[str, list[str]] = {"trace": [], "outcomes": [], "claims": [], "evidence": []}
-    batches: list[int] = []
+    reads: dict[str, list[str]] = {"claims": [], "evidence": []}
 
     def counted(name, real, key=lambda *a, **k: a[1] if len(a) > 1 else a[0].work_id):
         def wrapper(*args, **kwargs):
@@ -1288,25 +1164,9 @@ async def test_only_rendered_rows_are_hydrated_and_an_old_question_is_still_foun
         return wrapper
 
     monkeypatch.setattr(
-        work_view, "gather_run_trace",
-        counted("trace", work_view.gather_run_trace, key=lambda state, work, **_: work.work_id),
-    )
-    monkeypatch.setattr(
-        work_view, "read_outcomes",
-        counted("outcomes", work_view.read_outcomes, key=lambda db, work_id: work_id),
-    )
-    monkeypatch.setattr(
         work_view, "read_claims",
         counted("claims", work_view.read_claims, key=lambda db, work_id: work_id),
     )
-    real_batch = run_trace.read_current_run_facts
-
-    def batch(db_path, runs):
-        batches.append(len(runs))
-        return real_batch(db_path, runs)
-
-    monkeypatch.setattr(run_trace, "read_current_run_facts", batch)
-
     def answer(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/job-evidence":
             reads["evidence"].append(request.url.params.get("work_id", ""))
@@ -1332,8 +1192,6 @@ async def test_only_rendered_rows_are_hydrated_and_an_old_question_is_still_foun
     # the 20 busy Works past the Active limit or the 15 quiet ones.
     for name, ids in reads.items():
         assert sorted(ids) == sorted(rendered), name
-    # Classification read the current Runs of all 56 Works in one batch.
-    assert batches == [len(busy) + len(quiet) + 1]
     assert len(overview.cards) == len(busy) + len(quiet) + 1
 
 
@@ -1386,28 +1244,11 @@ def test_a_finish_time_is_the_close_time_and_nothing_else():
 
     closed = {"state": "closed", "closedAt": "2026-09-01T10:00:00Z",
               "updatedAt": "2026-09-25T10:00:00Z"}
-    assert work_finished_at(None, closed) == datetime(2026, 9, 1, 10, tzinfo=UTC)
+    assert work_finished_at(closed) == datetime(2026, 9, 1, 10, tzinfo=UTC)
     # A record cached before it carried ``closedAt`` has no finish time, not ``updatedAt``.
-    assert work_finished_at(None, {"state": "closed", "updatedAt": "2026-09-25T10:00:00Z"}) is None
-    assert work_finished_at(None, {**closed, "state": "open"}) is None
-    assert work_finished_at(None, {**closed, "is_pr": True}) is None
-    # A card still on the board and not done: the Work is open whatever the record says.
-    assert work_finished_at(_card(), closed) is None
-    assert work_finished_at(_card(status="Done", done=True), closed) is not None
-
-
-def test_the_board_summary_counts_by_role_not_by_spelling():
-    from agentdeck.work_overview import summarize_board
-
-    board = _board(
-        _card(1, status="Granskning", in_review=True, status_role="in_review"),
-        _card(2, status="Stuck", status_role="blocked"),
-        _card(3, status="More please", status_role="needs_more_info"),
-        _card(4, status="Shipped", done=True),
-    )
-    summary = summarize_board(board)
-    assert (summary.cards, summary.in_review, summary.blocked, summary.needs_info) == (3, 1, 1, 1)
-    assert summarize_board(BoardView()) is None and summarize_board(None) is None
+    assert work_finished_at({"state": "closed", "updatedAt": "2026-09-25T10:00:00Z"}) is None
+    assert work_finished_at({**closed, "state": "open"}) is None
+    assert work_finished_at({**closed, "is_pr": True}) is None
 
 
 # --- live updates -------------------------------------------------------------------------------
@@ -1481,7 +1322,7 @@ async def test_an_open_work_page_builds_only_when_its_own_work_moved(tmp_path, m
     from agentdeck.web import routes_works
     from agentdeck.web.work_view import WORK_INPUTS_TOPIC
 
-    app = _app(tmp_path, board=_board(_card(WORK.number), _card(OTHER.number)))
+    app = _app(tmp_path, board=_board())
     _add(app, "claude_code:test:worker", WORK)
     _add(app, "claude_code:test:cleanup", OTHER)
     await app.state.work_overview.refresh()
@@ -1531,9 +1372,9 @@ async def test_an_open_work_page_builds_only_when_its_own_work_moved(tmp_path, m
     rebuilt = builds._builds[WORK.work_id]
     for name in ("resolution", "workspace"):
         assert rebuilt.inputs[name] is page.inputs[name], name  # kept, not rendered
-    # The Run and workspace fragments are built only for a section that shows them and was
-    # rendered again: Runs shows both Run fragments, the details the workspace.
-    owed = {"runs": 2, "inspector": 1}
+    # The workspace fragment is built only for the section that shows it and was rendered
+    # again: the details.
+    owed = {"inspector": 1}
     assert spent[work_counter.WORK_FRAGMENT] == sum(
         count for name, count in owed.items() if rebuilt.inputs[name] is not page.inputs[name]
     )
@@ -1624,11 +1465,11 @@ def test_the_older_slices_routes_are_the_work_page_now(tmp_path):
 # --- Active, Recent and Archived Works (#2201) ---------------------------------------------------
 
 
-def _candidate(work: WorkRef = WORK, *, age: timedelta | None, live: bool = False, card=None):
+def _candidate(work: WorkRef = WORK, *, age: timedelta | None, live: bool = False):
     from agentdeck.work_overview import WorkCandidate
 
     at = NOW - age if age is not None else None
-    return WorkCandidate(work, None, card, at, live)
+    return WorkCandidate(work, None, at, live)
 
 
 def test_a_work_is_active_on_evidence_recent_by_activity_and_archived_otherwise():
@@ -1646,6 +1487,11 @@ def _old(app, key: str, work: WorkRef) -> str:
     return _add(app, key, work, last_activity=NOW - timedelta(days=30))
 
 
+def _active(app, key: str, work: WorkRef) -> str:
+    """An old Work still current: its chat is mid-turn."""
+    return _add(app, key, work, thinking=True, last_activity=NOW - timedelta(days=30))
+
+
 def _candidates(app, *, current=()):
     from agentdeck.web.work_view import gather_pass
     from agentdeck.work_overview import bucket_works, work_candidates
@@ -1654,7 +1500,6 @@ def _candidates(app, *, current=()):
     found = work_candidates(
         snapshot.state,
         snapshot.projection,
-        board=snapshot.board,
         owned_insights=snapshot.owned,
         legs_by_chat=snapshot.legs,
         current_work_ids=current,
@@ -1669,23 +1514,19 @@ def _candidates(app, *, current=()):
 
 
 def test_current_evidence_keeps_an_old_work_active(tmp_path):
-    works = tuple(WorkRef("eerovil/agentdeck", n) for n in range(1, 6))
-    working, carded, attended, reviewed, runtime = works
-    app = _app(tmp_path, board=_board(
-        _card(2, generation="gen-2"),
-        _card(4, ownership=False, status="In review", in_review=True),
-    ))
+    works = tuple(WorkRef("eerovil/agentdeck", n) for n in (1, 3, 5))
+    working, attended, runtime = works
+    app = _app(tmp_path, board=_board())
     _add(app, "claude_code:test:working", working, thinking=True,
          last_activity=NOW - timedelta(days=30))
-    for key, work in (("carded", carded), ("attended", attended), ("reviewed", reviewed),
-                      ("runtime", runtime)):
+    for key, work in (("attended", attended), ("runtime", runtime)):
         _old(app, f"claude_code:test:{key}", work)
     _attention(app, _insight("claude_code:test:attended"))
     _old(app, "claude_code:test:archived", OTHER)
 
     buckets = _candidates(app, current={runtime.work_id})
 
-    for work in (working, carded, attended, reviewed, runtime):
+    for work in works:
         assert buckets[work] == "active", work
     assert buckets[OTHER] == "archived"
 
@@ -1710,27 +1551,16 @@ def test_a_background_command_alone_does_not_keep_an_old_work_active(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_a_runtime_execution_or_a_running_verification_makes_a_work_current(tmp_path):
+async def test_a_running_verification_makes_a_work_current(tmp_path):
     from agentdeck.run_execution import ExecutionOutcome, OutcomeStore
     from agentdeck.web.work_view import current_work_ids
 
-    executing, stopped, verifying = (WorkRef("eerovil/agentdeck", n) for n in (11, 12, 13))
+    executing, verifying = (WorkRef("eerovil/agentdeck", n) for n in (11, 13))
     app = _app(tmp_path)
-    from pathlib import Path
-
-    from agentdeck.db import Db, DeliveryRoute
-
-    db = Db(Path(app.state.config.history.db_path))
-    for run_id, at in (("g1", "2026-09-24T08:00:00+00:00"), ("g2", "2026-09-24T09:00:00+00:00")):
-        db.freeze_delivery_route(DeliveryRoute(
-            f"d-{run_id}", "fp", stopped.work_id, run_id, "claude_code", "main", "w", at))
-    db.close()
+    # A Poller Run's open outcome no longer makes its Work current (#3741).
     store = OutcomeStore(app.state.config.history.db_path)
-    stamp = NOW.timestamp()
-    store.record(ExecutionOutcome(executing.work_id, "g1", "running", observed_at=stamp))
-    # A Run a later Run replaced does not keep its Work current, even re-observed last.
-    store.record(ExecutionOutcome(stopped.work_id, "g2", "ended", observed_at=stamp - 60))
-    store.record(ExecutionOutcome(stopped.work_id, "g1", "running", observed_at=stamp))
+    store.record(ExecutionOutcome(executing.work_id, "g1", "running",
+                                  observed_at=NOW.timestamp()))
     store.close()
     queue = [
         {"id": "j1", "work_id": verifying.work_id.replace("eerovil", "Eerovil"), "run_id": "g",
@@ -1741,45 +1571,13 @@ async def test_a_runtime_execution_or_a_running_verification_makes_a_work_curren
          "purpose": "verification"},
     ]
 
-    assert await current_work_ids(app, queue) == {executing.work_id, verifying.work_id}
-
-
-@pytest.mark.asyncio
-async def test_a_run_from_before_recording_reads_as_history_and_a_later_gap_as_a_warning(
-    tmp_path,
-):
-    from agentdeck.run_execution import ExecutionOutcome, OutcomeStore
-
-    recorded = NOW - timedelta(days=2)
-    old = _card(generation="gen-old", status="In review",
-                started_at=(NOW - timedelta(days=12)).isoformat())
-    gap = _card(2150, generation="gen-new", started_at=(NOW - timedelta(hours=1)).isoformat())
-    app = _app(tmp_path, board=_board(old, gap))
-    store = OutcomeStore(app.state.config.history.db_path)
-    store.record(ExecutionOutcome("github_issue:eerovil/agentdeck#1", "g", "ended",
-                                  observed_at=recorded.timestamp()))
-    store.close()
-
-    overview = await _overview(app)
-
-    history = _card_of(overview, WORK)
-    assert (history.run_state, history.run_label) == ("historical", "historical")
-    assert history.run_reason == "execution details unavailable"
-    assert not history.stuck and not history.needs_attention
-    warning = _card_of(overview, OTHER)
-    assert warning.run_state == "uncertain" and warning.stuck
-    assert warning.run_reason == "the Poller holds this Run but no Runtime fact names it"
-    # Both cards are still held by the Poller, so both Works stay current.
-    assert overview.archived == 0
-
-    page = _client(app).get(work_href(WORK.work_id)).text
-    assert 'data-rt-state="historical"' in page and 'data-rt-state="uncertain"' not in page
+    assert await current_work_ids(app, queue) == {verifying.work_id}
 
 
 def test_the_works_index_shows_active_and_recent_and_counts_the_archive(tmp_path):
     recent = WorkRef("eerovil/agentdeck", 3)
-    app = _app(tmp_path, board=_board(_card(generation="gen-1")))
-    _old(app, "claude_code:test:worker", WORK)
+    app = _app(tmp_path, board=_board())
+    _active(app, "claude_code:test:worker", WORK)
     _add(app, "claude_code:test:recent", recent, last_activity=NOW - timedelta(days=3))
     _old(app, "claude_code:test:old", OTHER)
     _old(app, "claude_code:test:older", WorkRef("eerovil/trailhead", 7))
@@ -1806,8 +1604,8 @@ async def test_the_works_index_streams_only_its_changed_rows(tmp_path, monkeypat
     import agentdeck.web.routes_sse as sse
 
     recent = WorkRef("eerovil/agentdeck", 3)
-    app = _app(tmp_path, board=_board(_card(generation="gen-1")))
-    _old(app, "claude_code:test:worker", WORK)
+    app = _app(tmp_path, board=_board())
+    _active(app, "claude_code:test:worker", WORK)
     _add(app, "claude_code:test:recent", recent, last_activity=NOW - timedelta(days=3))
     await app.state.work_overview.refresh()
     assert 'sse-connect="/events?view=works-index&amp;repo="' in _client(app).get("/works").text
@@ -1833,8 +1631,8 @@ async def test_the_works_index_streams_only_its_changed_rows(tmp_path, monkeypat
 def test_the_works_index_filters_by_project(tmp_path):
     trailhead = WorkRef("eerovil/trailhead", 7)
     recent = WorkRef("eerovil/agentdeck", 3)
-    app = _app(tmp_path, board=_board(_card(generation="gen-1")))
-    _old(app, "claude_code:test:worker", WORK)
+    app = _app(tmp_path, board=_board())
+    _active(app, "claude_code:test:worker", WORK)
     _add(app, "claude_code:test:recent", recent, last_activity=NOW - timedelta(days=3))
     _add(app, "claude_code:test:trailhead", trailhead, last_activity=NOW - timedelta(days=2))
     _old(app, "claude_code:test:old", OTHER)
@@ -1863,8 +1661,8 @@ def test_the_works_index_filters_by_project(tmp_path):
 
 
 def test_one_project_offers_no_filter(tmp_path):
-    app = _app(tmp_path, board=_board(_card(generation="gen-1")))
-    _old(app, "claude_code:test:worker", WORK)
+    app = _app(tmp_path, board=_board())
+    _active(app, "claude_code:test:worker", WORK)
 
     html = _client(app).get("/works").text
 
@@ -2060,19 +1858,31 @@ def test_viewing_and_classifying_works_writes_nothing(tmp_path):
 # --- in the browser -------------------------------------------------------------------------------
 
 
-def _browser_app(tmp_path, *extra: BoardCard):
-    """Two Works and a manual chat, with a Run, a blocker and a chat-local pull request;
-    ``extra`` cards are more Works on the board, with no chat."""
-    card = _card(
-        generation="gen-2",
-        pull_request_url="https://github.com/eerovil/agentdeck/pull/2200",
-        dispatch=BoardDispatch(id="d-2", run_id="gen-2", work_id=WORK.work_id),
-    )
-    blocked = _card(2150, blocked_by=("eerovil/agentdeck#2147",))
-    app = _app(tmp_path, board=_board(card, blocked, *extra))
-    state = app.state.app_state
-    worker = _add(app, "claude_code:test:worker", WORK, title="Promote Work to the UI")
-    state.bind_session_run(worker, WORK.work_id, "gen-1")
+def _browser_app(tmp_path, *unstarted: WorkRef):
+    """Two Works and a manual chat, with a chat-local pull request; each of ``unstarted`` is
+    an open issue no agent works on yet: a Work with no chat (#3558)."""
+    app = _app(tmp_path, board=_board())
+    if unstarted:
+        from agentdeck.issue_context import IssueBacklog, IssueContext, RepositoryIssues
+
+        issues = tuple(
+            IssueContext(
+                ref.repository, ref.number, f"Issue {ref.number}",
+                f"https://github.com/{ref.repository}/issues/{ref.number}", "open",
+                created_at=(NOW - timedelta(hours=1)).isoformat(),
+            )
+            for ref in unstarted
+        )
+        scope = BoardScope("agentdeck", org="eerovil", ownership_labels=("agent",),
+                           issue_repositories=("eerovil/agentdeck",))
+        backlog = IssueBacklog(
+            repositories=(RepositoryIssues("eerovil/agentdeck", issues, present=True, age_s=60.0),),
+            board=BoardView(scopes=(scope,)),
+        )
+        app.state.issues.read_board = lambda: backlog.board
+        app.state.issues.cached = lambda: backlog
+    # Mid-turn: something current keeps a Work the deck does not run itself listed.
+    _add(app, "claude_code:test:worker", WORK, title="Promote Work to the UI", thinking=True)
     _add(app, "codex:test:review", WORK, title="Review the Work UI")
     _add(app, "claude_code:test:cleanup", OTHER, title="Remove legacy paths")
     _add(app, "claude_code:test:manual", thinking=True, title="A chat started by hand")
@@ -2546,16 +2356,12 @@ async def test_the_house_reaches_the_front_page_from_a_chat_opened_over_a_work(t
         await browser.close()
 
 
-def test_work_page_disclosures_are_keyed_by_work_and_run(tmp_path):
-    card = _card(generation="gen-2")
-    app = _app(tmp_path, board=_board(card))
-    worker = _add(app, "claude_code:test:worker", WORK)
-    app.state.app_state.bind_session_run(worker, WORK.work_id, "gen-1")
+def test_work_page_disclosures_are_keyed_by_work(tmp_path):
+    app = _app(tmp_path, board=_board())
+    _add(app, "claude_code:test:worker", WORK)
     html = _client(app).get(work_href(WORK.work_id)).text
     keys = re.findall(r'data-keep-open="([^"]+)"', html)
-    assert f"work-inspector:{WORK.work_id}" in keys
-    assert f"work-runs:{WORK.work_id}" in keys and f"work-chats:{WORK.work_id}" in keys
-    assert f"run-history:{WORK.work_id}:gen-2" in keys
+    assert f"work-inspector:{WORK.work_id}" in keys and f"work-chats:{WORK.work_id}" in keys
     # No disclosure on the page shares a key another Work's page could also use.
     assert all(WORK.work_id in key for key in keys)
 
@@ -3094,7 +2900,7 @@ def test_a_chat_in_no_work_holding_a_background_command_stays_working_in_other_a
 def test_the_work_page_names_the_chat_a_desktop_opens_beside_it(tmp_path):
     """#2345: the Work page names one chat for a desktop to open beside the Work — the one a
     message would go to, else the Work's first chat — and a Work with no chat names none."""
-    app = _browser_app(tmp_path, _card(UNSTARTED.number))
+    app = _browser_app(tmp_path, UNSTARTED)
     client = _client(app)
     html = client.get(work_href(WORK.work_id)).text
     main = re.search(r'<main class="work-main"[^>]*>', html).group(0)
@@ -3115,7 +2921,7 @@ def test_a_front_page_row_names_the_chat_its_work_opens_into(tmp_path):
     """#2512: a front-page row carries the chat its Work opens into — the same one the Work
     page names for a desktop (#2345) — and still links to the Work; a Work with no chat yet
     names none."""
-    app = _browser_app(tmp_path, _card(UNSTARTED.number))
+    app = _browser_app(tmp_path, UNSTARTED)
     client = _client(app)
     front = client.get("/").text
     page = client.get(work_href(WORK.work_id)).text
@@ -3222,7 +3028,7 @@ async def test_a_phone_opens_a_works_chat_straight_from_the_front_page(tmp_path)
     from conftest import async_playwright
     from test_web import _live_server
 
-    app = _browser_app(tmp_path, _card(UNSTARTED.number))
+    app = _browser_app(tmp_path, UNSTARTED)
     # A working chat, so it is the one the Work opens into, whatever order the two idle
     # chats would tie in.
     _add(app, "claude_code:test:worker", WORK, title="Promote Work to the UI", cwd=tmp_path,
@@ -3452,7 +3258,7 @@ async def test_the_house_skips_the_work_beneath_a_phones_chat(tmp_path):
 def _work_with_a_checkout(tmp_path):
     from test_web import _checkout_with_a_change
 
-    app = _app(tmp_path, board=_board(_card()))
+    app = _app(tmp_path, board=_board())
     _add(app, "claude_code:test:worker", WORK, title="Worker chat",
          cwd=_checkout_with_a_change(tmp_path))
     return app
@@ -3475,7 +3281,7 @@ def test_the_work_page_opens_its_diff_without_a_chat(tmp_path):
     assert 'hx-trigger="toggle[this.open]"' in fold.group(0)
     # Under the workspace, above the folded history, and outside every swapped section.
     assert html.index('id="work-sec-workspace"') < html.index('id="work-diff"')
-    assert html.index('id="work-diff"') < html.index('id="work-sec-runs"')
+    assert html.index('id="work-diff"') < html.index('id="work-sec-chats"')
     assert "greeting.txt" not in html
 
     fragment = client.get(_diff_url())
@@ -3487,7 +3293,7 @@ def test_the_work_page_opens_its_diff_without_a_chat(tmp_path):
 
 def test_the_work_page_links_its_conversation_to_github(tmp_path):
     """#2591: the issue conversation is a plain link to GitHub, not an in-deck reader."""
-    app = _app(tmp_path, board=_board(_card()))
+    app = _app(tmp_path, board=_board())
     _add(app, "claude_code:test:worker", WORK, title="Worker chat")
     client = _client(app)
     html = client.get(work_href(WORK.work_id)).text
@@ -3498,13 +3304,13 @@ def test_the_work_page_links_its_conversation_to_github(tmp_path):
     assert f'href="https://github.com/{WORK.repository}/issues/{WORK.number}"' in link.group(1)
     assert 'target="_blank"' in link.group(1)
     assert html.index('id="work-sec-workspace"') < html.index('id="work-conversation"')
-    assert html.index('id="work-conversation"') < html.index('id="work-sec-runs"')
+    assert html.index('id="work-conversation"') < html.index('id="work-sec-chats"')
     assert "/conversation" not in html and "wd-conv-body" not in html
     assert client.get(f"/partials/works/{WORK.work_id}/conversation").status_code == 404
 
 
 def test_a_work_with_no_checkout_here_offers_no_diff(tmp_path):
-    app = _app(tmp_path, board=_board(_card()))
+    app = _app(tmp_path, board=_board())
     _add(app, "claude_code:test:worker", WORK, title="Worker chat")
     client = _client(app)
 
@@ -3652,7 +3458,7 @@ def test_the_work_diff_reads_the_worktree_its_pull_requests_branch_is_in(tmp_pat
 
     monkeypatch.setattr(routes_works, "load_work_detail", detail)
     monkeypatch.setattr(work_start, "checkout_candidates", lambda _app: [str(main), str(store)])
-    fragment = _client(_app(tmp_path, board=_board(_card()))).get(_diff_url())
+    fragment = _client(_app(tmp_path, board=_board())).get(_diff_url())
 
     assert fragment.status_code == 200
     assert "fix.py" in fragment.text and "agent/issue-2993" in fragment.text
@@ -3667,7 +3473,7 @@ async def test_the_work_cards_tell_the_live_window_which_chats_to_keep(tmp_path)
     them, so a Work going again finds its chats."""
     from agentdeck.live_window import LiveWindow
 
-    app = _app(tmp_path, board=_board(_card(), _card(2150, status="Done", done=True)))
+    app = _app(tmp_path, board=_board())
     state = app.state.app_state
     state.live_window = LiveWindow(7)
     going = _add(app, "claude_code:test:going", WORK, title="Still going")

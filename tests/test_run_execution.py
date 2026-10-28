@@ -9,13 +9,14 @@ from __future__ import annotations
 
 import sqlite3
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 from httpx import ASGITransport, AsyncClient
 
 from agentdeck import run_execution as rx
+from agentdeck.config import AccountConfig, AppConfig
 from agentdeck.db import Db, DeliveryRoute
-from agentdeck.ensure_delivery import PRIOR_RUN_EXECUTING
 from agentdeck.models import SNAPSHOT_BOOTED_AT_KEY
 from agentdeck.providers.delivery import DeliverResult
 
@@ -400,18 +401,20 @@ async def test_an_unreadable_host_with_no_route_does_not_block_a_settled_work(tm
     assert await executions.admit(WORK, "run-2") is None
 
 
-def _body(run_id: str, *, label: str = "main") -> dict:
-    return {
-        "contract": "ensure-delivery-v1",
-        "delivery_id": f"poller:{run_id}",
-        "work_id": WORK,
-        "run_id": run_id,
-        "requirements": {"candidates": [f"claude_code:{label}"]},
-        "worker_key": KEY,
-        "message": "go",
-        "role": "kanban",
-        "issue_ref": "eerovil/agentdeck#2159",
-    }
+def _runtime_config(tmp_path: Path) -> AppConfig:
+    return AppConfig.model_validate(
+        {
+            "claude_workers": {"enabled": True, "state_dir": str(tmp_path)},
+            "keyed_workers": {"state_dir": str(tmp_path)},
+            "restart_nudge": {"file": str(tmp_path / "restart-nudge.json")},
+            "history": {"db_path": str(tmp_path / "control.db")},
+            "accounts": [
+                AccountConfig(
+                    provider="claude_code", label="main", config_dir=str(tmp_path)
+                ).model_dump()
+            ],
+        }
+    )
 
 
 class AppHost(Host):
@@ -425,35 +428,11 @@ class AppHost(Host):
         self.delivered.append(kwargs.get("delivery_id") or "")
         return DeliverResult(True, "steered", session_id="s1")
 
-    def active_role_keys(self, _role):
-        return set()
-
-    def delivery_is_finalized(self, *_args):
-        return False
-
-    def role_last_result_at(self, *_args):
-        return 0.0
-
     def delivery_receipt(self, *_args):
         return None
 
 
-class FreshHost(AppHost):
-    """``AppHost`` whose fresh start is a new session, as a real worker's is."""
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.fresh: list[bool] = []
-
-    async def deliver(self, key, message, **kwargs):
-        self.fresh.append(bool(kwargs.get("fresh")))
-        result = await super().deliver(key, message, **kwargs)
-        return DeliverResult(True, result.action, session_id="s2" if self.fresh[-1] else "s1")
-
-
 def _runtime(tmp_path, host: AppHost, *runs: str, now: float = T0 + 120):
-    from test_ensure_delivery import _runtime_config
-
     from agentdeck.runtime import create_runtime_app
 
     app = create_runtime_app(_runtime_config(tmp_path))
@@ -463,60 +442,6 @@ def _runtime(tmp_path, host: AppHost, *runs: str, now: float = T0 + 120):
     executions.db = _db(tmp_path, *runs)
     executions.clock = lambda: now
     return app
-
-
-async def _ensure(app, body: dict) -> dict:
-    from agentdeck.ensure_delivery import ENSURE_DELIVERY_PATH
-
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://rt") as client:
-        response = await client.post(ENSURE_DELIVERY_PATH, json=body)
-    assert response.status_code == 200, response.text
-    return response.json()
-
-
-async def test_admitting_a_new_run_stops_the_run_it_supersedes_first(tmp_path):
-    """#2159 tests 1 and 5: supersede, stop, then admit — inside the admission lock. The new
-    Run reaches the provider only after the Runtime has stopped the old worker in the same
-    workspace; here a wedged one, which a new delivery must never be handed to."""
-    host = AppHost({KEY: _row(last_activity_at=T0)})
-    app = _runtime(tmp_path, host, "run-1", now=T0 + 3 * HOUR)
-    executions = app.state.run_executions
-    assert executions.outcome(WORK, "run-1").execution_state == rx.ABANDONED
-
-    answer = await _ensure(app, _body("run-2"))
-
-    assert answer["accepted"] is True
-    assert host.parked == [KEY]
-    assert host.delivered == ["poller:run-2"]
-    assert executions.outcome(WORK, "run-1").execution_state == rx.STOPPED
-    assert executions.outcome(WORK, "run-1").reason_code == "superseded_by:run-2"
-
-
-async def test_an_uncertain_stop_blocks_the_new_run_before_any_write(tmp_path):
-    """#2159 test 4: the old Run's stop cannot be proved, so the new Run is refused."""
-    host = AppHost({KEY: _row(last_activity_at=T0)})
-    host.on_park = lambda row: None
-    app = _runtime(tmp_path, host, "run-1", now=T0 + 3 * HOUR)
-
-    answer = await _ensure(app, _body("run-2"))
-
-    assert (answer["accepted"], answer["reason"]) == (False, PRIOR_RUN_EXECUTING)
-    assert host.delivered == []
-
-
-async def test_an_unreadable_prior_run_refuses_rather_than_admitting(tmp_path):
-    host = AppHost({KEY: _row()})
-    app = _runtime(tmp_path, host, "run-1")
-
-    def broken(_work_id):
-        raise OSError("store unreadable")
-
-    app.state.run_executions.outcomes = broken
-
-    answer = await _ensure(app, _body("run-2"))
-
-    assert (answer["accepted"], answer["reason"]) == (False, PRIOR_RUN_EXECUTING)
-    assert host.delivered == []
 
 
 async def test_a_new_run_landing_in_the_same_live_worker_is_not_a_conflict(tmp_path):
@@ -608,7 +533,7 @@ async def test_a_revival_after_the_stop_is_refused_under_the_same_lock(tmp_path)
 
     result, _ = await executions.stop(WORK, "run-1", "superseded")
     revived = await app.state.restart_nudges._deliver_keyed(
-        "claude_code", "main", host, KEY, "kanban",
+        "claude_code", "main", host, KEY, "delegated",
         message="the runtime restarted", delivery_id="revive:x",
     )
 
@@ -624,7 +549,7 @@ async def test_a_revival_that_lands_before_the_stop_is_ended_by_it(tmp_path):
     app = _runtime(tmp_path, host, "run-1")
 
     revived = await app.state.restart_nudges._deliver_keyed(
-        "claude_code", "main", host, KEY, "kanban",
+        "claude_code", "main", host, KEY, "delegated",
         message="the runtime restarted", delivery_id="revive:x",
     )
     row.update(live=True, turn_active=True, effective_activity=True, last_delivery_at=T0 + 60)
@@ -639,7 +564,7 @@ async def test_a_worker_serving_a_run_nobody_stopped_is_still_revived(tmp_path):
     app = _runtime(tmp_path, host, "run-1")
 
     revived = await app.state.restart_nudges._deliver_keyed(
-        "claude_code", "main", host, KEY, "kanban",
+        "claude_code", "main", host, KEY, "delegated",
         message="the runtime restarted", delivery_id="revive:x",
     )
 
@@ -650,8 +575,6 @@ async def test_a_worker_serving_a_run_nobody_stopped_is_still_revived(tmp_path):
 
 
 async def test_the_runtime_serves_the_outcome_and_the_stop_over_its_api(tmp_path):
-    from test_ensure_delivery import _runtime_config  # the same runtime config
-
     from agentdeck.runtime import create_runtime_app
 
     app = create_runtime_app(_runtime_config(tmp_path))
@@ -683,8 +606,6 @@ async def test_the_runtime_serves_the_outcome_and_the_stop_over_its_api(tmp_path
 async def test_the_outcome_api_names_an_ended_turns_uncollected_background_commands(tmp_path):
     """#2890: a chat that ended its turn while its own background command runs is waiting for
     that command to wake it, so the Poller is told which commands are still out."""
-    from test_ensure_delivery import _runtime_config
-
     from agentdeck.runtime import create_runtime_app
 
     ended = _row(
@@ -757,38 +678,12 @@ def test_a_chat_whose_process_is_gone_waits_on_no_background_command(tmp_path):
     assert (outcome.execution_state, outcome.background_tasks) == (rx.ENDED, ())
 
 
-async def test_a_runtime_without_run_execution_state_refuses_rather_than_admitting(
-    tmp_path, monkeypatch
-):
-    """Review of #2189: with no execution state there is no proof an older Run stopped, so
-    a Work/Run delivery fails closed before any write instead of entering the workspace."""
-    from test_ensure_delivery import _runtime_config
-
-    from agentdeck.runtime import create_runtime_app
-
-    def broken(*_args, **_kwargs):
-        raise OSError("outcome store could not open")
-
-    monkeypatch.setattr(rx, "OutcomeStore", broken)
-    app = create_runtime_app(_runtime_config(tmp_path))
-    assert app.state.run_executions is None
-    host = AppHost({})
-    app.state.claude_workers.hosts["main"] = host
-
-    answer = await _ensure(app, _body("run-1"))
-
-    assert (answer["accepted"], answer["reason"]) == (False, PRIOR_RUN_EXECUTING)
-    assert host.delivered == []
-
-
 async def test_without_execution_state_a_revival_of_a_runs_worker_is_refused(
     tmp_path, monkeypatch
 ):
     """Review of #2189, round 4: "unavailable" is one rule. A keyed revival or notice to a
     worker serving a Work/Run cannot be checked against a stop, so it is refused; a worker
     serving no Run is an ordinary chat and is still delivered."""
-    from test_ensure_delivery import _runtime_config
-
     from agentdeck.runtime import create_runtime_app
 
     def broken(*_args, **_kwargs):
@@ -801,7 +696,7 @@ async def test_without_execution_state_a_revival_of_a_runs_worker_is_refused(
     nudges = app.state.restart_nudges
 
     fenced = await nudges._deliver_keyed(
-        "claude_code", "main", host, KEY, "kanban", message="restarted", delivery_id="r:1"
+        "claude_code", "main", host, KEY, "delegated", message="restarted", delivery_id="r:1"
     )
     plain = await nudges._deliver_keyed(
         "claude_code", "main", host, "plain-chat", "primary", message="restarted",
@@ -1121,133 +1016,6 @@ async def test_an_unreadable_continuation_store_is_uncertain(tmp_path):
         rx.UNCERTAIN, "continuation_unreadable",
     )
     assert not outcome.safe
-
-
-async def test_a_continue_that_races_a_new_runs_admission_refuses_the_delivery(tmp_path):
-    """Review of #2863: admission looked, then a Continue reserved, then the route froze. The
-    look after the freeze finds the Continue: nothing is written and the route is released."""
-    host = AppHost({KEY: _limited()})
-    app = _runtime(tmp_path, host, "run-1")
-    executions = app.state.run_executions
-    deck = app.state.budget_db
-    deck.bind_session_run(ALT_SESSION, WORK, "run-1")
-    looked = executions.admit
-
-    async def admit_then_continue(*args, **kwargs):
-        answer = await looked(*args, **kwargs)
-        assert answer is None  # the look before the freeze saw nothing in the way
-        assert deck.reserve_chat_successor(
-            "c" * 32, ALT_SESSION, newest_run=(WORK, "run-1")
-        ) == "new"
-        return answer
-
-    executions.admit = admit_then_continue
-
-    answer = await _ensure(app, _body("run-2"))
-
-    assert (answer["accepted"], answer["reason"]) == (False, PRIOR_RUN_EXECUTING)
-    assert host.delivered == []
-    assert "run-2" not in [r.run_id for r in deck.latest_delivery_routes_by_run(WORK)]
-
-
-
-async def test_a_follow_up_into_the_runs_own_chat_is_not_raced_by_its_own_reservation(tmp_path):
-    """A follow-up that continues the Run's chat reserves that chat's successor itself, just
-    before admission looks. The race check must not read that reservation as a rival
-    Continue: it did, and refused every follow-up into an existing chat for good."""
-    host = AppHost({KEY: _limited()})
-    app = _runtime(tmp_path, host, "run-1")
-    deck = app.state.budget_db
-    deck.bind_session_run(ALT_SESSION, WORK, "run-1")
-    deck.record_session_token("d" * 32, ALT_SESSION)
-    reserved = []
-    reserve = deck.reserve_chat_successor
-
-    def watched(token, source, **kwargs):
-        reserved.append(source)
-        return reserve(token, source, **kwargs)
-
-    deck.reserve_chat_successor = watched
-    body = {**_body("run-1"), "continues_session_url": f"/sessions/{ALT_SESSION}"}
-
-    answer = await _ensure(app, body)
-
-    assert reserved == [ALT_SESSION]
-    assert answer["accepted"], answer
-    assert host.delivered == ["poller:run-1"]
-
-async def test_a_new_runs_resume_into_a_continued_chat_is_not_refused_by_its_own_reservation(
-    tmp_path,
-):
-    """#2884: a new Run's resume into a chat continued once reserves the newest leg's
-    successor itself, before admission looks. The older Run's walk reached that reservation
-    and read it as its own Continue still starting, so every attempt was refused for good.
-    Admitted, it starts the Run's worker fresh rather than resuming the old leg (review), so
-    the new session joins the chat after the continued leg."""
-    old_leg, continued_leg = "claude_code:main:s1", "claude_code:main:c1"
-    host = FreshHost({
-        KEY: _limited(),
-        "deck-chat": _continuation(
-            live=False, turn_active=False, effective_activity=False,
-            last_result_at=T0 + 100, last_result_subtype="success",
-        ),
-    })
-    app = _runtime(tmp_path, host)
-    deck = app.state.budget_db
-    executions = app.state.run_executions
-    executions.db = deck
-    assert deck.freeze_delivery_route(
-        DeliveryRoute(
-            "poller:run-1", "f", WORK, "run-1", "claude_code", "main", KEY,
-            datetime.fromtimestamp(T0, UTC).isoformat(),
-        )
-    )
-    deck.bind_session_run(old_leg, WORK, "run-1")
-    deck.record_session_token("d" * 32, old_leg)
-    assert deck.reserve_chat_successor("a" * 32, old_leg) == "new"
-    deck.record_session_token("a" * 32, continued_leg)
-    # The person's Continue happened long before this resume, on the race check's real clock.
-    _reserved_at(deck, datetime.now(UTC).timestamp() - HOUR)
-    assert executions.outcome(WORK, "run-1").safe
-    reserve = deck.reserve_chat_successor
-
-    def reserved_just_now(token, source, **kwargs):
-        # The delivery's own reservation, made a moment ago on the Runtime's clock.
-        answer = reserve(token, source, **kwargs)
-        assert deck._write(
-            "UPDATE chat_successors SET reserved_at = ? WHERE token = ?",
-            (datetime.fromtimestamp(T0 + 115, UTC).isoformat(), token),
-        )
-        return answer
-
-    deck.reserve_chat_successor = reserved_just_now
-    body = {**_body("run-2"), "continues_session_url": f"/sessions/{old_leg}"}
-
-    answer = await _ensure(app, body)
-
-    assert answer["accepted"], answer
-    assert host.delivered == ["poller:run-2"]
-    assert host.fresh == [True]
-    assert answer["session_key"] == "claude_code:main:s2"
-    assert deck.chat_for_session(old_leg).legs == (old_leg, continued_leg, "claude_code:main:s2")
-    assert deck.pending_chat_successor(continued_leg) is None
-
-
-async def test_a_resume_into_a_chat_nobody_continued_resumes_the_runs_own_leg(tmp_path):
-    """The fresh start is only for a worker behind its chat: the Run's own newest leg is
-    resumed as before."""
-    host = FreshHost({KEY: _limited()})
-    app = _runtime(tmp_path, host, "run-1")
-    deck = app.state.budget_db
-    deck.bind_session_run("claude_code:main:s1", WORK, "run-1")
-    deck.record_session_token("d" * 32, "claude_code:main:s1")
-    body = {**_body("run-1"), "continues_session_url": "/sessions/claude_code:main:s1"}
-
-    answer = await _ensure(app, body)
-
-    assert answer["accepted"], answer
-    assert host.fresh == [False]
-    assert answer["session_key"] == "claude_code:main:s1"
 
 
 def test_a_continue_after_a_new_runs_route_froze_is_superseded(tmp_path):

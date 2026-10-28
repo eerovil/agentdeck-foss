@@ -154,7 +154,7 @@ class KeyedWorkerHost(Protocol):
 
     One host owns the deck's workers for one Provider Account and maps stable
     opaque keys onto durable sessions. ``ClaudeWorkerHost`` and
-    ``CodexWorkerHost`` both satisfy this; ``KanbanCapacity``, ``RestartNudges``
+    ``CodexWorkerHost`` both satisfy this; ``WorkerDeliveries``, ``RestartNudges``
     and the ``/workers/accounts/{provider}/{label}/...`` routes reach a host
     only through the operations declared here.
 
@@ -227,18 +227,6 @@ class KeyedWorkerHost(Protocol):
         """The role this key's worker was last delivered under."""
         ...
 
-    def active_role_keys(self, role: SessionRole) -> set[str]:
-        """Worker keys currently executing work under ``role``."""
-        ...
-
-    def role_last_result_at(self, key: str, role: SessionRole) -> float:
-        """When this key's ``role`` worker last produced a terminal result."""
-        ...
-
-    def delivery_is_finalized(self, key: str, delivery_id: str | None) -> bool:
-        """True when ``delivery_id`` already has a replayable finalized receipt."""
-        ...
-
     def delivery_receipt(self, key: str, delivery_id: str) -> dict[str, Any] | None:
         """Read one durable receipt for reconciliation without writing."""
         ...
@@ -267,7 +255,6 @@ class DeliveryReceipts:
         effort: str | None,
         permission_mode: str | None,
         allow_over_budget: bool = False,
-        role: str | None = None,
         target: str | None = None,
         operation: str | None = None,
         require_idle: bool = False,
@@ -293,11 +280,9 @@ class DeliveryReceipts:
             payload_data["effort"] = effort
         if allow_over_budget:
             payload_data["allow_over_budget"] = True
-        # Primary/delegated preserve the pre-role fingerprint so in-flight
-        # receipts survive this upgrade. New privileged roles must be fenced
-        # from a same-id delivery that would silently change worker authority.
-        if role == "kanban":
-            payload_data["role"] = role
+        # No role is part of the fingerprint: every role keeps the pre-role one, so
+        # receipts written before roles existed still deduplicate. The one role that
+        # was fenced here, the poller's ``kanban``, went in #3741.
         if require_idle:
             payload_data["require_idle"] = True
         if require_active:

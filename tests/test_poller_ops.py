@@ -61,7 +61,7 @@ def test_a_healthy_instance_reads_as_ok_and_idle(tmp_path):
     assert view.exists is True
     assert view.state_label == "ok"
     assert view.believable is True
-    assert "idle" in view.summary
+    assert view.summary == "ok"
     assert view.timer.firing is True
 
 
@@ -89,75 +89,11 @@ def test_a_paused_instance_is_visibly_paused_rather_than_looking_dead(tmp_path):
     assert "paused" in view.summary
 
 
-def test_the_view_shows_what_is_working_and_what_is_queued(tmp_path):
-    _instance(
-        tmp_path,
-        issues={"store#5": {"status": "In progress"}, "store#6": {"status": "Todo"}},
-        controls={
-            "9": {"id": "9", "repo": "store", "number": 6, "kind": "claude",
-                  "status": "queued", "author": "eero", "created_at": "t1"}
-        },
-    )
+def test_card_records_left_in_state_are_not_shown_as_work(tmp_path):
+    """The poller holds no cards since #3732; an old record is history, not a worker."""
+    _instance(tmp_path, issues={"store#5": {"status": "In progress", "blocked_by": ["store#4"]}})
     view = read_instance(tmp_path, "reference", now=_NOW, runner=_timer())
-    assert view.working == ("store#5",)
-    assert view.queue[0]["card"] == "store#6"
-    assert view.queue[0]["author"] == "eero"
-    assert "1 working" in view.summary
-
-
-def test_a_card_waiting_on_a_dependency_is_shown_rather_than_read_as_idle(tmp_path):
-    """#640: "idle" on its own invites restarting a poller that is deliberately waiting."""
-    _instance(
-        tmp_path,
-        issues={
-            "store#5": {"status": "Todo", "manual_start": True, "blocked_by": ["store#4"]},
-            # Work already under way is not held, so it is not shown as blocked either.
-            "store#6": {"status": "In review", "started": True, "blocked_by": ["store#4"]},
-        },
-    )
-    view = read_instance(tmp_path, "reference", now=_NOW, runner=_timer())
-    assert view.blocked == ({"card": "store#5", "by": ("store#4",)},)
-    assert "1 blocked" in view.summary
-
-
-def test_a_card_whose_worker_stopped_on_a_blocker_is_shown_waiting_too(tmp_path):
-    """#1230: it started, so #640's hold never applies — but it is still not idle, and the
-    reader wants the same answer either way: this card is waiting on that one."""
-    _instance(
-        tmp_path,
-        issues={
-            "store#5": {
-                "status": "Blocked", "started": True, "blocked_until": ["other#122"],
-            },
-        },
-    )
-    view = read_instance(tmp_path, "reference", now=_NOW, runner=_timer())
-    assert view.blocked == ({"card": "store#5", "by": ("other#122",)},)
-    assert "1 blocked" in view.summary
-
-
-def test_a_started_card_resting_in_blocked_on_a_dependency_is_shown_waiting(tmp_path):
-    """#2241: the engine resumes this card by itself once its native dependency closes
-    (#1588), so it is waiting on that card, not parked for a person to nudge."""
-    _instance(
-        tmp_path,
-        issues={
-            "store#5": {
-                "status": "Blocked", "started": True, "blocked_by": ["store#4"],
-                "blocked_until": ["other#9", "store#4"],
-            },
-        },
-    )
-    view = read_instance(tmp_path, "reference", now=_NOW, runner=_timer())
-    # One list, each ref once, whichever hold named it.
-    assert view.blocked == ({"card": "store#5", "by": ("store#4", "other#9")},)
-
-
-def test_a_poller_with_nothing_waiting_says_nothing_about_dependencies(tmp_path):
-    _instance(tmp_path, issues={"store#5": {"status": "Todo"}})
-    view = read_instance(tmp_path, "reference", now=_NOW, runner=_timer())
-    assert view.blocked == ()
-    assert "blocked" not in view.summary
+    assert "working" not in view.summary and "blocked" not in view.summary
 
 
 def test_a_degraded_instance_names_its_reasons(tmp_path):
@@ -286,154 +222,6 @@ def test_ages_are_rendered_in_units_a_person_scans():
     assert view(200000) == "2d ago"
 
 
-# --- a poller instance with cards ---
-
-def _card_instance(tmp_path, cards, *, name="reference", org="eerovil"):
-    base = _instance(tmp_path, name, issues=cards)
-    (base / "poller.toml").write_text(
-        f'contract = 1\n\n[board]\norg = "{org}"\nproject_number = 1\n'
-    )
-    return base
-
-
-def test_the_done_column_is_read_from_the_project_not_assumed(tmp_path):
-    """A board that renames its done column must not leave finished cards on the
-    front page forever (#1025)."""
-    import json
-
-    from agentdeck import poller_ops
-
-    base = tmp_path / "instances" / "reference"
-    base.mkdir(parents=True)
-    (base / "poller.toml").write_text(
-        """
-contract = 1
-
-[board]
-org = "shop"
-project_number = 7
-
-[board.statuses]
-in_review = "In review"
-done = "Shipped"
-
-[[repos]]
-id = "store"
-holds_issues = true
-"""
-    )
-    (base / "state.json").write_text(
-        json.dumps(
-            {
-                "issues": {
-                    "store#1": {"status": "Shipped"},
-                    "store#2": {"status": "In review"},
-                    "store#3": {"status": "Blocked"},
-                }
-            }
-        )
-    )
-
-    board = poller_ops.read_board(tmp_path)
-    assert board.card("shop/store", 1).done is True
-    assert board.card("shop/store", 2).done is False
-    assert board.card("shop/store", 2).in_review is True
-    assert board.card("shop/store", 3).done is False
-
-
-def test_a_card_names_the_other_checkouts_beside_the_one_a_chat_started_in(tmp_path):
-    """A worker's launch directory is not necessarily where it worked (#1120)."""
-    import json
-
-    from agentdeck import poller_ops
-
-    base = tmp_path / "instances" / "reference"
-    base.mkdir(parents=True)
-    (base / "poller.toml").write_text(
-        """
-contract = 1
-
-[board]
-org = "shop"
-project_number = 7
-
-[[repos]]
-id = "issues"
-holds_issues = true
-"""
-    )
-    launched_in = tmp_path / "docker" / ".worktrees" / "issue-170"
-    worked_in = tmp_path / "abacus" / ".worktrees" / "issue-170"
-    for directory in (launched_in, worked_in):
-        directory.mkdir(parents=True)
-    (base / "state.json").write_text(
-        json.dumps(
-            {
-                "issues": {
-                    "issues#170": {
-                        "status": "In review",
-                        "worktrees": [str(launched_in), str(worked_in)],
-                    },
-                    "issues#171": {"status": "In review", "worktrees": []},
-                }
-            }
-        )
-    )
-
-    board = poller_ops.read_board(tmp_path)
-
-    assert board.worktrees_beside(launched_in) == (str(worked_in),)
-    assert board.worktrees_beside(worked_in) == (str(launched_in),)
-    # A directory no card claims, and no directory at all, both yield nothing
-    # rather than every worktree on the board.
-    assert board.worktrees_beside(tmp_path / "somewhere-else") == ()
-    assert board.worktrees_beside(None) == ()
-
-
-def test_a_card_carries_the_pull_request_its_worker_reported(tmp_path):
-    """Written by the engine from the worker's own report, so it costs no read (#1031)."""
-    import json
-
-    from agentdeck import poller_ops
-
-    base = tmp_path / "instances" / "reference"
-    base.mkdir(parents=True)
-    (base / "poller.toml").write_text(
-        """
-contract = 1
-
-[board]
-org = "shop"
-project_number = 7
-
-[[repos]]
-id = "issues"
-holds_issues = true
-"""
-    )
-    (base / "state.json").write_text(
-        json.dumps(
-            {
-                "issues": {
-                    "issues#91": {
-                        "status": "In review",
-                        "comment_links": {
-                            "pull_request_url": "https://github.com/shop/store/pull/2889"
-                        },
-                    },
-                    "issues#92": {"status": "In review"},
-                }
-            }
-        )
-    )
-
-    board = poller_ops.read_board(tmp_path)
-    assert board.card("shop/issues", 91).pull_request_url == (
-        "https://github.com/shop/store/pull/2889"
-    )
-    assert board.card("shop/issues", 92).pull_request_url == ""
-
-
 # --- reusing a durable read while its files have not moved (#1362) ---
 
 def _board_instance(tmp_path, cards, *, name="reference"):
@@ -458,7 +246,6 @@ def test_a_board_read_is_reused_until_the_durable_files_move(tmp_path):
     (base / "state.json").write_text(json.dumps({"issues": {"store#1": {"status": "Shipped"}}}))
     moved = poller_ops.read_board(tmp_path)
     assert moved is not first
-    assert moved.card("shop/store", 1).status == "Shipped"
 
 
 def test_one_instance_writing_decodes_only_that_instance_again(tmp_path, monkeypatch):
@@ -481,8 +268,7 @@ def test_one_instance_writing_decodes_only_that_instance_again(tmp_path, monkeyp
     moved = poller_ops.read_board(tmp_path)
 
     assert decoded == ["second"]
-    assert moved.card("shop/store", 1) == whole.card("shop/store", 1)
-    assert moved.card("shop/store", 2).status == "Done"
+    assert moved.scopes[0] is whole.scopes[0]
     assert [scope.instance for scope in moved.scopes] == ["first", "second"]
     assert moved.complete
 
@@ -506,7 +292,6 @@ def test_an_instance_whose_state_cannot_be_decoded_is_unread_not_empty(tmp_path)
     board = poller_ops.read_board(tmp_path)
     assert board.complete is False
     assert board.scopes[0].state_readable is False
-    assert board.cards == {}
 
 
 def test_an_instance_that_has_never_run_still_reads_as_unread(tmp_path):
@@ -527,7 +312,7 @@ def test_a_state_file_falling_back_to_its_backup_still_reads_as_a_board(tmp_path
 
     board = poller_ops.read_board(tmp_path)
     assert board.complete is True
-    assert board.card("shop/store", 1).in_review is True
+    assert board.scopes[0].state_readable is True
 
 
 def test_a_scope_names_its_artifact_repository_and_borrowed_checkouts(tmp_path):
@@ -598,29 +383,6 @@ def test_a_scope_carries_the_projects_spec_only_label(tmp_path):
     assert scopes["labels"].spec_only_label == "spec"
 
 
-def test_a_card_carries_its_instances_paused_label_and_the_engines_reading(tmp_path):
-    """#2548: the deck's Pause writes the label the project names, and reads the engine's
-    own last reading of it."""
-    import json
-
-    from agentdeck import poller_ops
-
-    base = tmp_path / "instances" / "deck"
-    base.mkdir(parents=True)
-    (base / "poller.toml").write_text(
-        'contract = 1\n[board]\norg = "eerovil"\nproject_number = 1\npaused_label = "paused"\n'
-        '\n[[repos]]\nid = "app"\nholds_issues = true\n'
-    )
-    (base / "state.json").write_text(
-        json.dumps({"issues": {"app#4": {"status": "Todo", "paused": True}, "app#5": {}}})
-    )
-
-    board = poller_ops.read_board(tmp_path)
-    paused, plain = board.card("eerovil/app", 4), board.card("eerovil/app", 5)
-    assert (paused.paused, paused.paused_label) == (True, "paused")
-    assert (plain.paused, plain.paused_label) == (False, "paused")
-
-
 def test_issue_label_targets_read_the_manifests_alone(tmp_path, monkeypatch):
     """The `gh` shim asks this from a fresh process on every `gh issue create` (#2505), so it
     reads only the manifests: issue repositories with every alias, never the state."""
@@ -647,13 +409,3 @@ def test_issue_label_targets_read_the_manifests_alone(tmp_path, monkeypatch):
         poller_ops.LabelTarget("eerovil/agentdeck", ("agent", "claude")),
         poller_ops.LabelTarget("acmecorp/bazaar", ("claude",)),
     )
-
-
-def test_a_cards_merged_outputs_include_the_steps_it_continued_past():
-    """#2730: a step merged before the card carried on is still one of its Work's outputs."""
-    card = {"steps_merged": ["store#7"], "merged": ["store#9", "store#7"]}
-    assert poller_ops._card_merged(card, "org") == (
-        "https://github.com/org/store/pull/7",
-        "https://github.com/org/store/pull/9",
-    )
-    assert poller_ops._card_merged({"steps_merged": "junk"}, "org") == ()

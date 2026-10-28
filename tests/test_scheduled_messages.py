@@ -305,34 +305,6 @@ async def test_a_row_left_mid_send_whose_files_are_gone_is_not_replayed(tmp_path
     assert injector.calls == []
 
 
-async def test_only_a_delivered_held_message_is_relayed_to_a_parked_card(tmp_path):
-    """#2847 review: relayed on delivery, once, and never for a wake-on message."""
-    store = Db(tmp_path / "agentdeck.db")
-    now = datetime.now(UTC)
-    store.record_scheduled_message(_held(tmp_path, now))
-    store.record_scheduled_message(
-        ScheduledMessage(
-            id="wake-on:2", chat_id="chat-2", text="Merged", due_at=now, created_at=now
-        )
-    )
-    relayed = []
-    reachable = {"up": False}
-    service = ScheduledMessageService(
-        store,
-        _HeldInjector(),
-        _held_target(reachable=reachable),
-        on_held_delivered=lambda key, message: relayed.append((key, message.id)),
-    )
-
-    await _sweep(service, now)
-    assert relayed == []
-
-    reachable["up"] = True
-    await _sweep(service, now)
-    await _sweep(service, now)
-    assert relayed == [("codex:test:sid", "held-1")]
-
-
 async def test_a_held_row_left_mid_send_is_also_given_up_after_thirty_minutes(tmp_path):
     """#2847 review: a dispatching held row is bounded too, and says it may have gone."""
     from agentdeck.scheduled_messages import HOLD_EXPIRED_MID_SEND_REASON

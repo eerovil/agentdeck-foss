@@ -666,9 +666,9 @@ def test_the_reference_extensions_declare_exactly_what_they_implement():
     """A declaration that drifts from the implementation is worse than none."""
     root = Path(__file__).resolve().parent.parent
     expected = {
-        "deploy-watch": {Hook.VALIDATE_CONFIG, Hook.RELEASE_GATE, Hook.HEALTH},
         "sentry-autofix": {Hook.VALIDATE_CONFIG, Hook.OBSERVE, Hook.PROPOSE, Hook.HEALTH},
-        "screenshots": {Hook.VALIDATE_CONFIG, Hook.COMMAND, Hook.HEALTH},
+        # `/shot` went with the cards it queued work on (#3741).
+        "screenshots": {Hook.VALIDATE_CONFIG, Hook.HEALTH},
     }
     for name, hooks in expected.items():
         program = extensions.program_for(name, [root])

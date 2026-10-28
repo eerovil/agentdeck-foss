@@ -18,11 +18,10 @@ from public_copy import private_feature
 
 from agentdeck import chat_board as _chat_board
 from agentdeck.models import Capability, IssueRef, Session, SessionStatus
-from agentdeck.poller_ops import BoardCard, BoardDispatch, BoardScope, BoardView
-from agentdeck.run_trace import NEEDS_ATTENTION, RUNNING, RunSession, RunView
+from agentdeck.poller_ops import BoardScope, BoardView
 from agentdeck.triage import CAUSE_PENDING_INTERACTION, AssistantInsight, AssistantView
 from agentdeck.work import WorkRef
-from agentdeck.work_facts import FOUND_BY_CARD, OutputFact, work_facts
+from agentdeck.work_facts import OutputFact, WorkFacts
 from agentdeck.work_overview import (
     VerificationSummary,
     WorkAttention,
@@ -37,11 +36,7 @@ from agentdeck.work_story import (
     CHAT_ACTION,
     CHAT_QUESTION,
     CHAT_STOPPED,
-    CLARIFICATION,
     DONE,
-    PROBLEM,
-    RELEASE_DECISION,
-    REVIEW_DECISION,
     message_target,
     work_status,
     workspace_rows,
@@ -63,30 +58,16 @@ PR = "https://github.com/eerovil/agentdeck/pull/2300"
 NOW = datetime.now(UTC)
 
 
-def _board_card(**fields) -> BoardCard:
-    fields.setdefault("status", "In progress")
-    fields.setdefault("ownership", True)
-    fields.setdefault("pull_request_url", PR)
-    return BoardCard("eerovil/agentdeck", WORK.number, **fields)
-
-
-def _trace(run_id: str, state: str, next_expected: str = "", sessions=()):
-    run = RunView(
-        run_id=run_id,
-        state=state,
-        next_expected=next_expected,
-        current=True,
-        sessions=tuple(sessions),
-    )
-    return SimpleNamespace(current=run, preflight="", preflight_next="", unreadable=())
-
-
-def _work(card=None, *, run: str = "", state: str = "", next_expected: str = "", **fields):
-    trace = _trace(run or "gen-1", state, next_expected) if state else None
-    return build_work_card(
-        WORK, issue=None, title="Work story", facts=work_facts(WORK, card=card), trace=trace,
-        **fields,
-    )
+def _work(*, pull: bool = False, **fields):
+    """A Work card; ``pull`` gives it its one pull request (``PR``), state unknown."""
+    if pull:
+        fields.setdefault(
+            "facts",
+            WorkFacts(
+                WORK, outputs=(OutputFact(PR, "eerovil/agentdeck", 2300, "chat_registration"),)
+            ),
+        )
+    return build_work_card(WORK, issue=None, title="Work story", **fields)
 
 
 def _verified(run_id: str = "gen-1") -> VerificationSummary:
@@ -103,7 +84,7 @@ def test_a_pass_on_a_commit_the_pull_request_moved_past_names_that_commit():
     """#2327: still a pass, but on the commit it tested, not on what would merge."""
     from dataclasses import replace
 
-    work = _work(_board_card(generation="gen-1"))
+    work = _work(pull=True)
     moved = replace(_verified(), superseded=(("eerovil/agentdeck", "def5678"),))
 
     assert _steps(work_status(replace(work, verification=moved)))["verify"] == (
@@ -121,59 +102,11 @@ def _steps(status) -> dict[str, tuple[str, str]]:
 # --- the required states --------------------------------------------------------------------
 
 
-def test_implementation_active_is_calm_progress():
-    status = work_status(
-        _work(_board_card(generation="gen-1"), state=RUNNING, next_expected="worker activity")
-    )
-
-    assert (status.tone, status.headline) == (ACTIVE, "Implementing")
-    assert status.next == "worker activity" and status.you == "Nothing needed"
-    assert _steps(status)["implement"] == ("active", "Working")
-    assert _steps(status)["review"] == ("idle", "Not yet")
-
-
-def test_automated_review_running_is_progress_not_attention():
-    card = _board_card(review_mode="merge-review", generation="gen-review")
-    work = _work(card, run="gen-review", state=RUNNING, next_expected="worker activity")
-    status = work_status(work)
-
-    assert (status.tone, status.headline) == (ACTIVE, "Reviewing")
-    assert status.summary == "Automated review in progress."
-    assert status.detail == "Implementation is done."
-    assert status.next == "review result" and status.you == "Nothing needed"
-    assert "decision" not in status.summary + status.detail + status.next
-    assert _steps(status)["implement"] == ("done", "Done")
-    assert _steps(status)["review"] == ("active", "Running")
-
-
-def test_review_findings_the_worker_is_fixing_read_as_fixing_not_attention():
-    card = _board_card(review_offer="rejected")
-    status = work_status(_work(card))
-
-    assert (status.tone, status.headline) == (ACTIVE, "Fixing review findings")
-    assert "the worker is fixing them" in status.summary
-    assert status.detail == "AgentDeck starts the fix Run itself."
-    assert status.you == "Nothing needed"
-    assert _steps(status) == {
-        "implement": ("active", "Fixing"),
-        "verify": ("waiting", "After review"),
-        "review": ("waiting", "Changes asked"),
-        "merge": ("waiting", "Waiting"),
-    }
-
-
-# --- the final suite runs after review (#2253) ------------------------------------------------
-
-
-def _with(work, *, review_state: str = "", verification: str = ""):
-    """The same Work card, with its review and its newest verification set by hand."""
+def _with(work, *, verification: str = ""):
+    """The same Work card, with its newest verification set by hand."""
     from dataclasses import replace
 
-    from agentdeck.work_overview import ReviewSummary
-
     fields = {}
-    if review_state:
-        fields["review"] = ReviewSummary(review_state, f"Review {review_state}", "release")
     if verification:
         fields["verification"] = VerificationSummary(
             verification, f"Verification {verification}", "job-1", "gen-1",
@@ -183,7 +116,7 @@ def _with(work, *, review_state: str = "", verification: str = ""):
 
 
 def test_the_milestones_read_implement_review_verify_merge():
-    status = work_status(_work(_board_card(generation="gen-1"), state=RUNNING))
+    status = work_status(_work(pull=True))
 
     assert [step.key for step in status.milestones] == [
         "implement", "review", "verify", "merge",
@@ -191,36 +124,28 @@ def test_the_milestones_read_implement_review_verify_merge():
     assert [step.label for step in status.milestones] == [
         "Implement", "Review", "Verify", "Merge",
     ]
+    assert (status.headline, status.summary) == ("Idle", "Nothing is running.")
+    assert _steps(status)["implement"] == ("idle", "Not started")
+    assert _steps(status)["review"] == ("idle", "Not yet")
 
 
 @pytest.mark.parametrize("running", ["running", "queued"])
-def test_the_final_run_after_a_passed_review_reads_verifying(running):
-    work = _with(
-        _work(_board_card(status="In review", in_review=True, status_role="in_review")),
-        review_state="passed", verification=running,
-    )
-    status = work_status(work)
+def test_a_running_verification_reads_verifying(running):
+    status = work_status(_with(_work(pull=True), verification=running))
 
     assert (status.tone, status.headline) == (ACTIVE, "Verifying")
     assert status.summary == f"Verification {running}."
-    assert _steps(status)["review"] == ("done", "Passed")
     assert _steps(status)["verify"] == ("active", running.capitalize())
 
 
-@pytest.mark.parametrize("review_state", ["", "pending", "running", "changes"])
-def test_a_stale_run_while_review_is_open_is_waiting_not_a_problem(review_state):
+def test_a_stale_run_is_waiting_until_the_work_is_done():
     """The suite is due on the head a review passes, so an older run is simply not due yet."""
-    card = _board_card(status="In review", in_review=True, status_role="in_review")
-    status = work_status(_with(_work(card), review_state=review_state, verification="stale"))
+    from dataclasses import replace
 
-    assert _steps(status)["verify"] == ("waiting", "After review")
-
-
-def test_a_stale_run_after_a_passed_review_is_still_a_problem():
-    card = _board_card(status="In review", in_review=True, status_role="in_review")
-    status = work_status(_with(_work(card), review_state="passed", verification="stale"))
-
-    assert _steps(status)["verify"] == ("problem", "Stale")
+    work = _with(_work(pull=True), verification="stale")
+    assert _steps(work_status(work))["verify"] == ("waiting", "After review")
+    done = work_status(replace(work, work_state="done"))
+    assert _steps(done)["verify"] == ("problem", "Stale")
 
 
 def _ask(key: str = "claude_code:test:worker", title: str = "Worker chat", **fields):
@@ -239,13 +164,9 @@ def _approval(key: str = "c:a:approver", title: str = "Approver", kind: str = "p
     return WorkAttention(key, title, "waiting", "/chats/a", question="Allow rm?", interaction=kind)
 
 
-def _human_review() -> BoardCard:
-    return _board_card(status="In review", in_review=True, status_role="human_review_pending")
-
-
 def test_a_chats_question_is_the_one_strong_attention_state():
     ask = _ask(question="Should the   migration\nrun first?")
-    status = work_status(_work(_board_card(generation="gen-1"), state=RUNNING, attention=(ask,)))
+    status = work_status(_work(pull=True, attention=(ask,)))
 
     assert (status.tone, status.headline) == (ATTENTION, "Needs your answer")
     assert status.summary == "Worker chat asked: Should the migration run first?"
@@ -258,30 +179,16 @@ def test_a_chats_question_is_the_one_strong_attention_state():
 
 
 def test_a_long_question_is_shortened_and_a_textless_one_still_asks():
-    status = work_status(_work(_board_card(), attention=(_ask(question="why " * 80),)))
+    status = work_status(_work(pull=True, attention=(_ask(question="why " * 80),)))
     assert status.summary.endswith("…") and len(status.summary) < 200
-    status = work_status(_work(_board_card(), attention=(_ask(),)))
+    status = work_status(_work(pull=True, attention=(_ask(),)))
     assert status.summary == "Worker chat is waiting for your answer."
 
 
-def test_a_review_parked_for_a_person_is_a_review_decision_not_a_question():
-    """#2207: In review, escalated to the operator, and no chat asked anything."""
-    # The worker's turn ended in a handoff: that is no dependency of its own (#2219).
-    status = work_status(_work(_human_review(), attention=(_stopped(state="finished"),)))
-
-    assert (status.tone, status.headline) == (ATTENTION, "Review needs your decision")
-    assert status.kind == REVIEW_DECISION
-    assert (status.next, status.you) == ("review decision", "Decide review")
-    assert (status.where, status.where_href) == ("PR eerovil/agentdeck#2300", PR)
-    words = " ".join((status.headline, status.summary, status.detail, status.next, status.you))
-    assert "answer" not in words.lower() and "question" not in words.lower()
-    assert _steps(status)["review"] == ("attention", "Needs you")
-
-
 def test_mixed_attention_keeps_every_kind_in_its_own_words():
-    """A question, an approval, a stopped chat and a review at once (#2225 review)."""
+    """A question, an approval and a stopped chat at once (#2225 review)."""
     attention = (_stopped("c:a:other", "Other"), _approval(), _ask())
-    status = work_status(_work(_human_review(), attention=attention))
+    status = work_status(_work(pull=True, attention=attention))
 
     # The question leads, deterministically; the others are follow-ups, never "more questions".
     assert (status.headline, status.kind, status.where) == (
@@ -290,16 +197,13 @@ def test_mixed_attention_keeps_every_kind_in_its_own_words():
         "Worker chat",
     )
     assert status.summary == "Worker chat is waiting for your answer."
-    assert status.detail == (
-        "Also waiting on its own page: Approver. Also stopped: Other. "
-        "Review needs your decision too: Waiting for a human review."
-    )
-    assert status.you == "Answer the question, then decide review"
+    assert status.detail == "Also waiting on its own page: Approver. Also stopped: Other."
+    assert status.you == "Answer the question"
 
 
 def test_only_other_questions_count_as_more_questions():
     two = (_ask(), _stopped("c:a:other", "Other"), _ask("c:a:second", "Second"))
-    status = work_status(_work(_board_card(), attention=two))
+    status = work_status(_work(pull=True, attention=two))
 
     assert status.summary == "Worker chat (and 1 more question) is waiting for your answer."
     assert status.detail == "Also stopped: Other."
@@ -311,7 +215,7 @@ def test_an_approval_leads_when_nothing_asks_and_names_the_rest():
         _approval(),
         _approval("c:a:b", "Browser", "mcp_url"),
     )
-    status = work_status(_work(_board_card(), attention=attention))
+    status = work_status(_work(pull=True, attention=attention))
 
     assert (status.headline, status.kind) == ("Chat is waiting on you", CHAT_ACTION)
     assert status.summary == "Approver is waiting on: Allow rm?"
@@ -320,14 +224,8 @@ def test_an_approval_leads_when_nothing_asks_and_names_the_rest():
     assert "answer" not in (status.headline + status.summary + status.you).lower()
 
 
-def test_a_review_decision_still_names_a_stopped_chat():
-    status = work_status(_work(_human_review(), attention=(_stopped("c:a:other", "Other"),)))
-
-    assert status.kind == REVIEW_DECISION and status.detail == "Also stopped: Other."
-
-
 def test_a_finished_handoff_alone_needs_nobody():
-    status = work_status(_work(_board_card(), attention=(_stopped(state="finished"),)))
+    status = work_status(_work(pull=True, attention=(_stopped(state="finished"),)))
     assert status.tone != ATTENTION and status.kind == ""
 
 
@@ -340,7 +238,7 @@ def test_a_needs_you_wake_on_tells_the_question_and_knows_the_work_s_own_chats()
     from agentdeck.work_story import FrontSections, front_row
 
     ask = _ask("claude_code:alt:leg2", question="Which colour?")
-    row = front_row(_work(_board_card(), attention=(ask,)), current=True)
+    row = front_row(_work(pull=True, attention=(ask,)), current=True)
     assert row.reason == "" and row.attention.label == "Needs answer"
     overview = SimpleNamespace(front=FrontSections(needs_you=(row,)))
     [stop] = needs_you_stops(overview, identity=lambda key: f"chat-of:{key.rsplit(':', 1)[-1]}")
@@ -351,106 +249,19 @@ def test_a_needs_you_wake_on_tells_the_question_and_knows_the_work_s_own_chats()
 def test_the_front_page_answers_only_a_real_question():
     from agentdeck.work_story import NEEDS_YOU, front_row
 
-    question = front_row(_work(_board_card(), attention=(_ask(),)), current=True)
+    question = front_row(_work(pull=True, attention=(_ask(),)), current=True)
     assert (question.section, question.action) == (NEEDS_YOU, "Answer")
     for attention, reason in (
         ((_approval(),), "Waiting on a chat's own page"),
         ((_stopped(),), "A chat stopped"),
     ):
-        row = front_row(_work(_board_card(), attention=attention), current=True)
+        row = front_row(_work(pull=True, attention=attention), current=True)
         assert (row.section, row.action, row.reason) == (NEEDS_YOU, "Open", reason)
         assert "Worker chat" not in row.reason and "Approver" not in row.reason
 
 
-def test_a_blocked_release_is_a_release_decision():
-    status = work_status(_work(_board_card(release_blocked="checks failed")))
-
-    assert (status.headline, status.kind) == ("Release needs your decision", RELEASE_DECISION)
-    assert (status.next, status.you) == ("release decision", "Decide the release")
-    assert status.summary == "Release blocked: checks failed."
-
-
-def test_a_card_parked_in_needs_more_info_asks_for_clarification_on_its_issue():
-    card = _board_card(status="Needs More Info", status_role="needs_more_info")
-    work = _work(card)
-    status = work_status(work)
-
-    assert (status.headline, status.kind) == ("Work needs clarification", CLARIFICATION)
-    assert (status.where, status.where_href) == (work.source_label, work.source_url)
-    assert "answer" not in (status.headline + status.you).lower()
-
-
-def test_a_plain_needs_more_info_card_needs_clarification_without_any_review():
-    """A worker that finished straight into Needs More Info: no review (#2225)."""
-    card = _board_card(status="Needs More Info", status_role="needs_more_info")
-    work = _work(card)
-    assert work.review is None and work.needs_attention
-    status = work_status(work)
-
-    assert (status.tone, status.headline, status.kind) == (
-        ATTENTION,
-        "Work needs clarification",
-        CLARIFICATION,
-    )
-    assert status.summary == (
-        "The card is in Needs More Info: the worker needs more information to go on."
-    )
-    assert (status.next, status.you) == ("your clarification", "Clarify the Work")
-    assert (status.where, status.where_href) == (work.source_label, work.source_url)
-    assert "answer" not in (status.headline + status.summary + status.you).lower()
-
-
-def test_a_needs_more_info_card_with_a_question_keeps_both_in_view():
-    card = _board_card(status="Needs More Info", status_role="needs_more_info")
-    status = work_status(_work(card, attention=(_ask(question="Which branch?"),)))
-
-    assert (status.headline, status.kind) == ("Needs your answer", CHAT_QUESTION)
-    assert status.detail == "Work needs clarification too: the card is in Needs More Info."
-    assert status.you == "Answer the question, then clarify the Work"
-
-
-def test_a_plain_blocked_or_done_card_is_not_a_clarification():
-    blocked = work_status(_work(_board_card(status="Blocked", status_role="blocked")))
-    assert blocked.kind != CLARIFICATION
-    done = _work(_board_card(status="Done", status_role="needs_more_info", done=True))
-    assert done.parked == "" and work_status(done).kind != CLARIFICATION
-
-
-def test_a_needs_more_info_left_from_the_spec_does_not_hold_a_verifying_work():
-    """#2777, from eerovil/score-plugins#376: the board still said Needs More Info
-    from the spec while the build Run's own suite was queued, and the Work sat in Needs you."""
-    from agentdeck.work_story import NEEDS_YOU, front_row
-    from agentdeck.work_workspace import RunVerification
-
-    def work(state: str, *, run_id: str = "gen-1", **fields):
-        check = RunVerification("job-1", run_id, state, False, ())
-        card = _board_card(status="Needs More Info", status_role="needs_more_info", **fields)
-        return _work(card, state="waiting", verifications=(check,))
-
-    for state in ("queued", "running"):
-        for fields in ({}, {"auto_release": True}):
-            verifying = work(state, **fields)
-            assert verifying.parked == "" and verifying.review is None, (state, fields)
-            status = work_status(verifying)
-            assert (status.tone, status.headline) == (ACTIVE, "Verifying"), (state, fields)
-            assert front_row(verifying, current=True).section != NEEDS_YOU
-    # A suite that finished, or one an earlier Run queued, leaves the question standing.
-    for held in (work("failed"), work("cancelled"), work("queued", run_id="gen-0")):
-        assert work_status(held).kind == CLARIFICATION
-        assert front_row(held, current=True).section == NEEDS_YOU
-    # Only Needs More Info: a card a worker blocked still waits on a person.
-    check = RunVerification("job-1", "gen-1", "running", False, ())
-    blocked = _work(
-        _board_card(status="Blocked", status_role="blocked"),
-        state="waiting",
-        verifications=(check,),
-    )
-    assert blocked.parked == "blocked"
-    assert front_row(blocked, current=True).section == NEEDS_YOU
-
-
 def test_a_chat_that_only_stopped_is_a_look_not_a_question():
-    status = work_status(_work(_board_card(generation="gen-1"), attention=(_stopped(),)))
+    status = work_status(_work(pull=True, attention=(_stopped(),)))
 
     assert (status.tone, status.headline, status.kind) == (
         ATTENTION,
@@ -463,10 +274,10 @@ def test_a_chat_that_only_stopped_is_a_look_not_a_question():
 
 
 def test_a_done_work_is_settled_and_names_what_merged():
-    card = _board_card(status="Done", done=True)
-    work = _work(card)
-    merged = OutputFact(PR, "eerovil/agentdeck", 2300, FOUND_BY_CARD, "merged")
-    work = work.__class__(**{**work.__dict__, "outputs": (merged,)})
+    from dataclasses import replace
+
+    merged = OutputFact(PR, "eerovil/agentdeck", 2300, "chat_registration", "merged")
+    work = replace(_work(pull=True), work_state="done", outputs=(merged,))
     status = work_status(work)
 
     assert (status.tone, status.headline, status.next) == (DONE, "Done", "")
@@ -474,39 +285,8 @@ def test_a_done_work_is_settled_and_names_what_merged():
     assert _steps(status)["merge"] == ("done", "Merged")
 
 
-def test_a_passed_review_reads_as_merging_until_its_pull_request_merges():
-    card = _board_card(review_mode="merge", auto_release=True)
-    status = work_status(_work(card))
-
-    assert (status.tone, status.headline, status.next) == (ACTIVE, "Merging", "merge")
-    assert _steps(status)["merge"] == ("active", "Merging")
-
-    # Once merged, the card is still open only for the deploy (#2316).
-    merged = OutputFact(PR, "eerovil/agentdeck", 2300, FOUND_BY_CARD, "merged")
-    work = _work(card)
-    status = work_status(work.__class__(**{**work.__dict__, "outputs": (merged,)}))
-
-    assert (status.tone, status.headline, status.next) == (ACTIVE, "Deploying", "deploy")
-    assert status.summary == "Merged."
-    assert _steps(status)["merge"] == ("done", "Merged")
-
-    # A second pull request still open means the merge step has not finished.
-    other = OutputFact(PR.replace("2300", "2301"), "eerovil/agentdeck", 2301, FOUND_BY_CARD, "open")
-    status = work_status(work.__class__(**{**work.__dict__, "outputs": (merged, other)}))
-
-    assert status.headline == "Merging"
-    assert _steps(status)["merge"] == ("active", "Merging")
-
-
-def test_a_stuck_run_is_a_problem_not_a_question():
-    status = work_status(_work(_board_card(generation="gen-1"), state=NEEDS_ATTENTION))
-
-    assert status.tone == PROBLEM and status.headline == "Run needs a look"
-    assert _steps(status)["implement"][0] == "problem"
-
-
 def test_every_state_carries_a_text_mark_not_just_a_colour():
-    status = work_status(_work(_board_card(generation="gen-1"), state=RUNNING))
+    status = work_status(_work(pull=True))
     assert status.mark and all(step.mark for step in status.milestones)
 
 
@@ -601,38 +381,33 @@ def _chat(key: str, title: str, *, working=False, minutes=5) -> WorkChat:
 def test_a_question_owns_the_message_and_asks_for_an_answer():
     asker, runner = _chat("c:a:asker", "Asker"), _chat("c:a:runner", "Runner", working=True)
     ask = WorkAttention(asker.session_key, "Asker", "waiting", asker.href, asks=True)
-    card = _work(_board_card(), attention=(ask,))
-    trace = _trace(
-        "gen-1",
-        RUNNING,
-        sessions=(RunSession("c:a:runner", "c:a:runner", "claude_code", "a", None),),
-    )
+    card = _work(pull=True, attention=(ask,))
 
-    target = message_target(card, trace, (asker, runner), lambda key: True)
+    target = message_target(card, (asker, runner), lambda key: True)
 
     assert target is not None and (target.session_key, target.answer) == ("c:a:asker", True)
 
 
-def test_a_review_decision_never_turns_a_message_into_an_answer():
+def test_a_stopped_chat_takes_the_message_unless_another_asks():
     stopped, asker = _chat("c:a:stopped", "Stopped"), _chat("c:a:asker", "Asker", minutes=30)
     card = _work(
-        _human_review(),
+        pull=True,
         attention=(WorkAttention("c:a:stopped", "Stopped", "stalled", stopped.href),),
     )
 
-    target = message_target(card, None, (stopped, asker), lambda key: True)
+    target = message_target(card, (stopped, asker), lambda key: True)
     assert target is not None and (target.session_key, target.answer) == ("c:a:stopped", False)
     assert target.why == "it stopped and is waiting for a look"
 
     # With a real question as well, the asking chat takes it, as an answer.
     both = _work(
-        _human_review(),
+        pull=True,
         attention=(
             WorkAttention("c:a:stopped", "Stopped", "stalled", stopped.href),
             WorkAttention("c:a:asker", "Asker", "waiting", asker.href, asks=True),
         ),
     )
-    target = message_target(both, None, (stopped, asker), lambda key: True)
+    target = message_target(both, (stopped, asker), lambda key: True)
     assert target is not None and (target.session_key, target.answer) == ("c:a:asker", True)
 
 
@@ -641,56 +416,51 @@ def test_a_chat_that_handed_off_is_not_said_to_have_stopped(state):
     """abacus#1951 (#2327): a finished turn is a handoff, as the status already reads it."""
     chat = _chat("c:a:done", "Done")
     card = _work(
-        _human_review(), attention=(WorkAttention("c:a:done", "Done", state, chat.href),)
+        pull=True, attention=(WorkAttention("c:a:done", "Done", state, chat.href),)
     )
 
-    target = message_target(card, None, (chat,), lambda key: True)
+    target = message_target(card, (chat,), lambda key: True)
 
     assert target is not None and target.session_key == "c:a:done"
     assert target.why == "it is this Work's latest chat"
 
 
-def test_a_chat_the_poller_restarts_is_not_said_to_have_stopped():
+def test_a_chat_that_restarts_by_itself_is_not_said_to_have_stopped():
     chat = _chat("c:a:worker", "Worker")
     item = WorkAttention("c:a:worker", "Worker", "stalled", chat.href, recovering=True)
 
-    target = message_target(_work(_human_review(), attention=(item,)), None, (chat,),
-                            lambda key: True)
+    target = message_target(_work(pull=True, attention=(item,)), (chat,), lambda key: True)
 
     assert target is not None and target.why == "it is this Work's latest chat"
 
 
-def test_otherwise_the_current_runs_chat_takes_it_not_the_newest():
-    old_run, newer = _chat("c:a:run", "Run chat", minutes=30), _chat("c:a:new", "Newer", minutes=1)
-    trace = _trace(
-        "gen-1", RUNNING, sessions=(RunSession("c:a:run", "c:a:run", "claude_code", "a", None),)
-    )
+def test_otherwise_a_working_chat_takes_it_then_the_newest():
+    old, newer = _chat("c:a:old", "Old", minutes=30), _chat("c:a:new", "Newer", minutes=1)
+    working = _chat("c:a:busy", "Busy", working=True, minutes=60)
 
-    target = message_target(_work(_board_card()), trace, (old_run, newer), lambda key: True)
-
-    assert target is not None and target.session_key == "c:a:run" and not target.answer
+    target = message_target(_work(pull=True), (old, newer), lambda key: True)
+    assert target is not None and target.session_key == "c:a:new" and not target.answer
+    target = message_target(_work(pull=True), (old, newer, working), lambda key: True)
+    assert target is not None and target.session_key == "c:a:busy"
 
 
 def test_a_chat_that_cannot_take_a_message_is_skipped_and_none_left_is_none():
     first, second = _chat("c:a:one", "One", minutes=1), _chat("c:a:two", "Two", minutes=9)
-    card = _work(_board_card())
+    card = _work(pull=True)
 
-    target = message_target(card, None, (first, second), lambda key: key == "c:a:two")
+    target = message_target(card, (first, second), lambda key: key == "c:a:two")
     assert target is not None and target.session_key == "c:a:two"
-    assert message_target(card, None, (first, second), lambda key: False) is None
+    assert message_target(card, (first, second), lambda key: False) is None
 
 
 # --- the page and its message route ---------------------------------------------------------
 
 
-def _app(tmp_path, card: BoardCard | None = None, *, injectable=True):
+def _app(tmp_path, *, injectable=True):
     from test_web import _app_with_state
 
     app = _app_with_state(tmp_path)
-    board = BoardView(
-        cards={card.identity: card} if card else {},
-        scopes=(BoardScope("agentdeck", org="eerovil", cards=(card,) if card else ()),),
-    )
+    board = BoardView(scopes=(BoardScope("agentdeck", org="eerovil"),))
     app.state.issues.read_board = lambda: board
     app.state.config.inject.enabled = True
     state = app.state.app_state
@@ -760,23 +530,6 @@ def test_a_question_turns_the_box_into_answer_question(tmp_path):
     assert 'data-wd-attention-kind="chat_question"' in main
     assert "Worker chat asked: Ship it now?" in main
     assert ">Answer question</button>" in main and 'placeholder="Answer the question…"' in main
-
-
-def test_a_review_escalation_page_sends_a_message_and_says_where_it_goes(tmp_path):
-    """The #2207 page: In review, escalated to the operator, the worker chat finished."""
-    app = _app(tmp_path, _human_review())
-    app.state.assistant.config.enabled = True
-    app.state.assistant.view = _insight(kind="finished")
-
-    main = _client(app).get(work_href(WORK.work_id)).text.split("<main", 1)[1]
-
-    assert 'data-wd-attention-kind="review_decision"' in main
-    assert "Review needs your decision" in main and "Decide review" in main
-    assert f'<a href="{PR}" data-wd-where target="_blank" rel="noopener">PR ' in main
-    assert "Needs your answer" not in main and "Answer" not in main
-    assert ">Send</button>" in main and "data-wd-answer" not in main
-    assert 'placeholder="Message this Work…"' in main
-    assert 'data-wd-message-target="claude_code:test:worker"' in main
 
 
 def test_only_a_real_question_makes_a_card_ask(tmp_path):
@@ -887,7 +640,7 @@ def test_a_question_form_asks_but_is_answered_on_the_chats_page(tmp_path, monkey
 )
 def test_an_approval_or_browser_step_is_not_a_question(tmp_path, monkeypatch, kind, act):
     _interaction(monkeypatch, kind)
-    app = _app(tmp_path, _human_review())
+    app = _app(tmp_path)
     app.state.assistant.config.enabled = True
     app.state.assistant.view = _insight(cause=CAUSE_PENDING_INTERACTION)
 
@@ -896,8 +649,7 @@ def test_an_approval_or_browser_step_is_not_a_question(tmp_path, monkeypatch, ki
     assert 'data-wd-attention-kind="chat_action"' in status
     assert "Chat is waiting on you" in status
     assert "Worker chat is waiting on: Allow command?" in status
-    assert f"{act}, then decide review" in status
-    assert "Review needs your decision too" in status
+    assert act in status
     # The operator's category files it under Needs answer (#2236); the story itself never
     # calls an approval a question.
     op, _, story = status.partition("</div>")
@@ -1032,7 +784,6 @@ async def test_a_ticked_work_send_posts_to_the_works_own_issue(tmp_path, monkeyp
     from agentdeck import gh_cli, issue_post
     from agentdeck.models import InjectResult
     from agentdeck.providers import PROVIDERS
-    from agentdeck.web import routes_actions
 
     app = _app(tmp_path)
     app.state.app_state.sessions["claude_code:test:worker"].cwd = tmp_path
@@ -1047,7 +798,6 @@ async def test_a_ticked_work_send_posts_to_the_works_own_issue(tmp_path, monkeyp
         return 0, b"https://github.com/eerovil/agentdeck/issues/2218#issuecomment-1\n", b""
 
     monkeypatch.setattr(PROVIDERS["claude_code"], "inject", fake_inject)
-    monkeypatch.setattr(routes_actions, "leave_answer", lambda **kwargs: None)
     monkeypatch.setattr(issue_post.shutil, "which", lambda name: "/usr/bin/gh")
     monkeypatch.setattr(gh_cli, "run_once", run_once)
     url = work_href(WORK.work_id) + "/message"
@@ -1084,10 +834,7 @@ async def test_a_live_attention_change_keeps_what_is_being_typed(tmp_path):
     from conftest import async_playwright
     from test_web import _live_server
 
-    card = _board_card(
-        generation="gen-1", dispatch=BoardDispatch(id="d-1", run_id="gen-1", work_id=WORK.work_id)
-    )
-    app = _app(tmp_path, card)
+    app = _app(tmp_path)
     async with _live_server(app) as base, async_playwright() as playwright:
         browser = await playwright.chromium.launch()
         page = await browser.new_page(
@@ -1126,64 +873,6 @@ async def test_a_live_attention_change_keeps_what_is_being_typed(tmp_path):
         for selector in ("#work-status", "#work-message", "#work-lifecycle"):
             box_of = page.locator(selector)
             bottom = await box_of.evaluate("el => el.getBoundingClientRect().bottom")
-            assert bottom <= 844, selector
-        await browser.close()
-
-
-@pytest.mark.browser
-@pytest.mark.asyncio
-async def test_a_live_review_escalation_stays_a_review_decision_on_a_phone(tmp_path):
-    """#2207: the card is escalated while the page is open; no chat asked anything. Since #2864
-    the page shows it on the next load."""
-    from conftest import async_playwright
-    from test_web import _live_server
-
-    card = _board_card(
-        generation="gen-1", dispatch=BoardDispatch(id="d-1", run_id="gen-1", work_id=WORK.work_id)
-    )
-    app = _app(tmp_path, card)
-    async with _live_server(app) as base, async_playwright() as playwright:
-        browser = await playwright.chromium.launch()
-        page = await browser.new_page(
-            viewport={"width": 390, "height": 844}, service_workers="block"
-        )
-        await page.add_init_script(
-            "document.addEventListener('htmx:sseOpen', () => { window.__sseOpen = true; }, true)"
-        )
-        await page.goto(base + work_href(WORK.work_id))
-        target = page.locator("#work-sec-message [data-wd-message-target]")
-        before = await target.get_attribute("data-wd-message-target")
-        box = page.locator('#work-message textarea[name="message"]')
-        await box.fill("half-typed note")
-
-        escalated = _human_review()
-        board = BoardView(
-            cards={escalated.identity: escalated},
-            scopes=(BoardScope("agentdeck", org="eerovil", cards=(escalated,)),),
-        )
-        app.state.issues.read_board = lambda: board
-        app.state.assistant.config.enabled = True
-        app.state.assistant.view = _insight(kind="finished")
-        app.state.app_state.bus.publish("assistant")
-        # No live update on a Work page since #2864: what is typed stays, and a reload shows
-        # the escalation.
-        assert await box.input_value() == "half-typed note"
-        await page.reload()
-
-        status = page.locator('#work-status[data-wd-attention-kind="review_decision"]')
-        await status.wait_for(timeout=15000)
-        # The headline is shown in capitals, so its text is compared case-folded.
-        assert "review needs your decision" in (await status.inner_text()).casefold()
-        assert "answer" not in (await page.locator("main.work-main").inner_text()).casefold()
-        assert await page.locator("#work-sec-message button[type=submit]").inner_text() == "Send"
-        assert await page.locator("#work-sec-message [data-wd-answer]").count() == 0
-        assert await target.get_attribute("data-wd-message-target") == before
-        assert await box.get_attribute("placeholder") == "Message this Work…"
-        # Why the Work waits, and what to do about it, are on the first phone screen.
-        for selector in ("#work-status .wd-status-head", "#work-status [data-wd-you]"):
-            bottom = await page.locator(selector).evaluate(
-                "el => el.getBoundingClientRect().bottom"
-            )
             assert bottom <= 844, selector
         await browser.close()
 
@@ -1275,126 +964,53 @@ async def test_an_unanswered_work_secret_is_never_kept_for_a_retry(tmp_path):
         await browser.close()
 
 
-def test_a_card_waiting_on_a_blocker_keeps_its_review_pass_on_the_page():
-    """#2367: a Blocked card waiting on another issue hides the review summary, but the pass
-    it kept for the current head is still a pass, not "Not yet"."""
-    head = "5be0c7f4d207fc616c052a3100f78e33a9a68acf"
-    card = _board_card(
-        status="Blocked",
-        status_role="blocked",
-        blocked_by=("eerovil/agentdeck#2365",),
-        auto_release=True,
-        review_pass_heads=(head,),
-    )
-    work = _work(card)
-    assert work.review is None
-
-    def at(sha: str):
-        output = OutputFact(PR, "eerovil/agentdeck", 2300, FOUND_BY_CARD, "open", sha)
-        return work_status(work.__class__(**{**work.__dict__, "outputs": (output,)}))
-
-    # The kept pass names its commit: a moved base could have changed what would merge.
-    assert _steps(at(head.upper()))["review"] == ("done", "Passed at 5BE0C7F")
-    # A push since the pass, or no known head, is not covered by it.
-    assert _steps(at("def5678"))["review"] == ("idle", "Not yet")
-    assert _steps(at(""))["review"] == ("idle", "Not yet")
-    # The pass does not turn into a merge on its own.
-    assert _steps(at(head))["merge"] == ("waiting", "Waiting")
-
-
-def test_the_kept_review_pass_is_read_from_the_engine_record():
-    """#2367: a Blocked card's pass lives in ``release_review_pass``, not a bits reading."""
-    from agentdeck.poller_ops import _card_review_pass_heads
-
-    head = "5be0c7f4d207fc616c052a3100f78e33a9a68acf"
-    record = {"release_review_pass": {"heads": {"agentdeck#2333": head}}}
-    assert _card_review_pass_heads(record) == (head,)
-    assert _card_review_pass_heads({}) == ()
-    assert _card_review_pass_heads({"release_review_pass": {"heads": ["x"]}}) == ()
-    assert _card_review_pass_heads({"release_review_pass": {"heads": {"a": ""}}}) == ()
-
-
-def test_a_waiting_card_says_passed_only_on_the_engines_fresh_reading():
-    """#2367 review: only the review bit's reading judged the content, so only it says
-    "Passed"; a kept pass at the same head names the commit instead."""
-    head = "5be0c7f4d207fc616c052a3100f78e33a9a68acf"
-
-    def review(**heads):
-        card = _board_card(
-            status="Blocked", status_role="blocked",
-            blocked_by=("eerovil/agentdeck#2365",), auto_release=True, **heads,
-        )
-        work = _work(card)
-        output = OutputFact(PR, "eerovil/agentdeck", 2300, FOUND_BY_CARD, "open", head)
-        status = work_status(work.__class__(**{**work.__dict__, "outputs": (output,)}))
-        return _steps(status)["review"]
-
-    assert review(review_passed_heads=(head,)) == ("done", "Passed")
-    assert review(review_passed_heads=(head,), review_pass_heads=(head,)) == ("done", "Passed")
-    assert review(review_pass_heads=(head,)) == ("done", "Passed at 5be0c7f")
-    assert review() == ("idle", "Not yet")
-
-
 # --- a ChatGPT review opened by hand (#2411) -------------------------------------------------
 
 HEAD = "537208c4d207fc616c052a3100f78e33a9a68acf"
 
 
-def _finished_on_a_stale_card(chat_reviews=None):
-    """bazaar#327: the issue closed, the merged pull request is the result, and the engine's
-    card still rests In review, so its review summary says a person closes the issue."""
-    card = _board_card(status="In review", status_role="in_review")
-    merged = OutputFact(PR, "eerovil/agentdeck", 2300, FOUND_BY_CARD, "merged", HEAD)
-    facts = work_facts(WORK, card=card)
-    facts = facts.__class__(**{**facts.__dict__, "outputs": (merged,), "finished_at": NOW})
+def _finished(chat_reviews=None):
+    """bazaar#327: the issue closed, and the merged pull request is the result."""
+    merged = OutputFact(PR, "eerovil/agentdeck", 2300, "chat_registration", "merged", HEAD)
+    facts = WorkFacts(WORK, outputs=(merged,), finished_at=NOW)
     return build_work_card(
         WORK, issue=None, title="Work story", issue_state="closed", facts=facts,
         chat_reviews=chat_reviews,
     )
 
 
-def test_a_finished_work_never_asks_for_a_review_from_a_stale_card():
-    work = _finished_on_a_stale_card()
-    assert work.work_state == "done" and work.review is not None and work.review.needs_human
-
-    status = work_status(work)
+def test_a_finished_work_asks_for_no_review():
+    status = work_status(_finished())
     assert status.headline == "Done"
     assert _steps(status)["review"] == ("idle", "None")
 
 
 def test_a_finished_work_says_chatgpt_reviewed_what_merged():
     reviewed = {("eerovil/agentdeck", 2300): ("0000000", HEAD[:7].upper())}
-    assert _steps(work_status(_finished_on_a_stale_card(reviewed)))["review"] == (
-        "done", "ChatGPT reviewed"
-    )
+    assert _steps(work_status(_finished(reviewed)))["review"] == ("done", "ChatGPT reviewed")
     # A review of a commit the pull request moved past, or of another pull request, is not it.
     for other in (
         {("eerovil/agentdeck", 2300): ("def5678",)},
         {("eerovil/agentdeck", 2301): (HEAD,)},
         {("other/agentdeck", 2300): (HEAD,)},
     ):
-        assert _steps(work_status(_finished_on_a_stale_card(other)))["review"] == (
-            "idle", "None"
-        )
+        assert _steps(work_status(_finished(other)))["review"] == ("idle", "None")
 
 
 def test_an_open_work_with_no_review_in_play_says_chatgpt_reviewed():
-    card = _board_card(status="In progress")
-    output = OutputFact(PR, "eerovil/agentdeck", 2300, FOUND_BY_CARD, "open", HEAD)
-    facts = work_facts(WORK, card=card)
-    facts = facts.__class__(**{**facts.__dict__, "outputs": (output,)})
+    output = OutputFact(PR, "eerovil/agentdeck", 2300, "chat_registration", "open", HEAD)
+    facts = WorkFacts(WORK, outputs=(output,))
 
     def review(reviews):
         work = build_work_card(
             WORK, issue=None, title="Work story", facts=facts, chat_reviews=reviews
         )
-        assert work.review is None
         return _steps(work_status(work))["review"]
 
     assert review({("eerovil/agentdeck", 2300): (HEAD,)}) == ("done", "ChatGPT reviewed")
     assert review({}) == ("idle", "Not yet")
     # A head the deck never learned is not the reviewed one.
-    blank = OutputFact(PR, "eerovil/agentdeck", 2300, FOUND_BY_CARD, "open", "")
+    blank = OutputFact(PR, "eerovil/agentdeck", 2300, "chat_registration", "open", "")
     facts = facts.__class__(**{**facts.__dict__, "outputs": (blank,)})
     assert review({("eerovil/agentdeck", 2300): ("",)}) == ("idle", "Not yet")
 
@@ -1437,57 +1053,6 @@ def test_the_work_reads_finished_review_chats_off_the_chat_board(tmp_path):
     assert _chat_reviews(app, _review_heads(app, state)) == {}
 
 
-def test_a_blocked_review_chat_asks_a_person_instead_of_reviewing():
-    """#2442: the reviewer awaits its chat, and the chat board says the chat is blocked."""
-    from agentdeck.poller_nudge import ExternalReviews
-
-    reviews = ExternalReviews(
-        None, {"eerovil/agentdeck#2300": "eerovil/review-chats#2653"}, frozenset()
-    )
-    card = _board_card(
-        status="In review", in_review=True, status_role="in_review", reviewer=reviews
-    )
-
-    def status(holds):
-        facts = work_facts(WORK, card=card, chat_holds=holds)
-        return work_status(build_work_card(WORK, issue=None, title="Work story", facts=facts))
-
-    running = status({})
-    assert running.headline == "Reviewing" and _steps(running)["review"] == ("active", "Running")
-
-    held = status({"eerovil/review-chats#2653": ("blocked",)})
-    assert held.headline != "Reviewing" and held.kind == REVIEW_DECISION
-    assert _steps(held)["review"] == ("attention", "Needs you")
-    assert "External review is blocked in eerovil/review-chats#2653" in held.summary
-
-
-@private_feature(_chat_board)
-def test_the_work_reads_held_chats_off_the_chat_board(tmp_path):
-    from agentdeck.chat_board import ChatBoardService, ChatRow
-    from agentdeck.web.work_view import _chat_holds
-
-    service = ChatBoardService(
-        tmp_path / "streams", repository="eerovil/Review-Chats", store_path=tmp_path / "b.json"
-    )
-    for number, state, labels in (
-        (1, "open", ("blocked",)),
-        (2, "open", ("in-progress",)),  # a run is working on it: still a running review
-        (3, "closed", ("blocked",)),  # a closed chat is the reviewer's to settle
-        (4, "open", ("blocked", "in-progress", "needs-more-info")),
-        (5, "open", ()),
-    ):
-        service.board.rows[number] = ChatRow(number, "Review x/y#1", state, labels)
-    app = SimpleNamespace(state=SimpleNamespace(chat_board=service))
-
-    assert _chat_holds(app) == {
-        "eerovil/review-chats#1": ("blocked",),
-        "eerovil/review-chats#4": ("needs-more-info", "blocked"),
-    }
-
-    service._enabled = False
-    assert _chat_holds(app) == {}
-
-
 # --- what an automatic wait reads as, and where it is listed (#2573) ------------------------
 
 
@@ -1512,32 +1077,11 @@ def _sections(*works):
     return front_sections([front_row(work, current=True) for work in works])
 
 
-def test_a_card_blocked_by_open_issues_waits_on_other_work():
-    from agentdeck.work_story import IDLE, IN_PROGRESS, WAITING_BLOCKERS, front_row
-
-    card = _board_card(blocked_by=("Eerovil/AgentDeck#2141", "eerovil/store#2142"))
-    work = _work(card)
-    status = work_status(work)
-
-    assert (status.tone, status.headline, status.kind) == (
-        IDLE, "Waiting on other work", WAITING_BLOCKERS
-    )
-    # The Work's own repository, in any case, is said as #n; another keeps its name.
-    assert status.summary == "Blocked by #2141, eerovil/store#2142."
-    assert status.next == "blockers to close"
-    row = front_row(work, current=True)
-    assert row.section == IN_PROGRESS and row.waits
-    assert row.line == "Blocked by #2141, eerovil/store#2142"
-    sections = _sections(work)
-    assert [item.card.work_id for item in sections.waiting] == [work.work_id]
-    assert sections.active == ()
-
-
 def test_a_starred_work_leads_its_section():
     """#3116: a starred Work comes first in Active (and Needs you), ahead of newer ones."""
     from dataclasses import replace
 
-    base = _work(_board_card(), chats=(_chat("c:a:worker", "Worker", working=True),))
+    base = _work(pull=True, chats=(_chat("c:a:worker", "Worker", working=True),))
     now = datetime.now(UTC)
     newer = replace(base, work_id="github_issue:o/r#1", last_activity=now)
     older = replace(base, work_id="github_issue:o/r#2", last_activity=now - timedelta(hours=1))
@@ -1548,14 +1092,6 @@ def test_a_starred_work_leads_its_section():
     assert [row.card.work_id for row in _sections(newer, starred).active] == [
         starred.work_id, newer.work_id
     ]
-
-
-def test_a_blocked_card_with_a_turn_running_is_still_working():
-    work = _work(
-        _board_card(blocked_by=("eerovil/agentdeck#2141",)),
-        chats=(_chat("c:a:worker", "Worker", working=True),),
-    )
-    assert work_status(work).headline == "Working"
 
 
 def _woken(key: str, title: str) -> WorkChat:
@@ -1570,8 +1106,7 @@ def test_a_chat_its_own_notification_woke_keeps_the_work_in_needs_you():
     from agentdeck.work_story import NEEDS_YOU, front_row
 
     work = _work(
-        _board_card(status="Blocked", status_role="blocked"),
-        chats=(_woken("c:a:worker", "Worker"),),
+        pull=True, attention=(_stopped(),), chats=(_woken("c:a:worker", "Worker"),)
     )
     row = front_row(work, current=True)
 
@@ -1588,55 +1123,32 @@ def test_a_woken_works_own_page_offers_and_plans_what_its_row_does():
     from agentdeck.work_story import front_row
 
     work = _work(
-        _board_card(status="Blocked", status_role="blocked"),
-        chats=(_woken("c:a:worker", "Worker"),),
+        pull=True, attention=(_stopped(),), chats=(_woken("c:a:worker", "Worker"),)
     )
     row = front_row(work, current=True)
-    detail = WorkDetail(work, None, None, (), ())
+    detail = WorkDetail(work, None, (), ())
 
-    assert detail.attention == row.attention
+    assert detail.attention == row.attention and detail.attention is not None
+    assert detail.buttons
     writes = [action for action in row.attention.actions if action in work_actions.WRITES]
-    assert writes
     for action in writes:
         assert work_actions.plan(action, detail.card, detail.attention) is not None
 
 
-def test_a_merge_waiting_for_its_deploy_reads_as_deploying_not_finished_or_needs_you():
-    """#2760 review: inside the deploy grace the Work sat under Finished, then moved to Needs you
-    once the grace ran out; it should wait as Deploying."""
-    from dataclasses import replace
-
-    from agentdeck.work_story import FINISHED, NEEDS_YOU, front_row
-
-    closed = replace(_work(_board_card()), work_state="done", awaiting_finish=True)
-    due = replace(closed, deploy_due=True)
-    row = front_row(due, current=True)
-
-    assert (row.status.headline, row.status.kind) == ("Deploying", "deploying")
-    assert row.section not in {FINISHED, NEEDS_YOU} and row.waits
-    assert front_row(closed, current=True).section == NEEDS_YOU  # past the grace: Finish it
-
-
 def test_a_closed_issue_with_an_open_pull_request_follows_the_pull_request():
-    """#3187: a Poller card done with its issue closed by another chat, its pull request open."""
+    """#3187: an issue another chat closed while its pull request is still open."""
     from dataclasses import replace
 
-    from agentdeck.work_facts import OutputFact
-    from agentdeck.work_overview import ReviewSummary
     from agentdeck.work_story import NEEDS_YOU, front_row
 
     opened = OutputFact("https://github.com/o/r/pull/9", "o/r", 9, "registered", state="open")
-    closed = replace(_work(_board_card()), work_state="done", awaiting_finish=True)
-    ready = ReviewSummary(
-        "passed", "Review passed", "merge", needs_human=True, decision="merge"
-    )
-    reviewing = ReviewSummary("running", "Review running", "release")
-    for review, headline in ((reviewing, "Reviewing"), (ready, "Ready for you to merge")):
-        work = replace(closed, outputs=(opened,), review=review)
+    closed = replace(_work(pull=True), work_state="done", awaiting_finish=True)
+    for attention, headline in (((), "Idle"), ((_ask(),), "Needs your answer")):
+        work = replace(closed, outputs=(opened,), attention=attention)
         status = work_status(work)
         assert status.headline == headline and status.summary.endswith(" · issue closed.")
-        attention = front_row(work, current=True).attention
-        assert attention is None or attention.category != "issue_closed"
+        row = front_row(work, current=True).attention
+        assert row is None or row.category != "issue_closed"
     # No pull request open: unchanged.
     assert work_status(closed).headline == "Issue closed"
     assert front_row(closed, current=True).section == NEEDS_YOU
@@ -1645,10 +1157,13 @@ def test_a_closed_issue_with_an_open_pull_request_follows_the_pull_request():
 def test_a_turn_someone_started_still_takes_the_work_out_of_needs_you():
     from agentdeck.work_story import IN_PROGRESS, front_row
 
-    parked = _board_card(status="Blocked", status_role="blocked")
-    answered = _work(parked, chats=(_chat("c:a:worker", "Worker", working=True),))
+    stopped = (_stopped(),)
+    answered = _work(
+        pull=True, attention=stopped, chats=(_chat("c:a:worker", "Worker", working=True),)
+    )
     mixed = _work(
-        parked,
+        pull=True,
+        attention=stopped,
         chats=(_woken("c:a:worker", "Worker"), _chat("c:a:other", "Other", working=True)),
     )
 
@@ -1660,20 +1175,10 @@ def test_a_turn_someone_started_still_takes_the_work_out_of_needs_you():
 def test_a_woken_chat_on_a_work_nobody_waits_on_stays_active():
     from agentdeck.work_story import IN_PROGRESS, front_row
 
-    work = _work(_board_card(), chats=(_woken("c:a:worker", "Worker"),))
+    work = _work(pull=True, chats=(_woken("c:a:worker", "Worker"),))
 
     assert work.woke_itself
     assert front_row(work, current=True).section == IN_PROGRESS
-
-
-def test_a_card_a_person_must_unblock_still_needs_them():
-    from agentdeck.work_story import NEEDS_YOU, front_row
-
-    work = _work(_board_card(status="Blocked", status_role="blocked"))
-    status = work_status(work)
-
-    assert (status.tone, status.headline) == (ATTENTION, "Blocked")
-    assert front_row(work, current=True).section == NEEDS_YOU
 
 
 def test_a_job_a_chat_queued_is_what_the_work_waits_for():
@@ -1682,7 +1187,7 @@ def test_a_job_a_chat_queued_is_what_the_work_waits_for():
 
     chat = _chat("c:a:worker", "Worker")
     jobs = work_jobs([_queue_row(chat.session_key)], (chat,))
-    work = _work(_board_card(), chats=(chat,), jobs=jobs)
+    work = _work(pull=True, chats=(chat,), jobs=jobs)
     status = work_status(work)
 
     assert (status.tone, status.headline, status.kind) == (ACTIVE, "Job queued", WAITING_JOB)
@@ -1701,7 +1206,7 @@ def test_a_running_job_comes_first_and_the_rest_are_counted():
         _queue_row(chat.session_key, "running", label="x" * 60),
     ]
     jobs = work_jobs(queue, (chat,))
-    status = work_status(_work(_board_card(), chats=(chat,), jobs=jobs))
+    status = work_status(_work(pull=True, chats=(chat,), jobs=jobs))
 
     assert [job.state for job in jobs] == ["running", "queued"]
     assert status.headline == "Job running"
@@ -1713,7 +1218,7 @@ def test_a_chat_mid_turn_reads_working_whatever_job_it_queued():
 
     chat = _chat("c:a:worker", "Worker", working=True)
     jobs = work_jobs([_queue_row(chat.session_key)], (chat,))
-    work = _work(_board_card(), chats=(chat,), jobs=jobs)
+    work = _work(pull=True, chats=(chat,), jobs=jobs)
 
     assert work_status(work).headline == "Working"
     assert _sections(work).waiting == ()
@@ -1741,24 +1246,6 @@ def test_only_the_works_own_unfinished_ordinary_jobs_count():
     assert jobs[0].since is None
 
 
-def test_both_deploying_readings_are_listed_under_live_checking():
-    """A Poller card's Deploying is the step after its merge (#3578): listed with Live checking."""
-    from agentdeck.work_story import DEPLOYING
-
-    watched = _work(_board_card(awaiting_deploy=True))
-    card = _board_card(review_mode="merge", auto_release=True)
-    merged = OutputFact(PR, "eerovil/agentdeck", 2300, FOUND_BY_CARD, "merged")
-    landed = _work(card)
-    landed = landed.__class__(**{**landed.__dict__, "outputs": (merged,)})
-
-    for work in (watched, landed):
-        status = work_status(work)
-        assert (status.headline, status.kind) == ("Deploying", DEPLOYING)
-        front = _sections(work)
-        assert [item.card.work_id for item in front.live] == [work.work_id]
-        assert not front.waiting
-
-
 def test_a_job_line_says_how_long_it_has_queued_or_run():
     from agentdeck.work_overview import WorkJob
     from agentdeck.work_story import _job_line
@@ -1781,7 +1268,7 @@ def test_a_paused_or_finished_work_is_never_working():
     from dataclasses import replace
 
     chats = (_chat("c:a:worker", "Worker", working=True),)
-    work = _work(_board_card(), chats=chats)
+    work = _work(pull=True, chats=chats)
     assert work_status(work).headline == "Working"
 
     assert work_status(replace(work, paused=True, label_paused=True)).headline == "Paused"
@@ -1789,8 +1276,8 @@ def test_a_paused_or_finished_work_is_never_working():
 
 
 def test_a_turn_only_reading_adds_nothing_to_working():
-    """#2590: Implementing, Starting, Not started and Idle say only what the turn already does."""
-    work = _work(_board_card(), chats=(_chat("c:a:worker", "Worker", working=True),))
+    """#2590: Idle says only what the turn already does."""
+    work = _work(pull=True, chats=(_chat("c:a:worker", "Worker", working=True),))
     status = work_status(work)
 
     assert (status.headline, status.summary) == ("Working", "Worker is working.")
@@ -1817,9 +1304,9 @@ def _tree_rows():
         )
 
     now = datetime.now(UTC)
-    quiet = _work(_board_card(status="Backlog", pull_request_url=""))
-    working = _work(_board_card(), chats=(_chat("c:a:worker", "Worker", working=True),))
-    asking = _work(_board_card(), attention=(_ask(),))
+    quiet = _work()
+    working = _work(pull=True, chats=(_chat("c:a:worker", "Worker", working=True),))
+    asking = _work(pull=True, attention=(_ask(),))
     parent = card(quiet, 10, last_activity=now - timedelta(days=3))
     rows = {
         10: front_row(parent, current=False),
@@ -2036,7 +1523,7 @@ def test_the_parent_row_and_the_work_page_draw_the_tree():
         ),
         counts=(1, 2),
     )
-    detail = WorkDetail(card=rows[10].card, trace=None, workspace=None, chats=(),
+    detail = WorkDetail(card=rows[10].card, workspace=None, chats=(),
                         verifications=(), tree=tree)
     section = dict(render_work_sections(templates, detail))["tree"]
     assert "Part of" in section and "#9 The map" in section
@@ -2048,7 +1535,7 @@ def test_the_parent_row_and_the_work_page_draw_the_tree():
     assert f'data-front-action="{button.action}"' in section
     assert (button.href or rows[11].card.href) in section
     # A Work in no tree draws nothing there.
-    plain = WorkDetail(card=rows[10].card, trace=None, workspace=None, chats=(),
+    plain = WorkDetail(card=rows[10].card, workspace=None, chats=(),
                        verifications=())
     assert "data-work-tree" not in dict(render_work_sections(templates, plain))["tree"]
 
@@ -2106,7 +1593,7 @@ async def test_a_maps_work_page_draws_its_tickets_from_cached_reads():
     templates = Jinja2Templates(directory=str(app_mod._TEMPLATES_DIR))
     render_mod.register_filters(templates)
     tree = work_tree.WorkTree(counts=(1, 3), diagram=diagram)
-    detail = WorkDetail(card=rows[10].card, trace=None, workspace=None, chats=(),
+    detail = WorkDetail(card=rows[10].card, workspace=None, chats=(),
                         verifications=(), tree=tree)
     section = dict(render_work_sections(templates, detail))["tree"]
     assert "Map" in section and "1/3 done" in section and "data-work-tree-child" not in section
@@ -2308,7 +1795,7 @@ async def test_a_maps_pages_and_pushes_point_at_its_waiting_questions():
     assert box["11"].href == asked.href and box["12"].href.startswith("/works/")
     assert [item.work_id for item in diagram.questions] == [ticket]
     tree = work_tree.WorkTree(counts=(1, 5), diagram=diagram)
-    detail = WorkDetail(card=rows[10].card, trace=None, workspace=None, chats=(),
+    detail = WorkDetail(card=rows[10].card, workspace=None, chats=(),
                         verifications=(), tree=tree)
     section = dict(work_view.render_work_sections(templates, detail))["tree"]
     assert "Waiting for you" in section and f'data-wm-question="{ticket}"' in section
@@ -2327,7 +1814,7 @@ def test_a_parent_row_stands_where_its_most_urgent_member_would():
 
     rows, parents = _tree_rows()
     waiting = replace(rows[10], section=IN_PROGRESS, status=replace(
-        rows[10].status, kind="waiting_blockers"))
+        rows[10].status, kind="waiting_job"))
     assert waiting.waits
     [row] = fold([waiting, rows[12]], parents=parents)
     assert row.lead.card.work_id == rows[12].card.work_id

@@ -17,19 +17,8 @@ from pathlib import Path
 
 import pytest
 from public_copy import private_feature
-from test_work_attention import (
-    AT,
-    GREEN,
-    KEY,
-    ORG,
-    PR,
-    WORK,
-    _passed,
-    _record,
-    _reviewer,
-    _row,
-    _work,
-)
+from test_work_attention import ORG, PR, STOPPED_CHAT, WORK, _derived, _row
+from test_work_attention import _work as _work_of
 
 from agentdeck import chat_review, gh_cli
 from agentdeck import chat_review as _chat_review
@@ -48,55 +37,64 @@ from agentdeck.work_overview import work_href
 from agentdeck.work_story import work_status
 
 ISSUE = f"{ORG}/agentdeck#5"
-RETRY_PARK = _record(
-    "Blocked", dispatch_failed=True, dispatch_failed_at=AT, dispatch_failed_refusal="at_capacity"
-)
-RELEASE_PARKED = _record(
-    "Blocked", **_passed(),
-    release_blocked={"why": "Auto-merge is disabled", "status": "Blocked", "generation": "gen-2"},
-)
-RELEASE_BLOCKING = _record(
-    "Ready to merge",
-    blocked_pending={"why": "checks failed", "merged": [], "steps": {}},
-)
 
 
-def _planned(tmp_path, record: dict, action: str, **extra):
-    work = _work(tmp_path, record, **extra)
+def _idle(**extra):
+    """A Work with its pull request open that waits on nobody."""
+    return _work_of(**extra)
+
+
+def _stopped(**extra):
+    """A Needs retry Work: a chat on it stopped, and nothing restarts it by itself."""
+    return _work_of(attention=(STOPPED_CHAT,), **extra)
+
+
+def _reviewing(**extra):
+    """A Work the deck runs whose ready pull request no reviewer took (#2960)."""
+    return _work_of(derived=_derived("review_stuck", "No reviewer runs"), **extra)
+
+
+def _ready(**extra):
+    """A Work the deck runs, reviewed and tested and waiting on a person's Merge (#2960)."""
+    return _work_of(derived=_derived("ready", "Reviewed and tested"), **extra)
+
+
+def _unstarted(**extra):
+    """An open issue no agent works on (#3558): Start agent, or Close issue (#3562)."""
+    return replace(_work_of(**extra), start_label="agent")
+
+
+def _planned(work, action: str):
     return plan(action, work, operator_attention(work, work_status(work)))
 
 
 # --- what each action does ----------------------------------------------------------------------
 
 @pytest.mark.parametrize(
-    ("record", "extra", "action", "kind", "body"),
+    ("work", "action", "kind", "body"),
     [
-        (_record("In review"), {"rows": {PR.lower(): _row("merged")}}, "close", "close",
-         "completed"),
-        (_record("In review"), {"rows": {PR.lower(): _row("closed")}}, "close", "close",
-         "not planned"),
+        (_unstarted, "close", "close", "completed"),
+        (_unstarted, "start", "add_label", "agent"),
         pytest.param(
-            _record("In review"), {}, "chatgpt_review", "chatgpt_review", "",
+            _reviewing, "chatgpt_review", "chatgpt_review", "",
             marks=private_feature(_chat_review),
         ),
         pytest.param(
-            _record("In review"), {}, "agent_review", "agent_review", "",
+            _reviewing, "agent_review", "agent_review", "",
             marks=private_feature(_chat_review),
         ),
     ],
-    ids=["close-merged", "close-unmerged", "chatgpt-review", "agent-review"],
+    ids=["close", "start", "chatgpt-review", "agent-review"],
 )
-def test_each_deck_write_makes_one_fixed_write_on_the_source_issue(
-    tmp_path, record, extra, action, kind, body
-):
-    step = _planned(tmp_path, record, action, **extra)
+def test_each_deck_write_makes_one_fixed_write_on_the_source_issue(work, action, kind, body):
+    step = _planned(work(), action)
 
     assert (step.kind, step.issue, step.body) == (kind, ISSUE, body)
 
 
-def test_merge_is_a_confirmed_form(tmp_path):
+def test_merge_is_a_confirmed_form():
     """#2324: Merge no longer hands `/merge` to GitHub; it is one press, and it asks first."""
-    work = _work(tmp_path, _record("Ready to merge", **_passed()), verifications=GREEN)
+    work = _ready()
     attention = operator_attention(work, work_status(work))
 
     (control,) = [button for button in buttons(work, attention) if button.action == "merge"]
@@ -105,8 +103,8 @@ def test_merge_is_a_confirmed_form(tmp_path):
     assert control.confirm.startswith("Merge this Work?")
 
 
-def test_merge_is_refused_for_a_work_the_deck_does_not_release(tmp_path):
-    work = _work(tmp_path, _record("Ready to merge", **_passed()), verifications=GREEN)
+def test_merge_is_refused_for_a_work_the_deck_does_not_release():
+    work = _ready()
 
     with pytest.raises(Refused, match="does not release"):
         plan("merge", work, operator_attention(work, work_status(work)))
@@ -119,9 +117,9 @@ def test_the_writes():
     }
 
 
-def test_merge_when_ready_and_withdraw_follow_the_releases_press(tmp_path):
+def test_merge_when_ready_and_withdraw_follow_the_releases_press():
     """#3320: offered from the release's own state on a Work not yet ready, like Pause."""
-    work = _work(tmp_path, _record("In progress"), outcome="running")
+    work = _idle()
     attention = operator_attention(work, work_status(work))
     assert plan("approve_merge", work, attention, approval="offered").kind == "deck_merge"
     assert plan("withdraw_merge", work, attention, approval="approved").kind == "deck_withdraw"
@@ -132,43 +130,33 @@ def test_merge_when_ready_and_withdraw_follow_the_releases_press(tmp_path):
     ]:
         with pytest.raises(Refused, match=why):
             plan(action, work, attention, approval=approval)
-    closed = _work(tmp_path, _record("In progress"), rows={PR.lower(): _row("merged")})
+    closed = _idle(rows={PR.lower(): _row("merged")})
     with pytest.raises(Refused, match="no open pull request"):
         plan("approve_merge", closed, None, approval="offered")
-    ready = _work(tmp_path, _record("Ready to merge", **_passed()), verifications=GREEN)
+    ready = _ready()
     with pytest.raises(Refused, match="Merge is offered instead"):
         plan("approve_merge", ready, operator_attention(ready, work_status(ready)),
              approval="offered")
 
 
 @pytest.mark.parametrize(
-    ("record", "action", "status"),
+    ("work", "action", "status"),
     [
-        (_record("Ready to merge", **_passed()), "close", 409),
-        (_record("In review"), "hide", 422),  # a link or unknown id is not a write
-        (_record("In review"), "rm -rf", 422),
+        (_ready, "close", 409),
+        (_reviewing, "hide", 422),  # a link or unknown id is not a write
+        (_reviewing, "rm -rf", 422),
     ],
     ids=["close-not-offered", "hide", "garbage"],
 )
-def test_an_action_the_work_does_not_offer_now_is_refused(tmp_path, record, action, status):
+def test_an_action_the_work_does_not_offer_now_is_refused(work, action, status):
     with pytest.raises(Refused) as refused:
-        _planned(tmp_path, record, action)
+        _planned(work(), action)
 
     assert refused.value.status == status
 
 
-@private_feature(_chat_review)
-def test_a_card_that_releases_itself_offers_both_reviews(tmp_path):
-    # Agent review is a separate Claude reviewer now (#2736), not the card's own worker, so a
-    # card that releases itself offers it like ChatGPT review: nobody reviews their own work.
-    self_releasing = replace(_work(tmp_path, _record("In review")), self_releasing=True)
-    attention = operator_attention(self_releasing, work_status(self_releasing))
-    offered = [b.action for b in buttons(self_releasing, attention)]
-    assert "agent_review" in offered and "chatgpt_review" in offered
-
-
-def test_a_work_that_needs_nobody_offers_nothing(tmp_path):
-    work = _work(tmp_path, _record("In progress"), outcome="running")
+def test_a_work_that_needs_nobody_offers_nothing():
+    work = _idle()
 
     assert operator_attention(work, work_status(work)) is None
     for action in WRITES - {"pause"}:
@@ -179,15 +167,16 @@ def test_a_work_that_needs_nobody_offers_nothing(tmp_path):
 
 
 @private_feature(_chat_review)
-def test_chatgpt_review_covers_the_whole_work_wherever_its_pull_requests_are(tmp_path):
+def test_chatgpt_review_covers_the_whole_work_wherever_its_pull_requests_are():
     """#2637: one chat about the issue, listing every open pull request — no longer a refusal
     for one in another repository (#2234), nor a review of that one alone (#2395)."""
-    work = _work(tmp_path, _record("In review"))
+    work = _reviewing()
+    found_by = "chat_registration"
     elsewhere = OutputFact(
-        f"https://github.com/{ORG}/store/pull/3374", f"{ORG}/store", 3374, "poller_card", "open"
+        f"https://github.com/{ORG}/store/pull/3374", f"{ORG}/store", 3374, found_by, "open"
     )
     gone = OutputFact(
-        f"https://github.com/{ORG}/store/pull/3370", f"{ORG}/store", 3370, "poller_card", "closed"
+        f"https://github.com/{ORG}/store/pull/3370", f"{ORG}/store", 3370, found_by, "closed"
     )
     work = replace(work, outputs=(*work.outputs, elsewhere, gone))
 
@@ -201,8 +190,8 @@ def test_chatgpt_review_covers_the_whole_work_wherever_its_pull_requests_are(tmp
 
 
 @private_feature(_chat_review)
-def test_the_same_repository_in_another_case_is_not_another_repository(tmp_path):
-    work = _work(tmp_path, _record("In review"))
+def test_the_same_repository_in_another_case_is_not_another_repository():
+    work = _reviewing()
     shouted = replace(work.outputs[0], repository=f"{ORG.upper()}/AgentDeck")
     work = replace(work, outputs=(shouted,))
 
@@ -210,28 +199,28 @@ def test_the_same_repository_in_another_case_is_not_another_repository(tmp_path)
 
 
 @private_feature(_chat_review)
-def test_the_row_and_the_page_offer_the_same_controls(tmp_path):
-    work = _work(tmp_path, _record("In review"))
+def test_the_row_and_the_page_offer_the_same_controls():
+    work = _reviewing()
     attention = operator_attention(work, work_status(work))
 
     row = buttons(work, attention)
     page = buttons(work, attention, page=True)
 
-    assert [b.action for b in row] == ["agent_review", "chatgpt_review", "review", "hide"]
-    assert [b.action for b in page] == [b.action for b in row]
+    assert [b.action for b in row][1:] == ["agent_review", "chatgpt_review", "review", "hide"]
+    assert [b.action for b in page][1:] == [b.action for b in row][1:]
     review = row[-2]
     assert (review.href, review.external) == (PR, True)
     # Hide changes only this deck, so it posts to the visibility route, not the action one.
-    assert (row[-1].route, row[0].route) == ("visibility", "action")
-    parked = _work(tmp_path, RETRY_PARK)
+    assert (row[-1].route, row[1].route) == ("visibility", "action")
+    parked = _stopped()
     attention = operator_attention(parked, work_status(parked))
     assert [b.action for b in buttons(parked, attention)] == ["inspect", "hide"]
     # Inspect opens the Work page, so the Work page itself does not offer it; a hidden Work
     # does not offer Hide again.
     assert [b.action for b in buttons(parked, attention, page=True)] == ["hide"]
     assert [b.action for b in buttons(parked, attention, page=True, hidden=True)] == []
-    merge = _work(tmp_path, _record("Ready to merge", **_passed()), verifications=GREEN)
-    control, _hide = buttons(merge, operator_attention(merge, work_status(merge)))
+    merge = _ready()
+    control, *_rest = buttons(merge, operator_attention(merge, work_status(merge)))
     assert control.action == "merge" and control.href == ""
 
 
@@ -269,20 +258,19 @@ class _Gh:
         return answer
 
 
-def _route_app(tmp_path, monkeypatch, record: dict, *, gh: _Gh | None = None, **extra):
+def _route_app(tmp_path, monkeypatch, make=_reviewing, *, gh: _Gh | None = None, **extra):
     from test_web import _app_with_state
 
     from agentdeck.web import routes_works
     from agentdeck.web.work_view import WorkDetail
 
     app = _app_with_state(tmp_path)
-    work = _work(tmp_path, record, **extra)
+    work = make(**extra)
     holder = {"card": work}
 
     async def detail(_app, ref, **_kw):
         assert ref == WORK
-        return WorkDetail(card=holder["card"], trace=None, workspace=None, chats=(),
-                          verifications=())
+        return WorkDetail(card=holder["card"], workspace=None, chats=(), verifications=())
 
     monkeypatch.setattr(routes_works, "load_work_detail", detail)
     monkeypatch.setattr(routes_works.shutil, "which", lambda name: "/usr/bin/gh")
@@ -305,16 +293,12 @@ def _post(client, action, action_id="press-0001", **headers):
                        headers=headers)
 
 
-CLOSABLE = _record("In review")
-CLOSED = {"rows": {PR.lower(): _row("closed")}}
-
-
 def _closable_app(tmp_path, monkeypatch, **kwargs):
-    return _route_app(tmp_path, monkeypatch, CLOSABLE, **CLOSED, **kwargs)
+    return _route_app(tmp_path, monkeypatch, _unstarted, **kwargs)
 
 
 def test_a_write_the_work_does_not_offer_writes_nothing(tmp_path, monkeypatch):
-    app, gh, _ = _route_app(tmp_path, monkeypatch, _record("Ready to merge", **_passed()))
+    app, gh, _ = _route_app(tmp_path, monkeypatch, _ready)
 
     response = _post(_client(app), "close")
 
@@ -349,22 +333,20 @@ def test_a_refused_authority_is_a_failed_press_that_may_be_retried(tmp_path, mon
     assert press.state == "failed"
 
 
-def test_close_closes_the_source_issue_with_the_categorys_reason(tmp_path, monkeypatch):
-    app, gh, _ = _route_app(
-        tmp_path, monkeypatch, _record("In review"), rows={PR.lower(): _row("closed")}
-    )
+def test_close_closes_the_source_issue_as_completed(tmp_path, monkeypatch):
+    app, gh, _ = _closable_app(tmp_path, monkeypatch)
 
     response = _post(_client(app), "close")
 
     assert response.status_code == 200 and f"Closed {ISSUE}" in response.text
     assert gh.calls[0][0] == ["/usr/bin/gh", "issue", "close", "5", "--repo", f"{ORG}/agentdeck",
-                              "--reason", "not planned"]
+                              "--reason", "completed"]
 
 
 def test_an_action_the_work_no_longer_offers_is_refused_before_any_write(tmp_path, monkeypatch):
     app, gh, holder = _closable_app(tmp_path, monkeypatch)
     # The row offered Close; by the time the press lands the Work moved on.
-    holder["card"] = _work(tmp_path, _record("In progress"), outcome="running")
+    holder["card"] = _idle()
 
     response = _post(_client(app), "close")
 
@@ -469,7 +451,7 @@ def test_a_press_known_not_to_have_been_sent_may_be_pressed_again(tmp_path, monk
 
 @private_feature(_chat_review)
 def test_chatgpt_review_is_the_existing_review_workflow(tmp_path, monkeypatch):
-    app, gh, _ = _route_app(tmp_path, monkeypatch, _record("In review"))
+    app, gh, _ = _route_app(tmp_path, monkeypatch)
     asked: list[tuple[str, bool]] = []
 
     async def open_review(config, target, *, start=True, pulls=(), board=None, releases=None):
@@ -497,7 +479,7 @@ def test_agent_review_opens_the_review_chat_and_starts_a_claude_reviewer_on_it(
 ):
     """#2736: the press is a Claude reviewer whose verdict the Poller accepts, not a
     ``/claude Review only`` follow-up that could post no verdict at all."""
-    app, gh, _ = _route_app(tmp_path, monkeypatch, _record("In review"))
+    app, gh, _ = _route_app(tmp_path, monkeypatch)
     asked: list[tuple[str, bool]] = []
     started: list[tuple[int, str]] = []
 
@@ -530,7 +512,7 @@ def test_agent_review_opens_the_review_chat_and_starts_a_claude_reviewer_on_it(
 
 @private_feature(_chat_review)
 def test_agent_review_leaves_a_chat_someone_already_holds(tmp_path, monkeypatch):
-    app, _gh, _ = _route_app(tmp_path, monkeypatch, _record("In review"))
+    app, _gh, _ = _route_app(tmp_path, monkeypatch)
 
     async def open_review(config, target, *, start=True, pulls=(), board=None, releases=None):
         return chat_review.ReviewOutcome(
@@ -550,10 +532,8 @@ def test_agent_review_leaves_a_chat_someone_already_holds(tmp_path, monkeypatch)
 
 
 def _merge_app(tmp_path, monkeypatch):
-    """A Ready to merge Work."""
-    return _route_app(
-        tmp_path, monkeypatch, _record("Ready to merge", **_passed()), verifications=GREEN
-    )
+    """A Ready for merge Work."""
+    return _route_app(tmp_path, monkeypatch, _ready)
 
 
 def test_a_merge_the_deck_does_not_release_writes_nothing(tmp_path, monkeypatch):
@@ -574,7 +554,7 @@ def test_merge_when_ready_is_not_sent_when_refused_and_may_be_pressed_again(
     from agentdeck.web import routes_works
     from agentdeck.work_release import PressRefused
 
-    app, _gh, _holder = _route_app(tmp_path, monkeypatch, _record("In review"))
+    app, _gh, _holder = _route_app(tmp_path, monkeypatch, _idle)
     state = {"approval": "offered", "refuse": True}
 
     class Release:
@@ -616,8 +596,7 @@ def test_a_merge_the_work_no_longer_offers_writes_nothing(tmp_path, monkeypatch)
     async def moved(_app, ref, **_kw):
         from agentdeck.web.work_view import WorkDetail
 
-        return WorkDetail(card=_work(tmp_path, _record("In progress"), outcome="running"),
-                          trace=None, workspace=None, chats=(), verifications=())
+        return WorkDetail(card=_idle(), workspace=None, chats=(), verifications=())
 
     monkeypatch.setattr(routes_works, "load_work_detail", moved)
 
@@ -635,8 +614,8 @@ def test_the_work_page_shows_the_controls_and_the_last_press(tmp_path, monkeypat
     client = _client(app)
     _post(client, "close")
     (press,) = app.state.control_db.load_work_actions(WORK.work_id)
-    detail = WorkDetail(card=_work(tmp_path, CLOSABLE, **CLOSED), trace=None,
-                        workspace=None, chats=(), verifications=(), last_action=press)
+    detail = WorkDetail(card=_unstarted(), workspace=None, chats=(), verifications=(),
+                        last_action=press)
 
     status = dict(render_work_sections(app.state.templates, detail))["status"]
 
@@ -654,11 +633,10 @@ def test_the_work_page_shows_merge_when_ready_then_approved_then_cleared(
     app, _gh, _ = _closable_app(tmp_path, monkeypatch)
     from agentdeck.web.work_view import WorkDetail, render_work_sections
 
-    card = _work(tmp_path, _record("In progress"), outcome="running")
+    card = _idle()
 
     def status(**extra):
-        detail = WorkDetail(card=card, trace=None, workspace=None, chats=(), verifications=(),
-                            **extra)
+        detail = WorkDetail(card=card, workspace=None, chats=(), verifications=(), **extra)
         return dict(render_work_sections(app.state.templates, detail))["status"]
 
     offered = status(approval="offered")
@@ -675,20 +653,19 @@ def test_the_work_page_shows_merge_when_ready_then_approved_then_cleared(
 
 
 def _retry_app(tmp_path, monkeypatch):
-    """A real Needs retry Work: a dispatch park the engine will not retry by itself."""
-    from test_work_ui import _app, _board, _card
+    """A real Needs retry Work: its worker chat stopped, and nothing restarts it by itself."""
+    from test_work_ui import WORK as UI_WORK
+    from test_work_ui import _add, _app, _attention, _insight
 
     from agentdeck.web import routes_works
 
-    card = _card(status="Blocked", status_role="blocked", generation="gen-2",
-                 dispatch_failed=True, dispatch_failed_at=AT,
-                 state_path=str(tmp_path / "instances" / "agentdeck" / "state.json"),
-                 state_key="agentdeck#2147")
-    app = _app(tmp_path, board=_board(card))
+    app = _app(tmp_path)
+    worker = _add(app, "claude_code:test:worker", UI_WORK, title="Worker chat")
+    _attention(app, _insight(worker, "stalled"))
     monkeypatch.setattr(routes_works.shutil, "which", lambda name: "/usr/bin/gh")
     gh = _Gh()
     monkeypatch.setattr(gh_cli, "run_once", gh)
-    return app, gh, card
+    return app, gh, worker
 
 
 async def _no_overflow(page, width: int, scope: str = "main") -> None:
@@ -754,7 +731,7 @@ async def test_a_needs_you_row_carries_no_action_and_swaps_in_place(
     from test_work_ui import WORK as UI_WORK
     from test_work_ui import _add
 
-    app, gh, _card = _retry_app(tmp_path, monkeypatch)
+    app, gh, _worker = _retry_app(tmp_path, monkeypatch)
     await app.state.work_overview.refresh()
     async with _live_server(app) as base, async_playwright() as playwright:
         browser = await playwright.chromium.launch()
@@ -796,10 +773,9 @@ def _retry_chat_app(tmp_path, monkeypatch):
     from test_work_ui import WORK as UI_WORK
     from test_work_ui import _add
 
-    app, gh, card = _retry_app(tmp_path, monkeypatch)
-    worker = _add(app, "claude_code:test:worker", UI_WORK)
+    app, gh, worker = _retry_app(tmp_path, monkeypatch)
     manual = _add(app, "claude_code:test:manual")
-    return app, UI_WORK, worker, manual, card
+    return app, UI_WORK, worker, manual, gh
 
 
 @pytest.mark.asyncio
@@ -869,64 +845,13 @@ def test_chat_work_actions_drops_links_to_the_same_chat_and_adds_pause(tmp_path)
 # --- a press acted on reads in the past tense (#2460) -------------------------------------------
 
 
-def test_a_merge_press_reads_as_done_once_the_work_merged(tmp_path):
+def test_a_merge_press_reads_as_done_once_the_work_merged():
     """issues#485: a press's receipt reads in the past tense once it was acted on."""
-    from types import SimpleNamespace
-
-    from agentdeck.run_trace import RunSession
     from agentdeck.web.work_view import WorkDetail
 
-    work = _work(tmp_path, _record("In review"))
-
-    def detail(bound_ago_s, *, action, card=work):
-        bound = datetime.now(UTC) - timedelta(seconds=bound_ago_s)
-        session = RunSession("c:a:w", "c:a:w", "claude_code", "a", bound)
-        trace = SimpleNamespace(current=SimpleNamespace(sessions=(session,)))
-        return WorkDetail(card, trace, None, (), (), last_action=action)
-
     merge = _press("merge", ago_s=3000)
-    assert detail(2900, action=merge).last_action_followed == ""
-    merged = replace(work, deploying=True)
-    assert detail(2900, action=merge, card=merged).last_action_followed == "Merge asked; merged"
+    open_ = WorkDetail(_idle(), None, (), (), last_action=merge)
+    merged = WorkDetail(_idle(rows={PR.lower(): _row("merged")}), None, (), (), last_action=merge)
 
-
-@pytest.mark.browser
-@pytest.mark.asyncio
-async def test_a_red_run_on_an_old_head_leaves_the_work_page_ready_for_merge(
-    tmp_path, monkeypatch
-):
-    """issues#485 (#2460): the page said Needs retry, Verification failed and "Look at the
-    verification" beside "CI passed". A red run on a head the pull request moved past, with
-    Drone green on the new one, is now ready for a person to merge on GitHub (#3025); the old
-    failure stays in Result, muted and naming the new head."""
-    from conftest import async_playwright
-    from test_web import _live_server
-    from test_work_attention import OLDER, _ci, _red
-
-    run_id = _work(tmp_path, _record("In review"), reviewer=_reviewer([KEY])).run_id
-    app, _gh, _holder = _route_app(
-        tmp_path, monkeypatch, _record("In review"), reviewer=_reviewer([KEY]),
-        verifications=_red(run_id, OLDER), ci=_ci("green"),
-    )
-    screenshot_dir = os.environ.get("AGENTDECK_SCREENSHOT_DIR")
-    async with _live_server(app) as base, async_playwright() as playwright:
-        browser = await playwright.chromium.launch()
-        context = await browser.new_context(
-            viewport={"width": 390, "height": 900}, service_workers="block"
-        )
-        page = await context.new_page()
-        await page.goto(base + work_href(WORK.work_id))
-        status = page.locator("#work-status .wd-op")
-        await status.wait_for()
-        assert await status.get_attribute("data-op-category") == "ready_for_merge"
-        assert await page.locator('#work-status [data-front-action="review"]').count() == 1
-        head = await page.locator("#work-status .wd-status-head").text_content()
-        assert "Ready for you to merge" in head
-        red = page.locator("#work-result .wk-verify.is-failed.is-superseded")
-        assert "the pull request's head is now" in await red.text_content()
-        await _no_overflow(page, 390, "#work-status")
-        if screenshot_dir:
-            await page.locator("main.work-main").screenshot(
-                path=str(Path(screenshot_dir) / "issue-2460-work-red-old-head-390.png")
-            )
-        await browser.close()
+    assert open_.last_action_followed == ""
+    assert merged.last_action_followed == "Merge asked; merged"

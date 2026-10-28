@@ -17,7 +17,6 @@ import json
 import re
 import runpy
 import sys
-from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -27,7 +26,6 @@ from agentdeck.poller_engine import __main__ as cli
 from agentdeck.poller_engine import config as engine_config
 from agentdeck.poller_engine import cycle as cycle_module
 from agentdeck.poller_engine import extensions
-from agentdeck.poller_engine.ownership import LabelEvent
 
 _MANIFEST = """
 contract = 1
@@ -75,27 +73,6 @@ else:
     sys.exit(2)
 """
 
-# A release gate that reports every watched build green — the extension a project trusts to say
-# whether production actually took the merge.
-_GATE_EXTENSION = """
-from pathlib import Path
-Path(__file__).with_suffix(".ran").write_text("x")
-hook = sys.argv[1] if len(sys.argv) > 1 else ""
-payload = json.loads(sys.stdin.read() or "{}")
-if hook == "hooks":
-    print(json.dumps({"hooks": ["health", "release-gate", "validate-config"]}))
-elif hook == "validate-config":
-    print(json.dumps({"problems": []}))
-elif hook == "release-gate":
-    print(json.dumps({"requests": [
-        {"kind": "release-status", "payload": {"repo": repo, "status": "ok"}}
-        for repo in (payload.get("context") or {}).get("builds") or {}
-    ]}))
-elif hook == "health":
-    print(json.dumps({"health": {"state": "ok"}}))
-else:
-    sys.exit(2)
-"""
 
 _PROPOSAL_EXTENSION = """
 from pathlib import Path
@@ -121,6 +98,10 @@ _MALFORMED_PROPOSAL_EXTENSION = _PROPOSAL_EXTENSION.replace(
     '"repo": "store", "key": ref, "title": ref, "instruction": "fix " + ref',
     '"repo": "store", "title": ref, "instruction": "fix " + ref',
 )
+_QUEUE_WORK_PROPOSAL_EXTENSION = _PROPOSAL_EXTENSION.replace(
+    '"kind": "open-work", "payload": {',
+    '"kind": "queue-work", "payload": {"number": 5, ',
+)
 
 @pytest.fixture(autouse=True)
 def _example_speaks_as_the_agent(tmp_path, monkeypatch):
@@ -128,7 +109,6 @@ def _example_speaks_as_the_agent(tmp_path, monkeypatch):
     accounts = tmp_path / "github-authority.toml"
     accounts.write_text('[owners]\nexample = "agent"\n', encoding="utf-8")
     monkeypatch.setenv("AGENTDECK_GITHUB_AUTHORITY_FILE", str(accounts))
-
 
 
 class _Discovery:
@@ -307,215 +287,29 @@ def test_propose_is_idempotent_before_the_next_wake(tmp_path, monkeypatch, in_pr
     assert "already proposed" in capsys.readouterr().out
 
 
-def test_propose_reports_a_malformed_extension_request_as_failure(
-    tmp_path, monkeypatch, in_process, capsys
+@pytest.mark.parametrize(
+    ("body", "said"),
+    [
+        (_MALFORMED_PROPOSAL_EXTENSION, "malformed proposal request"),
+        # There is no card to queue work on since #3732.
+        (_QUEUE_WORK_PROPOSAL_EXTENSION, "asked to queue work on a card"),
+    ],
+)
+def test_propose_reports_a_request_it_cannot_stage_as_failure(
+    tmp_path, monkeypatch, in_process, capsys, body, said
 ):
     from agentdeck.poller_engine.state import EnginePaths, StateStore
 
-    files = _instance(tmp_path, with_extension=True, body=_MALFORMED_PROPOSAL_EXTENSION)
+    files = _instance(tmp_path, with_extension=True, body=body)
     _activate(files)
     _stub_github(monkeypatch)
 
     assert cli.main(_propose_argv(files)) == 65
     captured = capsys.readouterr()
-    assert "malformed proposal request" in captured.err
+    assert said in captured.err
     assert "already proposed" not in captured.out
     state = StateStore(EnginePaths.from_base(tmp_path / "state.json")).read()
     assert "proposal_inbox" not in state
-
-
-def test_register_worktree_persists_immediately_for_the_active_generation(
-    tmp_path, monkeypatch
-):
-    from agentdeck.poller_engine.state import EnginePaths, StateStore
-
-    state_path = tmp_path / "state.json"
-    store = StateStore(EnginePaths.from_base(state_path))
-    with store.transaction() as state:
-        state["issues"] = {"store#5": {"generation": "gen1"}}
-    path = tmp_path / "repo" / ".worktrees" / "issue-5"
-    monkeypatch.setattr(cli.github, "registered_worktree", lambda value: (path.parent.parent, True))
-
-    code = cli.main([
-        "register-worktree",
-        "--state", str(state_path),
-        "--generation", "gen1",
-        "store", "5", str(path),
-    ])
-
-    assert code == 0
-    assert store.read()["issues"]["store#5"]["worktrees"] == [str(path)]
-
-
-def test_register_worktree_refuses_a_stale_generation_without_mutating_state(
-    tmp_path, monkeypatch
-):
-    from agentdeck.poller_engine.state import EnginePaths, StateStore
-
-    state_path = tmp_path / "state.json"
-    store = StateStore(EnginePaths.from_base(state_path))
-    with store.transaction() as state:
-        state["issues"] = {"store#5": {"generation": "current"}}
-    path = tmp_path / "repo" / ".worktrees" / "issue-5"
-    monkeypatch.setattr(cli.github, "registered_worktree", lambda value: (path.parent.parent, True))
-
-    code = cli.main([
-        "register-worktree",
-        "--state", str(state_path),
-        "--generation", "stale",
-        "store", "5", str(path),
-    ])
-
-    assert code == 75
-    assert "worktrees" not in store.read()["issues"]["store#5"]
-
-
-def test_register_worktree_before_creating_it_says_create_first(tmp_path, capsys):
-    """A worker that registers first hears the directory is missing, and nothing is recorded."""
-    from agentdeck.poller_engine.state import EnginePaths, StateStore
-
-    state_path = tmp_path / "state.json"
-    store = StateStore(EnginePaths.from_base(state_path))
-    with store.transaction() as state:
-        state["issues"] = {"store#5": {"generation": "gen1"}}
-    path = _sibling_worktree(tmp_path).parent / "not-made-yet"
-
-    code = cli.main([
-        "register-worktree",
-        "--state", str(state_path),
-        "--generation", "gen1",
-        "store", "5", str(path),
-    ])
-
-    assert code == 64
-    assert "create it first" in capsys.readouterr().err
-    assert "worktrees" not in store.read()["issues"]["store#5"]
-
-
-def _sibling_worktree(tmp_path):
-    """A real worktree of an `acme/lib` checkout, on its own branch, as a worker makes one."""
-    import subprocess
-
-    env = {"GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null", "HOME": "/x"}
-
-    def git(*args, cwd):
-        subprocess.run(["git", *args], cwd=cwd, env=env, check=True, capture_output=True)
-
-    checkout = tmp_path / "lib"
-    checkout.mkdir()
-    git("init", "-q", "--initial-branch=main", cwd=checkout)
-    git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "0",
-        cwd=checkout)
-    git("remote", "add", "origin", "git@github.com:acme/lib.git", cwd=checkout)
-    path = checkout / ".worktrees" / "agentdeck-5"
-    git("worktree", "add", "-q", "-b", "agent/sibling", str(path), cwd=checkout)
-    return path
-
-
-def _register_with_claim(tmp_path, monkeypatch, answer, *, while_asking=None, already=False):
-    from agentdeck.poller_engine.state import EnginePaths, StateStore
-
-    state_path = tmp_path / "state.json"
-    store = StateStore(EnginePaths.from_base(state_path))
-    path = _sibling_worktree(tmp_path)
-    with store.transaction() as state:
-        state["issues"] = {
-            "store#5": {"generation": "gen1", **({"worktrees": [str(path)]} if already else {})}
-        }
-    sent = []
-
-    def post(_socket, route, body, **_kwargs):
-        sent.append((route, body))
-        if while_asking:
-            while_asking(store, str(path))
-        return answer(str(path))
-
-    monkeypatch.setattr(cli.github, "runtime_post", post)
-    code = cli.main([
-        "register-worktree",
-        "--state", str(state_path),
-        "--generation", "gen1",
-        "--work-id", "github_issue:acme/store#5",
-        "--runtime-socket", "/run/rt.sock",
-        "store", "5", str(path),
-    ])
-    return code, store.read()["issues"]["store#5"].get("worktrees", []), sent, path
-
-
-def test_a_registered_worktree_becomes_the_works_claim(tmp_path, monkeypatch):
-    """#2195: nothing card-level owns a worker's sibling worktree; the Work does."""
-    code, registered, sent, path = _register_with_claim(
-        tmp_path,
-        monkeypatch,
-        lambda wanted: (200, {"outcome": "adopted", "claim": {"path": wanted}}),
-    )
-
-    assert code == 0
-    assert registered == [str(path)]
-    ((route, body),) = sent
-    assert route == "/work-workspaces/ensure"
-    assert body["work_id"] == "github_issue:acme/store#5"
-    assert (body["repository"], body["purpose"], body["branch"]) == (
-        "acme/lib", "implementation", "agent/sibling"
-    )
-    assert body["checkout"] == str(path.parent.parent)
-    # The runtime adopts only what the card registered, so the registration went first.
-    assert body["legacy_paths"] == [str(path)]
-
-
-@pytest.mark.parametrize(
-    "answer, reason",
-    [
-        (
-            lambda _wanted: (200, {"outcome": "reused", "claim": {"path": "/w/lib/.worktrees/x"}}),
-            "already has its acme/lib worktree at /w/lib/.worktrees/x",
-        ),
-        (lambda _wanted: (0, None), "the runtime did not claim it"),
-        (lambda _wanted: (200, {"outcome": "legacy", "claim": None}), "legacy"),
-    ],
-    ids=["second worktree of one repository", "runtime unreachable", "not adoptable"],
-)
-def test_a_worktree_the_runtime_will_not_claim_is_not_left_on_the_card(
-    tmp_path, monkeypatch, capsys, answer, reason
-):
-    code, registered, _sent, _path = _register_with_claim(tmp_path, monkeypatch, answer)
-
-    assert code == 65
-    assert registered == []
-    assert reason in capsys.readouterr().err
-
-
-def test_a_refused_claim_never_erases_a_newer_generations_registration(tmp_path, monkeypatch):
-    """#2215 review: the take-back is fenced like the registration it undoes.
-
-    While the runtime was being asked, a newer generation took the card and registered the
-    same path. The stale command's refusal must leave that registration alone.
-    """
-    from agentdeck.poller_engine import reconcile
-
-    def newer_generation_takes_over(store, path):
-        with store.transaction() as state:
-            state["issues"]["store#5"]["generation"] = "gen2"
-            assert reconcile.register_generation_worktrees(state, "store", 5, "gen2", [path])
-
-    code, registered, _sent, path = _register_with_claim(
-        tmp_path,
-        monkeypatch,
-        lambda _wanted: (0, None),
-        while_asking=newer_generation_takes_over,
-    )
-
-    assert code == 65
-    assert registered == [str(path)]
-
-
-def test_a_refused_claim_never_takes_back_a_registration_it_did_not_add(tmp_path, monkeypatch):
-    code, registered, _sent, path = _register_with_claim(
-        tmp_path, monkeypatch, lambda _wanted: (0, None), already=True
-    )
-
-    assert code == 65
-    assert registered == [str(path)]
 
 
 def test_a_wake_hands_the_cycle_the_extensions_the_manifest_enables(
@@ -558,9 +352,7 @@ def test_the_manifests_control_labels_reach_the_adapter_and_provisioner(
     loaded = engine_config.load(files["manifest"], files["overlay"], files["binding"])
     adapter = cli._adapter(loaded)
     assert adapter.ownership_label == "agent"
-    assert adapter.accepted_ownership_labels == ("agent", "claude")
     assert not hasattr(adapter, "automerge_label")
-    assert adapter.spec_only_label == "spec-only"
 
     paths = EnginePaths.from_base(tmp_path / "state.json")
     steps = cli._provision_steps(loaded, adapter, paths)
@@ -698,64 +490,6 @@ def test_an_extension_whose_manifest_states_no_hooks_runs_refused(tmp_path, monk
     assert "states no hooks" in problems[0].what
 
 
-def test_a_release_gated_on_a_broken_extension_does_not_proceed(tmp_path, monkeypatch):
-    """Case 8. The project named this extension as its source of deploy truth, so a wake that
-    cannot run it has no evidence the deploy went green — and must wait, not fall back to the
-    host as though no gate had ever been enabled."""
-    from agentdeck.poller_engine.ports import DeployState
-    from agentdeck.poller_engine.reconcile import CardSnapshot
-    from agentdeck.poller_engine.state import EnginePaths, StateStore
-
-    files = _instance(tmp_path, with_extension=True, body=_GATE_EXTENSION)
-    _activate(files)
-    # A deployed build that no longer answers at all.
-    _program(tmp_path).write_text("raise SystemExit(1)\n")
-
-    store = StateStore(EnginePaths.from_base(str(tmp_path / "state.json")))
-    with store.transaction() as state:
-        state.update(_watching_a_deploy())
-    # The host would happily call this deploy green. Only the project's own gate may say so.
-    port = FakePort(
-        permissions={"eero": "maintain"},
-        snapshots={"store#5": CardSnapshot(status="In progress")},
-        deploys={"store": DeployState(status="ok", link="https://ci/1")},
-    )
-    _stub_github(monkeypatch, port)
-
-    assert cli.main(_cycle_argv(files)) == 0
-    rec = store.read()["issues"]["store#5"]
-    assert rec.get("awaiting_deploy"), "the release finished without its gate"
-    assert rec["awaiting_deploy"]["builds"]["store"]["status"] == "pending"
-
-
-def _watching_a_deploy() -> dict:
-    """A card merged and waiting on production, the state the deploy gate reads."""
-    since = datetime.now(UTC).isoformat()
-    return {
-        "issues": {
-            "store#5": {
-                "status": "In progress",
-                "mode": "merge",
-                "started": True,
-                "started_at": since,
-                "generation": "gen1",
-                "merge_control": "3",
-                "merged": ["store#7"],
-                "awaiting_deploy": {
-                    "builds": {"store": {"sha": "sha1", "status": "pending"}},
-                    "since": since,
-                },
-            }
-        },
-        "controls": {
-            "3": {
-                "id": "3", "repo": "store", "number": 5, "kind": "merge",
-                "payload": None, "status": "processing", "created_at": "t1",
-            }
-        },
-    }
-
-
 def test_a_project_with_no_extensions_still_wakes(tmp_path, monkeypatch):
     files = _instance(tmp_path, with_extension=False)
     _activate(files)
@@ -784,7 +518,7 @@ def test_the_dry_run_shadow_cycle_sees_the_same_wake_inputs_and_apply_runs_none(
     assert cli.main(common) == 0
     assert len(seen) == 1
     assert [e.name for e in seen[0]["enabled_extensions"]] == ["probe"]
-    assert seen[0]["auto_deploy_repos"] == frozenset({"store"})
+    assert seen[0]["issue_repos"] == frozenset({"store"})
 
     assert cli.main([*common, "--apply", "eero"]) == 0, capsys.readouterr().err
     assert len(seen) == 1, "an apply ran a canary wake"
@@ -872,81 +606,6 @@ def test_an_instance_never_activated_is_left_without_a_health_record(tmp_path, m
     assert not StateStore(EnginePaths.from_base(str(tmp_path / "state.json"))).read()
 
 
-# --- worker control interface (#361) ---
-
-def _worker_argv(files, *operation: str) -> list[str]:
-    return [
-        "worker-control",
-        "--manifest", str(files["manifest"]),
-        "--overlay", str(files["overlay"]),
-        "--binding", str(files["binding"]),
-        *operation,
-    ]
-
-
-def test_worker_control_cli_uses_the_activated_instance_adapter(tmp_path, monkeypatch, capsys):
-    from agentdeck.poller_engine.reconcile import CardSnapshot
-    from agentdeck.poller_engine.state import EnginePaths, StateStore
-
-    files = _instance(tmp_path, with_extension=False)
-    _activate(files)
-    port = FakePort(snapshots={"store#5": CardSnapshot(status="In progress")})
-    _stub_github(monkeypatch, port)
-    store = StateStore(EnginePaths.from_base(tmp_path / "state.json"))
-    with store.transaction() as state:
-        state["issues"] = {"store#5": {"generation": "gen1", "status": "In progress"}}
-
-    body = tmp_path / "body.md"
-    body.write_text("Ready for review")
-    assert cli.main(_worker_argv(
-        files, "finish", "store", "5", "gen1", "in_review", "--body-file", str(body)
-    )) == 0
-    assert [effect.kind.value for effect in port.applied] == ["comment", "set-status"]
-    assert "finished -> In review" in capsys.readouterr().out
-
-
-def test_worker_control_cli_fails_closed_on_a_stale_generation(tmp_path, monkeypatch, capsys):
-    from agentdeck.poller_engine.reconcile import CardSnapshot
-    from agentdeck.poller_engine.state import EnginePaths, StateStore
-
-    files = _instance(tmp_path, with_extension=False)
-    _activate(files)
-    port = FakePort(snapshots={"store#5": CardSnapshot(status="In progress")})
-    _stub_github(monkeypatch, port)
-    store = StateStore(EnginePaths.from_base(tmp_path / "state.json"))
-    with store.transaction() as state:
-        state["issues"] = {"store#5": {"generation": "gen1", "status": "In progress"}}
-
-    assert cli.main(_worker_argv(files, "enabled", "store", "5", "old")) == 1
-    # The CLI prints the specific reason, and a superseded generation is the one case the
-    # word "stale" belongs to (#1651).
-    assert "stale: this generation has been superseded" in capsys.readouterr().out
-    assert port.applied == []
-
-
-def test_worker_control_cli_confirms_a_reportless_handoff(tmp_path, monkeypatch, capsys):
-    from agentdeck.poller_engine.reconcile import CardSnapshot
-    from agentdeck.poller_engine.state import EnginePaths, StateStore
-
-    files = _instance(tmp_path, with_extension=False)
-    _activate(files)
-    port = FakePort(snapshots={"store#5": CardSnapshot(status="In progress")})
-    _stub_github(monkeypatch, port)
-    store = StateStore(EnginePaths.from_base(tmp_path / "state.json"))
-    with store.transaction() as state:
-        state["issues"] = {
-            "store#5": {
-                "generation": "gen2",
-                "reportless_resolved": "gen1",
-                "status": "In progress",
-            }
-        }
-
-    assert cli.main(_worker_argv(files, "enabled", "store", "5", "gen1")) == 1
-    assert "handed to a new worker after a turn ended without a report" in capsys.readouterr().out
-    assert port.applied == []
-
-
 def _preview_argv(files) -> list[str]:
     return [
         "activate",
@@ -958,89 +617,27 @@ def _preview_argv(files) -> list[str]:
 
 
 def test_a_preview_leaves_durable_state_exactly_as_it_found_it(tmp_path, monkeypatch, capsys):
-    """#109 says nothing before the human gate changes anything. It used to, invisibly.
+    """#109 says nothing before the human gate changes anything.
 
     `_ShadowPort` intercepts `apply`, which covers every *external* write because they all leave
     through that one chokepoint. Durable state never passes through it — `store.transaction()`
-    saves on clean exit — so the shadow wake advanced the ownership ledger and consumed the very
-    starts it was reporting.
+    saves on clean exit — so the shadow wake runs against a scratch copy.
     """
     files = _instance(tmp_path, with_extension=False)
-    port = FakePort(
-        permissions={"eero": "maintain"},
-        labelled=["store#5"],
-        label_events={"store#5": ["e1"]},
-    )
-    _stub_github(monkeypatch, port)
+    _stub_github(monkeypatch, FakePort(permissions={"eero": "maintain"}))
 
     state = tmp_path / "state.json"
     state.parent.mkdir(parents=True, exist_ok=True)
     before = json.dumps({"schema_version": 1, "data": {
-        "ownership": {"initialized": True, "events": {}},
-        "issues": {},
+        "issues": {"store#5": {"status": "In progress"}},
     }}, indent=2)
     state.write_text(before)
-
-    assert cli.main(_preview_argv(files)) == 0
-    shown = json.loads(capsys.readouterr().out)["dry_run"]
-    # The preview still saw the real world and reported the start it would make.
-    assert shown["shadow"]["would_dispatch"] == ["store#5"]
-    # And changed nothing: byte-for-byte, including the ownership ledger it walked.
-    assert state.read_text() == before
-
-
-def test_previewing_twice_reports_the_same_thing_both_times(tmp_path, monkeypatch, capsys):
-    """The symptom that exposed it: the second preview came back empty, and the fingerprint
-    moved, purely because the first run had eaten the starts."""
-    files = _instance(tmp_path, with_extension=False)
-    port = FakePort(
-        permissions={"eero": "maintain"},
-        labelled=["store#5"],
-        label_events={"store#5": ["e1"]},
-    )
-    _stub_github(monkeypatch, port)
-    state = tmp_path / "state.json"
-    state.parent.mkdir(parents=True, exist_ok=True)
-    state.write_text(json.dumps({"schema_version": 1, "data": {
-        "ownership": {"initialized": True, "events": {}}, "issues": {},
-    }}))
 
     assert cli.main(_preview_argv(files)) == 0
     first = json.loads(capsys.readouterr().out)["dry_run"]
     assert cli.main(_preview_argv(files)) == 0
     second = json.loads(capsys.readouterr().out)["dry_run"]
 
-    assert first["shadow"] == second["shadow"] == {
-        # Dispatch writes the board status and nothing else: the card is claimed in the
-        # engine's own state, so no label edit is ever previewed (#2053).
-        "would_apply": ["set-status"],
-        "would_dispatch": ["store#5"],
-    }
-
-
-def test_preview_names_labelled_cards_that_would_be_adopted_without_dispatch(
-    tmp_path, monkeypatch, capsys
-):
-    files = _instance(tmp_path, with_extension=False)
-    port = FakePort(
-        permissions={"eero": "maintain"},
-        labelled=["store#5"],
-        label_events={"store#5": [LabelEvent("old", "2026-07-20T12:00:00Z")]},
-    )
-    _stub_github(monkeypatch, port)
-    state = tmp_path / "state.json"
-    state.parent.mkdir(parents=True, exist_ok=True)
-    state.write_text(json.dumps({"schema_version": 1, "data": {
-        "ownership": {
-            "initialized": True,
-            "events": {},
-            "last_complete_scan_at": "2026-07-25T11:59:00+00:00",
-        },
-        "issues": {},
-    }}))
-
-    assert cli.main(_preview_argv(files)) == 0
-    shown = json.loads(capsys.readouterr().out)["dry_run"]
-
-    assert shown["shadow"]["would_dispatch"] == []
-    assert shown["shadow"]["would_suppress"] == ["store#5"]
+    # The engine holds no cards (#3732): nothing to dispatch, nothing to write.
+    assert first["shadow"] == second["shadow"] == {"would_apply": []}
+    assert state.read_text() == before

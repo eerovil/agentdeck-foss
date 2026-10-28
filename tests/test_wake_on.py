@@ -1223,7 +1223,7 @@ def test_the_next_step_request_names_the_time_wait():
 
 
 def test_the_session_guide_offers_the_wait_next_to_the_no_polling_rule():
-    for role in ("primary", "delegated", "kanban"):
+    for role in ("primary", "delegated", "work"):
         flat = " ".join(agentdeck_session_instructions(provider="claude_code", role=role).split())
         assert "`POST $AGENTDECK_URL/api/sessions/<session-key>/wake-on`" in flat
         assert '{"pull_request": "<owner/repo#number>"}' in flat

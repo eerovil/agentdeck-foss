@@ -4,18 +4,15 @@ from __future__ import annotations
 
 import json
 import os
-import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 from conftest import async_playwright
 from fastapi.testclient import TestClient
-from public_copy import private_feature
 from test_web import _live_server
 
-from agentdeck import poller_nudge, poller_ops
-from agentdeck import poller_nudge as _poller_nudge
+from agentdeck import poller_ops
 from agentdeck.poller_engine import health as engine_health
 from agentdeck.poller_engine.state import EnginePaths, StateStore
 
@@ -296,96 +293,29 @@ def test_an_unknown_control_is_refused(app_client):
     assert state_file.read_bytes() == before
 
 
-# --- the ChatGPT PR-review nudge, seen and pressed from the page (#1584) ---
-
-def _install_nudge(root, name="reference", *, program=True):
-    base = Path(root) / "instances" / name
-    base.mkdir(parents=True, exist_ok=True)
-    (base / "poller.toml").write_text(
-        'contract = 1\n\n[extensions.chatgpt-nudge]\ntask = "AgentDeck PR Review"\n'
-    )
-    lines = ["[extensions.chatgpt-nudge]", f'state_file = "{base / "chatgpt-nudge.json"}"']
-    if program:
-        lines.append(f'nudge_program = "{Path(root) / "click.sh"}"')
-    (base / "overlay.toml").write_text("\n".join(lines) + "\n")
-    return base
+# --- the ChatGPT PR-review row went with the chatgpt-nudge extension (#3741) ---
 
 
-@private_feature(_poller_nudge)
-def test_the_page_says_when_the_chatgpt_task_was_last_nudged(app_client):
-    """The `last_nudge` number used to exist only inside the extension's state file (#1584)."""
-    client, root = app_client
-    _seed(root, at=datetime.now(UTC))
-    base = _install_nudge(root)
-    (base / "chatgpt-nudge.json").write_text(
-        json.dumps({"last_nudge": time.time() - 900, "seen": {}})
-    )
-
-    body = client.get("/pollers").text
-    assert "ChatGPT PR review" in body
-    assert "AgentDeck PR Review" in body
-    assert "15m ago" in body
-    assert "/pollers/reference/extensions/chatgpt-nudge" in body
-
-
-def test_an_instance_with_no_chatgpt_task_says_nothing_about_one(app_client):
+def test_the_page_has_no_chatgpt_review_row_and_no_press_route(app_client):
     client, root = app_client
     _seed(root, at=datetime.now(UTC))
     assert "ChatGPT PR review" not in client.get("/pollers").text
+    assert client.post("/pollers/reference/extensions/chatgpt-nudge").status_code in {404, 405}
 
 
-@private_feature(_poller_nudge)
-def test_pressing_run_now_launches_the_click_and_records_it(app_client, monkeypatch):
-    client, root = app_client
-    _seed(root, at=datetime.now(UTC))
-    base = _install_nudge(root)
-    launched = []
-
-    def launch(argv, receipt, unit):
-        launched.append((argv, receipt, unit))
-        return True
-
-    monkeypatch.setattr(poller_nudge, "_launch", launch)
-    # The launch was a stub, so no unit by that name exists. The page this press renders is a
-    # fresh read, and that read asks systemd — so hold the run open by answering for it, on the
-    # module the reader really asks (#2011). Patching the facade name instead left the answer to
-    # whatever `systemctl --user` said on the host: "inactive" where it works, "cannot say" on a
-    # cluster pod, and only the second of those happens to say a run is still out there.
-    monkeypatch.setattr(poller_nudge._core, "unit_active", lambda unit: True)
-
-    response = client.post("/pollers/reference/extensions/chatgpt-nudge")
-
-    assert response.status_code == 200
-    assert launched and launched[0][0][-1] == "AgentDeck PR Review"
-    assert json.loads((base / "chatgpt-nudge-manual.json").read_text())["at"] > 0
-    # Launching is not clicking, so while that unit is alive the fragment says so.
-    assert "A nudge is running now" in response.text
-
-
-@private_feature(_poller_nudge)
-def test_a_refused_press_is_a_sentence_on_the_page_not_a_failure(app_client):
-    client, root = app_client
-    _seed(root, at=datetime.now(UTC))
-    _install_nudge(root, program=False)
-
-    response = client.post("/pollers/reference/extensions/chatgpt-nudge")
-
-    assert response.status_code == 200
-    assert "nudge_program" in response.text
-
-
-def test_a_queue_and_a_worker_are_visible(app_client):
+def test_old_card_records_and_commands_add_no_rows(app_client):
+    """The poller holds no cards since #3732; what an old state file still holds is history."""
     client, root = app_client
     _seed(
         root,
         at=datetime.now(UTC),
-        issues={"store#5": {"status": "In progress"}},
+        issues={"store#5": {"status": "In progress", "blocked_by": ["store#4"]}},
         controls={"9": {"id": "9", "repo": "store", "number": 5, "kind": "claude",
                         "status": "queued", "created_at": "t"}},
     )
     body = client.get("/pollers").text
-    assert "store#5" in body
-    assert "1 queued command" in body
+    assert "queued command" not in body
+    assert "<strong>Working:</strong>" not in body and "Blocked:" not in body
 
 
 def test_each_poller_shows_its_board_issues_and_statuses_from_the_shared_read_model(
@@ -468,11 +398,10 @@ def test_an_unavailable_issue_read_is_shown_as_incomplete_not_as_an_empty_board(
 
     body = client.get("/pollers").text
 
-    assert "Board · 1 issue" in body
     assert "incomplete" in body
     assert "Missing issues are unknown, not absent." in body
-    assert "shop/store#5" in body and "Todo" in body
-    assert 'href="https://github.com/shop/store/issues/5"' in body
+    # An old card record in state is not an issue the read found (#3741).
+    assert "shop/store#5" not in body
 
 
 @pytest.mark.browser
@@ -594,45 +523,6 @@ async def test_the_board_expands_without_overflow_at_desktop_and_mobile(app_clie
             assert page.url == "https://github.com/shop/store/issues/6"
             await page.close()
         await browser.close()
-
-
-def test_a_card_waiting_on_a_dependency_says_what_it_waits_for(app_client):
-    client, root = app_client
-    _seed(
-        root,
-        at=datetime.now(UTC),
-        issues={"store#5": {"status": "Todo", "manual_start": True,
-                            "blocked_by": ["store#4"]}},
-    )
-    body = client.get("/pollers").text
-    assert "Blocked:" in body
-    assert "store#5" in body and "store#4" in body
-
-
-def test_a_card_left_holding_a_stale_overlap_key_is_not_shown_as_blocked(app_client):
-    """#2081: the file-overlap gate is gone, so its leftover key is not a blocker.
-
-    A record written by the old engine can still carry ``blocked_by_overlap`` until the state
-    migration runs. Nothing reads it any more, and a card wearing one is an ordinary waiting
-    card — showing it as blocked would name a hold that no wake will ever clear.
-    """
-    client, root = app_client
-    _seed(
-        root,
-        at=datetime.now(UTC),
-        issues={"store#5": {
-            "status": "Todo", "started": True, "pending": ["1"],
-            "blocked_by_overlap": {"owner": "store#4", "paths": ["src/agentdeck/app.py"]},
-        }},
-    )
-    body = client.get("/pollers").text
-    assert "Blocked:" not in body
-
-
-def test_a_poller_with_no_dependency_adds_no_row_for_one(app_client):
-    client, root = app_client
-    _seed(root, at=datetime.now(UTC), issues={"store#5": {"status": "Todo"}})
-    assert "Blocked:" not in client.get("/pollers").text
 
 
 # --- the Builder launch (#181) ---
@@ -1046,99 +936,4 @@ def test_saving_nothing_is_refused_rather_than_clearing_the_account(accounts_cli
     assert "choose the account" in response.text
     assert _overlay(root) == _OVERLAY
 
-@private_feature(_poller_nudge)
-def test_the_page_names_a_pull_request_whose_review_did_not_happen(app_client):
-    """A review that achieved nothing must not read like one that passed (#1876).
 
-    The extension's own bookkeeping is the source: the page reads the state file it already
-    reads for the nudge line, so there is one account of what happened and not two.
-    """
-    client, root = app_client
-    _seed(root, at=datetime.now(UTC))
-    base = _install_nudge(root)
-    (base / "chatgpt-nudge.json").write_text(
-        json.dumps(
-            {
-                "last_nudge": time.time() - 60,
-                "awaiting": {
-                    "eerovil/agentdeck#1874": {
-                        "sha": "c2f", "repository": "eerovil/review-chats", "chat": 86,
-                    }
-                },
-                "review_misses": {
-                    "eerovil/agentdeck#1873": {
-                        "sha": "77d", "count": 1, "why": "the run said it took no action",
-                    },
-                    "eerovil/agentdeck#1871": {
-                        "sha": "342", "count": 3, "why": "the run said it took no action",
-                    },
-                },
-            }
-        )
-    )
-
-    text = client.get("/pollers").text
-
-    assert "Reviewed nothing:" in text
-    assert "eerovil/agentdeck#1873" in text
-    assert "asking again (1 so far)" in text
-    # Three tries is where it stops, and the page says that rather than looking the same.
-    assert "asked 3 times, not asking again" in text
-    assert "eerovil/agentdeck#1874" in text
-    assert "waiting on chat #86" in text
-
-
-def test_an_instance_whose_reviews_all_settled_says_nothing_extra(app_client):
-    """Mobile cannot spare the height for a list that is empty on a good day."""
-    client, root = app_client
-    _seed(root, at=datetime.now(UTC))
-    base = _install_nudge(root)
-    (base / "chatgpt-nudge.json").write_text(
-        json.dumps({"last_nudge": time.time() - 60, "seen": {"eerovil/agentdeck#1873": "77d"}})
-    )
-
-    text = client.get("/pollers").text
-
-    assert "Reviewed nothing:" not in text
-    assert "Asked for, not answered yet:" not in text
-    assert "Parked, nothing will merge it:" not in text
-
-
-@private_feature(_poller_nudge)
-def test_the_page_names_a_pull_request_nothing_is_going_to_merge(app_client):
-    """The state PRs 1870 and 1884 came to rest in, which nothing used to say out loud (#1892).
-
-    Read off the same state file as the lines above, because a reviewed-and-unmerged pull
-    request is not a review failure or a worker failure and nothing else owns noticing it.
-    """
-    client, root = app_client
-    _seed(root, at=datetime.now(UTC))
-    base = _install_nudge(root)
-    (base / "chatgpt-nudge.json").write_text(
-        json.dumps(
-            {
-                "last_nudge": time.time() - 60,
-                "stalled": {
-                    "eerovil/agentdeck#1870": {
-                        "sha": "ab7",
-                        "why": "reviewed, up to date with its base, and still not merged",
-                        "advances": 0,
-                    },
-                    "eerovil/agentdeck#1884": {
-                        "sha": "91c",
-                        "why": "brought forward 3 times and still not merged — "
-                               "nothing here will move it again",
-                        "advances": 3,
-                    },
-                },
-            }
-        )
-    )
-
-    text = client.get("/pollers").text
-
-    assert "Parked, nothing will merge it:" in text
-    assert "eerovil/agentdeck#1870" in text
-    assert "reviewed, up to date with its base, and still not merged" in text
-    assert "eerovil/agentdeck#1884" in text
-    assert "brought forward 3 times and still not merged" in text

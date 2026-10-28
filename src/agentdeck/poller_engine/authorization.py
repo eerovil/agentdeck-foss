@@ -86,6 +86,15 @@ OWNERSHIP_TIER = Tier.WORK
 #     logins = ["my-review-app[bot]"]
 #
 # With none listed no account holds this grant: it is not a default anyone gets.
+def is_bot_login(login: object) -> bool:
+    """True for a login GitHub only ever gives an app: the ``[bot]`` suffix.
+
+    The suffix is all some reads carry — there is no user object to read a type off — so this
+    is the one question askable everywhere a login is known.
+    """
+    return str(login or "").endswith("[bot]")
+
+
 def reviewer_logins() -> frozenset[str]:
     from . import github_authority
 

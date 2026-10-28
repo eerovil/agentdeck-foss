@@ -142,35 +142,41 @@ async def test_clean_first_message_failure_retries_existing_rollover_target(tmp_
 
 
 
-async def test_kanban_role_is_persisted_and_sent_to_new_thread(tmp_path):
+async def test_the_role_is_persisted_and_sent_to_new_thread(tmp_path):
     client = _client()
     host = CodexWorkerHost(_account(tmp_path), client, state_dir=tmp_path / "state")
 
     result = await host.deliver(
-        "owner/repo#1", "inspect", cwd=str(tmp_path), role="kanban", delegated=True
+        "owner/repo#1", "inspect", cwd=str(tmp_path), role="work", delegated=True
     )
 
     assert result.accepted
-    assert host._records["owner/repo#1"].role == "kanban"
+    assert host._records["owner/repo#1"].role == "work"
     client.create_thread.assert_awaited_once_with(
         tmp_path,
         model=None,
-        role="kanban",
+        role="work",
         session_token=host._records["owner/repo#1"].session_token,
     )
+    # A thread recorded under the poller's retired kanban role (#3741) loads as primary.
+    state = json.loads(host._state_path.read_text())
+    state["workers"][0]["role"] = "kanban"
+    host._state_path.write_text(json.dumps(state))
+    reloaded = CodexWorkerHost(_account(tmp_path), client, state_dir=tmp_path / "state")
+    assert reloaded.worker_role("owner/repo#1") == "primary"
 
 
 async def test_artifact_rollout_configures_an_existing_codex_thread_before_followup(tmp_path):
     client = _client()
     host = CodexWorkerHost(_account(tmp_path), client, state_dir=tmp_path / "state")
     await host.deliver(
-        "owner/repo#1", "first", cwd=str(tmp_path), role="kanban", delegated=True
+        "owner/repo#1", "first", cwd=str(tmp_path), role="delegated", delegated=True
     )
 
     result = await host.deliver(
         "owner/repo#1",
         "next",
-        role="kanban",
+        role="delegated",
         delegated=True,
         command_artifacts={"mode": "observe"},
     )
@@ -188,7 +194,7 @@ async def test_artifact_rollout_configures_an_existing_codex_thread_before_follo
     await host.deliver(
         "owner/repo#1",
         "enforce now",
-        role="kanban",
+        role="delegated",
         delegated=True,
         command_artifacts={"mode": "enforce", "visible_tool_result_chars": 1600},
     )
@@ -567,7 +573,7 @@ async def test_codex_thread_started_before_a_guide_edit_is_refreshed_once(tmp_pa
         cwd="/work",
         delivery_id="delivery-1",
         delegated=True,
-        role="kanban",
+        role="delegated",
         session_token="token-1",
     )
 
@@ -586,7 +592,7 @@ async def test_codex_thread_started_before_a_guide_edit_is_refreshed_once(tmp_pa
         cwd="/work",
         delivery_id="delivery-2",
         delegated=True,
-        role="kanban",
+        role="delegated",
     )
 
     refreshed = client.queue_turn.await_args.args[1]
@@ -594,7 +600,7 @@ async def test_codex_thread_started_before_a_guide_edit_is_refreshed_once(tmp_pa
     # The operator's own turn survives the prefix intact.
     assert strip_session_guide(refreshed) == "follow up"
     # And it is this thread's own guide, not the generic one: role is part of it.
-    assert "Session role: kanban worker" in refreshed
+    assert "Session role: delegated worker" in refreshed
 
     await revived.deliver(
         "owner/repo#12",
@@ -602,7 +608,7 @@ async def test_codex_thread_started_before_a_guide_edit_is_refreshed_once(tmp_pa
         cwd="/work",
         delivery_id="delivery-3",
         delegated=True,
-        role="kanban",
+        role="delegated",
     )
     assert client.queue_turn.await_args.args[1] == "third"
 

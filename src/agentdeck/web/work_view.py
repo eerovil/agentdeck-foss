@@ -50,15 +50,6 @@ from ..providers.claude_code.auth import looks_like_auth_failure
 from ..quota_retry import QUOTA_RETRY_ID_PREFIX
 from ..quota_retry import message_id_for as quota_retry_message_id
 from ..review_refs import review_target
-from ..run_trace import (
-    RunTrace,
-    build_run_trace,
-    current_run_traces,
-    gather_run_trace,
-    read_current_executions,
-    read_evidence_since,
-    read_outcomes,
-)
 from ..runtime_feed import RUNTIME_TOPIC
 from ..staging_deploys import staging_copy
 from ..state import REVIEWS_TOPIC, chat_topic
@@ -83,12 +74,10 @@ from ..work_attention import (
     operator_attention,
 )
 from ..work_facts import (
-    DEPLOY_GRACE,
     FINISH_SLACK,
     Registration,
     WorkFacts,
     awaiting_finish,
-    deploy_due,
     discovery_urls,
     pull_identity,
     pull_state,
@@ -96,12 +85,10 @@ from ..work_facts import (
 )
 from ..work_hidden import HiddenWork, still_hidden
 from ..work_overview import (
-    CHANGES_GRACE,
     CONTINUED_GRACE,
     MAX_DASHBOARD_WORKS,
     RECENT_CHAT,
     RECENT_WORK,
-    BoardSummary,
     OtherChat,
     UnplacedChat,
     WorkAttention,
@@ -116,7 +103,6 @@ from ..work_overview import (
     front_page_works,
     in_inventory,
     other_activity,
-    summarize_board,
     unplaced_chats,
     unstarted_issues,
     work_candidates,
@@ -183,7 +169,7 @@ def _per_pass(key: tuple, read: Callable[[], Any]) -> Any:
 
 
 def _switched(app: Any, repository: str) -> bool:
-    """Whether the deck runs ``repository``'s Works itself (manifest ``works_router``)."""
+    """Whether the deck runs ``repository``'s Works itself: a poller manifest declares it."""
     switched = getattr(getattr(app.state, "work_router", None), "switched", None)
     if switched is None:
         return False
@@ -270,17 +256,15 @@ def _db_path(app: Any) -> str | None:
 _PENDING_JOB_STATES = frozenset({"queued", "running"})
 
 
-async def current_work_ids(app: Any, queue: Sequence[dict]) -> frozenset[str]:
-    """Works with current evidence the Poller board cannot show (#2201).
+# How long after an ended turn its uncollected background commands still count as the chat's
+# next step (#2890). A command that never finishes (a server left running) must not hold the
+# Work forever.
+BACKGROUND_HOLD = timedelta(hours=2)
 
-    A Runtime execution that may still be running, or a verification queued or running. Read
-    from the store and the queue already in hand; nothing here records an observation.
-    """
-    db_path = _db_path(app)
-    executing = (
-        await asyncio.to_thread(read_current_executions, db_path) if db_path is not None else None
-    )
-    named = list(executing or ()) + [
+
+async def current_work_ids(app: Any, queue: Sequence[dict]) -> frozenset[str]:
+    """Works with a verification queued or running (#2201), read from the queue in hand."""
+    named = [
         str(job.get("work_id") or "")
         for job in queue
         if job.get("purpose") == verification.PURPOSE
@@ -291,17 +275,13 @@ async def current_work_ids(app: Any, queue: Sequence[dict]) -> frozenset[str]:
     return frozenset(ref.work_id for ref in refs if ref is not None)
 
 
-def _read_stores(
+def _read_claims(
     db_path: str | Path | None, work_ids: Sequence[str]
-) -> tuple[dict[str, tuple[Any, list[WorkspaceClaim] | None]], datetime | None]:
-    """Each Work's execution outcomes and workspace claims, and when the Runtime began
-    recording Run facts, read-only, in one thread hop."""
+) -> dict[str, list[WorkspaceClaim] | None]:
+    """Each Work's workspace claims, read-only, in one thread hop."""
     if db_path is None:
-        return {work_id: ([], []) for work_id in work_ids}, None
-    return {
-        work_id: (read_outcomes(db_path, work_id), read_claims(db_path, work_id))
-        for work_id in work_ids
-    }, read_evidence_since(db_path)
+        return {work_id: [] for work_id in work_ids}
+    return {work_id: read_claims(db_path, work_id) for work_id in work_ids}
 
 
 def _board_and_backlog(app: Any) -> tuple[Any, Any]:
@@ -424,9 +404,6 @@ class _Pass:
     open_reviews: dict[tuple[str, int], tuple[OpenReview, ...]] = field(default_factory=dict)
     # The review chats that escalated to the owner, keyed the same way (#3216).
     escalated_reviews: dict[tuple[str, int], EscalatedReview] = field(default_factory=dict)
-    # The open chats that wait on a person, by casefolded ``owner/repo#number`` (#2442): the
-    # chat board's rows in memory, no GitHub call.
-    chat_holds: dict[str, tuple[str, ...]] = field(default_factory=dict)
     # Each visible Deckhand card's rendered attention state, by session key: one walk of the
     # insights per pass, not one per Work card (#2841).
     insight_states: dict[str, str] = field(default_factory=dict)
@@ -442,10 +419,10 @@ def _cached_issues(
 ) -> dict[str, dict]:
     """Each candidate's cached issue record, in one local metadata-cache read (#2219).
 
-    Every Work asks, card or no card: the record is the issue's title after it closes, and
-    its ``closedAt`` finishes a Work whose card the engine has not moved yet (#2226). No
-    GitHub call is made; a Work the deck never resolved simply has no record. ``strict``
-    raises a failed read rather than answering with no records (#3553).
+    Every Work asks: the record is the issue's title after it closes, and its ``closedAt``
+    finishes the Work (#2226). No GitHub call is made; a Work the deck never resolved simply
+    has no record. ``strict`` raises a failed read rather than answering with no records
+    (#3553).
     """
     issues = getattr(app.state, "issues", None)
     lookup = getattr(issues, "cached_issues", None)
@@ -577,7 +554,6 @@ def gather_pass(app: Any, reads: _PassReads | None = None) -> _Pass:
         chat_reviews=_chat_reviews(app, reads.review_heads),
         open_reviews=_open_reviews(app, reads.review_heads),
         escalated_reviews=_escalated_reviews(app, reads.review_heads),
-        chat_holds=_chat_holds(app),
         insight_states=assistant_insight_states(assistant) if assistant is not None else {},
         pending_message_ids=reads.pending_message_ids,
         message_handoffs=reads.message_handoffs,
@@ -797,30 +773,6 @@ def _escalated_reviews(
     return found
 
 
-def _chat_holds(app: Any) -> dict[str, tuple[str, ...]]:
-    """The labels each open chat waits on a person with, by casefolded chat ref (#2442).
-
-    A review chat marked ``blocked`` or ``needs-more-info`` is not a review running, though
-    the instance's reviewer keeps waiting on it. Only an open row counts, and a chat the board
-    holds no row for is unknown, never held.
-    """
-    service = chat_board_service(app.state)
-    if service is None:
-        return {}
-    try:
-        rows = list(service.board.rows.values())
-    except Exception:  # noqa: BLE001 -- an unreadable board holds nothing, as before
-        logger.debug("chat board unreadable for the Work overview", exc_info=True)
-        _degraded("chat_holds")
-        return {}
-    found: dict[str, tuple[str, ...]] = {}
-    for row in rows:
-        held = tuple(label for label in NEEDS_YOU_LABELS if label in row.labels)
-        if row.state == "open" and held:
-            found[f"{service.repository}#{row.number}".casefold()] = held
-    return found
-
-
 def _custom_titles(app: Any) -> dict[str, str]:
     """The names the operator gave Works on this deck (#2328); none is the derived title."""
     control = getattr(app.state, "control_db", None)
@@ -867,14 +819,12 @@ def start_chat_title(snapshot: Any, work_id: str) -> str:
 
 # --- one Work card, rebuilt only when what it reads moved (ADR 0007, #2865) ------------------
 
-# A card and the front page derive a few states from the clock: a review's grace for a fix
-# round, a deploy's grace, a finished Work coming back, the recent windows. Each ends this
+# A card and the front page derive a few states from the clock: a finished Work coming back,
+# the recent windows. Each ends this
 # long after a stamp the card or its facts carry, so a reused card is only reused until the
 # earliest such moment — a deadline, not a cache age.
 _TIME_THRESHOLDS = (
-    CHANGES_GRACE,
     CONTINUED_GRACE,
-    DEPLOY_GRACE,
     FINISH_SLACK,
     RECENT_WORK,
     RECENT_CHAT,
@@ -1038,9 +988,9 @@ def derived_for(
 ) -> Any:
     """The derived status of a Work the deck runs itself, or ``None`` (#2895 step 3, D7).
 
-    Only a ``works_router`` project's Work. Read from the owning chat (its question box, turn,
-    stall, failure and last text), its wake-ons, the open review chats and the card's own
-    facts; nothing is stored.
+    Only a Work in a repository a poller manifest declares. Read from the owning chat (its
+    question box, turn, stall, failure and last text), its wake-ons, the open review chats and
+    the card's own facts; nothing is stored.
     """
     from ..work_derived import DerivedInputs, derived_status
     from ..work_router import owner_of_issue
@@ -1177,9 +1127,8 @@ def derived_for(
     waits.extend((job.label, None) for job in card.jobs)
     # A command the turn left running in the background wakes the chat when it exits (#3405):
     # the agent's own way to wait on a sweep or a build. Not work (#2783), but its next step,
-    # held as long as the Poller holds one (#2890): Claude stops a background command by then.
+    # held for ``BACKGROUND_HOLD`` (#2890): Claude stops a background command by then.
     from ..models import BACKGROUND_TASK_ACTIVITY
-    from ..poller_engine.revive import BACKGROUND_HOLD_S
 
     ended_at = getattr(session, "last_message_at", None) if session is not None else None
     if (
@@ -1188,7 +1137,7 @@ def derived_for(
         and getattr(session, "thinking", False)
         and getattr(session, "activity", None) == BACKGROUND_TASK_ACTIVITY
     ):
-        hold = _aware(ended_at) + timedelta(seconds=BACKGROUND_HOLD_S)
+        hold = _aware(ended_at) + BACKGROUND_HOLD
         if datetime.now(UTC) < hold:
             waits.append(("its background command", hold))
     # A message handed to the chat after its turn ended, a fired wake-on's among them: the
@@ -1628,11 +1577,8 @@ def _card_inputs(
     work: Work | None,
     *,
     jobs: list[dict],
-    outcomes: Any,
     claims: Any,
     facts: WorkFacts,
-    evidence_since: datetime | None,
-    current_trace: Any,
     costly: bool = True,
 ) -> tuple[tuple, tuple]:
     """What ``_card`` reads for one Work: ``(compared by value, compared by identity)``.
@@ -1668,11 +1614,8 @@ def _card_inputs(
         ref,
         work,
         tuple(tuple(sorted(row.items())) if isinstance(row, dict) else row for row in jobs),
-        outcomes if outcomes is None else tuple(outcomes),
         claims if claims is None else tuple(claims),
         facts,
-        evidence_since,
-        current_trace,
         tuple(revision(key) for key in (*legs, *owned_keys)) if revision else None,
         tuple(len(snapshot.projection.works_for_chat(m.chat_id)) for m in memberships),
         tuple(can_send(key) for key in legs),
@@ -1744,11 +1687,11 @@ def _cached_card(
     hydrated: bool,
     now: datetime,
     **kwargs: Any,
-) -> tuple[WorkCard, RunTrace | None, tuple[WorkChat, ...]]:
+) -> tuple[WorkCard, tuple[WorkChat, ...]]:
     """``_card``, reusing the last one built for this Work while nothing it reads moved.
 
-    A pass still walks every Work; it only stops rebuilding the cards whose chats, facts,
-    Run and jobs are as they were, so one chat changing builds the cards of its own Works
+    A pass still walks every Work; it only stops rebuilding the cards whose chats, facts
+    and jobs are as they were, so one chat changing builds the cards of its own Works
     and no others (ADR 0007). Counted as ``work_counter.WORK_CARD`` per build.
     """
     cache = getattr(app.state, "work_card_cache", None)
@@ -1757,11 +1700,8 @@ def _cached_card(
     key = (ref.work_id, hydrated)
     inputs = {
         "jobs": kwargs["jobs"],
-        "outcomes": kwargs.get("outcomes"),
         "claims": kwargs.get("claims"),
         "facts": kwargs["facts"],
-        "evidence_since": kwargs.get("evidence_since"),
-        "current_trace": kwargs.get("current_trace", False),
     }
     entry = cache.get(key)
     gate = _card_gate(
@@ -1809,32 +1749,15 @@ def _card(
     work: Work | None,
     *,
     jobs: list[dict],
-    outcomes: Any,
     claims: list[WorkspaceClaim] | None,
     facts: WorkFacts,
     workspace: WorkWorkspace | None = None,
-    evidence_since: datetime | None = None,
-    current_trace: RunTrace | None | bool = False,
-) -> tuple[WorkCard, RunTrace | None, tuple[WorkChat, ...]]:
-    """One Work's card. ``current_trace`` is the front page's classification pass: a trace of
-    the current Run alone, already read in one batch for every Work (``current_run_traces``),
-    so this reads nothing Work-scoped. By default the full trace is gathered here.
+) -> tuple[WorkCard, tuple[WorkChat, ...]]:
+    """One Work's card and its chats.
 
     ``facts`` are the Work's facts from ``gather_facts``, the one pass both pages read, so
-    the two cannot disagree about a Work's outputs, review or finish (#2229)."""
-    card, issue_record = facts.card, facts.record
-    if current_trace is not False:
-        trace = current_trace or None
-    else:
-        run_facts = gather_run_trace(
-            snapshot.state,
-            ref,
-            board=snapshot.board,
-            jobs=jobs,
-            outcomes=outcomes,
-            evidence_since=evidence_since,
-        )
-        trace = build_run_trace(run_facts) if run_facts.known else None
+    the two cannot disagree about a Work's outputs or finish (#2229)."""
+    issue_record = facts.record
     chats = work_chats(
         snapshot.state,
         work,
@@ -1858,18 +1781,13 @@ def _card(
     updated = str((issue_record or {}).get("updatedAt") or "") or str(
         getattr(backlog_issue, "updated_at", "") or ""
     )
-    issue = (
-        work.issue
-        if work is not None
-        else (IssueRef(card.repository, card.number) if card is not None else None)
-    )
+    issue = work.issue if work is not None else None
     built = build_work_card(
         ref,
         issue=issue,
         title=title,
         issue_state=issue_state,
         facts=facts,
-        trace=trace,
         claims=claims,
         verifications=run_verifications(jobs, ref.work_id),
         workspace=workspace,
@@ -1885,14 +1803,14 @@ def _card(
         jobs=work_jobs(jobs, chats),
         paused_label=_deck_paused_label(app, ref.repository),
     )
-    opening = opening_chat(message_target(built, trace, chats, _can_send(app)), chats)
+    opening = opening_chat(message_target(built, chats, _can_send(app)), chats)
     if opening is not None:
         built = replace(built, chat_href=opening[1], chat_key=opening[0])
     # A Work no agent works on yet has no chat to derive a status from (#3558).
     derived = None if built.start_label else derived_for(app, snapshot, ref, built, jobs)
     if derived is not None:
         built = replace(built, derived=derived)
-    return built, trace, chats
+    return built, chats
 
 
 # The rescans ``_publish_live_works`` starts, held so none is collected mid-flight.
@@ -2077,24 +1995,22 @@ def gather_facts(
 ) -> dict[str, WorkFacts]:
     """Every candidate's ``WorkFacts``, from three local cache reads for the whole pass.
 
-    The one place a Work's card, issue record, open pull requests, chat registrations and
-    cached pull request rows are joined (#2229). The front page and the Work page both read
+    The one place a Work's issue record, open pull requests, chat registrations and cached
+    pull request rows are joined (#2229). The front page and the Work page both read
     a Work through this, and it never calls GitHub.
 
     ``strict`` (the overview's pass) raises when the issue or pull request cache cannot be
     read: without them every closed, merged or paused Work reads as open and stopped, so the
     pass keeps the last overview and retries rather than show, log or report that (#3553).
     """
-    board = snapshot.board
     records = _cached_issues(app, candidates, strict=strict)
     now = datetime.now(UTC)
     inputs = []
     for item in candidates:
         ref = item.ref
-        card = board.card(ref.repository, ref.number) if board is not None else None
         open_pulls = snapshot.open_pulls.get(f"{ref.repository}#{ref.number}".lower(), ())
         registered = _registrations(snapshot, getattr(item, "work", None))
-        inputs.append((ref, card, open_pulls, registered))
+        inputs.append((ref, open_pulls, registered))
     urls = [url for item in inputs for url in discovery_urls(*item)]
     rows = _cached_pulls(app, urls, strict=strict)
     checks = _cached_merge_checks(app, rows)
@@ -2105,31 +2021,25 @@ def gather_facts(
         snapshot.backlog, now=now, mine=getattr(app.state, "deck_claims", None)
     )
     found = {}
-    for (ref, card, open_pulls, registered), item in zip(inputs, candidates, strict=True):
+    for (ref, open_pulls, registered), item in zip(inputs, candidates, strict=True):
         facts = work_facts(
             ref,
-            card=card,
             record=records.get(ref.work_id),
             rows=rows,
             open_pulls=open_pulls,
             registered=registered,
             checks=checks,
-            chat_holds=snapshot.chat_holds,
         )
         signed = signoffs.get(ref.work_id)
         if awaiting_finish(
             facts.finished_at, signed[1] if signed else None, cutoff
         ) and not _finishes_by_itself(facts):
-            facts = replace(
-                facts,
-                awaiting_finish=True,
-                deploy_due=deploy_due(card, facts.outputs, facts.finished_at, now),
-            )
+            facts = replace(facts, awaiting_finish=True)
         if ref.work_id in held:
             facts = replace(facts, deck_paused=True)
         if ref.work_id.casefold() in starred:
             facts = replace(facts, starred=True)
-        if ref in unstarted and card is None and getattr(item, "work", None) is None:
+        if ref in unstarted and getattr(item, "work", None) is None:
             # No agent works on it yet (#3558): the label that would start one.
             labels = snapshot.backlog.board.ownership_labels(ref.repository)
             facts = replace(facts, start_label=labels[0])
@@ -2280,7 +2190,7 @@ def _hidden_works(app: Any, cards: dict[str, WorkCard]) -> dict[str, HiddenWork]
         if card is None:
             continue
         continued = continued_at(card.finished_at, card.last_activity)
-        if not still_hidden(hidden, card.comments, card.card_mark, continued):
+        if not still_hidden(hidden, card.comments, continued):
             logger.info("hidden Work %s came back: its issue, card or chat moved", work_id)
             control.unhide_work(work_id)
             continue
@@ -2437,7 +2347,6 @@ class WorkOverview:
     other_hidden: int = 0
     # The front page's sections (#2219): every card above in exactly one of them.
     front: FrontSections = FrontSections()
-    board: BoardSummary | None = None
     # Issues whose cached record cannot say whether or when the Work finished, newest
     # activity first: the service re-reads a few per minute (#2226). Not part of equality,
     # so the list alone never republishes the cards.
@@ -3001,36 +2910,27 @@ def merge_watch_pulls(cards: Sequence[WorkCard]) -> tuple[tuple[str, int], ...]:
 
 
 def _merge_watched(card: WorkCard, output: Any) -> bool:
-    if output.auto_merge or (output.review_clean and output.head):
+    if output.auto_merge:
         return True
-    # A Work the deck runs itself is offered Merge by its own release, not a Poller's reviewer
-    # (#3199): without this none of its pull requests ever had a row.
+    # A Work the deck runs itself is offered Merge by its own release (#3199): without this
+    # none of its pull requests ever had a row.
     from ..work_derived import READY
 
-    if getattr(card.derived, "kind", "") == READY and output.head:
-        return True
-    passed = card.review.heads if card.review is not None else ()
-    head = output.head.lower()
-    return len(head) >= 7 and any(
-        len(item) >= 7 and (head.startswith(item.lower()) or item.lower().startswith(head))
-        for item in passed
-    )
+    return getattr(card.derived, "kind", "") == READY and bool(output.head)
 
 
 def unresolved_issues(
     candidates: Sequence[Any], records: dict[str, dict], backlog: Any
 ) -> tuple[tuple[str, int], ...]:
     """Works whose issue record is closed without ``closedAt``, or missing for a Work no
-    open card or cached open-issue list vouches for (#2226)."""
+    cached open-issue list vouches for (#2226)."""
     found = []
     for item in candidates:
         record = records.get(item.ref.work_id)
         if record is not None:
             if record.get("is_pr") or record.get("state") != "closed" or record.get("closedAt"):
                 continue
-        elif (item.card is not None and not getattr(item.card, "done", False)) or (
-            backlog is not None and backlog.issue(item.ref.repository, item.ref.number)
-        ):
+        elif backlog is not None and backlog.issue(item.ref.repository, item.ref.number):
             continue
         found.append((item.ref.repository, item.ref.number))
     return tuple(found)
@@ -3344,7 +3244,6 @@ async def _tree_parents(
         }
         if not wanted:
             break
-        board = snapshot.board
         fresh = []
         for work_id in sorted(wanted):
             item = by_id.get(work_id)
@@ -3352,8 +3251,7 @@ async def _tree_parents(
                 ref = parse_work_id(work_id)
                 if ref is None:
                     continue
-                card = board.card(ref.repository, ref.number) if board is not None else None
-                item = WorkCandidate(ref, None, card, None, False)
+                item = WorkCandidate(ref, None, None, False)
                 fresh.append(item)
             added[work_id] = item
         if fresh:
@@ -3444,7 +3342,6 @@ async def _work_candidates(app: Any, snapshot: _Pass, queue: Sequence[dict]) -> 
     return work_candidates(
         snapshot.state,
         snapshot.projection,
-        board=snapshot.board,
         owned_insights=snapshot.owned,
         legs_by_chat=snapshot.legs,
         current_work_ids=await current_work_ids(app, queue),
@@ -3588,28 +3485,15 @@ async def _load_work_overview(
     }
     db_path = _db_path(app)
 
-    # 1. Classify every sectioned Work cheaply (#2219): board and candidate facts, owned
-    #    attention, finish times, the live queue, and the current Run of each Work from one
-    #    batched store read. No workspace claims, Run history, route or binding lookups per
-    #    Work, and no retained job evidence: none of them moves a Work between sections.
-    def classify() -> tuple[datetime | None, dict[str, RunTrace]]:
-        since = read_evidence_since(db_path) if db_path is not None else None
-        traces = current_run_traces(
-            db_path,
-            [(item.ref, item.card) for item in shown],
-            board=snapshot.board,
-            jobs=queue,
-            evidence_since=since,
-        )
-        return since, traces
-
-    evidence_since, traces = await asyncio.to_thread(classify)
+    # 1. Classify every sectioned Work cheaply (#2219): candidate facts, owned attention,
+    #    finish times and the live queue. No workspace claims per Work, and no retained job
+    #    evidence: neither moves a Work between sections.
     # Each Work's rows of the queue, from one walk of it (#2841): the whole queue scanned
     # again for every card was much of a pass's time on a deck with a long job history.
     queue_rows = WorkRows(queue)
 
     def light(item: Any) -> tuple[WorkCard, FrontRow]:
-        card, _, _ = _cached_card(
+        card, _ = _cached_card(
             app,
             snapshot,
             item.ref,
@@ -3617,11 +3501,8 @@ async def _load_work_overview(
             hydrated=False,
             now=now,
             jobs=queue_rows.for_work(item.ref.work_id),
-            outcomes=None,
             claims=(),
             facts=facts[item.ref.work_id],
-            evidence_since=evidence_since,
-            current_trace=traces.get(item.ref.work_id),
         )
         return card, front_row(card, current=item.live)
 
@@ -3648,8 +3529,8 @@ async def _load_work_overview(
         hidden=hidden,
     )
     # 2. The section policy decides what is listed: every Needs you row, Active and Recently
-    #    finished up to their limits. 3. Only those rows are hydrated with the full trace,
-    #    their claims and their retained evidence (#2148).
+    #    finished up to their limits. 3. Only those rows are hydrated with their claims and
+    #    their retained evidence (#2148).
     listed = list(
         dict.fromkeys(
             item.card.work_id
@@ -3664,12 +3545,11 @@ async def _load_work_overview(
         )
     )
     jobs = WorkRows(await runtime_jobs(app, listed, queue=queue))
-    stores, _ = await asyncio.to_thread(_read_stores, db_path, listed)
+    stores = await asyncio.to_thread(_read_claims, db_path, listed)
     by_id = {item.ref.work_id: item for item in shown}
     for work_id in listed:
         item = by_id[work_id]
-        outcomes, claims = stores.get(work_id, ([], []))
-        card, _, _ = _cached_card(
+        card, _ = _cached_card(
             app,
             snapshot,
             item.ref,
@@ -3677,10 +3557,8 @@ async def _load_work_overview(
             hydrated=True,
             now=now,
             jobs=jobs.for_work(work_id),
-            outcomes=outcomes,
-            claims=claims,
+            claims=stores.get(work_id, []),
             facts=facts[work_id],
-            evidence_since=evidence_since,
         )
         built[work_id] = (card, front_row(card, current=item.live))
         await asyncio.sleep(0)
@@ -3739,7 +3617,6 @@ async def _load_work_overview(
         front=front_sections(
             folded([*rows, *tree_rows]), now=now, max_active=MAX_DASHBOARD_WORKS, hidden=hidden
         ),
-        board=summarize_board(snapshot.board),
         unresolved=(
             *unresolved_issues(candidates, records, snapshot.backlog),
             *stopped_open_issues(cards, facts),
@@ -4279,7 +4156,6 @@ def _workspace_cache(app: Any) -> OrderedDict[str, tuple[float, WorkWorkspace | 
 @dataclass(frozen=True)
 class WorkDetail:
     card: WorkCard
-    trace: RunTrace | None
     workspace: WorkWorkspace | None
     chats: tuple[WorkChat, ...]
     verifications: tuple[Any, ...]  # every retained RunVerification, newest first
@@ -4391,9 +4267,7 @@ class WorkDetail:
             return ""
         if press.action == MERGE:
             outputs = self.card.outputs
-            if self.card.deploying or (
-                any(o.state == "merged" for o in outputs) and all(o.settled for o in outputs)
-            ):
+            if any(o.state == "merged" for o in outputs) and all(o.settled for o in outputs):
                 return "Merge asked; merged"
         return ""
 
@@ -4516,7 +4390,6 @@ async def _reread_settled_issue(app: Any, ref: WorkRef, facts: WorkFacts) -> boo
     if (
         refresh is None
         or switched is None
-        or facts.card is not None
         or not switched(ref.repository)
         or not record
         or record.get("is_pr")
@@ -4554,8 +4427,7 @@ async def load_work_detail(
         app, [ref.work_id], queue=await runtime_queue(app, work_id=ref.work_id)
     )
     lap("jobs")
-    stores, evidence_since = await asyncio.to_thread(_read_stores, _db_path(app), [ref.work_id])
-    outcomes, claims = stores[ref.work_id]
+    claims = (await asyncio.to_thread(_read_claims, _db_path(app), [ref.work_id]))[ref.work_id]
     lap("stores")
     if workspace is True:
         cache = _workspace_cache(app)
@@ -4588,24 +4460,20 @@ async def load_work_detail(
     ):
         facts = (await asyncio.to_thread(gather_facts, app, snapshot, [candidate]))[ref.work_id]
     lap("facts")
-    card, trace, chats = _card(
+    card, chats = _card(
         app,
         snapshot,
         ref,
         work,
         jobs=jobs,
-        outcomes=outcomes,
         claims=claims,
         facts=facts,
         workspace=workspace,
-        evidence_since=evidence_since,
     )
     lap("card")
     if (
         work is None
-        and trace is None
         and workspace is None
-        and facts.card is None
         and not facts.awaiting_finish
         and not facts.start_label  # an issue no agent works on yet is a Work too (#3558)
         # A parent issue's row, and each sub-issue its page lists, opens its page whether or
@@ -4624,7 +4492,6 @@ async def load_work_detail(
     release = getattr(app.state, "work_release", None)
     detail = WorkDetail(
         card=card,
-        trace=trace,
         workspace=workspace,
         chats=chats,
         verifications=run_verifications(jobs, ref.work_id, limit=None),
@@ -4635,7 +4502,7 @@ async def load_work_detail(
         approval=_release_read(release, "approval", ref.work_id),
         approval_cleared=_release_read(release, "approval_cleared", ref.work_id),
         tree=tree,
-        message_target=message_target(card, trace, chats, _can_send(app)),
+        message_target=message_target(card, chats, _can_send(app)),
         unplaced=unplaced_chats(
             snapshot.state,
             ref,
@@ -4937,7 +4804,6 @@ WORK_SECTIONS = (
     "result",
     "resolution",
     "workspace",
-    "runs",
     "chats",
     "inspector",
 )
@@ -4963,26 +4829,21 @@ SECTION_INPUTS: dict[str, Callable[[WorkDetail, Any], tuple]] = {
     "message": lambda d, line: (d.card, line, d.message_target, d.chats),
     "lifecycle": lambda d, line: (d.card.derived, line.milestones),
     "result": lambda d, line: (
-        d.card.outputs, d.card.staging, d.card.verification, d.card.untested, d.card.review
+        d.card.outputs, d.card.staging, d.card.verification
     ),
     "resolution": lambda d, line: (d.resolution, d.resolution_behind),
     "workspace": lambda d, line: (
         d.card.work_id, d.card.workspace_note, d.card.workspace, d.workspace, d.workspace_rows
     ),
-    "runs": lambda d, line: (
-        d.card.work_id, d.card.derived, d.card.run_label, d.card.run_state, d.trace
-    ),
     "chats": lambda d, line: (d.card.work_id, d.card.derived, d.chats, d.unplaced),
     "inspector": lambda d, line: (
-        d.card.work_id, d.card.review, d.card.run_id, d.chats, d.trace, d.verifications,
-        d.workspace,
+        d.card.work_id, d.chats, d.verifications, d.workspace,
     ),
 }
 
 
 # Which section shows which pre-rendered fragment (``work_detail.html``); no other reads one.
 SECTION_FRAGMENTS: dict[str, tuple[str, ...]] = {
-    "runs": ("run_html", "history_html"),
     "inspector": ("workspace_html",),
 }
 
@@ -5016,17 +4877,13 @@ def render_changed_sections(
 ) -> dict[str, tuple[tuple, str]]:
     """``name -> (inputs, html)``, rendering only the sections whose ``SECTION_INPUTS`` moved
     since ``previous`` (#3228). Counted as ``work_counter.WORK_SECTION`` per render."""
-    from .run_trace_view import render_run_trace
     from .work_workspace_view import render_work_workspace
 
     line = detail.line
     template = templates.get_template("partials/work_detail.html")
-    trace = detail.trace
-    # The Run and workspace fragments, each built only for the section that shows it (#3228):
-    # a status or chats change renders neither.
+    # The workspace fragment, built only for the section that shows it (#3228): a status or
+    # chats change does not render it.
     builders: dict[str, Callable[[], str]] = {
-        "run_html": lambda: render_run_trace(templates, trace, part="current") if trace else "",
-        "history_html": lambda: render_run_trace(templates, trace, part="history") if trace else "",
         "workspace_html": lambda: (
             render_work_workspace(templates, detail.workspace, show_verifications=False)
             if detail.workspace is not None

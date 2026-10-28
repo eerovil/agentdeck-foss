@@ -68,13 +68,13 @@ def test_a_poller_instance_does_not_depend_on_the_dashboard_or_the_runtime():
 def test_the_timer_wakes_every_two_minutes_and_never_replays_a_missed_tick():
     timer = _unit("agentdeck-poller@.timer")
     assert "OnUnitInactiveSec=120" in timer
-    # The engine's comment-scan overlap is sized in wakes, and the /pollers page judges
-    # freshness in wakes, so both must follow the timer or every instance reads late.
+    # The /pollers page judges freshness in wakes, so it must follow the timer or every
+    # instance reads late.
     from agentdeck import poller_ops
     from agentdeck.config import PollerConfig
-    from agentdeck.poller_engine import health, queue
+    from agentdeck.poller_engine import health
 
-    assert queue.WAKE_INTERVAL_S == 120
+    assert health.WAKE_INTERVAL_S == 120
     assert health.DEFAULT_INTERVAL_S == poller_ops.DEFAULT_INTERVAL_S == 120
     assert PollerConfig().interval_s == 120
     # Replaying a backlog of wakes after downtime would spawn against a stale world.

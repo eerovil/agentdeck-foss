@@ -1,4 +1,4 @@
-"""The deck starts a switched project's Work itself (#2895 step 5b, ADR 0008 D2).
+"""The deck starts a project's Work itself (#2895 step 5b, ADR 0008 D2).
 
 The router turns the ownership label landing on an issue no chat owns into one start, and
 ``start_work_agent`` starts one Claude chat with the ``work`` role at most once per Work.
@@ -18,7 +18,7 @@ from test_work_router import comment, deliver
 
 from agentdeck import work_claims, work_signals, work_start
 from agentdeck.inject import InjectResult
-from agentdeck.poller_ops import works_router_accounts, works_router_start_labels
+from agentdeck.poller_ops import work_accounts, work_start_labels
 from agentdeck.webhook_tailer import WebhookTailer
 from agentdeck.work import WorkRef
 from agentdeck.work_router import HANDED_OVER, WorkRouterService
@@ -264,7 +264,7 @@ async def test_an_issue_a_chat_already_owns_is_not_started_again(root):
     assert await route(root, owners={(ISSUE, 7): ("chat-1", "")}) == []
 
 
-async def test_a_project_that_has_not_switched_starts_nothing(root):
+async def test_a_repository_no_project_declares_starts_nothing(root):
     labelled(root, "d1")
     assert await route(root, switched=False) == []
 
@@ -1174,16 +1174,19 @@ def _manifest(root: Path, instance: str, body: str) -> None:
     path.write_text(body)
 
 
-def test_start_labels_are_a_switched_projects_ownership_labels(tmp_path):
+def test_start_labels_are_each_projects_ownership_labels(tmp_path):
     body = (
         'contract = 1\n[board]\norg = "eerovil"\nproject_number = 1\n'
         'ownership_label = ["agent", "Claude"]\n'
         '[[repos]]\nid = "notes"\nholds_issues = true\n'
     )
-    _manifest(tmp_path, "notes", body + "[capabilities]\nworks_router = true\n")
+    _manifest(tmp_path, "notes", body)
     _manifest(tmp_path, "other", body.replace("notes", "other"))
 
-    assert works_router_start_labels(tmp_path) == {"eerovil/notes": frozenset({"agent", "claude"})}
+    assert work_start_labels(tmp_path) == {
+        "eerovil/notes": frozenset({"agent", "claude"}),
+        "eerovil/other": frozenset({"agent", "claude"}),
+    }
 
 
 def _switched(root: Path, instance: str, worker: str) -> None:
@@ -1191,8 +1194,7 @@ def _switched(root: Path, instance: str, worker: str) -> None:
         root,
         instance,
         'contract = 1\n[board]\norg = "eerovil"\nproject_number = 1\n'
-        f'ownership_label = ["agent"]\n[[repos]]\nid = "{instance}"\nholds_issues = true\n'
-        "[capabilities]\nworks_router = true\n",
+        f'ownership_label = ["agent"]\n[[repos]]\nid = "{instance}"\nholds_issues = true\n',
     )
     (root / "instances" / instance / "overlay.toml").write_text(worker)
 
@@ -1206,7 +1208,7 @@ def test_a_switched_projects_worker_accounts_come_from_its_overlay(tmp_path):
     )
     _switched(tmp_path, "notes", "[checkouts]\nnotes = '~/notes'\n")  # names no worker
 
-    assert works_router_accounts(tmp_path) == {
+    assert work_accounts(tmp_path) == {
         "eerovil/agentdeck": ("claude_code:alt", "claude_code:main", "codex:codex"),
         "eerovil/notes": (),
     }
@@ -1215,13 +1217,13 @@ def test_a_switched_projects_worker_accounts_come_from_its_overlay(tmp_path):
 def test_an_unreadable_worker_overlay_has_no_configured_answer(tmp_path):
     _switched(tmp_path, "agentdeck", "this is not toml = [")
 
-    assert works_router_accounts(tmp_path) == {"eerovil/agentdeck": None}
+    assert work_accounts(tmp_path) == {"eerovil/agentdeck": None}
 
 
 def test_a_malformed_worker_choice_has_no_configured_answer(tmp_path):
     _switched(tmp_path, "agentdeck", 'worker = "not a table"\n')
 
-    assert works_router_accounts(tmp_path) == {"eerovil/agentdeck": None}
+    assert work_accounts(tmp_path) == {"eerovil/agentdeck": None}
 
 
 def _accounts(app, *keys):
@@ -1318,7 +1320,7 @@ async def test_the_first_message_says_whether_the_project_merges_on_its_own(
         'spec_only_label = "Spec-Only"\n'
         '[[repos]]\nid = "agentdeck"\nholds_issues = true\n'
         + (evidence if auto_release else proven)
-        + f"[capabilities]\nworks_router = true\nauto_release = {str(auto_release).lower()}\n",
+        + f"[capabilities]\nauto_release = {str(auto_release).lower()}\n",
     )
     (tmp_path / "poller" / "instances" / "agentdeck" / "overlay.toml").write_text("")
     app, _, injector = fake_app(tmp_path)

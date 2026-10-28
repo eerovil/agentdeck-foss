@@ -172,7 +172,7 @@ def _app(tmp_path, monkeypatch, *, cwd=None, starts=None):
     from agentdeck.providers import PROVIDERS
 
     app = _app_with_state(tmp_path)
-    board = BoardView(scopes=(BoardScope("agentdeck", org="eerovil", cards=()),))
+    board = BoardView(scopes=(BoardScope("agentdeck", org="eerovil"),))
     app.state.issues.read_board = lambda: board
     app.state.issues.cached_issues = lambda refs: {}
     app.state.config.inject.enabled = True
@@ -343,8 +343,7 @@ async def test_new_chat_starts_once_in_the_works_checkout_and_joins_the_work(tmp
     assert "Side chat" in chats
     inspector = html.split('id="work-inspector"', 1)[1]
     assert "side chat" in inspector
-    runs = html.split('id="work-runs"', 1)[1].split("</details>", 1)[0]
-    assert "side1" not in runs
+    assert 'id="work-runs"' not in html  # the Runs section went with the Poller's Runs
 
     # A new deliberate press is a new chat.
     assert (await _post(app, _press("side-chat-0002"))).status_code == 202

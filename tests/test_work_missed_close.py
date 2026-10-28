@@ -64,7 +64,6 @@ async def test_a_deck_run_works_open_issue_is_reread_once_its_pulls_settled():
     ("switched", "fields"),
     [
         (False, {}),  # its project's Poller still runs it
-        (True, {"card": object()}),  # a Poller card holds it, and re-reads it itself
         (True, {"record": {**OPEN, "state": "closed"}}),  # the close is already known
         (True, {"record": None}),  # never resolved: the overview's backfill reads it
         (True, {"record": {**OPEN, "is_pr": True}}),

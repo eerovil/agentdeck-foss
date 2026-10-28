@@ -6,8 +6,6 @@ chat link, and nothing could ever replace it but a person's own ✎ name.
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
 from httpx import ASGITransport, AsyncClient
 
@@ -217,10 +215,10 @@ def _front_titles(overview) -> set[str]:
 @pytest.mark.asyncio
 async def test_the_worker_name_shows_on_the_work_page_and_the_front_page(tmp_path):
     from fastapi.testclient import TestClient
-    from test_work_hidden import _board_card
-    from test_work_ui import _app, _board
+    from test_work_ui import WORK, _add, _app
 
-    app = _app(tmp_path, board=_board(_board_card()))
+    app = _app(tmp_path)
+    _add(app, "claude_code:test:worker", WORK, thinking=True)
     app.state.issues.cached_issues = lambda refs: {
         ("eerovil/agentdeck", 2147): {
             "title": "https://deck/chats/abc",
@@ -257,39 +255,3 @@ async def test_the_worker_name_shows_on_the_work_page_and_the_front_page(tmp_pat
     await app.state.work_overview.refresh()
     assert '<h1 class="wd-title">Mine<button' in client.get(work_href(WORK_ID)).text
     assert "Mine" in _front_titles(app.state.work_overview.overview)
-
-
-# --- the ask in the worker's brief ---------------------------------------------------------------
-
-
-def _brief(payload: str = "Implement the requested change."):
-    from agentdeck.poller_adapter.runner import Workspace, compose_message
-    from agentdeck.poller_adapter.worker import _compact_poller_brief
-
-    directive = {
-        "ref": "agentdeck#2128",
-        "repo": "agentdeck",
-        "number": 2128,
-        "generation": "g1",
-        "messages": [{"payload": payload}],
-    }
-    workspace = Workspace(path=Path("/repo/.worktrees/issue-2128"), branch="agent/issue-2128")
-    message = compose_message(directive, workspace)
-    compact = _compact_poller_brief(
-        directive, message, cwd=str(workspace.path), worktrees=[str(workspace.path)]
-    )
-    return message, compact
-
-
-def test_every_work_dispatch_asks_the_worker_to_name_its_work_at_its_report():
-    from agentdeck.poller_adapter.worker import WORK_TITLE_ASK
-
-    message, compact = _brief()
-    assert WORK_TITLE_ASK in message
-    assert compact.count(WORK_TITLE_ASK) == 1
-    # Beside the terminal commands, where the report it is tied to is made.
-    assert compact.index(WORK_TITLE_ASK) < compact.index("After all work, use exactly one")
-    flat = " ".join(WORK_TITLE_ASK.split())
-    assert "/api/sessions/<session-key>/work-title" in flat
-    assert "just before you run your terminal command" in flat
-    assert "could not tell what the Work is about" in flat

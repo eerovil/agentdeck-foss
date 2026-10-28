@@ -8,8 +8,7 @@ from dataclasses import dataclass
 
 from .poller_engine.refusal_policy import redecided_refusal_reasons
 
-# Backward-compatible projection for callers that still ask the ledger for the set. The
-# policy itself lives inside poller_engine so retry and replay semantics have one owner.
+# The refusals whose ledger row is decided again rather than replayed (``refusal_policy``).
 RE_DECIDED_REFUSALS = redecided_refusal_reasons()
 
 

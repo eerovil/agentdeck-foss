@@ -1040,11 +1040,6 @@ async def _tail_session(
         )
         last_usage_sig = _usage_sig(accounts, state)
         last_usage_push = loop.time()
-        # Read once here, the catch-up for a board move a file watch missed, and
-        # again only when ``board`` is published (#2865).
-        issue_board = (
-            request.app.state.issues.read_board() if session.issues else None
-        )
         forced_sidebar: set[str] = set()
         # Watching a chat is reading it (#2599). While this page is open, any
         # movement of the chat's activity clocks — a transcript update shown
@@ -1204,14 +1199,6 @@ async def _tail_session(
                 )
                 busy = label is not None
                 interaction = provider.pending_interaction(account, current)
-                if BOARD_TOPIC in sidebar_dirty or (current.issues and issue_board is None):
-                    refreshed_board = (
-                        request.app.state.issues.read_board() if current.issues else None
-                    )
-                    # An unread instance proves nothing about a card disappearing.
-                    # Keep the last whole snapshot until a complete read can replace it.
-                    if refreshed_board is None or refreshed_board.complete:
-                        issue_board = refreshed_board
                 pull_requests = session_pull_request_chips(assistant.contexts.get(leg_key))
                 view = SessionView(
                     current=current,
@@ -1221,7 +1208,7 @@ async def _tail_session(
                     age=age,
                     active_child_sessions=active_child_sessions,
                     interaction=interaction,
-                    issues=session_issue_chips(current, issue_board),
+                    issues=session_issue_chips(current),
                     pull_requests=pull_requests,
                     # A dict read once this commit has been asked about, so the chip
                     # goes live with the rest of the row rather than waiting for a
