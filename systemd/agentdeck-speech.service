@@ -1,0 +1,17 @@
+[Unit]
+Description=agentdeck voice mode speech service (#3409)
+# Starts at login (or on demand by agentdeck-speech.socket), loads its model at
+# once and keeps it loaded: by the owner's decision on #3766, speech is heard at
+# once even after an hour's break, at the cost of about 1.1 GB of the card.
+Requires=agentdeck-speech.socket
+
+[Service]
+ExecStart=%h/.local/share/agentdeck/speech-venv/bin/python %h/agentdeck/scripts/speech_server.py --device cuda --idle-exit 0
+# Speech is heard live: keep it ahead of test suites for the CPU.
+CPUWeight=500
+# A crash restarts it, so the next phrase does not wait for a cold start (#3766).
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

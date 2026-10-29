@@ -388,9 +388,45 @@ async def preview_asset(
     return StreamingResponse(_fd_chunks(file_fd), media_type=media_type, headers=headers)
 
 
+_MERMAID_BLOCK = re.compile(r"^```mermaid[ \t]*\n(.*?)\n```", re.S | re.M)
+_BOX_NOTE = re.compile(r"^\s*[-*+]\s+\*\*(.+?)\*\*\s*[:\u2014-]\s*(.+)$", re.M)
+_MD_LINK = re.compile(r"\[([^\]]+)\]\([^)]*\)")
+# The named colours a diagram may give a box (`class a,b amber`); diagram_frame.js has
+# the same hues.
+_DIAGRAM_COLOURS = {"blue": 214, "violet": 262, "teal": 174, "amber": 36, "rose": 340, "green": 142}
+
+
+def _diagram_parts(content: str) -> dict | None:
+    """A diagram file's title, summary, first Mermaid block and box notes (#3822)."""
+    content = content.replace("\r\n", "\n")
+    block = _MERMAID_BLOCK.search(content)
+    if block is None:
+        return None
+    head = content[: block.start()]
+    title = next((ln[2:].strip() for ln in head.splitlines() if ln.startswith("# ")), "")
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", head) if p.strip()]
+    summary = next((p for p in paragraphs if not p.startswith("#")), "")
+    notes, legend = {}, []
+    for m in _BOX_NOTE.finditer(content):
+        text = _MD_LINK.sub(r"\1", m.group(2)).replace("`", "").replace("*", "").strip()
+        name = m.group(1).strip().lower()
+        # A list item named after one of the diagram colours is the legend.
+        if name in _DIAGRAM_COLOURS:
+            legend.append({"colour": name, "hue": _DIAGRAM_COLOURS[name], "text": text})
+        else:
+            notes[re.sub(r"\s+", "", m.group(1)).lower()] = text
+    return {
+        "title": title,
+        "summary": summary,
+        "source": block.group(1),
+        "notes": notes,
+        "legend": legend,
+    }
+
+
 @router.get("/{local_path:path}", response_class=Response)
 async def local_file(
-    request: Request, local_path: str, raw: bool = False
+    request: Request, local_path: str, raw: bool = False, bare: bool = False
 ) -> Response:
     """Serve any readable host file; render HTML, and other text without executing it."""
     # This catch-all is registered last and claims every unmatched path, so a
@@ -431,6 +467,13 @@ async def local_file(
             and not raw
             and (line_number is None or line_number == 1)
         )
+        diagram = _diagram_parts(content) if markdown and bare else None
+        if diagram is not None:
+            response = get_templates(request).TemplateResponse(
+                request, "diagram_canvas.html", {"path": path, **diagram}
+            )
+            response.headers["Cache-Control"] = "no-store"
+            return response
         response = get_templates(request).TemplateResponse(
             request,
             "local_file.html",

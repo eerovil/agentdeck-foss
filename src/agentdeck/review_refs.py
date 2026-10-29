@@ -10,6 +10,7 @@ them.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -33,9 +34,6 @@ def reviewer_available() -> bool:
 # What a review issue is called. Also how a later call recognises one it already opened, so
 # it is a fixed sentence naming the exact target rather than anything time-varying.
 TITLE = "Review {repository}#{issue}"
-
-
-DIGEST_TOO_LARGE = "too_large"
 
 
 DIGEST_UNREADABLE = "unreadable"
@@ -158,13 +156,15 @@ async def target_digest(repository: str, number: int, head: str) -> tuple[str, s
     engine re-hashes at intake and refuses a mismatch either way; this keeps the chat from
     carrying a pair that could only ever be refused.
 
-    Empty is fail-closed, never a guess: no head, an unreadable or oversized diff, a binary
+    Empty is fail-closed, never a guess: no head, an unreadable diff, a binary
     section the digest cannot identify, or a head that moved. A reviewer handed no digest
     posts no verdict, so nothing merges on it.
 
-    The second value is why there is no digest (#2478): `DIGEST_TOO_LARGE` when GitHub refused a
-    diff over its size limit, `DIGEST_UNREADABLE` for anything else, and "" with a digest or
-    with no head to read one at.
+    A diff GitHub refuses as over its size limit gets ``head_digest`` instead (#3804), so its
+    review can still post a verdict the release checks, and its project merges on its own.
+
+    The second value is why there is no digest (#2478): `DIGEST_UNREADABLE`, or "" with a
+    digest or with no head to read one at.
     """
     if not head:
         return "", ""
@@ -182,8 +182,8 @@ async def target_digest(repository: str, number: int, head: str) -> tuple[str, s
         code, stdout, stderr = 1, b"", b""
     if code != 0:
         if review_diff_too_large((stderr or b"").decode("utf-8", "replace")):
-            log.info("chat review: %s#%s diff too large; no review digest", repository, number)
-            return "", DIGEST_TOO_LARGE
+            log.info("chat review: %s#%s diff too large; digest pinned to head", repository, number)
+            return head_digest(repository, number, head), ""
         log.info("chat review: %s#%s diff unreadable; no review digest", repository, number)
         return "", DIGEST_UNREADABLE
     try:
@@ -205,6 +205,21 @@ async def target_digest(repository: str, number: int, head: str) -> tuple[str, s
         log.info("chat review: %s#%s moved while its diff was read; no digest", repository, number)
         return "", DIGEST_UNREADABLE
     return digest, ""
+
+
+def head_digest(repository: str, number: int, head: str) -> str:
+    """The review digest of a pull request whose diff GitHub will not serve (#3804).
+
+    Over 20,000 lines GitHub refuses the diff for good, so no digest of its content can exist,
+    and a clean review used to dead-end: no verdict could be posted or checked, and a Merge
+    press was refused too. A head names the diff exactly (its base's later commits are not
+    ancestors of it, so the merge base stays put), so this pins the verdict to that one commit
+    instead. Unlike a content digest it carries over to no other head: a push, or a base
+    merged in, needs a new review. Retargeting the pull request to another base branch keeps
+    the head and changes the diff; that rare case is not caught.
+    """
+    ref = f"{repository}#{number}".lower()
+    return hashlib.sha256(f"head-v1\n{ref}\n{head.lower()}".encode()).hexdigest()
 
 
 async def _read_json(argv: list[str], what: str, *, owner: str | None = None) -> dict | None:

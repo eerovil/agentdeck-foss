@@ -1457,6 +1457,47 @@ async def post_session_review_request(
     return {"session_key": session_key, **asked, "registered": registered.payload()}
 
 
+class ReviewAcceptedBody(BaseModel):
+    pull_request: str
+    note: str
+
+
+@router.post("/sessions/{session_key}/review-accepted")
+async def post_session_review_accepted(
+    request: Request, session_key: str, body: ReviewAcceptedBody
+) -> dict:
+    """The owner accepted the review's findings at the current head with no code change
+    (#3828): that review counts as a pass there, and no new review runs."""
+    from ..work_router import AgainRefused
+
+    session_key, _session = resolve_chat_key(request, session_key)
+    ref = _pull_request_ref(body.pull_request)
+    state = get_state(request)
+    if ref.identity not in {held.identity for held in state.pull_requests_for(session_key)}:
+        raise HTTPException(
+            status_code=409,
+            detail=f"this chat has not registered {ref.repository}#{ref.number};"
+            " register it first (POST …/pull-requests)",
+        )
+    router_service = getattr(request.app.state, "work_router", None)
+    if router_service is None or not router_service.enabled:
+        raise HTTPException(
+            status_code=409, detail="this deck does not route Work events, so it keeps no pass"
+        )
+    note = body.note.strip()
+    if not note or len(note) > MAX_REVIEW_NOTE:
+        raise HTTPException(
+            status_code=422,
+            detail="quote the owner's decision in the note, as posted on the issue;"
+            f" at most {MAX_REVIEW_NOTE} characters",
+        )
+    try:
+        accepted = await router_service.accept(ref.repository, ref.number, note)
+    except AgainRefused as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"session_key": session_key, **accepted}
+
+
 # --- deck-owned Claude workers -------------------------------------------
 # Thin TCP-surface proxy to the runtime service (which owns worker processes
 # over a Unix socket), so external callers — e.g. a board poller — drive

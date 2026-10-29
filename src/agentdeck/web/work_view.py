@@ -32,6 +32,7 @@ import httpx
 from markupsafe import Markup
 
 from .. import (
+    live_prototype,
     review_refs,
     watch_retry,
     wayfinder_map,
@@ -92,6 +93,7 @@ from ..work_overview import (
     RECENT_CHAT,
     RECENT_WORK,
     OtherChat,
+    OtherDeckWork,
     UnplacedChat,
     WorkAttention,
     WorkCandidate,
@@ -105,6 +107,7 @@ from ..work_overview import (
     front_page_works,
     in_inventory,
     other_activity,
+    other_deck_works,
     unplaced_chats,
     unstarted_issues,
     work_candidates,
@@ -2390,6 +2393,8 @@ class WorkOverview:
     archived: int = 0  # Works on the Archived Works view (#2201)
     other: tuple[OtherChat, ...] = ()
     other_hidden: int = 0
+    # Issues another deck works, listed read only in their own folded group (#3834).
+    other_decks: tuple[OtherDeckWork, ...] = ()
     # The front page's sections (#2219): every card above in exactly one of them.
     front: FrontSections = FrontSections()
     # Issues whose cached record cannot say whether or when the Work finished, newest
@@ -3686,12 +3691,21 @@ async def _load_work_overview(
         presentation=snapshot.presentation,
     )
     records = {work_id: item.record for work_id, item in facts.items() if item.record is not None}
+    # A Work with a chat on this deck shows as one already, even after it went to another.
+    held_here = {item.ref.work_id for item in candidates if getattr(item, "work", None)}
     return WorkOverview(
         tuple(cards),
         0,
         archived,
         other,
         other_hidden,
+        other_decks=tuple(
+            item
+            for item in other_deck_works(
+                snapshot.backlog, now=now, mine=getattr(app.state, "deck_claims", None)
+            )
+            if item.work_id not in held_here
+        ),
         front=front_sections(
             folded([*rows, *tree_rows]), now=now, max_active=MAX_DASHBOARD_WORKS, hidden=hidden
         ),
@@ -4232,6 +4246,35 @@ def _workspace_cache(app: Any) -> OrderedDict[str, tuple[float, WorkWorkspace | 
 
 
 @dataclass(frozen=True)
+class WorkDiagram:
+    """The Work page's Diagram button (#3827): what it is called and where it goes."""
+
+    title: str
+    href: str
+    external: bool = False  # GitHub's page for the file, opened in a new tab
+
+
+def work_diagram(app: Any, ref: WorkRef, chats: Sequence[WorkChat]) -> WorkDiagram | None:
+    """The diagram on the live page of the Work's newest chat that has one (#3827).
+
+    It opens that live page while the file is there. Once the worktree is gone, an
+    agentdeck diagram opens from the deck's own checkout, and any other repository's from
+    GitHub: only the deck's checkout is kept current, so another one could be stale.
+    """
+    state = app.state.app_state
+    newest = sorted(
+        chats, key=lambda chat: chat.last_activity or datetime.min.replace(tzinfo=UTC),
+        reverse=True,
+    )
+    for chat in newest:
+        record = live_prototype.read(state.chat_identity_key(chat.session_key))
+        link = live_prototype.diagram_link(record, chat.session_key, ref.repository)
+        if link is not None:
+            return WorkDiagram(*link)
+    return None
+
+
+@dataclass(frozen=True)
 class WorkDetail:
     card: WorkCard
     workspace: WorkWorkspace | None
@@ -4253,6 +4296,8 @@ class WorkDetail:
     approval_cleared: str = ""
     # The issue's parent and sub-issues (#3622), or None when it is in no tree.
     tree: work_tree.WorkTree | None = None
+    # The Diagram button (#3827), or None while no chat of the Work has drawn one.
+    diagram: WorkDiagram | None = None
 
     @property
     def resolution_behind(self) -> datetime | None:
@@ -4580,6 +4625,7 @@ async def load_work_detail(
         approval=_release_read(release, "approval", ref.work_id),
         approval_cleared=_release_read(release, "approval_cleared", ref.work_id),
         tree=tree,
+        diagram=await asyncio.to_thread(work_diagram, app, ref, chats),
         message_target=message_target(card, chats, _can_send(app)),
         unplaced=unplaced_chats(
             snapshot.state,
@@ -4900,7 +4946,7 @@ SECTION_INPUTS: dict[str, Callable[[WorkDetail, Any], tuple]] = {
         # here so a control that starts reading something else cannot go stale.
         d.attention, d.buttons, d.finish_control, d.pause_control, d.star_control,
         d.pause_refusal, d.last_action_followed, d.bring_back, d.merge_approval_control,
-        d.approval, d.approval_cleared,
+        d.approval, d.approval_cleared, d.diagram,
     ),
     # The issue's parent and sub-issues (#3622), each line as the front page last drew it.
     "tree": lambda d, line: (d.tree,),
@@ -4992,9 +5038,9 @@ def render_changed_sections(
 
 
 # The front page's live parts (#2219), each its own stream event and swap target, in the order
-# the page lists them (#3578): the Work sections swap keyed by Work, the board line and the
+# the page lists them (#3818): the Work sections swap keyed by Work, the board line and the
 # other activity whole. ``needs``, ``stuck``, ``release`` and ``cleanup`` are the Needs you
-# groups at their places in a Work's life (``work_attention.FRONT_PLACES``).
+# groups at their places on the page (``work_attention.FRONT_PLACES``).
 FRONT_ROW_PARTS = frozenset(
     {
         "needs", "active", "stuck", "waiting", "release", "live", "cleanup", "finished",
@@ -5002,7 +5048,7 @@ FRONT_ROW_PARTS = frozenset(
     }
 )
 FRONT_PARTS = (
-    "summary", "needs", "active", "stuck", "waiting", "release", "live", "cleanup", "finished",
+    "summary", "needs", "release", "stuck", "active", "cleanup", "waiting", "live", "finished",
     "paused", "stopped", "board",
 )
 # The ``/events?view=`` values that show Works: the front page, ``/works?view=hidden`` and the
@@ -5175,3 +5221,20 @@ def render_work_front(
 
 def render_work_other(templates: Any, overview: WorkOverview) -> str:
     return templates.get_template("partials/work_other.html").render(work_overview=overview)
+
+
+def render_work_other_decks(templates: Any, overview: WorkOverview) -> str:
+    return templates.get_template("partials/work_other_decks.html").render(work_overview=overview)
+
+
+def other_deck_work(app: Any, ref: WorkRef) -> OtherDeckWork | None:
+    """The issue as another deck's Work, read fresh from the cached lists, or None (#3834).
+
+    The Work page and Take over ask this rather than the last overview, so a press made
+    after the issue came to this deck is refused instead of reassigning it again.
+    """
+    _, backlog = _board_and_backlog(app)
+    found = other_deck_works(
+        backlog, now=datetime.now(UTC), mine=getattr(app.state, "deck_claims", None)
+    )
+    return next((item for item in found if item.work_id == ref.work_id), None)

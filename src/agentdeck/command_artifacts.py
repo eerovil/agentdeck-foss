@@ -659,9 +659,6 @@ class ArtifactStore:
                 total += len(str(metadata.get("excerpt") or "").encode())
         return total
 
-    def has_uncovered(self, session_key: str, *, since: datetime | None = None) -> bool:
-        return bool(self.uncovered_summary(session_key, since=since))
-
     def uncovered_summary(
         self, session_key: str, *, since: datetime | None = None
     ) -> list[dict[str, str]]:

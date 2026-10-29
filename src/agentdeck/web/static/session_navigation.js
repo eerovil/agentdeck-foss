@@ -699,6 +699,12 @@
     }
   }
 
+  // Another script opening a chat in place, as a click on its card would: the deck chat's
+  // jump to another chat and back (#3816, chat_jump.js), which voice mode carries on into.
+  window.AgentDeckSessionNavigation = {
+    open: function (path) { return openSession(null, path, true); }
+  };
+
   // A phone opens a front-page row's chat rather than its Work (#2512): almost every visit
   // is to the conversation. The chat opens over the front page the way an All chats card
   // does, and Back closes it to the front page (#2878). A row with no chat yet still opens

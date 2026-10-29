@@ -1,11 +1,11 @@
-// Live prototyping's meeting page (#3569). The record comes with the page and again after
+// The live prototype page (#3569). The record comes with the page and again after
 // every change the agent records (`/events/live/<key>` says when); each new revision
 // reloads the prototype's frame. Suggestions, "Go back" and "Write the spec" are sent to
 // the chat through its own send route, so they queue like any typed message: the deck
 // does not batch suggestions sent during a change; the agent folds the waiting ones into
 // its next change, as the procedure tells it (the owner's decision on #3569).
 // #3571 adds what the agent is doing (the stream's `activity` event), dictation into the
-// suggestion box (composer_speech.js), and use cases: the agent and the room both write
+// suggestion box (composer_speech.js), and use cases: the agent and the person both write
 // them, and Start walks this screen through one step at a time over the prototype.
 (function () {
   "use strict";
@@ -17,15 +17,18 @@
   const empty = document.getElementById("live-empty");
   const versionsBox = document.getElementById("live-versions");
   const stepsList = document.getElementById("live-steps");
-  const stepLabel = document.getElementById("live-step-label");
   const status = document.getElementById("live-status");
   const form = document.getElementById("live-send");
-  const side = document.getElementById("live-side");
   const activity = document.getElementById("live-activity");
   const caseList = document.getElementById("live-case-list");
   const caseForm = document.getElementById("live-case-form");
   const caseAdd = document.getElementById("live-case-add");
   const walk = document.getElementById("live-walk");
+  // #3831: the panel is a column on a wide screen and a sheet over the prototype on a phone,
+  // where it starts closed; its button counts the changes.
+  const sideCount = document.getElementById("live-side-count");
+  const sideToggle = document.getElementById("live-side-toggle");
+  const narrow = window.matchMedia("(max-width: 719px)");
   // The use case being edited (its id), or null when the form adds one.
   let editing = null;
   // This screen's walkthrough: { id, index }, or null. Not shared: each screen walks its own.
@@ -38,14 +41,62 @@
   // A record fetched while a pick is being saved may hold the old pick: it is dropped.
   let picks = 0;
   let savedPicks = 0;
-  // The room's pick, kept by the deck so a reload and the spec request both see it.
+  // The person's pick, kept by the deck so a reload and the spec request both see it.
   let version = record.picked || null; // a version's name, or null for the main link
+  // A diagram has its own slot beside the prototype (#3827); this screen shows one of the
+  // two, the diagram when `?view=diagram` asked for it or there is no prototype.
+  let showDiagram = new URLSearchParams(window.location.search).get("view") === "diagram";
 
   function currentUrl() {
+    if (diagramShown()) return record.diagram;
     const picked = (record.versions || []).find((item) => item.name === version);
     if (!picked) version = null;
     return picked ? picked.url : record.url;
   }
+
+  // A diagram box picked by a tap in the frame (#3822): the suggestion box says which,
+  // and a suggestion sent while one is picked is about that box.
+  const boxRow = document.getElementById("live-box");
+  const boxName = document.getElementById("live-box-name");
+  const PLACEHOLDER = form.elements.message.placeholder;
+  let pickedBox = null;
+
+  function diagramShown() {
+    return Boolean(record.diagram && (showDiagram || !record.url));
+  }
+
+  // On a phone the diagram or prototype gets the whole screen (#3827, #3831): the
+  // suggestion bar is always under it, so a tapped box only has to close the sheet.
+  function compose(open) {
+    if (open && narrow.matches) setSide(false);
+  }
+
+  // A switch between the prototype and the diagram closes a phone's sheet.
+  let fittedFor = null; // the view the panel was last fitted to
+
+  function fitPanel() {
+    fittedFor = diagramShown();
+    if (narrow.matches) setSide(false);
+  }
+
+  function pickBox(text) {
+    pickedBox = text ? text.slice(0, 200) : null;
+    compose(Boolean(pickedBox));
+    boxRow.hidden = !pickedBox;
+    boxName.textContent = pickedBox ? "\u201c" + pickedBox + "\u201d" : "";
+    form.elements.message.placeholder = pickedBox
+      ? "What should change in \u201c" + pickedBox + "\u201d?"
+      : PLACEHOLDER;
+  }
+
+  window.addEventListener("message", (event) => {
+    // Only the deck's own diagram view, shown in this page's frame, may pick a box.
+    if (event.source !== frame.contentWindow || event.origin !== window.location.origin) return;
+    const box = event.data && event.data.agentdeckDiagramBox;
+    if (box === null || typeof box === "string") pickBox(box);
+  });
+  document.getElementById("live-box-clear").addEventListener("click", () => pickBox(null));
+  frame.addEventListener("load", () => pickBox(null));
 
   function loadFrame() {
     const url = currentUrl();
@@ -55,8 +106,27 @@
     if (url) frame.src = url;
   }
 
+  function viewButton(label, diagram) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = label;
+    button.dataset.liveView = diagram ? "diagram" : "prototype";
+    button.setAttribute("aria-pressed", String(showDiagram === diagram));
+    button.addEventListener("click", () => {
+      showDiagram = diagram;
+      fitPanel();
+      renderVersions();
+      loadFrame();
+    });
+    return button;
+  }
+
   function renderVersions() {
     versionsBox.replaceChildren();
+    if (record.url && record.diagram) {
+      versionsBox.append(viewButton("Prototype", false), viewButton("Diagram", true));
+    }
+    if (diagramShown()) return;
     for (const item of record.versions || []) {
       const button = document.createElement("button");
       button.type = "button";
@@ -74,14 +144,24 @@
 
   function renderSteps() {
     const steps = record.steps || [];
-    stepLabel.textContent = steps.length ? "Step " + steps[steps.length - 1].number : "";
+    sideCount.hidden = !steps.length;
+    sideCount.textContent = steps.length ? String(steps[steps.length - 1].number) : "";
     stepsList.replaceChildren();
     for (const step of steps.slice().reverse()) {
       const item = document.createElement("li");
       const number = document.createElement("span");
       number.className = "n";
-      number.textContent = step.number + ".";
-      item.append(number, document.createTextNode(step.summary));
+      number.textContent = step.number;
+      const text = document.createElement("span");
+      text.className = "text";
+      text.textContent = step.summary;
+      if (step === steps[steps.length - 1]) {
+        const now = document.createElement("span");
+        now.className = "now";
+        now.textContent = "Now";
+        text.append(now);
+      }
+      item.append(number, text);
       if (step !== steps[steps.length - 1]) {
         const back = document.createElement("button");
         back.type = "button";
@@ -192,6 +272,12 @@
   }
 
   function startWalk(useCase) {
+    // A use case walks the prototype, never the diagram.
+    if (record.url && showDiagram) {
+      showDiagram = false;
+      fitPanel();
+      renderVersions();
+    }
     const name = useCaseVersion(useCase);
     if (name !== version) {
       version = name;
@@ -199,6 +285,8 @@
       picking = pick(name);
     }
     walking = { id: useCase.id, index: 0 };
+    // On a phone the sheet covers the prototype, so it closes for the walkthrough.
+    if (narrow.matches) setSide(false);
     if (useCase.url) frame.src = useCase.url;
     else loadFrame();
     frame.hidden = false;
@@ -233,6 +321,8 @@
       version = record.picked || null;
       shownRevision = null;
     }
+    // A diagram the agent adds, or a prototype link it adds beside one, changes the view.
+    if (fittedFor !== diagramShown()) fitPanel();
     renderVersions();
     renderSteps();
     renderUseCases();
@@ -282,13 +372,25 @@
     }
   }
 
+  // One send at a time, as in the chat composer (#2843): a second Enter while the first
+  // is in flight would send the same suggestion again under a fresh action ID.
+  let sending = false;
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
     const box = form.elements.message;
     const text = box.value.trim();
-    if (!text) return;
-    // The text stays in the box until the send is confirmed.
-    if (await send(text)) box.value = "";
+    if (!text || sending) return;
+    const about = pickedBox ? "About the box \u201c" + pickedBox + "\u201d in the diagram: " : "";
+    sending = true;
+    try {
+      // The text stays in the box until the send is confirmed.
+      if (await send(about + text)) {
+        box.value = "";
+        grow();
+      }
+    } finally {
+      sending = false;
+    }
   });
   document.getElementById("live-spec").addEventListener("click", async () => {
     await picking;
@@ -297,9 +399,35 @@
     if (text && confirm(text)) send(text);
   });
   document.getElementById("live-reload").addEventListener("click", loadFrame);
-  document.getElementById("live-side-toggle").addEventListener("click", () => {
-    side.hidden = !side.hidden;
+  function setSide(open) {
+    root.classList.toggle("side-open", open);
+    sideToggle.setAttribute("aria-expanded", String(open));
+  }
+  // A phone starts with the sheet closed, a wide screen with the panel open, and turning
+  // a device across the breakpoint sets the panel for its new width.
+  setSide(!narrow.matches);
+  narrow.addEventListener("change", () => setSide(!narrow.matches));
+  sideToggle.addEventListener("click", () => setSide(!root.classList.contains("side-open")));
+  document.getElementById("live-side-close").addEventListener("click", () => setSide(false));
+  const message = form.elements.message;
+  // The box grows with its text, up to the height its style allows.
+  function grow() {
+    message.style.height = "auto";
+    message.style.height = message.scrollHeight + "px";
+  }
+  message.addEventListener("input", grow);
+  // Enter sends and Shift+Enter adds a line, as in the chat composer.
+  message.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter" || event.shiftKey || event.isComposing) return;
+    event.preventDefault();
+    form.requestSubmit();
   });
+  // The send button takes no focus, so a phone's keyboard stays up (as in the chat, #17).
+  document
+    .getElementById("live-send-button")
+    .addEventListener("mousedown", (event) => event.preventDefault());
+  // The phone's sheet ends above the suggestion bar, whatever its height.
+  new ResizeObserver(() => root.style.setProperty("--send-h", form.offsetHeight + "px")).observe(form);
 
   caseAdd.addEventListener("click", () => openCaseForm(null));
   document.getElementById("live-case-cancel").addEventListener("click", closeCaseForm);

@@ -19,4 +19,7 @@ class RevalidatingStaticFiles(StaticFiles):
     async def get_response(self, path: str, scope: Scope) -> Response:
         response = await super().get_response(path, scope)
         response.headers["Cache-Control"] = "public, no-cache"
+        if path.startswith("vendor/"):
+            # A diagram frame has no origin of its own, so it loads modules with CORS (#3822).
+            response.headers["Access-Control-Allow-Origin"] = "*"
         return response

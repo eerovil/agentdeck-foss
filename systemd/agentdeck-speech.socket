@@ -1,0 +1,11 @@
+[Unit]
+Description=agentdeck voice mode speech service listener (#3409)
+
+[Socket]
+ListenStream=%t/agentdeck-speech.sock
+SocketMode=0600
+Accept=no
+Service=agentdeck-speech.service
+
+[Install]
+WantedBy=sockets.target

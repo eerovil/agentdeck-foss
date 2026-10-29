@@ -796,17 +796,17 @@ def test_the_front_page_is_work_first(tmp_path):
 
     html = client.get("/").text
 
-    # The counts, then the groups in the order a Work moves through them (#3578), other
-    # activity, and the board with the links off the page.
+    # The counts, then the groups most needing the owner first (#3818), other activity, and
+    # the board with the links off the page.
     order = [
         'id="front-summary"',
         'id="front-needs"',
-        'id="works-section"',
-        'id="front-stuck"',
-        'id="front-waiting"',
         'id="front-release"',
-        'id="front-live"',
+        'id="front-stuck"',
+        'id="works-section"',
         'id="front-cleanup"',
+        'id="front-waiting"',
+        'id="front-live"',
         'id="front-finished"',
         'id="front-paused"',
         'id="front-stopped"',
@@ -1440,6 +1440,7 @@ def test_the_older_slices_routes_are_the_work_page_now(tmp_path):
         "/works/{work_id:path}",
         "/works/{work_id:path}/message",
         "/works/{work_id:path}/action",  # the one Work action route (#2237)
+        "/works/{work_id:path}/take-over",  # another deck's Work comes here (#3834)
         "/works/{work_id:path}/visibility",  # Hide and Bring back (#2238)
         "/works/{work_id:path}/star",  # Star and Unstar (#3116)
         "/api/works/{work_id:path}/star",  # the same for agents (#3116)

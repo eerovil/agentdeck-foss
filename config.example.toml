@@ -65,7 +65,6 @@ subject = ""                       # e.g. "mailto:you@example.com"
 
 [assistant]
 enabled = false
-refresh_interval_s = 60
 
 # Deck-owned Claude worker processes (spawned/steered/revived through the
 # runtime service's /claude/... API). Off by default — see docs/WORKER_RUNTIME.md.

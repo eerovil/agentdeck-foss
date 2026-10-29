@@ -143,7 +143,7 @@ def build(monkeypatch):
     def make(state=None, accounts=(HEALTHY, UNREAD)):
         state = state or _State()
         config = SimpleNamespace(
-            assistant=SimpleNamespace(enabled=True, refresh_interval_s=3600),
+            assistant=SimpleNamespace(enabled=True),
             poller=SimpleNamespace(root="unused"),
             build_accounts=lambda: [SimpleNamespace(key=key) for key in accounts],
         )

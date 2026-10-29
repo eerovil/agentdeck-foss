@@ -517,14 +517,12 @@ async def test_keyed_codex_worker_requires_cwd_for_a_new_key(tmp_path):
 
 
 
-async def test_model_usage_and_legacy_session_cap_do_not_block_codex(tmp_path):
+async def test_a_usage_cache_does_not_block_codex(tmp_path):
     host = CodexWorkerHost(
         _account(tmp_path),
         _client(),
         state_dir=tmp_path / "state",
-        usage_ceiling_pct=1,
         usage_cache_dir=tmp_path / "usage",
-        session_over_budget=lambda _session_id: True,
     )
     started = await host.deliver(
         "owner/repo#12", "work", cwd="/work", delivery_id="one", delegated=True
@@ -535,26 +533,6 @@ async def test_model_usage_and_legacy_session_cap_do_not_block_codex(tmp_path):
 
     assert started.accepted and started.action == "spawned"
     assert followed_up.accepted and followed_up.action == "queued"
-
-
-async def test_exhausted_codex_session_does_not_block_cwd_replacement(tmp_path):
-    exhausted = False
-    client = _client()
-    host = CodexWorkerHost(
-        _account(tmp_path),
-        client,
-        state_dir=tmp_path / "state",
-        session_over_budget=lambda _session_id: exhausted,
-    )
-    await host.deliver("owner/repo#12", "work", cwd="/old", delivery_id="one", delegated=True)
-    exhausted = True
-    client.create_thread.return_value = InjectResult(True, session_id="thread-2")
-
-    replaced = await host.deliver(
-        "owner/repo#12", "new work", cwd="/new", delivery_id="two", delegated=True
-    )
-
-    assert replaced.accepted and replaced.session_id == "thread-2"
 
 
 async def test_codex_thread_started_before_a_guide_edit_is_refreshed_once(tmp_path):

@@ -37,7 +37,7 @@ from ..state import REVIEWS_TOPIC
 from ..work import WorkRef
 from ..work_actions import STAR, UNSTAR, WorkActionPress, finish_question
 from ..work_attention import FINISH, HIDE
-from ..work_claims import own_assignee, run_gh_write, start_issue
+from ..work_claims import own_assignee, run_gh_write, start_issue, take_over
 from ..work_hidden import UNHIDE
 from ..work_overview import (
     WorkCandidate,
@@ -79,6 +79,7 @@ from .work_view import (
     mark_sent,
     needs_you_rows,
     note_work_opened,
+    other_deck_work,
     population_rows,
     render_changed_sections,
     render_work_sections,
@@ -611,6 +612,15 @@ async def work_page(request: Request, work_id: str) -> HTMLResponse:
     # Read before the build, so a change landing during it moves the key past it (#3228).
     before = work_page_key(request.app, ref, ())
     revisions = _revision_reader(request.app.state.app_state)
+    # Another deck's Work, read only, with Take over (#3834): also one this deck ran before
+    # the issue went to the other deck, whose stopped chats stay in the chat list.
+    other = other_deck_work(request.app, ref)
+    if other is not None:
+        response = get_templates(request).TemplateResponse(
+            request, "work_other_deck.html", {"other_deck": other}
+        )
+        response.headers["Cache-Control"] = "no-cache"
+        return response
     detail = await load_work_detail(request.app, ref, times=times)
     if detail is None:
         raise HTTPException(status_code=404, detail="nothing on this deck names this Work")
@@ -1459,6 +1469,104 @@ async def _write(
 async def _run_gh(argv: list[str], repository: str, label: str) -> tuple[str, str]:
     """One ``gh`` write of a Work action: ``("done", "")``, or its outcome and why."""
     return await run_gh_write(argv, repository, label, timeout=_GH_TIMEOUT_S)
+
+
+@router.post("/works/{work_id:path}/take-over", response_class=HTMLResponse)
+async def work_take_over(request: Request, work_id: str) -> HTMLResponse:
+    """Take another deck's Work to this deck: Take over, or Start here (#3834).
+
+    Offered only on the read-only page of an issue another deck works. The issue is read
+    again from the cached lists when the press arrives, so one that came to this deck
+    meanwhile is refused rather than reassigned twice. The press is reserved under its
+    client action id like every Work action, and an uncertain write is never made again.
+    """
+    from ..poller_engine.github_authority import deck_person
+    from . import routes_actions
+
+    routes_actions._require_same_origin(request)
+    ref, _ = _resolve(work_id)
+    if ref is None:
+        raise HTTPException(status_code=404, detail="not a Work id")
+    form = await request.form()
+    label = work_actions.LABELS[work_actions.TAKE_OVER]
+    action_id = str(form.get("client_action_id") or "")
+    if not _ACTION_ID_RE.fullmatch(action_id):
+        return _message_receipt(
+            request,
+            text=f"{label} was not sent: the press carried no usable action ID.",
+            state="refused",
+            status_code=422,
+        )
+    db = get_control_db(request)
+    earlier = db.work_action(action_id)
+    if earlier is not None:
+        if earlier.work_id != ref.work_id or earlier.action != work_actions.TAKE_OVER:
+            return _message_receipt(
+                request,
+                text="That action ID was already used for something else; nothing was sent.",
+                state="refused",
+                status_code=409,
+            )
+        return _pressed_receipt(request, earlier)
+    other = other_deck_work(request.app, ref)
+    person = deck_person()
+    if other is None or not person:
+        return _message_receipt(
+            request,
+            text="This Work is no longer another deck's, so there is nothing to take over.",
+            state="refused",
+            status_code=409,
+        )
+    gh = shutil.which("gh")
+    if gh is None:
+        return _message_receipt(
+            request,
+            text=f"{label} was not sent: gh is not available on this host.",
+            state="refused",
+            status_code=409,
+        )
+    # A second press with a new id, before the cached lists show the issue as this deck's,
+    # would make the edit and the comment again: refused like any repeated Work action.
+    recent = work_actions.recent_press(db.load_work_actions(ref.work_id), work_actions.TAKE_OVER)
+    if recent is not None:
+        how = "was sent" if recent.state == "sent" else "may have been sent"
+        return _not_again(request, label, how, recent.age_s())
+    reserved = db.reserve_work_action(action_id, ref.work_id, work_actions.TAKE_OVER)
+    if not reserved:
+        pressed = db.work_action(action_id) if reserved is not None else None
+        if pressed is not None:
+            return _pressed_receipt(request, pressed)
+        return _message_receipt(
+            request,
+            text="The deck could not record this press, so nothing was sent.",
+            state="refused",
+            status_code=409,
+        )
+    outcome, receipt = await take_over(
+        gh,
+        other.ref.repository,
+        other.ref.number,
+        assignees=other.assignees,
+        person=person,
+        start_label=other.start_label,
+        started=other.started,
+        timeout=_GH_TIMEOUT_S,
+    )
+    if outcome == "uncertain":
+        logger.warning("take over of %s is uncertain: %s", ref.work_id, receipt)
+        return _message_receipt(
+            request,
+            text=f"{receipt}, so it will not be sent again.",
+            state="uncertain",
+            status_code=202,
+        )
+    db.settle_work_action(action_id, outcome, receipt)
+    if outcome == "failed":
+        return _message_receipt(
+            request, text=f"{label} was not sent: {receipt}", state="refused", status_code=409
+        )
+    logger.info("work take-over of %s: %s", ref.work_id, receipt)
+    return _message_receipt(request, text=receipt, state="sent")
 
 
 @router.post("/works/{work_id:path}/action", response_class=HTMLResponse)

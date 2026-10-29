@@ -175,3 +175,11 @@ works it, so both never start an agent on one issue.
 
 A deck that sees another deck's "started an agent" comment on an issue it works tells its agent
 to stop pushing and ask you who keeps it.
+
+Each deck also lists the other decks' issues on its front page, in a folded **Other decks** group
+under Other activity: the ones another deck's agent works, and the other person's issues no agent
+has started that were opened in the last 14 days. Opening one shows a read-only page with the
+issue, whose deck has it and its open pull request. Its one button, **Take over** (or **Start
+here** for one not started), does step 3 for you: it makes you the issue's only assignee, adds
+the start label when none is on, and for a started one posts a comment saying who took it over
+from whom. The new agent starts on the pushed branch and registers the open pull request.

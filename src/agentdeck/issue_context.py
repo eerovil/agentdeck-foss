@@ -123,14 +123,6 @@ def issue_reference_from_url(url: str | None) -> tuple[str, int] | None:
     return (f"{match.group(1)}/{match.group(2)}", int(match.group(3)))
 
 
-def pull_reference_from_url(url: str | None) -> tuple[str, int] | None:
-    """``(owner/repo, number)`` for a GitHub *pull request* link, or None."""
-    match = _PULL_LINK_RE.search(url or "")
-    if match is None:
-        return None
-    return (f"{match.group(1)}/{match.group(2)}", int(match.group(3)))
-
-
 def identity(repository: str, number: int) -> str:
     """The join key. Case-insensitive because GitHub repository names are."""
     return f"{repository.lower()}#{number}"
@@ -397,29 +389,6 @@ class IssueBacklog:
             if entry.present
             and not entry.decides_closure(self.CLOSURE_HORIZON_S)
             and not entry.truncated
-        )
-
-    def open_pull(self, repository: str, number: int) -> dict | None:
-        """One open pull request by identity, or None when it is not open.
-
-        None is also what an unread list gives, which is why the caller checks
-        ``pulls_complete`` before reading absence as "not open".
-        """
-        lowered = repository.lower()
-        for entry in self.pulls:
-            if entry.repository.lower() != lowered:
-                continue
-            for pull in entry.pulls:
-                if pull.get("number") == number:
-                    return pull
-        return None
-
-    def knows_pulls_for(self, repository: str) -> bool:
-        """Whether this repository's open pull request list was actually read."""
-        lowered = repository.lower()
-        return any(
-            entry.repository.lower() == lowered and entry.complete
-            for entry in self.pulls
         )
 
     def pulls_by_issue(self) -> dict[str, tuple[dict, ...]]:
@@ -1057,10 +1026,6 @@ class IssueResolver:
     def held_blocked_by(self, repository: str, number: int) -> tuple[tuple[dict, ...] | None, bool]:
         """``blocked_by``' held value without asking GitHub, and whether it is fresh."""
         return self._held(wayfinder_map.BLOCKED_BY_KEY, repository, number, _issue_rows)
-
-    def held_issue_body(self, repository: str, number: int) -> tuple[str | None, bool]:
-        """``issue_body``' held value without asking GitHub, and whether it is fresh."""
-        return self._held(wayfinder_map.ISSUE_BODY_KEY, repository, number, _body_of)
 
     def _held(self, prefix: str, repository: str, number: int, parse) -> tuple[Any, bool]:
         lookup = self._metadata.peek(wayfinder_map.cache_key(prefix, repository, number))

@@ -1395,13 +1395,8 @@ async def test_worker_command_includes_configured_flags(tmp_path):
     await host.stop()
 
 
-async def test_model_usage_and_legacy_session_cap_do_not_block_delivery(tmp_path):
-    host, _spawned = _host(
-        tmp_path,
-        usage_ceiling_pct=1.0,
-        usage_reader=lambda: 100.0,
-        session_over_budget=lambda _session_id: True,
-    )
+async def test_full_model_usage_does_not_block_delivery(tmp_path):
+    host, _spawned = _host(tmp_path, usage_reader=lambda: 100.0)
     started = await host.deliver(
         "issue-1", "start", cwd=str(tmp_path), delegated=False
     )
@@ -1409,23 +1404,6 @@ async def test_model_usage_and_legacy_session_cap_do_not_block_delivery(tmp_path
 
     assert started.accepted and started.action == "spawned"
     assert followed_up.accepted and followed_up.action == "steered"
-    await host.stop()
-
-
-async def test_exhausted_claude_session_does_not_block_cwd_replacement(tmp_path):
-    exhausted = False
-    host, spawned = _host(
-        tmp_path, session_over_budget=lambda _session_id: exhausted
-    )
-    await host.deliver("issue-1", "start", cwd=str(tmp_path / "old"), delegated=False)
-    spawned[0]["process"].terminate()
-    await _settle()
-    exhausted = True
-
-    replaced = await host.deliver("issue-1", "new work", cwd=str(tmp_path / "new"), delegated=False)
-
-    assert replaced.accepted
-    assert replaced.session_id == "sid-auto-2"
     await host.stop()
 
 

@@ -58,10 +58,32 @@ chat started there spends real usage.
 
 ## Voice mode
 
-Voice mode sends speech to a separate service for speech-to-text and text-to-speech. The
-author's ran [faster-whisper](https://github.com/SYSTRAN/faster-whisper) and
-[Piper](https://github.com/rhasspy/piper) on an old graphics card, started on demand by a
-systemd socket. Point the voice settings at your own service, or leave voice mode off.
+Voice mode needs a speech service on the same host: speech to text, and
+[Piper](https://github.com/rhasspy/piper) to read replies aloud. Nothing leaves the host.
+With no service set, voice mode stays hidden and 🎤 dictation uses the browser's own
+recognizer.
+
+1. Run `scripts/speech_setup.sh` (it needs `python3.12`, or set `PYTHON`). It builds the
+   service's own virtualenv, downloads the voices and models, and enables the
+   `agentdeck-speech` and `agentdeck-wake` user units. The units expect the checkout at
+   `~/agentdeck`; `--no-units` stops before them.
+2. Add the `[speech]` lines it prints to your deck config and restart `agentdeck.service`.
+3. Pick the speech-to-text engine with `[speech] engine`: `"whisper"` runs
+   [faster-whisper](https://github.com/SYSTRAN/faster-whisper) on an NVIDIA card (the
+   pins in the script suit old cards too), `"parakeet"` runs on the CPU with no card. A
+   phrase Whisper fails on is heard by Parakeet instead. Restart
+   `agentdeck-speech.service` after changing it.
+4. The wake word ("hey jarvis") is optional: leave `wake_socket` out to go without it.
+
+To bring your own service instead, serve these on a Unix socket and set `[speech] socket`
+to it (`scripts/speech_server.py` has the details):
+
+| Request | Body | Answer |
+| --- | --- | --- |
+| `POST /transcribe` | 16-bit mono WAV | `{"text", "language", "seconds", "segments"}` |
+| `POST /say` | `{"text", "language", "voice", "speed"}` | `audio/wav` |
+| `POST /warm` | none | 202 while the model loads |
+| `GET /status` | none | `{"engine", "loaded", ...}` |
 
 ## Ostree systems (Fedora Silverblue and its relatives)
 

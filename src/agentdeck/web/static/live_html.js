@@ -62,6 +62,33 @@
       '"></iframe>';
   }
 
+  // A ```mermaid block in a markdown file drawn as a diagram (#3822): the same sandbox
+  // and sizing as `frame`, plus the deck's own Mermaid copy and diagram_frame.js, which
+  // draws, styles and makes it clickable. The source is escaped once more, so it reaches
+  // the frame as text, and the box notes go in as JSON.
+  var MERMAID_SRC = DECK + '/static/vendor/mermaid.min.js';
+  var MERMAID_PRELUDE = PRELUDE.replace("script-src 'unsafe-inline'",
+    "script-src 'unsafe-inline' " + DECK + '/static/vendor/ ' + DECK + '/static/diagram_frame.js');
+  var MERMAID_RUN =
+    '<script src="' + MERMAID_SRC + '"><\/script>' +
+    '<script src="' + DECK + '/static/diagram_frame.js"><\/script>';
+
+  // `fill` draws the diagram as a canvas filling the frame, with pan and zoom, for
+  // the full-screen view; otherwise it is laid out in the page at its own height.
+  // `reserved` names the colours the file's legend gives a meaning, which groups skip.
+  function mermaidFrame(escapedSource, notes, fill, reserved) {
+    var json = JSON.stringify(notes || {}).replace(/</g, '\\u003c');
+    var colours = JSON.stringify(reserved || []).replace(/</g, '\\u003c');
+    return '<iframe class="md-live md-diagram' + (fill ? ' md-diagram-fill' : '') +
+      '" sandbox="allow-scripts" ' +
+      'title="Diagram" srcdoc="' + escapeAttr(MERMAID_PRELUDE) +
+      escapeAttr('<script>window.agentdeckBoxNotes=' + json + ';window.agentdeckFill=' +
+        (fill ? 'true' : 'false') + ';window.agentdeckReservedColours=' + colours +
+        ';<\/script>') +
+      escapeAttr('<pre class="mermaid">') + escapeAttr(escapedSource) +
+      escapeAttr('</pre>' + MERMAID_RUN) + '"></iframe>';
+  }
+
   window.addEventListener('message', function (event) {
     var data = event.data;
     if (!data || typeof data.agentdeckLiveHeight !== 'number') return;
@@ -74,5 +101,5 @@
     }
   });
 
-  window.AgentdeckLiveHtml = { frame: frame, PRELUDE: PRELUDE };
+  window.AgentdeckLiveHtml = { frame: frame, mermaid: mermaidFrame, PRELUDE: PRELUDE };
 })();

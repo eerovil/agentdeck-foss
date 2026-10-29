@@ -1,0 +1,114 @@
+<!doctype html>
+{#- A diagram file shown as a full-screen canvas (#3822): the drawing fills the page,
+    with its title and zoom floating on top. `?bare=1` on a `.md` file that
+    holds a ```mermaid block; the live page loads this. -#}
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <title>{{ title or path.name }}</title>
+  <style>
+    [hidden] { display: none !important; }
+    html, body { margin: 0; height: 100%; overflow: hidden; background: #f6f7f9; color: #1f2328;
+      font: 14px/1.45 system-ui, -apple-system, sans-serif; }
+    @media (prefers-color-scheme: dark) { html, body { background: #15181d; color: #e6e8eb; } }
+    iframe.md-diagram { position: fixed; inset: 0; width: 100vw; height: 100vh !important; border: 0; display: block; }
+    .dc-head { position: fixed; top: 12px; left: 12px; right: 12px; display: flex; gap: 8px;
+      align-items: flex-start; pointer-events: none; z-index: 2; }
+    .dc-card { pointer-events: auto; max-width: min(560px, 100%); padding: 8px 12px; border-radius: 10px;
+      background: rgba(255,255,255,.92); border: 1px solid rgba(0,0,0,.08);
+      box-shadow: 0 2px 10px rgba(0,0,0,.08); backdrop-filter: blur(6px); }
+    @media (prefers-color-scheme: dark) { .dc-card { background: rgba(30,34,41,.92); border-color: rgba(255,255,255,.08); } }
+    .dc-title { font-weight: 600; font-size: 15px; display: flex; gap: 8px; align-items: center; }
+    .dc-title button, .dc-tools button { font: inherit; border: 0; background: none; color: inherit;
+      cursor: pointer; opacity: .7; padding: 2px 6px; border-radius: 6px; }
+    .dc-title button:hover, .dc-tools button:hover { opacity: 1; background: rgba(127,127,127,.15); }
+    .dc-summary { margin: 6px 0 2px; font-size: 13px; opacity: .85; }
+    .dc-tools { margin-left: auto; display: flex; gap: 2px; padding: 4px 6px; }
+    .dc-legend { position: fixed; left: 12px; bottom: 12px; z-index: 2; padding: 8px 12px;
+      display: flex; flex-direction: column; gap: 4px; font-size: 12.5px; }
+    .dc-legend div { display: flex; align-items: center; gap: 8px; }
+    .dc-legend-button { display: inline-flex; align-items: center; }
+    .dc-legend-button .dc-swatch { width: 9px; height: 9px; border-radius: 3px; margin-left: -3px; }
+    .dc-legend-button .dc-swatch:first-child { margin-left: 0; }
+    .dc-legend-button[aria-expanded="true"] { opacity: 1; background: rgba(127,127,127,.2); }
+    .dc-swatch { width: 14px; height: 14px; border-radius: 4px; flex: none;
+      background: hsl(var(--h) 88% 88%); border: 1.5px solid hsl(var(--h) 70% 46%); }
+    @media (prefers-color-scheme: dark) {
+      .dc-swatch { background: hsl(var(--h) 45% 25%); border-color: hsl(var(--h) 65% 58%); } }
+  </style>
+  <script src="/static/live_html.js?v={{ asset_ver }}"></script>
+</head>
+<body>
+  <div class="dc-head">
+    <div class="dc-card">
+      <div class="dc-title"><span>{{ title or path.name }}</span>
+        {% if summary %}<button type="button" id="dc-info" aria-expanded="false" title="About this diagram">ⓘ</button>{% endif %}</div>
+      {% if summary %}<p class="dc-summary" id="dc-summary" hidden>{{ summary }}</p>{% endif %}
+    </div>
+    <div class="dc-card dc-tools">
+      <button type="button" data-zoom="out" title="Zoom out">−</button>
+      <button type="button" data-zoom="fit" title="Fit to screen">Fit</button>
+      <button type="button" data-zoom="in" title="Zoom in">+</button>
+      {#- The legend is rarely needed and covers a tapped box's note, so it waits behind this
+          (#3831). #}
+      {% if legend %}<button type="button" class="dc-legend-button" id="dc-legend-button"
+        aria-controls="dc-legend" aria-expanded="false" title="What the colours mean"
+        aria-label="What the colours mean">
+        {%- for item in legend[:3] %}<span class="dc-swatch" style="--h: {{ item.hue }}"></span>{% endfor -%}
+      </button>{% endif %}
+    </div>
+  </div>
+  {% if legend %}
+  <div class="dc-card dc-legend" id="dc-legend" aria-label="Colours" hidden>
+    {% for item in legend %}<div><span class="dc-swatch" style="--h: {{ item.hue }}"></span>{{ item.text }}</div>{% endfor %}
+  </div>
+  {% endif %}
+  <div id="dc-stage"></div>
+  <script>
+  (function () {
+    function esc(s) {
+      return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    }
+    var stage = document.getElementById('dc-stage');
+    var bar = document.querySelector('.dc-tools');
+    stage.innerHTML = AgentdeckLiveHtml.mermaid(esc({{ source | tojson }}), {{ notes | tojson }}, true,
+      {{ legend | map(attribute='colour') | list | tojson }});
+    var frame = stage.querySelector('iframe');
+    bar.addEventListener('click', function (event) {
+      var b = event.target.closest('[data-zoom]');
+      if (b) frame.contentWindow.postMessage({ agentdeckZoom: b.dataset.zoom }, '*');
+    });
+    // A tapped box goes on to the live page around this one, when there is one, so
+    // its suggestion box can say which box a change is about.
+    var legend = document.getElementById('dc-legend');
+    var legendButton = document.getElementById('dc-legend-button');
+    function showLegend(open) {
+      if (!legend) return;
+      legend.hidden = !open;
+      legendButton.setAttribute('aria-expanded', String(open));
+    }
+    if (legendButton) legendButton.addEventListener('click', function () {
+      showLegend(legend.hidden);
+    });
+    window.addEventListener('message', function (event) {
+      if (event.source !== frame.contentWindow) return;
+      var box = event.data && event.data.agentdeckDiagramBox;
+      if (box !== null && typeof box !== 'string') return;
+      // A tapped box's note shows where the legend sits, so the legend makes way.
+      if (box) showLegend(false);
+      if (window.parent === window) return;
+      window.parent.postMessage({ agentdeckDiagramBox: box }, window.location.origin);
+    });
+    var info = document.getElementById('dc-info');
+    if (info) info.addEventListener('click', function () {
+      var s = document.getElementById('dc-summary');
+      s.hidden = !s.hidden;
+      info.setAttribute('aria-expanded', String(!s.hidden));
+    });
+  })();
+  </script>
+</body>
+</html>

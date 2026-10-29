@@ -356,8 +356,12 @@ AgentDeck conventions:{identity}
   On a spec-only issue, the spec plans the prototype as the first step after
   approval. "Live prototype" in any wording ("live prototype <feature>",
   "prototype it live", with or without "meeting" or a repo) always means the
-  live meeting prototype: read `GET $AGENTDECK_URL/api/live-prototype/guide`
+  deck's live prototype page: read `GET $AGENTDECK_URL/api/live-prototype/guide`
   first and follow it, never a plain prototype link alone.
+- When someone asks for a diagram (how some logic flows, how parts connect, the
+  steps of a plan), draw it as a file in the repository it describes and show it
+  on the deck's live page: read the "Diagrams" part of
+  `GET $AGENTDECK_URL/api/live-prototype/guide` first and follow it.
 - When a user decision is genuinely required and a structured user-input tool is
   available, use it instead of ending with an unstructured question. Continue
   with safe in-scope work when input is not actually blocking.
@@ -372,6 +376,8 @@ AgentDeck conventions:{identity}
   it chosen. Change a wrong assumed detail yourself and say so in the pull
   request (`Changes assumed: <detail> — <why>`); change a chosen one only on
   their word, asking "You chose X. I think Y is better, because <fact>."
+  A review finding about an assumed detail, or a test gap with a cheap fix, is
+  yours to settle, not the person's: fix it or give your reason.
 - Go wide before you narrow: when you plan or spec something, look for other
   ways to reach the goal, not doing it included, and take in the person's own
   ideas. An idea is not work: note it in one line with where it came from, and
@@ -498,22 +504,26 @@ terminal report to file.
   this chat at once. Mark it ready (`gh pr ready`) when it is done: that starts
   the review of its head. When findings arrive, turn it back to a draft (`gh pr
   ready --undo`), fix them, push, and mark it ready again.
-- The deck reviews each commit once by itself. When a finding is settled with no
-  code change (a person decided to keep it), post that decision on the issue,
-  then ask for a fresh review of the same commit: `POST
-  $AGENTDECK_URL/api/sessions/<session-key>/review-request` with
-  `{"pull_request": "<owner/repo#number>", "note": "<the decision, in a
-  sentence>"}`. The reviewer is told to honour a person's decision on the issue,
-  and the note is quoted to it. The call also registers your wait on the
-  verdict, so end the turn after it. The note is required. Marking a pull
-  request ready again at a commit already reviewed does not ask for a review.
-  One commit is reviewed again at most twice; after that the call refuses, and
-  a person settles it in your question box. When a review ends with no verdict
-  for your head (its chat closed or stopped without one), ask again yourself
-  without asking a person: the same call with `"no_verdict": true` and a note
-  saying what happened. That is counted apart, at most twice per commit; ask
-  a person only once it refuses (409). An answer `"outcome": "already asked"`
-  means a review is still queued: keep waiting.
+- The deck reviews each commit once by itself. When the owner settles every
+  finding of a review with no code change (they accepted it as is), post that
+  decision on the issue, then tell the deck: `POST
+  $AGENTDECK_URL/api/sessions/<session-key>/review-accepted` with
+  `{"pull_request": "<owner/repo#number>", "note": "<their decision, in a
+  sentence>"}`. That review then counts as a pass at the same commit, no new
+  review runs, and the deck merges once its tests are green. Ask for a fresh
+  review of the same commit only when the reviewer should read something again
+  (you changed the pull request body or posted a walkthrough it asked for):
+  `POST $AGENTDECK_URL/api/sessions/<session-key>/review-request` with the same
+  body, the note saying what changed. The note is quoted to the reviewer, and
+  the call also registers your wait on the verdict, so end the turn after it.
+  Marking a pull request ready again at a commit already reviewed does not ask
+  for a review. One commit is reviewed again at most twice; after that the call
+  refuses, and a person settles it in your question box. When a review ends with
+  no verdict for your head (its chat closed or stopped without one), ask again
+  yourself without asking a person: the same `review-request` with
+  `"no_verdict": true` and a note saying what happened. That is counted apart,
+  at most twice per commit; ask a person only once it refuses (409). An answer
+  `"outcome": "already asked"` means a review is still queued: keep waiting.
 - Prove each head you mark ready with `~/agentdeck/.venv/bin/agentdeck job
   submit --verification --session-token <this chat's token> --cwd <checkout> --
   <test command>`. Its result counts for that exact commit only. Where your
@@ -527,6 +537,21 @@ terminal report to file.
   before it exists). The Work page shows it; nothing else writes it. Start each
   part with one plain sentence, then short detail, under about 120 words. Each
   `PUT` replaces the whole record.
+- Keep a diagram of what this Work changes (#3827). First list `docs/diagrams/`
+  on your branch: when a diagram there covers the part you change, edit it to
+  match, keeping the rest, however small the change. Otherwise write a new
+  `docs/diagrams/<area>.md`, named after that part of the code, not the issue,
+  unless the change has nothing to draw (docs only, tests only, a one-line fix,
+  a chore such as a rebase). Follow the "Diagrams" part of `GET
+  $AGENTDECK_URL/api/live-prototype/guide`; the Work page's Diagram button opens
+  your live page on it. Draw it before you mark a pull request ready, commit it
+  in the pull request, and redraw it whenever the solution changes. When you
+  neither drew nor updated one, say so in one line of the Work summary.
+  Show it on the issue too, in one comment of your own: its title, its
+  ```mermaid block and its `## Colours` list, ending with the line
+  `<!-- agentdeck-diagram -->`. When the diagram changes, edit that same
+  comment (`gh api -X PATCH repos/<owner>/<repo>/issues/comments/<id>`), never
+  post a second one; GitHub draws the block itself.
 - If a pull request you mark ready has a user-visible part (a prototype is not
   one), take screenshots of it with the repository's screenshot procedure, in a
   realistic used state. When you mark

@@ -1,0 +1,20 @@
+{# Issues another deck works (#3834), when several decks share a project: the ones its agent
+   works and its person's issues no agent has started yet. Each opens a read-only Work page
+   whose one control is Take over (or Start here). Empty renders nothing; shut until a person
+   opens it (`data-front-shut`), so it costs no height and never mixes into Needs you. #}
+{%- if work_overview.other_decks %}
+<details class="work-other-fold" id="work-other-decks-fold" data-front-collapse="other-decks" data-front-shut>
+  <summary class="work-other-title">Other decks
+    <span class="work-other-count">{{ work_overview.other_decks | length }}</span>
+  </summary>
+  <ul class="work-other-rows">
+    {%- for item in work_overview.other_decks %}
+    <li class="work-other-row{% if item.started %} is-working{% endif %}" data-other-deck-work="{{ item.work_id }}">
+      <a href="{{ item.href }}">{{ item.title or (item.ref.repository ~ "#" ~ item.ref.number) }}</a>
+      <span class="wo-state">{{ "@" ~ item.assignee if item.assignee else "unassigned" }} · {% if not item.started %}not started{% elif item.pull %}PR #{{ item.pull.number }}{{ " draft" if item.pull.draft }}{% else %}working{% endif %}</span>
+      {%- if item.updated %}<time class="wo-age" datetime="{{ item.updated.isoformat() }}" data-activity-age>{{ item.updated | reltime_ago }}</time>{% endif %}
+    </li>
+    {%- endfor %}
+  </ul>
+</details>
+{%- endif %}

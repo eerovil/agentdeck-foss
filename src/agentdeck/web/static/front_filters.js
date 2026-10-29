@@ -13,7 +13,9 @@
 //    paints, and a retained row is never touched. A tap folds the group its press started
 //    on, since a live push redraws the header and a press that ends on the new one is no
 //    click (#3432). Other activity is a `<details>` that shares
-//    the same store (`data-front-collapse`). Everything is open by default.
+//    the same store (`data-front-collapse`). Everything is open by default, except a
+//    `<details>` marked `data-front-shut` (Other decks, #3834): shut until opened, which the
+//    store keeps as `{key: false}`.
 // 2. The project tabs (#3226). Each Work row names its project (`data-work-project`); a line
 //    of tabs under the counts, pinned under the top bar, has one tab per project on the
 //    page, the one with the newest activity first (#3399), each with its new count, and All
@@ -24,6 +26,8 @@
 //    `agentdeck-front-hidden-projects` as `{project: true}`. Like folding it is a generated
 //    stylesheet, so a pushed row is hidden before it paints; the group headers, their NEW
 //    pills and the counts line are then recounted without the hidden rows.
+// 3. The deck chat can switch the tabs on every open page (#3814, `view_commands.py`): its
+//    command arrives as a `view` event in the top bar's hidden slot.
 (function () {
   'use strict';
 
@@ -35,6 +39,13 @@
       var parsed = JSON.parse(localStorage.getItem(FOLD_KEY) || '{}');
       return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
     } catch (_) { return {}; }
+  }
+
+  // Whether a group is shut: its stored fold, else its default.
+  function isShut(fold, key) {
+    if (Object.prototype.hasOwnProperty.call(fold, key)) return Boolean(fold[key]);
+    var details = document.querySelector('details[data-front-collapse="' + key + '"]');
+    return Boolean(details && details.hasAttribute('data-front-shut'));
   }
 
   function applyFolds() {
@@ -56,7 +67,7 @@
       button.setAttribute('aria-expanded', fold[button.getAttribute('data-front-toggle')] ? 'false' : 'true');
     });
     Array.prototype.forEach.call(document.querySelectorAll('details[data-front-collapse]'), function (details) {
-      var open = !fold[details.getAttribute('data-front-collapse')];
+      var open = !isShut(fold, details.getAttribute('data-front-collapse'));
       if (details.open !== open) details.open = open;
     });
   }
@@ -64,7 +75,9 @@
   function setFold(key, shut) {
     if (!FOLD_NAME.test(key)) return;
     var fold = folded();
-    if (shut) fold[key] = true;
+    var details = document.querySelector('details[data-front-collapse="' + key + '"]');
+    if (details && details.hasAttribute('data-front-shut')) fold[key] = Boolean(shut);
+    else if (shut) fold[key] = true;
     else delete fold[key];
     try { localStorage.setItem(FOLD_KEY, JSON.stringify(fold)); } catch (_) {}
     applyFolds();
@@ -113,7 +126,7 @@
     var details = e.target;
     if (!details || !details.matches || !details.matches('details[data-front-collapse]')) return;
     var key = details.getAttribute('data-front-collapse');
-    if (Boolean(folded()[key]) !== !details.open) setFold(key, !details.open);
+    if (isShut(folded(), key) !== !details.open) setFold(key, !details.open);
   }, true);
 
   var PROJECT_KEY = 'agentdeck-front-hidden-projects';
@@ -401,6 +414,32 @@
     swipe = null;
     if (Math.abs(dx) >= SWIPE_PX && Math.abs(dy) * 2 < Math.abs(dx)) step(dx < 0 ? 1 : -1);
   }, {passive: true});
+
+  // The deck chat's view change (#3814): every open page shows one project, or All, as a tap
+  // on its tab would, but setting rather than toggling, so the same command twice is the same
+  // view. `projects` is every project the deck knows, so a page whose list is not mounted
+  // still hides the others.
+  var lastCommand = '';
+
+  document.addEventListener('htmx:sseMessage', function (e) {
+    var slot = e.target;
+    if (!slot || slot.id !== 'view-command-slot') return;
+    var el = slot.querySelector('[data-view-command]');
+    var command;
+    try { command = el ? JSON.parse(el.getAttribute('data-view-command')) : null; } catch (_) { command = null; }
+    if (!command || !command.id || command.id === lastCommand) return;
+    lastCommand = command.id;
+    var name = String(command.project || '');
+    var next = {};
+    if (name) {
+      tabOrder(hiddenProjects()).names.concat(command.projects || []).forEach(function (other) {
+        if (other !== name) next[other] = true;
+      });
+    }
+    saveHidden(next);
+    var tab = document.querySelector('#front-tabs .front-tab.on');
+    if (tab && tab.scrollIntoView) tab.scrollIntoView({block: 'nearest', inline: 'center'});
+  });
 
   function apply() {
     applyFolds();

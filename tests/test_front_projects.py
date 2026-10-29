@@ -92,6 +92,33 @@ def _row(html: str, work: WorkRef) -> str:
     return html.split(f'data-work-id="{work.work_id.lower()}"', 1)[1].split(">", 1)[0]
 
 
+def test_the_deck_chat_switches_every_page_to_one_known_project(tmp_path):
+    """#3814: the deck chat names a project; every page stream carries it once, as sent."""
+    from test_work_ui import _client
+
+    from agentdeck.view_commands import VIEW_TOPIC
+
+    app = _deck(tmp_path)
+    client = _client(app)
+    with app.state.app_state.bus.subscribe(VIEW_TOPIC) as page:
+        missing = client.post("/api/view/project-filter", json={"project": "nope"})
+        assert missing.status_code == 404
+        assert missing.json()["projects"] == ["agentdeck", "bazaar", "trailhead"]
+        assert page.get_nowait() is None and app.state.view_commands.latest is None
+
+        answer = client.post("/api/view/project-filter", json={"project": "AgentDeck"})
+        assert answer.json() == {"project": "agentdeck", "pages": 1}
+        assert page.get_nowait() == (VIEW_TOPIC, None)
+    command = app.state.view_commands.fresh()
+    assert command.project == "agentdeck"
+    assert command.projects == ("agentdeck", "bazaar", "trailhead")
+    assert client.post("/api/view/project-filter", json={"project": "all"}).json() == {
+        "project": "all", "pages": 0}
+    # A page rendered afterwards has the slot the command swaps into, and no command in it.
+    html = client.get("/").text
+    assert '<span id="view-command-slot" sse-swap="view" hidden></span>' in html
+
+
 def test_each_row_names_its_project_and_the_tabs_start_unbuilt(tmp_path):
     from test_work_ui import _client
 
@@ -219,6 +246,26 @@ async def test_a_hidden_project_stays_hidden_through_a_push_and_a_reload(tmp_pat
                                      "'agentdeck-front-hidden-projects') === '{}'")
         assert await working.inner_text() == "4"
         assert await running.inner_text() == "4"
+
+        # The deck chat switches the tabs by name, in any case, on every open page (#3814),
+        # and asking twice is the same view, not a toggle back to All.
+        import httpx
+
+        async with httpx.AsyncClient(base_url=base) as api:
+            for _ in range(2):
+                answer = await api.post("/api/view/project-filter", json={"project": "Bazaar"})
+                assert answer.json() == {"project": "bazaar", "pages": 1}
+                await page.wait_for_function("() => localStorage.getItem("
+                                             "'agentdeck-front-hidden-projects') !== '{}'")
+                assert await page.evaluate(hidden) == {"trailhead": True, "agentdeck": True}
+            await deck_row.wait_for(state="hidden")
+            assert await bazaar_row.is_visible()
+            assert await page.locator('[data-project-tab="bazaar"]').get_attribute(
+                "aria-pressed") == "true"
+            await api.post("/api/view/project-filter", json={"project": "all"})
+            await page.wait_for_function("() => localStorage.getItem("
+                                         "'agentdeck-front-hidden-projects') === '{}'")
+        assert await working.inner_text() == "4"
 
         # A sideways swipe on the list steps from All, the last tab, round to the first.
         await deck_row.evaluate("""row => {

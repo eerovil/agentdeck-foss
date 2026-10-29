@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import contextlib
 import json
 import os
@@ -1831,6 +1832,59 @@ async def test_secret_command_never_enters_drafts_or_optimistic_transcript(
     await app.state.injector.stop()
 
 
+_PNG_1PX = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg=="
+)
+
+
+@pytest.mark.browser
+async def test_composer_sends_an_image_alone_but_never_an_empty_box(tmp_path, monkeypatch):
+    app = _web_app(tmp_path, max_message_chars=1000)
+    delivered = []
+    release = asyncio.Event()
+
+    async def inject(_account, _session, message, *, timeout_s, images=None, **_kwargs):
+        delivered.append((message, len(images or [])))
+        await release.wait()
+        return InjectResult(True)
+
+    from agentdeck.providers import PROVIDERS
+
+    monkeypatch.setattr(PROVIDERS["codex"], "inject", inject)
+    async with _live_server(app) as base_url, async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=True)
+        page = await browser.new_page(viewport={"width": 390, "height": 844})
+        await page.goto(f"{base_url}/sessions/codex:test:sid")
+        sends = []
+        page.on("request", lambda r: sends.append(r) if r.url.endswith("/inject") else None)
+        # Nothing typed and nothing attached sends nothing, as `required` did (#3790).
+        await page.locator("#inject-message").press("Enter")
+        await page.locator("#composer-controls button", has_text="Send").click()
+        assert sends == [] and await page.locator(".optimistic-message").count() == 0
+
+        await page.locator("#inject-images").set_input_files(
+            [{"name": "shot.png", "mimeType": "image/png", "buffer": base64.b64decode(_PNG_1PX)}]
+        )
+        async with page.expect_response(lambda r: r.url.endswith("/inject")) as answer:
+            await page.locator("#composer-controls button", has_text="Send").click()
+        assert (await answer.value).status == 202
+        row = page.locator(".optimistic-message, [data-pending-message]").first
+        await row.locator("img").first.wait_for()
+        assert "See the attached image." in await row.inner_text()
+        for _ in range(50):
+            if delivered:
+                break
+            await asyncio.sleep(0.02)
+        assert delivered == [("See the attached image.", 1)]
+        screenshot_dir = os.environ.get("AGENTDECK_SCREENSHOT_DIR")
+        if screenshot_dir:
+            await page.screenshot(path=str(Path(screenshot_dir) / "issue-3790-image-only.png"))
+        release.set()
+        await browser.close()
+
+    await app.state.injector.stop()
+
+
 @pytest.mark.browser
 async def test_a_refused_send_shows_why_it_was_refused(tmp_path, monkeypatch):
     """#1171: a bare "Failed · retry" hid the sentence the server wrote for the person.
@@ -3444,6 +3498,7 @@ async def test_inject_route_validates_images_and_cleans_up(tmp_path, monkeypatch
     release = asyncio.Event()
     started = asyncio.Event()
     received = []
+    messages = []
 
     async def fake_inject(
         account,
@@ -3456,6 +3511,7 @@ async def test_inject_route_validates_images_and_cleans_up(tmp_path, monkeypatch
     ):
         assert allow_over_budget is True
         received.extend(images or [])
+        messages.append(message)
         started.set()
         await release.wait()
         return InjectResult(True)
@@ -3466,7 +3522,7 @@ async def test_inject_route_validates_images_and_cleans_up(tmp_path, monkeypatch
                     TranscriptEvent(
                         seq=seq + 1,
                         role="user",
-                        text="inspect",
+                        text="See the attached image.",
                         ts=datetime.now(UTC),
                         image_media_types=("image/png",),
                 )
@@ -3497,14 +3553,16 @@ async def test_inject_route_validates_images_and_cleans_up(tmp_path, monkeypatch
         )
         assert oversized.status_code == 422
 
+        # An empty box with an image sends the image alone (#3790).
         accepted = await client.post(
             "/sessions/codex:test:sid/inject",
-            data={"message": "inspect"},
+            data={"message": " "},
             files={"images": ("attacker-name.png", png, "image/png")},
             headers={"origin": "http://test"},
         )
         assert accepted.status_code == 202
         await asyncio.wait_for(started.wait(), timeout=1)
+        assert messages == ["See the attached image."]
         assert len(received) == 1
         saved = received[0]
         assert saved.is_file()
@@ -3660,9 +3718,10 @@ async def test_inject_route_keeps_an_arbitrary_file_through_the_turn(
         assert oversized.status_code == 422
         assert oversized.json()["detail"] == "file is too large"
 
+        # A file alone is a follow-up too, with a line naming it (#3790).
         response = await client.post(
             "/sessions/codex:test:sid/inject",
-            data={"message": "read the brief"},
+            data={"message": ""},
             files={
                 "images": (
                     "../../brief.pdf",
@@ -3675,6 +3734,7 @@ async def test_inject_route_keeps_an_arbitrary_file_through_the_turn(
         assert response.status_code == 202, response.text
         assert "agentdeck-attachments" not in response.text
         await asyncio.wait_for(delivered.wait(), timeout=1)
+        assert display_message(seen["message"]) == "See the attached file."
         attachment = json.loads(
             re.search(r"^- (\{.*\})$", seen["message"], re.MULTILINE).group(1)
         )
@@ -3933,6 +3993,14 @@ async def test_new_session_keeps_an_arbitrary_file_through_the_first_turn(
     async with AsyncClient(
         transport=ASGITransport(app=app), base_url="http://test"
     ) as client:
+        # A first message still needs words; only a follow-up may be a file alone (#3790).
+        wordless = await client.post(
+            "/sessions/new",
+            data={"account_key": "codex:test", "cwd": str(tmp_path), "message": ""},
+            files={"images": ("notes.txt", b"hello", "text/plain")},
+            headers={"origin": "http://test"},
+        )
+        assert wordless.status_code == 422
         response = await client.post(
             "/sessions/new",
             data={

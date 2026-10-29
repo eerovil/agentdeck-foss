@@ -10,7 +10,7 @@ import hashlib
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
 from time import monotonic, time
@@ -346,28 +346,6 @@ class Account:
     provider_id: str
     label: str  # from config: "main", "alt"
     root: Path  # CLAUDE_CONFIG_DIR for claude_code
-
-
-@dataclass(frozen=True)
-class SeenSession:
-    """One row of the ``sessions_seen`` ledger — a chat the deck once observed.
-
-    This is the deck's memory of chats the live scans no longer surface, which is
-    what deep search reaches into (#2034). Everything but the key is optional: a
-    session can be in the ledger before it ever had a title, and a transcript can
-    turn up in the text index that no scan ever recorded at all.
-    """
-
-    session_key: str
-    account_key: str | None = None
-    title: str | None = None
-    cwd: str | None = None
-    first_seen: datetime | None = None
-    last_seen: datetime | None = None
-    # What the deck saw it as: "subagent" for a Task-tool or spawned-agent leg,
-    # which search leaves out of its answers (#2055). None on a row written
-    # before the column existed and not classified since.
-    kind: str | None = None
 
 
 @dataclass(frozen=True)
@@ -777,34 +755,6 @@ class UsageSnapshot:
         """The fullest reported window, or None when no window has a meter."""
         values = self.percentages()
         return max(values) if values else None
-
-
-# Admission may trust a usage snapshot only this long. Past it the reader does
-# not know how full the account is, and every admission path fails open on
-# ignorance rather than refusing work a fresh probe would have admitted.
-USAGE_SNAPSHOT_MAX_AGE_S = 1800.0
-
-
-def usage_snapshot_is_current(
-    snapshot: object,
-    now: datetime,
-    *,
-    max_age_s: float = USAGE_SNAPSHOT_MAX_AGE_S,
-) -> bool:
-    """May an admission decision trust this snapshot's meters?
-
-    The one answer to "is this usage figure recent enough to act on", shared by
-    the Builder, and any future admission path so a new caller
-    cannot drift into honouring an hours-old meter its siblings would have aged
-    out (#790). Duck-typed like the Builder's snapshots: an object without a
-    ``fetched_at`` datetime has an unknowable age, which is not current.
-    """
-    fetched_at = getattr(snapshot, "fetched_at", None)
-    if not isinstance(fetched_at, datetime):
-        return False
-    if fetched_at.tzinfo is None:
-        fetched_at = fetched_at.replace(tzinfo=UTC)
-    return (now.astimezone(UTC) - fetched_at).total_seconds() <= max_age_s
 
 
 # The normalized quota windows an adapter can report. A window is usable for

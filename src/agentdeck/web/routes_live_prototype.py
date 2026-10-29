@@ -1,7 +1,7 @@
-"""Live prototyping's meeting page and the agent's API for it (#3569).
+"""Live prototyping's page and the agent's API for it (#3569).
 
 The agent registers the prototype's link and versions and records each change; the
-meeting page shows the prototype in a frame and reloads it when a change is recorded.
+live prototype page shows the prototype in a frame and reloads it when a change is recorded.
 Everything the page sends to the chat (a suggestion, "Go back", "Write the spec") goes
 through the chat's own send route, so it queues like any other message. Use cases are
 written by the agent and the page alike, one at a time (#3571), and the page's stream
@@ -36,8 +36,10 @@ HEARTBEAT_S = 15.0
 
 
 class LinkRequest(BaseModel):
-    url: str
+    url: str | None = None
     versions: list[dict] | None = None
+    # A diagram's full-screen view (#3827), kept apart from the prototype's link.
+    diagram: str | None = None
 
 
 class PickRequest(BaseModel):
@@ -63,8 +65,11 @@ def _chat_key(request: Request, session_key: str) -> str:
 def _payload(session_key: str, record: dict | None) -> dict:
     return {
         "session_key": session_key,
-        "meeting_url": live_prototype.meeting_url(session_key),
+        "page_url": live_prototype.page_url(session_key),
+        # The old name, for agents still following the guide before #3811.
+        "meeting_url": live_prototype.page_url(session_key),
         "url": (record or {}).get("url"),
+        "diagram": (record or {}).get("diagram"),
         "versions": (record or {}).get("versions", []),
         "steps": (record or {}).get("steps", []),
         "revision": (record or {}).get("revision", 0),
@@ -93,11 +98,27 @@ async def get_live_prototype(request: Request, session_key: str) -> dict:
 async def put_live_prototype(request: Request, session_key: str, body: LinkRequest) -> dict:
     session_key, _session = resolve_chat_key(request, session_key)
     chat_key = _chat_key(request, session_key)
+    if body.url is None and body.diagram is None:
+        raise HTTPException(status_code=422, detail="give url, diagram or both")
     try:
-        record = live_prototype.set_link(chat_key, body.url, body.versions)
+        # Both checked before either is stored, so a bad one changes nothing.
+        if body.diagram is not None:
+            live_prototype.clean_url(body.diagram)
+        if body.url is not None:
+            record = live_prototype.set_link(chat_key, body.url, body.versions)
+        if body.diagram is not None:
+            repository = await asyncio.to_thread(
+                live_prototype.diagram_repository, live_prototype.diagram_file(body.diagram)
+            )
+            record = live_prototype.set_diagram(chat_key, body.diagram, repository)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from None
     _publish(request, chat_key, record)
+    if body.diagram is not None:
+        # The Work page's Diagram button reads it (#3827).
+        from .work_view import WORK_INPUTS_TOPIC
+
+        get_state(request).bus.publish(WORK_INPUTS_TOPIC)
     return _payload(session_key, record)
 
 
@@ -117,7 +138,7 @@ async def post_live_prototype_step(request: Request, session_key: str, body: Ste
 
 @router.put("/api/sessions/{session_key}/live-prototype/picked")
 async def put_live_prototype_pick(request: Request, session_key: str, body: PickRequest) -> dict:
-    """The meeting page's version switch: the room's pick, kept for reloads and the spec."""
+    """The page's version switch: the person's pick, kept for reloads and the spec."""
     session_key, _session = resolve_chat_key(request, session_key)
     chat_key = _chat_key(request, session_key)
     try:
@@ -187,7 +208,7 @@ async def _activity(request: Request, session_key: str) -> str | None:
 
 
 @router.get("/live/{session_key}", response_class=HTMLResponse)
-async def meeting_page(request: Request, session_key: str) -> HTMLResponse:
+async def live_prototype_page(request: Request, session_key: str) -> HTMLResponse:
     session_key, session = resolve_chat_key(request, session_key)
     record = live_prototype.read(_chat_key(request, session_key))
     return get_templates(request).TemplateResponse(
@@ -202,8 +223,8 @@ async def meeting_page(request: Request, session_key: str) -> HTMLResponse:
 
 
 @router.get("/events/live/{session_key}")
-async def meeting_events(request: Request, session_key: str) -> StreamingResponse:
-    """A ``data:`` line per meeting change; the page fetches the record then.
+async def live_prototype_events(request: Request, session_key: str) -> StreamingResponse:
+    """A ``data:`` line per prototype change; the page fetches the record then.
 
     An ``activity`` event carries what the agent is doing (#3571), sent when it
     changes: the chat's own topics say when to look, never a clock.
@@ -231,7 +252,7 @@ async def meeting_events(request: Request, session_key: str) -> StreamingRespons
                 while sub.get_nowait() is not None:
                     pass
                 # Read from the counters, not the queue: a busy deck's chat updates
-                # can push the meeting's own wake-up out of it.
+                # can push the prototype's own wake-up out of it.
                 changed = sub.changed_topics()
                 if topic in changed:
                     yield "data: changed\n\n"

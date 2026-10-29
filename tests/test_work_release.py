@@ -15,9 +15,9 @@ from types import SimpleNamespace
 import pytest
 
 from agentdeck.poller_ops import release_policies
+from agentdeck.review_refs import head_digest
 from agentdeck.work_release import (
     ALREADY_MERGED,
-    DIFF_TOO_LARGE,
     FAILED,
     MERGED,
     OWNER_CALL_ASK,
@@ -828,11 +828,6 @@ async def test_merge_when_ready_is_cleared_by_a_changed_diff_or_a_new_pull_reque
 
 async def test_a_withdrawn_merge_approval_waits_for_a_new_press(fake):
     fake.policy = Policy(auto_release=False)
-    fake.digests[(PR, HEAD)] = DIFF_TOO_LARGE
-    with pytest.raises(PressRefused, match="too large"):
-        await fake.service.request_merge(WORK)
-    assert "asked" not in fake.entry, "a diff that can never be compared takes no press"
-    fake.digests[(PR, HEAD)] = DIGEST
     fake.green = set()
     # Two Merge when ready presses at once (#3320 review): the Work's lock records one.
     first, second = await asyncio.gather(
@@ -1342,15 +1337,16 @@ async def test_a_recorded_pass_is_told_once_naming_the_pull_head_and_review_chat
     assert answered == [[PR], [PR]]
 
 
-async def test_a_verdict_on_a_diff_too_large_to_read_is_refused(fake):
-    """#3029: the port's marker for a diff GitHub never serves is no digest to match."""
-
-    async def too_large(ref, head):
-        return DIFF_TOO_LARGE
-
-    fake.service.ports.digest = too_large
-    assert "digest does not match" in await passed(fake, digest=DIFF_TOO_LARGE)
-    assert "passes" not in fake.entry
+async def test_a_clean_pass_on_a_diff_too_large_for_github_merges_at_its_head(fake):
+    """#3804: GitHub serves no diff over 20,000 lines, so its digest is pinned to the head, and
+    a clean review stating it merges a tested Work on its own instead of dead-ending."""
+    pinned = head_digest("eerovil/agentdeck", 9, HEAD)
+    fake.digests[(PR, HEAD)] = pinned
+    elsewhere = head_digest("eerovil/agentdeck", 9, OTHER)
+    assert "digest does not match" in await passed(fake, digest=elsewhere)
+    assert fake.merged == []
+    assert "review pass recorded" in await passed(fake, digest=pinned)
+    assert fake.merged == [(PR, "merge")] and fake.merge_heads == [HEAD]
 
 
 async def test_an_unreadable_verdict_is_told_once_from_a_reviewer_only(fake):
@@ -1468,6 +1464,22 @@ async def test_a_no_code_verdict_holds_the_merge_and_its_fix_passes_with_no_revi
     await fake.service.on_verdict(WORK, "no-code", OTHER[:12], "e" * 64)
     await fake.service.on_verdict(WORK, "changes-needed", OTHER[:12], "")
     assert fake.service.no_code_head(WORK, PR) is None
+
+
+async def test_an_owner_accepting_findings_passes_the_head_with_no_review(fake):
+    """#3828: findings the owner accepted with no code change pass the reviewed head, which
+    merges once green; never a head the branch left."""
+    await fake.service.on_verdict(WORK, "changes-needed", HEAD[:12], "")
+    assert fake.merged == [] and "findings" in fake.entry
+    assert "not open at" in await fake.service.owner_accepted(WORK, PR, OTHER, "keep it")
+    answer = await fake.service.owner_accepted(WORK, PR, HEAD, " Owner: accept as is ")
+    assert verdict_settled(answer) and fake.merge_heads == [HEAD]
+    assert fake.entry["passes"][PR]["accepted"] == "Owner: accept as is"
+    assert "findings" not in fake.entry
+    assert any(
+        ":verdict:pass:" in key and "the owner accepted the review's findings" in text
+        for _chat, key, text in fake.told
+    )
 
 
 def test_the_review_chat_is_the_newest_one_opened_at_that_head():

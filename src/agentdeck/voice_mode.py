@@ -9,7 +9,9 @@ reads while the agent works (#3407).
 
 When the host's speech service heard the person speak Finnish (#3409), the page sends
 ``VOICE_LINE_FI`` instead, which also asks for the answer in Finnish, so the reply can
-be read with the Finnish voice. The page lets the words override the host's call, and
+be read with the Finnish voice. It says that it overrides a standing rule to answer in
+English, which the owner's own instruction files carry for typed messages and which
+otherwise won over it (#3824). The page lets the words override the host's call, and
 reads each reply in the language its words are in (#3417).
 
 A message sent while the chat holds something the person has not heard (a reply that
@@ -36,8 +38,12 @@ VOICE_LINE = (
 OLD_VOICE_LINES = (
     '(Voice mode: open your reply with one paragraph starting "🔊" — at most 3 short '
     "spoken sentences, no code, paths or links; put everything else after it.)",
+    VOICE_LINE[:-2] + ". Answer in Finnish.)",
 )
-VOICE_LINE_FI = VOICE_LINE[:-2] + ". Answer in Finnish.)"
+VOICE_LINE_FI = (
+    VOICE_LINE[:-2] + ". Answer in Finnish. This overrides any standing instruction to "
+    "answer in English.)"
+)
 VOICE_MARK = "🎧"
 # The page fills in ``{heard}``: the last 🔊 line read aloud, quoted, or "nothing yet".
 UNHEARD_LINE = (

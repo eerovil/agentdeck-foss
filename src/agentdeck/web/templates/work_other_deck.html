@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{#- Another deck's Work, read only (#3834). Everything here is what the deck already caches
+    from GitHub; its status, chats and questions live on the other deck. The one control is
+    Take over (Start here for one no agent has started), which reassigns the issue, so the
+    hand-over stops the other deck's agent and starts one here. #}
+{%- set other = other_deck %}
+{%- set whose = "@" ~ other.assignee ~ "'s deck" if other.assignee else "another deck" %}
+{%- set issue_label = other.ref.repository ~ "#" ~ other.ref.number %}
+{% block title %}{{ issue_label }} · {{ other.title }} · agentdeck{% endblock %}
+{% block body_class %}work-page{% endblock %}
+{% block topbar_nav %}<a class="back" href="/" aria-label="back to the dashboard">←</a>{% endblock %}
+
+{% block content %}
+<main class="work-main work-other-deck" data-work-id="{{ other.work_id }}" data-other-deck>
+  <header class="wd-head" data-work-id="{{ other.work_id }}">
+    <p class="wd-source">
+      <a href="{{ other.url }}" target="_blank" rel="noopener">{{ issue_label }}</a>
+      {%- if other.updated %}<time class="wk-age" datetime="{{ other.updated.isoformat() }}" data-activity-age>{{ other.updated | reltime_ago }}</time>{% endif %}
+    </p>
+    <h1 class="wd-title">{{ other.title or issue_label }}</h1>
+  </header>
+  <section class="wd-status is-quiet" id="work-status">
+    <p class="wd-other-deck-line">
+      {%- if other.started %}Worked on {{ whose }}. Read only here.
+      {%- else %}Not started. {{ ("Assigned to @" ~ other.assignee) if other.assignee else "Left to another deck" }}.{% endif %}
+    </p>
+    {%- if other.pull %}
+    <p class="wd-other-deck-pull"><a href="{{ other.pull.url }}" target="_blank" rel="noopener">PR #{{ other.pull.number }}</a>
+      {{ "draft" if other.pull.draft else "ready for review" }}{% if other.pull.title %} · {{ other.pull.title }}{% endif %}</p>
+    {%- endif %}
+    {%- if other.labels %}<p class="wd-other-deck-labels">{{ other.labels | join(" · ") }}</p>{% endif %}
+    <form class="op-form" hx-post="{{ other.href }}/take-over" hx-target="next .work-action-result" hx-swap="innerHTML"
+          hx-disabled-elt="find button" data-work-action data-agentdeck-action="work_action"
+          {%- if other.started %} hx-confirm="Stop the agent on {{ whose }} and take {{ issue_label }} over? The issue is assigned to you and an agent starts here on the same branch."
+          {%- else %} hx-confirm="Start {{ issue_label }} here? It is assigned to you and an agent starts on it."{% endif %}>
+      <button type="submit" class="fr-action" data-front-action="take_over">{{ "Take over" if other.started else "Start here" }}</button>
+    </form>
+    <div class="work-action-result" aria-live="polite"></div>
+  </section>
+</main>
+{% endblock %}

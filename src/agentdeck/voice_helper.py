@@ -2,9 +2,10 @@
 
 By the owner's decisions on #3444, voice mode runs two agents. The chat itself (the
 slow agent) does the work and knows nothing of this one. The fast agent talks as if
-it were the chat: every phrase heard goes to it first, it says a short sentence at
-once ("Starting on the login bug."), and the page sends its cleaned-up version of the
-phrase to the chat through the composer's own Send. It fixes words speech
+it were the chat: every phrase heard goes to it first, it writes a short sentence at
+once ("Starting on the login bug."), said only if the chat stays quiet, and the page
+sends its cleaned-up version of the phrase to the chat through the composer's own
+Send. It fixes words speech
 recognition misheard and drops only what is plainly not meant for the agent (noise,
 a stray "thanks for watching"). The chat shows only the cleaned-up text. The chat's
 replies are still heard through their own 🔊 paragraph, as before.
@@ -39,7 +40,20 @@ action or states content, which the chat's own 🔊 reply would then say again
 knows and the chat's title, so it can tell "Agent Dick" was AgentDeck.
 
 No Claude account with room, a failure or a timeout means no answer: the page sends
-the words as heard and says its own "Got it, working on it."
+the words as heard.
+
+Its SAY line is no longer spoken at once (#3799): the chat usually says the same in
+its own 🔊 note, so the owner heard it twice. The page holds it, and when the chat
+says nothing aloud for 5 s after a send while it works, it asks ``narrate``: the
+same process is told the steps the agent took since the person last spoke (its tool
+calls and what it wrote, from the transcript) and says in one sentence what the agent
+is doing. A last call with no result after it is told as still running, and for how long,
+so it is said to go on rather than to start (#3806). With nothing from that, the page
+says the held SAY line, or its own "Got it, working on it.". While the agent keeps
+working, every 30 s with nothing said asks again, and with nothing new the page says
+"Still working on it.". Each
+narration is saved in the voice log too, and the page reports which lines it really
+said (``spoken``), so the log can tell a proposed line from one heard.
 
 Every phrase is also saved, one JSON line per phrase in a file per chat under
 ``LOG_DIR`` (#3475), so the owner can read back how well the fast agent works: the
@@ -62,10 +76,11 @@ import re
 import shutil
 import time
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import quote
 
-from . import guess, guess_cli
+from . import guess, guess_cli, meta_chat
 from .models import Account
 
 log = logging.getLogger(__name__)
@@ -120,14 +135,37 @@ only when it is plainly not speech meant for the agent: noise, a stray "thanks f
 watching", a half word. Then write "SAY:" with nothing after it. A one-word answer \
 such as "juu", "joo", "yes", "no" or "ei" is never NONE, and a lone "you" right after \
 the agent asked a question is the Finnish "juu".
+Words in "[unsure: …]" are words speech recognition itself doubted. Copy each such \
+part into RELAY exactly as heard, brackets included, so the agent can ask what was \
+meant; never fix or drop it, and never write NONE for a phrase with one.
 
 Never add, guess or promise anything beyond what was heard.
 
-Words this person often uses, which speech recognition mishears: {words}. A word that \
+A message that starts "Agent working quietly" is not the person: the agent has said \
+nothing aloud for a while and the person is waiting, and it lists what the agent did \
+since they last spoke. Answer it with one line only: SAY: one short spoken sentence, \
+in the first person and {say_language}, saying what you are doing now, such as \
+"I'm reading the voice mode code." or "Running the tests now." Base it only on those \
+steps, say it plainly, and do not repeat what you or the agent already said aloud. \
+Write "SAY:" with nothing after it when the steps tell nothing new. A step marked \
+still running, or one you already said aloud, goes on: say it continues, such as \
+"Still waiting for the tests." or "Odotan edelleen.", never as if it were starting.
+
+{back}Words this person often uses, which speech recognition mishears: {words}. A word that \
 makes no sense where it was heard but sounds like one of these is that word: "Agent \
 Dick" is AgentDeck, "high go" is Haiku, "Xing Xiong" is sing song, "Finish" said of \
 a language is Finnish.\
 {title}"""
+# In any chat but the deck chat, the way back to it (#3816): the fast agent spots the ask
+# and the page opens the deck chat, without sending the words to the chat it is in.
+BACK = "BACK"
+BACK_RULE = """\
+When the person asks to go back to the deck chat, in any words or language ("back to \
+the deck chat", "go to deck chat", "takaisin deck chattiin"), answer with the one line \
+BACK and nothing else. Only an ask to move there is BACK, never a message about the \
+deck chat.
+
+"""
 # The owner's own words (#3507); the projects the deck knows and the chat's title
 # are added to them when a process starts.
 WORDS = (
@@ -164,12 +202,26 @@ MAX_ANSWER_WORDS = 3
 MISHEARD_JUU = frozenset({"you", "jo", "yo"})
 
 
+# Words Whisper doubted, as the page marks them (#3817): kept as heard all the way to
+# the chat, which can then ask what was meant.
+UNSURE = re.compile(r"\[unsure: ([^\]]*)\]")
+
+
+# What the agent did since the person last spoke, as the fast agent is told it (#3799).
+MAX_STEPS = 12
+MAX_STEP_CHARS = 160
+QUIET = "Agent working quietly for {seconds} seconds. What it did since the person last spoke:"
+NARRATED = "narrated"
+
+
 @dataclass(frozen=True)
 class Answer:
     """What to say now, and what to send the chat (None: send nothing)."""
 
     say: str
     relay: str | None
+    # The person asked to go back to the deck chat (#3816): nothing is sent or said.
+    back: bool = False
 
 
 @dataclass
@@ -190,6 +242,8 @@ class _Agent:
     # again when the page throws its answer away (#3765).
     last_id: str = ""
     last_lines: int = 0
+    # Its process was told the way back to the deck chat (#3816).
+    back: bool = False
 
 
 _agents: dict[str, _Agent] = {}
@@ -201,14 +255,16 @@ _ended_runs: dict[str, None] = {}
 MAX_ENDED_RUNS = 100
 
 
-def system_prompt(projects=(), title: str = "", finnish: bool = False) -> str:
+def system_prompt(projects=(), title: str = "", finnish: bool = False, back: bool = False) -> str:
     """The instructions with the owner's words, ``projects`` and the chat's ``title``.
 
     ``finnish``: the owner always speaks Finnish, English words mixed in (#3525), so
-    the acknowledgement is always Finnish."""
+    the acknowledgement is always Finnish. ``back``: a chat other than the deck chat,
+    which the person can ask to leave for the deck chat (#3816)."""
     words = dict.fromkeys((*WORDS, *list(projects)[:MAX_PROJECT_WORDS]))
     title = _clip(title, 200)
     return SYSTEM_PROMPT.format(
+        back=BACK_RULE if back else "",
         words=", ".join(words),
         say_language="in Finnish" if finnish else "in the language they spoke",
         title=f"\n\nThe chat you speak for is titled: {title}" if title else "",
@@ -289,9 +345,16 @@ def message(
     return "\n\n".join(parts)
 
 
-def parse(reply: str, heard: str, question: bool = False) -> Answer:
+def parse(reply: str, heard: str, question: bool = False, back: bool = False) -> Answer:
     """The two lines of a reply. A missing or reworded RELAY sends the words heard;
-    a short yes or no is always sent, a lone "you" after a ``question`` as "Juu."."""
+    a short yes or no is always sent, a lone "you" after a ``question`` as "Juu.".
+    ``back``: a BACK line is the ask to go back to the deck chat (#3816).
+    A phrase with doubted words reaches the chat as heard, marks and all, whatever the
+    reply: never as a guessed "Juu.", a jump to the deck chat or noise (#3817)."""
+    if UNSURE.search(heard):
+        return _parse(reply, heard)
+    if back and any(line.strip().strip(".").upper() == BACK for line in reply.splitlines()):
+        return Answer("", None, back=True)
     answer = _parse(reply, heard)
     words = set(re.findall(r"[^\W\d_]+", heard.casefold()))
     short = 0 < len(re.findall(r"[^\W\d_]+", heard)) <= MAX_ANSWER_WORDS
@@ -324,10 +387,16 @@ def _parse(reply: str, heard: str) -> Answer:
         # Someone who said "none" meant it; noise gets no answer either.
         if heard.upper().rstrip(".") == NONE:
             return Answer(say, heard)
+        # Doubted words are marked, never dropped: the agent asks what was meant (#3817).
+        if UNSURE.search(heard):
+            return Answer(say, heard)
         return Answer("", None)
     if relay is None:
         return Answer(say, heard)
     if not MIN_RELAY_SHARE * len(heard) <= len(relay) <= MAX_RELAY_SHARE * len(heard) + 20:
+        return Answer(say, heard)
+    # A doubted part fixed or dropped would reach the chat as a sure guess (#3817).
+    if UNSURE.findall(relay) != UNSURE.findall(heard):
         return Answer(say, heard)
     return Answer(say, relay)
 
@@ -450,8 +519,11 @@ async def heard(
                 "reply": reply,
                 "say": answer.say if answer else None,
                 "relay": answer.relay if answer else text,
+                **({"back": True} if answer is not None and answer.back else {}),
                 "fresh": fresh,
                 "ms": round((time.monotonic() - started) * 1000),
+                # Its line is said only if the chat stays quiet (#3799).
+                "held": True,
                 **({"replaces": drop} if dropped else {}),
             },
         )
@@ -488,12 +560,127 @@ async def warm(app, key: str, run: str = "") -> None:
             await _close(agent)
 
 
+def steps(events, now: datetime | None = None) -> list[str]:
+    """What the agent did since the person's last message, oldest first: its tool
+    calls and what it wrote, from the chat's transcript ``events`` (#3799). A last
+    tool call with no result after it yet is marked as still running, with how long
+    it has run by ``now`` (#3806): told only the step, the fast agent described a
+    40-second wait 30 s into it as just starting."""
+    since = []
+    # The last step, while it is a tool call with no result after it. Results carry no
+    # call id, so with calls in parallel any result clears it: one may be the last
+    # call's, and a step said to run on after it ended is worse than one not said to.
+    last_call = None
+    for event in events:
+        if event.role == "user" and not event.subagent and not event.queued:
+            since, last_call = [], None
+            continue
+        if event.subagent or event.failed:
+            continue
+        if event.role == "tool" and not event.tool_name:
+            last_call = None
+            continue
+        if event.tool_name:
+            name = event.tool_display_name or event.tool_name
+            summary = event.tool_summary or ""
+            since.append(_clip(f"{name}: {summary}" if summary else name, MAX_STEP_CHARS))
+            last_call = None if event.role == "system" else event
+        elif event.role == "assistant" and (event.text or "").strip():
+            since.append(_clip(f"Wrote: {event.text}", MAX_STEP_CHARS))
+            last_call = None
+    since = since[-MAX_STEPS:]
+    if since and last_call is not None:
+        ran = ""
+        if last_call.ts is not None:
+            started = last_call.ts if last_call.ts.tzinfo else last_call.ts.replace(tzinfo=UTC)
+            seconds = int(((now or datetime.now(UTC)) - started).total_seconds())
+            ran = f" for {seconds} seconds" if seconds > 0 else ""
+        since[-1] += f" (still running{ran}, no result yet)"
+    return since
+
+
+async def narrate(
+    app,
+    key: str,
+    done: list[str],
+    seconds: int,
+    run: str = "",
+    finnish: bool = False,
+    narration_id: str = "",
+) -> str | None:
+    """What the fast agent says about the chat's quiet work (#3799): one sentence on
+    what the agent is doing, from the steps it ``done``, or None for nothing to say.
+    The page asks once the agent has been silent ``seconds`` after a send, and again
+    after each long silence while it works. ``finnish``: the person's last message
+    asked for Finnish."""
+    if not done or (run and run in _ended_runs):
+        return None
+    agent = _agents.setdefault(key, _Agent(key))
+    agent.used = time.monotonic()
+    _arm(agent)
+    await _tidy(key)
+    started = time.monotonic()
+    async with agent.lock:
+        agent.last_id, agent.last_lines = "", 0
+        fresh = not _running(agent)
+        said, outcome, reply = await _narrate_turn(app, agent, done, seconds, finnish)
+        await asyncio.to_thread(
+            _save,
+            key,
+            {
+                "at": time.time(),
+                "id": narration_id,
+                NARRATED: done,
+                "quiet": seconds,
+                "outcome": outcome,
+                "reply": reply,
+                "say": said,
+                "fresh": fresh,
+                "ms": round((time.monotonic() - started) * 1000),
+            },
+        )
+        if agent.gone:
+            await _close(agent)
+        if said:
+            agent.history = (agent.history + [f"You, while it worked: {said}"])[-HISTORY_LINES:]
+        return said or None
+
+
+async def _narrate_turn(
+    app, agent: _Agent, done: list[str], seconds: int, finnish: bool
+) -> tuple[str, str, str | None]:
+    if not _running(agent):
+        why = await _start(app, agent)
+        if why is not None:
+            return "", why, None
+    parts = []
+    if agent.new and agent.history:
+        parts.append("Earlier in this voice conversation:\n" + "\n".join(agent.history))
+    parts.append(QUIET.format(seconds=seconds) + "\n" + "\n".join(f"- {step}" for step in done))
+    parts.append(
+        "Say it in Finnish." if finnish else "Say it in the language of their last message."
+    )
+    agent.new = False
+    outcome = FAILED
+    try:
+        reply = await asyncio.wait_for(_ask(agent.proc, "\n\n".join(parts)), timeout=TURN_TIMEOUT_S)
+    except TimeoutError:
+        reply, outcome = None, TIMED_OUT
+    except (OSError, ConnectionError):
+        reply = None
+    if reply is None:
+        await _close(agent)
+        return "", outcome, None
+    return _parse(reply, "").say, ANSWERED, reply
+
+
 def _running(agent: _Agent) -> bool:
     return agent.proc is not None and agent.proc.returncode is None
 
 
-def _prompt(app, key: str) -> str:
-    """The instructions for chat ``key``: the projects the deck knows and its title."""
+def _prompt(app, key: str, back: bool = False) -> str:
+    """The instructions for chat ``key``: the projects the deck knows and its title, and
+    with ``back`` the way back to the deck chat."""
     sessions = getattr(app.state.app_state, "sessions", None) or {}
     projects = sorted(
         {
@@ -504,7 +691,17 @@ def _prompt(app, key: str) -> str:
     )
     session = sessions.get(key)
     title = session.display_title if session is not None else ""
-    return system_prompt(projects, title, finnish=app.state.config.speech.language == "fi")
+    finnish = app.state.config.speech.language == "fi"
+    return system_prompt(projects, title, finnish=finnish, back=back)
+
+
+def _can_go_back(app, key: str) -> bool:
+    """Whether chat ``key`` is not the deck chat while one exists (#3816)."""
+    state = app.state.app_state
+    db = getattr(app.state, "db", None)
+    return meta_chat.deck_chat_session_key(state, db) is not None and not meta_chat.is_deck_chat(
+        state, db, key
+    )
 
 
 async def _start(app, agent: _Agent) -> str | None:
@@ -512,7 +709,8 @@ async def _start(app, agent: _Agent) -> str | None:
     account = guess.guess_account(app.state.accounts, app.state.app_state.usage)
     if account is None:
         return NO_ACCOUNT
-    agent.proc = await start_process(account, _prompt(app, agent.key))
+    agent.back = _can_go_back(app, agent.key)
+    agent.proc = await start_process(account, _prompt(app, agent.key, agent.back))
     if agent.proc is None:
         return FAILED
     agent.new = True
@@ -548,7 +746,7 @@ async def _turn(
         # Its answer may still come; a fresh process is told the conversation instead.
         await _close(agent)
         return None, outcome, None
-    return parse(reply, text, question), ANSWERED, reply
+    return parse(reply, text, question, back=agent.back), ANSWERED, reply
 
 
 def log_path(key: str) -> Path:
@@ -577,6 +775,13 @@ async def sent(key: str, phrase_id: str, text: str | None, how: str) -> None:
     await asyncio.to_thread(_save, key, record)
 
 
+async def spoken(key: str, phrase_id: str, text: str) -> None:
+    """The fast agent's line the page really said for ``phrase_id`` (#3799): it is held
+    back until the chat stays quiet, so a line proposed is often never heard."""
+    record = {"at": time.time(), "spoken_for": phrase_id, "spoken": text}
+    await asyncio.to_thread(_save, key, record)
+
+
 async def timed(key: str, phrase_id: str, timing: dict) -> None:
     """The page's measured waits for phrase ``phrase_id`` (#3765): ms from the end of
     speech to its words, its send and the first voice heard. Unknown keys go."""
@@ -596,8 +801,9 @@ async def timed(key: str, phrase_id: str, timing: dict) -> None:
 def saved(keys) -> list[dict]:
     """Every saved phrase of the chats ``keys``, newest first, each with the page's
     report of what it sent as ``report`` (None when the page never said) and its
-    measured waits as ``timing`` (None when not measured)."""
-    records, reports, timings = [], {}, {}
+    measured waits as ``timing`` (None when not measured) and the line the page
+    really said for it as ``spoken`` (None when it said none)."""
+    records, reports, timings, spoken_lines = [], {}, {}, {}
     for key in keys:
         try:
             lines = log_path(key).read_text(encoding="utf-8").splitlines()
@@ -614,11 +820,14 @@ def saved(keys) -> list[dict]:
                 reports[record["sent_for"]] = record
             elif record.get("timing_for"):
                 timings[record["timing_for"]] = record.get("timing")
-            elif "heard" in record:
+            elif record.get("spoken_for"):
+                spoken_lines[record["spoken_for"]] = record.get("spoken")
+            elif "heard" in record or NARRATED in record:
                 records.append(record)
     for record in records:
         record["report"] = reports.get(record.get("id")) if record.get("id") else None
         record["timing"] = timings.get(record.get("id")) if record.get("id") else None
+        record["spoken"] = spoken_lines.get(record.get("id")) if record.get("id") else None
     return sorted(records, key=lambda record: record["at"], reverse=True)
 
 

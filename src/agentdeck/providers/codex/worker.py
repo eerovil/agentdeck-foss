@@ -102,13 +102,11 @@ class CodexWorkerHost:
         client: CodexAppServer,
         *,
         state_dir: Path,
-        usage_ceiling_pct: float = 0.0,
         usage_cache_dir: Path | None = None,
-        session_over_budget: Callable[[str], bool] | None = None,
         bind_session_token: Callable[[str, str], None] | None = None,
         artifact_root: Path | None = None,
     ) -> None:
-        del usage_ceiling_pct, usage_cache_dir, session_over_budget
+        del usage_cache_dir
         self.account = account
         self.client = client
         self._state_path = Path(state_dir) / f"{account.label}.json"

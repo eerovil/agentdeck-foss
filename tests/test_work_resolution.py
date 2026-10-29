@@ -190,6 +190,64 @@ def test_the_work_page_shows_the_resolution_only_once_one_is_written(tmp_path, m
     assert page.index('id="work-sec-result"') < page.index('id="work-sec-resolution"')
 
 
+def test_the_work_diagram_opens_the_live_page_then_the_merged_copy(tmp_path, monkeypatch):
+    """The Diagram button (#3827): the newest chat's live page while its file is there, then
+    the deck's own checkout for agentdeck, else GitHub; and the page shows it in its header."""
+    from datetime import UTC, datetime
+    from types import SimpleNamespace
+
+    from fastapi.testclient import TestClient
+
+    from agentdeck import live_prototype
+    from agentdeck.web import work_view
+    from agentdeck.work import WorkRef
+    from agentdeck.work_overview import WorkChat
+
+    def chat(key, hour):
+        return WorkChat(key, key, key, "/x", False, datetime(2026, 10, 29, hour, tzinfo=UTC), ())
+
+    worktree = tmp_path / "wt" / "docs" / "diagrams"
+    worktree.mkdir(parents=True)
+    (worktree / "merge-queue.md").write_text("Intro\n# Merge queue\n```mermaid\n```\n")
+    deck = SimpleNamespace(state=SimpleNamespace(app_state=SimpleNamespace(
+        chat_identity_key=lambda key: key)))
+    ours, theirs = WorkRef("eerovil/agentdeck", 1), WorkRef("acme/shop", 2)
+    chats = [chat("old", 1), chat("new", 2), chat("none", 3)]
+    assert work_view.work_diagram(deck, ours, chats) is None
+    live_prototype.set_diagram("old", "https://d/elsewhere/docs/diagrams/old.md?bare=1")
+    live_prototype.set_diagram("new", f"https://d{worktree}/merge-queue.md?bare=1")
+
+    shown = work_view.work_diagram(deck, ours, chats)
+    assert shown == work_view.WorkDiagram("Merge queue", "/live/new?view=diagram")
+    (worktree / "merge-queue.md").unlink()
+    monkeypatch.setattr(live_prototype, "DECK_CHECKOUT", tmp_path / "deck")
+    assert work_view.work_diagram(deck, theirs, chats) == work_view.WorkDiagram(
+        "merge-queue", "https://github.com/acme/shop/blob/HEAD/docs/diagrams/merge-queue.md",
+        external=True,
+    )
+    merged = tmp_path / "deck" / "docs" / "diagrams"
+    merged.mkdir(parents=True)
+    (merged / "merge-queue.md").write_text("# Merge queue, merged\n")
+    assert work_view.work_diagram(deck, ours, chats) == work_view.WorkDiagram(
+        "Merge queue, merged", f"{merged}/merge-queue.md?bare=1"
+    )
+    # A diagram drawn in another repository than the issue's links to that one, never to a
+    # same-named file in the deck's checkout.
+    live_prototype.set_diagram("new", f"https://d{worktree}/merge-queue.md?bare=1", "acme/shop")
+    assert work_view.work_diagram(deck, ours, chats).href == (
+        "https://github.com/acme/shop/blob/HEAD/docs/diagrams/merge-queue.md"
+    )
+
+    app = _deck(tmp_path, monkeypatch)
+    client = TestClient(app)
+    assert "data-wd-diagram" not in client.get(work_href(WORK_ID)).text
+    monkeypatch.setattr(
+        work_view, "work_diagram", lambda *_: work_view.WorkDiagram("Flow", "/live/k?view=diagram")
+    )
+    page = client.get(work_href(WORK_ID)).text
+    assert '<a class="wd-diagram" data-wd-diagram href="/live/k?view=diagram" title="Flow">' in page
+
+
 def test_the_work_page_breaks_a_part_into_paragraphs_and_bullets(tmp_path, monkeypatch):
     from fastapi.testclient import TestClient
 

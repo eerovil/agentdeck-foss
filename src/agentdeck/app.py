@@ -36,6 +36,7 @@ from .auto_dream import AutoDream, settled
 from .board_watch import BoardWatch
 from .chat_board import TOPIC as CHAT_BOARD_TOPIC
 from .chat_board import ChatBoardService
+from .chat_jump import ChatJumps
 from .chat_notes import TOPIC as CHAT_NOTES_TOPIC
 from .chat_notes import ChatNotesService
 from .collector import Collector
@@ -72,6 +73,7 @@ from .staging_deploys import StagingDeployService
 from .state import AppState
 from .usage_move import UsageMoveService, start_moved_leg
 from .usage_move import transcript_url as usage_move_transcript_url
+from .view_commands import ViewCommands
 from .wake_on import WakeOnService
 from .web import render as render_mod
 from .web.action_timing import ActionTiming, identify_action
@@ -608,11 +610,11 @@ def create_app(config: AppConfig) -> FastAPI:
         )
 
     async def release_digest(ref: str, head: str) -> str:
-        from .review_refs import DIGEST_TOO_LARGE, target_digest
+        from .review_refs import target_digest
 
         repository, _, number = ref.partition("#")
-        digest, why = await target_digest(repository, int(number), head)
-        return work_release.DIFF_TOO_LARGE if why == DIGEST_TOO_LARGE else digest
+        digest, _why = await target_digest(repository, int(number), head)
+        return digest
 
     async def release_green_heads(work_id: str) -> set[str]:
         from .poller_engine.verification import credited_head_for_work_alone
@@ -1141,6 +1143,10 @@ def create_app(config: AppConfig) -> FastAPI:
     app.state.shared_fragments = SharedFragments(state.bus)
     # The dashboard's Work cards (#2147): rebuilt off the request path, published on change.
     app.state.work_overview = WorkOverviewService(app)
+    # The deck chat's page moved to another chat by asking (#3816).
+    app.state.chat_jumps = ChatJumps(state.bus)
+    # View changes the deck chat asks every open page to make (#3814).
+    app.state.view_commands = ViewCommands(state.bus)
     # Claude CLIs booted ahead of the next New chat and deck chat (#3420).
     app.state.start_spares = StartSpares(app)
     # The top bar's new Needs you list (#3239), from the last overview built: a page render

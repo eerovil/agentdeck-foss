@@ -51,13 +51,14 @@ deliveries are the deck's own echo):
   turns it back to draft when findings arrive. A new head whose diff has the review digest of
   the last head sent for review only merged its base, and is not reviewed (#3314): the chat is
   told the verdict on that diff stands, and the release keeps it for the new head.
-* **A review asked for again at an unchanged head** (#3183) — the agent's
-  ``POST /api/sessions/<key>/review-request`` (``ask_again``) with a note saying what changed.
-  A person may have decided a finding with no code change, and nothing else could ever start
-  the next review. Each asks once more, at most ``MAX_AGAIN`` times per head; past that a
-  person decides, and the chat is told so. A pull request turned back to draft and marked
-  ready again at a head already reviewed no longer asks (#3344): it carries no reason, and
-  every chat it opened read to the reviewer as a plain duplicate. The chat is told what is
+* **A review asked for again at an unchanged head** (#3183) — the agent's ``POST
+  /api/sessions/<key>/review-request`` (``ask_again``) with a note saying what changed, such as
+  a walkthrough the reviewer asked for, and nothing else could ever start the next review. A
+  finding the owner accepted needs none (#3828): ``review-accepted`` (``accept``) counts the
+  review of that head as a pass. Each asks once more, at most ``MAX_AGAIN`` times per head;
+  past that a person decides, and the chat is told so. A pull request turned back to draft and
+  marked ready again at a head already reviewed no longer asks (#3344): it carries no reason,
+  and every chat it opened read to the reviewer as a plain duplicate. The chat is told what is
   going on instead (#3584): the head passed, its verdict has findings, its review is still
   running (and the chat now waits on it), or its review chat ended with no verdict, which
   asks again as ``no_verdict`` below. A request marked ``no_verdict`` (#3453) asks again because
@@ -140,7 +141,7 @@ from .wake_on import STOP_SETTLE_S
 from .watch_retry import Backoff
 from .webhook_tailer import Delivery, WebhookTailer, WebhookWatcher
 from .work_claims import assignee_of
-from .work_release import OWNER_CALL_ASK
+from .work_release import ACCEPTED_ASK, OWNER_CALL_ASK
 from .work_signals import MARKER as START_MARKER
 
 log = logging.getLogger(__name__)
@@ -209,6 +210,8 @@ _CLAUDE_RE = re.compile(r"^\s*/claude\b", re.IGNORECASE)
 _REF_RE = re.compile(
     r"(?<![\w/#])(?P<repository>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)?#(?P<number>\d+)\b"
 )
+#: A commit id a reviewer's findings or escalation names (#3828 review): 7 to 40 hex digits.
+_SHA_RE = re.compile(r"(?<![0-9A-Za-z])[0-9a-fA-F]{7,40}(?![0-9A-Za-z])")
 _RELEASE_VERDICT_RE = re.compile(r"^\s*/reviewed\b", re.IGNORECASE)
 _DECK_REVIEW_RE = re.compile(r"^\s*/(?:claude\s+Review\b|reviewed\b)", re.IGNORECASE)
 #: A reviewer handing the review to the owner instead of passing it or sending it back (#3216),
@@ -221,9 +224,7 @@ _ESCALATED_RE = re.compile(
 ESCALATED_ASK = (
     "The reviewer will not review this commit again by itself, so stop waiting on the review. "
     "Ask the owner in your question box: the reviewer's question, with its options as the "
-    "choices. Once they answer, post their decision on the issue and act on it; when it "
-    "settles the finding without a code change, ask for a fresh review of the same commit "
-    "with your session's `review-request`, quoting the decision as its note."
+    "choices. Once they answer, post their decision on the issue and act on it. " + ACCEPTED_ASK
 )
 
 
@@ -862,6 +863,16 @@ class ReviewedHeads:
             if key.startswith(prefix) and not (exclude and key.startswith(exclude))
         )
 
+    def heads(self, pull: str) -> set[str]:
+        """Every head of ``pull`` a review was asked for, as remembered (#3828 review)."""
+        self._fresh()
+        prefix = f"{pull.lower()}@"
+        return {
+            key.removeprefix(prefix).partition("+")[0].removesuffix(RESERVED)
+            for key in self._keys
+            if key.startswith(prefix)
+        }
+
     def reserve(self, prefix: str, limit: int, key: str, exclude: str = "") -> bool:
         """Add ``key`` unless ``limit`` keys already start with ``prefix``; whether it was.
 
@@ -1467,6 +1478,8 @@ class WorkRouterService:
                         self._on_verdict(owner[0], self._verdict_pulls(event, owner))
                     except Exception:  # noqa: BLE001 - a stale wait times out on its own
                         log.warning("work-router: ending review waits failed", exc_info=True)
+                if sent and event.verdict:
+                    await self._note_answered(event, owner)
                 if event.comment_id:
                     self._background(
                         self._ack(event.repository, event.comment_id), "work-router-ack"
@@ -2488,9 +2501,9 @@ class WorkRouterService:
             self._send_refusal(
                 delivery,
                 owner,
-                f"{at} was reviewed and has findings: fix them and push a new commit (or, if a"
-                " person settled them on the issue, POST"
-                " $AGENTDECK_URL/api/sessions/<session-key>/review-request with a note saying"
+                f"{at} was reviewed and has findings: fix them and push a new commit (or, if"
+                " the owner settled them on the issue with no code change, POST"
+                " $AGENTDECK_URL/api/sessions/<session-key>/review-accepted with a note saying"
                 " what they decided)",
             )
             return
@@ -2625,6 +2638,82 @@ class WorkRouterService:
             "again": bool(again),
             "outcome": "asked" if spent in self.reviewed else "pending",
         }
+
+    async def _note_answered(self, event: Event, owner: Owner) -> None:
+        """Write down that findings or an escalation answered the review of each pull request
+        they are about, at its live head when that head was sent for review and the text
+        names its commit id and no other head sent for review (#3828 review).
+
+        Only such a head may pass on the owner's acceptance (``accept``): the review was
+        asked for and came back with something for the owner to accept. Findings about an
+        older head that arrive after a push name that head, not the live one, so they never
+        mark it (owner's decision on #3828); text naming no commit marks nothing, and the
+        agent asks for a fresh review instead.
+        """
+        named = {token.lower() for token in _SHA_RE.findall(event.text)}
+        if not named:
+            return
+        pulls = self._verdict_pulls(event, owner)
+        if pulls is None:
+            read = getattr(getattr(self._release, "ports", None), "pulls", None)
+            try:
+                held = read(_work_id(owner)) if read else ()
+                pulls = sorted({str(pull).lower() for pull in held})
+            except Exception:  # noqa: BLE001 - unnoted: an acceptance is refused, not wrong
+                log.warning("work-router: could not list %s's pulls", owner[1], exc_info=True)
+                pulls = []
+        for pull in pulls:
+            repository, _, number = pull.lower().rpartition("#")
+            if not number.isdigit():
+                continue
+            head = await self._live_ready_head(repository, int(number))
+            if not head:
+                continue
+            # Exactly one head sent for review named, the live one (owner's decision on the
+            # second #3828 escalation): text about an older head that mentions the new one
+            # in passing names two, and marks nothing.
+            sent = self.reviewed.heads(f"{repository}#{number}")
+            judged = {item for item in sent if any(item.startswith(t) for t in named)}
+            if judged == {head}:
+                self.reviewed.note_verdict(f"{repository}#{number}", head)
+
+    async def accept(self, repository: str, number: int, note: str) -> dict:
+        """Count the review of the pull request's ready head as a pass, because the owner
+        accepted its findings with no code change (#3828).
+
+        Only at a head whose review came back with findings or an escalation
+        (``ReviewedHeads.answered``), so no diff the reviewer never finished passes this way.
+        Raises ``AgainRefused`` with the reason otherwise; answers the release's ``outcome``
+        (``review pass recorded for …``).
+        """
+        repository = repository.lower()
+        pull = f"{repository}#{number}"
+        owner = self._owner_of_pull(repository, number)
+        if owner is None:
+            raise AgainRefused(f"no Work's chat registered {pull}")
+        if not self._switched(repository) or self._release is None:
+            raise AgainRefused(f"the deck does not release {repository}'s Works")
+        head = await self._live_ready_head(repository, number)
+        if not head:
+            raise AgainRefused(
+                f"{pull} is not open and ready for review (a draft, closed, or unreadable now):"
+                " mark it ready with `gh pr ready` first"
+            )
+        if f"{pull}@{head}" not in self.reviewed or not self.reviewed.answered(pull, head):
+            # Asked for is not answered (#3828 review): a review still running has returned
+            # nothing the owner could have accepted.
+            raise AgainRefused(
+                f"no findings or escalation came back from a review of {pull} at {head[:12]},"
+                " so there is nothing at it to accept: wait for the review's verdict, and a"
+                " push after the review is reviewed as usual"
+            )
+        answer = str(await self._release.owner_accepted(_work_id(owner), pull, head, note))
+        from .work_release import PASS_RECORDED
+
+        if not answer.startswith(PASS_RECORDED):
+            raise AgainRefused(answer)
+        self.pending.discard(f"review:{pull}@{head}")
+        return {"pull_request": pull, "head": head, "outcome": answer}
 
     async def _may_instruct(self, event: Event) -> bool:
         """Does the comment's author hold the project's Work tier, as the Poller requires?
@@ -2785,8 +2874,8 @@ class WorkRouterService:
                     f" {before[:12]}: only its base branch changed. No new review was started;"
                     " the review verdict on that diff stands. A pass carries over to this head."
                     " Findings about that diff still need an answer: fix"
-                    " them and push, or, when a person settled one on the issue, ask for a fresh"
-                    " review of this commit with your session's `review-request`, quoting the"
+                    " them and push, or, when the owner settled them on the issue with no code"
+                    " change, tell the deck with your session's `review-accepted`, quoting the"
                     " decision as its note."
                 ),
                 due_at=now,

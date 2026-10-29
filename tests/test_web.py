@@ -3876,6 +3876,40 @@ async def test_local_markdown_file_opens_from_absolute_path_with_line_suffix(tmp
     assert "first" in source.text
 
 
+async def test_diagram_file_opens_full_screen_with_its_notes_and_legend(tmp_path):
+    """A diagram file's `?bare=1` is the full-screen view the live page shows (#3822)."""
+    app = _app_with_state(tmp_path)
+    diagram = tmp_path / "flow.md"
+    diagram.write_text(
+        "# Order flow\n\nHow an order is <b>picked</b>.\n\n"
+        "```mermaid\nflowchart TD\n  a[Start] --> b{Ready?}\n  class b amber\n```\n\n"
+        "## Colours\n\n- **amber**: Waits for a person\n\n"
+        "## Boxes\n\n- **Ready?**: Checks [stock](https://x.test/s) in `pick.py`\n".replace(
+            "\n", "\r\n"
+        )
+    )
+    plain = tmp_path / "plain.md"
+    plain.write_text("# Plain\n\nNo diagram here.\n")
+
+    async with _client(app) as client:
+        bare = await client.get(f"{diagram}?bare=1")
+        inline = await client.get(f"{diagram}")
+        plain_bare = await client.get(f"{plain}?bare=1")
+
+    assert bare.status_code == 200
+    assert "<title>Order flow</title>" in bare.text
+    assert "How an order is &lt;b&gt;picked&lt;/b&gt;." in bare.text
+    assert 'style="--h: 36"></span>Waits for a person' in bare.text
+    # The box note loses its link markup, keyed as diagram_frame.js looks it up.
+    assert '{"ready?": "Checks stock in pick.py"}' in bare.text
+    assert "flowchart TD" in bare.text and "local-markdown" not in bare.text
+    assert bare.headers["cache-control"] == "no-store"
+    # Without `bare` the file opens as markdown, drawing its diagrams inline.
+    assert "mdToHtml(" in inline.text and ", null, false, true)" in inline.text
+    # A markdown file with no diagram has no full-screen view.
+    assert 'id="local-markdown"' in plain_bare.text
+
+
 async def test_local_file_route_previews_html_and_serves_binary_inline(tmp_path):
     app = _app_with_state(tmp_path)
     active = tmp_path / "page.html"
@@ -7953,10 +7987,15 @@ async def test_static_assets_are_compressed_and_always_revalidated(tmp_path):
         unversioned = await client.get("/static/app.css")
         stale_version = await client.get("/static/app.css?v=stale")
 
+        # A diagram frame has no origin, so only the vendored libraries are CORS-readable.
+        vendored = await client.get("/static/vendor/mermaid-elk/mermaid-layout-elk.esm.min.mjs")
+
     assert versioned.headers["content-encoding"] == "gzip"
     assert versioned.headers["cache-control"] == "public, no-cache"
     assert unversioned.headers["cache-control"] == "public, no-cache"
     assert stale_version.headers["cache-control"] == "public, no-cache"
+    assert vendored.headers["access-control-allow-origin"] == "*"
+    assert "access-control-allow-origin" not in unversioned.headers
 
 
 async def test_static_byte_ranges_are_not_gzipped(tmp_path):
@@ -8300,6 +8339,202 @@ async def test_an_agent_reply_shows_its_html_live_block_working(tmp_path):
     assert result["user_frames"] == 0
     assert not [url for url in posts if "/pollers/" in url]
     assert result["user_code"] == _LIVE_HTML
+
+
+@pytest.mark.browser
+async def test_a_diagram_file_draws_full_screen_and_a_tapped_box_shows_its_note(tmp_path):
+    """A diagram file's full-screen view draws it with the vendored Mermaid and ELK and
+    shows a tapped box's note (#3822); the same block in an agent's reply stays code."""
+    app = _app_with_state(tmp_path, with_transcript=True)
+    source = "flowchart TD\n  a[Start] --> b{Ready?}\n  subgraph g [Store]\n    b\n  end"
+    diagram = tmp_path / "flow.md"
+    # Blue is named only in the legend: the group must not take it (#3822 review).
+    diagram.write_text(
+        f"# Order flow\n\nHow an order moves.\n\n```mermaid\n{source}\n```\n\n"
+        "## Colours\n\n- **blue**: Not used yet\n\n## Boxes\n\n- **Ready?**: Checks stock\n"
+    )
+    # With all six colours meaning something, a group stays neutral.
+    crowded = tmp_path / "crowded.md"
+    crowded.write_text(
+        f"# Full\n\nAll taken.\n\n```mermaid\n{source}\n```\n\n## Colours\n\n"
+        + "".join(f"- **{c}**: x\n" for c in ("blue", "violet", "teal", "amber", "rose", "green"))
+    )
+    transcript = tmp_path / "projects" / "-tmp" / "sid1.jsonl"
+    lines = [json.loads(line) for line in transcript.read_text().splitlines()]
+    lines[1]["message"]["content"][0]["text"] = f"```mermaid\n{source}\n```"
+    transcript.write_text("".join(json.dumps(line) + "\n" for line in lines))
+
+    async with _live_server(app) as base, async_playwright() as playwright:
+        browser = await playwright.chromium.launch()
+        context = await browser.new_context(service_workers="block")
+        page = await context.new_page()
+        await page.goto(f"{base}{diagram}?bare=1")
+        inner = page.frame_locator("iframe.md-diagram")
+        await inner.locator(".mm-headings").wait_for(state="attached", timeout=30000)
+        layout = await inner.locator("body").get_attribute("data-layout")
+        group_fill = await inner.locator("g.cluster rect").first.evaluate("r => r.style.fill")
+        # The light panel tint of violet (262), as the browser writes a colour back.
+        violet = await page.evaluate(
+            "() => { const d = document.createElement('div');"
+            " d.style.color = 'hsl(262 75% 95%)'; return d.style.color; }"
+        )
+        await page.goto(f"{base}{crowded}?bare=1")
+        await inner.locator(".mm-headings").wait_for(state="attached", timeout=30000)
+        crowded_fill = await inner.locator("g.cluster rect").first.evaluate("r => r.style.fill")
+        await page.goto(f"{base}{diagram}?bare=1")
+        await inner.locator(".mm-headings").wait_for(state="attached", timeout=30000)
+        # The legend waits behind its button and makes way for a tapped box's note (#3831).
+        legend_at_start = await page.locator("#dc-legend").is_hidden()
+        await page.click("#dc-legend-button")
+        legend_opened = await page.locator("#dc-legend").is_visible()
+        await inner.locator("g.node", has_text="Ready?").first.click()
+        await expect(page.locator("#dc-legend")).to_be_hidden()
+        note = await inner.locator(".mm-pop").text_content()
+        heading = await inner.locator(".mm-headings").count()
+        await page.goto(f"{base}/sessions/claude_code:test:sid1")
+        await page.locator(".ev.assistant .md-code").wait_for()
+        chat_frames = await page.locator(".ev.assistant iframe").count()
+
+        # On the live page, a tapped box goes with the suggestion sent about it. The diagram
+        # has its own slot (#3827), and on a phone it starts with the panel hidden.
+        await page.request.put(
+            f"{base}/api/sessions/claude_code:test:sid1/live-prototype",
+            data={"diagram": f"{base}{diagram}?bare=1"},
+        )
+        await page.set_viewport_size({"width": 390, "height": 800})
+        sent = []
+
+        async def capture(route):
+            sent.append(route.request.post_data)
+            await route.fulfill(status=200, body="{}")
+
+        await page.route("**/inject", capture)
+        await page.goto(f"{base}/live/claude_code:test:sid1")
+        panel_at_start = await page.locator("#live-side").is_hidden()
+        live = page.frame_locator("#live-frame").frame_locator("iframe.md-diagram")
+        await live.locator("g.node", has_text="Ready?").first.click()
+        await expect(page.locator("#live-box-name")).to_have_text("\u201cReady?\u201d")
+        # Only the suggestion box comes up, not the changes list.
+        composing = [
+            await page.locator(sel).is_visible() for sel in ("#live-send textarea", "#live-steps")
+        ]
+        await page.fill("#live-send textarea", "Split it in two")
+        await page.click("#live-send button[type=submit]")
+        await expect(page.locator("#live-status")).to_have_text("Sent to the agent.")
+        await page.click("#live-box-clear")
+        picked_after_clear = await page.locator("#live-box").is_hidden()
+        panel_after_clear = await page.locator("#live-side").is_hidden()
+        # With a prototype as well, a switch keeps a phone's sheet closed and the bar up (#3831).
+        await page.request.put(
+            f"{base}/api/sessions/claude_code:test:sid1/live-prototype",
+            data={"url": f"{base}{crowded}?bare=1"},
+        )
+        await page.goto(f"{base}/live/claude_code:test:sid1?view=diagram")
+        await live.locator("g.node", has_text="Ready?").first.click()
+        await expect(page.locator("#live-box")).to_be_visible()
+        await page.click("[data-live-view=prototype]")
+        on_prototype = [
+            await page.locator(sel).is_visible() for sel in ("#live-side", "#live-send textarea")
+        ]
+        await page.click("[data-live-view=diagram]")
+        await expect(page.locator("#live-side")).to_be_hidden()
+        await context.close()
+        await browser.close()
+
+    assert layout == "elk"
+    # Blue is the first group hue, but the legend holds it, so the group takes violet.
+    assert group_fill == violet
+    assert crowded_fill == ""
+    assert legend_at_start and legend_opened
+    assert note == "Ready?Checks stock"
+    assert heading == 1
+    assert chat_frames == 0
+    assert "About the box \u201cReady?\u201d in the diagram: Split it in two" in sent[0]
+    assert picked_after_clear
+    assert panel_at_start and composing == [True, False] and panel_after_clear
+    assert on_prototype == [False, True]
+
+
+@pytest.mark.browser
+async def test_the_live_page_gives_a_phone_the_prototype_and_sends_on_enter(tmp_path):
+    """On a phone the prototype takes the width and the panel is a closed sheet; Enter
+    sends a suggestion once and keeps the box focused, Shift+Enter adds a line; eight
+    versions leave the header's buttons on screen; taps are 40px; turning the screen
+    across the breakpoint sets the panel (#3831)."""
+    app = _app_with_state(tmp_path, with_transcript=True)
+    api = "/api/sessions/claude_code:test:sid1/live-prototype"
+    async with _live_server(app) as base, async_playwright() as playwright:
+        browser = await playwright.chromium.launch()
+        context = await browser.new_context(
+            service_workers="block", viewport={"width": 390, "height": 844}
+        )
+        page = await context.new_page()
+        versions = [{"name": f"V{n}", "url": f"{base}/healthz?v={n}"} for n in range(8)]
+        await page.request.put(
+            f"{base}{api}", data={"url": f"{base}/healthz", "versions": versions}
+        )
+        await page.request.post(f"{base}{api}/steps", data={"summary": "Cards"})
+        await page.request.post(f"{base}{api}/steps", data={"summary": "Chips on top"})
+        sent = []
+
+        async def capture(route):
+            sent.append(route.request.post_data)
+            # Slow enough that a second Enter lands while the first send is in flight.
+            await asyncio.sleep(0.3)
+            await route.fulfill(status=200, body="{}")
+
+        await page.route("**/inject", capture)
+        await page.goto(f"{base}/live/claude_code:test:sid1")
+        frame_width = await page.locator("#live-frame").evaluate(
+            "e => e.getBoundingClientRect().width"
+        )
+        sheet_hidden = await page.locator("#live-side").is_hidden()
+        count = await page.locator("#live-side-count").text_content()
+        right_edges = [
+            await page.locator(sel).evaluate("e => e.getBoundingClientRect().right")
+            for sel in ("#live-reload", "#live-side-toggle")
+        ]
+        box = page.locator("#live-send textarea")
+        await box.click()
+        await box.type("Sticky chips")
+        await page.keyboard.press("Shift+Enter")
+        await box.type("on scroll")
+        typed = await box.input_value()
+        await page.keyboard.press("Enter")
+        await page.keyboard.press("Enter")
+        await expect(page.locator("#live-status")).to_have_text("Sent to the agent.")
+        await expect(box).to_have_value("")
+        focused = await page.evaluate("document.activeElement.name")
+        await page.click("#live-side-toggle")
+        sheet_open = await page.locator("#live-side").is_visible()
+        heights = [
+            await page.locator(sel).first.evaluate("e => e.getBoundingClientRect().height")
+            for sel in ("#live-send-button", "#live-steps button", "#live-versions button")
+        ]
+        # Starting a use case's walkthrough closes the sheet that would cover it.
+        await page.request.post(
+            f"{base}{api}/use-cases", data={"title": "Find a helmet", "steps": ["Tap a chip"]}
+        )
+        await page.click("[data-live-tab=live-cases]")
+        await page.click("#live-case-list button:text-is('Start')")
+        await expect(page.locator("#live-side")).to_be_hidden()
+        await page.click("#live-walk-end")
+        # Turned to a wide screen without a reload, then back.
+        await page.set_viewport_size({"width": 1280, "height": 800})
+        await expect(page.locator("#live-side")).to_be_visible()
+        await page.set_viewport_size({"width": 390, "height": 844})
+        await expect(page.locator("#live-side")).to_be_hidden()
+        await context.close()
+        await browser.close()
+
+    assert frame_width == 390
+    assert sheet_hidden and sheet_open
+    assert count == "2"
+    assert max(right_edges) <= 390
+    assert min(heights) >= 40
+    assert typed == "Sticky chips\non scroll"
+    assert len(sent) == 1 and "Sticky chips" in sent[0] and "on scroll" in sent[0]
+    assert focused == "message"
 
 
 @pytest.mark.browser
@@ -8827,6 +9062,93 @@ async def test_mobile_fast_swipe_toward_earlier_messages_jumps_to_top(tmp_path):
     assert 0 < result["smoothStart"] < result["beforeFast"]
     assert result["fast"] <= 1
     assert result["topScrolls"] == [{"top": 0, "behavior": "smooth"}]
+
+
+@pytest.mark.browser
+async def test_mobile_keyboard_hides_the_action_bar_and_keeps_the_chat_at_its_end(tmp_path):
+    """While the phone keyboard is up the pills and the Work's buttons step out, and the chat
+    scrolls to its end as they leave and come back (#3810). Focus alone is no sign: Android's
+    down key closes the keyboard and keeps focus, so the bar returns when the screen grows."""
+    app = _app_with_state(tmp_path, with_transcript=True)
+    async with _client(app) as client:
+        detail = await client.get("/sessions/claude_code:test:sid1")
+
+    static_dir = Path(__file__).parents[1] / "src/agentdeck/web/static"
+    assets = {
+        "/static/app.css": ("text/css", (static_dir / "app.css").read_text()),
+        "/static/mobile_session_stack.js": (
+            "text/javascript",
+            (static_dir / "mobile_session_stack.js").read_text(),
+        ),
+    }
+
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch()
+        context = await browser.new_context(
+            viewport={"width": 390, "height": 800}, service_workers="block"
+        )
+        page = await context.new_page()
+
+        async def serve(route, request):
+            path = request.url.split("?", 1)[0].removeprefix("http://agentdeck.test")
+            if path == "/sessions/claude_code:test:sid1":
+                await route.fulfill(status=200, content_type="text/html", body=detail.text)
+            elif path in assets:
+                kind, body = assets[path]
+                await route.fulfill(status=200, content_type=kind, body=body)
+            else:
+                await route.fulfill(status=204, body="")
+
+        await page.route("http://agentdeck.test/**", serve)
+        await page.goto("http://agentdeck.test/sessions/claude_code:test:sid1")
+        await page.wait_for_function(
+            "document.body.classList.contains('mobile-session-stack-ready')"
+        )
+        await page.evaluate(
+            """() => {
+              document.querySelector('.transcript').insertAdjacentHTML('afterbegin',
+                '<div class="ev" style="min-height:2000px">older</div>');
+              // This read-only chat draws no composer; an owned one's box is all it needs.
+              document.querySelector('.session-detail').insertAdjacentHTML('beforeend',
+                '<form class="inject-form"><textarea id="inject-message"></textarea></form>');
+            }"""
+        )
+        state = """() => {
+          const detail = document.querySelector('.session-detail');
+          const bar = document.getElementById('session-action-bar');
+          return {
+            up: detail.classList.contains('keyboard-up'),
+            bar: getComputedStyle(bar).display !== 'none',
+            atEnd: detail.scrollHeight - detail.scrollTop - detail.clientHeight <= 1,
+          };
+        }"""
+        scroll_up = "() => { document.querySelector('.session-detail').scrollTop = 0; }"
+        frames = "() => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))"
+
+        await page.focus("#inject-message")
+        await page.evaluate(frames)
+        focused_only = await page.evaluate(state)
+
+        await page.evaluate(scroll_up)
+        await page.set_viewport_size({"width": 390, "height": 440})
+        await page.wait_for_function(
+            "document.querySelector('.session-detail').classList.contains('keyboard-up')"
+        )
+        await page.evaluate(frames)
+        keyboard_up = await page.evaluate(state)
+
+        await page.evaluate(scroll_up)
+        await page.set_viewport_size({"width": 390, "height": 800})
+        await page.wait_for_function(
+            "!document.querySelector('.session-detail').classList.contains('keyboard-up')"
+        )
+        await page.evaluate(frames)
+        keyboard_closed = await page.evaluate(state)
+        await browser.close()
+
+    assert (focused_only["up"], focused_only["bar"]) == (False, True)
+    assert keyboard_up == {"up": True, "bar": False, "atEnd": True}
+    assert keyboard_closed == {"up": False, "bar": True, "atEnd": True}
 
 
 async def test_subagent_count_renders_on_card_and_detail_header(tmp_path):

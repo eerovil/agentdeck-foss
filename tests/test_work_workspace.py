@@ -614,6 +614,8 @@ def test_the_workspace_is_served_only_inside_the_work_page(tmp_path):
         "/works/{work_id:path}/message",
         # The Work action route (#2237) performs an operator action; it serves no workspace.
         "/works/{work_id:path}/action",
+        # Take over another deck's Work (#3834) reassigns its issue; no workspace.
+        "/works/{work_id:path}/take-over",
         # Hide and Bring back (#2238) change this deck's display only; no workspace.
         "/works/{work_id:path}/visibility",
         "/works/{work_id:path}/star",

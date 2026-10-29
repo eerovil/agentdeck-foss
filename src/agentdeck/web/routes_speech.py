@@ -15,10 +15,6 @@ the wake log, joined by the page's phrase id, which ``scripts/wake_report.py`` r
 to compare the two checks; a phrase either check woke on, or the detector nearly
 did, keeps its audio there for 30 days.
 
-With ``[speech] keep_audio_days`` set, every transcribed phrase also keeps its
-audio and Whisper's words in ``keep_audio_dir`` for that many days, which
-``scripts/speech_bench.py`` runs other speech-to-text models on (#3499).
-
 ``/api/voice/heard`` gives a phrase heard in voice mode to the chat's fast agent
 (``voice_helper``) and returns what to say and what to send; a 503 there means the
 page sends the words as heard and says its own acknowledgement.
@@ -26,15 +22,17 @@ The page asks it as soon as a phrase's words come back (#3765), and names an ask
 answer it threw away, as more words joined the phrase, in the next one's ``drop``.
 The short "Mm." the page played while the fast agent answered (#3765) and its
 ``/api/voice/filler`` route were removed by the owner's decision on #3780.
+In any chat but the deck chat its answer can instead be the ask to go back there (#3816):
+the reply then names the deck chat's ``jump`` and the page opens it, sending nothing.
 ``/api/voice/warm`` starts that agent before a phrase needs it (#3507), has the
-speech service load its speech-to-text model (#3766), and with
-``[speech] tts = "chatterbox"`` has ``scripts/tts_server.py`` load its model too.
+speech service load its speech-to-text model (#3766).
 
-With ``[speech] tts = "chatterbox"`` (#3519), ``/api/speech/say`` asks Chatterbox
-over ``[speech] tts_socket`` first. A sentence it fails on, gives no audio for
-within ``TTS_TIMEOUT``, or answers "loading" is read by Piper instead, and after a
-failure Piper reads everything for ``TTS_REST`` seconds, so a reply does not flip
-between the two voices.
+``/api/speech/say`` reads with Piper in the speech service. Chatterbox, tried as a
+second voice in #3519, was removed in #3796: the owner kept Piper everywhere.
+``/api/voice/narrate`` (#3799) is asked when the chat has said nothing aloud for a while
+after a send, or during a long quiet spell of work: the fast agent reads what the
+agent did since the person last spoke, from the transcript, and returns one sentence
+saying what it is doing, or 204 for nothing to say.
 ``/sessions/{key}/voice-log`` reads back what the fast agent heard and said (#3475).
 
 ``GET /api/speech/status`` says whether the service has its model loaded yet: 🎤 asks
@@ -50,7 +48,6 @@ import json
 import logging
 import re
 import time
-import uuid
 import wave
 from collections import OrderedDict
 from datetime import datetime
@@ -60,8 +57,8 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
-from .. import voice_helper
-from .deps import get_config, get_state, get_templates, require_access
+from .. import meta_chat, voice_helper
+from .deps import get_config, get_db, get_state, get_templates, require_access, resolve_current_leg
 from .routes_actions import _require_same_origin
 
 log = logging.getLogger(__name__)
@@ -87,16 +84,8 @@ KEEP_AUDIO_S = 30 * 86400
 RECENT_PHRASES = 20
 _recent_audio: OrderedDict[str, bytes] = OrderedDict()
 MAX_ID_CHARS = 40
-# Phrases kept for comparing speech-to-text models (#3499).
-KEPT_LOG = "kept.jsonl"
-# Chatterbox (#3519): Piper reads a sentence it has no audio for in this long.
-TTS_TIMEOUT = httpx.Timeout(4.0, connect=1.0)
-# After a Chatterbox failure, Piper reads everything for this many seconds.
-TTS_REST = 300.0
-_tts_down_until = 0.0
-# Warm-ups in flight, held so none is collected before it ends; nothing awaits them.
-_tts_warming: set[asyncio.Task] = set()
-# The speech service's warm-ups (#3766), held the same way.
+# The speech service's warm-ups (#3766), held so none is collected before it ends;
+# nothing awaits them.
 _stt_warming: set[asyncio.Task] = set()
 
 
@@ -150,7 +139,9 @@ async def status(request: Request) -> JSONResponse:
 
 @router.post("/api/speech/transcribe")
 async def transcribe(request: Request) -> JSONResponse:
-    """A recorded phrase (16-bit WAV) as ``{"text", "language"}``."""
+    """A recorded phrase (16-bit WAV) as ``{"text", "language", "segments"}``:
+    ``segments`` are the text's parts in order, each ``{"text", "unsure"}``, and voice
+    mode marks the ones Whisper doubted for the agent (#3817)."""
     _require_same_origin(request)
     audio = await _audio(request)
     pinned = get_config(request).speech.language
@@ -162,32 +153,19 @@ async def transcribe(request: Request) -> JSONResponse:
         path = f"/transcribe?language={previous}"
     else:
         path = "/transcribe"
-    started = time.monotonic()
     reply = await _forward(request, path, content=audio, headers={"Content-Type": "audio/wav"})
     heard = reply.json()
     language = pinned if pinned in LANGUAGES else heard.get("language")
-    speech = get_config(request).speech
-    if speech.keep_audio_days > 0:
-        line = {
-            "id": _phrase_id(request.query_params.get("id")) or uuid.uuid4().hex[:12],
-            "text": str(heard.get("text") or ""),
-            "language": heard.get("language"),
-            "only": pinned if pinned in LANGUAGES else "",
-            "seconds": _seconds(audio),
-            "ms": round((time.monotonic() - started) * 1000),
-        }
-        await asyncio.to_thread(
-            _write_log,
-            Path(speech.keep_audio_dir).expanduser(),
-            KEPT_LOG,
-            line,
-            audio,
-            speech.keep_audio_days * 86400,
-        )
+    parts = heard.get("segments") if isinstance(heard.get("segments"), list) else []
     return JSONResponse(
         {
             "text": str(heard.get("text") or ""),
             "language": language if language in LANGUAGES else "en",
+            "segments": [
+                {"text": part["text"], "unsure": part.get("unsure") is True}
+                for part in parts
+                if isinstance(part, dict) and isinstance(part.get("text"), str)
+            ],
         }
     )
 
@@ -332,10 +310,6 @@ async def say(request: Request) -> Response:
         raise HTTPException(status_code=400, detail="no text")
     language = body.get("language") if body.get("language") in LANGUAGES else "en"
     speech = get_config(request).speech
-    if speech.tts == "chatterbox" and speech.tts_socket:
-        wav = await _chatterbox(speech, text, language)
-        if wav is not None:
-            return Response(wav, media_type="audio/wav", headers={"Cache-Control": "no-store"})
     voice = getattr(speech, f"voice_{language}")
     speed = getattr(speech, f"speed_{language}")
     reply = await _forward(
@@ -344,45 +318,6 @@ async def say(request: Request) -> Response:
         json={"text": text, "language": language, "voice": voice, "speed": speed},
     )
     return Response(reply.content, media_type="audio/wav", headers={"Cache-Control": "no-store"})
-
-
-async def _chatterbox(speech, text: str, language: str) -> bytes | None:
-    """Chatterbox's WAV for ``text``, or None for Piper to read it (#3519)."""
-    global _tts_down_until
-    if time.monotonic() < _tts_down_until:
-        return None
-    transport = httpx.AsyncHTTPTransport(uds=str(Path(speech.tts_socket).expanduser()))
-    payload = {
-        "text": text,
-        "language": language,
-        "exaggeration": speech.tts_exaggeration,
-        "cfg_weight": getattr(speech, f"tts_cfg_{language}"),
-    }
-    try:
-        async with httpx.AsyncClient(transport=transport, timeout=TTS_TIMEOUT) as client:
-            reply = await client.post("http://tts/say", json=payload)
-    except httpx.HTTPError as exc:
-        log.warning("Chatterbox unreachable or slow, Piper reads: %r", exc)
-        _tts_down_until = time.monotonic() + TTS_REST
-        return None
-    if reply.status_code == 200:
-        return reply.content
-    if reply.status_code == 503 and "loading" in reply.text:
-        return None
-    log.warning("Chatterbox answered %s, Piper reads: %s", reply.status_code, reply.text[:200])
-    _tts_down_until = time.monotonic() + TTS_REST
-    return None
-
-
-async def _warm_chatterbox(speech) -> None:
-    """Have Chatterbox load its model while voice mode listens; run as a task that
-    nothing waits on, so a slow socket never holds up the fast agent's warm-up."""
-    transport = httpx.AsyncHTTPTransport(uds=str(Path(speech.tts_socket).expanduser()))
-    try:
-        async with httpx.AsyncClient(transport=transport, timeout=TTS_TIMEOUT) as client:
-            await client.post("http://tts/warm")
-    except httpx.HTTPError as exc:
-        log.info("Chatterbox warm-up failed: %r", exc)
 
 
 async def _warm_speech(socket: str) -> None:
@@ -420,7 +355,41 @@ async def voice_heard(request: Request) -> JSONResponse:
     answer = await voice_helper.heard(request.app, key, text, lines, phrase_id, run, drop)
     if answer is None:
         raise HTTPException(status_code=503, detail="the fast agent has no answer")
+    if answer.back:
+        # The ask to go back to the deck chat (#3816): the page opens it in place.
+        state = get_state(request)
+        deck_key = meta_chat.deck_chat_session_key(state, get_db(request))
+        if deck_key is None:
+            return JSONResponse({"say": "", "relay": text})
+        jump = {"path": state.chat_path_for_session(deck_key), "title": meta_chat.SPOKEN_TITLE}
+        return JSONResponse({"say": "", "relay": None, "jump": jump})
     return JSONResponse({"say": answer.say, "relay": answer.relay})
+
+
+@router.post("/api/voice/narrate")
+async def voice_narrate(request: Request) -> Response:
+    """``{"session_key", "seconds", "run", "lang"}``: the chat has said nothing aloud for that
+    long while it works, so the fast agent says what it is doing (#3799), as
+    ``{"say"}``; 204 when it has nothing to say."""
+    _require_same_origin(request)
+    body = await _json_object(request)
+    key = str(body.get("session_key") or "").strip()
+    if not key:
+        raise HTTPException(status_code=400, detail="a session key is needed")
+    try:
+        seconds = max(0, min(3600, int(body.get("seconds") or 0)))
+    except (TypeError, ValueError):
+        seconds = 0
+    run = str(body.get("run") or "").strip()[:MAX_ID_CHARS]
+    narration_id = str(body.get("id") or "").strip()[:MAX_ID_CHARS]
+    account, session, provider = resolve_current_leg(request, key)
+    detail = await provider.load_transcript(account, session)
+    done = voice_helper.steps(detail.events)
+    finnish = body.get("lang") == "fi"
+    said = await voice_helper.narrate(request.app, key, done, seconds, run, finnish, narration_id)
+    if not said:
+        return Response(status_code=204)
+    return JSONResponse({"say": said})
 
 
 @router.post("/api/voice/sent")
@@ -428,7 +397,8 @@ async def voice_sent(request: Request) -> Response:
     """``{"session_key", "id", "text", "how"}``: what the page really sent for a phrase
     (``text`` null: nothing, and ``how`` says why), saved in the voice log (#3475).
     ``{"session_key", "id", "timing"}`` instead saves the phrase's measured waits
-    (#3765)."""
+    (#3765), and ``{"session_key", "id", "spoken"}`` the fast agent's line the page
+    really said for it, which it holds back until the chat stays quiet (#3799)."""
     _require_same_origin(request)
     body = await _json_object(request)
     key = str(body.get("session_key") or "").strip()
@@ -437,6 +407,9 @@ async def voice_sent(request: Request) -> Response:
         raise HTTPException(status_code=400, detail="a session key and a phrase id are needed")
     if isinstance(body.get("timing"), dict):
         await voice_helper.timed(key, phrase_id, body["timing"])
+        return Response(status_code=204)
+    if isinstance(body.get("spoken"), str):
+        await voice_helper.spoken(key, phrase_id, body["spoken"][:MAX_SAY_CHARS])
         return Response(status_code=204)
     text = body.get("text")
     text = str(text)[: voice_helper.MAX_HEARD_CHARS * 2] if isinstance(text, str) else None
@@ -448,8 +421,7 @@ async def voice_sent(request: Request) -> Response:
 @router.post("/api/voice/warm")
 async def voice_warm(request: Request) -> Response:
     """Voice mode is listening: start the chat's fast agent and load the speech
-    model before a phrase needs them (#3766), and Chatterbox's model before a reply
-    does (#3519)."""
+    model before a phrase needs them (#3766)."""
     _require_same_origin(request)
     body = await _json_object(request)
     key = str(body.get("session_key") or "").strip()
@@ -457,8 +429,6 @@ async def voice_warm(request: Request) -> Response:
     speech = get_config(request).speech
     if speech.socket:
         _background(_stt_warming, _warm_speech(speech.socket))
-    if speech.tts == "chatterbox" and speech.tts_socket:
-        _background(_tts_warming, _warm_chatterbox(speech))
     if key:
         await voice_helper.warm(request.app, key, run)
     return Response(status_code=204)

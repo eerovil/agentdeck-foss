@@ -9,10 +9,10 @@
 
 {% block content %}
 {% include "partials/session_sidebar_head.html" %}
-{# One line of counts, then the Works in the order they move through their life (#3578,
-   replacing #2254's): Not started and Needs answer, Working now, Needs retry and Work error,
-   Waiting, Needs review, Release blocked and Ready for merge, Live checking, clean-up, Recently
-   finished, Paused, then Recently stopped. A Work is in exactly one of them, picked from the
+{# One line of counts, then the Works by how much they need the owner (#3818, replacing #3578's
+   order of a Work's life): Needs answer, Ready for merge, Needs review and Release blocked,
+   Needs retry and Work error, Working now, the quick tidy-ups (Issue closed, Not started),
+   Waiting, Live checking, Recently finished, Paused, then Recently stopped. A Work is in exactly one of them, picked from the
    same status the Work page shows (`work_story.front_row`); Recently stopped is a shortcut to
    where each landed. Each part draws its own header, so an empty one takes no height, and the
    page's order is the DOM's, so keyboard and screen-reader order match it. #}
@@ -27,13 +27,19 @@
     {%- set part = "needs" %}{% include "partials/work_front.html" %}
   </div>
 </section>
+{%- for part, label in (("release", "Release"), ("stuck", "Stuck")) %}
+<section class="front-sec front-{{ part }}" id="front-{{ part }}" aria-label="{{ label }}">
+  <div class="front-rows" id="works-{{ part }}" sse-swap="works-{{ part }}" hx-swap="keyed-works">
+    {%- include "partials/work_front.html" %}
+  </div>
+</section>
+{%- endfor %}
 <section class="front-sec front-active" id="works-section" aria-label="Working now">
   <div class="front-rows" id="works" sse-swap="works-active" hx-swap="keyed-works">
     {%- set part = "active" %}{% include "partials/work_front.html" %}
   </div>
 </section>
-{%- for part, label in (("stuck", "Stuck"), ("waiting", "Waiting"), ("release", "Release"),
-                        ("live", "Live checking"), ("cleanup", "Clean-up"),
+{%- for part, label in (("cleanup", "Clean-up"), ("waiting", "Waiting"), ("live", "Live checking"),
                         ("finished", "Recently finished"), ("paused", "Paused")) %}
 <section class="front-sec front-{{ part }}" id="front-{{ part }}" aria-label="{{ label }}">
   <div class="front-rows" id="works-{{ part }}" sse-swap="works-{{ part }}" hx-swap="keyed-works">
@@ -54,6 +60,10 @@
 <section class="work-other" id="work-other" sse-swap="work-other" hx-swap="innerHTML"
          data-skip-unchanged>
   {%- include "partials/work_other.html" %}
+</section>
+<section class="work-other work-other-decks" id="work-other-decks" sse-swap="work-other-decks"
+         hx-swap="innerHTML" data-skip-unchanged>
+  {%- include "partials/work_other_decks.html" %}
 </section>
 {#- The counts, the empty headers and Other activity's fold, before the parser goes on. #}
 <script>if (window.AgentDeckFront) AgentDeckFront.apply();</script>

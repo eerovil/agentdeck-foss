@@ -204,20 +204,6 @@ class AssistantService:
                     self._settle_until = asyncio.get_running_loop().time() + _OPEN_SETTLE_S
                 self._wake.set()
 
-    def _initial_scans_complete(self) -> bool:
-        """Whether every account has supplied one authoritative session set.
-
-        Account scans land independently. Refreshing Deckhand after the first one
-        ranks a partial deck, so old sessions can enter the bounded triage window
-        and briefly reappear as finished cards during every web restart. Keep the
-        restored checkpoint until the initial deck is available or the startup
-        grace expires; after that, refresh preserves the unread accounts' records.
-        """
-        return all(
-            self.state.session_scan_revision(account.key) > 0
-            for account in self.accounts
-        )
-
     def request_refresh(self) -> bool:
         if not self.config.enabled:
             return False
@@ -260,17 +246,6 @@ class AssistantService:
             key: self.state.chat_current_session_key(key, chats)
             for key in self.state.sessions
         }
-
-    def _eligible_sessions(
-        self, presentation=None, *, parents: dict[str, str | None] | None = None
-    ) -> list[Session]:
-        """Every current top-level session participates in the stop-edge rule."""
-        owner_keys = self._attention_owner_keys(presentation, parents=parents)
-        return [
-            session
-            for session in self.state.sessions.values()
-            if session.key in owner_keys
-        ]
 
     def _reported_attention(self, session_key: str):
         return self.state.attention_report_for(session_key)

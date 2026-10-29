@@ -122,6 +122,49 @@ def test_the_first_ensure_reserves_creates_and_confirms_one_claim(service, host,
     assert [claim.key for claim in service.store.active()] == [
         (WORK, "example/store", "implementation")
     ]
+    assert _git(path, "rev-parse", "HEAD") == _git(checkout, "rev-parse", "origin/master")
+
+
+def test_a_branch_only_origin_has_is_checked_out_with_its_commits(service, checkout):
+    """#3834: a Work taken over from another deck carries on from that deck's pushes."""
+    _git(checkout, "-c", "user.email=t@example.com", "-c", "user.name=T",
+         "commit", "-q", "--allow-empty", "-m", "the other deck's work")
+    pushed = _git(checkout, "rev-parse", "HEAD")
+    _git(checkout, "update-ref", "refs/remotes/origin/agent/issue-7", pushed)
+    _git(checkout, "reset", "-q", "--hard", "origin/master")
+
+    result = service.ensure(_request(checkout))
+
+    path = checkout / ".worktrees" / "issue-7"
+    assert result.outcome == claims.CREATED
+    assert _git(path, "rev-parse", "--abbrev-ref", "HEAD") == "agent/issue-7"
+    assert _git(path, "rev-parse", "HEAD") == pushed
+    assert _git(path, "rev-parse", "--abbrev-ref", "@{upstream}") == "origin/agent/issue-7"
+
+
+def test_a_branch_left_here_moves_up_to_the_other_decks_pushes(service, checkout):
+    """#3834 review: a Work handed away and taken back carries on from origin's newer commits;
+    a local branch with commits origin lacks is kept as it is."""
+    def commit(message):
+        _git(checkout, "-c", "user.email=t@example.com", "-c", "user.name=T",
+             "commit", "-q", "--allow-empty", "-m", message)
+        return _git(checkout, "rev-parse", "HEAD")
+
+    _git(checkout, "switch", "-q", "-c", "agent/issue-7")
+    ours = commit("this deck's earlier stint")
+    theirs = commit("the other deck's work")
+    _git(checkout, "update-ref", "refs/remotes/origin/agent/issue-7", theirs)
+    _git(checkout, "switch", "-q", "master")
+    _git(checkout, "branch", "-f", "agent/issue-7", ours)
+    _git(checkout, "update-ref", "refs/remotes/origin/agent/issue-8", ours)
+    _git(checkout, "branch", "agent/issue-8", theirs)  # ahead of origin: kept
+
+    first = service.ensure(_request(checkout))
+    second = service.ensure(_request(checkout, "issue-8", work_id=OTHER_WORK))
+
+    assert first.outcome == claims.CREATED and second.outcome == claims.CREATED
+    assert _git(checkout / ".worktrees" / "issue-7", "rev-parse", "HEAD") == theirs
+    assert _git(checkout / ".worktrees" / "issue-8", "rev-parse", "HEAD") == theirs
 
 
 def test_every_later_consumer_of_the_work_resolves_the_same_workspace(service, host, checkout):

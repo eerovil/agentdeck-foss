@@ -276,6 +276,7 @@
   <script src="/static/composer_phrases.js?v={{ asset_ver }}" defer></script>
   <script src="/static/composer_speech.js?v={{ asset_ver }}" defer></script>
   <script src="/static/voice_mode.js?v={{ asset_ver }}" defer></script>
+  <script src="/static/chat_jump.js?v={{ asset_ver }}" defer></script>
   <script src="/static/issue_post.js?v={{ asset_ver }}" defer></script>
   <script src="/static/code_copy.js?v={{ asset_ver }}" defer></script>
   <script src="/static/live_html.js?v={{ asset_ver }}" defer></script>
@@ -338,6 +339,9 @@
         {# A page with no stream of its own connects this wrapper to /events/topbar,
            which carries both icons below (#2864, #3239). #}
         <span class="topbar-live"{% block topbar_sse %}{% endblock %}>
+        {# The deck chat's view change (#3814): every page stream sends it here, and
+           front_filters.js applies it. Never shown. #}
+        <span id="view-command-slot" sse-swap="view" hidden></span>
         {# New Works in Needs you (#3239): a stable slot, swapped when that list changes. #}
         {% if needs_you_menu is defined %}
         <span id="needs-you-slot" sse-swap="needs_you">{% include 'partials/needs_you_menu.html' %}</span>
@@ -506,15 +510,45 @@
     '<svg class="code-copy-done" viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">' +
     '<path fill="currentColor" d="M13.3 4.2 6.5 11l-3.8-3.8 1-1L6.5 9l5.8-5.8 1 1Z"/>' +
     '</svg></button>';
+  // A diagram file's `- **Box text**: note` lines, keyed by the box text in lower case
+  // without spaces, as diagram_frame.js looks them up (#3822).
+  // The colours a diagram file's `## Colours` legend names (`- **amber**: …`).
+  function mdLegendColours(text) {
+    var found = [];
+    text.split('\n').forEach(function (line) {
+      var m = line.match(/^\s*[-*+]\s+\*\*(blue|violet|teal|amber|rose|green)\*\*\s*[:\u2014-]/i);
+      if (m) found.push(m[1].toLowerCase());
+    });
+    return found;
+  }
+  function mdBoxNotes(text) {
+    var notes = {};
+    text.split('\n').forEach(function (line) {
+      var m = line.match(/^\s*[-*+]\s+\*\*(.+?)\*\*\s*[:\u2014-]\s*(.+)$/);
+      if (!m) return;
+      var note = m[2].replace(/\[([^\]]+)\]\([^)]*\)/g, '$1').replace(/[*`]/g, '');
+      notes[m[1].replace(/\s+/g, '').toLowerCase()] = note.trim();
+    });
+    return notes;
+  }
   // `live` is set for an agent's own reply: there an `html-live` block is shown as
   // working HTML in a sandboxed frame rather than as code (live_html.js, #3547).
-  function mdToHtml(text, sessionKey, live) {
+  // `diagrams` is set for a markdown file in the file viewer: there a ```mermaid
+  // block is drawn (live_html.js, #3822), and each `- **Box text**: note` line
+  // becomes the note shown when that box is tapped.
+  function mdToHtml(text, sessionKey, live, diagrams) {
+    var notes = diagrams ? mdBoxNotes(text) : null;
     var segs = mdEscape(text).split(/```/), out = '';
     for (var i = 0; i < segs.length; i++) {
       if (i % 2 === 1) {                       // inside a fenced code block
         var body = segs[i].replace(/^[^\n]*\n/, '').replace(/\n$/, '');
         if (live && window.AgentdeckLiveHtml && /^html-live[ \t]*\n/.test(segs[i])) {
           out += window.AgentdeckLiveHtml.frame(body);
+          continue;
+        }
+        if (diagrams && window.AgentdeckLiveHtml && /^mermaid[ \t]*\n/.test(segs[i])) {
+          out += window.AgentdeckLiveHtml.mermaid(body, notes, false, mdLegendColours(text)) +
+            '<div class="md-diagram-bar"><a href="?bare=1">Full screen</a></div>';
           continue;
         }
         out += '<div class="md-code"><pre><code>' +
@@ -899,6 +933,18 @@
         event.preventDefault();
       }
     });
+    // The chat composer has no `required` box, because a follow-up may be only an
+    // image or a file (#3790). Nothing typed and nothing attached sends nothing.
+    document.addEventListener('submit', function (event) {
+      var form = event.target;
+      if (!form.matches || !form.matches('form.inject-form')) return;
+      var input = messageInput(form);
+      var files = form.querySelector('input[type="file"][name="images"]');
+      if (input && !input.value.trim() && !(files && files.files && files.files.length)) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+      }
+    }, true);
     // One send at a time per composer. The emptied box would otherwise take a
     // second Enter while the first send is in flight, and htmx would queue it
     // under the first send's action ID and optimistic row (#2843).

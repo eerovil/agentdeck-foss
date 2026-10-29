@@ -1324,8 +1324,26 @@ async def test_the_api_registers_lists_and_cancels_a_wait(tmp_path):
             json={"pull_request": "eerovil/agentdeck#9", "note": "no verdict", "no_verdict": True},
         )
         after_busy = await client.get(f"/api/sessions/{key}/wake-on")
-        app.state.work_router = SimpleNamespace(enabled=True, ask_again=ask_again)
+        accepts = []
+
+        async def accept(repository, number, note):
+            accepts.append((repository, number, note))
+            if number != 9:
+                raise AgainRefused("never sent for review")
+            return {"pull_request": f"{repository}#{number}", "outcome": "review pass recorded"}
+
+        app.state.work_router = SimpleNamespace(enabled=True, ask_again=ask_again, accept=accept)
         app.state.app_state.add_pull_request(key, PullRequestRef.parse("eerovil/agentdeck#9"))
+        # #3828: the owner's acceptance passes the head with no review and no wait.
+        accepted = await client.post(
+            f"/api/sessions/{key}/review-accepted",
+            json={"pull_request": "eerovil/agentdeck#9", "note": " accept as is "},
+        )
+        blank_accept = await client.post(
+            f"/api/sessions/{key}/review-accepted",
+            json={"pull_request": "eerovil/agentdeck#9", "note": " "},
+        )
+        after_accept = await client.get(f"/api/sessions/{key}/wake-on")
         again = await client.post(
             f"/api/sessions/{key}/review-request",
             json={
@@ -1362,6 +1380,11 @@ async def test_the_api_registers_lists_and_cancels_a_wait(tmp_path):
     assert [item["kind"] for item in after_cap.json()["waits"]] == ["pull_request"]
     assert busy.status_code == 200 and busy.json()["outcome"] == "already asked", busy.text
     assert [item["kind"] for item in after_busy.json()["waits"]] == ["pull_request", "review"]
+    assert accepted.status_code == 200, accepted.text
+    assert accepted.json()["outcome"] == "review pass recorded"
+    assert blank_accept.status_code == 422 and "decision" in blank_accept.text
+    assert accepts == [("eerovil/agentdeck", 9, "accept as is")]
+    assert [item["kind"] for item in after_accept.json()["waits"]] == ["pull_request", "review"]
     assert again.status_code == 200, again.text
     assert asks == [("eerovil/agentdeck", 9, "no verdict", True)]
     assert again.json()["registered"]["kind"] == "review"

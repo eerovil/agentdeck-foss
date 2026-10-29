@@ -5,16 +5,15 @@
 <span class="speech-control"{% if host_speech %} data-host-speech{% endif %}>
   <button type="button" class="speech-button" data-speech-button aria-pressed="false"
           {%- if voice_mic %} data-voice-mic{% endif %}
-          aria-label="Dictate" title="Dictate">🎤</button>
+          {%- if voice_mic %} aria-label="Listen" title="Tap to talk · hold for Jarvis, Always or Off"{% else %} aria-label="Dictate" title="Dictate"{% endif %}>🎤</button>
   <span class="speech-status" role="status" hidden></span>
   {%- if voice_mic %}
-  {#- How 🎤 listens in the chat composer (#3540): a long press opens this; voice_mode.js
+  {#- How 🎤 listens in the chat composer (#3787): a long press opens this; voice_mode.js
       marks the current choice. Closed by default, it takes no room. #}
   <span class="voice-mic-menu" data-voice-mic-menu role="menu" aria-label="How 🎤 listens" hidden>
-    <button type="button" role="menuitemradio" data-voice-mic-mode="open">Always listening</button>
-    <button type="button" role="menuitemradio" data-voice-mic-mode="jarvis">Only after “Hey Jarvis”</button>
-    <button type="button" role="menuitemradio" data-voice-mic-mode="tap">Tap to talk</button>
-    <button type="button" role="menuitemradio" data-voice-mic-mode="dictate">Dictate</button>
+    <button type="button" role="menuitemradio" data-voice-mic-mode="jarvis">Jarvis</button>
+    <button type="button" role="menuitemradio" data-voice-mic-mode="open">Always</button>
+    <button type="button" role="menuitemradio" data-voice-mic-mode="off">Off</button>
   </span>
   {%- endif %}
 </span>

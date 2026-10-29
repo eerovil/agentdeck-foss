@@ -252,12 +252,14 @@ def _app(tmp_path, *, issues=(STORE_ISSUE,)):
     return app
 
 
-async def _send(app, data, *, action_id=ACTION):
+async def _send(app, data, *, action_id=ACTION, files=None):
     headers = {"origin": "http://test"}
     if action_id:
         headers["x-agentdeck-action-id"] = action_id
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        return await client.post(f"/sessions/{SESSION}/inject", data=data, headers=headers)
+        return await client.post(
+            f"/sessions/{SESSION}/inject", data=data, files=files, headers=headers
+        )
 
 
 @pytest.mark.anyio
@@ -294,6 +296,8 @@ async def test_an_unticked_message_posts_nothing(tmp_path, gh):
         ({"message": "/secret TOKEN abc"}, ACTION, 422, "A secret is never posted"),
         ({"message": "hi"}, None, 422, "needs the page's action id"),
         ({"message": "hi", "post_to_issue": "org/store#6"}, ACTION, 409, "issue changed"),
+        # Only an image: the agent's stand-in line is not the person's words (#3790).
+        ({"message": ""}, ACTION, 422, "Nothing to post"),
     ],
 )
 async def test_a_ticked_send_that_cannot_post_is_refused_before_anything_is_sent(
@@ -303,7 +307,10 @@ async def test_a_ticked_send_that_cannot_post_is_refused_before_anything_is_sent
     app = _app(tmp_path)
     data = {"post_to_issue": "org/store#5", **data}
 
-    refused = await _send(app, data, action_id=action_id)
+    image = {"images": ("shot.png", b"\x89PNG\r\n\x1a\nsmall", "image/png")}
+    refused = await _send(
+        app, data, action_id=action_id, files=None if data["message"] else image
+    )
 
     assert refused.status_code == status
     assert words in refused.json()["detail"]

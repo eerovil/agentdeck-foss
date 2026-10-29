@@ -11,7 +11,6 @@ import pytest
 
 from agentdeck import work_release
 from agentdeck.work_release import (
-    DIFF_TOO_LARGE,
     MERGED,
     Policy,
     Ports,
@@ -423,25 +422,6 @@ async def test_an_unreadable_digest_keeps_the_first_in_line(deck):
     deck.retest(2)
     await deck.service.on_tests()
     assert deck.merged == [pull(101), pull(102)]
-
-
-async def test_a_diff_too_large_to_read_loses_the_pass_and_the_place(deck):
-    """#3029: GitHub never serves it, so waiting for it would hold the line for good."""
-    await deck.review_all()
-    readable = deck.digest
-    # Work 2's agent pushed a change too large to diff while first in line.
-    ref = pull(102)
-    deck.pulls[ref] = Pull(**{**deck.pulls[ref].__dict__, "head": "f0" * 20})
-    deck.retest(2)
-
-    async def too_large(ref, head):
-        return DIFF_TOO_LARGE if ref == pull(102) else await readable(ref, head)
-
-    deck.service.ports.digest = too_large
-    answer = await deck.service.evaluate(work(2))
-    assert "has no review pass" in answer
-    assert deck.line() == [pull(103)]
-    assert deck.updated == [pull(102), pull(103)], "the next in line goes"
 
 
 async def test_an_update_that_never_lands_is_asked_again_then_leaves_the_line(deck):

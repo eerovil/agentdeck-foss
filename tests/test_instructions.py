@@ -46,6 +46,8 @@ def test_primary_session_guide_covers_agentdeck_action_contracts():
     # Wayfinder's decision habits, for every agent (#3690).
     assert "the last is **None of these**" in flat
     assert "`Changes assumed: <detail> — <why>`" in flat
+    # #3845: a review finding on an assumed detail is the agent's to settle.
+    assert "is yours to settle, not the person's" in flat
     assert "act on it only once the person keeps it" in flat
     assert "assistant response" in guide and "tool output" in guide
     assert "raw-restart the persistent AgentDeck runtime" in guide
@@ -460,6 +462,12 @@ def test_work_session_guide_says_what_the_deck_reads_and_names_no_poller():
         assert "--verification --session-token" in flat
         # The Work page's summary (#3093): nothing but the Work agent writes it.
         assert "/work-resolution` with JSON `problem`" in flat
+        # Every Work keeps a diagram (#3827): an old one is edited, a chore draws none.
+        assert "First list `docs/diagrams/` on your branch" in flat
+        assert "however small the change" in flat
+        assert "the Work page's Diagram button opens your live page" in flat
+        # ... and shown on the issue in one comment, edited in place.
+        assert "`<!-- agentdeck-diagram -->`" in flat and "never post a second one" in flat
         # Screenshots go on the issue, pinned to their commit (#3098), as the Poller's did.
         assert "post them in one comment on the issue" in flat
         assert "(a prototype is not one)" in flat

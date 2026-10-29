@@ -79,30 +79,31 @@ START = "start"
 
 LINKS = {ANSWER: "Answer", OPEN: "Open", INSPECT: "Inspect", REVIEW: "Review"}
 
-# The front page's Needs you groups, in the order a Work moves through them (#3578, replacing
-# #2254's): not started, a question, a stopped Run, a review, its release, then clean-up. Each
-# has a glyph so the category never rests on colour alone.
+# The front page's Needs you groups, most needing the owner first (#3818, replacing #3578's
+# order of a Work's life): a question, a merge or review, a stopped Run, then the quick
+# tidy-ups below Working now. Each has a glyph so the category never rests on colour alone.
 FRONT_ORDER = (
-    UNSTARTED,
     NEEDS_ANSWER,
-    NEEDS_RETRY,
-    WORK_ERROR,
+    READY_FOR_MERGE,
     NEEDS_REVIEW,
     RELEASE_BLOCKED,
-    READY_FOR_MERGE,
+    NEEDS_RETRY,
+    WORK_ERROR,
     ISSUE_CLOSED,
+    UNSTARTED,
 )
-# Where each group sits among the front page's other groups (#3578), one keyed part each:
-# ``start`` above Working now, ``stuck`` between it and Waiting, ``release`` after Waiting and
-# before Live checking, ``cleanup`` after that. A category not named here is clean-up.
+# Where each group sits among the front page's other groups (#3818), one keyed part each, the
+# page's order being ``start``, ``release``, ``stuck``, Working now, ``cleanup``, then Waiting,
+# Live checking, Recently finished and Paused. A category not named here is clean-up.
 FRONT_PLACES = {
-    UNSTARTED: "start",
     NEEDS_ANSWER: "start",
     NEEDS_RETRY: "stuck",
     WORK_ERROR: "stuck",
     NEEDS_REVIEW: "release",
     RELEASE_BLOCKED: "release",
     READY_FOR_MERGE: "release",
+    ISSUE_CLOSED: "cleanup",
+    UNSTARTED: "cleanup",
 }
 GLYPHS = {
     READY_FOR_MERGE: "↑",

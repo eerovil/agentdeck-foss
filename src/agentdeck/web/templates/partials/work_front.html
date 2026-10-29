@@ -1,6 +1,6 @@
-{# The Work-first front page's live parts (#2219), in the order a Work moves through them
-   (#3578, replacing #2254's): `needs` (Not started, Needs answer), `active`, `stuck`, `waiting`,
-   `release`, `live`, `cleanup`, `finished`, `paused`, `stopped`. `part` picks one. The
+{# The Work-first front page's live parts (#2219), most needing the owner first (#3818,
+   replacing #3578's): `needs` (Needs answer), `release`, `stuck`, `active`, `cleanup` (Issue
+   closed, Not started), `waiting`, `live`, `finished`, `paused`, `stopped`. `part` picks one. The
    Work lists are keyed rows that `work_list.js`
    swaps by `data-work-id` and `data-work-rev`, so an unchanged row keeps focus; each part
    draws its own header, so its count moves with the push that changed it. `summary` is the

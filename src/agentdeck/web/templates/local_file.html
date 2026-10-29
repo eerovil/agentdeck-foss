@@ -21,7 +21,7 @@
   <div id="local-markdown" class="local-markdown"></div>
   <script>
   document.addEventListener('DOMContentLoaded', function () {
-    document.getElementById('local-markdown').innerHTML = mdToHtml({{ content | tojson }});
+    document.getElementById('local-markdown').innerHTML = mdToHtml({{ content | tojson }}, null, false, true);
   });
   </script>
   {% else %}

@@ -256,6 +256,37 @@
     applyHeight();
   }
 
+  // While the phone keyboard is up, the chat's pills and the Work's buttons step out so the
+  // space left above it shows the chat (#3810). The keyboard is up when the message box has
+  // focus and the visible screen is clearly shorter than the tallest seen at this width.
+  // Focus alone is not enough: Android's back or down key closes the keyboard and keeps
+  // focus. The page's own height is no yardstick either: the installed app shrinks it with
+  // the keyboard.
+  var KEYBOARD_PX = 150;
+  var tallest = 0;
+  var tallestWidth = 0;
+  function checkKeyboard() {
+    if (window.innerWidth !== tallestWidth) { tallestWidth = window.innerWidth; tallest = 0; }
+    var height = viewport ? viewport.height * viewport.scale : window.innerHeight;
+    if (height > tallest) tallest = height;
+    var box = document.getElementById('inject-message');
+    var up = !!(mobile.matches && box && document.activeElement === box &&
+      height < tallest - KEYBOARD_PX);
+    if (up === detail.classList.contains('keyboard-up')) return;
+    detail.classList.toggle('keyboard-up', up);
+    // The chat pane is the scroll box on a phone: keep its newest message in view as the
+    // pills leave or come back.
+    requestAnimationFrame(function () { detail.scrollTop = detail.scrollHeight; });
+  }
+  if (viewport) viewport.addEventListener('resize', checkKeyboard, {signal: signal});
+  window.addEventListener('resize', checkKeyboard, {signal: signal});
+  document.addEventListener('focusin', checkKeyboard, {signal: signal});
+  document.addEventListener('focusout', checkKeyboard, {signal: signal});
+  if (mobile.addEventListener) {
+    mobile.addEventListener('change', checkKeyboard, {signal: signal});
+  }
+  checkKeyboard();
+
   initialize();
   if (mobile.addEventListener) {
     mobile.addEventListener('change', initialize, {signal: signal});

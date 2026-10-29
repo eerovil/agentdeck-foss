@@ -26,6 +26,7 @@ from urllib.parse import quote
 
 from .agent_review import is_reviewer_prompt
 from .chat_cwd import cannot_resume
+from .issue_context import identity
 from .models import BACKGROUND_TASK_ACTIVITY, IssueRef
 from .poller_engine.schedules import LABEL as SCHEDULE_LABEL
 from .triage import KIND_FINISHED
@@ -560,29 +561,6 @@ def _same_commit(one: str, other: str) -> bool:
     return len(one) >= 7 and len(other) >= 7 and (one.startswith(other) or other.startswith(one))
 
 
-def verification_covers(
-    verification: VerificationSummary | None, outputs: Sequence[OutputFact]
-) -> bool:
-    """Green verification covers every open pull request's current head (#2364).
-
-    A pull request is covered by a green verification job that tested that commit, whichever
-    Run submitted it. What never covers a head is a job on another commit, one still running,
-    a red one, or none at all.
-    """
-    opened = [output for output in outputs if not output.settled]
-    if not opened:
-        return False
-    green = verification is not None and verification.status in {"verified", "stale", "earlier"}
-    tested = [(name.casefold(), head) for name, head in verification.tested] if green else []
-    return all(
-        any(
-            name == output.repository.casefold() and _same_commit(head, output.head)
-            for name, head in tested
-        )
-        for output in opened
-    )
-
-
 def build_work_card(
     ref: WorkRef,
     *,
@@ -848,6 +826,96 @@ def unstarted_issues(
                 continue
             found[WorkRef.from_issue(IssueRef(entry.repository, issue.number))] = opened
     return found
+
+
+@dataclass(frozen=True)
+class OtherDeckWork:
+    """An issue another deck works, shown on this one read only (#3834).
+
+    ``assignee`` is the first assignee's login, lowercased ("" for nobody); ``started`` says
+    an agent label is on it, so the other deck's agent works it; ``pull`` is the cached open
+    pull request belonging to it, if any; ``start_label`` is the label Take over adds when
+    none is on.
+    """
+
+    ref: WorkRef
+    title: str
+    url: str
+    assignee: str
+    started: bool
+    labels: tuple[str, ...]
+    start_label: str
+    pull: Mapping[str, Any] | None = None
+    updated: datetime | None = None
+    # Every assignee, lowercased: Take over removes them all, or a second one could stay
+    # ahead of this deck's person.
+    assignees: tuple[str, ...] = ()
+
+    @property
+    def work_id(self) -> str:
+        return self.ref.work_id
+
+    @property
+    def href(self) -> str:
+        return work_href(self.ref.work_id)
+
+
+def other_deck_works(
+    backlog: Any,
+    *,
+    now: datetime,
+    mine: Callable[[str, str], bool] | None,
+) -> tuple[OtherDeckWork, ...]:
+    """Open issues in a Poller repository that another deck works, newest first (#3834).
+
+    The issues ``unstarted_issues`` leaves out because ``mine`` says they are another
+    deck's (``work_claims``): every one carrying an agent label, and the ones no agent has
+    started yet that were opened within ``UNSTARTED_WINDOW``, the same window as Not
+    started. A schedule definition is never one. With no deck person named, ``mine`` says
+    every issue is this deck's, so the list is empty. Read from the backlog's cached lists
+    only, with the same freshness rule, so nothing new is asked of GitHub.
+    """
+    if backlog is None or mine is None:
+        return ()
+    horizon = getattr(backlog, "CLOSURE_HORIZON_S", 3600.0)
+    pulls_by_issue = backlog.pulls_for_work() if hasattr(backlog, "pulls_for_work") else {}
+    found: list[OtherDeckWork] = []
+    for entry in getattr(backlog, "repositories", ()) or ():
+        if not entry.present or entry.age_s is None or entry.age_s > horizon:
+            continue
+        owned = list(backlog.board.ownership_labels(entry.repository))
+        if not owned:
+            continue
+        folded = {label.casefold() for label in owned}
+        for issue in entry.issues:
+            assignee = (issue.assignees or ("",))[0].strip().lower()
+            if not issue.is_open or issue.has_label(SCHEDULE_LABEL):
+                continue
+            if mine(entry.repository, assignee):
+                continue
+            started = any(label.casefold() in folded for label in issue.labels)
+            opened = _stamp(issue.created_at)
+            if not started and (opened is None or now - opened > UNSTARTED_WINDOW):
+                continue
+            pulls = pulls_by_issue.get(identity(entry.repository, issue.number)) or ()
+            found.append(
+                OtherDeckWork(
+                    ref=WorkRef.from_issue(IssueRef(entry.repository, issue.number)),
+                    title=issue.title,
+                    url=issue.url,
+                    assignee=assignee,
+                    started=started,
+                    labels=tuple(issue.labels),
+                    start_label=owned[0],
+                    pull=pulls[0] if pulls else None,
+                    updated=_stamp(issue.updated_at) or opened,
+                    assignees=tuple(
+                        login.strip().lower() for login in issue.assignees if login.strip()
+                    ),
+                )
+            )
+    floor = datetime.min.replace(tzinfo=UTC)
+    return tuple(sorted(found, key=lambda item: item.updated or floor, reverse=True))
 
 
 def _waiting(insight: Any) -> bool:

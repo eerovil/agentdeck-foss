@@ -15,6 +15,20 @@
     the page then sent to this chat, newest first. "Sent" is saved when the page presses
     Send; a send that then failed still shows here.</p>
   {% for phrase in phrases %}
+  {% if phrase.narrated is defined %}
+  {# The agent was quiet, so the helper said what it was doing (#3799). #}
+  <section class="voice-log-phrase voice-log-narrated" data-outcome="{{ phrase.outcome }}">
+    <div class="voice-log-when">{{ phrase.when }} · {{ phrase.ms }} ms · agent quiet {{ phrase.quiet }} s
+      {%- if phrase.fresh %} · new helper{% endif %}
+      {%- if phrase.outcome != answered %} · <strong>{{ phrase.outcome }}</strong>{% endif %}</div>
+    <details class="voice-log-reply"><summary>What the agent did</summary>
+      <pre>{{ phrase.narrated | join("\n") }}</pre></details>
+    <p><span class="voice-log-label">Proposed</span>
+      {%- if phrase.say %} {{ phrase.say }}{% else %} <em>nothing</em>{% endif %}</p>
+    <p><span class="voice-log-label">Spoken</span>
+      {%- if phrase.spoken %} {{ phrase.spoken }}{% else %} <em>nothing</em>{% endif %}</p>
+  </section>
+  {% else %}
   <section class="voice-log-phrase" data-outcome="{{ phrase.outcome }}">
     <div class="voice-log-when">{{ phrase.when }} · {{ phrase.ms }} ms
       {%- if phrase.fresh %} · new helper{% endif %}
@@ -25,7 +39,12 @@
     <p class="voice-log-aloud">🔊 {{ line }}</p>
     {% endfor %}
     <p><span class="voice-log-label">Heard</span> {{ phrase.heard }}</p>
-    {% if phrase.say %}<p><span class="voice-log-label">Said</span> {{ phrase.say }}</p>{% endif %}
+    {% if phrase.held %}
+    {# The page holds its line until the chat stays quiet (#3799): often never said. #}
+    {% if phrase.say %}<p><span class="voice-log-label">Proposed</span> {{ phrase.say }}</p>{% endif %}
+    <p><span class="voice-log-label">Spoken</span>
+      {%- if phrase.spoken %} {{ phrase.spoken }}{% else %} <em>nothing: the chat spoke first, or it was not needed</em>{% endif %}</p>
+    {% elif phrase.say %}<p><span class="voice-log-label">Said</span> {{ phrase.say }}</p>{% endif %}
     {% if phrase.outcome == answered %}
     <p><span class="voice-log-label">Fixed</span>
       {%- if phrase.relay is none %} <em>nothing: taken as not meant for the chat</em>
@@ -42,6 +61,7 @@
       <pre>{{ phrase.reply }}</pre></details>
     {% endif %}
   </section>
+  {% endif %}
   {% else %}
   <p class="voice-log-empty">Nothing saved yet. Phrases heard in voice mode show here.</p>
   {% endfor %}

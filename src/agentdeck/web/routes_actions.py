@@ -370,7 +370,8 @@ def _issue_post_target(request: Request, session, form, message: str, secret_com
         raise _issue_post_refusal(
             uploads, 422, "Posting to the issue needs the page's action id; reload and send again."
         )
-    if not display_message(message).strip():
+    # The person's own words: an attachment-only stand-in is not something to post.
+    if not _typed_text(form) or not display_message(message).strip():
         raise _issue_post_refusal(uploads, 422, "Nothing to post: the message has no text.")
     state = get_state(request)
     expected = getattr(request.state, "issue_post_work", None)
@@ -502,7 +503,26 @@ def _message_with_files(message: str, files: tuple[UploadedFile, ...]) -> str:
     )
 
 
-async def _turn_form(request: Request) -> tuple[str, SavedUploads, FormData]:
+def _attachment_only_text(uploads: SavedUploads) -> str:
+    """The line an agent gets for a message that is only attachments (#3790).
+
+    Claude refuses an empty text block, and every queue and delivery path refuses an
+    empty message, so the person's empty box becomes this line rather than nothing.
+    """
+    count = len(uploads.paths)
+    noun = "image" if not uploads.files else "file"
+    return f"See the attached {noun}{'s' if count > 1 else ''}."
+
+
+def _typed_text(form: FormData) -> str:
+    """The person's own words, before any attachment-only stand-in."""
+    raw = form.get("message")
+    return raw.strip() if isinstance(raw, str) else ""
+
+
+async def _turn_form(
+    request: Request, *, attachments_alone: bool = False
+) -> tuple[str, SavedUploads, FormData]:
     content_type = request.headers.get("content-type", "").lower()
     if not content_type.startswith(("application/x-www-form-urlencoded", "multipart/form-data")):
         raise HTTPException(status_code=415, detail="form content type required")
@@ -518,9 +538,9 @@ async def _turn_form(request: Request) -> tuple[str, SavedUploads, FormData]:
             max_fields=32,
             max_part_size=config.max_image_bytes,
         )
-    raw = form.get("message")
-    message = raw.strip() if isinstance(raw, str) else ""
-    if not message or config.too_long(message):
+    message = _typed_text(form)
+    # A follow-up may be only an image or a file (#3790); a first message never is.
+    if (not message and not attachments_alone) or config.too_long(message):
         raise HTTPException(status_code=422, detail="invalid message")
     if ATTACHMENT_MARKER in message:
         raise HTTPException(status_code=422, detail="message contains reserved attachment text")
@@ -533,6 +553,10 @@ async def _turn_form(request: Request) -> tuple[str, SavedUploads, FormData]:
             uploads = await save_uploaded_files(form, config, action_id=action_id)
     except UploadError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from None
+    if not message:
+        if not uploads.paths:
+            raise HTTPException(status_code=422, detail="invalid message")
+        message = _attachment_only_text(uploads)
     message = _message_with_files(message, uploads.files)
     return message, uploads, form
 
@@ -869,7 +893,7 @@ async def inject_message(request: Request, session_key: str) -> HTMLResponse:
                 status_code=403, detail="message injection unavailable"
             )
     queued_behind_turn = session.thinking or injector.can_queue(session.key)
-    message, uploads, form = await _turn_form(request)
+    message, uploads, form = await _turn_form(request, attachments_alone=True)
     images = list(uploads.images)
     files = [upload.path for upload in uploads.files]
     secret_command = _secret_command_or_422(message, uploads.paths)
@@ -1226,7 +1250,7 @@ async def steer_turn(request: Request, session_key: str) -> HTMLResponse:
     config = get_config(request).inject
     if not config.enabled:
         raise HTTPException(status_code=403, detail="active-turn steering unavailable")
-    message, uploads, form = await _turn_form(request)
+    message, uploads, form = await _turn_form(request, attachments_alone=True)
     images = list(uploads.images)
     files = [upload.path for upload in uploads.files]
     _reject_reserved_secret_command(message, uploads)

@@ -639,6 +639,22 @@ async def starting_chat(request: Request, token: str) -> RedirectResponse:
     return RedirectResponse(destination, status_code=303)
 
 
+def _live_page_links(request: Request, session_key: str, repository: str = "") -> dict:
+    """The chat's ▶ Live prototype and ◇ Diagram chips (#3827): one live page holds both.
+    The Diagram chip follows the Work page's button (``live_prototype.diagram_link``): the
+    live page while the file is there, then the merged copy."""
+    record = live_prototype.read(get_state(request).chat_identity_key(session_key)) or {}
+    page = live_prototype.page_url(session_key)
+    has_diagram = bool(record.get("diagram"))
+    link = live_prototype.diagram_link(record, session_key, repository)
+    return {
+        # A page that holds only a diagram has no prototype to open.
+        "live_prototype_url": page if record and (record.get("url") or not has_diagram) else None,
+        "live_diagram_url": link[1] if link else None,
+        "live_diagram_external": bool(link and link[2]),
+    }
+
+
 async def _render_session_detail(
     request: Request,
     session_key: str,
@@ -875,10 +891,8 @@ async def _render_session_detail(
             "voice_log_saved": voice_helper.has_saved(
                 get_state(request).chat_session_keys(session.key)
             ),
-            "live_prototype_url": (
-                live_prototype.meeting_url(session.key)
-                if live_prototype.read(get_state(request).chat_identity_key(session.key))
-                else None
+            **_live_page_links(
+                request, session.key, git_context.repository if git_context else ""
             ),
             "new_work": new_work_form(
                 request,

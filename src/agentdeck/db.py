@@ -33,7 +33,6 @@ from .models import (
     IssueRef,
     PollerReviewVerdict,
     PullRequestRef,
-    SeenSession,
     Session,
     UsageSnapshot,
 )
@@ -1754,101 +1753,6 @@ class Db:
             ),
         )
 
-    def mark_session_kind(self, session_key: str, kind: str) -> None:
-        """Record what one already-known session is, without touching the rest.
-
-        The transcript indexer's way of saying "this row is a subagent's" about
-        a chat the live scans stopped reporting long ago (#2055). Rows the scan
-        never revisits would otherwise keep the NULL kind they were written with,
-        and a search would still offer them. It updates only — a session with no
-        ledger row has nothing to hide from a search.
-        """
-        self._write(
-            "UPDATE sessions_seen SET kind = ? WHERE session_key = ?",
-            (kind, session_key),
-        )
-
-    _SEEN_COLUMNS = (
-        "session_key, account_key, title, cwd, first_seen, last_seen, kind"
-    )
-
-    def _seen_row(self, row: tuple) -> SeenSession:
-        return SeenSession(
-            session_key=str(row[0]),
-            account_key=str(row[1]) if row[1] else None,
-            title=str(row[2]) if row[2] else None,
-            cwd=str(row[3]) if row[3] else None,
-            first_seen=_parse_dt(row[4]),
-            last_seen=_parse_dt(row[5]),
-            kind=str(row[6]) if row[6] else None,
-        )
-
-    def search_sessions_seen(
-        self, query: str, limit: int = 200
-    ) -> tuple[SeenSession, ...]:
-        """Chats whose title, directory or key contains every word of ``query``.
-
-        This is the shallow half of deep search (#2034), and its reach is the
-        point: ``sessions_seen`` holds every session the deck has ever observed,
-        including the ones the 200-per-account scan cap and the paged list keep
-        off the deck entirely. Words are ANDed so a second word narrows rather
-        than widens, and each is matched with LIKE — the ledger is thousands of
-        short rows, so a substring scan over it is a millisecond and needs no
-        index of its own.
-
-        Subagents are left out (#2055). They are a chat's internal legs, not
-        chats a person went looking for, and they outnumber the answer badly: a
-        Task-tool subagent carries its parent's directory and a title of its own,
-        so a search for a project matched every leg it ever spawned. A row whose
-        kind is NULL predates the column and is still shown — the live scan and
-        the transcript indexer are what fill it in.
-        """
-        words = [word for word in query.split() if word]
-        if not words:
-            return ()
-        clauses = []
-        params: list[object] = []
-        # Every word, not a prefix of them. Dropping the tail silently returned a
-        # chat that matched only the words that survived, which reads as a match
-        # for the whole phrase — a false positive the caller cannot detect. The
-        # route already bounds the query length, so the clause count is bounded
-        # with it.
-        for word in words:
-            clauses.append(
-                "(COALESCE(title, '') LIKE ? ESCAPE '\\'"
-                " OR COALESCE(cwd, '') LIKE ? ESCAPE '\\'"
-                " OR session_key LIKE ? ESCAPE '\\')"
-            )
-            like = f"%{_escape_like(word)}%"
-            params.extend([like, like, like])
-        params.append(limit)
-        try:
-            with self._lock:
-                rows = self._conn.execute(
-                    f"SELECT {self._SEEN_COLUMNS} FROM sessions_seen"
-                    f" WHERE {' AND '.join(clauses)}"
-                    " AND COALESCE(kind, '') <> 'subagent'"
-                    " ORDER BY last_seen DESC LIMIT ?",
-                    tuple(params),
-                ).fetchall()
-        except sqlite3.Error as exc:
-            log.warning("sessions_seen search failed: %s", exc)
-            return ()
-        return tuple(self._seen_row(row) for row in rows)
-
-    def seen_session(self, session_key: str) -> SeenSession | None:
-        """The ledger row for one session, for a hit found by another index."""
-        try:
-            with self._lock:
-                row = self._conn.execute(
-                    f"SELECT {self._SEEN_COLUMNS} FROM sessions_seen"
-                    " WHERE session_key = ?",
-                    (session_key,),
-                ).fetchone()
-        except sqlite3.Error:
-            return None
-        return self._seen_row(row) if row is not None else None
-
     # --- durable chat identity ---------------------------------------
 
     # Chat identity is read once per session per pass, by three separate hot
@@ -2160,17 +2064,6 @@ class Db:
         target = str(rows[0][0]) if rows[0][0] is not None else None
         return target, _parse_dt(rows[0][1]) or datetime.now(UTC)
 
-    def chat_predecessor(self, target_session_key: str) -> str | None:
-        """The leg this chat was continued from, or None when it was not a Continue.
-
-        A store that cannot be read raises rather than answering "not a Continue".
-        """
-        rows = self._query_or_raise(
-            "SELECT source_session_key FROM chat_successors WHERE target_session_key = ?",
-            (target_session_key,),
-        )
-        return str(rows[0][0]) if rows else None
-
     def chat_run_binding(
         self, session_key: str, *, max_legs: int
     ) -> SessionRunBinding | None:
@@ -2208,28 +2101,6 @@ class Db:
                 return None
             leg = str(predecessor[0])
         raise LookupError(f"{session_key} has more than {max_legs} continued legs")
-
-    def continuations_reserved_since(
-        self, work_id: str, since: datetime, *, max_legs: int, excluding: str | None = None
-    ) -> list[str]:
-        """Chats of this Work a Continue reserved a successor for at or after ``since``.
-
-        A Run's admission asks this after freezing its route: a Continue that reserved in
-        between its first look and the freeze is one it never saw (#2862). ``excluding`` is
-        the asking delivery's own token: a follow-up that continues the Run's chat reserves
-        that chat's successor itself, and is not its own rival. Raises when it cannot tell.
-        """
-        rows = self._query_or_raise(
-            "SELECT source_session_key FROM chat_successors"
-            " WHERE reserved_at >= ? AND token IS NOT ?",
-            (since.astimezone(UTC).isoformat(), excluding),
-        )
-        found = []
-        for (source,) in rows:
-            binding = self.chat_run_binding(str(source), max_legs=max_legs)
-            if binding is not None and binding.work_id == work_id:
-                found.append(str(source))
-        return found
 
     def release_chat_successor(self, token: str) -> None:
         self._write(
@@ -2811,27 +2682,6 @@ class Db:
             raise RoutingStoreError(str(exc)) from exc
         return [DeliveryRoute(*(str(value) for value in row)) for row in rows]
 
-    def delivery_route(self, delivery_id: str) -> DeliveryRoute | None:
-        rows = self._route_rows(
-            f"SELECT {self._ROUTE_COLUMNS} FROM delivery_routes WHERE delivery_id = ?",
-            (delivery_id,),
-        )
-        return rows[0] if rows else None
-
-    def latest_delivery_route(
-        self, work_id: str, *, run_id: str | None = None
-    ) -> DeliveryRoute | None:
-        """The newest route decided for this Work (or this Run of it)."""
-        where, params = "work_id = ?", (work_id,)
-        if run_id is not None:
-            where, params = "work_id = ? AND run_id = ?", (work_id, run_id)
-        rows = self._route_rows(
-            f"SELECT {self._ROUTE_COLUMNS} FROM delivery_routes WHERE {where}"
-            " ORDER BY decided_at DESC, rowid DESC LIMIT 1",
-            params,
-        )
-        return rows[0] if rows else None
-
     def latest_delivery_routes_by_run(self, work_id: str) -> list[DeliveryRoute]:
         """The newest route of every Run of this Work, newest Run first (#2159)."""
         rows = self._route_rows(
@@ -2851,9 +2701,6 @@ class Db:
             " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             tuple(route),
         )
-
-    def release_delivery_route(self, delivery_id: str) -> bool:
-        return self._write("DELETE FROM delivery_routes WHERE delivery_id = ?", (delivery_id,))
 
     def latest_session_run(self, session_ref: str) -> SessionRunBinding | None:
         """The Run this session most recently joined, by full key or raw provider id.

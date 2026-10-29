@@ -1,0 +1,17 @@
+[Unit]
+Description=agentdeck voice mode wake word detector (#3476)
+# Starts at login (or on demand by agentdeck-wake.socket) and stays up: by the
+# owner's decision on #3793, "Hey Jarvis" works at once even after a long break,
+# rather than waiting for a cold start. CPU only, about 0.5 GB of memory.
+Requires=agentdeck-wake.socket
+
+[Service]
+ExecStart=%h/.local/share/agentdeck/speech-venv/bin/python %h/agentdeck/scripts/wake_server.py --idle-exit 0
+# Heard live, like the speech service: keep it ahead of test suites for the CPU.
+CPUWeight=500
+# A crash restarts it, so the next wake does not wait for a cold start.
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

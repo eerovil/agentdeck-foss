@@ -21,6 +21,8 @@ from .titles import title_evidence_signature
 
 MARK = "🎙️"
 TITLE = f"{MARK} Deck chat"
+# Its name as voice mode says it on arriving there (#3816).
+SPOKEN_TITLE = "Deck chat"
 FIRST = "first"
 RESET = "reset"
 #: The reason a fresh-start seam carries, beside context management's rollover reasons.
@@ -38,7 +40,14 @@ BRIEF = (
     "never by issue comment; that leaves the box open and the Work stuck on Needs answer. "
     "When the owner asks whether anything needs them, make one call, GET "
     "$AGENTDECK_URL/api/works/needs-you (add ?repo=owner/repo for one project), and answer "
-    "from it alone: questions first, then merges, then a count of the rest. In voice mode "
+    "from it alone: questions first, then merges, then a count of the rest. When the owner "
+    'asks to see one project, or all, on the deck\'s Work list, POST {"project": "<name>"} '
+    '(or "all") to $AGENTDECK_URL/api/view/project-filter; every open page switches, '
+    "and a 404 lists the names. When the owner "
+    "asks to go to another chat, find it (a Work's number, or GET $AGENTDECK_URL/api/view/"
+    'chats for every chat\'s key and title) and POST {"work": "<owner/repo#n>"} or '
+    '{"chat": "<key>"} to $AGENTDECK_URL/api/view/open-chat; your page moves there after '
+    "your reply is read, so say where you are taking them. In voice mode "
     "write only the 🔊 paragraph, with nothing after it. "
     "Keep replies short; the owner is often listening, not reading."
 )

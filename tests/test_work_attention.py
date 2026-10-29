@@ -357,18 +357,18 @@ def test_needs_you_is_grouped_by_category_in_the_front_pages_order():
     works = (closed, answer, retry, ready)
     front = front_sections([front_row(work, current=True) for work in works])
 
-    # In the order a Work moves through them (#3578), each at its place in the page's flow.
+    # Most needing the owner first (#3818), each at its place in the page's flow.
     assert [group.category for group in front.groups] == [
         NEEDS_ANSWER,
-        NEEDS_RETRY,
         READY_FOR_MERGE,
+        NEEDS_RETRY,
         ISSUE_CLOSED,
     ]
-    assert [group.glyph for group in front.groups] == ["?", "↻", "↑", "☐"]
+    assert [group.glyph for group in front.groups] == ["?", "↑", "↻", "☐"]
     assert [
         [group.category for group in front.groups_in(place)]
-        for place in ("start", "stuck", "release", "cleanup")
-    ] == [[NEEDS_ANSWER], [NEEDS_RETRY], [READY_FOR_MERGE], [ISSUE_CLOSED]]
+        for place in ("start", "release", "stuck", "cleanup")
+    ] == [[NEEDS_ANSWER], [READY_FOR_MERGE], [NEEDS_RETRY], [ISSUE_CLOSED]]
     assert dict((key, count) for key, count, _ in front.summary) == {
         "merge": 1,
         "stuck": 1,

@@ -60,6 +60,30 @@ def test_reads_a_real_lock_back_out_of_the_kernel(slots):
         os.close(fd)
 
 
+def test_a_held_slot_a_torn_read_of_proc_locks_skipped_is_still_found(slots, monkeypatch):
+    """``/proc/locks`` comes a page per read, and a lock dropped between two
+    reads can make a held slot's line vanish (#3838). Simulate that skip on the
+    first read: the slot is really locked, so it is looked up again."""
+    reads = []
+
+    def torn_then_whole():
+        reads.append(1)
+        return {} if len(reads) == 1 else _flock_holders()
+
+    monkeypatch.setattr("agentdeck.host_slots._flock_holders", torn_then_whole)
+    fd = try_take_slot(slots)
+    assert fd is not None
+    try:
+        found = slot_holders(slots)
+    finally:
+        os.close(fd)
+    assert found[slots[0]] is not None
+    assert found[slots[0]].pid == os.getpid()
+    # The untaken slot is probed, found free, and costs no read of its own.
+    assert found[slots[1]] is None
+    assert len(reads) == 2
+
+
 def test_an_untaken_slot_file_is_free(slots):
     assert slot_holders(slots) == {slots[0]: None, slots[1]: None}
 

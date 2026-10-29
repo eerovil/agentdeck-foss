@@ -75,6 +75,18 @@ async def test_both_composers_and_the_settings_page_offer_dictation(tmp_path):
         voice_helper._save("codex:test:sid", {
             "at": 3.0, "heard": "Agent Dick", "aloud": [], "outcome": "timed out",
             "reply": None, "say": None, "relay": "Agent Dick", "fresh": False, "ms": 6000})
+        # The fast agent spoke for a quiet chat (#3799); its line for a phrase is held,
+        # and said only if the chat stays quiet: here the chat spoke first.
+        voice_helper._save("codex:test:sid", {
+            "at": 4.0, "narrated": ["Bash: pytest -q"], "quiet": 5, "outcome": "answered",
+            "reply": "SAY: Running the tests.", "say": "Running the tests.", "fresh": False,
+            "ms": 800, "id": "n"})
+        voice_helper._save("codex:test:sid", {"at": 4.1, "spoken_for": "n",
+                                              "spoken": "Running the tests."})
+        voice_helper._save("codex:test:sid", {
+            "at": 5.0, "heard": "Check the logs.", "aloud": [], "outcome": "answered",
+            "reply": "SAY: The logs.\nRELAY: Check the logs.", "say": "The logs.",
+            "relay": "Check the logs.", "fresh": False, "ms": 700, "id": "h", "held": True})
         voiced = (await client.get("/sessions/codex:test:sid")).text
         log_page = (await client.get("/sessions/codex:test:sid/voice-log")).text
         front = (await client.get("/")).text
@@ -95,13 +107,22 @@ async def test_both_composers_and_the_settings_page_offer_dictation(tmp_path):
     assert "voice-log" not in chat
     assert 'href="/sessions/codex:test:sid/voice-log"' in voiced
     phrases = re.findall(r'<section class="voice-log-phrase".*?</section>', log_page, re.S)
-    assert ["Agent Dick" in phrases[0], "Thanks" in phrases[1], "bag" in phrases[2]] == [
+    assert ["Agent Dick" in phrases[1], "Thanks" in phrases[2], "bag" in phrases[3]] == [
         True] * 3
-    assert "<strong>timed out</strong>" in phrases[0] and "not reported" in phrases[0]
-    assert "not meant for the chat" in phrases[1]
-    assert "🔊 Reading the logs." in phrases[2] and "Fix the login bug." in phrases[2]
+    assert "<strong>timed out</strong>" in phrases[1] and "not reported" in phrases[1]
+    narrated = re.findall(r'<section class="voice-log-phrase voice-log-narrated".*?</section>',
+                          log_page, re.S)
+    assert len(narrated) == 1 and "agent quiet 5 s" in narrated[0]
+    assert "Bash: pytest -q" in narrated[0]
+    assert re.search(r"Spoken</span> Running the tests\.", narrated[0])
+    assert log_page.index("voice-log-narrated") < log_page.index("Agent Dick")
+    held = phrases[0]
+    assert "Check the logs." in held and "Proposed</span> The logs." in held
+    assert "nothing: the chat spoke first" in held and "Said</span>" not in held
+    assert "not meant for the chat" in phrases[2]
+    assert "🔊 Reading the logs." in phrases[3] and "Fix the login bug." in phrases[3]
     # What the helper proposed is told apart from what the page really sent.
-    assert "<em>not sent: sent by hand</em>" in phrases[2]
+    assert "<em>not sent: sent by hand</em>" in phrases[3]
     # The chat page carries only its own composer: the new-chat form left it with its
     # chat list (#2603) and is checked on the front page below. New work's appears
     # only when the host has an issue board, so it is left out here and checked
@@ -152,7 +173,8 @@ def test_the_chat_view_shows_a_mark_instead_of_the_voice_line():
     # A message sent before the line changed (#3407) still shows the mark.
     assert display_chat_message(f"Add a test\n\n{OLD_VOICE_LINES[0]}") == "Add a test 🎧"
     # The Finnish line asks for a Finnish answer and is hidden the same way (#3409).
-    assert VOICE_LINE_FI.endswith("Answer in Finnish.)")
+    assert VOICE_LINE_FI.endswith("overrides any standing instruction to answer in English.)")
+    assert display_chat_message(f"Lisää testi\n\n{OLD_VOICE_LINES[1]}") == "Lisää testi 🎧"
     assert display_chat_message(f"Lisää testi\n\n{VOICE_LINE_FI}") == "Lisää testi 🎧"
     assert display_chat_message(VOICE_LINE) == "🎧"
     assert card_preview(f"Add a test\n\n{VOICE_LINE}") == "Add a test 🎧"
@@ -195,7 +217,9 @@ def _speech_server(socket_path):
             if not data.startswith(b"RIFF"):
                 raise ValueError("expected 16-bit PCM")
             self.previous.append(previous + only.upper())
-            return {"text": "hei maailma", "language": "fi", "seconds": 0.1}
+            return {"text": "hei maailma", "language": "fi", "seconds": 0.1,
+                    "segments": [{"text": "hei", "unsure": False},
+                                 {"text": "maailma", "unsure": True}, "x", {"text": 3}]}
 
         def say(self, text, language, name="", speed=1.0):
             self.said.append((text, language, name, speed))
@@ -317,15 +341,6 @@ async def test_speech_routes_pass_audio_to_the_host_service_and_back(tmp_path):
                 "/api/speech/transcribe?language=fi", content=b"RIFF....WAVE"
             )
             app.state.config.speech.language = "auto"
-            # Kept phrases for comparing models (#3499): off keeps nothing above; on
-            # keeps the audio and the words, and drops audio past its days.
-            kept_off = not (tmp_path / "kept").exists()
-            app.state.config.speech.keep_audio_days = 7
-            app.state.config.speech.keep_audio_dir = str(tmp_path / "kept")
-            (tmp_path / "kept").mkdir()
-            old_kept = tmp_path / "kept/old.wav"
-            old_kept.write_bytes(b"RIFF")
-            os.utime(old_kept, (time.time() - 8 * 86400,) * 2)
             heard = await client.post("/api/speech/transcribe?id=k1", content=b"RIFF....WAVE")
             # Voice mode turning on loads the speech model behind the reply (#3766).
             warm = await client.post("/api/voice/warm", json={})
@@ -333,7 +348,6 @@ async def test_speech_routes_pass_audio_to_the_host_service_and_back(tmp_path):
                 await asyncio.sleep(0.005)
             # Whether a slow phrase is waiting on the model loading (#3722).
             loading = await client.get("/api/speech/status")
-            app.state.config.speech.keep_audio_days = 0
             # The language heard last rides along; anything else is not passed on.
             await client.post("/api/speech/transcribe?language=fi", content=b"RIFF....WAVE")
             await client.post("/api/speech/transcribe?language=x%26y", content=b"RIFF....WAVE")
@@ -406,15 +420,11 @@ async def test_speech_routes_pass_audio_to_the_host_service_and_back(tmp_path):
         assert "Switch verdict withheld: 1 shadow phrases" in printed
         assert "Caught" not in printed
     assert sorted(path.name for path in (tmp_path / "wake").glob("*.wav")) == ["a1.wav", "b2.wav"]
-    assert english.json() == {"text": "hei maailma", "language": "en"}
-    assert heard.json() == {"text": "hei maailma", "language": "fi"}
+    # The parts, and which Whisper doubted, come along for voice mode to mark (#3817).
+    parts = [{"text": "hei", "unsure": False}, {"text": "maailma", "unsure": True}]
+    assert english.json() == {"text": "hei maailma", "language": "en", "segments": parts}
+    assert heard.json() == {"text": "hei maailma", "language": "fi", "segments": parts}
     assert (warm.status_code, server.speech.warmed) == (204, 1)
-    assert kept_off and sorted(p.name for p in (tmp_path / "kept").glob("*.wav")) == ["k1.wav"]
-    assert (tmp_path / "kept/k1.wav").read_bytes() == b"RIFF....WAVE"
-    kept = [json.loads(line) for line in (tmp_path / "kept/kept.jsonl").read_text().splitlines()]
-    assert [(line["id"], line["text"], line["language"], line["only"]) for line in kept] == [
-        ("k1", "hei maailma", "fi", "")
-    ]
     assert server.speech.previous == ["EN", "", "fi", ""]
     # Whisper's made-up closing lines and segments it rates as no speech are dropped.
     phantom = server.module.is_phantom
@@ -448,16 +458,17 @@ async def test_speech_routes_pass_audio_to_the_host_service_and_back(tmp_path):
     config = tmp_path / "config.toml"
     config.write_text(
         '[speech]\nengine = "parakeet"\nparakeet_model = "/m/orukeet"\n'
-        'whisper_model = "large-v3-turbo"\nwhisper_beam = 1\n'
+        'whisper_model = "large-v3-turbo"\nwhisper_beam = 1\nwhisper_prompt = ""\n'
     )
     assert module.configured_engine(str(config)) == {
         "engine": "parakeet", "parakeet_model": "/m/orukeet",
-        "whisper_model": "large-v3-turbo", "whisper_beam": 1,
+        "whisper_model": "large-v3-turbo", "whisper_beam": 1, "whisper_prompt": "",
     }
     assert module.configured_engine(str(tmp_path / "none.toml")) == {}
     assert module.PARAKEET_MODEL == SpeechConfig().parakeet_model
     assert module.WHISPER_MODEL == SpeechConfig().whisper_model
     assert module.WHISPER_BEAM == SpeechConfig().whisper_beam
+    assert module.WHISPER_PROMPT == SpeechConfig().whisper_prompt
     args = type("A", (), {"engine": "parakeet", "parakeet_model": "/m/orukeet", "idle_exit": 300})
     host = module.Speech(args)
     host.parakeet = lambda speech: {1: "Tee siitä commit ja pushaa se.", 2: "Thanks for watching."}[
@@ -474,6 +485,22 @@ async def test_speech_routes_pass_audio_to_the_host_service_and_back(tmp_path):
         assert host.transcribe([], "fi") == {"text": "", "language": "fi", "seconds": 0.0}
         module.gpu_mib = lambda: None
         assert (host.status()["engine"], host.status()["loaded"]) == ("parakeet", True)
+        # Whisper names the parts it doubted, so voice mode can mark them (#3817).
+        host.args.engine, host.args.beam, host.args.prompt = "whisper", 1, ""
+
+        def said(text, logprob):
+            return SimpleNamespace(
+                text=text, no_speech_prob=0.0, avg_logprob=logprob, temperature=0.0
+            )
+
+        heard_segments = [said(" Tee issue.", -0.2), said(" Igu su aseto sorriva.", -0.73)]
+        host.whisper = SimpleNamespace(transcribe=lambda *_, **__: (heard_segments, None))
+        doubted = host.transcribe([1], "", "fi")
+        assert (doubted["text"], doubted["segments"]) == (
+            "Tee issue. Igu su aseto sorriva.",
+            [{"text": "Tee issue.", "unsure": False},
+             {"text": "Igu su aseto sorriva.", "unsure": True}],
+        )
         # Whisper on the card falls back to Parakeet for a phrase it cannot hear, and
         # for every phrase once it failed to load (#3517).
         host.args.engine = "whisper"
@@ -535,6 +562,11 @@ async def test_speech_routes_pass_audio_to_the_host_service_and_back(tmp_path):
     unit = (Path(__file__).resolve().parents[1] / "systemd/agentdeck-speech.service").read_text()
     assert "--idle-exit 0" in unit and "WantedBy=default.target" in unit
     assert "Restart=on-failure" in unit
+    # So does the wake word detector, warmed at start (#3793).
+    root = Path(__file__).resolve().parents[1]
+    wake_unit = (root / "systemd/agentdeck-wake.service").read_text()
+    assert "--idle-exit 0" in wake_unit and "WantedBy=default.target" in wake_unit
+    assert "server.detector.warm()" in (root / "scripts/wake_server.py").read_text()
     # The language changes only on a sure call; a third language keeps the last one.
     choose = server.module.choose_language
     assert choose({"fi": 0.9, "en": 0.05}, "en") == ("fi", pytest.approx(0.947, abs=0.001))
@@ -565,266 +597,113 @@ async def test_speech_routes_pass_audio_to_the_host_service_and_back(tmp_path):
     assert dead.status_code == 503
 
 
-@shipped("scripts/speech_server.py", "scripts/tts_server.py")
-async def test_chatterbox_reads_replies_and_piper_takes_over_when_it_cannot(
-    tmp_path, monkeypatch
-):
-    """With ``[speech] tts = "chatterbox"`` a sentence comes from Chatterbox's own
-    service; while its model loads, Piper reads it and the load is started; after a
-    failure or a dead socket Piper reads everything for a while; voice mode starting
-    to listen loads the model; ``"piper"`` never asks it (#3519)."""
-    import importlib.util
-    import io
-    import socket
-    import sys
-    import threading
-    import wave
+async def test_the_fast_agent_says_what_the_quiet_agent_is_doing(monkeypatch):
+    """The chat silent after a send, the fast agent is told the steps the agent took
+    since the person last spoke, read from the transcript, and says one sentence on
+    them; "SAY:" alone or no steps says nothing (204). It is saved in the voice log
+    and remembered for the next phrase (#3799). A last step with no result yet is
+    told as still running, and for how long, so it is said to continue (#3806)."""
+    import asyncio
+    import json as json_
+    import re
+    from datetime import UTC, datetime, timedelta
     from types import SimpleNamespace
 
     from fastapi import FastAPI
 
+    from agentdeck import voice_helper
     from agentdeck.config import AppConfig
+    from agentdeck.models import Account, TranscriptEvent
     from agentdeck.web import routes_speech
 
-    scripts = Path(__file__).resolve().parents[1] / "scripts"
-    if "speech_server" not in sys.modules:
-        spec = importlib.util.spec_from_file_location("speech_server", scripts / "speech_server.py")
-        sys.modules["speech_server"] = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(sys.modules["speech_server"])
-    spec = importlib.util.spec_from_file_location("tts_server", scripts / "tts_server.py")
-    tts = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(tts)
-    monkeypatch.setattr(tts, "gpu_mib", lambda: None)  # no nvidia-smi call per status
+    started = datetime.now(UTC) - timedelta(seconds=40)
+    replies = ["SAY: Running the tests now.", "SAY:"]
+    told = []
+    lines = asyncio.Queue()
 
-    loaded = threading.Event()
+    def write(data):
+        told.append(json_.loads(data)["message"]["content"])
+        lines.put_nowait(json_.dumps({"type": "result", "result": replies.pop(0)}).encode())
 
-    class FakeModel:
-        sr = 24000
-        said = []
+    async def drain():
+        return None
 
-        def generate(self, text, language_id, exaggeration, cfg_weight):
-            if text == "Boom.":
-                raise RuntimeError("CUDA out of memory")
-            self.said.append((text, language_id, exaggeration, cfg_weight))
-            return FakeTensor()
+    process = SimpleNamespace(returncode=None, stdout=SimpleNamespace(readline=lines.get),
+                              stdin=SimpleNamespace(write=write, drain=drain), kill=lambda: None)
+    process.wait = drain
 
-    class FakeTensor:  # the shape Chatterbox returns: a (1, n) float tensor
-        def detach(self):
-            return self
+    async def start(account, prompt=None):
+        return process
 
-        float = cpu = detach
+    events = [
+        TranscriptEvent(seq=1, role="user", text="Old message"),
+        TranscriptEvent(seq=2, role="tool", tool_name="Bash", tool_summary="git log"),
+        TranscriptEvent(seq=3, role="user", text="Fix the login bug 🎧"),
+        TranscriptEvent(seq=4, role="assistant", tool_name="Read", tool_summary="login.py"),
+        TranscriptEvent(seq=5, role="tool", text="file contents"),
+        TranscriptEvent(seq=6, role="user", text="and the readme", queued=True),
+        TranscriptEvent(seq=7, role="tool", tool_name="Grep", subagent="a1"),
+        TranscriptEvent(seq=8, role="assistant", text="API error", failed=True),
+        TranscriptEvent(seq=9, role="assistant", text="The bug is in the  session check."),
+        TranscriptEvent(seq=10, role="assistant", tool_name="Bash", ts=started,
+                        tool_display_name="Run tests", tool_summary="pytest -q " + "x" * 200),
+    ]
+    transcript = SimpleNamespace(events=events)
 
-        def reshape(self, *shape):
-            return SimpleNamespace(tolist=lambda: [0.0, 0.5, -2.0])
+    async def load_transcript(account, session):
+        return transcript
 
-    def loader(device, dtype):
-        loaded.wait(2)
-        return FakeModel()
-
-    args = SimpleNamespace(device="cpu", dtype="float32", idle_exit=0)
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    sock.bind(str(tmp_path / "t.sock"))
-    sock.listen(4)
-    tts_server = tts.TtsServer(sock, tts.Voice(args, loader))
-    threading.Thread(
-        target=tts_server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True
-    ).start()
-    piper = _speech_server(tmp_path / "s.sock")
+    provider = SimpleNamespace(load_transcript=load_transcript)
+    monkeypatch.setattr(routes_speech, "resolve_current_leg",
+                        lambda request, key: (None, None, provider))
+    monkeypatch.setattr(voice_helper, "start_process", start)
     app = FastAPI()
     app.include_router(routes_speech.router)
     app.state.config = AppConfig()
-    speech = app.state.config.speech
-    speech.socket = str(tmp_path / "s.sock")
-    speech.tts_socket = str(tmp_path / "t.sock")
-    monkeypatch.setattr(routes_speech, "_tts_down_until", 0.0)
-
-    async def say(text, language="en"):
-        reply = await client.post("/api/speech/say", json={"text": text, "language": language})
-        return reply.content
-
+    app.state.accounts = [Account("claude_code:main", "claude_code", "main", Path("/a/main"))]
+    app.state.app_state = SimpleNamespace(usage={}, sessions={})
+    key = "claude_code:main:quiet"
     transport = httpx.ASGITransport(app=app)
-    try:
-        async with httpx.AsyncClient(transport=transport, base_url="http://deck") as client:
-            piper_only = await say("Piper.")
-            speech.tts = "chatterbox"
-            speech.tts_cfg_fi = 0.0
-            loading = await say("Still loading.")
-            loading_status = tts_server.voice.status()
-            loaded.set()
-            while tts_server.voice.model is None:
-                await asyncio.sleep(0.005)
-            english = await say("Hello there.")
-            finnish = await say("Hei vaan.", "fi")
-            failed = await say("Boom.")
-            resting = await say("Right after.")
-            rest = routes_speech._tts_down_until - time.monotonic()
-            routes_speech._tts_down_until = 0.0  # the rest is over
-            rested = await say("Five minutes later.")
-            speech.tts_socket = str(tmp_path / "gone.sock")
-            dead = await say("Gone.")
-            warm_dead = await client.post("/api/voice/warm", json={})
-            while routes_speech._tts_warming:  # the dead socket's warm-up fails at once
-                await asyncio.sleep(0.005)
-            # A socket that takes the request and never answers holds up nothing.
-            stalled = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            stalled.bind(str(tmp_path / "stalled.sock"))
-            stalled.listen(4)
-            speech.tts_socket = str(tmp_path / "stalled.sock")
-            warm_stalled = await client.post("/api/voice/warm", json={})
-            still_warming = [not task.done() for task in routes_speech._tts_warming]
-            for task in list(routes_speech._tts_warming):
-                task.cancel()
-            stalled.close()
-            routes_speech._tts_down_until = 0.0
-            speech.tts_socket = str(tmp_path / "t.sock")
-            tts_server.voice.model = None
-            warmed = await client.post("/api/voice/warm", json={})
-            for _ in range(400):
-                if tts_server.voice.model is not None and not routes_speech._stt_warming:
-                    break
-                await asyncio.sleep(0.005)
-    finally:
-        for server in (tts_server, piper):
-            server.shutdown()
-            server.server_close()
+    async with httpx.AsyncClient(transport=transport, base_url="http://deck") as client:
+        said = await client.post("/api/voice/narrate", json={
+            "session_key": key, "seconds": 5, "lang": "fi", "run": "r", "id": "n1"})
+        # The page then says which line it really spoke.
+        spoke = await client.post("/api/voice/sent", json={
+            "session_key": key, "id": "n1", "spoken": "Running the tests now."})
+        nothing = await client.post("/api/voice/narrate", json={"session_key": key, "seconds": 30})
+        transcript.events = events[:3]
+        no_steps = await client.post("/api/voice/narrate", json={"session_key": key})
+        no_key = await client.post("/api/voice/narrate", json={})
+    agent = voice_helper._agents[key]
+    await voice_helper.end(key)
 
-    assert piper.speech.said == [
-        ("Piper.", "en", "en_US-ryan-high", 1.0),
-        ("Still loading.", "en", "en_US-ryan-high", 1.0),
-        ("Boom.", "en", "en_US-ryan-high", 1.0),
-        ("Right after.", "en", "en_US-ryan-high", 1.0),
-        ("Gone.", "en", "en_US-ryan-high", 1.0),
-    ]
-    assert piper_only == loading == failed == resting == dead == b"RIFF-wav"
-    assert routes_speech.TTS_REST - 5 < rest <= routes_speech.TTS_REST
-    assert loading_status["loading"] is True and loading_status["loaded"] is False
-    assert FakeModel.said == [
-        ("Hello there.", "en", 0.5, 0.5),
-        ("Hei vaan.", "fi", 0.5, 0.0),
-        ("Five minutes later.", "en", 0.5, 0.5),
-    ]
-    with wave.open(io.BytesIO(english)) as audio:
-        assert (audio.getframerate(), audio.getnchannels(), audio.getsampwidth()) == (24000, 1, 2)
-        # Out of range samples are clipped, not wrapped.
-        assert audio.readframes(3) == b"\x00\x00\x00\x40\x01\x80"
-    assert finnish.startswith(b"RIFF") and rested.startswith(b"RIFF")
-    assert warm_dead.status_code == warmed.status_code == warm_stalled.status_code == 204
-    assert still_warming == [True]
-    assert tts_server.voice.model is not None
-    # A model that failed to load is a failure the deck rests from, not "loading"
-    # for ever; the next sentence after that loads it again.
-    def broken(device, dtype):
-        raise RuntimeError("CUDA out of memory")
-
-    voice = tts.Voice(args, broken)
-    with pytest.raises(tts.Loading):
-        voice.say("Hi.", "en", 0.5, 0.5)
-    while voice.loading:
-        time.sleep(0.005)
-    with pytest.raises(RuntimeError, match="did not load: CUDA out of memory"):
-        voice.say("Hi.", "en", 0.5, 0.5)
-    with pytest.raises(tts.Loading):
-        voice.say("Hi.", "en", 0.5, 0.5)
-    # Its precision is the deck's setting, read at start: float16 when the speed
-    # check calls for it, float32 otherwise.
-    config = tmp_path / "config.toml"
-    assert tts.configured_dtype(str(config)) == "float32"
-    config.write_text('[speech]\ntts_dtype = "float16"\n')
-    assert tts.configured_dtype(str(config)) == "float16"
-    config.write_text('[speech]\ntts_dtype = "int4"\n')
-    assert tts.configured_dtype(str(config)) == "float32"
-    assert AppConfig().speech.tts_dtype in tts.DTYPES
-    # The service keeps its own bounds on what the deck sends.
-    assert (tts.number("x", 0.5), tts.number(9, 0.5), tts.number(-1, 0.5)) == (0.5, 2.0, 0.0)
-
-
-@shipped("scripts/tts_bench.py")
-def test_the_voice_comparison_picks_real_lines_of_each_kind(tmp_path, monkeypatch):
-    """The Chatterbox comparison reads real 🔊 lines from the voice log, newest first,
-    4 of each kind, and reads each a sentence at a time as voice mode does (#3519)."""
-    import importlib.util
-    from types import SimpleNamespace
-
-    spec = importlib.util.spec_from_file_location(
-        "tts_bench", Path(__file__).resolve().parents[1] / "scripts/tts_bench.py"
-    )
-    bench = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(bench)
-    english = [f"Done {n}. The agent will fix it and ask you before it merges." for n in range(5)]
-    finnish = [f"Selvä {n}. Katson lokit ja kerron, mitä löytyi." for n in range(5)]
-    mixed = [f"Valmis {n}. Nyt Chatterbox tulee, ja Piper jää varalle." for n in range(5)]
-    entries = [
-        {"at": n, "heard": "x", "aloud": [english[n], finnish[n], mixed[n], "Okay."]}
-        for n in range(5)
-    ] + [{"at": 9, "heard": "x", "aloud": [english[0]]}, {"bad": "line"}]
-    (tmp_path / "chat.jsonl").write_text(
-        "\n".join(json.dumps(entry) for entry in entries) + "\nnot json\n"
-    )
-
-    lines = bench.pick(tmp_path)
-
-    assert [(line["id"], line["language"], line["text"]) for line in lines] == [
-        ("en1", "en", english[0]), ("en2", "en", english[4]), ("en3", "en", english[3]),
-        ("en4", "en", english[2]), ("fi1", "fi", finnish[4]), ("fi2", "fi", finnish[3]),
-        ("fi3", "fi", finnish[2]), ("fi4", "fi", finnish[1]), ("mixed1", "fi", mixed[4]),
-        ("mixed2", "fi", mixed[3]), ("mixed3", "fi", mixed[2]), ("mixed4", "fi", mixed[1]),
-    ]
-    # "on" is Finnish too, and one English word does not make a line mixed.
-    assert bench.kind("Se on valmis, ja testi on nyt on kunnossa.") == "fi"
-    assert bench.kind("Se on valmis, ja Piper jää varalle.") == "fi"
-    assert bench.kind("Valmis. Nyt Chatterbox tulee, ja Piper jää.") == "mixed"
-    assert bench.sentences("Done. e.g. the fix. 1. Then go? Äiti tuli.") == [
-        "Done. e.g. the fix.", "1. Then go?", "Äiti tuli."
-    ]
-    assert bench.verdict([{"made": [1.0, 2.0], "played": [3.0, 1.0]}])["passes"] is True
-    assert bench.verdict([{"made": [1.0, 2.5], "played": [3.0, 1.0]}])["passes"] is False
-    # Both models on the 6 GB card must leave 300 MiB free, or float16 is tried.
-    assert bench.fits((5800, 6144))["fits"] is True
-    assert bench.fits((5900, 6144)) == {"card_used_mib": 5900, "card_free_mib": 244, "fits": False}
-    assert bench.fits(None)["fits"] is None
-
-    # The memory check stops unless speech to text answered and says it is loaded,
-    # or the card would look roomier than in voice mode.
-    answers = []
-
-    class FakeConnection:
-        def __init__(self, path):
-            self.path = path
-
-        def request(self, method, path, *args):
-            self.asked = path
-
-        def getresponse(self):
-            status, body = answers.pop(0)
-            return SimpleNamespace(status=status, read=lambda: body)
-
-    monkeypatch.setattr(bench, "UnixConnection", FakeConnection)
-    voices = {"socket": "s.sock"}
-    answers[:] = [(200, b"{}"), (200, b'{"loaded": true, "gpu_mib": 1400}')]
-    assert bench.speech_to_text_loaded(voices)["gpu_mib"] == 1400
-    for answer in ([(500, b"CUDA out of memory")], [(200, b"{}"), (200, b'{"loaded": false}')]):
-        answers[:] = answer
-        with pytest.raises(SystemExit, match="speech to text"):
-            bench.speech_to_text_loaded(voices)
-    # Both models must be on the card: speech to text on the CPU stops the check.
-    bench.on_the_card({"loaded": True, "device": "cuda"})
-    with pytest.raises(SystemExit, match="pick a card speech-to-text engine"):
-        bench.on_the_card({"loaded": True, "device": "cpu"})
-    # Each precision runs in a fresh process; float16 only when float32 left too little.
-    ran = []
-
-    def run(command, check):
-        dtype = command[command.index("--dtype") + 1]
-        ran.append(dtype)
-        result = {"dtype": dtype, "fits": dtype == "float16" or room}
-        (tmp_path / f"speed-cuda-{dtype}.json").write_text(json.dumps(result))
-
-    monkeypatch.setattr(bench.subprocess, "run", run)
-    # run() above reads `room` through its closure, which B007 cannot see.
-    for room, expected in ((True, ["float32"]), (False, ["float32", "float16"])):  # noqa: B007
-        ran.clear()
-        report = bench.speed(tmp_path, tmp_path / "config.toml", "cuda", "float32")
-        assert ran == expected and [r["dtype"] for r in report["runs"]] == expected
+    assert said.status_code == 200 and said.json() == {"say": "Running the tests now."}
+    assert spoke.status_code == 204
+    assert [nothing.status_code, no_steps.status_code, no_key.status_code] == [204, 204, 400]
+    # The last call has no result yet: it is marked running, with how long (#3806).
+    assert re.fullmatch(
+        "Agent working quietly for 5 seconds. What it did since the person last spoke:\n"
+        "- Read: login.py\n- Wrote: The bug is in the session check.\n"
+        f"- Run tests: pytest -q {'x' * 138}… \\(still running for 4\\d seconds, "
+        "no result yet\\)\n\nSay it in Finnish.", told[0])
+    # A result after it, whichever parallel call it answers, means it may be done.
+    then = started + timedelta(seconds=40)
+    result = TranscriptEvent(seq=11, role="tool", text="ok")
+    call = TranscriptEvent(seq=12, role="assistant", tool_name="Bash", ts=started)
+    assert voice_helper.steps(events + [result], then)[-1].endswith("…")
+    assert voice_helper.steps([call, result, call], then)[-1] == (
+        "Bash (still running for 40 seconds, no result yet)")
+    assert voice_helper.steps([call, call, result], then) == ["Bash", "Bash"]
+    assert "edelleen" in voice_helper.system_prompt()
+    assert told[1].startswith("Agent working quietly for 30 seconds.")
+    assert told[1].endswith("Say it in the language of their last message.")
+    assert len(told) == 2
+    assert agent.history == ["You, while it worked: Running the tests now."]
+    saved = voice_helper.saved([key])
+    assert [(p["say"], p["quiet"], p["outcome"]) for p in reversed(saved)] == [
+        ("Running the tests now.", 5, "answered"), ("", 30, "answered")]
+    assert saved[-1]["narrated"][0] == "Read: login.py"
+    assert saved[-1]["spoken"] == "Running the tests now." and saved[0]["spoken"] is None
 
 
 async def test_the_fast_agent_answers_at_once_and_relays_what_was_meant(monkeypatch):
@@ -1025,15 +904,53 @@ async def test_the_fast_agent_answers_at_once_and_relays_what_was_meant(monkeypa
     assert parse("SAY:\nRELAY: NONE", "Bröt.", question=True).relay is None
     assert parse("SAY: Sure.\nRELAY: thank you", "Thank you", question=True).relay == (
         "thank you")
+    # Words Whisper doubted reach the chat as heard, marked, however the fast agent
+    # reworded them, and are never noise (#3817).
+    doubted = "Tee se. [unsure: Igu su aseto sorriva.]"
+    assert parse("SAY: Ok.\nRELAY: Tee se. Eli sun asetus jää.", doubted).relay == doubted
+    kept = "SAY: Ok.\nRELAY: Tee se nyt. [unsure: Igu su aseto sorriva.]"
+    assert parse(kept, doubted).relay == "Tee se nyt. [unsure: Igu su aseto sorriva.]"
+    assert parse("SAY:\nRELAY: NONE", "[unsure: No.]").relay == "[unsure: No.]"
+    assert parse("SAY:\nRELAY: NONE", doubted).relay == doubted
+    # Nor is a doubted lone "you" a sure "Juu.", or a doubted phrase a jump (#3817).
+    assert parse("SAY:\nRELAY: Juu.", "[unsure: You.]", question=True).relay == (
+        "[unsure: You.]")
+    assert parse("BACK", "[unsure: Back to deck.]", back=True) == voice_helper.Answer(
+        "", "[unsure: Back to deck.]")
     agent = voice_helper._Agent("q")
     assert voice_helper._asked(agent, ["Long line " * 80 + "Shall I?"])
     agent.history = ["Agent said aloud: Which one?", "Person: hm"]
     assert voice_helper._asked(agent, []) and not voice_helper._asked(agent, ["Done."])
     command = voice_helper.fast_command("/bin/claude")
+    assert "[unsure: …]" in command[command.index("--system-prompt") + 1]
     assert command[:4] == ["/bin/claude", "-p", "--model", "haiku"]
     assert command[command.index("--input-format") + 1] == "stream-json"
     assert "--no-session-persistence" in command and "Never add, guess" in command[
         command.index("--system-prompt") + 1]
+    assert "go back to the deck chat" not in prompts[0]
+
+    # The way back to the deck chat (#3816): told only in a chat that is not the deck chat
+    # while one exists, it sends nothing and names the deck chat's page. A BACK from a
+    # process not told it is only words.
+    assert parse("BACK", "back to the deck chat", back=True) == voice_helper.Answer(
+        "", None, back=True)
+    assert parse("BACK", "back to the deck chat").relay == "back to the deck chat"
+    app.state.db = SimpleNamespace(deck_chat_starts=lambda: [("deck-token", "first", 0)])
+    app.state.app_state = SimpleNamespace(
+        usage={}, sessions={"claude_code:main:s1": chat},
+        session_key_for_token={"deck-token": "claude_code:main:deck"}.get,
+        chat_identity_key=lambda key: key, chat_path_for_session=lambda key: f"/chats/{key}")
+    monkeypatch.setattr(voice_helper, "start_process", start)
+    scripts.extend([["BACK"], ["BACK"]])
+    async with httpx.AsyncClient(transport=transport, base_url="http://deck") as client:
+        back = await hear("Take me back to the deck chat.")
+        stays = await hear("Back.", key="claude_code:main:deck")
+    assert "go back to the deck chat" in prompts[-2] and "BACK" in prompts[-2]
+    assert "go back to the deck chat" not in prompts[-1]
+    assert back.json() == {"say": "", "relay": None, "jump": {
+        "path": "/chats/claude_code:main:deck", "title": "Deck chat"}}
+    assert stays.json()["relay"] == "Back."
+    assert voice_helper.saved(["claude_code:main:s1"])[0]["back"] is True
 
 
 async def test_an_answer_thrown_away_is_forgotten_and_the_waits_are_saved(monkeypatch):
@@ -1781,6 +1698,14 @@ _ROW = """
 """
 
 
+# How long the chat may stay quiet before the fast agent speaks (#3799), as "<after a
+# send> <while it works>" in seconds.
+_QUIET = """
+((seconds) => document.querySelector('form.inject-form .voice-control')
+  .setAttribute('data-voice-quiet-seconds', seconds))
+"""
+
+
 def _action_id(body):
     """The action ID a sent form carried, urlencoded or multipart."""
     import re
@@ -1794,17 +1719,32 @@ class _HostVoice:
     (`_FAKE_MICROPHONE`), and the host transcribes that phrase as `text`. A phrase
     with nothing queued is heard as no words. `hold` reads for 20 s (or that many
     seconds), and `hang`
-    never answers a reading, as a browser that will not play in the background."""
+    never answers a reading, as a browser that will not play in the background.
+    `wait`, an event, holds each transcription until it is set. A phrase in `doubted`
+    comes back as wholly unsure (#3817)."""
 
     def __init__(self, page):
         self.page = page
         self.said, self.phrases, self.queue, self.hung = [], [], [], []
-        self.languages = []
+        self.languages, self.narrated, self.doubted = [], [], set()
+        self.narration = ""
         self.hold = self.hang = False
+        self.wait = None
 
     async def install(self):
         await self.page.route("**/api/speech/say", self._say)
         await self.page.route("**/api/speech/transcribe*", self._transcribe)
+        await self.page.route("**/api/voice/narrate", self._narrate)
+
+    async def _narrate(self, route):
+        # The fast agent on the chat's quiet work (#3799): `narration` is its line,
+        # empty for nothing to say.
+        self.narrated.append(json.loads(route.request.post_data))
+        if not self.narration:
+            await route.fulfill(status=204)
+            return
+        await route.fulfill(status=200, content_type="application/json",
+                            body=json.dumps({"say": self.narration}))
 
     async def _say(self, route):
         body = json.loads(route.request.post_data)
@@ -1820,8 +1760,11 @@ class _HostVoice:
     async def _transcribe(self, route):
         text = self.queue.pop(0) if self.queue else ""
         self.phrases.append(text)
+        if self.wait:
+            await self.wait.wait()
+        parts = [{"text": text, "unsure": text in self.doubted}]
         await route.fulfill(status=200, content_type="application/json",
-                            body=json.dumps({"text": text, "language": "en"}))
+                            body=json.dumps({"text": text, "language": "en", "segments": parts}))
 
     async def sound(self, ms=400):
         await self.page.evaluate("__mic.level(0.5)")
@@ -1867,18 +1810,31 @@ def _host_voice_app(tmp_path, **kwargs):
 _VOICE_STATE = ("() => document.querySelector('[data-voice-button]')"
                 ".getAttribute('data-voice-state')")
 _LISTENING = f"() => ({_VOICE_STATE})() === 'listening'"
-# Plain dictation on the chat composer's 🎤, which is voice mode's microphone otherwise (#3540).
-_DICTATE = "localStorage.setItem('agentdeck.voiceListenMode', 'dictate')"
+# The chat composer's 🎤 is voice mode's microphone with a speech service (#3787):
+# with voice_mode.js kept off the page, it dictates as on the forms that still do.
+_VOICE_MODE_JS = "**/static/voice_mode.js*"
 
 
 async def _voice_on(page):
-    """Voice mode reading aloud (🎧) and listening (🎤), as one tap each (#3540)."""
+    """Voice mode reading aloud (🎧) and listening to everything (🎤's Always)."""
     await page.locator("form.inject-form [data-voice-button]").click()
-    await page.locator("form.inject-form [data-voice-mic]").click()
+    await _pick(page, "open")
+
+
+async def _pick(page, mode):
+    """🎤's long-press menu (#3787): 'jarvis', 'open' (Always) or 'off'."""
+    item = page.locator(f'form.inject-form [data-voice-mic-mode="{mode}"]')
+    # A page still settling (the desktop list mounting beside the chat) can swap the
+    # composer under the first press.
+    for _ in range(3):
+        await _hold(page, page.locator("form.inject-form [data-voice-mic]"))
+        if await item.is_visible():
+            break
+    await item.click()
 
 
 async def _hold(page, locator):
-    """A long press: on 🎤 it opens the menu of how it listens (#3540)."""
+    """A long press: on 🎤 it opens the menu of how it listens (#3787)."""
     box = await locator.bounding_box()
     await page.mouse.move(box["x"] + 5, box["y"] + 5)
     await page.mouse.down()
@@ -1930,6 +1886,8 @@ async def test_voice_mode_speaks_the_marked_paragraph_and_sends_what_it_hears(tm
         button = page.locator("form.inject-form [data-voice-button]")
         await button.wait_for(state="visible")
         mic = page.locator("form.inject-form [data-voice-mic]")
+        # The fast agent speaking for a quiet chat (#3799) is tested on its own below.
+        await page.evaluate(_QUIET + "('60 600')")
         # Turned on during a turn it did not see start, which counts as unheard (#3520).
         await page.evaluate(_TURN + "(['thinking', null])")
         await _voice_on(page)
@@ -2053,25 +2011,66 @@ async def test_voice_mode_speaks_the_marked_paragraph_and_sends_what_it_hears(tm
         background_turn = said[said_before:]
         await page.evaluate(_TURN + "(['idle', null])")
 
-        # Each message sent is acknowledged at once, whatever the agent does first;
-        # mid-turn too (#3444).
-        acks = []
-        for words in ("look at the logs", "check the tests too"):
-            await wait_until(page, "it listens before the message", _LISTENING)
-            said_before = len(said)
-            await host.hear(words)
-            for _ in range(60):
-                if len(said) > said_before:
-                    break
-                await page.wait_for_timeout(50)
-            acks.append(said[said_before:])
-        await page.evaluate(_TURN + "(['thinking', null])")
-        await page.evaluate(_ROW + "('tool')")
-        await wait_until(page, "it listens mid-turn", _LISTENING)
+        # Nothing is said at a send but its tone (#3799): the chat says it in its own
+        # words. Only when it stays quiet while it works does the fast agent speak, here
+        # 0.5 s after a send and then every 1.5 s, saying what the agent does; with
+        # nothing from it, its own line for the phrase or "Got it, working on it.".
+        await page.evaluate(_QUIET + "('0.5 1.5')")
+        # The voice log is told which of the fast agent's lines were really said.
+        spoken = []
+
+        async def spoken_route(route):
+            body = json.loads(route.request.post_data)
+            if "spoken" in body:
+                spoken.append(body["spoken"])
+            await route.fulfill(status=204)
+
+        async def tests_too(route):
+            await route.fulfill(status=200, content_type="application/json", body=json.dumps(
+                {"say": "The tests, got it.", "relay": "check the tests too"}))
+
+        await page.route("**/api/voice/sent", spoken_route)
+        await wait_until(page, "it listens before the message", _LISTENING)
         said_before = len(said)
+        await host.hear("look at the logs")
+        await page.wait_for_timeout(1500)
+        idle_send = said[said_before:]
+        await wait_until(page, "it listens before the second message", _LISTENING)
+        said_before = len(said)
+        await page.route("**/api/voice/heard", tests_too)
+        await host.hear("check the tests too")
+        await sends(len(sent) + 1)
+        await page.evaluate(_TURN + "(['thinking', null])")
+        await page.evaluate(_TURN + "(['thinking', '🔊 Checking the tests.'])")
+        await page.wait_for_timeout(1000)
+        own_note = said[said_before:]
+        await wait_until(page, "it listens mid-turn", _LISTENING)
+
+        async def readme(route):
+            await route.fulfill(status=200, content_type="application/json", body=json.dumps(
+                {"say": "The readme, got it.", "relay": "and the readme"}))
+
+        await page.unroute("**/api/voice/heard")
+        await page.route("**/api/voice/heard", readme)
+        said_before = len(said)
+        narrated_before = len(host.narrated)
         await host.hear("and the readme")
-        await _until(page, "the follow-up was acknowledged", lambda: len(said) > said_before)
-        acks.append(said[said_before:])
+        await _until(page, "the quiet turn was spoken for", lambda: len(said) > said_before)
+        host.narration = "I'm reading the readme."
+        await _until(page, "the long quiet was spoken for", lambda: len(said) > said_before + 1)
+        # Nothing new to say on the next long quiet spell: still a line.
+        host.narration = ""
+        await _until(page, "the next long quiet was spoken for",
+                     lambda: len(said) > said_before + 2)
+        quiet_turn = said[said_before:]
+        quiet_asks = host.narrated[narrated_before:]
+        await page.unroute("**/api/voice/heard")
+        await page.evaluate(_TURN + "(['idle', null])")
+        narrated_at_end = len(host.narrated)
+        await page.wait_for_timeout(2000)
+        after_end = len(host.narrated) - narrated_at_end
+        await page.unroute("**/api/voice/sent")
+        await page.evaluate(_QUIET + "('60 600')")
 
         # The fast agent hears it first (#3444): its words are spoken at once in place
         # of the acknowledgement, and its cleaned-up text is what is sent. Noise it
@@ -2116,11 +2115,8 @@ async def test_voice_mode_speaks_the_marked_paragraph_and_sends_what_it_hears(tm
         await page.evaluate("""() => {
             const box = document.querySelector('form.inject-form textarea');
             box.value += ' please'; box.dispatchEvent(new Event('input', { bubbles: true })); }""")
-        for _ in range(80):
-            if len(said) > said_before:
-                break
-            await page.wait_for_timeout(50)
-        await page.wait_for_timeout(300)
+        await _until(page, "the fast agent's words were sent", lambda: len(sent) > sent_before)
+        await page.wait_for_timeout(500)
         fast_spoken = said[said_before:]
         fast_sent = sent[sent_before:]
         await wait_until(page, "it listens after the fast agent", _LISTENING)
@@ -2201,6 +2197,7 @@ async def test_voice_mode_speaks_the_marked_paragraph_and_sends_what_it_hears(tm
         stopped = [await page.evaluate(f"({_VOICE_STATE})()"),
                    await page.locator(".voice-control .speech-status").text_content(),
                    said[-1], len(sent) - stopped_sent]
+        host.doubted |= {"just thinking aloud", "Hey Jarvis, check the build"}
         await host.hear("just thinking aloud")
         await page.evaluate(_TURN + "(['thinking', null])")
         await page.wait_for_timeout(1200)
@@ -2210,12 +2207,12 @@ async def test_voice_mode_speaks_the_marked_paragraph_and_sends_what_it_hears(tm
         await wait_until(page, "it waits after the reply",
                          f"() => ({_VOICE_STATE})() === 'waiting'", timeout=6000)
         read_stopped = "Read while stopped." in said
-        # "Hey Jarvis" starts a message with no tap (#3500).
+        # "Hey Jarvis" starts a message with no tap (#3500). Whisper doubted it all:
+        # the words after the name go marked, not the doubt of a phrase let go of
+        # before it (#3817).
         await host.hear("Hey Jarvis, check the build")
         await sends(stopped_sent + 1)
         jarvis_sent = sent[stopped_sent:]
-        await _until(page, "the message was acknowledged",
-                     lambda: said[-1] == "Got it, working on it.")
         await wait_until(page, "it waits after the message",
                          f"() => ({_VOICE_STATE})() === 'waiting'", timeout=6000)
         # A long press on 🎤 opens the menu; Always listening listens at once.
@@ -2224,9 +2221,12 @@ async def test_voice_mode_speaks_the_marked_paragraph_and_sends_what_it_hears(tm
         await page.locator('[data-voice-mic-mode="open"]').click()
         await wait_until(page, "Always listens", _LISTENING)
 
-        # A tap on 🎤 while it listens turns listening off: the microphone is let go
-        # of, a reply is still read, and nothing listens until 🎤 is tapped again.
+        # A tap on 🎤 while it listens, with nothing heard, goes to Jarvis (#3787).
         await mic.click()
+        to_jarvis = await page.evaluate(f"({_VOICE_STATE})()")
+        # Off from the menu: the microphone is let go of, a reply is still read, and
+        # nothing listens until 🎤 is tapped again.
+        await _pick(page, "off")
         muted = await page.evaluate(
             f"""() => [({_VOICE_STATE})(), document.querySelector('[data-voice-mic]')
                        .hasAttribute('data-voice-hears'),
@@ -2238,8 +2238,8 @@ async def test_voice_mode_speaks_the_marked_paragraph_and_sends_what_it_hears(tm
         await wait_until(page, "nothing listens after it", f"() => ({_VOICE_STATE})() === 'idle'",
                          timeout=6000)
         muted_after = said[said_before:]
-        await mic.click()
-        await wait_until(page, "a tap listens again", _LISTENING)
+        await _pick(page, "open")
+        await wait_until(page, "Always listens again", _LISTENING)
 
         # 🎧 tapped mid-reply only stops that reading: 🎧 stays on, the bubble says
         # so, and listening goes on (#3779).
@@ -2266,7 +2266,7 @@ async def test_voice_mode_speaks_the_marked_paragraph_and_sends_what_it_hears(tm
         reading_off = await button.get_attribute("aria-pressed")
 
         # Both off: voice mode ends and lets go of the microphone.
-        await mic.click()
+        await _pick(page, "off")
         held_off = [await page.evaluate("document.documentElement.classList.contains('voice-on')"),
                     await page.evaluate("__mic.stream.getTracks().map((t) => t.readyState)")]
 
@@ -2342,8 +2342,21 @@ async def test_voice_mode_speaks_the_marked_paragraph_and_sends_what_it_hears(tm
     assert unseen_turn == ["About fifty euros."]
     assert background_turn == ["The phone agent is on it."], background_turn
     ack = "Got it, working on it."
-    assert acks == [[ack], [ack], [ack]]
-    assert fast_spoken == ["Starting on the login bug."]
+    assert idle_send == [] and own_note == ["Checking the tests."]
+    assert quiet_turn == ["The readme, got it.", "I'm reading the readme.",
+                          "Still working on it."], quiet_turn
+    # The chat's own note came first, so "The tests, got it." was never said, and the
+    # voice log is not told it was.
+    # Each line said goes on its quiet check's entry; the phrase's own line on the
+    # phrase's entry too.
+    assert spoken == ["The readme, got it.", "The readme, got it.", "I'm reading the readme.",
+                      "Still working on it."]
+    assert [(a["session_key"], a["run"] > "", a["lang"]) for a in quiet_asks[:2]] == [
+        ("codex:test:sid", True, "en")] * 2
+    assert 0 <= quiet_asks[0]["seconds"] <= 2 and quiet_asks[1]["seconds"] >= 1
+    assert after_end == 0
+    # Its line for the phrase is said only if the chat stays quiet (#3799).
+    assert fast_spoken == []
     assert waiting_state != "listening"
     assert len(fast_sent) == 1 and ("Fix the login bug. please" in fast_sent[0]
                                     or "Fix+the+login+bug.+please" in fast_sent[0])
@@ -2356,7 +2369,7 @@ async def test_voice_mode_speaks_the_marked_paragraph_and_sends_what_it_hears(tm
         (fast[2]["id"], None, "not sent: sent by hand meanwhile"),
         (reports[3]["id"], "go ahead", "sent"),
         (reports[4]["id"], "yes approve that one", "sent"),
-        (reports[5]["id"], "check the build", "sent as heard: no answer in time"),
+        (reports[5]["id"], "[unsure: check the build]", "sent as heard: no answer in time"),
         (reports[6]["id"], "yes approve that one", "sent as heard: no answer in time"),
     ]
     assert [f["session_key"] for f in fast] == ["codex:test:sid"] * 3
@@ -2369,13 +2382,15 @@ async def test_voice_mode_speaks_the_marked_paragraph_and_sends_what_it_hears(tm
         assert code not in unmarked + " ".join(marked), code
     assert "and/or a retry" in unmarked
     assert unmarked.startswith("Fixed it in") and unmarked.endswith("More on screen.")
-    assert stopped == ["waiting", "Say “Hey Jarvis”", "OK, only after Hey Jarvis.", 0]
+    assert stopped == ["waiting", "Say “Hey Jarvis” · tap 🎤 to talk",
+                       "OK, only after Hey Jarvis.", 0]
     assert menu is True
     assert stopped_working == ["waiting", 0]
     assert read_stopped
     assert len(jarvis_sent) == 1 and ("check+the+build" in jarvis_sent[0]
                                       or "check the build" in jarvis_sent[0])
     assert "Jarvis" not in jarvis_sent[0]
+    assert to_jarvis == "waiting"
     assert muted == ["idle", False, ["ended"]]
     assert muted_after == ["Read while muted."]
     assert hushed == ["true", "Stopped reading", True]
@@ -2582,7 +2597,9 @@ async def test_voice_mode_goes_on_in_a_hidden_tab_and_says_what_the_browser_refu
 
 
 @pytest.mark.browser
-@pytest.mark.parametrize("kind", ["question", "mcp_form", "secret", "mic", "jarvis", "finnish"])
+@pytest.mark.parametrize(
+    "kind",
+    ["question", "mcp_form", "secret", "mic", "jarvis", "finnish", "refreshed", "midway"])
 async def test_voice_mode_answers_a_question_box_by_number(tmp_path, monkeypatch, kind):
     """A question box is read with numbered options, "option two" ticks the second,
     and the box's own Submit sends it through the real route. An English box is read
@@ -2590,7 +2607,10 @@ async def test_voice_mode_answers_a_question_box_by_number(tmp_path, monkeypatch
     Tap mode with 🎧 off, answers a box already open rather than sending a chat
     message (#3540 review). In Hey Jarvis mode, on before the box arrives, words
     without the name are let go of and "Hey Jarvis" plus the answer answers it (the
-    owner's decision on #3540)."""
+    owner's decision on #3540). A box brought in by the page's own refresh, which a
+    reconnected stream does not re-send, is asked too, and one swapped in again
+    between two questions keeps the answer already given (#3799). An answer Whisper
+    doubted picks nothing and is asked for again (#3817)."""
     from dataclasses import replace
 
     from conftest import async_playwright, wait_until
@@ -2613,6 +2633,9 @@ async def test_voice_mode_answers_a_question_box_by_number(tmp_path, monkeypatch
         # A secret choice: options only, so no password field gives it away (#3401 review).
         secret = replace(question.questions[0], secret=True, allow_other=False)
         box = {"pending": replace(question, questions=(secret,))}
+    elif kind == "midway":
+        second = _question_interaction("tok-1", "Cache", "Which cache?", "Redis", "None")
+        box = {"pending": replace(question, questions=question.questions + second.questions)}
     else:
         box = {"pending": replace(question, kind="mcp_form" if kind == "mcp_form" else "question")}
     captured = {}
@@ -2627,9 +2650,7 @@ async def test_voice_mode_answers_a_question_box_by_number(tmp_path, monkeypatch
     monkeypatch.setattr(provider, "answer_interaction", answer_interaction)
 
     async with _live_server(app) as base_url, async_playwright() as playwright:
-        mode = {"mic": "tap", "jarvis": "jarvis"}.get(kind)
-        scripts = (f"localStorage.setItem('agentdeck.voiceListenMode', '{mode}')",) if mode else ()
-        browser, page, host = await _voice_page(playwright, base_url, scripts=scripts)
+        browser, page, host = await _voice_page(playwright, base_url)
         sent = []
 
         async def fulfil(route):
@@ -2648,7 +2669,8 @@ async def test_voice_mode_answers_a_question_box_by_number(tmp_path, monkeypatch
             await page.evaluate("""() => { const slot = document.getElementById(
                 'pending-interaction-slot');
                 window.__box = slot.innerHTML; slot.innerHTML = ''; }""")
-            await _voice_on(page)
+            await page.locator("form.inject-form [data-voice-button]").click()
+            await _pick(page, "jarvis")
             await wait_until(page, "it waits for Hey Jarvis",
                              f"() => ({_VOICE_STATE})() === 'waiting'", timeout=8000)
             await page.evaluate("""() => { const slot = document.getElementById(
@@ -2661,7 +2683,24 @@ async def test_voice_mode_answers_a_question_box_by_number(tmp_path, monkeypatch
             await host.hear("option two")
             await page.wait_for_timeout(1500)
             unwoken = [captured.copy(), await page.locator("#pending-interaction form").count()]
+            # A doubted answer picks nothing and is asked for again (#3817).
+            host.doubted.add("Hey Jarvis, option one")
+            await host.hear("Hey Jarvis, option one")
+            # In Hey Jarvis mode the answer again takes the name too, as any answer.
+            await _until(page, "it asked again", lambda: "Please say it again." in host.said[-1])
+            await wait_until(page, "it waits for the answer again",
+                             f"() => ({_VOICE_STATE})() === 'waiting'", timeout=8000)
             await host.hear("Hey Jarvis, option two")
+        elif kind == "refreshed":
+            await page.evaluate("""() => {
+                document.getElementById('pending-interaction-slot').innerHTML = ''; }""")
+            await _voice_on(page)
+            await wait_until(page, "it listens with no box", _LISTENING)
+            await page.evaluate("""() => htmx.ajax('GET',
+                '/partials/sessions/codex:test:sid/interaction?known_interaction_id=',
+                { target: '#pending-interaction-slot', swap: 'innerHTML' })""")
+            await _until(page, "the refreshed question was read",
+                         lambda: "Option 2, SQLite." in " ".join(host.said))
         else:
             await _voice_on(page)
         if kind == "secret":
@@ -2681,8 +2720,23 @@ async def test_voice_mode_answers_a_question_box_by_number(tmp_path, monkeypatch
             for text, lang in zip(host.said, host.languages, strict=True)
             if "SQLite" in text
         ]
+        if kind == "question":
+            # A doubted answer picks nothing and is asked for again (#3817).
+            host.doubted.add("option one")
+            await host.hear("option one")
+            await _until(page, "it asked again", lambda: "Please say it again." in host.said[-1])
+            await wait_until(page, "it listens for the answer again", _LISTENING)
         if kind != "jarvis":
             await host.hear("option two")
+        if kind == "midway":
+            # The same box swapped in again while the second question is asked.
+            await _until(page, "the second question was read",
+                         lambda: "Which cache?" in " ".join(host.said))
+            await page.evaluate("""() => htmx.ajax('GET',
+                '/partials/sessions/codex:test:sid/interaction?known_interaction_id=',
+                { target: '#pending-interaction-slot', swap: 'innerHTML' })""")
+            await wait_until(page, "it listens for the second answer", _LISTENING)
+            await host.hear("option one")
         await wait_until(page, "the answer reached the route",
                          "() => !document.querySelector('#pending-interaction form')",
                          timeout=8000)
@@ -2697,24 +2751,29 @@ async def test_voice_mode_answers_a_question_box_by_number(tmp_path, monkeypatch
         assert "Option 1, Postgres." in asked and "Option 2, SQLite." in asked
     if kind == "finnish":
         assert read_in == ["en"]
+    if kind == "midway":
+        assert captured == {"answers": {"database": ["SQLite"], "cache": ["Redis"]},
+                            "decision": "accept"}
+        return
     assert captured == {"answers": {"database": ["SQLite"]}, "decision": "accept"}
 
 
 @pytest.mark.browser
 async def test_voice_mode_keeps_typing_and_stops_dictation(tmp_path):
-    """Turning 🎧 on stops a running 🎤 dictation first, so it never hears "Voice mode
-    on", and 🎤 then listens for voice mode once picked from its menu (#3540);
+    """🎤 listens to everything once Always is picked from its menu (#3787);
     words typed while it listens stay in the draft (#3401 review); opening another
     chat in place lets go of this chat's microphone and starts voice mode again there,
     as it was (#3548), while a navigation that leaves this chat in place (the desktop
     front page mounting beside it, #3408) leaves it alone; a full page load starts it
-    again too, and once tapped off, the next chat opened starts with it off."""
+    again too, and once tapped off, the next chat opened starts with it off. Asked to,
+    it goes back to the deck chat, and the deck chat moves it on once its reply was
+    read, naming the chat it arrives in (#3816)."""
     from conftest import async_playwright, wait_until
     from test_inject import _live_server
 
     app = _host_voice_app(tmp_path, max_message_chars=1000)
     async with _live_server(app) as base_url, async_playwright() as playwright:
-        browser, page, host = await _voice_page(playwright, base_url, scripts=(_DICTATE,))
+        browser, page, host = await _voice_page(playwright, base_url)
         sent = []
 
         async def fulfil(route):
@@ -2726,15 +2785,11 @@ async def test_voice_mode_keeps_typing_and_stops_dictation(tmp_path):
 
         await page.route("**/sessions/codex:test:sid/inject", fulfil)
         await page.goto(f"{base_url}/sessions/codex:test:sid")
-        mic = page.locator("form.inject-form [data-speech-button]")
-        await mic.click()
-        await wait_until(page, "dictation records", "() => !!window.__mic")
         await page.locator("form.inject-form [data-voice-button]").click()
         await _until(page, "it said it is on", lambda: host.said)
-        await _hold(page, mic)
-        await page.locator('[data-voice-mic-mode="open"]').click()
+        await _pick(page, "open")
         await wait_until(page, "voice mode listens", _LISTENING)
-        dictation = [await mic.get_attribute("aria-pressed"), host.said[:]]
+        said = host.said[:]
 
         box = page.locator("#inject-message")
         await host.hear("fix the")
@@ -2759,11 +2814,47 @@ async def test_voice_mode_keeps_typing_and_stops_dictation(tmp_path):
         navigated = await page.evaluate(
             """() => [document.querySelector('[data-voice-button]').getAttribute('aria-pressed'),
                       __left.stream.getTracks().map((t) => t.readyState), __mic !== __left]""")
-        # A full load: 🎧 is on again; the init script put 🎤 back to dictation.
+        # A full load: 🎧 is on again.
         await page.reload()
         await _until(page, "it said it is on again", lambda: host.said.count("Voice mode on.") == 3)
         reloaded = await page.locator("[data-voice-button]").get_attribute("aria-pressed")
+        await wait_until(page, "it listens after the reload", _LISTENING)
+
+        # The way back to the deck chat (#3816): the fast agent's jump sends nothing and
+        # opens the deck chat in place, where voice mode names it instead of "on".
+        async def back_route(route):
+            await route.fulfill(status=200, content_type="application/json", body=json.dumps(
+                {"say": "", "relay": None, "jump": {"path": "/chats/deck", "title": "Deck chat"}}))
+
+        await page.route("**/api/voice/heard", back_route)
+        await page.evaluate("""() => { window.__opened = [];
+            AgentDeckSessionNavigation.open = (path) => { __opened.push(path);
+              document.querySelector('.transcript').dataset.sessionKey =
+                'codex:test:' + path.split('/').pop();
+              document.dispatchEvent(new CustomEvent('agentdeck:session-navigation')); }; }""")
+        await host.hear("take me back to the deck chat")
+        await _until(page, "it named the chat it arrived in",
+                     lambda: "Now in: Deck chat." in host.said)
+        went_back = [await page.evaluate("__opened"), len(sent)]
+        await page.unroute("**/api/voice/heard")
+        # The deck chat's jump onward, made mid-turn: the page moves only once the turn's
+        # reply was read, so that is heard first.
+        await wait_until(page, "it listens in the deck chat", _LISTENING)
+        await page.evaluate(_TURN + "(['thinking', null])")
+        await page.evaluate("""() => { const slot = document.getElementById('chat-jump-slot');
+            slot.innerHTML = '<span data-chat-jump=\\'{"id": "j1", "path": "/chats/bug",'
+              + ' "title": "🐞 The login bug"}\\'></span>';
+            slot.dispatchEvent(new CustomEvent('htmx:sseMessage', {bubbles: true})); }""")
+        await page.wait_for_timeout(300)
+        waited = await page.evaluate("__opened.length")
+        await page.evaluate(_TURN + "(['idle', '🔊 Taking you to the login bug.'])")
+        await _until(page, "it named the chat it jumped to",
+                     lambda: "Now in: The login bug." in host.said)
+        heard_first = host.said[-2:]
+        went_on = await page.evaluate("__opened")
+        await wait_until(page, "it listens in the chat jumped to", _LISTENING)
         await page.locator("form.inject-form [data-voice-button]").click()
+        await _pick(page, "off")
         await page.evaluate(other_chat)
         await page.wait_for_timeout(300)
         tapped_off = [await page.locator("[data-voice-button]").get_attribute("aria-pressed"),
@@ -2771,13 +2862,16 @@ async def test_voice_mode_keeps_typing_and_stops_dictation(tmp_path):
                           "() => document.documentElement.classList.contains('voice-on')")]
         await browser.close()
 
-    assert dictation == ["false", ["Voice mode on."]]
+    assert said == ["Voice mode on."]
     assert len(sent) == 1
     assert "fix+the+login+bug" in sent[0] or "fix the login bug" in sent[0]
     assert kept == "true"
     assert navigated == ["true", ["ended"], True]
     assert host.said.count("Voice mode on.") == 3
     assert reloaded == "true"
+    assert went_back == [["/chats/deck"], 1]
+    assert went_on == ["/chats/deck", "/chats/bug"] and waited == 1
+    assert heard_first == ["Taking you to the login bug.", "Now in: The login bug."]
     assert tapped_off == ["false", False]
 
 
@@ -2900,10 +2994,12 @@ async def test_voice_mode_listens_and_speaks_through_the_host(tmp_path):
         await page.route("**/sessions/codex:test:sid/inject", inject)
         await page.route("**/api/speech/say", say)
         await page.route("**/api/speech/transcribe*", transcribe)
+        await page.route("**/api/voice/narrate", lambda route: route.fulfill(status=204))
         await page.goto(f"{base_url}/sessions/codex:test:sid")
         button = page.locator("form.inject-form [data-voice-button]")
-        mic = page.locator("form.inject-form [data-voice-mic]")
         await button.wait_for(state="visible")
+        # A send mid-turn is acknowledged once the chat stays quiet for 0.3 s (#3799).
+        await page.evaluate(_QUIET + "('0.3 600')")
         await _voice_on(page)
         listening = """() => document.querySelector('[data-voice-button]')
             .getAttribute('data-voice-state') === 'listening'"""
@@ -2911,17 +3007,18 @@ async def test_voice_mode_listens_and_speaks_through_the_host(tmp_path):
 
         # Half a second of speech, then quiet: one phrase goes to the host, and its
         # words are sent a second later with the Finnish line.
+        await page.evaluate(_TURN + "(['thinking', null])")
+        await wait_until(page, "it listens while the agent works", listening)
         await page.evaluate("__mic.level(0.5)")
         await page.wait_for_timeout(500)
         await page.evaluate("__mic.level(0)")
         for _ in range(40):
-            if sent:
+            if len(said) > 1:
                 break
             await page.wait_for_timeout(100)
 
         # English words Whisper called Finnish (#3417), said while the agent works:
         # sent with the plain line.
-        await page.evaluate(_TURN + "(['thinking', null])")
         await wait_until(page, "it listens while the agent works", listening)
         # The room stays a little loud after the words (#3424): learned while it
         # lasts, that noise counts as quiet, and the phrase still ends.
@@ -2934,6 +3031,10 @@ async def test_voice_mode_listens_and_speaks_through_the_host(tmp_path):
                 break
             await page.wait_for_timeout(100)
         await page.evaluate("__mic.level(0)")
+        for _ in range(40):
+            if len(said) > 2:
+                break
+            await page.wait_for_timeout(100)
 
         # The reply's 🔊 paragraph is read with the Finnish voice.
         await wait_until(page, "it listens after the acknowledgements", listening)
@@ -2999,13 +3100,9 @@ async def test_voice_mode_listens_and_speaks_through_the_host(tmp_path):
         await wait_until(page, "the turn's end listens", listening, timeout=8000)
         await page.clock.fast_forward(31000)
         await wait_until(page, "it waits again", f"() => ({state})() === 'waiting'")
-        # Each send is acknowledged at once (#3444); it listens again after that.
+        # Nothing is said at a send with no turn (#3799); it listens again after it.
         async def after_ack(count):
-            for _ in range(60):
-                if len(said) > count:
-                    break
-                await page.wait_for_timeout(100)
-            await wait_until(page, "it listens after the acknowledgement", listening)
+            await wait_until(page, "it listens after the send", listening)
 
         acked = len(said)
         await say_phrase("Hey, Jarvis. Run the tests.")
@@ -3016,22 +3113,21 @@ async def test_voice_mode_listens_and_speaks_through_the_host(tmp_path):
         await page.evaluate("window.__first = __mic.stream")
         mic_stopped = await page.evaluate(
             "() => __first.getTracks().map((t) => t.readyState)")
-        await mic.click()
+        await _pick(page, "off")
         mic_muted = await page.evaluate(
             "() => __first.getTracks().map((t) => t.readyState)")
-        await mic.click()
+        await _pick(page, "open")
         await wait_until(page, "on again, it listens on a new recording", """() =>
             __mic.stream !== __first && document.querySelector('[data-voice-button]')
             .getAttribute('data-voice-state') === 'listening'""")
 
-        # No words for the page's 5 s (#3424): it waits for "Hey Jarvis"; 🎤 off and on
-        # again listens for a message.
+        # No words for the page's 5 s (#3424): it waits for "Hey Jarvis"; Always
+        # picked again listens.
         await wait_until(page, "it waits after the idle seconds",
                          f"() => ({state})() === 'waiting'", timeout=8000)
         idled = await page.locator(".voice-control .speech-status").text_content()
-        await mic.click()
-        await mic.click()
-        await wait_until(page, "a tap listens again", listening)
+        await _pick(page, "open")
+        await wait_until(page, "Always listens again", listening)
 
         # The service crashes once: the phrase is sent again once it is back.
         host["fail"] = 1
@@ -3155,7 +3251,8 @@ async def test_voice_mode_listens_and_speaks_through_the_host(tmp_path):
         await browser.close()
 
     assert said[0] == {"text": "Voice mode on.", "language": "en"}
-    # Each send is acknowledged at once, in the language it asked for (#3444).
+    # Each send mid-turn is acknowledged once the chat stays quiet, in the language it
+    # asked for (#3444, #3799).
     assert said[1:3] == [{"text": "Selvä, työn alla.", "language": "fi"},
                          {"text": "Got it, working on it.", "language": "en"}]
     assert said[3] == {"text": "Valmis, testi lisätty.", "language": "fi"}
@@ -3174,7 +3271,7 @@ async def test_voice_mode_listens_and_speaks_through_the_host(tmp_path):
     assert "still+there" in sent[3] or "still there" in sent[3]
     assert "long+sentence" in sent[4] or "long sentence" in sent[4]
     assert "over+the+noise" in sent[5] or "over the noise" in sent[5]
-    assert idled == "Say “Hey Jarvis”"
+    assert idled == "Say “Hey Jarvis” · tap 🎤 to talk"
     assert "lis%C3%A4%C3%A4+testi" in sent[0] or "lisää testi" in sent[0]
     assert "Answer+in+Finnish" in sent[0] or VOICE_LINE_FI in sent[0]
     assert "last+hour" in sent[1] or "last hour" in sent[1]
@@ -3241,7 +3338,9 @@ async def test_voice_mode_answers_sooner_after_the_owner_stops_talking(tmp_path)
             mark("transcribe")
             with wave.open(io.BytesIO(route.request.post_data_buffer)) as posted:
                 lengths.append(posted.getnframes() / posted.getframerate())
-            body = json.dumps({"text": words[0], "language": "en"})
+            # Whisper doubts the second "test." (#3817).
+            parts = [{"text": words[0], "unsure": words[0] == "test."}]
+            body = json.dumps({"text": words[0], "language": "en", "segments": parts})
             await route.fulfill(status=200, content_type="application/json", body=body)
 
         async def heard(route):
@@ -3295,6 +3394,10 @@ async def test_voice_mode_answers_sooner_after_the_owner_stops_talking(tmp_path)
         await page.evaluate("__mic.pulse(0.5, 500)")
         await until("sent", 1)
         first = list(log)
+        # Nothing is said at the send (#3799): the first voice is the chat's reply.
+        await page.evaluate(_TURN + "(['thinking', null])")
+        await page.evaluate(_TURN + "(['idle', '🔊 Fixed it.'])")
+        await until("say", 1)
         await wait_until(page, "it listens after the answer", listening, timeout=8000)
         played_first = await page.evaluate("__played.slice()")
 
@@ -3310,7 +3413,7 @@ async def test_voice_mode_answers_sooner_after_the_owner_stops_talking(tmp_path)
 
         # More words while the first piece's answer is on its way: thrown away.
         log.clear()
-        words[0] = "And the"
+        words[0] = "And the test."
         await page.evaluate("__mic.pulse(0.5, 500)")
         await until("ask", 1)
         words[0] = "test."
@@ -3345,13 +3448,18 @@ async def test_voice_mode_answers_sooner_after_the_owner_stops_talking(tmp_path)
     assert "filler" not in names and 0.6 not in played_first
     assert second.count("transcribe") == 2 and second.count("ask") == 1
     assert third.count("ask") == 2 and "filler" not in third
-    assert asks[-2]["text"] == "And the" and asks[-1]["text"] == "And the test."
+    # The part Whisper doubted is asked about, and sent, marked: the second "test",
+    # not the first (#3817).
+    doubted = "And the test. [unsure: test.]"
+    assert asks[-2]["text"] == "And the test." and asks[-1]["text"] == doubted
+    assert [r["text"] for r in reports if r.get("id") == asks[-1]["id"] and "how" in r] == [
+        doubted]
     assert asks[-1]["drop"] == asks[-2]["id"] and not asks[-2]["drop"]
     dropped = [r for r in reports if r.get("id") == asks[-2]["id"]]
     assert dropped == [{"session_key": "codex:test:sid", "id": asks[-2]["id"], "text": None,
                         "how": "not sent: more words followed"}]
     timing = [r["timing"] for r in reports if r.get("id") == asks[0]["id"] and "timing" in r]
-    # The first voice is now the acknowledgement, after the send.
+    # The first voice is the chat's reply, after the send.
     assert len(timing) == 1 and timing[0]["words"] < timing[0]["sent"] < timing[0]["voice"]
     # Its check, then the whole phrase with the 0.8 s pause that ended it.
     assert overheard.count("transcribe") == 2 and lengths[-1] > lengths[0] + 0.7, lengths
@@ -3420,7 +3528,11 @@ async def test_voice_mode_for_an_owner_who_always_speaks_finnish(tmp_path):
         await page.route("**/api/speech/say", say)
         await page.route("**/api/speech/transcribe*", transcribe)
         await page.route("**/api/speech/status", status)
+        # The fast agent has nothing to say on the quiet turn (#3799).
+        await page.route("**/api/voice/narrate", lambda route: route.fulfill(status=204))
         await page.goto(f"{base_url}/sessions/codex:test:sid")
+        await page.evaluate("""() => document.querySelector('form.inject-form .voice-control')
+            .setAttribute('data-voice-quiet-seconds', '0.5 30')""")
         await _voice_on(page)
         listening = """() => document.querySelector('[data-voice-button]')
             .getAttribute('data-voice-state') === 'listening'"""
@@ -3439,8 +3551,13 @@ async def test_voice_mode_for_an_owner_who_always_speaks_finnish(tmp_path):
                 break
             await page.wait_for_timeout(100)
         shown = await page.evaluate("window.__shown")
-        await wait_until(page, "it listens after the acknowledgement", listening)
+        # A quiet turn: once its quiet spell is over, the acknowledgement.
         await page.evaluate(_TURN + "(['thinking', null])")
+        for _ in range(60):
+            if len(said) > 1:
+                break
+            await page.wait_for_timeout(100)
+        await wait_until(page, "it listens after the acknowledgement", listening)
         await page.evaluate(_TURN + "(['idle', '🔊 Done, the pull request is merged.'])")
         for _ in range(60):
             if len(said) > 2:
@@ -3465,7 +3582,11 @@ async def test_voice_mode_waits_on_the_wake_word_detector(tmp_path, monkeypatch)
     alone beeps and listens untranscribed, saying nothing (#3781), and a phrase with
     words after the wake word is transcribed whole and sent without it, even when
     Whisper misspells the name.
-    What Whisper made of a waiting phrase is reported for the wake log."""
+    What Whisper made of a waiting phrase is reported for the wake log.
+    In Jarvis mode a reply being read goes on through talk the detector does not
+    wake on; "Hey Jarvis" stops it (#3798), sending the words after the name with
+    the line saying the reply was not heard in full, or beeping and listening with
+    none."""
     import json
 
     from conftest import async_playwright, wait_until
@@ -3482,7 +3603,7 @@ async def test_voice_mode_waits_on_the_wake_word_detector(tmp_path, monkeypatch)
     monkeypatch.setattr(issue_post, "issue_post_target", lambda state, key: chip)
     app.state.templates.env.globals["voice_idle_seconds"] = 5
     app.state.templates.env.globals["voice_wake"] = "detector"
-    wav = _silent_wav()
+    wav, long = _silent_wav(), _silent_wav(seconds=20)
     async with _live_server(app) as base_url, async_playwright() as playwright:
         browser = await playwright.chromium.launch(
             args=["--autoplay-policy=no-user-gesture-required"]
@@ -3508,7 +3629,8 @@ async def test_voice_mode_waits_on_the_wake_word_detector(tmp_path, monkeypatch)
 
         async def say(route):
             said.append(json.loads(route.request.post_data)["text"])
-            await route.fulfill(status=200, body=wav, content_type="audio/wav")
+            body = long if said[-1].startswith("The tests passed") else wav
+            await route.fulfill(status=200, body=body, content_type="audio/wav")
 
         async def wake(route):
             woken.append(route.request.url.partition("?id=")[2])
@@ -3540,7 +3662,7 @@ async def test_voice_mode_waits_on_the_wake_word_detector(tmp_path, monkeypatch)
             return [r.left >= 0 && r.right <= innerWidth, s.scrollWidth <= s.clientWidth,
                     s.textContent]; }"""
 
-        async def say_phrase(answer, text=""):
+        async def say_phrase(answer, text="", settle=1500):
             found.append(answer)
             heard.append(text)
             asked = len(woken)
@@ -3551,7 +3673,7 @@ async def test_voice_mode_waits_on_the_wake_word_detector(tmp_path, monkeypatch)
                 if len(woken) > asked:
                     break
                 await page.wait_for_timeout(100)
-            await page.wait_for_timeout(1500)
+            await page.wait_for_timeout(settle)
 
         await page.clock.fast_forward(31000)
         await wait_until(page, "it waits for the wake word", waiting)
@@ -3560,8 +3682,9 @@ async def test_voice_mode_waits_on_the_wake_word_detector(tmp_path, monkeypatch)
         chatter = [len(woken), list(transcribed), len(sent), await page.evaluate(
             f"({_VOICE_STATE})()")]
         quiet = [len(said), await page.evaluate("__tones.length")]
-        await say_phrase({"woken": True, "score": 0.98, "speech_after": False})
-        await wait_until(page, "it listens after the wake word", _LISTENING, timeout=5000)
+        await say_phrase({"woken": True, "score": 0.98, "speech_after": False}, settle=0)
+        # At once, not after the second a message waits for more words (#3793).
+        await wait_until(page, "it listens after the wake word", _LISTENING, timeout=600)
         bare = [list(transcribed), said[quiet[0]:],
                 await page.evaluate(f"__tones.slice({quiet[1]})")]
 
@@ -3583,15 +3706,56 @@ async def test_voice_mode_waits_on_the_wake_word_detector(tmp_path, monkeypatch)
             if len(sent) > 1:
                 break
             await page.wait_for_timeout(100)
+        named, logs, words = list(woken), list(logged), list(transcribed)
+
+        # Jarvis mode, reading a reply: talk the detector does not wake on goes
+        # untranscribed and the reading goes on (#3798).
+        speaking = f"() => ({_VOICE_STATE})() === 'speaking'"
+        await _pick(page, "jarvis")
+        await wait_until(page, "it waits in Jarvis mode", waiting)
+
+        async def read(reply):
+            await page.evaluate(_TURN + "(['thinking', null])")
+            await page.evaluate(_TURN + f"(['idle', {json.dumps(reply)}])")
+            # Not the short "Got it" still read for the message sent before.
+            for _ in range(40):
+                if said[-1] == reply[2:]:
+                    break
+                await page.wait_for_timeout(100)
+            await page.wait_for_timeout(300)
+            await wait_until(page, "it reads the reply", speaking)
+
+        await read("🔊 The tests passed and the branch is merged.")
+        heard_before = len(transcribed)
+        await say_phrase({"woken": False, "score": 0.02, "speech_after": False}, "Nice day.")
+        read_on = [len(woken) - len(named), transcribed[heard_before:],
+                   await page.evaluate(f"({_VOICE_STATE})()")]
+        await say_phrase({"woken": True, "score": 0.96, "speech_after": True},
+                         "Hey Jarvis, what changed?", settle=0)
+        for _ in range(40):
+            if len(sent) > 2:
+                break
+            await page.wait_for_timeout(100)
+        # With nothing after the name it beeps and listens.
+        await read("🔊 The tests passed once more.")
+        tones = await page.evaluate("__tones.length")
+        await say_phrase({"woken": True, "score": 0.98, "speech_after": False}, settle=0)
+        await wait_until(page, "the name alone stops it and listens", _LISTENING, timeout=2000)
+        alone = [transcribed[heard_before:], await page.evaluate(f"__tones.slice({tones})")]
         await browser.close()
 
-    assert on_screen == [True, True, "Say “Hey Jarvis”"]
+    assert on_screen == [True, True, "Say “Hey Jarvis” · tap 🎤 to talk"]
     assert chatter == [1, [], 0, "waiting"]
     assert bare == [[], [], [880]]
+    woken, logged, transcribed = named, logs, words
     assert transcribed == ["Hey, Jarvis. Run the tests.", "Hey Travis, check the logs."]
     assert "Run+the+tests" in sent[0] or "Run the tests" in sent[0]
     assert "Jarvis" not in sent[0]
     assert "check+the+logs" in sent[1] or "check the logs" in sent[1]
+    assert read_on == [1, [], "speaking"]
+    assert alone == [["Hey Jarvis, what changed?"], [880]]
+    cut = sent[2].replace("+", " ") if len(sent) == 3 else ""
+    assert "what changed" in cut and "Jarvis" not in cut and "had not heard" in cut
     # Each phrase is named, and Whisper's words for the woken ones are logged.
     assert len(set(woken)) == 4 and all(woken)
     phrases = [entry for entry in logged if "id" in entry]
@@ -3607,12 +3771,14 @@ async def test_voice_mode_waits_on_the_wake_word_detector(tmp_path, monkeypatch)
 
 @pytest.mark.browser
 async def test_voice_mode_reads_with_headphones_and_listens_with_the_mic_its_way(tmp_path):
-    """🎧 only reads aloud and 🎤 only listens, each on and off by a tap (#3540). With
-    🎧 alone a reply is read and nothing listens; 🎤 in Always listens after each
-    reply, with 🎧 off too, and then asks for no 🔊 line. A long press on 🎤 picks how
-    it listens, kept on the device: Hey Jarvis lets talk in the room go and sends the
-    words after the name; Tap lets go of the microphone between messages and listens
-    for one message a tap; Dictate gives 🎤 back to plain dictation."""
+    """🎧 only reads aloud and 🎤 only listens (#3540). With 🎧 alone a reply is read
+    and nothing listens. 🎤 starts in Jarvis (#3787): a tap listens for one message,
+    then it waits for "Hey Jarvis", letting talk in the room go and sending the words
+    after the name; a tap while it waits listens for one message again, and a tap
+    while it listens sends what was heard and goes back to Jarvis. A long press opens
+    Jarvis, Always and Off: Always listens after each reply, with 🎧 off too, and then
+    asks for no 🔊 line; Off lets go of the microphone. A fresh page starts in Jarvis,
+    and the mode the old menu kept on the device is dropped."""
     from conftest import async_playwright, wait_until
     from test_inject import _live_server
 
@@ -3685,28 +3851,15 @@ async def test_voice_mode_reads_with_headphones_and_listens_with_the_mic_its_way
                   await page.locator(".voice-control .speech-status").text_content(),
                   await page.evaluate("document.documentElement.classList.contains('voice-on')")]
 
-        # 🎤 in Always: it listens, and a message asks for a 🔊 line while 🎧 reads.
+        # 🎤 tapped: it listens for one message at once, which asks for a 🔊 line
+        # while 🎧 reads, and then waits for "Hey Jarvis".
         await mic.click()
         await wait_until(page, "🎤 listens", _LISTENING)
         await host.hear("add a test")
         await sends(1)
-        # 🎧 off: a reply is not read, and Always listens once the turn ends; the
-        # message then asks for no 🔊 line.
-        await wait_until(page, "it listens after the send", _LISTENING, timeout=8000)
-        await button.click()
-        silent_tap = await button.get_attribute("aria-pressed")
-        said_before = len(said)
-        await reply("Not read.")
-        await wait_until(page, "it listens after the unread reply", _LISTENING, timeout=6000)
-        await host.hear("and the docs")
-        await sends(2)
-        unread = said[said_before:]
-
-        # Hey Jarvis: talk in the room is let go of while the agent works, and after
-        # the reply it waits again; the words after the name are sent.
-        await wait_until(page, "it listens after the send", _LISTENING, timeout=8000)
-        await pick("jarvis")
-        await wait_until(page, "it waits for Hey Jarvis", state_is("waiting"))
+        await wait_until(page, "it waits for Hey Jarvis", state_is("waiting"), timeout=8000)
+        # Talk in the room is let go of while the agent works, and after the reply it
+        # waits again; the words after the name are sent.
         await page.evaluate(_TURN + "(['thinking', null])")
         await host.hear("what shall we eat today")
         await page.wait_for_timeout(1500)
@@ -3714,35 +3867,63 @@ async def test_voice_mode_reads_with_headphones_and_listens_with_the_mic_its_way
         await page.wait_for_timeout(1500)
         chatter = [len(sent), await page.evaluate(f"({_VOICE_STATE})()")]
         await host.hear("Hey Jarvis, add a label.")
-        await sends(3)
+        await sends(2)
         await wait_until(page, "it waits after the send", state_is("waiting"), timeout=8000)
-
-        # Tap: picked, it listens for one message, then lets go of the microphone; a
-        # tap listens again, and a second tap takes the message back.
-        await pick("tap")
-        await wait_until(page, "picking Tap listens once", _LISTENING)
-        await host.hear("run the tests")
-        await sends(4)
-        voice_off = "() => !document.documentElement.classList.contains('voice-on')"
-        # With 🎧 off too, voice mode ends with the message.
-        await wait_until(page, "closed after the send", voice_off, timeout=8000)
-        tapped = await page.evaluate(tracks)
+        # A tap while it waits listens for one message without the name; a tap while
+        # it listens sends what was heard at once and goes back to waiting.
+        # Tapped while the words are still with the host, they go once back.
         await mic.click()
         await wait_until(page, "a tap listens", _LISTENING)
+        host.wait = asyncio.Event()
+        await host.hear("run the tests")
         await mic.click()
-        await wait_until(page, "a second tap takes it back", voice_off)
-        tap = await page.evaluate(tracks)
+        host.wait.set()
+        host.wait = None
+        await sends(3)
+        await wait_until(page, "a tap sent it and waits", state_is("waiting"), timeout=8000)
+        # Tapped while still talking, the phrase ends there and is sent.
+        await mic.click()
+        await wait_until(page, "a tap listens again", _LISTENING)
+        host.queue.append("and the lint")
+        await page.evaluate("__mic.level(0.5)")
+        await page.wait_for_timeout(500)
+        await mic.click()
+        await page.evaluate("__mic.level(0)")
+        await sends(4)
+        await wait_until(page, "it waits again", state_is("waiting"), timeout=8000)
 
-        # Both off ends voice mode; a fresh page keeps Tap, and Dictate gives 🎤 back
-        # to dictation, with no voice mode.
+        # Always, from the menu: 🎧 off, a reply is not read, and it listens once the
+        # turn ends; the message then asks for no 🔊 line.
+        await pick("open")
+        await wait_until(page, "Always listens", _LISTENING)
+        await button.click()
+        silent_tap = await button.get_attribute("aria-pressed")
+        said_before = len(said)
+        await reply("Not read.")
+        await wait_until(page, "it listens after the unread reply", _LISTENING, timeout=6000)
+        await host.hear("and the docs")
+        await sends(5)
+        unread = said[said_before:]
+
+        # Off, from the menu: the microphone is let go of, and with 🎧 off voice mode ends.
+        await wait_until(page, "it listens after the send", _LISTENING, timeout=8000)
+        await pick("off")
+        voice_off = "() => !document.documentElement.classList.contains('voice-on')"
+        await wait_until(page, "voice mode ended", voice_off)
+        off = await page.evaluate(tracks)
+
+        # A fresh page starts in Jarvis, and the device's old mode is dropped.
+        await page.evaluate("localStorage.setItem('agentdeck.voiceListenMode', 'dictate')")
         await page.reload()
         await mic.wait_for(state="visible")
-        kept = await mic.get_attribute("data-voice-listen")
-        await pick("dictate")
         await mic.click()
-        await wait_until(page, "it dictates", """() => document.querySelector(
-            '[data-voice-mic]').getAttribute('aria-pressed') === 'true'""")
-        dictating = await page.evaluate("document.documentElement.classList.contains('voice-on')")
+        await wait_until(page, "a tap listens through voice mode", _LISTENING)
+        fresh = [await page.evaluate("localStorage.getItem('agentdeck.voiceListenMode')"),
+                 await mic.get_attribute("aria-pressed")]
+        await _hold(page, mic)
+        ticked = await page.evaluate("""() => [...document.querySelectorAll(
+            '[data-voice-mic-mode]')].map((b) => b.dataset.voiceMicMode + ':'
+            + b.getAttribute('aria-checked'))""")
         await browser.close()
 
     def has(body, words):
@@ -3750,18 +3931,19 @@ async def test_voice_mode_reads_with_headphones_and_listens_with_the_mic_its_way
 
     assert reads_only == [[], False]
     assert hushed == ["true", "Stopped reading", True]
-    assert silent_tap == "false"
-    assert menus == [True, True, True]
+    assert menus == [True, True]
     assert VOICE_LINE.split(" ")[0] in sent[0] and has(sent[0], "add a test")
+    assert chatter == [1, "waiting"]
+    assert has(sent[1], "add a label") and "Jarvis" not in sent[1]
+    assert has(sent[2], "run the tests")
+    assert has(sent[3], "and the lint")
+    assert silent_tap == "false"
     assert unread == []
-    assert VOICE_LINE.split(" ")[0] not in sent[1] and has(sent[1], "and the docs")
-    assert chatter == [2, "waiting"]
-    assert has(sent[2], "add a label") and "Jarvis" not in sent[2]
-    assert tap == ["ended"]
-    assert has(sent[3], "run the tests") and len(sent) == 4
-    assert tapped == ["ended"]
-    assert kept == "tap"
-    assert dictating is False
+    assert VOICE_LINE.split(" ")[0] not in sent[4] and has(sent[4], "and the docs")
+    assert len(sent) == 5
+    assert off == ["ended"]
+    assert fresh == [None, "false"]
+    assert ticked == ["jarvis:true", "open:false", "off:false"]
 
 
 @pytest.mark.browser
@@ -4022,7 +4204,7 @@ async def test_dictation_listens_through_the_host_and_falls_back_to_the_browser(
         context = await browser.new_context(service_workers="block")
         await context.add_init_script(_NO_RECOGNITION)
         await context.add_init_script(_FAKE_MICROPHONE)
-        await context.add_init_script(_DICTATE)
+        await context.route(_VOICE_MODE_JS, lambda route: route.abort())
         page = await context.new_page()
         await page.route("**/sessions/codex:test:sid/inject", inject)
         await page.route("**/api/speech/transcribe*", transcribe)
@@ -4119,7 +4301,7 @@ async def test_dictation_listens_through_the_host_and_falls_back_to_the_browser(
         context = await browser.new_context(service_workers="block")
         await context.add_init_script(_FAKE_RECOGNITION)
         await context.add_init_script(_FAKE_MICROPHONE)
-        await context.add_init_script(_DICTATE)
+        await context.route(_VOICE_MODE_JS, lambda route: route.abort())
         page = await context.new_page()
         await page.route("**/api/speech/transcribe*", transcribe)
         await page.goto(f"{base_url}/sessions/codex:test:sid")
@@ -4370,7 +4552,7 @@ async def test_a_microphone_granted_after_a_mute_is_let_go_of_at_once(tmp_path):
                  ".getAttribute('data-voice-state')")
         await wait_until(page, "it listens, the microphone still pending",
                          f"() => ({state})() === 'listening' && window.__grant && !window.__mic")
-        await page.locator("form.inject-form [data-voice-mic]").click()
+        await _pick(page, "off")
         await wait_until(page, "listening is off", f"() => ({state})() === 'idle'")
         await page.evaluate("__grant()")
         await wait_until(page, "the late stream arrived", "() => !!window.__mic")
@@ -4381,66 +4563,6 @@ async def test_a_microphone_granted_after_a_mute_is_let_go_of_at_once(tmp_path):
 
     assert got == ["idle", ["ended"]]
 
-
-
-@shipped("scripts/speech_bench.py")
-def test_the_speech_bench_scores_words_terms_and_both_languages(tmp_path):
-    """``scripts/speech_bench.py`` (#3499): term spellings count as one word in any
-    form, a mixed phrase's Finnish is scored without its terms, and a model passes
-    only on every part of the rule."""
-    import importlib.util
-
-    scripts = Path(__file__).resolve().parents[1] / "scripts"
-    spec = importlib.util.spec_from_file_location("speech_bench", scripts / "speech_bench.py")
-    bench = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(bench)
-
-    # Room noise never takes a line of the list, but a spoken phrase Whisper heard
-    # no words in still does: the audio decides, not Whisper's text.
-    kept = tmp_path / "kept"
-    kept.mkdir()
-    for number, (text, audio) in enumerate([("Stop.", b"RIFFs"), ("", b"RIFFs"), ("", b"RIFF")]):
-        (kept / f"k{number}.wav").write_bytes(audio)
-        with (kept / "kept.jsonl").open("a") as log:
-            log.write(json.dumps({"at": 10 + number, "id": f"k{number}", "text": text}) + "\n")
-    lines = bench.spoken(bench.kept_since(kept, 0, 99), kept, lambda audio: audio.endswith(b"s"))
-    assert [line["id"] for line in lines] == ["k0", "k1"]
-    phrases = bench.load_phrases()
-    groups = [group for group, _ in phrases]
-    assert (groups.count("en"), groups.count("fi"), groups.count("mix")) == (10, 10, 25)
-    assert bench.words("Open Agent Deck, the pull-request!") == [
-        "open", "agentdeck", "the", "pullrequest"
-    ]
-    assert bench.errors(["a", "b", "c"], ["a", "x", "c", "d"]) == 2
-    assert bench.terms_in("Avaa AgentDeckin speech server") == {"AgentDeck", "speech server"}
-    assert bench.terms_in("speech") == set()
-    assert bench.finnish_only("Tee pull request ja deployaa se") == ["tee", "ja", "se"]
-
-    def row(group, said, a, b):
-        return {"group": group, "said": said, "a": a, "a_s": 0.5, "whisper-en": b,
-                "whisper-en_s": 0.7, "whisper-auto": b, "whisper-auto_s": 1.0}
-
-    rows = [
-        row("en", "Merge it now.", "merge it now", "merge it now"),
-        row("mix", "Mergeä se pull request.", "Mergeä se pull request", "Merge a C pull quest"),
-    ]
-    scores = {name: bench.score(rows, name) for name in ("a", "whisper-en", "whisper-auto")}
-    assert (scores["a"]["mix"], scores["a"]["terms"], scores["a"]["terms_of"]) == (0.0, 3, 3)
-    assert scores["whisper-en"]["mix_fi"] > 100  # "se" heard as "a c pull quest"
-    assert bench.verdict(scores, "a").startswith("**passes**")
-    # A run with only some models (``--models``) compares with the Whisper it has.
-    assert "against whisper-en" in bench.verdict({k: scores[k] for k in ("a", "whisper-en")}, "a")
-    # With no small Whisper run, a large Whisper is held against Orukeet (#3517).
-    no_small = {"whisper-turbo": scores["a"], "orukeet": scores["whisper-en"]}
-    assert "against orukeet" in bench.verdict(no_small, "whisper-turbo")
-    # English may be two words worse in total, not three (owner's choice).
-    rows[0]["a"] = "merge a bit now"
-    assert bench.verdict({**scores, "a": bench.score(rows, "a")}, "a").startswith("**passes**")
-    rows[0]["a"] = "merge a bit of it now"
-    assert "✗ English" in bench.verdict({**scores, "a": bench.score(rows, "a")}, "a")
-    rows[0]["a"] = "merge it now"
-    rows[0]["a_s"] = rows[1]["a_s"] = 2.0
-    assert "✗ median" in bench.verdict({**scores, "a": bench.score(rows, "a")}, "a")
 
 
 def test_status_marks_a_chat_kept_working_only_by_background_work():

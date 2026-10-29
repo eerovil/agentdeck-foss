@@ -2,6 +2,7 @@
   'use strict';
 
   var SEND_RETRY_DELAYS = [800, 1600, 3200];
+  var IMAGE_TYPES = /^(?:image\/png|image\/jpeg|image\/webp|image\/gif)$/;
 
   function timing() { return window.AgentDeckActionTiming; }
 
@@ -38,10 +39,18 @@
   }
   window.AgentDeckSendRetry = {bufferable: retryBufferable};
 
+  // The line the server sends in place of an empty box (`_attachment_only_text`, #3790).
+  function attachmentOnlyText(files) {
+    var images = files.every(function (file) { return IMAGE_TYPES.test(file.type); });
+    return 'See the attached ' + (images ? 'image' : 'file') + (files.length > 1 ? 's' : '') + '.';
+  }
+
   function optimisticMessage(form, record) {
     var transcript = document.querySelector('.transcript');
     var input = form.querySelector('textarea[name="message"]');
-    if (!transcript || !input || !input.value.trim()) return null;
+    var fileInput = form.querySelector('input[type="file"][name="images"]');
+    var files = Array.from((fileInput && fileInput.files) || []);
+    if (!transcript || !input || (!input.value.trim() && !files.length)) return null;
     var row = document.createElement('div');
     row.className = 'ev user pending-message optimistic-message sending';
     row.dataset.pendingMessage = '';
@@ -64,17 +73,16 @@
     text.textContent = isSecretCommand(input.value)
       ? (name ? 'Temporary secret ' + name + ' submitted securely' :
         'Temporary secret command submitted securely')
-      : input.value.trim();
+      : (input.value.trim() || attachmentOnlyText(files));
     row.appendChild(head);
     row.appendChild(text);
-    var fileInput = form.querySelector('input[type="file"][name="images"]');
-    if (fileInput && fileInput.files && fileInput.files.length) {
+    if (files.length) {
       var attachments = document.createElement('div');
       attachments.className = 'ev-images';
       attachments.setAttribute('aria-label', fileInput.files.length +
         (fileInput.files.length === 1 ? ' attached file' : ' attached files'));
       Array.from(fileInput.files).forEach(function (file, index) {
-        if (/^(?:image\/png|image\/jpeg|image\/webp|image\/gif)$/.test(file.type)) {
+        if (IMAGE_TYPES.test(file.type)) {
           var image = document.createElement('img');
           var url = URL.createObjectURL(file);
           image.className = 'ev-image';

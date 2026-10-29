@@ -78,6 +78,9 @@ NEW_CHAT = "new_chat"
 # replay answers with what that press did. Its ``work_id`` is ``new-work:<owner/repo>``, since
 # the Work it starts has no issue number until the press makes one.
 NEW_WORK = "new_work"
+# Take over, or Start here, on another deck's issue (#3834): reserved in the same store, but
+# its own route (``/works/{id}/take-over``), since the Work is not this deck's to offer it.
+TAKE_OVER = "take_over"
 
 LABELS = {
     MERGE: "Merge",
@@ -101,6 +104,7 @@ LABELS = {
     FINISH: "Finish",
     NEW_CHAT: "New chat",
     NEW_WORK: "New work",
+    TAKE_OVER: "Take over",
     **LINKS,
 }
 

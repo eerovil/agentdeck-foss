@@ -45,9 +45,9 @@ NUDGE_TEXT = (
     " which wakes you when it ends, or register a time wait (a wake-on with"
     ' `{{"at": "11:30", "waiting_for": "the render"}}` or `after_minutes`);\n'
     "- your pull request is done: mark it ready (`gh pr ready`); the deck reviews it by itself;\n"
-    "- a person settled the review's findings without a code change: ask for a fresh review"
-    " (`POST $AGENTDECK_URL/api/sessions/<key>/review-request`), which also waits on its"
-    " verdict;\n"
+    "- the owner settled the review's findings without a code change: tell the deck"
+    " (`POST $AGENTDECK_URL/api/sessions/<key>/review-accepted`), which counts that review as"
+    " a pass;\n"
     "- its review passed: run this Work's verification job on its head, as a test run the deck"
     " can see, unless your first message says CI or the review alone proves that repository"
     " (for CI, register a wake-on for its checks; for the review, nothing is left to run);"

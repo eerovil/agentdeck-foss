@@ -1,6 +1,8 @@
-"""Live prototyping's meeting page and the agent's API for it (#3569)."""
+"""Live prototyping's page and the agent's API for it (#3569)."""
 
 from __future__ import annotations
+
+import subprocess
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -49,18 +51,22 @@ def _client(app):
 
 async def test_agent_registers_link_records_steps_and_page_shows_them(tmp_path):
     app = _app(tmp_path)
-    # Kept per chat, not per leg: a chat that continues keeps its meeting.
+    # Kept per chat, not per leg: a chat that continues keeps its prototype.
     chat = app.state.app_state.chat_identity_key(KEY)
     async with _client(app) as client:
         guide = await client.get("/api/live-prototype/guide")
         assert "/live-prototype/steps" in guide.text
         assert "Build no backend" in guide.text
-        assert "Never make the room log in" in guide.text
+        assert "Never make the person log in" in guide.text
         assert "Do not take screenshots" in guide.text
         # Every chat's guide sends any "live prototype" ask here (#3760).
         trigger = " ".join(AGENTDECK_SESSION_INSTRUCTIONS.split())
         assert '"Live prototype" in any wording' in trigger
-        assert "always means the live meeting prototype" in trigger
+        assert "always means the deck's live prototype page" in trigger
+        # A diagram ask is sent to the guide's "Diagrams" part, which uses this page (#3822).
+        assert "draw it as a file in the repository it describes" in trigger
+        assert "Diagrams (#3822)" in guide.text
+        assert "?bare=1" in guide.text
 
         # A step before any link has nowhere to show.
         early = await client.post(f"{API}/steps", json={"summary": "x"})
@@ -80,6 +86,8 @@ async def test_agent_registers_link_records_steps_and_page_shows_them(tmp_path):
                     ],
                 },
             )
+            assert linked.json()["page_url"] == f"/live/{KEY}"
+            # The old name still answers for agents on the guide before #3811.
             assert linked.json()["meeting_url"] == f"/live/{KEY}"
             first = await client.post(
                 f"{API}/steps", json={"summary": "Filters  on top", "commit": "abc123"}
@@ -94,7 +102,7 @@ async def test_agent_registers_link_records_steps_and_page_shows_them(tmp_path):
         assert len(relinked.json()["steps"]) == 2
         assert [v["name"] for v in relinked.json()["versions"]] == ["A", "B"]
 
-        # The room's pick is meeting state: the spec request names it, a reload shows it.
+        # The person's pick is the prototype's state: the spec request names it, a reload shows it.
         picked = await client.put(f"{API}/picked", json={"version": "B"})
         assert picked.json()["spec_request"] == (
             "Write the spec from what we picked: version B (https://host.ts.net:8443/?v=b)."
@@ -106,6 +114,10 @@ async def test_agent_registers_link_records_steps_and_page_shows_them(tmp_path):
         assert '"picked": "B"' in page.text
         assert page.status_code == 200
         assert "live_prototype.js" in page.text
+        # Enter sends; on a phone the panel's button counts the changes (#3831).
+        assert 'class="send-on-enter"' in page.text
+        assert 'aria-label="Send suggestion"' in page.text
+        assert 'id="live-side-count"' in page.text
         assert "https://host.ts.net:9000/" in page.text
 
         # Versions replaced without B drop the pick back to the main link.
@@ -116,8 +128,44 @@ async def test_agent_registers_link_records_steps_and_page_shows_them(tmp_path):
         # The record outlives the web process.
         assert live_prototype.read(chat)["revision"] == dropped.json()["revision"]
 
+        # A diagram has a slot of its own (#3827): it keeps the prototype's link, and a
+        # bad one stores neither.
+        assert (await client.put(API, json={})).status_code == 422
+        refused = await client.put(
+            API, json={"url": "https://host.ts.net:1/", "diagram": "file:///etc/x.md"}
+        )
+        assert refused.status_code == 422
+        assert live_prototype.read(chat)["url"] == "https://host.ts.net:9000/"
+        drawn = await client.put(
+            API, json={"diagram": "https://deck.ts.net/w/docs/diagrams/flow.md?bare=1"}
+        )
+        assert drawn.json()["url"] == "https://host.ts.net:9000/"
+        assert drawn.json()["diagram"] == "https://deck.ts.net/w/docs/diagrams/flow.md?bare=1"
+        # The file's own repository is kept, for the Work's link once the worktree is gone.
+        assert live_prototype.read(chat)["diagram_repository"] == ""
+        folder = tmp_path / "shop" / "docs" / "diagrams"
+        folder.mkdir(parents=True)
+        subprocess.run(["git", "init", "-q", str(tmp_path / "shop")], check=True)
+        subprocess.run(
+            ["git", "-C", str(tmp_path / "shop"), "remote", "add", "origin",
+             "git@github.com:Acme/Shop.git"], check=True,
+        )
+        await client.put(API, json={"diagram": f"https://deck.ts.net{folder}/flow.md?bare=1"})
+        assert live_prototype.read(chat)["diagram_repository"] == "acme/shop"
+        assert '{"diagram":' in guide.text and "Inside a Work" in guide.text
 
-async def test_the_chat_page_links_its_meeting_once_there_is_one(tmp_path):
+    # A chat that only draws records its changes too.
+    live_prototype.set_diagram("drawing", "https://deck.ts.net/w/docs/diagrams/a.md?bare=1")
+    assert live_prototype.add_step("drawing", "Split the queue")["steps"][0]["number"] == 1
+    assert live_prototype.diagram_file("https://d/w%20t/docs/diagrams/a.md?bare=1") == (
+        "/w t/docs/diagrams/a.md"
+    )
+    for other in ("https://d/w/docs/a.md", "https://d/w/docs/diagrams/a.py", None,
+                  "https://d/w/docs/diagrams/../../etc/x.md"):
+        assert live_prototype.diagram_file(other) == ""
+
+
+async def test_the_chat_page_links_its_live_prototype_once_there_is_one(tmp_path):
     app = _app(tmp_path)
     async with _client(app) as client:
         before = await client.get(f"/sessions/{KEY}")
@@ -127,6 +175,30 @@ async def test_the_chat_page_links_its_meeting_once_there_is_one(tmp_path):
         )
         after = await client.get(f"/sessions/{KEY}")
         assert f'href="/live/{KEY}"' in after.text
+        assert "live-diagram-link" not in after.text
+        # A diagram gets its own chip, opening the page on it (#3827).
+        chat = app.state.app_state.chat_identity_key(KEY)
+        drawn = tmp_path / "w" / "docs" / "diagrams" / "a.md"
+        drawn.parent.mkdir(parents=True)
+        drawn.write_text("# A\n")
+        live_prototype.set_diagram(chat, f"https://d{drawn}?bare=1", "acme/shop")
+        both = await client.get(f"/sessions/{KEY}")
+        assert f'href="/live/{KEY}"' in both.text
+        assert f'href="/live/{KEY}?view=diagram"' in both.text
+        record = live_prototype.read(chat)
+        record.pop("url")
+        live_prototype._write(chat, record)
+        drawn_only = await client.get(f"/sessions/{KEY}")
+        assert f'href="/live/{KEY}"' not in drawn_only.text
+        assert f'href="/live/{KEY}?view=diagram"' in drawn_only.text
+        # Once the worktree is gone the chip follows the Work page's fallback, to the
+        # repository the diagram was drawn in.
+        drawn.unlink()
+        cleaned = await client.get(f"/sessions/{KEY}")
+        assert (
+            'href="https://github.com/acme/shop/blob/HEAD/docs/diagrams/a.md"'
+            in cleaned.text
+        )
 
 
 async def test_use_cases_are_written_one_at_a_time_without_reloading_the_prototype(tmp_path):
@@ -182,10 +254,10 @@ async def test_use_cases_are_written_one_at_a_time_without_reloading_the_prototy
         assert "composer_speech.js" in page.text
 
 
-async def test_meeting_stream_says_what_the_agent_is_doing(tmp_path):
+async def test_live_prototype_stream_says_what_the_agent_is_doing(tmp_path):
     from types import SimpleNamespace
 
-    from agentdeck.web.routes_live_prototype import meeting_events
+    from agentdeck.web.routes_live_prototype import live_prototype_events
 
     app = _app(tmp_path)
     state = app.state.app_state
@@ -200,7 +272,7 @@ async def test_meeting_stream_says_what_the_agent_is_doing(tmp_path):
             return self.cycles < 0
 
     request = _Request(app=app, query_params={})
-    response = await meeting_events(request, KEY)
+    response = await live_prototype_events(request, KEY)
     frames = response.body_iterator
     assert await anext(frames) == "data: connected\n\n"
     assert await anext(frames) == 'event: activity\ndata: "Using tools"\n\n'

@@ -283,6 +283,8 @@ def test_a_reviewers_escalation_reaches_the_chat_with_what_to_do(root):
     )
     assert "Operator decision needed" in event.text
     assert ESCALATED_ASK in event.text and ESCALATED_ASK in event.link
+    # #3828: an owner's acceptance needs no fresh review.
+    assert "/review-accepted" in ESCALATED_ASK and "/review-accepted" in OWNER_CALL_ASK
 
 
 def test_the_reviewers_verdict_is_sent_but_its_chatter_is_not(root):
@@ -1500,6 +1502,75 @@ async def test_fixing_a_no_code_review_starts_no_new_review(root, harness, monke
     ):
         touched = changed
         assert await between("eerovil/agentdeck", 9, OLD, NEW, before) is proven, changed
+
+
+async def test_an_owner_accepting_findings_passes_the_reviewed_head_with_no_review(root, harness):
+    """#3828: escalation, the owner accepts as is, and the head counts as reviewed with no
+    second review round; never a head the reviewer was not sent, nor a draft."""
+    from agentdeck.work_router import AgainRefused
+
+    pull = "eerovil/agentdeck#9"
+    accepted = []
+
+    class Release:
+        ports = SimpleNamespace(pulls=lambda work: [pull])
+
+        async def on_pull_event(self, *args):
+            return None
+
+        def no_code_head(self, work, ref):
+            return None
+
+        async def owner_accepted(self, work, ref, head, note):
+            accepted.append((work, ref, head, note))
+            return f"review pass recorded for {ref} at {head[:12]}"
+
+    harness.service._release = Release()
+    with pytest.raises(AgainRefused, match="not open and ready"):
+        await harness.service.accept("eerovil/agentdeck", 9, "accept as is")
+    harness.heads[("eerovil/agentdeck", 9)] = OLD
+    with pytest.raises(AgainRefused, match="nothing at it to accept"):
+        await harness.service.accept("eerovil/agentdeck", 9, "accept as is")
+    pull_event(root, "d1", action="ready_for_review", sha=OLD)
+    await harness.drain()
+    assert len(harness.asks) == 1
+    # Asked for is not answered (#3828 review): the first review is still running.
+    with pytest.raises(AgainRefused, match="nothing at it to accept"):
+        await harness.service.accept("eerovil/agentdeck", 9, "accept as is")
+    assert accepted == []
+    # An escalation naming other commits, or none, marks nothing (owner's decision on #3828).
+    comment(root, "d2", body=ESCALATION, number=7)
+    await harness.drain()
+    with pytest.raises(AgainRefused, match="nothing at it to accept"):
+        await harness.service.accept("eerovil/agentdeck", 9, "accept as is")
+    # A push to NEW, reviewed; then a late escalation about OLD must not pass NEW.
+    harness.heads[("eerovil/agentdeck", 9)] = NEW
+    pull_event(root, "d3", action="synchronize", sha=NEW)
+    await harness.drain()
+    assert len(harness.asks) == 2
+    comment(root, "d4", body=f"Review loop escalated to the operator\n\nAt `{OLD[:12]}`: X?")
+    await harness.drain()
+    with pytest.raises(AgainRefused, match="nothing at it to accept"):
+        await harness.service.accept("eerovil/agentdeck", 9, "accept as is")
+    # One about OLD that mentions NEW, whose own review is pending, names two: nothing.
+    both = f"At `{OLD[:12]}` X stands; `{NEW[:7]}` was pushed, its review is pending."
+    comment(root, "d4b", body=f"Review loop escalated to the operator\n\n{both}")
+    await harness.drain()
+    with pytest.raises(AgainRefused, match="nothing at it to accept"):
+        await harness.service.accept("eerovil/agentdeck", 9, "accept as is")
+    assert accepted == []
+    comment(root, "d5", body=f"Review loop escalated to the operator\n\nAt `{NEW[:12]}`: X?")
+    await harness.drain()
+    answer = await harness.service.accept("EerOvil/AgentDeck", 9, "accept as is")
+    assert answer == {
+        "pull_request": pull,
+        "head": NEW,
+        "outcome": f"review pass recorded for {pull} at {NEW[:12]}",
+    }
+    assert accepted == [("github_issue:eerovil/agentdeck#7", pull, NEW, "accept as is")]
+    assert len(harness.asks) == 2 and not harness.service.pending.entries
+    with pytest.raises(AgainRefused, match="no Work's chat registered"):
+        await harness.service.accept("eerovil/agentdeck", 10, "accept as is")
 
 
 async def test_a_reviewed_head_is_reviewed_again_on_request_at_most_twice(root, harness):

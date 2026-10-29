@@ -777,7 +777,6 @@ class ClaudeWorkerHost:
         permission_mode: str | None = "auto",
         start_bypassed: bool = False,
         model: str | None = None,
-        usage_ceiling_pct: float = 0.0,
         usage_cache_dir: Path | None = None,
         stall_after_s: float = 0.0,
         idle_after_s: float = 0.0,
@@ -788,11 +787,9 @@ class ClaudeWorkerHost:
         base_url: str | None = None,
         process_factory=None,
         usage_reader=None,
-        session_over_budget: Callable[[str], bool] | None = None,
         bind_session_token: Callable[[str, str], None] | None = None,
         artifact_root: Path | None = None,
     ) -> None:
-        del usage_ceiling_pct, session_over_budget
         self.account = account
         # Loopback base for AgentDeck's HTTP API, injected into each spawned
         # worker as AGENTDECK_URL so the agent can reach its own transcript

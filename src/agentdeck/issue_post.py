@@ -75,10 +75,6 @@ def shown_target(value: str) -> WorkRef | None:
     return WorkRef.from_issue(ref) if ref is not None else None
 
 
-def box_value(target: WorkRef) -> str:
-    return f"{target.repository}#{target.number}"
-
-
 def issue_url(target: WorkRef) -> str:
     return f"https://github.com/{target.repository}/issues/{target.number}"
 

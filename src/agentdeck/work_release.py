@@ -125,10 +125,6 @@ REVIEW_PASSED_TEXT = "AgentDeck: the review of {ref} passed at {head}. " + VERIF
 #: A pass whose digest could not be read at the new head: no answer, so a place in the merge
 #: queue stands (#3022 review).
 DIGEST_UNREADABLE = "could not be read to carry its review pass over"
-#: What the digest port answers for a diff GitHub will not serve at all (over its size limit).
-#: No pass was ever recorded for such a diff, so it is a changed diff, not an unreadable one:
-#: waiting would hold the first place in line for good (#3029).
-DIFF_TOO_LARGE = "too-large"
 #: How long the deck waits for an update it made to show on GitHub, and how many times it asks
 #: for one head, before a pull request that stays behind leaves the merge queue (#3033).
 UPDATE_GRACE_S = 600.0
@@ -306,14 +302,36 @@ def verifies(rows: Iterable[object], work_id: str) -> bool:
 #: How ``on_verdict`` answers a pass it recorded, and findings about a commit the branch left.
 PASS_RECORDED = "review pass recorded for"
 FINDINGS_DROPPED = "findings dropped"
+#: What the agent does once the owner settled every finding at a head with no code change
+#: (#3828): the review counts as a pass there, with no new review. Asking for a fresh review
+#: instead held a head already tested green for a second review round the owner never wanted.
+ACCEPTED_ASK = (
+    "When their answer settles every finding without a code change, tell the deck so: `POST"
+    " $AGENTDECK_URL/api/sessions/<session-key>/review-accepted` with"
+    ' `{"pull_request": "<owner/repo#number>", "note": "<their decision>"}`. That review then'
+    " counts as a pass at the same commit and no new review runs. Ask for a fresh review"
+    " (`review-request`) only when you changed something the reviewer should read again."
+)
+#: What makes a finding the owner's call, shared by the reviewer's prompt and the agent's
+#: message so both draw the line in one place. Narrowed in #3845: a reviewer escalated a test
+#: the build had dropped from an approved spec, twice, and the owner only picked the
+#: recommended option. Approving a spec does not make its decisions chosen (session guide).
+OWNER_CALL_TEST = (
+    "it is the owner's decision rather than a defect: it costs money or quota, accepts a known"
+    " risk to data, a live system or a person, goes against a decision the owner chose"
+    " themselves (picked or wrote, on the issue or in their question box), or changes another"
+    " requester's work. A detail the spec or the agent settled without the owner picking it is"
+    " not the owner's, even in an approved spec, and neither is a missing or too narrow test"
+    " with a cheap fix: those are ordinary findings the agent settles, fixing them or giving"
+    " its reason in the pull request body"
+)
 #: Under every reviewer's findings the Work's agent hears (#3314): a finding only the owner can
 #: settle, sent as one to fix, held a Work in review for two days until it repeated.
 OWNER_CALL_ASK = (
-    "If a finding is the owner's decision rather than a defect (a design trade-off, or relaxing"
-    " something the issue asks for), do not work around it: ask the owner in your question box"
-    " now, with the options. Once they answer, post their decision on the issue; when it"
-    " settles the finding without a code change, ask for a fresh review of the same commit"
-    " with your session's `review-request`, quoting the decision as its note."
+    "A finding is the owner's call only when "
+    + OWNER_CALL_TEST
+    + ". For such a finding, do not work around it: ask the owner in your question box"
+    " now, with the options. Once they answer, post their decision on the issue. " + ACCEPTED_ASK
 )
 
 #: The verdict a reviewer sends when none of its findings needs a change to code or tests
@@ -586,8 +604,8 @@ class Ports:
     #: The chat that owns the Work, for the messages to its agent.
     chat: Callable[[str], str | None]
     read_pull: Callable[[str], Awaitable[Pull | None]]
-    #: The review digest of ``ref``'s diff at ``head``; "" when it could not be read just now,
-    #: ``DIFF_TOO_LARGE`` when GitHub will never serve it.
+    #: The review digest of ``ref``'s diff at ``head``; "" when it could not be read just now.
+    #: A diff GitHub will never serve has one pinned to its head (``review_refs.head_digest``).
     digest: Callable[[str, str], Awaitable[str]]
     #: The heads a green verification job of this Work proves.
     green_heads: Callable[[str], Awaitable[set[str]]]
@@ -917,7 +935,7 @@ class WorkReleaseService:
                 # A pass about a head the branch left counts only where the router proved the
                 # new head a base merge away and reviewed nothing new for it (#3314).
                 return f"{pull} is not open at {head[:12]}"
-            if not current or current == DIFF_TOO_LARGE or current != digest.lower():
+            if not current or current != digest.lower():
                 return f"the digest does not match {pull}'s diff at {facts.head[:12]}"
             passed = {"head": facts.head, "digest": current, "at": self.ports.clock()}
             chat = self.ports.review_chat(pull, facts.head) or self.ports.review_chat(pull, head)
@@ -985,7 +1003,7 @@ class WorkReleaseService:
         if facts is None or facts.state != "OPEN" or not same_commit(facts.head, head):
             return None
         current = await self.ports.digest(pull, facts.head)
-        if not current or current == DIFF_TOO_LARGE or current != (digest or "").lower():
+        if not current or current != (digest or "").lower():
             return None
         files = None
         if self.ports.pull_files is not None:
@@ -1029,7 +1047,7 @@ class WorkReleaseService:
             if facts is None or facts.state != "OPEN" or not same_commit(facts.head, head):
                 return f"{pull} is not open at {head[:12]}"
             current = await self.ports.digest(pull, facts.head)
-            if not current or current == DIFF_TOO_LARGE:
+            if not current:
                 return f"{pull}'s diff at {facts.head[:12]} {DIGEST_UNREADABLE}"
             passed = {
                 "head": facts.head,
@@ -1053,6 +1071,42 @@ class WorkReleaseService:
             f"AgentDeck: {pull} at {facts.head[:12]}{since} answers a review that asked only for"
             " fixes needing no code, so no new review was started and that review counts as a"
             " pass here."
+        )
+        return await self._announce_pass(work_id, pull, facts.head, lead)
+
+    async def owner_accepted(self, work_id: str, pull: str, head: str, note: str) -> str:
+        """The owner settled the review's findings on ``pull`` at ``head`` with no code change
+        (#3828): that review counts as a pass there, with no new review. The router checks
+        the reviewer read this head; ``note`` is the owner's decision, kept with the pass."""
+        if not self.handles(work_id):
+            return "not released by the deck"
+        pull = pull.lower()
+        async with self._lock(work_id):
+            entry = self.store.get(work_id)
+            facts = await self.ports.read_pull(pull)
+            if facts is None or facts.state != "OPEN" or not same_commit(facts.head, head):
+                return f"{pull} is not open at {head[:12]}"
+            current = await self.ports.digest(pull, facts.head)
+            if not current:
+                return f"{pull}'s diff at {facts.head[:12]} {DIGEST_UNREADABLE}"
+            passed = {
+                "head": facts.head,
+                "digest": current,
+                "at": self.ports.clock(),
+                "accepted": note.strip(),
+            }
+            chat = self.ports.review_chat(pull, facts.head)
+            if chat:
+                passed["chat"] = chat
+            entry.setdefault("passes", {})[pull] = passed
+            entry.pop("findings", None)
+            _set_no_code(entry, pull, None)
+            self.store.put(work_id, entry)
+            self.ports.verdict_taken(pull, facts.head)
+        lead = (
+            f"AgentDeck: the owner accepted the review's findings on {pull} at"
+            f" {facts.head[:12]} with no code change, so no new review was started and that"
+            " review counts as a pass here."
         )
         return await self._announce_pass(work_id, pull, facts.head, lead)
 
@@ -1169,10 +1223,6 @@ class WorkReleaseService:
                     digest = str(passed.get("digest") or "")
                 if not digest:
                     digest = await self.ports.digest(ref, pull.head)
-                if digest == DIFF_TOO_LARGE:
-                    raise PressRefused(
-                        f"{ref}'s diff is too large to compare, so no Merge was recorded"
-                    )
                 if not digest:
                     raise PressRefused(f"{ref}'s diff could not be read, so no Merge was recorded")
                 pulls[ref] = {"digest": digest, "head": pull.head}
@@ -1244,7 +1294,7 @@ class WorkReleaseService:
         """Clear a person's Merge press once a diff it was for changed (#3320).
 
         A head that moved is read once: the same digest (a merge of the base) moves the
-        press's head, a changed or too-large one clears it, and a failed read changes nothing.
+        press's head, a changed one clears it, and a failed read changes nothing.
         An open pull request the press never covered clears it too.
         """
         pulls = _asked_pulls(entry)

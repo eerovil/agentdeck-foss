@@ -435,24 +435,71 @@ def _describe_process(pid: int) -> SlotHolder | None:
     return SlotHolder(pid=pid, command=command, cwd=cwd, started_at=started_at)
 
 
+# How many more times ``slot_holders`` reads ``/proc/locks`` for a slot that is
+# locked but was missing from the read (#3838).
+_LOCKS_REREADS = 5
+
+
+def _is_locked(path: Path) -> bool:
+    """Whether some open file holds a ``flock`` on ``path`` right now.
+
+    A non-blocking shared probe, dropped at once: it fails exactly when a holder
+    has the slot's exclusive lock. A taker racing the probe skips this slot for
+    that instant, which its own sweep already tolerates.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+    return False
+
+
 def slot_holders(paths: list[Path]) -> dict[Path, SlotHolder | None]:
-    """Who holds each of ``paths`` right now; None where the slot is free."""
-    flocks = _flock_holders()
+    """Who holds each of ``paths`` right now; None where the slot is free.
+
+    ``/proc/locks`` is not one snapshot: the kernel hands it out a page per
+    ``read``, and a lock released between two reads shifts every later line, so
+    one can be skipped. On a host with thousands of locks that is about one read
+    in a hundred, and a held slot read as free (#3838). A slot missing from the
+    read is therefore probed, and only a slot that really is locked costs more
+    reads to find its holder.
+    """
     mounts = _mount_devices()
-    found: dict[Path, SlotHolder | None] = {}
+    keys: dict[Path, tuple[int, int, int] | None] = {}
     for path in paths:
         try:
             stat = path.stat()
         except OSError:
             # No file yet means nobody has ever taken this slot: free.
-            found[path] = None
+            keys[path] = None
             continue
         device = _superblock_device(path, mounts) or (
             os.major(stat.st_dev),
             os.minor(stat.st_dev),
         )
-        key = (*device, stat.st_ino)
-        pid = flocks.get(key)
+        keys[path] = (*device, stat.st_ino)
+    flocks = _flock_holders()
+    for _ in range(_LOCKS_REREADS):
+        missed = [
+            key
+            for path, key in keys.items()
+            if key is not None and key not in flocks and _is_locked(path)
+        ]
+        if not missed:
+            break
+        for key, pid in _flock_holders().items():
+            flocks.setdefault(key, pid)
+    found: dict[Path, SlotHolder | None] = {}
+    for path, key in keys.items():
+        pid = None if key is None else flocks.get(key)
         found[path] = None if pid is None else _describe_process(pid)
     return found
 

@@ -1663,27 +1663,6 @@ class _UnixHTTPConnection(http.client.HTTPConnection):
         self.sock = sock
 
 
-def runtime_post(
-    socket_path: str, path: str, body: dict, *, timeout: float = DEFAULT_TIMEOUT_S
-) -> tuple[int, object | None]:
-    """One JSON ``POST`` to the runtime over its socket: ``(status, body)``, 0 when unreached."""
-    connection = _UnixHTTPConnection(socket_path, timeout)
-    try:
-        connection.request(
-            "POST", path, body=json.dumps(body), headers={"Content-Type": "application/json"}
-        )
-        response = connection.getresponse()
-        raw = response.read()
-        try:
-            return response.status, json.loads(raw) if raw else None
-        except ValueError:
-            return response.status, None
-    except (OSError, http.client.HTTPException):
-        return 0, None
-    finally:
-        connection.close()
-
-
 def _runtime_get(
     socket_path: str, path: str, *, timeout: float = DEFAULT_TIMEOUT_S
 ) -> object | None:

@@ -1324,6 +1324,16 @@ async def test_the_first_message_says_whether_the_project_merges_on_its_own(
     )
     (tmp_path / "poller" / "instances" / "agentdeck" / "overlay.toml").write_text("")
     app, _, injector = fake_app(tmp_path)
+    pull = "https://github.com/eerovil/agentdeck/pull/70"
+    if not auto_release:
+        # #3834: a pull request already open for it, as on a Work taken over from another deck.
+        from types import SimpleNamespace
+
+        from agentdeck.issue_context import IssueBacklog, RepositoryPulls
+
+        rows = ({"number": 70, "url": pull, "head_branch": "agent/issue-7"},)
+        backlog = IssueBacklog(pulls=(RepositoryPulls("eerovil/agentdeck", rows),))
+        app.state.issues = SimpleNamespace(cached=lambda: backlog)
 
     labels = ("agent", "spec-only") if auto_release else ("agent",)
     assert await start_work_agent(app, "EeroVil/AgentDeck", 7, labels=labels) == "started"
@@ -1341,6 +1351,8 @@ async def test_the_first_message_says_whether_the_project_merges_on_its_own(
             " Commit this Work's screenshots to `eerovil/agent-evidence`"
             " under `agentdeck/issue-7/`."
         )
+    else:
+        wanted += " " + work_start.OPEN_PULL_TEXT.format(pulls=pull)
     # #3274: last, where it works; claimed under the id Finish releases, whatever the case.
     assert app.state.runtime_asked[0]["work_id"] == "github_issue:eerovil/agentdeck#7"
     wanted += " " + work_start.WORKTREE_TEXT.format(
@@ -1351,6 +1363,8 @@ async def test_the_first_message_says_whether_the_project_merges_on_its_own(
     if auto_release:
         head, _, tail = message.partition(f"{work_start.FIRST_TEXT} {spec}")
         assert tail.endswith(wanted) and "--remove-label Spec-Only" in tail
+        # A spec may draw its plan's diagram, uncommitted (#3827).
+        assert "other than docs and plans under `docs/` in your own worktree" in tail
     else:
         assert spec not in message
         assert message.endswith(f"{work_start.FIRST_TEXT} {wanted}")

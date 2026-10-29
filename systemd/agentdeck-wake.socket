@@ -1,0 +1,11 @@
+[Unit]
+Description=agentdeck voice mode wake word listener (#3476)
+
+[Socket]
+ListenStream=%t/agentdeck-wake.sock
+SocketMode=0600
+Accept=no
+Service=agentdeck-wake.service
+
+[Install]
+WantedBy=sockets.target

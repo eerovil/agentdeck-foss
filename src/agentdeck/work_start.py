@@ -101,7 +101,9 @@ EVIDENCE_TEXT = "Commit this Work's screenshots to `{evidence}` under `{folder}/
 SPEC_ONLY_TEXT = (
     "This issue carries the `{label}` label, so it is a spec only: write a concrete "
     "implementation specification as an issue comment ending with the line `{marker}`, so "
-    "the deck shows it waiting on the person's approval, and do not edit repository files, "
+    "the deck shows it waiting on the person's approval, and do not edit repository files "
+    "other than docs and plans under `docs/` in your own worktree, left uncommitted (draw "
+    "the plan's diagram there, put it on your live page and link it in the spec), "
     "create or switch a branch, commit, push, or open a pull request. Building starts only "
     "once a person approves the spec; never remove the label without their explicit "
     "approval. If they approve in this chat and ask you to build it, remove the label "
@@ -331,6 +333,31 @@ def _evidence_text(app: Any, repository: str, number: int) -> str:
         return ""
     folder = f"{repository.split('/', 1)[-1].lower()}/issue-{number}"
     return EVIDENCE_TEXT.format(evidence=evidence, folder=folder)
+
+
+#: A Work started with a pull request already open for it (#3834): one taken over from another
+#: deck, whose agent's work is on that branch. The deck reviews and merges only pull requests
+#: this deck's chats registered, so the agent registers it before anything else.
+OPEN_PULL_TEXT = (
+    "A pull request is already open for this issue: {pulls}, from an earlier agent, or from "
+    "another deck's that this deck took over. Register it for this chat first, then read its "
+    "branch, the pull request and the issue's comments before changing anything."
+)
+
+
+def _open_pull_text(app: Any, repository: str, number: int) -> str:
+    """The open pull requests the deck's cached lists hold for this issue, for the brief."""
+    from .issue_context import identity
+
+    issues = getattr(app.state, "issues", None)
+    try:
+        backlog = issues.cached() if issues is not None else None
+        pulls = backlog.pulls_for_work().get(identity(repository, number), ()) if backlog else ()
+    except Exception:  # noqa: BLE001 - a missing line must never stop the start
+        log.warning("work start: could not read the cached pull requests", exc_info=True)
+        return ""
+    urls = [str(pull.get("url")) for pull in pulls if pull.get("url")]
+    return OPEN_PULL_TEXT.format(pulls=", ".join(urls)) if urls else ""
 
 
 def _overlay_checkouts(poller_root: str | Path) -> list[str]:
@@ -625,6 +652,7 @@ def _brief(app: Any, ref: WorkRef, opening: str, labels: Iterable[str], where: s
                 _spec_only_text(app, ref.repository, ref.number, labels),
                 _merge_text(app, ref.repository),
                 _evidence_text(app, ref.repository, ref.number),
+                _open_pull_text(app, ref.repository, ref.number),
                 where,
             ),
         )

@@ -456,11 +456,40 @@ class GitHost:
         return ""
 
     def create(self, checkout: str, path: str, branch: str, base_ref: str) -> str:
-        """Add the worktree; answers "" on success, else why not."""
+        """Add the worktree; answers "" on success, else why not.
+
+        A branch only origin has, as for a Work taken over from another deck (#3834), is
+        checked out from there with its commits, never started again from the base.
+        """
         self._git("-C", checkout, "fetch", "--quiet", "origin", base_ref)
         existing = self._git("-C", checkout, "rev-parse", "--verify", "--quiet", branch)
+        # Fails quietly for a branch origin does not have, which is the usual start.
+        self._git("-C", checkout, "fetch", "--quiet", "origin", branch)
+        pushed = self._git(
+            "-C", checkout, "rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{branch}"
+        )
+        if (
+            existing is not None
+            and existing.returncode == 0
+            and pushed is not None
+            and pushed.returncode == 0
+        ):
+            # A branch left here from an earlier stint, before another deck took the Work and
+            # pushed more (#3834): moved up to origin's when that only adds commits. One with
+            # commits origin lacks is kept as it is, and a branch checked out elsewhere is
+            # refused by ``git branch -f``, so nothing local is lost.
+            behind = self._git(
+                "-C", checkout, "merge-base", "--is-ancestor", branch, f"origin/{branch}"
+            )
+            if behind is not None and behind.returncode == 0:
+                self._git("-C", checkout, "branch", "--quiet", "-f", branch, f"origin/{branch}")
         if existing is not None and existing.returncode == 0:
             made = self._git("-C", checkout, "worktree", "add", path, branch)
+        elif pushed is not None and pushed.returncode == 0:
+            made = self._git(
+                "-C", checkout, "worktree", "add", "--track", "-b", branch, path,
+                f"origin/{branch}",
+            )
         else:
             made = self._git(
                 "-C", checkout, "worktree", "add", path, "-b", branch, f"origin/{base_ref}"

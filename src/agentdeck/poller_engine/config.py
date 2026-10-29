@@ -147,17 +147,6 @@ FINISH_ROLES: dict[str, str] = {
 }
 
 
-def role_of_finish_token(token: str | None) -> str | None:
-    """The board role a terminal marker's token names, or None when it names none.
-
-    Tolerant about spacing and case because the marker is parsed out of a comment body and the
-    engine has spelled the token with spaces in the past; strict about the vocabulary, because
-    the whole point is that an ending nobody defined must not become a status write.
-    """
-    if not token:
-        return None
-    return FINISH_ROLES.get(str(token).strip().casefold().replace(" ", "_"))
-
 _MERGE_METHODS = ("merge", "squash", "rebase")
 
 # How far a worker may deploy when a requester on its card explicitly asks it to (#2656). The
@@ -468,12 +457,6 @@ class Manifest:
 
     def auto_deploy_repos(self) -> frozenset[str]:
         return frozenset(repo.id for repo in self.repos if repo.auto_deploys)
-
-    def ci_verified_repos(self) -> frozenset[str]:
-        """The repositories whose GitHub checks are the verification (#2364)."""
-        return frozenset(
-            repo.id for repo in self.repos if repo.verification == VERIFICATION_GITHUB_CHECKS
-        )
 
     def review_only_repos(self) -> frozenset[str]:
         """The repositories whose review pass alone proves a pull request (#2729)."""

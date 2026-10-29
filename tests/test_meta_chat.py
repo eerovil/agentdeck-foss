@@ -104,6 +104,10 @@ def test_the_chat_view_hides_the_brief_behind_a_mark():
     # #3773: "do you need me?" is one call, answered by the 🔊 paragraph alone.
     assert "make one call, GET $AGENTDECK_URL/api/works/needs-you" in brief
     assert "write only the 🔊 paragraph, with nothing after it" in brief
+    # #3816: the owner can send the deck chat's page to another chat by asking.
+    assert "to $AGENTDECK_URL/api/view/open-chat; your page moves there" in brief
+    # #3814: the owner can switch every open page's project tabs by asking.
+    assert "to $AGENTDECK_URL/api/view/project-filter; every open page switches" in brief
     later = meta_chat.with_brief("And now?", "https://deck/sessions/x/transcript")
     assert display_chat_message(first) == "🎙️ What is running?"
     assert display_chat_message(later) == "🎙️ And now?"
@@ -208,3 +212,73 @@ async def test_a_first_start_lost_to_a_restart_still_blocks_a_second_one(tmp_pat
         accepted = await client.post("/meta/new", data={"message": "Hello deck"})
     assert accepted.status_code == 202, accepted.text
     assert len(starts) == 1
+
+
+async def test_the_deck_chat_moves_only_its_own_page_to_another_chat(tmp_path):
+    """#3816: the deck chat names a chat; only a stream showing the deck chat carries the
+    jump, once, as it is made and never in a prime."""
+    import asyncio
+
+    from agentdeck.chat_jump import JUMP_TOPIC
+    from agentdeck.web.routes_sse import _session_stream
+
+    app, _starts, _sends = _app(tmp_path, idle_minutes=5)
+    state = app.state.app_state
+    other = replace(state.sessions[KEY], key="claude_code:main:sid2", session_id="sid2")
+    state.update_session(other)
+    state.set_generated_title(other.key, "The login bug", "sig", source="agent")
+
+    class Page:
+        query_params: dict = {}
+
+        def __init__(self):
+            self.app = app
+
+        async def is_disconnected(self):
+            return False
+
+    async def frames_until_jump(stream):
+        while "event: chat_jump" not in (frame := await asyncio.wait_for(anext(stream), 5)):
+            assert "data-chat-jump" not in frame
+        return frame
+
+    deck, elsewhere = _session_stream(Page(), KEY), _session_stream(Page(), other.key)
+    try:
+        # Each stream subscribes at its first frame; only the deck chat's hears jumps.
+        await asyncio.wait_for(anext(deck), 5)
+        await asyncio.wait_for(anext(elsewhere), 5)
+        assert state.bus.subscribers(JUMP_TOPIC) == 1
+        async with _client(app) as client:
+            chats = (await client.get("/api/view/chats")).json()["chats"]
+            title = state.sessions[other.key].display_title
+            assert "The login bug" in title
+            assert [(c["key"], c["title"]) for c in chats] == [(other.key, title)]
+            for body, status in (({"chat": "nope"}, 404), ({"chat": KEY}, 409), ({}, 400)):
+                assert (await client.post("/api/view/open-chat", json=body)).status_code == status
+            assert app.state.chat_jumps.latest is None
+            answer = await client.post("/api/view/open-chat", json={"chat": other.key})
+        path = state.chat_path_for_session(other.key)
+        assert answer.json() == {"opened": path, "title": title, "pages": 1}
+        frame = await frames_until_jump(deck)
+    finally:
+        await deck.aclose()
+        await elsewhere.aclose()
+    assert f"&#34;path&#34;: &#34;{path}&#34;" in frame
+    assert frame.count("event: chat_jump") == 1
+
+
+def test_a_jump_finds_a_work_by_any_spelling_of_its_reference():
+    from types import SimpleNamespace
+
+    from agentdeck.chat_jump import work_matches
+
+    cards = [
+        SimpleNamespace(work_id="github_issue:eerovil/agentdeck#3816"),
+        SimpleNamespace(work_id="github_issue:eerovil/bazaar#3816"),
+        SimpleNamespace(work_id="github_issue:eerovil/agentdeck#38"),
+    ]
+    one = [cards[0]]
+    for ref in ("eerovil/AgentDeck#3816", "agentdeck#3816", cards[0].work_id, " agentdeck#3816 "):
+        assert work_matches(cards, ref) == one, ref
+    assert work_matches(cards, "#3816") == work_matches(cards, "3816") == cards[:2]
+    assert work_matches(cards, "other#3816") == work_matches(cards, "agentdeck") == []

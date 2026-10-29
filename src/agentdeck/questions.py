@@ -81,9 +81,5 @@ class OpenQuestion:
     answered_session_key: str | None = None
 
 
-def event_text(event: TranscriptEvent) -> str | None:
-    return event.answer or event.text
-
-
 def event_question(event: TranscriptEvent) -> str | None:
     return event.question or (trailing_question(event.text) if event.role == "assistant" else None)

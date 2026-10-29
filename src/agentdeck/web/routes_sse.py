@@ -9,6 +9,7 @@ rendered once per page load and has no event of its own (#2603).
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from collections.abc import AsyncIterator, Iterator
 from datetime import UTC, datetime
@@ -16,10 +17,12 @@ from typing import NamedTuple
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
+from markupsafe import escape
 
-from .. import mac_runner, work_counter
+from .. import mac_runner, meta_chat, work_counter
 from ..board_watch import BOARD_TOPIC
 from ..chat_board import TOPIC as CHAT_BOARD_TOPIC
+from ..chat_jump import JUMP_TOPIC
 from ..chat_notes import TOPIC as CHAT_NOTES_TOPIC
 from ..chat_transcript import chat_event_id, parse_chat_event_id, switch_into_leg
 from ..models import (
@@ -32,10 +35,12 @@ from ..models import (
 from ..providers import PROVIDERS
 from ..runtime_feed import RUNTIME_TOPIC
 from ..state import ALL_CHATS_TOPIC, REVIEWS_TOPIC, chat_topic
+from ..view_commands import VIEW_TOPIC
 from .chat_board_page import chat_board_context
 from .deps import (
     get_accounts,
     get_chat_renders,
+    get_db,
     get_injector,
     get_shared_fragments,
     get_state,
@@ -74,6 +79,7 @@ from .work_view import (
     SentRows,
     render_work_front,
     render_work_other,
+    render_work_other_decks,
     row_renders,
 )
 
@@ -118,6 +124,7 @@ CHAT_PAGE_TOPICS = (
     "mac_runner",
     NEEDS_YOU_TOPIC,
     CHAT_NOTES_TOPIC,
+    VIEW_TOPIC,
 )
 # Topics that can move a chat page's own fragments; the rest only touch the top bar.
 _CHAT_VIEW_TOPICS = frozenset({ALL_CHATS_TOPIC, BOARD_TOPIC, REVIEWS_TOPIC, "assistant", "jobs"})
@@ -192,6 +199,32 @@ def needs_you_event(shared, templates) -> str:
             lambda: templates.get_template("partials/needs_you_menu.html").render(),
         ),
     )
+
+
+def jump_event(jumps) -> str:
+    """The deck chat's latest jump to another chat as a ``chat_jump`` event (#3816), or
+    nothing. Sent only when it is published, never as a prime, so a page that reconnects
+    is not moved by an old request."""
+    jump = jumps.fresh() if jumps is not None else None
+    if jump is None:
+        return ""
+    payload = json.dumps({"id": jump.id, "path": jump.path, "title": jump.title})
+    return format_sse(JUMP_TOPIC, f'<span data-chat-jump="{escape(payload)}"></span>')
+
+
+def view_event(request: Request) -> str:
+    """The deck chat's latest view change as a ``view`` event (#3814), or nothing.
+
+    Sent only when ``VIEW_TOPIC`` is published, never as a prime, so a page that
+    reconnects does not undo a tap made since the command."""
+    commands = getattr(request.app.state, "view_commands", None)
+    command = commands.fresh() if commands is not None else None
+    if command is None:
+        return ""
+    payload = json.dumps(
+        {"id": command.id, "project": command.project, "projects": list(command.projects)}
+    )
+    return format_sse(VIEW_TOPIC, f'<span data-view-command="{escape(payload)}"></span>')
 
 
 def watching_needs_you(request: Request) -> None:
@@ -362,11 +395,26 @@ async def _stream(request: Request) -> AsyncIterator[str]:
                 )
 
             parts = "".join(format_sse(f"works-{part}", part_html(part)) for part in FRONT_PARTS)
-            return parts + format_sse(
-                "work-other",
-                shared.get(
-                    "work-other", ("works",), (), lambda: render_work_other(templates, overview)
-                ),
+            return (
+                parts
+                + format_sse(
+                    "work-other",
+                    shared.get(
+                        "work-other",
+                        ("works",),
+                        (),
+                        lambda: render_work_other(templates, overview),
+                    ),
+                )
+                + format_sse(
+                    "work-other-decks",
+                    shared.get(
+                        "work-other-decks",
+                        ("works",),
+                        (),
+                        lambda: render_work_other_decks(templates, overview),
+                    ),
+                )
             )
         return ""
 
@@ -374,7 +422,7 @@ async def _stream(request: Request) -> AsyncIterator[str]:
     # No page streams a chat list any more (#2603): `/chats` is rendered once per load. Only
     # a page that shows Works subscribes to them, so a settings or pollers page open
     # elsewhere neither keeps the overview rebuilding nor receives its rows (#3228).
-    topics = ["usage", "host", "deployment", "jobs", "mac_runner", NEEDS_YOU_TOPIC]
+    topics = ["usage", "host", "deployment", "jobs", "mac_runner", NEEDS_YOU_TOPIC, VIEW_TOPIC]
     if view in WORKS_VIEWS:
         topics.append("works")
     if view == WORKS_INDEX_VIEW:
@@ -465,6 +513,8 @@ async def _stream(request: Request) -> AsyncIterator[str]:
             for t in ("usage", "jobs", "works", "deployment", "mac_runner", NEEDS_YOU_TOPIC):
                 if t in dirty and (fragment := render(t)):
                     yield fragment
+            if VIEW_TOPIC in dirty and (view_change := view_event(request)):
+                yield view_change
             if pollers_due:
                 yield await render_pollers()
                 pollers_at = loop.time()
@@ -507,7 +557,7 @@ async def topbar_events(request: Request) -> StreamingResponse:
     async def stream() -> AsyncIterator[str]:
         loop = asyncio.get_running_loop()
         both = ("mac_runner", NEEDS_YOU_TOPIC)
-        with state.bus.subscribe(*both) as sub:
+        with state.bus.subscribe(*both, VIEW_TOPIC) as sub:
             watching_needs_you(request)
             yield icons(both) or ": ping\n\n"
             last_sent = loop.time()
@@ -529,6 +579,8 @@ async def topbar_events(request: Request) -> StreamingResponse:
                 dirty = {topic}
                 while (item := sub.get_nowait()) is not None:
                     dirty.add(item[0])
+                if VIEW_TOPIC in dirty and (view_change := view_event(request)):
+                    yield view_change
                 if sent := icons(dirty):
                     last_sent = loop.time()
                     yield sent
@@ -584,7 +636,9 @@ async def chat_board_events(request: Request, signature: str = "") -> StreamingR
                 )
             last_freshness = fresh
 
-        with state.bus.subscribe(CHAT_BOARD_TOPIC, "mac_runner", NEEDS_YOU_TOPIC) as sub:
+        with state.bus.subscribe(
+            CHAT_BOARD_TOPIC, "mac_runner", NEEDS_YOU_TOPIC, VIEW_TOPIC
+        ) as sub:
             watching_needs_you(request)
             # A delivery can land between the page render and this subscription. Comparing
             # once inside the subscription repairs that without pushing an unchanged
@@ -610,6 +664,10 @@ async def chat_board_events(request: Request, signature: str = "") -> StreamingR
                     continue
                 if topic == NEEDS_YOU_TOPIC:
                     yield needs_you_event(shared, templates)
+                    continue
+                if topic == VIEW_TOPIC:
+                    if view_change := view_event(request):
+                        yield view_change
                     continue
                 for fragment in fragments(chat_board_context(request, with_nudges=False)):
                     yield fragment
@@ -989,7 +1047,12 @@ async def _tail_session(
             (leg_key, leg_index, offset, seq, _tail_revision()), read
         )
 
-    with state.bus.subscribe(*sorted(chat_topics), *CHAT_PAGE_TOPICS) as sidebar_sub:
+    # Only a page showing the deck chat moves when it jumps to another chat (#3816).
+    jumps = getattr(request.app.state, "chat_jumps", None)
+    deck_page = jumps is not None and meta_chat.is_deck_chat(state, get_db(request), leg_key)
+    with state.bus.subscribe(
+        *sorted(chat_topics), *CHAT_PAGE_TOPICS, *((JUMP_TOPIC,) if deck_page else ())
+    ) as sidebar_sub:
         watching_needs_you(request)
         presentation = state.session_presentation()
         yield format_sse("usage", _limit_bars(session.account_key))
@@ -1278,6 +1341,10 @@ async def _tail_session(
                 yield mac
             if NEEDS_YOU_TOPIC in sidebar_dirty:
                 yield needs_you_event(shared, templates)
+            if JUMP_TOPIC in sidebar_dirty and (jump := jump_event(jumps)):
+                yield jump
+            if VIEW_TOPIC in sidebar_dirty and (view_change := view_event(request)):
+                yield view_change
             # The chat's notes (#3227): primed once per connection, so a note that landed
             # between the page render and this subscription is not missed, then on change.
             # A chat with none sends nothing.

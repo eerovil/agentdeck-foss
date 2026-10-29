@@ -225,16 +225,6 @@ class InjectConfig(BaseModel):
 
 class AssistantConfig(BaseModel):
     enabled: bool = False
-    # Read by nothing since Deckhand stopped making a periodic full pass (#2865); kept so
-    # a config file that still sets it loads.
-    refresh_interval_s: float = 60.0
-
-    @field_validator("refresh_interval_s")
-    @classmethod
-    def _positive_interval(cls, value: float) -> float:
-        if value <= 0:
-            raise ValueError("assistant intervals must be positive")
-        return value
 
 
 class ClaudeWorkerOverrides(BaseModel):
@@ -247,7 +237,6 @@ class ClaudeWorkerOverrides(BaseModel):
     max_workers: int | None = None
     permission_mode: str | None = None
     model: str | None = None
-    usage_ceiling_pct: float | None = None
     stall_after_s: float | None = None
     idle_after_s: float | None = None
     memory_max: str | None = None
@@ -259,15 +248,6 @@ class ClaudeWorkerOverrides(BaseModel):
     def _positive_max_workers(cls, value: int | None) -> int | None:
         if value is not None and value <= 0:
             raise ValueError("claude_workers accounts max_workers must be positive")
-        return value
-
-    @field_validator("usage_ceiling_pct")
-    @classmethod
-    def _usage_ceiling_range(cls, value: float | None) -> float | None:
-        if value is not None and not 0 <= value <= 100:
-            raise ValueError(
-                "claude_workers accounts usage_ceiling_pct must be between 0 and 100"
-            )
         return value
 
     @field_validator("stall_after_s")
@@ -305,8 +285,6 @@ class ClaudeWorkersConfig(BaseModel):
     # guarded command through is dropped with a warning.
     classifier_skip_rules: list[str] = []
     model: str = ""  # "" = account default model
-    # Refuse (re)spawns at/above the fullest reported usage window %; 0 disables.
-    usage_ceiling_pct: float = 0.0
     stall_after_s: float = (
         0.0  # flag a live worker stalled after this many silent seconds; 0 disables
     )
@@ -358,13 +336,6 @@ class ClaudeWorkersConfig(BaseModel):
             raise ValueError("claude_workers.idle_after_s must be non-negative")
         return value
 
-    @field_validator("usage_ceiling_pct")
-    @classmethod
-    def _usage_ceiling_range(cls, value: float) -> float:
-        if not 0 <= value <= 100:
-            raise ValueError("claude_workers.usage_ceiling_pct must be between 0 and 100")
-        return value
-
     @field_validator("stall_after_s")
     @classmethod
     def _non_negative_stall(cls, value: float) -> float:
@@ -377,48 +348,16 @@ class ClaudeWorkersConfig(BaseModel):
         return Path(self.state_dir).expanduser()
 
 
-class KeyedWorkerOverrides(BaseModel):
-    usage_ceiling_pct: float | None = None
-
-    @field_validator("usage_ceiling_pct")
-    @classmethod
-    def _usage_ceiling_range(cls, value: float | None) -> float | None:
-        if value is not None and not 0 <= value <= 100:
-            raise ValueError("keyed_workers usage_ceiling_pct must be between 0 and 100")
-        return value
-
-
 class KeyedWorkersConfig(BaseModel):
     """Provider-neutral durable state for keyed worker adapters."""
 
     state_dir: str = "~/.local/share/agentdeck/keyed-workers"
-    usage_ceiling_pct: float = 0.0
     # Opt-in: run each Codex app-server as a persistent `--listen` backend reached
     # through a `codex app-server proxy`, so in-flight interactions survive a runtime
     # restart. Off by default because that proxy/--listen path currently hangs on
     # `initialize` (codex-cli 0.144.3 & 0.147.0), crash-looping the runtime; the
     # default `--stdio` path is the one that works. See issue #992.
     persistent_backend: bool = False
-    accounts: dict[str, KeyedWorkerOverrides] = {}
-
-    def for_account(self, label: str) -> KeyedWorkersConfig:
-        override = self.accounts.get(label)
-        if override is None:
-            return self
-        return self.model_copy(
-            update={
-                key: value
-                for key, value in override.model_dump().items()
-                if value is not None
-            }
-        )
-
-    @field_validator("usage_ceiling_pct")
-    @classmethod
-    def _usage_ceiling_range(cls, value: float) -> float:
-        if not 0 <= value <= 100:
-            raise ValueError("keyed_workers.usage_ceiling_pct must be between 0 and 100")
-        return value
 
     @property
     def state_path(self) -> Path:
@@ -715,10 +654,6 @@ class SpeechConfig(BaseModel):
     not shrink, so the Finnish default ``1.5`` reads a reply about a third faster
     than the voice's own pace (#3543).
 
-    ``keep_audio_days`` keeps every transcribed phrase's audio and Whisper's words
-    in ``keep_audio_dir`` for that many days, for ``scripts/speech_bench.py`` to
-    compare speech-to-text models on (#3499). ``0``, the default, keeps nothing.
-
     ``engine``, ``whisper_model`` and ``parakeet_model`` are read by the speech
     service itself when it starts, not by the deck (#3509): ``"parakeet"``, the
     default, runs the Parakeet TDT model in the folder ``parakeet_model`` (Orukeet,
@@ -729,17 +664,11 @@ class SpeechConfig(BaseModel):
     Super with ``language = "fi"``: the owner's mixed Finnish heard best and fastest,
     about 0.6 s a phrase, keeping English sentences English; ``large-v3`` forced to
     Finnish translates them, and ``small`` is best only with ``language = "en"`` (#3517).
+    ``whisper_prompt`` is the words Whisper is told to expect, the owner's tech terms
+    by default; ``""`` turns it off. On the owner's 45 recordings it took mixed speech
+    from 11.8 % to 10.4 % wrong at the same speed (#3791).
     The service keeps its model loaded (#3766), so a change takes effect when it is
     restarted (``systemctl --user restart agentdeck-speech.service``).
-
-    ``tts`` is who reads replies aloud (#3519): ``"piper"``, the default, is Piper in
-    the speech service; ``"chatterbox"`` asks Chatterbox Multilingual on the card
-    (``scripts/tts_server.py`` behind ``tts_socket``) first, and Piper reads any
-    sentence it fails on, is slow with or is still loading for. ``tts_exaggeration``
-    and ``tts_cfg_en``/``tts_cfg_fi`` are Chatterbox's own settings for each language.
-    ``tts_dtype`` is read by that service when it starts: ``"float16"`` when
-    ``scripts/tts_bench.py speed`` finds float32 leaves under 300 MiB of the card
-    free beside speech to text.
     """
 
     socket: str = ""
@@ -753,18 +682,18 @@ class SpeechConfig(BaseModel):
     voice_fi: str = Field(default="fi_FI-harri-medium", pattern=r"^[A-Za-z0-9_-]+$")
     speed_en: float = Field(default=1.0, ge=0.5, le=3)
     speed_fi: float = Field(default=1.5, ge=0.5, le=3)
-    keep_audio_days: int = Field(default=0, ge=0, le=90)
-    keep_audio_dir: str = "~/.local/share/agentdeck/speech/kept"
     engine: Literal["whisper", "parakeet"] = "parakeet"
     parakeet_model: str = "~/.local/share/agentdeck/speech/models/orukeet"
     whisper_model: str = Field(default="large-v3-turbo", pattern=r"^[A-Za-z0-9._/~-]+$")
     whisper_beam: int = Field(default=1, ge=1, le=10)
-    tts: Literal["piper", "chatterbox"] = "piper"
-    tts_socket: str = ""
-    tts_exaggeration: float = Field(default=0.5, ge=0, le=2)
-    tts_cfg_en: float = Field(default=0.5, ge=0, le=2)
-    tts_cfg_fi: float = Field(default=0.5, ge=0, le=2)
-    tts_dtype: Literal["float32", "float16"] = "float32"
+    whisper_prompt: str = Field(
+        default=(
+            "AgentDeck, Haiku, Codex, Opus, pull request, deploy, staging, review, merge, "
+            "issue, wake word, voice mode, Sentry, webhook, dashboard, commit, push, branch, "
+            "master, runtime."
+        ),
+        max_length=1000,
+    )
 
 
 class MetaChatConfig(BaseModel):
@@ -847,18 +776,11 @@ class AppConfig(BaseModel):
             seen.add(k)
         return self
 
-    def usage_ceiling_pct(self, provider_id: str, label: str) -> float:
-        """Read the retired ceiling setting for backward-compatible config tooling."""
-        sections = {"claude_code": self.claude_workers}
-        section = sections.get(provider_id, self.keyed_workers)
-        return section.for_account(label).usage_ceiling_pct
-
     def native_model_override(self, provider_id: str, label: str) -> str | None:
         """The deck-configured default model for one account, or None.
 
-        Same one-map shape as ``usage_ceiling_pct``: each provider's worker
-        section owns its configured model, and every reader (currently the New
-        chat defaults) resolves it here instead of naming a provider. Codex has
+        Each provider's worker section owns its configured model, and every reader
+        (currently the New chat defaults) resolves it here instead of naming a provider. Codex has
         no configured model section, so its answer is None — the account-native
         default applies.
         """

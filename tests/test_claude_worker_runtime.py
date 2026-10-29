@@ -115,7 +115,7 @@ async def test_runtime_host_applies_account_overrides(tmp_path):
 
 @pytest.mark.parametrize(
     "field,value",
-    [("usage_ceiling_pct", -1), ("usage_ceiling_pct", 101), ("stall_after_s", -1)],
+    [("stall_after_s", -1), ("idle_after_s", -1), ("max_workers", 0)],
 )
 def test_per_account_overrides_validate_policy_ranges(field, value):
     with pytest.raises(ValidationError):

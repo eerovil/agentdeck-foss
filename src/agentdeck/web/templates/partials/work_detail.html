@@ -15,6 +15,9 @@
     <a href="{{ card.source_url|issue_href }}" target="_blank" rel="noopener">{{ card.source_label }}</a>
     {%- if card.work_state and not derived %}<span class="wk-state" data-wk-state="{{ card.work_state }}">{{ card.work_state }}</span>{% endif %}
     {%- if card.last_activity %}<time class="wk-age" datetime="{{ card.last_activity.isoformat() }}" data-activity-age>{{ card.last_activity | reltime_ago }}</time>{% endif %}
+    {#- The Work's diagram (#3827), on this line so it adds no height. #}
+    {%- set diagram = detail.diagram %}
+    {%- if diagram %}<a class="wd-diagram" data-wd-diagram href="{{ diagram.href }}" title="{{ diagram.title }}"{% if diagram.external %} target="_blank" rel="noopener"{% endif %}>◇ Diagram</a>{% endif %}
   </p>
   {#- ✎ opens the rename form, which sits outside this swapped section (work.html) so a live
       update never clears a name being typed (#2328). The name is this deck's own. #}

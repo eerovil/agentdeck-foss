@@ -13,7 +13,7 @@ one that loses it stops its agent (``work_router``).
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 
 
 def assignee_of(issue: object) -> str:
@@ -110,3 +110,70 @@ async def start_issue(
         timeout=timeout,
     )
     return (outcome, done) if outcome == "done" else (outcome, text)
+
+
+async def take_over(
+    gh: str,
+    repository: str,
+    number: int,
+    *,
+    assignees: Sequence[str],
+    person: str,
+    start_label: str,
+    started: bool,
+    timeout: float = 30.0,
+) -> tuple[str, str]:
+    """Take another deck's issue to this deck: Take over, or Start here (#3834).
+
+    One edit makes ``person`` the only assignee (every other one is removed: only the first
+    assignee counts, and one left in any order could leave it with another deck) and adds
+    ``start_label`` to an issue no agent works on. The hand-over that follows is the
+    router's (``work_router``, #3731): the other deck stops its agent, this one starts. A
+    started Work also gets one comment, so the other person sees why their agent stopped; a
+    failed comment is said, not undone. Answers ``("done", what happened)`` or the edit's
+    outcome and why.
+    """
+    issue = f"{repository}#{number}"
+    current = next(iter(assignees), "")
+    others = [login for login in dict.fromkeys(assignees) if login and login != person]
+    argv = [gh, "issue", "edit", str(number), "--repo", repository]
+    if others:
+        argv += ["--remove-assignee", ",".join(others)]
+    argv += ["--add-assignee", person]
+    if not started:
+        argv += ["--add-label", start_label]
+    label = "Take over" if started else "Start here"
+    outcome, text = await run_gh_write(argv, repository, label, timeout=timeout)
+    if outcome != "done":
+        return outcome, text
+    if not started:
+        return "done", (
+            f"Started {issue} here: it is assigned to {person} and has the {start_label} "
+            "label, so an agent starts on it"
+        )
+    done = f"Took over {issue}: it is assigned to {person}, so "
+    done += (
+        f"@{current}'s deck stops its agent and "
+        if current
+        else "the other deck stops its agent and "
+    )
+    done += "this deck starts one on the same branch"
+    whom = f"@{current}'s deck" if current else "another deck"
+    comment, why = await run_gh_write(
+        [
+            gh,
+            "issue",
+            "comment",
+            str(number),
+            "--repo",
+            repository,
+            "--body",
+            f"@{person} took this over from {whom}.",
+        ],
+        repository,
+        "The take-over comment",
+        timeout=timeout,
+    )
+    if comment != "done":
+        done += f". {why}"
+    return "done", done

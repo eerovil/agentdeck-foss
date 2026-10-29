@@ -1593,19 +1593,6 @@ class AppState:
         current = tuple(refs)
         return replace(session, issues=current) if session.issues != current else session
 
-    def _republish_session(self, session_key: str) -> None:
-        """Re-project one session's stored metadata onto the read model.
-
-        Deckhand watches ``sessions``, so publishing is also what makes a fresh
-        registration re-resolve its GitHub state.
-        """
-        session = self.sessions.get(session_key)
-        if session is not None:
-            self.sessions[session_key] = self._with_issues(
-                self._with_pull_requests(self._with_generated_title(session))
-            )
-        self.sessions_changed((session_key,))
-
     def _republish_chat(self, session_key: str) -> None:
         """Re-project chat-owned metadata onto every currently resolved leg."""
         keys = self.chat_session_keys(session_key)
@@ -2539,15 +2526,6 @@ class AppState:
 
     def session_is_muted(self, session_key: str, *, now: datetime | None = None) -> bool:
         return self.mute_lease(session_key, now=now) is not None
-
-    def babysat_session_keys(self, *, now: datetime | None = None) -> frozenset[str]:
-        """Chats a live lease is currently held on."""
-        at = now or datetime.now(UTC)
-        return frozenset(
-            key
-            for key, lease in self.mute_leases.items()
-            if lease.active_at(at)
-        )
 
     def grant_mute_lease(
         self,

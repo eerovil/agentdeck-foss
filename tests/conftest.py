@@ -630,7 +630,7 @@ def _no_live_guesses(monkeypatch, tmp_path_factory):
     monkeypatch.setattr(voice_helper, "start_process", no_agent)
     monkeypatch.setattr(voice_helper, "_agents", {})
     monkeypatch.setattr(voice_helper, "LOG_DIR", tmp_path_factory.mktemp("voice-log"))
-    # Live prototyping's meeting records (#3569) are files under the home directory too.
+    # Live prototyping's records (#3569) are files under the home directory too.
     from agentdeck import live_prototype
 
     monkeypatch.setattr(

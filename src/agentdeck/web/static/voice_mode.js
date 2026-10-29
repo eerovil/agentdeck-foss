@@ -58,8 +58,26 @@
 //   back the words with speech-recognition mistakes fixed, which the composer then
 //   sends. Plain noise it drops. Its memory is only what was said by voice, so the
 //   page tells it each 🔊 line it read aloud since. With no answer in time the
-//   words are sent as heard and the page says "Got it, working on it." (Finnish
-//   when the message asked for Finnish), as it does for any other send.
+//   words are sent as heard.
+// - Words Whisper doubted reach the fast agent and the chat as "[unsure: …]"
+//   (#3817), so the agent can ask what was meant rather than act on a guess. The
+//   host names them by segment, and the page keeps where they sit in the words
+//   heard (`v.doubts`, [start, end] pairs), so the same words said twice are told
+//   apart. The page's own checks (the wake word, "stop", an echo of the reading)
+//   read the words unmarked; only the copy that is asked about and sent is marked.
+//   A doubted answer to a question box picks nothing: it is asked for again, by the
+//   owner's decision on #3817. Voice mode's own commands ("stop", "cancel", "stop
+//   listening") still act when doubted, by the owner's decision on its review: they
+//   often score low yet are right, and an ignored real "stop" is worse.
+// - The fast agent waits for the chat to speak (#3799): nothing is said at a send
+//   but its tone. When the chat says nothing aloud for 5 s after a send while it
+//   works, the fast agent says in one sentence what the agent is doing, from the
+//   steps the transcript shows (`/api/voice/narrate`); with nothing from it, its
+//   own line for the phrase or "Got it, working on it." (Finnish when the message
+//   asked for Finnish). After that, every 30 s with nothing said while the agent
+//   works brings one more such line, or "Still working on it." when it sees
+//   nothing new. A question box being read counts as the chat speaking. The voice
+//   log is told which of its lines were really said.
 // - Sooner after the person stops talking (#3765): a phrase goes to the host after
 //   0.3 s of quiet, while the 0.8 s pause that ends it runs, and that result is
 //   dropped if sound comes back first. The fast agent is asked as soon as the words
@@ -99,15 +117,24 @@
 // - The screen is kept awake while voice mode is on; a tap on either button resumes
 //   a paused voice mode. With 🎧 off nothing is said, voice mode's own lines
 //   included, and messages ask for no 🔊 line.
-// - How 🎤 listens is picked from the menu a long press on it opens, and kept on the
-//   device (#3540): Always, all of the above; Hey Jarvis, which waits for the name
-//   wherever Always would listen ("lopeta kuuntelu" said alone switches to it); Tap,
-//   which listens for one message a tap and lets go of the microphone in between (a
-//   second tap takes the message back); and Dictate, plain dictation into the draft
-//   (composer_speech.js). In Hey Jarvis and Tap, talking over a reading does not
-//   stop it. A question box is answered in Hey Jarvis by "Hey Jarvis" and the
-//   answer, and in Tap by a tap on 🎤, so talk in the room is not taken for the
-//   owner's.
+// - 🎤 starts in Jarvis (#3787, the owner's version F of the live prototype):
+//   only phrases with "Hey Jarvis" count, talking over a reading does not stop it,
+//   and a question box needs the name or a tap. A tap is "talk now": from off
+//   (🎤 turns on in Jarvis), while it waits for the name or while a reply is read,
+//   it listens for one message and then waits for the name again. A tap while it
+//   listens sends what was heard and goes to Jarvis. A long press opens a menu of
+//   Jarvis, Always (all of the above: it listens after every reply and while the
+//   agent works, waiting for the name after the idle spell) and Off. "lopeta
+//   kuuntelu" said alone switches to Jarvis. The choice is carried to the next chat
+//   in the tab like 🎧 and 🎤, never kept on the device: a new voice mode starts in
+//   Jarvis. Plain dictation is gone from the chat composer; New work and new chat
+//   forms still dictate (composer_speech.js).
+// - Jumping between chats (#3816): the deck chat can move its page to another chat
+//   (chat_jump.js), and voice mode carries on there. With voice mode on, the move waits
+//   until the deck chat's turn has ended and its reply was read, so that is heard first
+//   (`AgentDeckVoiceJump`). In any other chat the fast agent spots an ask to go back to
+//   the deck chat, in any words, and the page opens it without sending the words. The
+//   chat arrived in is named aloud ("Now in: Deck chat.") instead of "Voice mode on.".
 // - It goes on speaking and listening with the page hidden (#3408), and the page's
 //   live stream stays open for it. Where the browser will not do one of them there,
 //   it pauses as before and the bubble says which; a tap reads a reply that
@@ -135,23 +162,35 @@
   var QUICK_ENDS_ALLOWED = 3;
   var MARK = '🔊';  // 🔊
   var ACK = { en: 'Got it, working on it.', fi: 'Selvä, työn alla.' };
+  // A long quiet spell where the fast agent sees nothing new to say (#3799): the work
+  // is still going, and that much is true.
+  var STILL = { en: 'Still working on it.', fi: 'Yhä työn alla.' };
   // What voice mode itself says, in Finnish for an owner who speaks only that (#3525).
   var SAID = {
     en: {
       on: 'Voice mode on.', onScreen: 'Answer on screen.',
       secret: 'This question needs a secret.', number: 'Please say an option number.',
       option: 'Option', more: 'More on screen.', reply: 'The reply is on screen.',
-      room: 'OK, only after Hey Jarvis.'
+      room: 'OK, only after Hey Jarvis.', now: 'Now in:',
+      again: 'I did not catch that. Please say it again.'
     },
     fi: {
       on: 'Äänitila päällä.', onScreen: 'Vastaa ruudulla.',
       secret: 'Tähän kysymykseen tarvitaan salaisuus.', number: 'Sano vaihtoehdon numero.',
       option: 'Vaihtoehto', more: 'Lisää ruudulla.', reply: 'Vastaus on ruudulla.',
-      room: 'Selvä, vain Hey Jarvis.'
+      room: 'Selvä, vain Hey Jarvis.', now: 'Nyt:',
+      again: 'En saanut selvää. Sano uudelleen.'
     }
   };
   // The fast agent answers in about a second; past this the words go as heard.
   var FAST_WAIT_MS = 6500;
+  // The chat silent this long after a send, or this long while it works, has the
+  // fast agent say what it is doing (#3799); `data-voice-quiet-seconds` ("5 30")
+  // overrides both.
+  var NARRATE_FIRST_MS = 5000;
+  var NARRATE_EVERY_MS = 30000;
+  // A send whose turn has not started by then is not waited on any more.
+  var NARRATE_GIVE_UP_MS = 60000;
   // The 🔊 lines read aloud that the fast agent is told with the next phrase.
   var ALOUD_KEPT = 5;
   // Host listening: a phrase ends after this much quiet, and is sent this long after
@@ -178,26 +217,25 @@
   var LOADING_MODEL = 'Loading speech model…';
   var LOADING_RETRY_MS = 2000;
   var LOADING_RETRIES = 10;
-  var WAITING = 'Say “Hey Jarvis”';
-  // How 🎤 listens, picked from the menu a long press on it opens and kept on this
-  // device (#3540): 'open' listens after every reply, 'jarvis' only after "Hey
-  // Jarvis", 'tap' for one message a tap, and 'dictate' is plain dictation
-  // (composer_speech.js), which only writes into the draft.
-  var LISTEN_MODES = ['open', 'jarvis', 'tap', 'dictate'];
-  var LISTEN_TITLE = {
-    open: 'Always listening after a reply',
-    jarvis: 'Listening only after “Hey Jarvis”',
-    tap: 'Listening for one message a tap',
-    dictate: 'Dictate into the draft'
+  var WAITING = 'Say “Hey Jarvis” · tap 🎤 to talk';
+  // The device-kept mode of #3540, cleared on load (#3787).
+  var OLD_LISTEN_KEY = 'agentdeck.voiceListenMode';
+  var MIC_TITLE = {
+    off: 'Tap to talk · hold for Jarvis, Always or Off',
+    listening: 'Listening · tap when done · hold for the menu',
+    waiting: 'Waiting for “Hey Jarvis” · tap to talk · hold for the menu'
   };
-  var LISTEN_KEY = 'agentdeck.voiceListenMode';
   // 🎧 and 🎤 as they were in the chat left, for the next one opened (#3548).
   var CARRY_KEY = 'agentdeck.voiceCarry';
+  // The chat a jump moves to, named aloud on arriving there (#3816).
+  var ARRIVE_KEY = 'agentdeck.voiceArrive';
+  // A deck chat jump still waiting for its turn's reply this long goes anyway.
+  var JUMP_WAIT_MS = 90000;
   // A carried voice mode whose audio the browser will not start without a tap.
   var CARRY_PAUSED = 'Voice mode paused · tap 🎧 to go on';
   var CARRY_START_MS = 1000;
   var TAP_TO_ANSWER = 'Answer on screen · tap 🎤 to answer';
-  // Said alone, in any mode, it switches to Jarvis (#3540).
+  // Said alone, it switches 🎤 to Jarvis (#3540, #3787).
   var ROOM_PHRASE = /^(?:(?:lopeta|lopetta|lopettaa) kuuntel\w*|älä kuuntele|stop listening)$/;
   // How Whisper writes "Hey Jarvis" (#3476): "Hey, Jarvis.", "Hi Jarvis!", "Hei Jarvis".
   var WAKE_WORD = /\b(?:hey|hei|hay|hi|hai|a)[\s,.!-]*(?:jarvis|jarvi|javis|jarves|jarvus)\b[\s,.!?:;-]*/i;
@@ -287,6 +325,7 @@
     else v.mic.removeAttribute('data-voice-hears');
     if (listeningMode(v)) v.mic.setAttribute('data-voice-state', v.mode);
     else v.mic.removeAttribute('data-voice-state');
+    v.mic.title = !on ? MIC_TITLE.off : v.mode === 'waiting' ? MIC_TITLE.waiting : MIC_TITLE.listening;
   }
 
   // A name for a waiting phrase or a spell of waiting in the wake log (#3476).
@@ -490,8 +529,10 @@
     if (document.hidden && v.blocked.speak) { background(v, 'speak'); return; }
     stopListening(v);
     clearTimeout(v.speechWatch);
+    clearTimeout(v.quietTimer);
     silence(v);
     v.noting = false;
+    v.voicedAt = Date.now();
     var token = {};
     v.speaking = token;
     setMode('speaking');
@@ -504,7 +545,9 @@
     var v = voice;
     v.speaking = null;
     v.source = null;
+    v.voicedAt = Date.now();
     if (then) then();
+    if (voice === v && !v.speaking) watchQuiet(v);
   }
 
   // A request to the host's speech service. A 503 or a dropped connection is most
@@ -647,19 +690,23 @@
   // sound, and only words that are not the reading's echo pause it while the
   // phrase is heard out; an echo after all resumes it a second before the pause.
   // Every pause resumes, however many (the owner's decision on #3426).
+  // In Jarvis mode the room's talk would cut every reply short (#3540): each phrase
+  // goes to the wake word detector instead, and only "Hey Jarvis" stops the reading
+  // (#3798). A reading that says the name itself is heard by Whisper, so its own
+  // echo (which the detector wakes on) is let go of.
   var REWIND_S = 1;
   var OVERHEAR_CHECK_MS = 400;
   var OVERHEAR_RECHECK_MS = 700;
 
   function overhear(v, played) {
-    // In Jarvis and Tap modes the room's talk would cut every reply short (#3540).
-    if (!v.hears || v.listenMode !== 'open' || !v.capture || v.played !== played) return;
+    if (!v.hears || !v.capture || v.played !== played) return;
     var rec = new HostRecognition(v);
     v.overheard = rec;
+    if (v.room) rec.waking = WAKE_WORD.test(played.text) ? 'whisper' : v.wake;
     var checked = 0;
     var checking = false;
     rec.onsound = function (soundMs) {
-      if (checking || v.overheard !== rec || !v.source) return;
+      if (checking || rec.waking || v.overheard !== rec || !v.source) return;
       if (soundMs < (checked ? checked + OVERHEAR_RECHECK_MS : OVERHEAR_CHECK_MS)) return;
       checked = soundMs;
       checking = true;
@@ -679,7 +726,8 @@
     rec.onresult = function (event) {
       if (v.overheard !== rec) return;
       var text = event.results[0][0].transcript;
-      if (echoOf(text, played.text)) {
+      var name = rec.waking && WAKE_WORD.exec(text);
+      if ((rec.waking && !name && !event.results[0].woke) || echoOf(text, played.text)) {
         // What the host made of the reading is not what the person speaks.
         v.lang = lang[0];
         v.heardLang = lang[1];
@@ -691,11 +739,25 @@
       var source = v.source;
       v.source = null;
       if (source) { try { source.stop(); } catch (e) { /* already ended */ } }
+      // Woken, the words after the name are the message, and with none it beeps and
+      // listens for one (#3781); "Hey Jarvis, stop" only stops it.
+      var doubts = event.results[0].doubts || [];
+      if (name) {
+        var after = afterWake(text, doubts, name);
+        text = after.text;
+        doubts = after.doubts;
+      }
+      var stop = words(text).join(' ') === 'stop';
+      if (rec.waking && !stop) v.once = true;
       // Its end listens, and that listening starts from these words.
-      if (words(text).join(' ') !== 'stop') v.interrupted = text;
+      if (!stop) {
+        v.interrupted = text;
+        v.interruptedDoubts = doubts;
+      }
       var reading = v.reading;
       spoke(played.token, played.then);
       v.interrupted = '';
+      v.once = false;
       cutShort(v, reading);
     };
     // A stalled microphone or a failed host: the rest of this reading is not heard.
@@ -934,8 +996,10 @@
     return v.rec === this && (v.purpose === 'answer' || v.purpose === 'turn');
   };
 
-  // Who hears the phrase: Whisper alone, or the wake word detector first.
+  // Who hears the phrase: Whisper alone, or the wake word detector first. Over a
+  // reading in Jarvis mode, `waking` says (#3798).
   HostRecognition.prototype.wake = function () {
+    if (this.waking) return this.waking;
     return this.v.purpose === 'wake' ? this.v.wake : 'whisper';
   };
 
@@ -990,7 +1054,7 @@
         // Whisper can call English sound Finnish and still write English words: the
         // words win.
         v.lang = v.heardLang = v.always || wordsLanguage(text) || (heard.language === 'fi' ? 'fi' : 'en');
-        self.heard(text, !!(wake && wake.detected));
+        self.heard(text, !!(wake && wake.detected), doubtSpans(text, heard.segments));
       }
       self.end();
     }).catch(function () {
@@ -1030,11 +1094,13 @@
   }
 
   // One phrase's words, as a recognizer's final result. `woke`: the detector heard
-  // the wake word in it, whatever Whisper wrote.
-  HostRecognition.prototype.heard = function (text, woke) {
+  // the wake word in it, whatever Whisper wrote; `doubts`: where the parts Whisper
+  // doubted sit in `text`.
+  HostRecognition.prototype.heard = function (text, woke, doubts) {
     var result = [{ transcript: text }];
     result.isFinal = true;
     result.woke = woke;
+    result.doubts = doubts || [];
     if (this.onresult) this.onresult({ resultIndex: 0, results: [result] });
   };
 
@@ -1067,6 +1133,16 @@
       var text = (heard.text || '').trim();
       done(!!text, text);
     }).catch(function () { done(false); });
+  };
+
+  // A tap meaning "done" (#3787): the phrase being said ends now, as if paused.
+  // False when no phrase has started.
+  HostRecognition.prototype.cut = function () {
+    var phrase = !this.done && this.sofar ? this.sofar() : [];
+    if (!phrase.length) return false;
+    this.endedAt = Date.now();
+    this.finish(phrase);
+    return true;
   };
 
   HostRecognition.prototype.end = function () {
@@ -1128,6 +1204,63 @@
     return v.phrases.join(' ').trim();
   }
 
+  // Where the segments Whisper doubted sit in `text`, the host's words for a phrase,
+  // as [start, end] pairs (#3817). `segments` are its parts in order, each
+  // `{text, unsure}`; each is found after the one before, so the same words said
+  // twice are told apart.
+  function doubtSpans(text, segments) {
+    var spans = [];
+    var at = 0;
+    (Array.isArray(segments) ? segments : []).forEach(function (segment) {
+      var part = String((segment && segment.text) || '').trim();
+      var found = part ? text.indexOf(part, at) : -1;
+      if (found < 0) return;
+      if (segment.unsure === true) spans.push([found, found + part.length]);
+      at = found + part.length;
+    });
+    return spans;
+  }
+
+  // `spans` moved `by` characters and kept inside `length`, empty ones dropped.
+  function moveSpans(spans, by, length) {
+    var moved = [];
+    (spans || []).forEach(function (span) {
+      var start = Math.max(0, span[0] + by);
+      var end = Math.min(length, span[1] + by);
+      if (end > start) moved.push([start, end]);
+    });
+    return moved;
+  }
+
+  // The words after the wake word `name` found in `text`, and their doubts.
+  function afterWake(text, doubts, name) {
+    var tail = text.slice(name.index + name[0].length);
+    var message = tail.trim();
+    var cut = text.length - tail.replace(/^\s+/, '').length;
+    return { text: message, doubts: moveSpans(doubts, -cut, message.length) };
+  }
+
+  // A phrase's words joined to the ones heard so far, its doubts with them.
+  function addPhrase(v, text, doubts) {
+    var before = v.phrases.join(' ');
+    var by = before.length + (v.phrases.length ? 1 : 0);
+    v.phrases.push(text);
+    v.doubts = (v.doubts || []).concat(moveSpans(doubts, by, by + text.length));
+  }
+
+  // `text` with each doubted span as "[unsure: …]" (#3817).
+  function markUnsure(text, doubts) {
+    var spans = (doubts || []).slice().sort(function (a, b) { return b[0] - a[0]; });
+    var end = text.length;
+    spans.forEach(function (span) {
+      if (span[1] > end) return;  // overlaps one already marked
+      text = text.slice(0, span[0]) + '[unsure: ' + text.slice(span[0], span[1]) + ']' +
+        text.slice(span[1]);
+      end = span[0];
+    });
+    return text;
+  }
+
   function clearTimers(v) {
     clearTimeout(v.sendTimer);
     clearTimeout(v.giveUpTimer);
@@ -1145,27 +1278,31 @@
     if (!v) return;
     // A phrase still with the fast agent: its answer listens (#3444).
     if (v.relaying) { v.relayPurpose = purpose; return; }
+    // The deck chat's jump waited for its turn's reply to be read (#3816).
+    if (v.jump && !working() && !v.question) { jumpNow(v); return; }
     var interrupted = v.interrupted;
     v.interrupted = '';
+    v.doneTap = false;
     // A tap on 🎤, or "Hey Jarvis" alone, listens for one message in any mode (#3540).
     var once = v.once;
     v.once = false;
+    // Woken over a 🔊 note read while it waited, it listens for the message (#3798).
+    if (once && purpose === 'wake') purpose = working() ? 'turn' : 'answer';
     stopListening(v);
     if (dictating()) { rest('Dictation is on'); return; }
     if (document.hidden && v.blocked.listen) { background(v, 'listen'); return; }
-    // Only Always mode answers a question box unasked; Hey Jarvis waits for the name
-    // and takes the words after it as the answer, by the owner's decision on #3540;
-    // otherwise talk in the room could pick an option, so it rests until a tap on 🎤
-    // answers it.
+    // Listening openly answers a question box unasked; the room state waits for the
+    // name and takes the words after it as the answer, by the owner's decision on
+    // #3540, or for a tap on 🎤; with 🎤 off it rests until a tap answers it.
     var asked = purpose === 'question' && !once && !(v.question && v.question.tapped);
-    if (asked && v.hears && v.listenMode === 'jarvis') purpose = 'wake';
-    else if (asked && !(v.hears && v.listenMode === 'open')) {
+    if (asked && v.hears && v.room) purpose = 'wake';
+    else if (asked && !v.hears) {
       v.purpose = purpose;
       if (!v.hears) closeMicrophone(v);
       rest(TAP_TO_ANSWER);
       return;
     }
-    // 🎤 off, or Tap mode between taps: the microphone is let go of, so the
+    // 🎤 off: the microphone is let go of, so the
     // browser's recording light goes out too; with 🎧 off as well, voice mode ends.
     if (purpose !== 'question' && !once && !v.hears) {
       v.purpose = purpose;
@@ -1175,10 +1312,11 @@
       showStatus('');
       return;
     }
-    if (purpose !== 'question' && !once && v.listenMode === 'jarvis') purpose = 'wake';
+    if (purpose !== 'question' && !once && v.room) purpose = 'wake';
     v.purpose = purpose;
     dropEarly(v, 'not sent: listening started over');
     v.phrases = interrupted ? [interrupted] : [];
+    v.doubts = interrupted ? v.interruptedDoubts || [] : [];
     v.woke = false;
     v.wordsAt = Date.now();
     v.base = v.input.value.replace(/\s+$/, '');
@@ -1227,7 +1365,7 @@
       if (current() !== v || v.rec !== rec) return;
       v.quickEnds = 0;
       idle(v);
-      v.phrases.push(event.results[0][0].transcript.trim());
+      addPhrase(v, event.results[0][0].transcript.trim(), event.results[0].doubts);
       if (event.results[0].woke) v.woke = true;
       // More words joined the phrase: the fast agent's answer so far is not its.
       if (v.early && v.early.text !== heard(v)) dropEarly(v, 'not sent: more words followed');
@@ -1273,6 +1411,10 @@
       if (why === 'background') { background(v, 'listen'); return; }
       if (why) { off(why); return; }
       if (!listeningMode(v)) return;
+      // Tapped done (#3787): what the phrase brought goes at once, and with nothing
+      // it goes back to waiting for "Hey Jarvis".
+      var tapped = v.doneTap;
+      v.doneTap = false;
       // A phrase that held the send back and brought no words (a cough, a fan, a
       // dropped "Thank you.") lets it go when it was due: a second after the last
       // words, not after the noise, or a run of coughs would put it off for good.
@@ -1281,13 +1423,20 @@
       clearTimeout(v.holdTimer);
       if (heard(v)) {
         clearTimeout(v.sendTimer);
-        var due = v.wordsAt + HOST_SEND_AFTER_MS - Date.now();
+        // The detector heard "Hey Jarvis" (#3793): it answers at once. Waiting a
+        // second for more words gained nothing, since a waiting phrase without the
+        // name is let go of, and made the beep come late.
+        var now = tapped || (v.woke && v.purpose === 'wake');
+        var due = now ? 0 : v.wordsAt + HOST_SEND_AFTER_MS - Date.now();
         if (due > 0) v.sendTimer = setTimeout(function () { finish(v); }, due);
         else finish(v);
         // Sent, the phrase is with the fast agent: no listener may write a later
         // phrase into the draft it is sent from (#3514). One its answer started
         // already listens.
         if (!listeningMode(v) || v.rec) return;
+      } else if (tapped) {
+        listen(v.question ? 'question' : working() ? 'turn' : 'answer');
+        return;
       }
       if (Date.now() - v.startedAt < QUICK_END_MS && !heard(v)) {
         v.quickEnds += 1;
@@ -1338,6 +1487,7 @@
     v.base = v.input.value.replace(/\s+$/, '');
     v.written = v.input.value;
     v.phrases = [];
+    v.doubts = [];
     dropEarly(v, 'not sent: typed over');
     clearTimeout(v.sendTimer);
     v.sendTimer = null;
@@ -1425,12 +1575,16 @@
       dropEarly(v, 'not sent: the words changed');
       early = null;
     }
-    if (v.purpose === 'wake') { woken(v, text); return; }
-    if (v.purpose === 'question') { answerQuestion(v, text); return; }
+    var doubts = v.doubts || [];
+    v.doubts = [];
+    if (v.purpose === 'wake') { woken(v, text, doubts); return; }
+    var marked = markUnsure(text, doubts);
+    if (v.purpose === 'question') { answerQuestion(v, text, doubts.length > 0); return; }
     if (ROOM_PHRASE.test(said)) {
       restoreDraft(v);
-      setListenMode(v, 'jarvis');
+      v.room = true;
       v.hears = true;
+      remember(v);
       speak(ownLine('room'), function () { listen(working() ? 'turn' : 'answer'); });
       return;
     }
@@ -1471,13 +1625,24 @@
     // What the person had not heard when they stopped speaking (#3520).
     var unheard = unheardNow(v);
     var last = v.lastAloud;
-    answered(early || startAsk(v, text, id), function (answer) {
+    answered(early || startAsk(v, text, id, false, marked), function (answer) {
       v.relaying = false;
       if (current() !== v) return;
       var after = function () {
         if (v.mode === 'speaking' || v.question) return;
         listen(working() ? 'turn' : (v.relayPurpose || 'answer'));
       };
+      if (answer && answer.jump) {
+        // The way back to the deck chat (#3816): the words go nowhere, the page goes there.
+        v.input.value = v.input.value === shown ? base : v.input.value;
+        v.input.dispatchEvent(new Event('input', { bubbles: true }));
+        reportSent(v, id, null, 'not sent: back to the deck chat');
+        showStatus('Back to the deck chat…');
+        var back = answer.jump;
+        v.jump = { title: back.title, go: function () { goTo(back.path); } };
+        jumpNow(v);
+        return;
+      }
       if (answer && answer.relay === null) {
         // Plain noise: nothing is sent and nothing said; the draft is what it was
         // with anything typed meanwhile.
@@ -1496,7 +1661,7 @@
         after();
         return;
       }
-      var words = answer ? answer.relay : text;
+      var words = answer ? answer.relay : marked;
       // What was typed meanwhile is kept: after the words, or, edited into them,
       // in place of them.
       var now = v.input.value;
@@ -1512,14 +1677,15 @@
         after();
         return;
       }
-      // Its own words stand in for the acknowledgement this send would get.
-      if (answer && answer.say) v.fastSaidAt = Date.now();
+      // Its own line is said only if the chat stays silent (#3799).
+      v.fastSay = answer && answer.say ? { text: answer.say, id: id } : null;
       v.spoken = { unheard: unheard, last: last, at: Date.now() };
       button.click();
+      v.fastSay = null;
       reportSent(v, id, value, answer ? 'sent' : 'sent as heard: no answer in time');
       v.base = '';
       showStatus(working() ? 'Sent as a follow-up · listening…' : 'Sent');
-      if (!(answer && answer.say && aside(v, answer.say))) after();
+      after();
     });
   }
 
@@ -1544,7 +1710,7 @@
     dropEarly(v, 'not sent: more words followed');
     if (!relayed(v, words(text).join(' '))) return;
     var at = Date.now();
-    v.early = startAsk(v, text, phraseId(at), true);
+    v.early = startAsk(v, text, phraseId(at), true, markUnsure(text, v.doubts));
     v.early.at = at;
   }
 
@@ -1559,8 +1725,9 @@
   }
 
   // Asks the fast agent about `text` (#3444); `answered` hears its answer. `keep`
-  // leaves the 🔊 lines it is told for the next ask.
-  function startAsk(v, text, id, keep) {
+  // leaves the 🔊 lines it is told for the next ask. `marked` is `text` as the fast
+  // agent is told it, its doubted parts marked (#3817).
+  function startAsk(v, text, id, keep, marked) {
     var ask = { text: text, id: id, at: Date.now(), aloud: v.aloud.length, done: false,
       answer: null, waiting: [] };
     var aloud = keep ? v.aloud.slice() : v.aloud.splice(0);
@@ -1576,16 +1743,17 @@
     }
     fetch('/api/voice/heard', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ session_key: v.key, text: text, aloud: aloud, id: id, run: v.run,
-        drop: drop })
+      body: JSON.stringify({ session_key: v.key, text: marked || text, aloud: aloud, id: id,
+        run: v.run, drop: drop })
     }).then(function (reply) { return reply.ok ? reply.json() : null; })
       .then(function (body) {
         if (!body || (typeof body.relay !== 'string' && body.relay !== null)) {
           finished(null);
           return;
         }
-        var relay = body.relay === null ? null : body.relay.trim() || text;
-        finished({ say: speakable(String(body.say || '')), relay: relay });
+        var relay = body.relay === null ? null : body.relay.trim() || marked || text;
+        var jump = body.jump && typeof body.jump.path === 'string' ? body.jump : null;
+        finished({ say: speakable(String(body.say || '')), relay: relay, jump: jump });
       }, function () { finished(null); });
     return ask;
   }
@@ -1672,12 +1840,17 @@
   // words after it are a message, as if heard while listening for one. A phrase the
   // detector woke on counts even when Whisper wrote the name some other way: then
   // all of its words are the message.
-  function woken(v, text) {
+  function woken(v, text, doubts) {
     var woke = v.woke;
     v.woke = false;
     var match = WAKE_WORD.exec(text);
     if (!match && !woke) return;
-    var message = match ? text.slice(match.index + match[0].length).trim() : text;
+    var message = text;
+    if (match) {
+      var after = afterWake(text, doubts, match);
+      message = after.text;
+      doubts = after.doubts;
+    }
     // The name alone listens at once: the listening beep is its only answer, so no
     // spoken line is there for the microphone to hear (#3781).
     if (!message) {
@@ -1689,7 +1862,7 @@
     if (v.question) {
       setMode('listening');
       v.purpose = 'question';
-      answerQuestion(v, message);
+      answerQuestion(v, message, doubts.length > 0);
       return;
     }
     v.purpose = working() ? 'turn' : 'answer';
@@ -1697,6 +1870,7 @@
     setMode('listening');
     showStatus('Listening…');
     v.phrases = [message];
+    v.doubts = doubts;
     show(v);
     finish(v);
   }
@@ -1712,7 +1886,18 @@
     var v = current();
     var id = form.querySelector('input[name="interaction_id"]');
     var key = id ? id.value : form;
-    if (!v || v.asked === key) return;
+    if (!v) return;
+    if (v.asked === key) {
+      // The same box swapped in again: the answers given so far are carried into
+      // it, and the rest go into the one on the page.
+      var q = v.question;
+      if (q && q.form !== form) {
+        carryAnswers(q.form, form);
+        q.form = form;
+        q.sets = Array.prototype.slice.call(form.querySelectorAll('fieldset'));
+      }
+      return;
+    }
     v.asked = key;
     stopListening(v);
     var kind = form.getAttribute('data-interaction-kind');
@@ -1730,6 +1915,28 @@
     askNext(v);
   }
 
+  // What was ticked or typed in `from`, set in the same fields of `to`, as if picked
+  // there, so the box's own draft keeping sees it too.
+  function carryAnswers(from, to) {
+    Array.prototype.forEach.call(from.querySelectorAll('input'), function (old) {
+      if (!old.name || old.type === 'hidden' || old.type === 'password') return;
+      var fresh = Array.prototype.filter.call(to.querySelectorAll('input'), function (input) {
+        return input.name === old.name && input.type === old.type &&
+          (old.type === 'text' || input.value === old.value);
+      })[0];
+      if (!fresh) return;
+      if (old.type === 'text') {
+        if (!old.value || fresh.value === old.value) return;
+        fresh.value = old.value;
+      } else {
+        if (!old.checked || fresh.checked) return;
+        fresh.checked = true;
+      }
+      fresh.dispatchEvent(new Event('input', { bubbles: true }));
+      fresh.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+  }
+
   function optionsOf(fieldset) {
     return Array.prototype.slice.call(fieldset.querySelectorAll('input[type=radio], input[type=checkbox]'));
   }
@@ -1739,6 +1946,11 @@
     var fieldset = q.sets[q.index];
     if (!fieldset) {
       v.question = null;
+      // An answer the box still lacks would block its Submit: not "Answer sent".
+      if (q.form.checkValidity && !q.form.checkValidity()) {
+        speak(ownLine('onScreen'), function () { rest('Answer on screen'); });
+        return;
+      }
       var submit = q.form.querySelector('button[name="decision"][value="accept"]');
       if (submit) submit.click();
       tone(660);
@@ -1787,7 +1999,9 @@
     return picked;
   }
 
-  function answerQuestion(v, text) {
+  // `doubted`: Whisper doubted some of the words, so nothing is picked from them and
+  // the answer is asked for again, once (the owner's decision on #3817).
+  function answerQuestion(v, text, doubted) {
     var q = v.question;
     if (!q || !q.form.isConnected) { v.question = null; rest(''); return; }
     var fieldset = q.sets[q.index];
@@ -1799,10 +2013,22 @@
       speak(ownLine('onScreen'), function () { rest('Answer on screen'); });
       return;
     }
-    var picked = options.length ? numbersIn(text, options.length) : null;
+    var picked = options.length && !doubted ? numbersIn(text, options.length) : null;
     var multi = options.length && options[0].type === 'checkbox';
-    if (picked && (multi || picked.length === 1)) {
-      picked.forEach(function (n) { options[n - 1].checked = true; });
+    if (doubted && !q.retried) {
+      q.retried = true;
+      speak(ownLine('again'), function () { listen('question'); });
+      return;
+    } else if (doubted) {
+      v.question = null;
+      speak(ownLine('onScreen'), function () { rest('Answer on screen'); });
+      return;
+    } else if (picked && (multi || picked.length === 1)) {
+      picked.forEach(function (n) {
+        var option = options[n - 1];
+        option.checked = true;
+        option.dispatchEvent(new Event('change', { bubbles: true }));
+      });
     } else if (other) {
       other.value = text;
       other.dispatchEvent(new Event('input', { bubbles: true }));
@@ -1842,7 +2068,11 @@
         if (v.mode === 'listening') v.purpose = 'turn';
         else listen('turn');
       }
+      watchQuiet(v);
     } else if (!now && was) {
+      // Its reply is read next; nothing more is said about its work.
+      v.quiet = null;
+      clearTimeout(v.quietTimer);
       // Words still being spoken are sent by their own 2 s of silence, not cut off here.
       waitForReply(v);
     }
@@ -1904,6 +2134,8 @@
       // Already being read (a tap replayed it): its end listens, not a timer left
       // over from before (#3520).
       if (v.speaking) return;
+      // A reply already read as the turn's note: a waiting jump goes now (#3816).
+      if (v.jump && !v.question) { stopListening(v); jumpNow(v); return; }
       if (v.mode === 'listening') v.purpose = 'answer';
       else listen('answer');
       return;
@@ -1986,32 +2218,115 @@
     return true;
   }
 
-  // The acknowledgement of a message just sent from here (#3444): at once, whatever
-  // the agent does first, unless the fast agent just spoke for it.
-  function acknowledge(v, lang) {
-    if (Date.now() - (v.fastSaidAt || 0) < 1000) return;
-    aside(v, ACK[lang] || ACK.en, lang);
+  // A message just sent from here (#3444) is not answered at once (#3799): the chat
+  // usually says so itself. Only when it stays silent does the fast agent speak;
+  // `fast` (the fast agent's own line for the phrase and its id) is said when it has
+  // nothing, else "Got it, working on it.".
+  function expectVoice(v, lang, fast) {
+    v.quiet = { since: Date.now(), lang: lang,
+      fallback: fast ? fast.text : ACK[lang] || ACK.en, fallbackId: fast ? fast.id : '' };
+    watchQuiet(v);
   }
 
-  // Something said in passing. It does not cut into a reply being read or a
-  // question being asked; like a note, it finishes before the turn's reply is read.
-  // With 🎧 off nothing is said (#3540).
-  function aside(v, text, lang) {
-    if (current() !== v || !v.reads || v.question || v.mode === 'speaking' ||
-        v.mode === 'resting') return false;
-    speak(text, function () { afterAside(v); }, lang || spokenLanguage(v, text));
+  function quietTimes(v) {
+    var control = v.form.querySelector('.voice-control');
+    var attribute = control && control.getAttribute('data-voice-quiet-seconds');
+    var given = String(attribute || '').trim().split(/\s+/).map(Number);
+    return [(given[0] * 1000) || NARRATE_FIRST_MS, (given[1] * 1000) || NARRATE_EVERY_MS];
+  }
+
+  // Times the next quiet spell: 5 s after a send, else 30 s while the agent works,
+  // counted from the last thing said. A reading stopped by a tap on 🎧 never ends
+  // in `spoke`, so the next quiet spell waits for something else to be said or
+  // sent: a limit the owner accepted on #3799.
+  function watchQuiet(v) {
+    clearTimeout(v.quietTimer);
+    if (current() !== v || !v.reads) return;
+    var q = v.quiet;
+    if (q && !working() && Date.now() - q.since > NARRATE_GIVE_UP_MS) { v.quiet = q = null; }
+    if (!q && !working()) return;
+    var from = Math.max(v.voicedAt || 0, v.quietFrom || 0, q ? q.since : 0);
+    var wait = quietTimes(v)[q ? 0 : 1] - (Date.now() - from);
+    v.quietTimer = setTimeout(function () { quietSpell(v); }, Math.max(0, wait));
+  }
+
+  // The chat has said nothing for a while: the fast agent says what it is doing.
+  function quietSpell(v) {
+    if (current() !== v || !v.reads || v.narrating) return;
+    var q = v.quiet;
+    // Said aloud since the send: the chat answered for itself.
+    if (q && (v.voicedAt || 0) > q.since) { v.quiet = null; watchQuiet(v); return; }
+    // Its turn has not started yet; the status swap that starts it watches again.
+    if (!working()) return;
+    // A question box, even one left to answer on screen, or something being said,
+    // speaks for the chat already; the box closing watches again.
+    if (v.question || questionForm() || v.speaking || v.mode === 'speaking') return;
+    if (v.relaying || (v.mode === 'listening' && (heard(v) || v.hearing)) ||
+        (v.mode === 'resting' && !v.idled)) {
+      v.quietTimer = setTimeout(function () { quietSpell(v); }, SEND_AFTER_MS);
+      return;
+    }
+    var asked = Date.now();
+    var id = phraseId(asked);
+    var before = v.voicedAt;
+    var lang = q ? q.lang : (v.answerLang || v.always || 'en');
+    var from = Math.max(v.voicedAt || 0, v.quietFrom || 0, q ? q.since : 0);
+    v.narrating = true;
+    fetch('/api/voice/narrate', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_key: v.key, run: v.run, lang: lang, id: id,
+        seconds: Math.round((asked - from) / 1000) })
+    }).then(function (reply) { return reply.status === 200 ? reply.json() : null; })
+      .catch(function () { return null; })
+      .then(function (body) {
+        v.narrating = false;
+        if (current() !== v) return;
+        var said = body && typeof body.say === 'string' ? speakable(body.say) : '';
+        // The phrase whose held line is said instead, for the voice log.
+        var phrase = '';
+        if (!said && q && v.quiet === q) { said = q.fallback; phrase = q.fallbackId; }
+        // Nothing new while the work goes on: say so rather than nothing.
+        if (!said && !q) said = STILL[lang] || STILL.en;
+        if (v.quiet === q) v.quiet = null;
+        v.quietFrom = Date.now();
+        // The chat spoke, a box opened, the turn ended or a new send came while it
+        // was asked.
+        if (v.voicedAt !== before || !working() || v.question || questionForm() || v.speaking ||
+            (v.quiet && v.quiet !== q) ||
+            v.relaying || !said || !sayQuietly(v, said)) watchQuiet(v);
+        else {
+          reportSpoken(v, id, said);
+          if (phrase) reportSpoken(v, phrase, said);
+        }
+      });
+  }
+
+  // The voice log keeps what was really said, not only what was proposed (#3799).
+  function reportSpoken(v, id, text) {
+    try {
+      fetch('/api/voice/sent', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, keepalive: true,
+        body: JSON.stringify({ session_key: v.key, id: id, spoken: text })
+      }).catch(function () { /* the log then shows it as not spoken */ });
+    } catch (e) { /* the log then shows it as not spoken */ }
+  }
+
+  // The fast agent's line on the chat's quiet work, said like a 🔊 note: after it
+  // the microphone is as it was.
+  function sayQuietly(v, text) {
+    if (v.mode === 'speaking' || (v.mode === 'resting' && !v.idled)) return false;
+    if (v.mode === 'listening' && (heard(v) || v.hearing)) return false;
+    var asleep = v.mode === 'waiting';
+    var idled = v.mode === 'resting';
+    speak(text, function () {
+      v.noting = false;
+      if (replyIfEnded(v)) return;
+      if (working() && idled) rest('Voice mode on', true);
+      else listen(!working() ? 'answer' : asleep ? 'wake' : 'turn');
+      if (working()) speakNote(v);
+    }, spokenLanguage(v, text));
     v.noting = true;
     return true;
-  }
-
-  // Back to listening after something said in passing; a 🔊 note that landed
-  // meanwhile is read first.
-  function afterAside(v) {
-    v.noting = false;
-    if (current() !== v) return;
-    if (replyIfEnded(v)) return;
-    listen(working() ? 'turn' : 'answer');
-    if (working()) speakNote(v);
   }
 
   function onSse(event) {
@@ -2023,14 +2338,27 @@
       else if (working()) speakNote(voice);
       else if (voice.awaiting && unreadReply(voice)) waitForReply(voice);
     } else if (target.id === 'pending-interaction-slot') {
-      var form = questionForm();
-      if (form) askQuestions(form);
-      else if (voice.question) {
-        voice.question = null;
-        voice.asked = null;
-        listen(working() ? 'turn' : 'answer');
-      }
+      onInteraction();
     }
+  }
+
+  // The question box came or went. Also reached by the page's own refresh of the
+  // box, which a reconnected stream does not re-send (#3799); each box is asked once.
+  function onInteraction() {
+    var form = questionForm();
+    if (form) { askQuestions(form); return; }
+    if (voice.question) {
+      voice.question = null;
+      voice.asked = null;
+      listen(working() ? 'turn' : 'answer');
+    }
+    // The work goes on after the box: its quiet spells count again.
+    watchQuiet(voice);
+  }
+
+  function onSwap(event) {
+    var target = event.target;
+    if (target && target.id === 'pending-interaction-slot' && current()) onInteraction();
   }
 
   // ---- on and off ---------------------------------------------------------
@@ -2077,7 +2405,7 @@
       wake: control.getAttribute('data-voice-wake') || 'whisper',
       audio: audio, mode: 'idle', phrases: [], base: '', working: working(),
       blocked: {}, run: Date.now().toString(36) + Math.random().toString(36).slice(2),
-      reads: false, hears: false, listenMode: storedListenMode()
+      reads: false, hears: false, room: true
     };
     document.documentElement.classList.add('voice-on');
     wakeLock();
@@ -2099,7 +2427,9 @@
     v.button.setAttribute('aria-pressed', 'true');
     v.button.title = 'Reading replies aloud — tap to stop';
     var question = !v.question && questionForm();
-    speak(ownLine('on'), function () {
+    var line = v.arrival || ownLine('on');
+    v.arrival = '';
+    speak(line, function () {
       if (question) askQuestions(question);
       else if (v.question) listen('question');
       else listen(working() ? 'turn' : 'answer');
@@ -2140,13 +2470,11 @@
     else listen(working() ? 'turn' : 'answer');
   }
 
-  // 🎤 on: Always and Hey Jarvis listen until 🎤 is tapped again, Tap for one
-  // message. Something being read is heard out first, except in Tap mode, where
-  // the tap is to talk now.
+  // 🎤 on: it listens until 🎤 is tapped again. Something being read is heard out
+  // first, except for a tap to talk now (`v.once`).
   function startHearing(v) {
     if (v.relaying) return;
-    if (v.listenMode === 'tap') v.once = true;
-    else v.hears = true;
+    v.hears = true;
     remember(v);
     if (v.question) v.question.tapped = true;
     if (!v.captureReady) openMicrophone(v);
@@ -2171,14 +2499,15 @@
     listen(working() ? 'turn' : 'answer');
   }
 
-  // 🎤 off, or in Tap mode a message taken back: the microphone is let go of.
+  // 🎤 off: the microphone is let go of and words not yet sent are taken back; it
+  // comes back on in Jarvis.
   function stopHearing(v) {
-    var tapped = v.listenMode === 'tap';
     v.hears = false;
+    v.room = true;
     v.once = false;
     remember(v);
     if (listeningMode(v)) {
-      if (tapped) restoreDraft(v);
+      restoreDraft(v);
       stopListening(v);
       showStatus('');
     }
@@ -2199,11 +2528,18 @@
   function off(why, leaving) {
     var v = voice;
     if (!v) return;
+    // A jump still waiting goes now when voice mode is turned off, and is dropped when
+    // the page left the deck chat some other way (#3816).
+    var jump = !leaving && v.jump;
+    v.jump = null;
+    clearTimeout(v.jumpTimer);
+    if (jump) setTimeout(jump.go, 0);
     if (!leaving) forget();
     stopListening(v);
     stopSpeaking(v);
     clearTimeout(v.replyTimer);
     clearTimeout(v.noteTimer);
+    clearTimeout(v.quietTimer);
     voice = null;
     // Its fast agent and memory go with it (#3444).
     try {
@@ -2240,7 +2576,7 @@
   function remember(v) {
     var hears = !!v.hears;
     try {
-      if (v.reads || hears) sessionStorage.setItem(CARRY_KEY, JSON.stringify({ reads: !!v.reads, hears: hears }));
+      if (v.reads || hears) sessionStorage.setItem(CARRY_KEY, JSON.stringify({ reads: !!v.reads, hears: hears, room: !!v.room }));
       else sessionStorage.removeItem(CARRY_KEY);
     } catch (e) { /* this chat only */ }
   }
@@ -2265,7 +2601,9 @@
     var v = on(button.closest('form'));
     if (!v) return;
     v.carrying = true;
-    var hears = kept.hears && v.listenMode !== 'tap' && v.listenMode !== 'dictate';
+    v.arrival = arrived();
+    var hears = !!kept.hears;
+    v.room = kept.room !== false;
     function go() {
       if (voice !== v || !v.carrying) return;
       v.carrying = false;
@@ -2285,26 +2623,59 @@
     try { v.audio.resume().then(go, function () { /* the pause above */ }); } catch (e) { /* paused */ }
   }
 
-  // ---- how 🎤 listens (#3540) ----------------------------------------------
+  // ---- jumping to another chat (#3816) ---------------------------------------
 
-  function storedListenMode() {
-    var mode = null;
-    try { mode = localStorage.getItem(LISTEN_KEY); } catch (e) { /* not stored here */ }
-    return LISTEN_MODES.indexOf(mode) >= 0 ? mode : 'open';
+  // The deck chat asked to move this page to another chat: with voice mode on here, it
+  // waits until the turn has ended and its reply was read, and `listen` makes it. Said
+  // when voice mode is off here: chat_jump.js moves at once.
+  window.AgentDeckVoiceJump = function (jump, go) {
+    var v = current();
+    if (!v) return false;
+    clearTimeout(v.jumpTimer);
+    v.jump = { title: String(jump.title || ''), go: go };
+    v.jumpTimer = setTimeout(function () { if (current() === v) jumpNow(v); }, JUMP_WAIT_MS);
+    // The turn already ended and its reply was read: nothing is left to hear here.
+    if (!working() && !v.relaying && !v.replyDeadline && v.mode !== 'speaking' &&
+        !v.question && !unreadReply(v)) {
+      jumpNow(v);
+    }
+    return true;
+  };
+
+  function jumpNow(v) {
+    var jump = v.jump;
+    if (!jump) return;
+    v.jump = null;
+    clearTimeout(v.jumpTimer);
+    try {
+      sessionStorage.setItem(ARRIVE_KEY, JSON.stringify({ title: jump.title, at: Date.now() }));
+    } catch (e) { /* said as "Voice mode on." */ }
+    jump.go();
   }
 
-  function storeListenMode(mode) {
-    try { localStorage.setItem(LISTEN_KEY, mode); } catch (e) { /* this visit only */ }
-    document.querySelectorAll('[data-voice-mic]').forEach(function (mic) {
-      mic.setAttribute('data-voice-listen', mode);
-      mic.title = LISTEN_TITLE[mode] + ' · hold to change';
-    });
+  function goTo(path) {
+    if (window.AgentDeckChatJump) AgentDeckChatJump.go(path);
+    else location.assign(path);
   }
 
-  function setListenMode(v, mode) {
-    v.listenMode = mode;
-    storeListenMode(mode);
+  // The line said on arriving by a jump, once: "Now in: <the chat's title>". One left
+  // from a jump that never arrived with voice mode on is old by the next chat opened.
+  var ARRIVE_MS = 30000;
+  function arrived() {
+    var kept = null;
+    try {
+      kept = JSON.parse(sessionStorage.getItem(ARRIVE_KEY) || 'null');
+      sessionStorage.removeItem(ARRIVE_KEY);
+    } catch (e) { kept = null; }
+    if (!kept || !(Date.now() - kept.at < ARRIVE_MS)) return '';
+    var title = speakable(String(kept.title || '').replace(/[^\p{L}\p{N}\s.,:'!?#-]+/gu, ' '))
+      .replace(/[\s.!?:,]+$/, '');
+    return title ? ownLine('now') + ' ' + title + '.' : '';
   }
+
+  // ---- the old device-kept mode (#3540) ---------------------------------------
+
+  try { localStorage.removeItem(OLD_LISTEN_KEY); } catch (e) { /* not stored here */ }
 
   // Dictation and voice mode would fight over the microphone: a dictation running
   // when voice mode is about to listen is stopped by its own button, keeping what
@@ -2317,64 +2688,12 @@
     try { mic.click(); } finally { releasing = false; }
   }
 
-  // A mode picked from the menu: dictation hands 🎤 back to composer_speech.js;
-  // the others start listening in it at once.
-  function pickListenMode(form, mode) {
-    var v = current();
-    if (mode === 'dictate') {
-      if (v) {
-        setListenMode(v, mode);
-        stopHearing(v);
-      } else {
-        storeListenMode(mode);
-      }
-      return;
-    }
-    stopDictation();
-    if (!v) v = on(form);
-    if (!v) { storeListenMode(mode); return; }
-    if (v.hears || listeningMode(v)) {
-      v.hears = false;
-      stopListening(v);
-    }
-    setListenMode(v, mode);
-    startHearing(v);
-  }
-
-  function menuOf(mic) {
-    var control = mic.closest('.speech-control');
-    return control && control.querySelector('[data-voice-mic-menu]');
-  }
-
-  function openMenu(mic) {
-    var menu = menuOf(mic);
-    if (!menu) return;
-    var mode = voice ? voice.listenMode : storedListenMode();
-    menu.querySelectorAll('[data-voice-mic-mode]').forEach(function (item) {
-      item.setAttribute('aria-checked', item.getAttribute('data-voice-mic-mode') === mode ? 'true' : 'false');
-    });
-    // It hangs from 🎤's right edge; on a crowded phone composer 🎤 sits far left, so
-    // it slides right until it is back on the screen, as the status bubble does.
-    menu.style.right = '';
-    menu.hidden = false;
-    var left = menu.getBoundingClientRect().left;
-    if (left < STATUS_MARGIN) menu.style.right = (left - STATUS_MARGIN) + 'px';
-  }
-
-  function closeMenus() {
-    document.querySelectorAll('[data-voice-mic-menu]').forEach(function (menu) { menu.hidden = true; });
-  }
-
-  storeListenMode(storedListenMode());
-  document.addEventListener('htmx:load', function () {
-    storeListenMode(storedListenMode());
-    carryOn();
-  });
+  document.addEventListener('htmx:load', carryOn);
 
   // ---- the buttons ----------------------------------------------------------
 
-  // A long press on 🎤 opens the menu of how it listens; the click that follows it
-  // is swallowed.
+  // A long press on 🎤 opens the menu of how it listens (#3787); the click that
+  // follows it is swallowed.
   var LONG_PRESS_MS = 600;
   var pressTimer = null;
   var longPressed = false;
@@ -2397,20 +2716,73 @@
   });
   // A long press on a phone opens the context menu instead of ending the press.
   document.addEventListener('contextmenu', function (event) {
-    if (event.target.closest && event.target.closest('[data-voice-mic], [data-voice-button]')) {
-      event.preventDefault();
-    }
+    if (event.target.closest && event.target.closest('[data-voice-mic]')) event.preventDefault();
   });
 
-  // 🎤 in voice mode's chat composer. Captured before composer_speech.js sees it;
-  // in Dictate mode it is let through, to dictate as before.
+  function menuOf(mic) {
+    var control = mic.closest('.speech-control');
+    return control && control.querySelector('[data-voice-mic-menu]');
+  }
+
+  // Which item is ticked: Off while 🎤 is off, else Jarvis or Always.
+  function openMenu(mic) {
+    var menu = menuOf(mic);
+    if (!menu) return;
+    var v = current();
+    var picked = !(v && v.hears) ? 'off' : v.room ? 'jarvis' : 'open';
+    menu.querySelectorAll('[data-voice-mic-mode]').forEach(function (item) {
+      item.setAttribute('aria-checked', item.getAttribute('data-voice-mic-mode') === picked ? 'true' : 'false');
+    });
+    // It hangs from 🎤's right edge; on a crowded phone composer 🎤 sits far left, so
+    // it slides right until it is back on the screen, as the status bubble does.
+    menu.style.right = '';
+    menu.hidden = false;
+    var left = menu.getBoundingClientRect().left;
+    if (left < STATUS_MARGIN) menu.style.right = (left - STATUS_MARGIN) + 'px';
+  }
+
+  function closeMenus() {
+    document.querySelectorAll('[data-voice-mic-menu]').forEach(function (menu) { menu.hidden = true; });
+  }
+
+  // A menu item: Off lets go of the microphone; Jarvis or Always turns 🎤 on that
+  // way, or switches it while it is on.
+  function pickListening(form, mode) {
+    var v = current();
+    if (mode === 'off') {
+      if (v && (v.hears || listeningMode(v))) stopHearing(v);
+      return;
+    }
+    if (!v) v = on(form);
+    if (!v) return;
+    v.carrying = false;
+    var room = mode === 'jarvis';
+    if (!v.hears) {
+      v.room = room;
+      startHearing(v);
+      return;
+    }
+    // Always picked while it waits after the idle spell listens again at once.
+    if (v.room === room && (room || v.mode !== 'waiting')) return;
+    v.room = room;
+    remember(v);
+    tone(room ? 330 : 880);
+    if (v.mode === 'speaking' || v.relaying) return;
+    restoreDraft(v);
+    listen(v.question ? 'question' : working() ? 'turn' : 'answer');
+  }
+
+  // 🎤 in voice mode's chat composer. Captured before composer_speech.js sees it,
+  // which dictates only in the other forms (#3787). A tap is "talk now": from off,
+  // while it waits for "Hey Jarvis" or while it reads, it listens for one message.
+  // While it listens, a tap sends what was heard and goes to Jarvis.
   document.addEventListener('click', function (event) {
     var item = event.target.closest && event.target.closest('[data-voice-mic-mode]');
     if (item) {
       event.preventDefault();
       event.stopPropagation();
       closeMenus();
-      pickListenMode(item.closest('form'), item.getAttribute('data-voice-mic-mode'));
+      pickListening(item.closest('form'), item.getAttribute('data-voice-mic-mode'));
       return;
     }
     var mic = event.target.closest && event.target.closest('[data-voice-mic]');
@@ -2419,36 +2791,37 @@
       return;
     }
     if (releasing) return;
-    if (longPressed) {
-      longPressed = false;
-      event.preventDefault();
-      event.stopPropagation();
-      return;
-    }
+    event.preventDefault();
+    event.stopPropagation();
+    if (longPressed) { longPressed = false; return; }
     closeMenus();
     var v = current();
     if (v) v.carrying = false;
-    if ((v ? v.listenMode : storedListenMode()) === 'dictate') {
-      // Dictating while it reads aloud would write the reading into the draft; the
-      // tap that ends dictation lets voice mode read again.
-      if (v && dictating()) {
-        if (v.mode === 'resting' && !v.question) {
-          setMode('idle');
-          showStatus('');
-        }
-      } else if (v) {
-        stopSpeaking(v);
-        rest('Dictation is on');
-      }
-      return;
-    }
-    event.preventDefault();
-    event.stopPropagation();
     if (!v) v = on(mic.closest('form'));
     if (!v) return;
     if (paused(v)) { resumeFromPause(v); return; }
-    if (v.listenMode === 'tap' ? listeningMode(v) : v.hears) stopHearing(v);
-    else startHearing(v);
+    if (!v.hears) {
+      v.room = true;
+      v.once = true;
+      startHearing(v);
+      return;
+    }
+    if (v.mode === 'listening') {
+      v.room = true;
+      remember(v);
+      tone(330);
+      clearTimeout(v.sendTimer);
+      clearTimeout(v.holdTimer);
+      // A phrase still being said or transcribed is sent once its words are back.
+      var rec = v.rec;
+      if (rec && !rec.aborted && (rec.done || rec.cut())) { v.doneTap = true; return; }
+      if (heard(v)) { finish(v); return; }
+      listen(v.question ? 'question' : working() ? 'turn' : 'answer');
+      return;
+    }
+    if (v.mode === 'speaking') stopSpeaking(v);
+    v.once = true;
+    listen(v.question ? 'question' : working() ? 'turn' : 'answer');
   }, true);
 
   // 🎧 turns reading aloud on and off; while something is read, a tap only stops it.
@@ -2526,11 +2899,11 @@
     v.acked.push(id);
     if (v.acked.length > 20) v.acked.shift();
     var lang = detail.voiceAck;
-    // After the send's own tone and status.
-    setTimeout(function () { acknowledge(v, lang); }, 0);
+    expectVoice(v, lang, v.fastSay);
   });
 
   document.addEventListener('htmx:sseMessage', onSse, true);
+  document.addEventListener('htmx:afterSwap', onSwap, true);
 
   // Opening another chat in place ends voice mode there: its microphone, wake lock
   // and replies belong to the chat it was turned on in. It then starts again in the

@@ -453,11 +453,7 @@ class InjectionService:
         # takeover uses for a child whose start was cut off (#2582).
         delegation_store: DelegationStore | None = None,
         session_key_for_token: Callable[[str], str | None] | None = None,
-        # Retired in #1497. Keep accepting it so third-party embedders do not
-        # break merely by upgrading; the callback is deliberately never read.
-        session_over_budget: Callable[[str], bool] | None = None,
     ):
-        del session_over_budget
         self.config = config
         # Why the deck sends nothing to this session now, or None (#2559): a person paused a
         # Work it belongs to. Set by the app once its Work overview exists; consulted before a

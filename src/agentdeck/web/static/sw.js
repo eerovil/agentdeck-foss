@@ -60,6 +60,7 @@ const ASSETS = [
   '/static/composer_phrases.js',
   '/static/composer_speech.js',
   '/static/voice_mode.js',
+  '/static/chat_jump.js',
   '/static/issue_post.js',
   '/static/code_copy.js',
   '/static/live_html.js',

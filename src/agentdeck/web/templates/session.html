@@ -134,7 +134,11 @@
   {% endif %}
   {% if live_prototype_url %}
   <a class="chip live-prototype-link" href="{{ live_prototype_url }}"
-     title="The meeting page of this chat's live prototype">▶ Live prototype</a>
+     title="This chat's live prototype page">▶ Live prototype</a>
+  {% endif %}
+  {% if live_diagram_url %}
+  <a class="chip live-diagram-link" href="{{ live_diagram_url }}"
+     title="This chat's diagram"{% if live_diagram_external %} target="_blank" rel="noopener"{% endif %}>◇ Diagram</a>
   {% endif %}
 </div>
 
@@ -192,6 +196,10 @@
   {% endfor %}
 </div>
 {% endif %}
+
+{# The deck chat's jump to another chat (#3816): only its stream sends one, and
+   chat_jump.js opens that chat in place. Never shown. #}
+<span id="chat-jump-slot" sse-swap="chat_jump" hidden></span>
 
 <div id="chat-notes" class="chat-notes-source" hidden sse-swap="chat-notes" hx-swap="innerHTML">
   {{ rendered_chat_notes | default('') | safe }}
@@ -282,7 +290,7 @@
   <label for="inject-message">Message</label>
   <div class="composer-input" data-composer-autocomplete>
     <textarea id="inject-message" class="send-on-enter" name="message" rows="3"{% if inject_max_chars %} maxlength="{{ inject_max_chars }}"{% endif %}
-              required placeholder="Send a follow-up…" autocomplete="off" aria-autocomplete="list"
+              placeholder="Send a follow-up…" autocomplete="off" aria-autocomplete="list"
               aria-controls="composer-suggestions" aria-expanded="false"></textarea>
     <div id="composer-suggestions" class="composer-suggestions" role="listbox"
          aria-label="Commands and skills" data-composer-suggestions hidden></div>

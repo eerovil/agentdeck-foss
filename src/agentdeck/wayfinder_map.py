@@ -612,9 +612,6 @@ class Progress:
     def holds(self, work_id: str) -> bool:
         return work_id == self.work_id or work_id in self.tickets
 
-    def question_of(self, work_id: str) -> Question | None:
-        return next((item for item in self.questions if item.work_id == work_id), None)
-
     def next_after(self, work_id: str) -> Question | None:
         """The first waiting question other than ``work_id``'s: where Submit leads on to."""
         return next((item for item in self.questions if item.work_id != work_id), None)

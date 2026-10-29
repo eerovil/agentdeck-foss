@@ -12,7 +12,6 @@ from .review_refs import (  # noqa: F401 -- the same names the real module re-ex
     _TIMEOUT_S,
     _TITLE_LIMIT,
     _TITLE_RE,
-    DIGEST_TOO_LARGE,
     DIGEST_UNREADABLE,
     TITLE,
     ReviewBusy,
