@@ -80,6 +80,14 @@ WAITS_FOR_MERGE = (
     "the same head, your pull request waits for a person to press Merge on the Work page. "
     "When it gets there, say in your final reply that it is ready for them to merge."
 )
+#: What the Work's agent is told on a deck with no Work reviewer (#3849): the role's review
+#: steps would otherwise have it wait on a verdict that never comes.
+NO_REVIEWER = (
+    "This deck has no Work reviewer: nothing reviews your pull request and no review verdict "
+    "will come, so do not ask for a review (`review-request`) or wait on one (a `review` "
+    "wake-on). Mark it ready once it is done and tested, and end the turn: a person reviews "
+    "it and presses Merge on the Work page."
+)
 
 #: What the Work's agent is told about the repositories its project proves another way
 #: (#3147): the role's guide has every head proven by a verification job, which in a
@@ -226,17 +234,22 @@ def _merge_text(app: Any, repository: str) -> str:
     so the role's guide is left to cover both cases."""
     from .poller_ops import release_policies
 
+    no_reviewer = bool(getattr(getattr(app.state, "work_router", None), "reviewer_off", False))
+    alone = NO_REVIEWER if no_reviewer else ""
     poller = getattr(app.state.config, "poller", None)
     if poller is None:
-        return ""
+        return alone
     try:
         policy = release_policies(poller.root).get(repository.lower())
     except Exception:  # noqa: BLE001 - a missing line must never stop the start
         log.warning("work start: could not read the merge policy", exc_info=True)
-        return ""
+        return alone
     if policy is None:
-        return ""
-    texts = [MERGES_ITSELF if getattr(policy, "auto_release", False) else WAITS_FOR_MERGE]
+        return alone
+    if no_reviewer:
+        texts = [NO_REVIEWER]
+    else:
+        texts = [MERGES_ITSELF if getattr(policy, "auto_release", False) else WAITS_FOR_MERGE]
     for repos, template in (
         (getattr(policy, "github_checks", ()), CI_TESTS_TEXT),
         (getattr(policy, "review_only", ()), REVIEW_ONLY_TEXT),

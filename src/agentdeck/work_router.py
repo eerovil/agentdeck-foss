@@ -134,7 +134,7 @@ from pathlib import Path
 from . import wayfinder_lists, wayfinder_map
 from .poller_engine import github_authority
 from .poller_engine.authorization import reviewer_logins
-from .review_refs import ReviewBusy, ReviewError
+from .review_refs import REVIEWER_OFF_TEXT, ReviewBusy, ReviewError, ReviewOff
 from .scheduled_messages import ScheduledMessage
 from .shared_file import SharedFile
 from .wake_on import STOP_SETTLE_S
@@ -1053,6 +1053,7 @@ class WorkRouterService:
         owner_of_pull: Callable[[str, int], Owner | None],
         schedule: Callable[[ScheduledMessage], ScheduledMessage | None],
         start_review: Callable[..., Awaitable[object]],
+        reviewer_off: bool = False,
         own_logins: Callable[[], Iterable[str]] | Iterable[str] = configured_own_logins,
         refusal: Callable[[str, str], str | None] = lambda chat_id, text: None,
         ready_head: Callable[[str, int], Awaitable[str]] | None = None,
@@ -1102,6 +1103,8 @@ class WorkRouterService:
         self._chat_of_pull = owner_of_pull
         self._schedule = schedule
         self._start_review = start_review
+        # No Work reviewer at all (#3849): a ready head asks for nothing and stays unasked.
+        self.reviewer_off = bool(reviewer_off)
         self._start_work = start_work
         self._start_labels = start_labels
         self._spec_only_label = spec_only_label
@@ -1237,6 +1240,13 @@ class WorkRouterService:
         ``PendingActions.changed``, and a new or rescheduled action wakes it to re-plan.
         """
         failures = Backoff()
+        if self.reviewer_off:
+            try:
+                await self.settle_without_reviewer()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("work-router: settling reviews with no reviewer failed")
         while True:
             self.pending.changed.clear()
             wait = self.pending.wait(self._clock())
@@ -1253,6 +1263,18 @@ class WorkRouterService:
                 # A pass that raised moved no ``next_at``: wait before trying it again.
                 log.exception("work-router: retrying pending actions failed")
                 await asyncio.sleep(failures.failed())
+
+    async def settle_without_reviewer(self) -> None:
+        """Answer every review kept pending, at once, on a deck with no reviewer (#3849).
+
+        Kept before the upgrade, each waited out its back-off, and one past a day was dropped
+        with nobody told: the Work that reported it would have heard nothing. Each goes the
+        retry's way, so it follows the live ready head, frees its place, and its chat is told
+        once that no review is coming.
+        """
+        for key, entry in list(self.pending.entries.items()):
+            if entry.get("kind") == REVIEW:
+                await self._retry_review(key, entry)
 
     async def retry_pending(self) -> None:
         """Try every pending action whose back-off has run out, each once.
@@ -2493,6 +2515,9 @@ class WorkRouterService:
         """
         pull = f"{repository}#{number}"
         at = f"{pull} at {head[:12]}"
+        if self.reviewer_off:
+            self._send_refusal(delivery, owner, REVIEWER_OFF_TEXT)
+            return
         if self._passed_since(owner, repository, number, head, 0.0):
             # The head already passed (#3341): there is nothing to ask again.
             self._send_refusal(delivery, owner, f"{at} already has a review pass")
@@ -2570,6 +2595,21 @@ class WorkRouterService:
             delivery, owner, f"AgentDeck: marking it ready again did not start a review: {why}."
         )
 
+    def _tell_no_reviewer(self, owner: Owner, pull: str, head: str) -> None:
+        """Tell the chat once per head that no review is coming (#3849); the id absorbs a
+        replayed ready event and a pending ask retried after an upgrade."""
+        now = datetime.now(UTC)
+        self._deliver(
+            ScheduledMessage(
+                id=f"work-event:no-reviewer:{pull}@{head}",
+                chat_id=owner[0],
+                text=f"AgentDeck: {pull} at {head[:12]} gets no review: {REVIEWER_OFF_TEXT}."
+                " Mark it ready and end the turn; do not wait on a review.",
+                due_at=now,
+                created_at=now,
+            )
+        )
+
     def _tell(self, delivery: Delivery, owner: Owner, text: str) -> None:
         """Send ``text`` to the chat under the delivery's message id."""
         now = datetime.now(UTC)
@@ -2600,6 +2640,8 @@ class WorkRouterService:
         owner = self._owner_of_pull(repository, number)
         if owner is None:
             raise AgainRefused(f"no Work's chat registered {pull}")
+        if self.reviewer_off:
+            raise AgainRefused(REVIEWER_OFF_TEXT)
         if not self._switched(repository):
             raise AgainRefused(f"{repository} is not a repository any poller project declares")
         head = await self._live_ready_head(repository, number)
@@ -2959,6 +3001,12 @@ class WorkRouterService:
             return
         if key in self._in_flight:
             return
+        if self.reviewer_off:
+            # Nothing pending, nothing reviewed (#3849): kept, it was retried for a day while
+            # every later ask heard "already asked, keep waiting".
+            self._drop_pending(pending_key)
+            self._tell_no_reviewer(owner, pull, event.head)
+            return
         # In memory while it runs, so a registration check and an event for the same head
         # never ask twice; on disk only once it returned (see ``ReviewedHeads``).
         self._in_flight.add(key)
@@ -2998,6 +3046,10 @@ class WorkRouterService:
             # head is not spent: it is asked for again after the back-off.
             self.pending.put(pending_key, retry, self._clock())
             log.info("work-router: review of %s is busy; kept pending", key)
+        except ReviewOff:
+            # No reviewer at all (#3849): it never starts, so nothing is kept to retry.
+            self._drop_pending(pending_key)
+            self._tell_no_reviewer(owner, pull, event.head)
         except ReviewError as exc:
             # Refused before anything was written (``open_review`` finds the open chat
             # before it writes one), so asking again later is safe.

@@ -59,6 +59,20 @@ class ReviewError(Exception):
     """The review could not be requested, with a sentence an operator can act on."""
 
 
+class ReviewOff(ReviewError):
+    """This deck has no Work reviewer at all (``[review] reviewer`` is off, #3849).
+
+    Unlike a busy or refused start this never changes on its own, so the Work router keeps
+    nothing pending for it: a person reviews the pull request and presses Merge.
+    """
+
+
+REVIEWER_OFF_TEXT = (
+    "this deck has no Work reviewer ([review] reviewer is off): a person reviews the pull"
+    " request and presses Merge on the Work page"
+)
+
+
 class ReviewBusy(ReviewError):
     """Somebody else holds this review chat and would not let go. Ask again later.
 

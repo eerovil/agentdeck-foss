@@ -9,6 +9,7 @@ deliveries reach a chat, which chat, under which id, and how often a review is a
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -1300,6 +1301,70 @@ async def test_a_refused_review_leaves_the_head_for_the_next_event(root, harness
     pull_event(root, "d2", action="synchronize")
     await harness.drain()
     assert len(harness.reviews) == 2, "a start that wrote nothing is asked again"
+
+
+async def test_a_deck_with_no_reviewer_keeps_nothing_pending_and_says_so_once(root, harness):
+    # #3849: the public copy's reviewer is off. Kept pending, the refusal was retried for a day
+    # and every later ask heard "already asked, keep waiting".
+    from agentdeck.review_refs import ReviewOff
+    from agentdeck.work_router import AgainRefused
+
+    harness.service.reviewer_off = True
+    harness.heads[("eerovil/agentdeck", 9)] = SHA
+    pull_event(root, "d1")
+    pull_event(root, "d2", action="synchronize")  # the same head again
+    await harness.drain()
+    assert harness.reviews == [] and not harness.service.pending.entries
+    assert "eerovil/agentdeck#9@" + SHA not in harness.service.reviewed
+    assert [message.chat_id for message in harness.scheduled] == ["chat-a"]
+    assert "no Work reviewer" in harness.scheduled[0].text
+    with pytest.raises(AgainRefused, match="no Work reviewer"):
+        await harness.service.ask_again("eerovil/agentdeck", 9, "walkthrough posted")
+
+    # An ask kept pending before the upgrade, even one past a day, is answered once the
+    # router starts again with no reviewer, rather than waiting out its back-off.
+    harness.service.pending.put(
+        f"review:eerovil/agentdeck#9@{SHA}+ab12",
+        {
+            "kind": REVIEW,
+            "repository": "eerovil/agentdeck",
+            "number": 9,
+            "head": SHA,
+            "again": "ab12",
+            "note": "walkthrough posted",
+        },
+        harness.now - 2 * 86400,
+    )
+    # Tried again since, so its next attempt is still to come: the loop alone would wait.
+    harness.service.pending.put(f"review:eerovil/agentdeck#9@{SHA}+ab12", {}, harness.now)
+    harness.service.reviewed.add(f"eerovil/agentdeck#9@{SHA}+ab12?")
+    restarted = Harness(root)  # read back from disk, as after the upgrade's restart
+    restarted.heads[("eerovil/agentdeck", 9)] = SHA
+    restarted.service.reviewer_off = True
+    assert restarted.service.pending.wait(restarted.now) > 0, "not due by its back-off"
+    loop = asyncio.create_task(restarted.service._retry_loop())
+    for _ in range(20):
+        await asyncio.sleep(0)
+    loop.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await loop
+    assert not restarted.service.pending.entries and restarted.reviews == []
+    assert restarted.service.reviewed.count(f"eerovil/agentdeck#9@{SHA}+") == 0, "place freed"
+    assert [message.chat_id for message in restarted.scheduled] == ["chat-a"]
+    assert "no Work reviewer" in restarted.scheduled[0].text
+
+    # A start that says so itself (the flag unset) is not kept pending either.
+    async def off(pull, work, **asks):
+        harness.reviews.append((pull, work))
+        raise ReviewOff("no Work reviewer here")
+
+    harness.service.reviewer_off = False
+    harness.service._start_review = off
+    harness.heads[("eerovil/agentdeck", 9)] = "b" * 40
+    pull_event(root, "d3", action="synchronize", sha="b" * 40)
+    await harness.drain()
+    assert len(harness.reviews) == 1 and not harness.service.pending.entries
+    assert len(harness.scheduled) == 2 and "no Work reviewer" in harness.scheduled[-1].text
 
 
 async def test_an_uncertain_review_start_spends_the_head(root, harness):

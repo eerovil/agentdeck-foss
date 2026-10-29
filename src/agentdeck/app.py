@@ -451,9 +451,7 @@ def create_app(config: AppConfig) -> FastAPI:
         if agent_reviewer is not None:
             return await agent_reviewer.start(pull, work, note=note, again=again)
         if work_reviewer == agent_review.OFF:
-            raise review_refs.ReviewError(
-                "this deck has no Work reviewer ([review] reviewer is off); press Merge instead"
-            )
+            raise review_refs.ReviewOff(review_refs.REVIEWER_OFF_TEXT)
         from .web.routes_chat_board import note_review_head, request_review
 
         outcome = await request_review(
@@ -818,6 +816,7 @@ def create_app(config: AppConfig) -> FastAPI:
         schedule=scheduled_messages.schedule,
         exists=scheduled_messages.exists,
         start_review=start_work_review,
+        reviewer_off=work_reviewer == agent_review.OFF,
         refusal=work_event_refusal,
         ready_head=ready_pull_head,
         enabled=config.github_webhook.enabled,

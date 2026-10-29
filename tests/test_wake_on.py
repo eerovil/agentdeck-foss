@@ -1280,6 +1280,13 @@ async def test_the_api_registers_lists_and_cancels_a_wait(tmp_path):
             f"/api/sessions/{key}/wake-on",
             json={"pull_request": "eerovil/agentdeck#7", "timeout_minutes": 30},
         )
+        # #3849: on a deck with no Work reviewer a review wait could only time out.
+        app.state.work_router.reviewer_off = True
+        no_reviewer = await client.post(
+            f"/api/sessions/{key}/wake-on", json={"review": "eerovil/agentdeck#7"}
+        )
+        app.state.work_router.reviewer_off = False
+        assert no_reviewer.status_code == 409 and "no Work reviewer" in no_reviewer.text
         timed = await client.post(
             f"/api/sessions/{key}/wake-on",
             json={"after_minutes": 45, "waiting_for": "the render"},
@@ -1308,6 +1315,13 @@ async def test_the_api_registers_lists_and_cancels_a_wait(tmp_path):
             json={"pull_request": "eerovil/agentdeck#9", "note": "  "},
         )
         after_blank = await client.get(f"/api/sessions/{key}/wake-on")
+        # #3849: with no reviewer, said before the note is even read.
+        app.state.work_router = SimpleNamespace(enabled=True, ask_again=refuse, reviewer_off=True)
+        no_reviewer = await client.post(
+            f"/api/sessions/{key}/review-request", json={"pull_request": "eerovil/agentdeck#9"}
+        )
+        assert no_reviewer.status_code == 409 and "no Work reviewer" in no_reviewer.text
+        app.state.work_router = SimpleNamespace(enabled=True, ask_again=refuse)
         capped = await client.post(
             f"/api/sessions/{key}/review-request",
             json={"pull_request": "eerovil/agentdeck#9", "note": "once more"},

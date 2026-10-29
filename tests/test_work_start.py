@@ -1371,6 +1371,23 @@ async def test_the_first_message_says_whether_the_project_merges_on_its_own(
     await _settled()
 
 
+def test_a_deck_with_no_reviewer_tells_the_agent_to_wait_for_merge(monkeypatch):
+    # #3849: the role's review steps would have the agent wait on a verdict that never comes.
+    from agentdeck import poller_ops
+
+    policy = SimpleNamespace(auto_release=True, github_checks=(), review_only=("o/docs",))
+    monkeypatch.setattr(poller_ops, "release_policies", lambda root: {"o/r": policy})
+    router = SimpleNamespace(reviewer_off=True)
+    config = SimpleNamespace(poller=SimpleNamespace(root="/nowhere"))
+    app = SimpleNamespace(state=SimpleNamespace(config=config, work_router=router))
+    told = work_start._merge_text(app, "O/R")
+    assert told.startswith(work_start.NO_REVIEWER) and work_start.MERGES_ITSELF not in told
+    config.poller = None
+    assert work_start._merge_text(app, "o/r") == work_start.NO_REVIEWER
+    router.reviewer_off = False
+    assert work_start._merge_text(app, "o/r") == ""
+
+
 def test_a_readable_overlay_with_no_preference_uses_an_available_account(tmp_path, monkeypatch):
     _switched(tmp_path / "poller", "agentdeck", "[checkouts]\nagentdeck = '~/agentdeck'\n")
     app, db, injector = fake_app(tmp_path)

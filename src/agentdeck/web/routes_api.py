@@ -53,7 +53,7 @@ from ..public_origin import public_origin
 from ..restart_nudge import NUDGE_MESSAGE, RestartNudgeRegistry
 from ..state import OPERATOR_PRESENCE_IDLE_AFTER_S
 from ..titles import normalize_agent_title, title_evidence_signature
-from ..wake_on import KIND_DEPLOYMENT, WakeRequestError, parse_request
+from ..wake_on import KIND_DEPLOYMENT, KIND_REVIEW, WakeRequestError, parse_request
 from ..work import work_id_for
 from .chat_successor import reserve_chat_successor
 from .deps import (
@@ -1318,6 +1318,12 @@ async def post_session_wake_on(
         fields = parse_request(**body.model_dump())
     except WakeRequestError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    router_service = getattr(request.app.state, "work_router", None)
+    if fields.get("kind") == KIND_REVIEW and getattr(router_service, "reviewer_off", False):
+        # No verdict can ever come (#3849): the wait would only run out its timeout.
+        from ..review_refs import REVIEWER_OFF_TEXT
+
+        raise HTTPException(status_code=409, detail=REVIEWER_OFF_TEXT)
     seen: dict = {}
     if fields.get("kind") == KIND_DEPLOYMENT:
         # The deploys the deck already stored for it (#3584), so the agent never reads the
@@ -1405,6 +1411,11 @@ async def post_session_review_request(
         raise HTTPException(
             status_code=409, detail="this deck does not route Work events, so it starts no review"
         )
+    if getattr(router_service, "reviewer_off", False):
+        # Before the note and the wait (#3849): no review can be asked for at all.
+        from ..review_refs import REVIEWER_OFF_TEXT
+
+        raise HTTPException(status_code=409, detail=REVIEWER_OFF_TEXT)
     service = _wake_on_service(request)
     note = (body.note or "").strip()
     if not note:
