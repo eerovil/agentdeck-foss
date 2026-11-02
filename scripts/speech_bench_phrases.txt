@@ -1,0 +1,47 @@
+# The phrases the owner reads once for scripts/speech_bench.py (#3499), in order,
+# one per pause. Each line: group (en, fi or mix), a tab, the words as said.
+en	Open AgentDeck and show me the Haiku chat.
+en	What has happened in the last hour?
+en	Merge the pull request and deploy it to staging.
+en	Stop.
+en	Ask Codex to review the issue.
+en	Read the last reply again, slower.
+en	Is the review finished yet?
+en	Start a new chat with Opus about the speech server.
+en	Restart the runtime when the chats are idle.
+en	No, wait, cancel that.
+fi	Mitä viimeisen tunnin aikana on tapahtunut?
+fi	Lue minulle viimeisin vastaus uudestaan.
+fi	Ei, odota hetki.
+fi	Kyllä, tee niin.
+fi	Mikä on tilanne nyt?
+fi	Kerro lyhyesti mitä se teki.
+fi	Älä lähetä vielä mitään.
+fi	Paljonko viikon käytöstä on jäljellä?
+fi	Pysäytä se ja kysy minulta ensin.
+fi	Hyvä, jatka samaan malliin.
+mix	Tee tästä pull request ja deployaa se stagingiin.
+mix	Avaa AgentDeck ja katso mitä Haiku vastasi.
+mix	Onko se review jo valmis, vai pitääkö mergetä käsin?
+mix	Pyydä Codexia katsomaan se issue.
+mix	Käynnistä speech server uudestaan ja tarkista lokit.
+mix	Mergeä se pull request kun testit menee läpi.
+mix	Kysy Opukselta onko tämä bugi vai feature.
+mix	Avaa uusi chat ja anna sille tämä issue.
+mix	Miksi se deploy epäonnistui?
+mix	Laita se Work odottamaan minun vastausta.
+mix	Tarkista onko master branch ajan tasalla.
+mix	Käytä Haikua tähän, se on nopeampi.
+mix	Onko runtime käynnissä vai pitääkö restartata?
+mix	Tee siitä commit ja pushaa se.
+mix	Lue se spec ääneen.
+mix	Mitä se reviewer sanoi siitä pull requestista?
+mix	Siirrä se merge queuessa ensimmäiseksi.
+mix	Onko staging vapaana?
+mix	Sulje se issue kun live check on tehty.
+mix	Näytä minulle AgentDeckin dashboard.
+mix	Vaihda voice mode englanniksi.
+mix	Kuinka monta tokenia tämä chat on käyttänyt?
+mix	Katso Sentrystä onko uusia virheitä.
+mix	Laita wake word takaisin päälle.
+mix	Onko se webhook tullut jo perille?

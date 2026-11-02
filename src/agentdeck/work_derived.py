@@ -45,6 +45,9 @@ Work's own facts. Nothing here is stored and nothing here asks the agent to call
    after that, **Needs you — no reviewer since 20:37** (#2943), an AgentDeck bug,
    since every ready head is reviewed by itself; **the reviewer stopped since 20:37**
    when the review chat is labelled blocked, so a reviewer ran and says why there (#2974).
+   A ready pull request with no review chat at all, whose head the Work router's backstop
+   found with no checklist, review or verdict and could not start either, reads **Needs you —
+   ready at 1a2b3c4, no review started** (#3903), the same AgentDeck bug.
    Before all of these, an open pull request whose newest review chat ended with the reviewer
    escalating its current head to the owner reads **Needs you — the reviewer escalated it
    to you (review-chats#5914) · 20:19** (#3216): the agent was told to ask the reviewer's
@@ -78,15 +81,17 @@ Work's own facts. Nothing here is stored and nothing here asks the agent to call
    13:02**, which is reported as a bug. Where the deck does not ask (``asks`` off, as on
    staging), the same line stands without a request or a report. A schedule definition (an
    issue labelled ``scheduled``, which stays open on purpose) is never asked: it reads
-   **Scheduled — files a new card on its schedule** (#2998). Nor is a spec-only Work whose
-   agent posted its spec on the issue, with no pull request open and nobody commenting since:
-   building waits on a person's approval, so it reads **Needs you — approve the spec · posted
-   06:35**, linking the spec comment (#3247). Nor is a Work whose issue carries the ``parked``
-   label: a person asked its agent to leave it until they write, so it reads **Parked —
-   waits for your message** (#3560). The label also stands over the earlier rules that only
-   wait on a person — the reviewer's escalation, Ready for merge, a held pull request, a
-   posted spec — whatever pull request is open (#3757): the person already said they will
-   write. A question, a turn, a death, a wait or a review in progress still reads as itself.
+   **Scheduled — files a new card on its schedule** (#2998). Nor is a turn whose reply ends on a
+   paragraph asking the person something: an open question goes in the reply, not the question box,
+   so it reads **Needs you — answer in the chat: "…"** (#3887). Nor is a spec-only Work whose agent
+   posted its spec on the issue, with no pull request open and nobody commenting since: building
+   waits on a person's approval, so it reads **Needs you — approve the spec · posted 06:35**,
+   linking the spec comment (#3247). Nor is a Work whose issue carries the ``parked`` label: a
+   person asked its agent to leave it until they write, so it reads **Parked — waits for your
+   message** (#3560). The label also stands over the earlier rules that only wait on a person — the
+   reviewer's escalation, Ready for merge, a held pull request, a posted spec — whatever pull
+   request is open (#3757): the person already said they will write. A question, a turn, a death, a
+   wait or a review in progress still reads as itself.
 
 Since #2944 this is the one status of such a Work: the front page's section, the operator's
 category and the buttons follow it too (``work_story.work_status``). A time not on today's
@@ -129,12 +134,17 @@ NOT_LIVE = "not_live"  # merged, but part of it is not running yet (#3220)
 REVIEW_ESCALATED = "review_escalated"  # the reviewer handed the review to the owner (#3216)
 SPEC_WAIT = "spec_wait"  # a spec-only Work's spec is posted; a person approves it (#3247)
 PARKED = "parked"  # a person asked the agent to leave it until they write (#3560)
+#: The turn ended on a reply whose last paragraph asks the person something (#3887).
+ASKED_IN_CHAT = "asked_in_chat"
 
 #: The issue label an agent puts on a Work a person asked it to leave until they write.
 PARKED_LABEL = "parked"
 #: What the label stands over: each only waits on the person who parked it (#3757).
 _PARKED_OVER = frozenset(
-    {REVIEW_ESCALATED, READY, PR_HELD, PR_STUCK, SPEC_WAIT, ENDED, NUDGED, UNFINISHED}
+    {
+        REVIEW_ESCALATED, READY, PR_HELD, PR_STUCK, SPEC_WAIT, ENDED, NUDGED, UNFINISHED,
+        ASKED_IN_CHAT,
+    }
 )
 
 #: How long an asked agent may take to start answering before the Work needs a person.
@@ -160,6 +170,17 @@ MAX_QUOTE = 140
 _SENTENCE_END = re.compile(r"(?<=[.!?])\s|\n")
 #: A markdown link, shown as its text alone: a status line is plain words (#2944).
 _LINK = re.compile(r"\[([^\]]+)\]\([^)\s]+\)")
+#: A fenced code block, which never holds the question a reply ends on (#3887).
+_FENCED = re.compile(r"^```.*?^```[^\n]*$", re.DOTALL | re.MULTILINE)
+#: A sentence's end in a reply's last paragraph: ``.!?`` and anything closing it that is not a
+#: letter or digit (Markdown, a quote, a bracket, an emoji), then a space, so "**Which one?**
+#: Tell me." and "Which one?🙂 Tell me." are two sentences each (#3887 review).
+_ASKED_SPLIT = re.compile(r"(?<=[.!?])(?:[^\w\s]|_)*\s+|\n")
+#: Emphasis or code marks around a quoted question, which a status line shows as plain words.
+_MARKUP_EDGE = re.compile(r"^[\s*_`~]+|[\s*_`~]+$")
+#: What may follow a question's ``?`` and still leave it a question: closing marks, quotes,
+#: brackets and emoji, anything that is neither a letter, a digit nor ``.!?``.
+_TRAILING_DECOR = re.compile(r"(?:[^\w.!?]|_)+$")
 #: What a provider says while it works, which says nothing about the work (#2944).
 _GENERIC_PROGRESS = frozenset({"using tools", "working", "thinking"})
 
@@ -230,6 +251,9 @@ class DerivedInputs:
     #: ChatGPT was not started on that review chat, and why (#3326): the deck hands it to its
     #: Claude or Codex reviewer, and the owner learns the ChatGPT browser needs them.
     review_start_failed: str = ""
+    #: A ready pull request and its head with no checklist, review or verdict that the Work
+    #: router's backstop could not start either (#3903): ``(number, head)``.
+    review_unstarted: tuple[int, str] | None = None
     #: The reviewer escalated an open pull request's current head to the owner (#3216): that
     #: pull request, when, and the review chat.
     escalated_pr: int | None = None
@@ -356,6 +380,25 @@ def question_sentence(text: str) -> str:
     sentences = _sentences(text)
     asked = next((sentence for sentence in sentences if sentence.endswith("?")), "")
     return _cut(asked) if asked else first_sentence(text)
+
+
+def asked_in_last_paragraph(text: str) -> str:
+    """The question the reply's last paragraph asks the person, else "" (#3887).
+
+    An agent asks an open question as the last paragraph of its reply rather than in the
+    question box, which is for a pick between named options. A ``?`` earlier in the reply
+    (quoting, reasoning) does not count, and a trailing code block is not a paragraph.
+    """
+    text = _FENCED.sub("", text or "")
+    paragraphs = [part for part in re.split(r"\n\s*\n", text) if part.strip()]
+    if not paragraphs:
+        return ""
+    paragraph = _LINK.sub(r"\1", paragraphs[-1])
+    for part in _ASKED_SPLIT.split(paragraph):
+        sentence = " ".join(_MARKUP_EDGE.sub("", part).split())
+        if _TRAILING_DECOR.sub("", sentence).endswith("?"):
+            return _cut(sentence)
+    return ""
 
 
 def progress_sentence(text: str) -> str:
@@ -506,6 +549,16 @@ def _first_rule(
         return DerivedStatus(
             QUESTION, f"Needs you — {summary}", summary=summary, chat_href=href
         )
+    asked = asked_in_last_paragraph(inputs.last_text)
+    if asked:
+        # The reply ended on a question to the person (#3887). It outranks the agent's own
+        # waits, its review and its live check (#3905): the agent waits on the answer, and a
+        # wait it registered still wakes it by itself.
+        summary = f'answer in the chat: "{asked}"'
+        return DerivedStatus(
+            ASKED_IN_CHAT, f"Needs you — {summary}", at=inputs.ended_at, summary=summary,
+            chat_href=href,
+        )
     if closed and inputs.live_result == "failed":
         # The agent reopens the issue and fixes it; still closed, a person decides (#3141).
         summary = inputs.live_line
@@ -556,6 +609,15 @@ def _first_rule(
         return DerivedStatus(
             REVIEW, f"In review — {summary}", at=inputs.review_active, deadline=reopen_until,
             summary=summary, pr=inputs.review_pr,
+        )
+    if inputs.review_unstarted is not None:
+        # A ready head nothing moved towards a review, not even the router's backstop (#3903):
+        # every ready head is reviewed by itself, so this is the deck's, reported as a bug.
+        # Ahead of another pull request's open review, which would otherwise hide it.
+        pr, head = inputs.review_unstarted
+        summary = f"ready at {head[:7]}, no review started"
+        return DerivedStatus(
+            REVIEW_STUCK, f"Needs you — {summary}", summary=summary, pr=pr, chat_href=href,
         )
     if inputs.review_pr is not None and reopen_until is None:
         pr = inputs.review_pr
@@ -695,7 +757,11 @@ def _cut_off(inputs: DerivedInputs, *, clock: Callable[[datetime | None], str]) 
 def _ended(
     inputs: DerivedInputs, *, now: datetime, clock: Callable[[datetime | None], str]
 ) -> DerivedStatus:
-    """D7 rule 9: the turn ended without a next step (#2960)."""
+    """D7 rule 9: the turn ended without a next step (#2960).
+
+    A reply whose last paragraph asks the person something is a next step (#3887), read
+    ahead of the waits in ``_first_rule``.
+    """
     href = inputs.chat_href
     ended = _aware(inputs.ended_at)
     nudged = _aware(inputs.nudged_at)

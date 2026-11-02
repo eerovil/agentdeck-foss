@@ -131,11 +131,16 @@ async def take_over(
     router's (``work_router``, #3731): the other deck stops its agent, this one starts. A
     started Work also gets one comment, so the other person sees why their agent stopped; a
     failed comment is said, not undone. Answers ``("done", what happened)`` or the edit's
-    outcome and why.
+    outcome and why. ``assignees`` are spelled as GitHub spells them: ``gh`` removes a login
+    only on an exact match (#3852).
     """
     issue = f"{repository}#{number}"
     current = next(iter(assignees), "")
-    others = [login for login in dict.fromkeys(assignees) if login and login != person]
+    others = [
+        login
+        for login in dict.fromkeys(assignees)
+        if login and login.casefold() != person.casefold()
+    ]
     argv = [gh, "issue", "edit", str(number), "--repo", repository]
     if others:
         argv += ["--remove-assignee", ",".join(others)]

@@ -289,6 +289,9 @@ class Repo:
     # ``github_checks``, the repository's own CI reported on GitHub for the exact head, or
     # ``review_only``, the review pass on the exact head alone (#2729).
     verification: str = VERIFICATION_AGENTDECK_JOB
+    # An ``agentdeck_job`` repository whose own GitHub CI runs the rest of the suite (#3919):
+    # a merge needs its checks present and green on the head too, not merely not red or pending.
+    github_checks_required: bool = False
 
     @property
     def name(self) -> str:
@@ -1294,11 +1297,23 @@ def _parse_repos(raw: object, report: Report) -> tuple[Repo, ...]:
                 f"use one of {', '.join(VERIFICATION_SOURCES)}",
             )
             verification = VERIFICATION_AGENTDECK_JOB
+        checks_required = entry.get("github_checks_required", False)
+        if not isinstance(checks_required, bool) or (
+            checks_required and verification.strip() != VERIFICATION_AGENTDECK_JOB
+        ):
+            report.add(
+                f"{location}.github_checks_required",
+                "must be true or false, and true only with verification = agentdeck_job",
+                "set it only where a verification job and the repository's own CI both prove "
+                "a pull request",
+            )
+            checks_required = False
         repo = Repo(
             id=repo_id,
             workspace=workspace.strip(),
             closing_keywords=closing.strip(),
             verification=verification.strip(),
+            github_checks_required=checks_required,
             **flags,
         )
         if not (repo.holds_issues or repo.holds_code or repo.holds_artifacts):

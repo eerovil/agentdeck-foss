@@ -10,6 +10,7 @@ either way is never made again.
 from __future__ import annotations
 
 import base64
+import dataclasses
 import json
 from types import SimpleNamespace
 
@@ -38,8 +39,10 @@ TRAILHEAD = BoardScope(
     ownership_label="claude",
     ownership_labels=("claude",),
     spec_only_label="spec-only",
-    issue_repositories=("Northwind/store", "Northwind/issues"),
+    issue_repositories=("Northwind/store", "Northwind/docker", "Northwind/issues"),
     artifact_repositories=("Northwind/issues",),
+    # The tracker holds no code: its cards are worked in docker's checkout.
+    borrowed_workspaces=(("Northwind/issues", "Northwind/docker"),),
 )
 MINECRAFT = BoardScope(
     instance="minecraft",
@@ -60,10 +63,16 @@ def test_targets_are_every_issue_repository_with_its_own_projects_labels_and_evi
         [
             "eerovil/agentdeck",
             "Northwind/store",
+            "Northwind/docker",
             "Northwind/issues",
             "eerovil/game-mod",
         ]
     )
+    # A project's new Work lands on its own tracker, not the sorted-first docker (#3882);
+    # a project with no tracker on its first repository.
+    assert sorted(item for item, target in found.items() if target.project_default) == [
+        "Northwind/issues", "eerovil/agentdeck", "eerovil/game-mod"
+    ]
     deck = found["eerovil/agentdeck"]
     # The first ownership label is the canonical one for creating an issue.
     assert (deck.ownership_label, deck.spec_only_label, deck.evidence_repository) == (
@@ -535,6 +544,61 @@ def test_an_issue_the_shim_filed_starts_only_on_its_labels_read_back_from_github
     assert ("eerovil/other", 5) not in read
 
 
+
+def test_an_agents_ready_press_rereads_only_its_registered_open_pull_requests(
+    tmp_path, monkeypatch
+):
+    """#3903: the shim's `gh pr ready` re-reads the row from GitHub, which wakes the Work
+    router's backstop; only registered pull requests of a switched repository are read."""
+    from agentdeck.models import PullRequestRef
+
+    app, _gh = _app(tmp_path, monkeypatch)
+    app.state.work_router = SimpleNamespace(
+        switched=lambda repository: repository == "eerovil/agentdeck"
+    )
+    app.state.app_state.session_pull_requests["chat-a"] = (
+        PullRequestRef("eerovil/agentdeck", 9),
+        PullRequestRef("EEROVIL/agentdeck", 12),
+        PullRequestRef("eerovil/agentdeck", 13),
+        PullRequestRef("eerovil/other", 3),
+    )
+    # More registered open ones than one press reads: the branch picks the oldest (#3904).
+    app.state.app_state.session_pull_requests["chat-b"] = tuple(
+        PullRequestRef("eerovil/agentdeck", number) for number in (20, 21, 22, 23)
+    )
+    rows = {("eerovil/agentdeck", 13): {"state": "MERGED", "mergedAt": "x"}}
+    rows[("eerovil/agentdeck", 9)] = {"state": "OPEN", "headRefName": "agent/issue-9"}
+    read: list = []
+
+    async def refresh(refs, *, limit):
+        read.append(list(refs))
+        return len(refs)
+
+    monkeypatch.setattr(app.state.issues, "refresh_pull_rows", refresh)
+    monkeypatch.setattr(
+        app.state.issues,
+        "cached_pulls",
+        lambda refs: {ref: rows[ref] for ref in refs if ref in rows},
+    )
+    client = _client(app)
+
+    def post(**body):
+        return client.post("/api/works/pr-ready", json=body).json()
+
+    assert post(repository="EEROVIL/agentdeck", number=9)["refreshed"] == 1
+    assert read == [[("eerovil/agentdeck", 9)]]
+    # The current branch's (no number): the one whose cached row has that branch, though
+    # four newer ones are registered too.
+    assert post(repository="eerovil/agentdeck", branch="agent/issue-9")["refreshed"] == 1
+    assert read[-1] == [("eerovil/agentdeck", 9)]
+    # No cached row names the branch: the open registered ones, at most four.
+    post(repository="eerovil/agentdeck", branch="unknown")
+    assert len(read[-1]) == 4 and ("eerovil/agentdeck", 13) not in read[-1]
+    # Not registered, or not a switched repository: no GitHub read.
+    assert post(repository="eerovil/agentdeck", number=99)["refreshed"] == 0
+    assert post(repository="eerovil/other", number=3)["refreshed"] == 0
+    assert len(read) == 3
+
 def test_unticking_spec_only_leaves_its_label_off(tmp_path, monkeypatch):
     app, gh = _app(tmp_path, monkeypatch)
 
@@ -992,6 +1056,7 @@ async def test_the_front_page_form_files_keeps_words_on_failure_and_follows_the_
         }""")
         select = page.locator('details#new-work select[name="repository"]')
         await page.locator('[data-project-tab="trailhead"]').click()
+        # Its tracker, though docker sorts first (#3882).
         assert await select.input_value() == "Northwind/issues"
         if shots:
             await page.screenshot(path=os.path.join(shots, "new-work-follows-filter.png"))
@@ -1002,6 +1067,39 @@ async def test_the_front_page_form_files_keeps_words_on_failure_and_follows_the_
         await page.locator('[data-project-tab="minecraft"]').click()
         assert await select.input_value() == "eerovil/game-mod"
         assert await page.locator("details#new-work [data-new-work-attach]").is_hidden()
+
+        # A project that sorts first starts on its docker only as the browser's automatic
+        # first option, which is no one's choice: its tab and its name still land on the
+        # tracker (#3882 review).
+        later = dataclasses.replace(MINECRAFT, issue_repositories=("zeta/game-mod",))
+        monkeypatch.setattr(
+            app.state.issues, "read_board", lambda: BoardView(scopes=(TRAILHEAD, later))
+        )
+        fresh = await browser.new_page(viewport={"width": 390, "height": 844},
+                                       service_workers="block")
+        await fresh.goto(base + "/")
+        await fresh.locator("details#new-work summary").click()
+        select = fresh.locator('details#new-work select[name="repository"]')
+        assert await select.input_value() == "Northwind/docker"
+        await fresh.locator('details#new-work textarea[name="message"]').fill(
+            "Trailhead: the checkout shows the wrong price"
+        )
+        await fresh.wait_for_function(
+            "document.querySelector('details#new-work select').value === 'Northwind/issues'"
+        )
+        await fresh.reload()
+        await fresh.evaluate("""() => {
+          const main = document.querySelector('.front-page main');
+          for (const name of ['trailhead', 'minecraft']) {
+            const row = document.createElement('article');
+            row.setAttribute('data-work-project', name);
+            main.appendChild(row);
+          }
+          window.AgentDeckFront.apply();
+        }""")
+        await fresh.locator('[data-project-tab="trailhead"]').click()
+        await fresh.locator("details#new-work summary").click()
+        assert await select.input_value() == "Northwind/issues"
         await browser.close()
 
 

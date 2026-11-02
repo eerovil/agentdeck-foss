@@ -430,6 +430,9 @@ class _ManifestFacts:
     # The repositories whose GitHub checks are the verification (``verification =
     # "github_checks"``, #2364), as the manifest names them.
     ci_repos: tuple[str, ...] = ()
+    # The ``agentdeck_job`` repositories whose GitHub checks must also be green
+    # (``github_checks_required``, #3919).
+    checks_required_repos: tuple[str, ...] = ()
     # The repositories whose review pass is the verification (``verification =
     # "review_only"``, #2729, #2832), as the manifest names them.
     review_only_repos: tuple[str, ...] = ()
@@ -518,6 +521,13 @@ def _manifest(path: Path) -> _ManifestFacts:
             if isinstance(entry, dict)
             and entry.get("id")
             and str(entry.get("verification") or "").strip() == "github_checks"
+        ),
+        checks_required_repos=tuple(
+            str(entry.get("id")).strip()
+            for entry in (repos if isinstance(repos, list) else [])
+            if isinstance(entry, dict)
+            and entry.get("id")
+            and entry.get("github_checks_required") is True
         ),
         review_only_repos=tuple(
             str(entry.get("id")).strip()
@@ -804,6 +814,9 @@ def release_policies(root: str | Path) -> dict[str, object]:
             ),
             github_checks=frozenset(
                 _qualified(facts.org, repo).lower() for repo in facts.ci_repos
+            ),
+            checks_required=frozenset(
+                _qualified(facts.org, repo).lower() for repo in facts.checks_required_repos
             ),
             authorization=facts.authorization,
             spec_only_label=facts.spec_only_label,

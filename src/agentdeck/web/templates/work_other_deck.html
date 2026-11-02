@@ -1,10 +1,11 @@
 {% extends "base.html" %}
-{#- Another deck's Work, read only (#3834). Everything here is what the deck already caches
-    from GitHub; its status, chats and questions live on the other deck. The one control is
+{#- Another deck's Work, read only (#3834), in the Work page's own layout (#3855): header,
+    status line, result. Everything here is what the deck already caches from GitHub or read
+    from the webhook log; its chats and questions live on the other deck. The one control is
     Take over (Start here for one no agent has started), which reassigns the issue, so the
     hand-over stops the other deck's agent and starts one here. #}
 {%- set other = other_deck %}
-{%- set whose = "@" ~ other.assignee ~ "'s deck" if other.assignee else "another deck" %}
+{%- set whose = other.whose %}
 {%- set issue_label = other.ref.repository ~ "#" ~ other.ref.number %}
 {% block title %}{{ issue_label }} · {{ other.title }} · agentdeck{% endblock %}
 {% block body_class %}work-page{% endblock %}
@@ -19,23 +20,46 @@
     </p>
     <h1 class="wd-title">{{ other.title or issue_label }}</h1>
   </header>
-  <section class="wd-status is-quiet" id="work-status">
+  {%- set status = other.status %}
+  <section class="wd-status is-{{ status.tone if status else 'idle' }}" id="work-status" data-wd-tone="{{ status.tone if status else 'idle' }}"
+           data-other-deck-status="{{ status.key if status else '' }}">
+    {#- The status line from GitHub alone (#3855): what the other deck keeps to itself (a
+        question, a stuck chat, its Merge) is never guessed. A div, not a p: the form inside
+        would close a p and land on a line of its own. #}
+    <div class="wd-status-head">{{ status.headline if status else "Working" }} on {{ whose }}
+      <form class="op-form wd-other-deck-take" hx-post="{{ other.href }}/take-over" hx-target="#work-action-result" hx-swap="innerHTML"
+            hx-disabled-elt="find button" data-work-action data-agentdeck-action="work_action"
+            {%- if other.started %} hx-confirm="Stop the agent on {{ whose }} and take {{ issue_label }} over? The issue is assigned to you and an agent starts here on the same branch."
+            {%- else %} hx-confirm="Start {{ issue_label }} here? It is assigned to you and an agent starts on it."{% endif %}>
+        <button type="submit" class="fr-action" data-front-action="take_over">{{ "Take over" if other.started else "Start here" }}</button>
+      </form>
+    </div>
     <p class="wd-other-deck-line">
-      {%- if other.started %}Worked on {{ whose }}. Read only here.
-      {%- else %}Not started. {{ ("Assigned to @" ~ other.assignee) if other.assignee else "Left to another deck" }}.{% endif %}
+      {%- if status and status.link %}<a href="{{ status.link }}" target="_blank" rel="noopener" data-other-deck-link>{{ "Read the spec" if status.key == "spec" else "Read the review" }}</a> · {% endif %}
+      {%- if other.started %}Read only here: its chats, questions and Merge are on {{ whose }}.
+      {%- else %}{{ ("Assigned to @" ~ other.assignee) if other.assignee else "Left to another deck" }}; no agent works on it yet.{% endif %}
     </p>
-    {%- if other.pull %}
-    <p class="wd-other-deck-pull"><a href="{{ other.pull.url }}" target="_blank" rel="noopener">PR #{{ other.pull.number }}</a>
-      {{ "draft" if other.pull.draft else "ready for review" }}{% if other.pull.title %} · {{ other.pull.title }}{% endif %}</p>
-    {%- endif %}
     {%- if other.labels %}<p class="wd-other-deck-labels">{{ other.labels | join(" · ") }}</p>{% endif %}
-    <form class="op-form" hx-post="{{ other.href }}/take-over" hx-target="next .work-action-result" hx-swap="innerHTML"
-          hx-disabled-elt="find button" data-work-action data-agentdeck-action="work_action"
-          {%- if other.started %} hx-confirm="Stop the agent on {{ whose }} and take {{ issue_label }} over? The issue is assigned to you and an agent starts here on the same branch."
-          {%- else %} hx-confirm="Start {{ issue_label }} here? It is assigned to you and an agent starts on it."{% endif %}>
-      <button type="submit" class="fr-action" data-front-action="take_over">{{ "Take over" if other.started else "Start here" }}</button>
-    </form>
-    <div class="work-action-result" aria-live="polite"></div>
   </section>
+  <div class="work-action-result" id="work-action-result" aria-live="polite"></div>
+  {%- if other.outputs or other.pull %}
+  <section class="wd-section wd-result" id="work-result">
+    <h3 class="wd-title-sm">Result</h3>
+    <ul class="wd-facts">
+      {%- for output in other.outputs %}
+      <li data-wd-output="{{ output.url }}"><a href="{{ output.url }}" target="_blank" rel="noopener">PR {{ output.label }}</a>
+        {%- if output.state %} · <span class="wo-state">{{ "draft" if output.draft and output.is_open else output.state }}</span>{% endif %}
+        {%- if output.additions is not none and output.deletions is not none and output.files is not none %} · <span data-wd-output-size>{% if output.files %}+{{ output.additions }}/−{{ output.deletions }} · {{ output.files }} {{ "file" if output.files == 1 else "files" }}{% else %}no source change{% endif %}</span>{% endif %}
+        {%- if output.base and output.base != "master" %} · <span data-wd-output-target>into {{ output.base }}</span>{% endif %}
+        {#- This pull request's own verdict at its head (#3855): one per pull request, so a
+            pass on one never reads as the other's. #}
+        {%- set verdict = other.verdict_for(output.url) %}
+        {%- if verdict %} · <a href="{{ verdict.url }}" target="_blank" rel="noopener" data-wd-output-verdict="{{ verdict.kind }}">{{ "reviewed" if verdict.kind == "passed" else "review found problems" }} at {{ output.head[:7] }}</a>{% endif %}</li>
+      {%- else %}
+      <li data-wd-output="{{ other.pull.url }}"><a href="{{ other.pull.url }}" target="_blank" rel="noopener">PR #{{ other.pull.number }}</a> · <span class="wo-state">{{ "draft" if other.pull.draft else "open" }}</span></li>
+      {%- endfor %}
+    </ul>
+  </section>
+  {%- endif %}
 </main>
 {% endblock %}

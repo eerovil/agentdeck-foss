@@ -29,6 +29,7 @@ from urllib.parse import quote, urlencode
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from markupsafe import Markup
+from pydantic import BaseModel, Field
 
 from .. import wayfinder_map, work_actions, work_counter
 from ..board_watch import BOARD_TOPIC
@@ -47,6 +48,7 @@ from ..work_overview import (
     work_chats,
     work_href,
     work_inventory,
+    work_project,
     work_title,
 )
 from ..work_resolution import MAX_TITLE, normalize_title
@@ -239,8 +241,12 @@ def _matches(row: WorkIndexRow, query: str) -> bool:
 WORKS_INDEX_TOPICS = ("works", "sessions", BOARD_TOPIC)
 
 
-async def works_index_context(app, repo: str = "", *, fresh: bool = False) -> dict:
-    """The default ``/works`` list: its Active and Recent rows, filtered to ``repo``.
+async def works_index_context(
+    app, repo: str = "", *, project: str = "", fresh: bool = False
+) -> dict:
+    """The default ``/works`` list: its Active and Recent rows, filtered to ``repo``, and to
+    ``project`` (#3873), the front page's project tab: one Poller instance can span several
+    repositories, so the front page's All Works link names the project, not a repository.
 
     Shared by the page and its stream (#3228): the stream asks once per ``works`` change for
     every tab showing the same filter, and renders only the rows whose revision moved. A page
@@ -253,7 +259,7 @@ async def works_index_context(app, repo: str = "", *, fresh: bool = False) -> di
     cache = getattr(app.state, "works_index_cache", None)
     if cache is None:
         cache = app.state.works_index_cache = {}
-    slot = repo.strip().casefold()
+    slot = (repo.strip().casefold(), project.strip().casefold())
     # Its rows read chats and the board beyond what the overview lists, so a change to
     # either moves it too, not only a ``works`` publication (#3228).
     revision = bus.revision(*WORKS_INDEX_TOPICS)
@@ -276,11 +282,21 @@ async def works_index_context(app, repo: str = "", *, fresh: bool = False) -> di
     named = {row.repository.casefold(): row.repository for row in active + recent}
     if wanted:
         chosen = named.setdefault(wanted, chosen)
+    group = project.strip()
+
+    def kept(row: WorkIndexRow) -> bool:
+        if wanted and row.repository.casefold() != wanted:
+            return False
+        return not group or (
+            work_project(row.repository, snapshot.board).casefold() == group.casefold()
+        )
+
     context = {
         "archived_count": archived_count(buckets, snapshot.state.db),
-        "active": [row for row in active if not wanted or row.repository.casefold() == wanted],
-        "recent": [row for row in recent if not wanted or row.repository.casefold() == wanted],
+        "active": [row for row in active if kept(row)],
+        "recent": [row for row in recent if kept(row)],
         "repo": chosen,
+        "project": group,
         "repositories": sorted(named.values(), key=str.casefold),
     }
     # One entry per filter, replaced at the next change: a filter is a query parameter, so
@@ -330,7 +346,12 @@ def render_works_index(
 
 @router.get("/works", response_class=HTMLResponse)
 async def works_index(
-    request: Request, view: str = "", q: str = "", repo: str = "", page: int = 1
+    request: Request,
+    view: str = "",
+    q: str = "",
+    repo: str = "",
+    page: int = 1,
+    project: str = "",
 ) -> HTMLResponse:
     if view == "paused":
         # Paused Works are a group on the front page now (#2566); an old link lands there.
@@ -346,7 +367,10 @@ async def works_index(
         return response
     if view != "archived":
         # The default list, which its stream keeps current row by row (#3228).
-        context = {"view": view, **await works_index_context(request.app, repo, fresh=True)}
+        context = {
+            "view": view,
+            **await works_index_context(request.app, repo, project=project, fresh=True),
+        }
         response = get_templates(request).TemplateResponse(request, "works.html", context)
         response.headers["Cache-Control"] = "no-cache"
         return response
@@ -523,11 +547,10 @@ async def reorder_merge_queue(request: Request, owner: str, repo: str) -> JSONRe
     if not isinstance(order, list) or not all(isinstance(name, str) for name in order):
         raise HTTPException(status_code=400, detail='send {"order": ["#n", ...]}')
     try:
-        release.reorder(repository, order)
+        queue = await release.reorder_and_wake(repository, order)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    await release.wake_first()
-    return JSONResponse({"repository": repository, "queue": release.queue(repository)})
+    return JSONResponse({"repository": repository, "queue": queue})
 
 
 @router.get("/api/works/status-log/flaps")
@@ -1099,7 +1122,7 @@ _DECK_REQUEST_TARGET_RE = re.compile(
 
 
 async def _deck_released_verdict(
-    request: Request, repository: str, number: int, command: str
+    request: Request, repository: str, number: int, command: str, action_id: str = ""
 ) -> str | None:
     """The deck reviewer's ``/reviewed`` on a Work the deck releases itself (#2895).
 
@@ -1128,7 +1151,12 @@ async def _deck_released_verdict(
         for verdict in parsed:
             answers.append(
                 await release.on_verdict(
-                    work_id, verdict.verdict, verdict.head, verdict.digest, verdict.targets
+                    work_id,
+                    verdict.verdict,
+                    verdict.head,
+                    verdict.digest,
+                    verdict.targets,
+                    source=f"request:{action_id}" if action_id else "",
                 )
             )
         return answers
@@ -1170,7 +1198,9 @@ async def _deck_run_request(
             ),
         )
     stale = (
-        await release.stale_findings(work_id, parsed.instruction, repository) if findings else ""
+        await release.stale_findings(work_id, parsed.instruction, repository, action_id)
+        if findings
+        else ""
     )
     if stale:
         # About a commit the branch has left (#3192): the newer head has its own review, so
@@ -1241,7 +1271,7 @@ async def deck_request_api(request: Request) -> JSONResponse:
     if not _ACTION_ID_RE.match(action_id):
         raise HTTPException(status_code=400, detail="the request carried no usable id")
     repository, number = target.group("repo"), int(target.group("n"))
-    released = await _deck_released_verdict(request, repository, number, command)
+    released = await _deck_released_verdict(request, repository, number, command, action_id)
     if released is not None:
         return JSONResponse({"outcome": "done", "detail": released})
     taken = await _deck_run_request(request, repository, number, command, action_id)
@@ -1328,7 +1358,7 @@ async def _agent_review(request: Request, step: work_actions.Step, label: str) -
     except Exception as exc:  # noqa: BLE001 - an unknown failure may have written
         logger.exception("work action Agent review for %s failed", step.issue)
         return "uncertain", f"{label} did not finish ({exc}); it may have started"
-    note_review_head(request.app, outcome)
+    note_review_head(request.app, outcome, asked=True)
     if outcome.note and outcome.note != "left for the deck to start":
         # ``open_review`` says why it started nothing: the chat is claimed or waiting on a
         # person, and a reviewer started on it would skip it by its labels.
@@ -1382,7 +1412,7 @@ async def _write(
         except Exception as exc:  # noqa: BLE001 - an unknown failure may have written
             logger.exception("work action ChatGPT review for %s failed", step.issue)
             return "uncertain", f"{label} did not finish ({exc}); it may have started"
-        note_review_head(request.app, outcome)
+        note_review_head(request.app, outcome, asked=True)
         return "done", f"ChatGPT review: {outcome.summary}"
     if step.kind == "agent_review":
         return await _agent_review(request, step, label)
@@ -1393,11 +1423,13 @@ async def _write(
         work_id = WorkRef(step.repository.lower(), step.number).work_id
         if release is None or not release.handles(work_id):
             return "failed", "The deck does not release this Work; nothing was sent."
+        from ..services_link import ServicesUnavailable
         from ..work_release import PressRefused
 
         try:
             answer = await release.request_merge(work_id, fresh=step.body == "fresh")
-        except PressRefused as refused:
+        except (PressRefused, ServicesUnavailable) as refused:
+            # The merge service restarting sent nothing (#4016): press again in a moment.
             return "failed", str(refused)
         except Exception as exc:  # noqa: BLE001 - a merge may have reached GitHub
             logger.exception("work action Merge for %s failed", step.issue)
@@ -1409,8 +1441,12 @@ async def _write(
         work_id = WorkRef(step.repository.lower(), step.number).work_id
         if release is None or not release.handles(work_id):
             return "failed", "The deck does not release this Work; nothing was sent."
+        from ..services_link import ServicesUnavailable
+
         try:
             answer = await release.withdraw_merge(work_id)
+        except ServicesUnavailable as unavailable:
+            return "failed", str(unavailable)
         except Exception as exc:  # noqa: BLE001 - the press may already be gone
             logger.exception("work action Withdraw for %s failed", step.issue)
             return "uncertain", f"{label} did not finish ({exc}); it may have been withdrawn"
@@ -2523,6 +2559,52 @@ async def put_work_star(request: Request, work_id: str) -> JSONResponse:
 async def delete_work_star(request: Request, work_id: str) -> JSONResponse:
     """Unstar a Work (#3116); unstarring an unstarred Work changes nothing."""
     return await _star_json(request, work_id, False)
+
+
+class AgentMessageRequest(BaseModel):
+    text: str
+    #: The sending chat's own session key.
+    sender: str = Field(alias="from")
+    #: The caller's own name for this message: a retry under it is sent once (#3909 review).
+    id: str = Field(default="", max_length=200)
+
+
+@router.post("/api/works/{work_id:path}/message")
+async def post_work_message(
+    request: Request, work_id: str, body: AgentMessageRequest
+) -> JSONResponse:
+    """An agent's message to the chat running another Work (#3908).
+
+    That agent never reads later edits or comments on its issue, so this is how a request is
+    changed or corrected once its Work started. Sent once per sender, Work and ``id``; with no
+    ``id``, every call is a new message.
+    """
+    from ..work_message import MessageRefused, send
+    from .deps import resolve_chat_key
+
+    ref, _ = _resolve(work_id)
+    if ref is None:
+        raise HTTPException(status_code=404, detail="not a Work id")
+    sender_key, _session = resolve_chat_key(request, body.sender.strip())
+    messages = getattr(request.app.state, "scheduled_messages", None)
+    if messages is None:
+        raise HTTPException(status_code=503, detail="the deck cannot send messages right now")
+    try:
+        sent = send(
+            request.app.state.app_state, messages, ref, sender_key, body.text, body.id
+        )
+    except MessageRefused as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.detail) from None
+    return JSONResponse(
+        {
+            "work_id": ref.work_id,
+            "chat": sent.chat_id,
+            "message_id": sent.message_id,
+            "sent": True,
+            "already_sent": not sent.new,
+        },
+        status_code=202,
+    )
 
 
 async def _star_json(request: Request, work_id: str, starred: bool) -> JSONResponse:

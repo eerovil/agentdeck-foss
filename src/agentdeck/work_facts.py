@@ -13,11 +13,13 @@ found (``OutputFact.found_by``).
 
 Each output also carries its size and target branch from the same cached row (#2236):
 ``gh pr view`` stores the per-file ``files`` list beside the changed-file count, so
-``diffstat`` sums a Work's outputs without a GitHub call. The size counts source files only
-(#2331): tests, docs and non-code files (``worktree_diff.classify_path``) are left out, the
-way the chat's diff pane groups them away. The same list's ``changeType`` splits that size
-into lines in new files and lines in edited ones (#3617): a large diff of new files is usually
-fine to review, so the front page's icon is graded by the edited lines alone.
+``diffstat`` sums a Work's outputs without a GitHub call; while any of them is open, only the
+open ones count, so a merged one stops inflating what is left to review (#4010). The size
+counts source files only (#2331): tests, docs and non-code files
+(``worktree_diff.classify_path``) are left out, the way the chat's diff pane groups them away.
+The same list's ``changeType`` splits that size into lines in new files and lines in edited
+ones (#3617): a large diff of new files is usually fine to review, so the front page's icon is
+graded by the edited lines alone.
 
 An output whose auto-merge waits on a required check that never reported carries those
 checks' names (#2275), from the row ``merge_checks`` caches for armed pull requests only.
@@ -188,8 +190,14 @@ class DiffStat:
 
 
 def _counted(outputs: Sequence[OutputFact]) -> list[OutputFact]:
-    """The outputs a Work's size is about: every one except those closed without merging."""
-    return [output for output in outputs if output.state != CLOSED]
+    """The outputs a Work's size is about: the open ones while any is open, else every one
+    except those closed without merging (#4010).
+
+    A merged pull request is history once a new one is open: counting it would grade what is
+    already in rather than what is left to review."""
+    counted = [output for output in outputs if output.state != CLOSED]
+    pending = [output for output in counted if output.is_open]
+    return pending or counted
 
 
 def diffstat(outputs: Sequence[OutputFact]) -> DiffStat | None:

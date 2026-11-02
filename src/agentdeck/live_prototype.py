@@ -97,6 +97,8 @@ draws it.
    `diagram/<name>` (inside a Work, on the Work's branch), never in the live checkout.
 2. Write `docs/diagrams/<name>.md`: a `# Title`, two to four sentences on what it
    shows, one ```mermaid block, then a `## Colours` list and a `## Boxes` list.
+   One diagram per feature (#3860): name the file and title after the feature, never
+   an issue number, and when the feature already has a diagram, extend that one.
    - Logic: `flowchart TD` with `{question?}` boxes and labelled `-- Yes -->` arrows.
      Parts of a system: `subgraph` groups; the deck gives each group its own colour.
    - Colour boxes by what they do with `class <ids> <colour>`, using only blue,
@@ -117,6 +119,17 @@ draws it.
    that box, its arrows or its note.
 4. Push the branch through the repository's normal flow when the person wants to
    share it; GitHub draws the same file.
+5. A copy of the diagram in a GitHub comment (a Work's issue comment ending
+   `<!-- agentdeck-diagram -->`) adds these lines at the end of its ```mermaid
+   block, after the `class` lines, so GitHub shows the colours too (#3927). Copy them
+   as they are; the file itself keeps none.
+
+       classDef blue fill:#c5ddfb,stroke:#236ac7,color:#183862
+       classDef violet fill:#d9c5fb,stroke:#5f23c7,color:#331862
+       classDef teal fill:#c5fbf6,stroke:#23c7b7,color:#18625b
+       classDef amber fill:#fbe6c5,stroke:#c78623,color:#624518
+       classDef rose fill:#fbc5d7,stroke:#c7235a,color:#621831
+       classDef green fill:#c5fbd9,stroke:#23c75f,color:#186233
 
 Inside a Work, work on the Work's branch in its worktree and commit the diagram in the
 Work's pull request; the Work page's Diagram button opens your live page on it.

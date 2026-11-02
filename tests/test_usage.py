@@ -6,6 +6,7 @@ import pytest
 import respx
 
 from agentdeck.models import Account, UsageSnapshot
+from agentdeck.providers import account_health
 from agentdeck.providers import usage as shared_usage
 from agentdeck.providers.claude_code import usage
 from agentdeck.providers.claude_code.usage import (
@@ -31,6 +32,19 @@ def _account(cfg_path) -> Account:
 def account(tmp_path, write_credentials):
     write_credentials(tmp_path, "tok-1")
     return _account(tmp_path)
+
+
+def test_no_test_reaches_the_live_usage_cache(account):
+    """#3952: a poller built without `cache_dir` lands in a scratch folder, never the live one."""
+    import os
+    from pathlib import Path
+
+    live = {Path(f"/run/user/{os.getuid()}"), Path("~/.cache").expanduser()}
+    if os.environ.get("AGENTDECK_TEST_LIVE_RUNTIME_DIR"):
+        live.add(Path(os.environ["AGENTDECK_TEST_LIVE_RUNTIME_DIR"]))
+    default = ClaudeUsagePoller(account, _FakeState()).cache_dir
+    assert default == shared_usage.shared_cache_dir()
+    assert not any(default.is_relative_to(root) for root in live), default
 
 
 async def test_fetch_usage_once_happy(account):
@@ -121,6 +135,7 @@ async def test_poller_backoff_schedule(account):
         account,
         _FakeState(),
         interval_s=100.0,
+        cache_dir=account.root / "cache",
         sleep=fake_sleep,
         jitter=lambda: 0.9,  # phase offset → 0
     )
@@ -146,7 +161,12 @@ async def test_poller_publishes_on_success(account):
             raise Stop
 
     poller = ClaudeUsagePoller(
-        account, state, interval_s=100.0, sleep=fake_sleep, jitter=lambda: 0.9
+        account,
+        state,
+        interval_s=100.0,
+        cache_dir=account.root / "cache",
+        sleep=fake_sleep,
+        jitter=lambda: 0.9,
     )
     with respx.mock:
         respx.get(USAGE_URL).mock(return_value=httpx.Response(200, json=OK_BODY))
@@ -325,6 +345,22 @@ async def test_write_shared_cache(account, tmp_path):
     written = (cache / "usage-main.json").read_text()
     assert '"five_hour_pct": 12.0' in written
     assert (cache / "usage-claude_code-main.json").read_text() == written
+
+
+def test_a_plan_with_no_five_hour_window_clears_its_circuit_on_the_week(account, tmp_path):
+    """Main's meter answers ``"five_hour": null`` on every read since 2026-10-30 (#3947)."""
+    cache = tmp_path / "cache"
+    tripped = datetime(2026, 11, 1, tzinfo=UTC)
+    account_health.trip_hard_quota(cache, account.key, reason="weekly quota", now=tripped)
+    no_week = usage.parse_usage(account.key, {"five_hour": {"utilization": 3.0}})
+    shared_usage.write_shared_cache(no_week, account, cache)
+    # The weekly window is still required.
+    assert account_health.open_circuit(cache, account.key) is not None
+    week_only = usage.parse_usage(
+        account.key, {"five_hour": None, "seven_day": {"utilization": 51.0}}
+    )
+    shared_usage.write_shared_cache(week_only, account, cache)
+    assert account_health.open_circuit(cache, account.key) is None
 
 
 def test_read_shared_cache_round_trips_write(account, tmp_path):

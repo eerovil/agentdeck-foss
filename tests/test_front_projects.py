@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import re
+from pathlib import Path
 
 import pytest
 
@@ -141,6 +142,42 @@ def test_each_row_names_its_project_and_the_tabs_start_unbuilt(tmp_path):
         assert active and f'class="fr-age" datetime="{active.group(1)}"' in article
 
 
+def test_all_works_opens_on_one_project_across_its_repositories(tmp_path):
+    """#3873: the front page's All Works links open ``/works`` on its project tab."""
+    from jinja2 import Environment, FileSystemLoader
+    from test_work_ui import _active, _archived_ids, _client
+
+    import agentdeck.web
+
+    issues = WorkRef("Northwind/issues", 6)
+    app = _deck(tmp_path)
+    _active(app, "claude_code:test:issues", issues)
+    client = _client(app)
+    front = client.get("/").text
+    assert front.count("data-all-works") >= 2
+    # The counted links count every project, so they stay whole.
+    assert "data-active-more data-all-works" not in front
+    assert "data-quiet-link data-all-works" not in front
+    templates = Path(agentdeck.web.__file__).parent / "templates"
+    page = Environment(loader=FileSystemLoader(templates)).get_template(
+        "partials/work_front.html"
+    ).make_module({"work_overview": {}, "part": ""})
+    assert "data-all-works" not in str(page.head("finished", "Done", 3, "4 more", "/works"))
+    assert "data-all-works" in str(page.head("working", "Working", 3, "All Works", "/works"))
+
+    # One instance's several repositories are one project, however it is spelled.
+    trailhead = client.get("/works?project=Trailhead").text
+    assert sorted(_archived_ids(trailhead)) == sorted(
+        work.work_id.lower() for work in (STORE, issues)
+    )
+    assert "data-works-project-summary>Trailhead<" in trailhead
+    assert "project=Trailhead" in trailhead.split("sse-connect=", 1)[1].split(">", 1)[0]
+    assert 'href="/works" aria-current' not in trailhead
+    assert set(_archived_ids(client.get("/works").text)) == {
+        work.work_id.lower() for work in (DECK, BAZAAR, STORE, issues)
+    }
+
+
 @pytest.mark.browser
 @pytest.mark.asyncio
 async def test_a_hidden_project_stays_hidden_through_a_push_and_a_reload(tmp_path):
@@ -202,6 +239,12 @@ async def test_a_hidden_project_stays_hidden_through_a_push_and_a_reload(tmp_pat
         assert await tabs.last.get_attribute("aria-pressed") == "false"
         assert await working.inner_text() == "1"
         assert await running.inner_text() == "1"
+        # All Works opens the list on that project (#3873).
+        all_works = page.locator("a[data-all-works]").first
+        assert await all_works.get_attribute("href") == "/works?project=agentdeck"
+        await page.evaluate(
+            "() => document.querySelectorAll('a[data-all-works]').forEach(a => { a.__old = 1; })"
+        )
 
         # A push that brings a new bazaar Work in hides it before anyone sees it, and leaves the
         # tabs where they were though bazaar is now the newest.
@@ -218,6 +261,14 @@ async def test_a_hidden_project_stays_hidden_through_a_push_and_a_reload(tmp_pat
         )
         assert await working.inner_text() == "1"
         assert await tabs.evaluate_all(order) == [*names, ""]
+        # The push redrew the Working now header with a plain /works; it follows the tab still.
+        await page.wait_for_function(
+            "() => [...document.querySelectorAll('a[data-all-works]')].some(a => !a.__old)"
+        )
+        assert set(await page.evaluate(
+            "() => [...document.querySelectorAll('a[data-all-works]')]"
+            ".filter(a => !a.__old).map(a => a.getAttribute('href'))"
+        )) == {"/works?project=agentdeck"}
 
         # A reload sorts them again.
         await page.reload()
@@ -246,6 +297,7 @@ async def test_a_hidden_project_stays_hidden_through_a_push_and_a_reload(tmp_pat
                                      "'agentdeck-front-hidden-projects') === '{}'")
         assert await working.inner_text() == "4"
         assert await running.inner_text() == "4"
+        assert await all_works.get_attribute("href") == "/works"
 
         # The deck chat switches the tabs by name, in any case, on every open page (#3814),
         # and asking twice is the same view, not a toggle back to All.

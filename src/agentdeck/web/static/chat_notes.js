@@ -20,6 +20,34 @@
     return isNaN(when) ? null : when;
   }
 
+  function escapeText(s) {
+    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+
+  // GitHub's rendering of a ```mermaid block is only a placeholder its own page fills
+  // in, so a diagram comment showed as raw code here (#3927). Each one is drawn in the
+  // deck's diagram frame instead, in the deck's colours, with the comment's
+  // `- **amber**: …` legend keeping those colours off the groups as a diagram file's does.
+  function drawDiagrams(copy) {
+    var live = window.AgentdeckLiveHtml;
+    if (!live) return;
+    var legend = [];
+    copy.querySelectorAll('li > strong:first-child').forEach(function (b) {
+      var name = b.textContent.trim().toLowerCase();
+      if (/^(blue|violet|teal|amber|rose|green)$/.test(name)) legend.push(name);
+    });
+    copy.querySelectorAll('section[data-type="mermaid"]').forEach(function (section) {
+      var plain = section.querySelector('[data-plain]');
+      var code = section.querySelector('pre');
+      var src = plain ? plain.getAttribute('data-plain') : (code ? code.textContent : '');
+      if (!src || !src.trim()) return;
+      var holder = document.createElement('div');
+      holder.innerHTML = live.mermaid(escapeText(src.replace(/\n+$/, '')), {}, false, legend);
+      section.replaceWith(holder.firstChild);
+    });
+  }
+
   function place(source, transcript) {
     var notes = Array.prototype.slice.call(source.querySelectorAll(':scope > .chat-note'));
     var wanted = {};
@@ -50,6 +78,7 @@
       var copy = note.cloneNode(true);
       copy.classList.add('ev');
       copy.id = 'chat-note-' + id;
+      drawDiagrams(copy);
       transcript.insertBefore(copy, after ? after.nextSibling : (rows[0] || null));
     });
   }

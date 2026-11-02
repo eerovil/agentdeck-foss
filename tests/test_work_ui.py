@@ -1444,6 +1444,7 @@ def test_the_older_slices_routes_are_the_work_page_now(tmp_path):
         "/works/{work_id:path}/visibility",  # Hide and Bring back (#2238)
         "/works/{work_id:path}/star",  # Star and Unstar (#3116)
         "/api/works/{work_id:path}/star",  # the same for agents (#3116)
+        "/api/works/{work_id:path}/message",  # another Work's agent changing its request (#3908)
         "/api/works/{work_id:path}/map-layout",  # a wayfinder map's moved boxes (#3627)
         "/api/works/{work_id:path}/question",  # its question boxes, for agents (#3481)
         "/works/{work_id:path}/title",  # the Work's own name on this deck (#2328)
@@ -1454,6 +1455,7 @@ def test_the_older_slices_routes_are_the_work_page_now(tmp_path):
         "/works/{work_id:path}/chat",  # the New work receipt's link to the Work's chat (#3590)
         "/works/seen",  # mark Works read from the top bar's list (#3246)
         "/api/works/filed",  # an issue the deck filed starts its Work now (#3371)
+        "/api/works/pr-ready",  # an agent's `gh pr ready` re-reads its row now (#3903)
         "/api/works/population",  # read-only rows for staging comparisons (#2250)
         "/api/works/needs-you",  # what needs the owner, for the deck chat (#3773)
         "/api/works/status-log",  # every logged status change (#2751)
@@ -1883,10 +1885,11 @@ def _browser_app(tmp_path, *unstarted: WorkRef):
         )
         app.state.issues.read_board = lambda: backlog.board
         app.state.issues.cached = lambda: backlog
-    # Mid-turn: something current keeps a Work the deck does not run itself listed.
+    # Mid-turn: something current keeps a Work the deck does not run itself listed. Both
+    # Works are, so the front page lists two (#3984): an idle one is only counted as quiet.
     _add(app, "claude_code:test:worker", WORK, title="Promote Work to the UI", thinking=True)
     _add(app, "codex:test:review", WORK, title="Review the Work UI")
-    _add(app, "claude_code:test:cleanup", OTHER, title="Remove legacy paths")
+    _add(app, "claude_code:test:cleanup", OTHER, title="Remove legacy paths", thinking=True)
     _add(app, "claude_code:test:manual", thinking=True, title="A chat started by hand")
     return app
 
@@ -2117,7 +2120,8 @@ async def test_a_work_push_swaps_only_the_changed_card(tmp_path):
         assert await this.get_attribute("data-work-rev") == held_rev
         # Done typing: the next push brings the owed row, though it is only a placeholder.
         await this.evaluate("el => { el.querySelector('textarea').remove(); }")
-        _add(app, "claude_code:test:cleanup", OTHER, thinking=True, title="Remove legacy paths")
+        # Another Work's change is the next push; each keeps it mid-turn, so it stays listed.
+        _add(app, "claude_code:test:cleanup", OTHER, thinking=True, title="Remove old paths")
         await app.state.work_overview.refresh()
         await page.wait_for_function(
             "([id, rev]) => { const el = document.querySelector(`[data-work-id=\"${id}\"]`);"
@@ -2126,7 +2130,7 @@ async def test_a_work_push_swaps_only_the_changed_card(tmp_path):
         )
         # A row the page lost comes back: its placeholder reopens the stream, which sends it.
         await this.evaluate("el => el.remove()")
-        _add(app, "claude_code:test:cleanup", OTHER, title="Remove legacy paths")
+        _add(app, "claude_code:test:cleanup", OTHER, thinking=True, title="Remove legacy paths")
         await app.state.work_overview.refresh()
         await this.wait_for()
         assert await page.locator("[data-work-same]").count() == 0
@@ -2229,7 +2233,8 @@ async def test_the_work_ui_fits_a_320px_phone(tmp_path, path):
         await root.wait_for()
         state = page.locator(f'[data-work-id="{WORK.work_id}"] .fr-line').first
         if path == "work":
-            state = page.locator("#work-status[data-wk-run-state]")
+            # The status box always carries its tone; its Run state went with Runs in #3741.
+            state = page.locator("#work-status[data-wd-tone]")
         assert await state.is_visible()
         overflow = await root.evaluate(
             """el => [...el.querySelectorAll('*')].filter(
@@ -2240,8 +2245,8 @@ async def test_the_work_ui_fits_a_320px_phone(tmp_path, path):
         assert overflow == []
         assert await page.evaluate("() => document.documentElement.scrollWidth") <= 320
         if path == "work":
-            # Provider and session detail stays collapsed on a phone, and so do Runs and Chats.
-            for fold in ("#work-inspector", "#work-runs", "#work-chats"):
+            # Provider and session detail stays collapsed on a phone, and so do Chats.
+            for fold in ("#work-inspector", "details#work-chats"):
                 assert await page.locator(fold).evaluate("el => el.open") is False, fold
         await browser.close()
 
@@ -2638,7 +2643,10 @@ async def test_clicking_a_work_row_again_while_it_loads_still_opens_it(tmp_path)
     from test_web import _live_server
 
     app = _browser_app(tmp_path)
-    _add(app, "claude_code:test:worker", WORK, title="Promote Work to the UI", cwd=tmp_path)
+    # Still mid-turn, as `_browser_app` made it: a Work with nothing current is quiet, and the
+    # front page lists no row for it to click (#3985).
+    _add(app, "claude_code:test:worker", WORK, title="Promote Work to the UI", cwd=tmp_path,
+         thinking=True)
     await app.state.work_overview.refresh()
     work_path = work_href(WORK.work_id)
     screenshot_dir = os.environ.get("AGENTDECK_SCREENSHOT_DIR")
@@ -2970,6 +2978,8 @@ async def test_a_phone_opens_a_shared_chat_with_the_work_it_tapped(tmp_path):
     app = _browser_app(tmp_path)
     shared = _add(app, "claude_code:test:shared", WORK, OTHER, title="Spec weekly SEO audit",
                   cwd=tmp_path, thinking=True)
+    # The shared chat alone keeps the other Work current, so its row opens that chat.
+    _add(app, "claude_code:test:cleanup", OTHER, title="Remove legacy paths")
     await app.state.work_overview.refresh()
     chat_path = app.state.app_state.sessions[shared].detail_path
     screenshot_dir = os.environ.get("AGENTDECK_SCREENSHOT_DIR")

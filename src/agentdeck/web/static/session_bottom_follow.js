@@ -143,15 +143,18 @@
     function reconcilePendingMessages() {
       transcript.querySelectorAll('[data-observed-queue-id], [data-observed-action-id]')
         .forEach(function (durable) {
-          var queueId = durable.dataset.observedQueueId;
-          var actionId = durable.dataset.observedActionId;
-          if (queueId) observedQueueIds.add(queueId);
-          if (actionId && !observedActionIds.has(actionId)) {
-            observedActionIds.add(actionId);
-            if (window.AgentDeckActionTiming) {
-              window.AgentDeckActionTiming.mark(actionId, 'first_transcript');
+          // Space-separated: one line can carry several queued sends (#3931).
+          (durable.dataset.observedQueueId || '').split(/\s+/).forEach(function (queueId) {
+            if (queueId) observedQueueIds.add(queueId);
+          });
+          (durable.dataset.observedActionId || '').split(/\s+/).forEach(function (actionId) {
+            if (actionId && !observedActionIds.has(actionId)) {
+              observedActionIds.add(actionId);
+              if (window.AgentDeckActionTiming) {
+                window.AgentDeckActionTiming.mark(actionId, 'first_transcript');
+              }
             }
-          }
+          });
         });
 
       var actionRows = new Map();

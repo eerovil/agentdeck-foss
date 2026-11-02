@@ -1529,46 +1529,27 @@ def test_review_history_reads_newest_first(tmp_path):
     db.close()
 
 
-def test_the_commit_a_review_chat_is_about_round_trips(tmp_path):
-    # #2088: the chip compares this with the pull request's head, so it has to survive the
-    # web restart that happens between opening a chat and reading its verdict.
+def test_the_commit_a_review_chat_is_about_is_its_chat_row_in_the_review_history(tmp_path):
+    """#2088, #2637, #3956: the chip compares this with the pull request's head, so it has to
+    survive a web restart; one chat covers a Work, so each pull request has its own commit,
+    and a chat written again at a newer head answers with that one."""
     db = Db(tmp_path / "h.db", 30)
-    db.record_chat_review_head("org/review-chats", 41, "org/store", 3309, "a" * 40)
-    db.record_chat_review_head("org/review-chats", 42, "org/store", 3310, "b" * 40)
+    chat = {"chat": "org/review-chats#41"}
+    db.append_review_event("org/store#3309", "a" * 40, "chat", "k1", 1.0, chat)
+    db.append_review_event("Org/Lib#12", "b" * 40, "chat", "k2", 1.0, chat)
+    db.append_review_event("org/store#3309", "c" * 40, "chat", "k3", 2.0, chat)
+    db.append_review_event("org/store#3310", "d" * 40, "chat", "k4", 1.0, {"chat": "x/y#42"})
+    db.append_review_event("org/store#3310", "d" * 40, "pass", "k5", 1.0, chat)
 
-    assert db.chat_review_heads("org/review-chats") == {
-        41: {("org/store", 3309): "a" * 40},
-        42: {("org/store", 3310): "b" * 40},
+    assert db.chat_review_heads("Org/Review-Chats") == {
+        41: {("org/store", 3309): "c" * 40, ("org/lib", 12): "b" * 40}
     }
-    # Another deck's chat repository is not this one's.
     assert db.chat_review_heads("org/other-chat") == {}
     db.close()
 
 
-def test_a_review_chat_written_twice_keeps_one_row(tmp_path):
-    """One chat is one commit; a retried write must not become a second answer."""
-    db = Db(tmp_path / "h.db", 30)
-    db.record_chat_review_head("org/review-chats", 41, "org/store", 3309, "a" * 40)
-    db.record_chat_review_head("org/review-chats", 41, "org/store", 3309, "c" * 40)
-
-    assert db.chat_review_heads("org/review-chats") == {41: {("org/store", 3309): "c" * 40}}
-    db.close()
-
-
-def test_a_work_review_chat_keeps_a_commit_per_pull_request(tmp_path):
-    """#2637: one chat covers the Work, so each of its pull requests is a row of its own."""
-    db = Db(tmp_path / "h.db", 30)
-    db.record_chat_review_head("org/review-chats", 41, "org/store", 3309, "a" * 40)
-    db.record_chat_review_head("org/review-chats", 41, "Org/Lib", 12, "b" * 40)
-
-    assert db.chat_review_heads("org/review-chats") == {
-        41: {("org/store", 3309): "a" * 40, ("org/lib", 12): "b" * 40}
-    }
-    db.close()
-
-
-def test_the_old_one_row_per_chat_table_is_migrated_with_its_rows(tmp_path):
-    """#2637: migration 13 rebuilds chat_review_heads on the wider key and keeps every row."""
+def test_the_old_chat_review_heads_table_is_dropped_with_its_rows(tmp_path):
+    """#3956: migration 19 drops it; nothing is copied into the review history."""
     path = tmp_path / "h.db"
     old = sqlite3.connect(path)
     old.execute(
@@ -1585,40 +1566,16 @@ def test_the_old_one_row_per_chat_table_is_migrated_with_its_rows(tmp_path):
     old.close()
 
     db = Db(path, 30)
-    db.record_chat_review_head("org/review-chats", 40, "org/lib", 7, "f" * 40)
-
-    assert db.chat_review_heads("org/review-chats") == {
-        40: {("org/store", 3300): "e" * 40, ("org/lib", 7): "f" * 40}
-    }
+    assert db.chat_review_heads("org/review-chats") == {}
     db.close()
     connection = sqlite3.connect(path)
     try:
-        assert 13 in applied_versions(connection)
-        info = connection.execute("PRAGMA table_info(chat_review_heads)").fetchall()
-        keyed = [row[1] for row in sorted(info, key=lambda row: row[5]) if row[5]]
+        assert {13, 19} <= set(applied_versions(connection))
         tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master")}
     finally:
         connection.close()
-    assert keyed == ["chat_repository", "chat_number", "target_repo", "target_number"]
-    assert "chat_review_heads_2637" not in tables, "no scratch table is left behind"
-    # Opening again is a no-op: the migration is recorded and idempotent besides.
-    Db(path, 30).close()
-
-
-def test_the_widening_runs_once_however_often_it_is_asked(tmp_path):
-    from agentdeck.db_migrations import _widen_chat_review_heads
-
-    db = Db(tmp_path / "h.db", 30)
-    db.record_chat_review_head("org/review-chats", 41, "org/store", 3309, "a" * 40)
-    db.close()
-    connection = sqlite3.connect(tmp_path / "h.db")
-    _widen_chat_review_heads(connection)
-    _widen_chat_review_heads(connection)
-    connection.commit()
-    rows = connection.execute("SELECT chat_number, target_repo FROM chat_review_heads").fetchall()
-    connection.close()
-
-    assert rows == [(41, "org/store")]
+    assert "chat_review_heads" not in tables and "chat_review_heads_2637" not in tables
+    Db(path, 30).close()  # opening again is a no-op
 
 
 def test_latest_context_delivery_keeps_the_run_from_a_completed_noop(tmp_path):

@@ -253,6 +253,8 @@
   <script src="/static/session_bottom_follow.js?v={{ asset_ver }}" defer></script>
   <script src="/static/session_last_user_jump.js?v={{ asset_ver }}" defer></script>
   <script src="/static/tool_call_groups.js?v={{ asset_ver }}" defer></script>
+  {#- Before chat_notes.js, which draws a diagram comment with it (#3927). #}
+  <script src="/static/live_html.js?v={{ asset_ver }}" defer></script>
   <script src="/static/chat_notes.js?v={{ asset_ver }}" defer></script>
   <script src="/static/message_collapse.js?v={{ asset_ver }}" defer></script>
   <script src="/static/side_chat.js?v={{ asset_ver }}" defer></script>
@@ -279,7 +281,6 @@
   <script src="/static/chat_jump.js?v={{ asset_ver }}" defer></script>
   <script src="/static/issue_post.js?v={{ asset_ver }}" defer></script>
   <script src="/static/code_copy.js?v={{ asset_ver }}" defer></script>
-  <script src="/static/live_html.js?v={{ asset_ver }}" defer></script>
   <script src="/static/page_refresh.js?v={{ asset_ver }}" defer></script>
   <script src="/static/wayfinder_map.js?v={{ asset_ver }}" defer></script>
   {#- Not deferred: the folds and the hidden projects are stylesheets before the first row is

@@ -212,14 +212,19 @@ class WorkProjection:
         the chat or the deck recorded about this chat itself. A provider-read issue URL and a
         Work inherited from a parent are left out (#2552).
         """
+        return self._joined_by_chat.get(chat_id, ())
+
+    @cached_property
+    def _joined_by_chat(self) -> dict[str, tuple[WorkRef, ...]]:
+        # Built once per projection: ``work_pulls`` asks per registered pull request, and a
+        # walk of every Work each time held the event loop for seconds (#3975).
         own = (WorkEvidence.REGISTERED_ISSUE, WorkEvidence.SIDE_CHAT, WorkEvidence.RUN_BINDING)
-        return tuple(
-            work.ref
-            for work in self.works
-            for membership in work.memberships
-            if membership.chat_id == chat_id
-            and any(item.evidence in own for item in membership.provenance)
-        )
+        index: dict[str, list[WorkRef]] = {}
+        for work in self.works:
+            for membership in work.memberships:
+                if any(item.evidence in own for item in membership.provenance):
+                    index.setdefault(membership.chat_id, []).append(work.ref)
+        return {chat_id: tuple(refs) for chat_id, refs in index.items()}
 
     @cached_property
     def _by_chat(self) -> dict[str, tuple[WorkRef, ...]]:

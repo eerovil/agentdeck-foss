@@ -6,12 +6,19 @@ chat link, and nothing could ever replace it but a person's own ✎ name.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 from httpx import ASGITransport, AsyncClient
 
 from agentdeck.work_overview import work_href, work_title
 
 WORK_ID = "github_issue:eerovil/agentdeck#2147"
+
+
+def titles(db):
+    """Each Work's own chat's name, without the key it started under."""
+    return {work_id: title for work_id, (title, _key) in db.work_start_chats().items()}
 KEY = "claude_code:test:sid1"
 URL = f"/api/sessions/{KEY}/work-title"
 
@@ -82,17 +89,38 @@ def test_only_a_works_own_agent_chat_names_it(tmp_path):
     db.bind_session_work("k:helper", early, "side_chat")
     name("k:early", "early agent")
     name("k:helper", "helper")
-    assert db.work_start_chat_titles() == {usual: "usual agent", early: "early agent"}
+    assert titles(db) == {usual: "usual agent", early: "early agent"}
 
     # A Deckhand guess, or a name typed on the chat, does not name the Work.
     name("k:early", "guess", source="deckhand")
     name("k:own", "typed", source="user")
-    assert db.work_start_chat_titles() == {}
+    assert titles(db) == {}
 
     # Continued on another account, the chat's name lives on its new leg and still counts.
     db.append_chat_leg("k:own", "k:next")
     name("k:next", "renamed")
-    assert db.work_start_chat_titles() == {usual: "renamed"}
+    assert titles(db) == {usual: "renamed"}
+    # The key the chat started under, so the front page can ask which Works it is in.
+    assert db.work_start_chats() == {usual: ("renamed", "k:own")}
+
+
+def test_a_chat_in_several_works_names_none_of_them():
+    """#3964: v1's chat, asked for v2 and v3, renamed itself "v3" and the v1 card read "v3".
+    Its other Work registered on a later leg counts, since the projection keys the chat."""
+    from agentdeck.web.work_view import own_chat_titles
+
+    v1, v3 = WORK_ID, "github_issue:eerovil/agentdeck#2150"
+    chat_of = {"k:own": "chat-1", "k:next": "chat-1", "k:alone": "chat-2"}
+    works = {"chat-1": (v1,), "chat-2": (v3,)}
+    projection = SimpleNamespace(works_for_chat=lambda chat: works.get(chat, ()))
+    starts = {v1: ("Pilkkiminen v3", "k:own"), v3: ("Own name", "k:alone")}
+
+    def titles():
+        return own_chat_titles(starts, projection, chat_of.__getitem__)
+
+    assert titles() == {v1: "Pilkkiminen v3", v3: "Own name"}
+    works["chat-1"] = (v1, v3)  # registered from the leg "k:next"
+    assert titles() == {v3: "Own name"}
 
 
 # --- the worker's write --------------------------------------------------------------------------

@@ -12,21 +12,7 @@
    only for a row's one button (#2526). #}
 {%- set front = work_overview.front -%}
 {%- from "partials/work_actions.html" import control -%}
-{%- macro size(card, lead=true) -%}
-{#- The Work's pull requests' size, and their target only when it is not master (#2236).
-    Source files only: tests, docs and non-code files are left out (#2331). -#}
-{%- set stat = card.diffstat -%}
-{%- if stat %}{% if lead %} · {% endif %}<span class="fr-size" data-work-diffstat>{% if stat.files %}+{{ stat.additions }}/&minus;{{ stat.deletions }} · {{ stat.files }} {{ "file" if stat.files == 1 else "files" }}{% if stat.new_files %} ({{ stat.new_files }} new){% endif %}{% else %}no source change{% endif %}</span>{% endif -%}
-{%- if card.targets %} · <span class="fr-target" data-work-target>into {{ card.targets | join(", ") }}</span>{% endif -%}
-{%- endmacro -%}
-{%- macro diff_icon(card) -%}
-{#- GitHub's diff square (#3617): [+] when most changed lines are in new files, [•] otherwise,
-    coloured good/ok/bad by the lines in edited files alone; a large diff of new files is
-    usually fine. First on the title line, so it is always in the same place. -#}
-{%- set stat = card.diffstat -%}
-{%- if stat and stat.split %}<span class="fr-diff fr-diff-{{ stat.grade }}" role="img" title="{{ stat.split_label }}" aria-label="{{ stat.split_label }}" data-work-diff="{{ stat.grade }} {{ 'new' if stat.mostly_new else 'edited' }}"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="1.75" y="1.75" width="12.5" height="12.5" rx="2" fill="none" stroke="currentColor" stroke-width="1.5"/>
-{%- if stat.mostly_new %}<path d="M8 4.5v7M4.5 8h7" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>{% else %}<circle cx="8" cy="8" r="2.4" fill="currentColor"/>{% endif %}</svg></span>{% endif -%}
-{%- endmacro -%}
+{%- from "partials/work_macros.html" import size, diff_icon -%}
 {%- macro ref(item) -%}{{ item.number if front.one_repository else item.source }}{%- endmacro -%}
 {%- macro age(card, finished=false) -%}
 {#- A finished row is dated by when the Work finished, not when its chats last moved; one a
@@ -46,7 +32,7 @@
     and a folded group still shows its count, NEW pill and note. #}
 <h3 class="fr-group fr-group-{{ key }}" data-front-group="{{ key }}"><span class="fr-group-mark" aria-hidden="true"></span><span class="fr-group-label">{{ label }}</span> <span class="fr-group-count">{{ count }}</span>
   {%- if new %}<span class="fr-new" data-front-new="{{ new }}">{{ new }} new</span>{% endif %}
-  {%- if link %}<a class="fr-group-note" href="{{ link }}">{{ note }}</a>{% elif note %}<span class="fr-group-note">{{ note }}</span>{% endif -%}
+  {%- if link %}<a class="fr-group-note" href="{{ link }}"{% if note == "All Works" %} data-all-works{% endif %}>{{ note }}</a>{% elif note %}<span class="fr-group-note">{{ note }}</span>{% endif -%}
   <button type="button" class="fr-chev" data-front-toggle="{{ key }}" aria-expanded="true" aria-label="Show or hide {{ label }}"></button></h3>
 {%- endmacro -%}
 {%- macro title(item, hidden=false) -%}
@@ -237,7 +223,7 @@
 
 {%- elif part == "board" %}
 <span class="front-links">
-<a href="/works">All Works</a>
+<a href="/works" data-all-works>All Works</a>
 {%- if front.quiet %}<a href="/works" data-quiet-link>{{ front.quiet }} quiet {{ "Work" if front.quiet == 1 else "Works" }}</a>{% endif %}
 {%- if work_overview.archived %}<a href="/works?view=archived" data-archived-link>Archived ({{ work_overview.archived }})</a>{% endif %}
 <a class="front-board-open" href="/pollers">Board</a>

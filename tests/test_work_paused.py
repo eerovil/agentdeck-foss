@@ -412,8 +412,8 @@ async def test_the_routers_resume_ends_a_deck_pause_and_takes_the_label_off(tmp_
     from types import SimpleNamespace
 
     app, gh = _chat_only(tmp_path, monkeypatch)
-    router = app.state.work_router
-    release = app.state.work_release
+    router = app.state.work_services.router
+    release = app.state.work_services.release
     release.ports = replace(
         release.ports, policy=lambda repository: SimpleNamespace(paused_label="Paused")
     )
@@ -445,14 +445,14 @@ async def test_a_label_that_will_not_come_off_resumes_nothing(tmp_path, monkeypa
 
     app, _gh = _chat_only(tmp_path, monkeypatch)
     monkeypatch.setattr(gh_cli, "run_once", _Gh((1, b"", b"boom")))
-    release = app.state.work_release
+    release = app.state.work_services.release
     release.ports = replace(
         release.ports, policy=lambda repository: SimpleNamespace(paused_label="paused")
     )
     record = {"title": "Chat only", "state": "open", "is_pr": False, "labels": ["paused"]}
     app.state.issues.cached_issues = lambda refs: {(WORK.repository, WORK.number): record}
-    assert app.state.work_router._paused(WORK.work_id)
-    assert await app.state.work_router._resume(WORK.work_id) is False
+    assert app.state.work_services.router._paused(WORK.work_id)
+    assert await app.state.work_services.router._resume(WORK.work_id) is False
 
 
 @pytest.mark.asyncio
@@ -465,23 +465,23 @@ async def test_a_deck_without_a_reviewer_counts_a_merge_press_as_the_review(
 
     monkeypatch.setattr(chat_review, "PUBLIC_STUB", False, raising=False)  # the real module
     app, _gh = _chat_only(tmp_path, monkeypatch)
-    assert app.state.work_release.ports.press_is_review is False
+    assert app.state.work_services.release.ports.press_is_review is False
     monkeypatch.setattr(chat_review, "PUBLIC_STUB", True, raising=False)
     app, _gh = _chat_only(tmp_path / "public", monkeypatch)
-    assert app.state.work_release.ports.press_is_review is True
+    assert app.state.work_services.release.ports.press_is_review is True
     # A deck-started Claude or Codex reviewer is a reviewer in either edition (#3640).
     from agentdeck import agent_review
 
     monkeypatch.setattr(agent_review, "effective", lambda reviewer, review_chats: "claude")
     app, _gh = _chat_only(tmp_path / "agent", monkeypatch)
-    assert app.state.work_release.ports.press_is_review is False
+    assert app.state.work_services.release.ports.press_is_review is False
 
 
 async def test_the_routers_resume_wakes_the_release(tmp_path, monkeypatch):
     """#2956 review: a verdict the release held as "paused" merges once the router resumes
     the Work, as the Work page's Resume makes the release look again."""
     app, _gh = _chat_only(tmp_path, monkeypatch)
-    release = app.state.work_release
+    release = app.state.work_services.release
     db = app.state.control_db
     looked = []
 
@@ -494,7 +494,7 @@ async def test_the_routers_resume_wakes_the_release(tmp_path, monkeypatch):
     monkeypatch.setattr(release, "evaluate", evaluate)
     db.pause_work(WORK.work_id)
 
-    assert await app.state.work_router._resume(WORK.work_id) is True
+    assert await app.state.work_services.router._resume(WORK.work_id) is True
     assert looked == [(WORK.work_id, False)]
 
     async def broken(work_id):
@@ -502,4 +502,5 @@ async def test_the_routers_resume_wakes_the_release(tmp_path, monkeypatch):
 
     monkeypatch.setattr(release, "evaluate", broken)
     db.pause_work(WORK.work_id)
-    assert await app.state.work_router._resume(WORK.work_id) is True, "resumed all the same"
+    router = app.state.work_services.router
+    assert await router._resume(WORK.work_id) is True, "resumed all the same"

@@ -55,10 +55,12 @@ MANIFEST_FILE = DATA / "staging-snapshot.json"
 WORKS_DIR = DATA / "staging-works"
 STUB_DIR = DATA / "staging-bin"
 
-PROD_UNITS = ("agentdeck.service", "agentdeck-codex.service")
+PROD_UNITS = ("agentdeck.service", "agentdeck-codex.service", "agentdeck-services.service")
 STAGING_WEB_UNIT = "agentdeck-staging.service"
 STAGING_RUNTIME_UNIT = "agentdeck-staging-codex.service"
-STAGING_UNITS = (STAGING_WEB_UNIT, STAGING_RUNTIME_UNIT)
+# The staging Work services twin (#4016, #4018): fenced like the web, started by hand.
+STAGING_SERVICES_UNIT = "agentdeck-staging-services.service"
+STAGING_UNITS = (STAGING_WEB_UNIT, STAGING_RUNTIME_UNIT, STAGING_SERVICES_UNIT)
 FENCE_DROPIN = "staging-fence.conf"
 STAGING_GITHUB_CACHE = "%h/.cache/agentdeck-staging/github_metadata.sqlite3"
 
@@ -79,6 +81,9 @@ REFUSING_PROGRAM = STUB_DIR / "refuse"
 # Config paths staging is meant to share with production: the agent accounts it monitors,
 # and the nudge program, which is a program and not state.
 SHARED_FIELDS = {"accounts", "chat_board.nudge_program"}
+# The folder of the files kept beside the webhook streams: ``github_webhook.state_dir``'s
+# parent. Refresh copies production's release store and router files into staging's.
+BESIDE_STREAMS = "github_webhook.store_path"
 _PATH_NAME = re.compile(r"(^|_)(path|dir|file|root)$")
 _WORKS_NAME = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 
@@ -133,9 +138,11 @@ def _runtime_dir(env: dict[str, str]) -> Path:
 
 
 def _env_paths(units: tuple[str, ...], unit_dir: Path) -> dict[str, Path]:
-    """The two process-environment paths the units decide, defaulted the way the code does."""
+    """The process-environment paths the units decide, defaulted the way the code does."""
     found: dict[str, Path] = {}
     for unit in units:
+        if unit == STAGING_SERVICES_UNIT and not (unit_dir / unit).exists():
+            continue  # the twin not installed runs nothing (#4016)
         env = unit_environment(unit, unit_dir)
         cache = env.get("AGENTDECK_GITHUB_CACHE", "~/.cache/agentdeck/github_metadata.sqlite3")
         socket = env.get("AGENTDECK_CODEX_SOCKET") or str(
@@ -143,6 +150,13 @@ def _env_paths(units: tuple[str, ...], unit_dir: Path) -> dict[str, Path]:
         )
         found[f"{unit}:AGENTDECK_GITHUB_CACHE"] = Path(cache).expanduser()
         found[f"{unit}:AGENTDECK_CODEX_SOCKET"] = Path(socket).expanduser()
+        # The web and the Work services meet on this one (#4016). A web unit that does not
+        # name it is a web from before the move, from the same checkout, which never opens it.
+        if "AGENTDECK_SERVICES_SOCKET" in env or unit.endswith("services.service"):
+            services = env.get("AGENTDECK_SERVICES_SOCKET") or str(
+                _runtime_dir(env) / "agentdeck-services" / "services.sock"
+            )
+            found[f"{unit}:AGENTDECK_SERVICES_SOCKET"] = Path(services).expanduser()
     return found
 
 
@@ -203,19 +217,43 @@ def check_isolation(
         for p_name, p_path in sorted(prod.items())
         if _overlaps(s_path, p_path)
     ]
-    web_env = unit_environment(STAGING_WEB_UNIT, unit_dir)
-    # A unit without its own PATH runs with the service manager's.
-    gh = _gh_on(web_env.get("PATH") or manager_path or os.environ.get("PATH", os.defpath))
-    try:
-        stubbed = gh is not None and STUB_REFUSAL in gh.read_text()
-    except (OSError, UnicodeDecodeError):
-        stubbed = False
-    if not stubbed:
-        refusals.append(
-            f"the staging web's gh is {gh or 'missing'}, not the refusing stub:"
-            " run `scripts/staging.sh fence`"
-        )
+    # The files the deck keeps beside the webhook streams sit in ``state_dir``'s parent, which
+    # no field names: a staging ``state_dir`` of its own still shared production's release
+    # store through it (#3962). Production's own folder holds staging's other folders, so it
+    # is compared with this one alone.
+    beside = staging_config.github_webhook.store_path
+    beside_prod = {**prod, BESIDE_STREAMS: prod_config.github_webhook.store_path}
+    refusals += [
+        f"staging {BESIDE_STREAMS} = {beside} overlaps production {p_name} = {p_path}"
+        for p_name, p_path in sorted(beside_prod.items())
+        if _overlaps(beside, p_path)
+    ]
+    # The web and the Work services twin both run `gh` (#4016): each the refusing stub.
+    for unit, name in ((STAGING_WEB_UNIT, "web's"), (STAGING_SERVICES_UNIT, "services twin's")):
+        if unit == STAGING_SERVICES_UNIT and not (unit_dir / unit).exists():
+            continue
+        env = unit_environment(unit, unit_dir)
+        # A unit without its own PATH runs with the service manager's.
+        gh = _gh_on(env.get("PATH") or manager_path or os.environ.get("PATH", os.defpath))
+        try:
+            stubbed = gh is not None and STUB_REFUSAL in gh.read_text()
+        except (OSError, UnicodeDecodeError):
+            stubbed = False
+        if not stubbed:
+            refusals.append(
+                f"the staging {name} gh is {gh or 'missing'}, not the refusing stub:"
+                " run `scripts/staging.sh fence`"
+            )
+    # The router, the release and the backstop may run in the staging services twin over a
+    # copied stream (``services.enabled``, #4018), never in the staging web, whose other
+    # readers stay off with the streams.
+    from .work_services import services_enabled
+
     settings = {
+        "services.in_web with the Work services enabled": (
+            staging_config.services.in_web and services_enabled(staging_config),
+            False,
+        ),
         "github_webhook.enabled": (staging_config.github_webhook.enabled, False),
         "chat_board.enabled": (staging_config.chat_board.enabled, False),
         "poller.issue_refresh_interval_s": (staging_config.poller.issue_refresh_interval_s, 0),
@@ -269,6 +307,10 @@ def install_fence(
             f'Environment="PATH={os.pathsep.join(entries)}"',
         ],
         STAGING_RUNTIME_UNIT: [f"Environment=AGENTDECK_GITHUB_CACHE={STAGING_GITHUB_CACHE}"],
+        STAGING_SERVICES_UNIT: [
+            f"Environment=AGENTDECK_GITHUB_CACHE={STAGING_GITHUB_CACHE}",
+            f'Environment="PATH={os.pathsep.join(entries)}"',
+        ],
     }.items():
         directory = unit_dir / f"{unit}.d"
         directory.mkdir(parents=True, exist_ok=True)
@@ -526,6 +568,30 @@ def copy_poller(prod_root: Path, staging_root: Path) -> list[Path]:
     fresh.rename(current)
     shutil.rmtree(old, ignore_errors=True)
     return [current / p.relative_to(fresh) if p.is_relative_to(fresh) else p for p in written]
+
+
+def copy_beside_streams(prod_dir: Path, staging_dir: Path) -> list[Path]:
+    """Copy the files a Work's status reads from beside production's streams; returns the copies.
+
+    Staging reads its own copy and writes only that (#3962). Each file is replaced whole by
+    its writer, so a copy is never half written. Nothing that acts is copied: not the
+    endings ledger, nor the wake-on registry, nor the tailers' offsets.
+    """
+    from . import work_release, work_router
+
+    copied = []
+    for name in (
+        work_release.STORE_FILENAME,
+        work_router.PENDING_FILENAME,
+        work_router.HANDED_OVER_FILENAME,
+    ):
+        source, target = prod_dir / name, staging_dir / name
+        if source.is_file():
+            _atomic_copy(source, target)
+            copied.append(target)
+        else:
+            target.unlink(missing_ok=True)
+    return copied
 
 
 # --- the lease -----------------------------------------------------------------------------
@@ -926,7 +992,7 @@ def refresh(ctx: Context) -> dict:
     staging_env = _env_paths(STAGING_UNITS, ctx.unit_dir)
     started = datetime.now(UTC)
     ctx.out("==> stop staging")
-    _systemctl(ctx.run, "stop", "agentdeck-staging.socket", STAGING_WEB_UNIT, STAGING_RUNTIME_UNIT)
+    _systemctl(ctx.run, "stop", "agentdeck-staging.socket", *_running_units(ctx.unit_dir))
     try:
         ctx.out("==> copy poller instances")
         poller_files = copy_poller(Path(prod.poller.root), Path(staging.poller.root))
@@ -934,6 +1000,10 @@ def refresh(ctx: Context) -> dict:
         db_target = Path(staging.history.db_path).expanduser()
         scrubbed = copy_sqlite(
             Path(prod.history.db_path).expanduser(), db_target, scrub=SCRUBBED_TABLES
+        )
+        ctx.out("==> copy the release store and the router's files")
+        beside_files = copy_beside_streams(
+            prod.github_webhook.store_path, staging.github_webhook.store_path
         )
         ctx.out("==> copy the GitHub cache")
         cache_target = staging_env[f"{STAGING_WEB_UNIT}:AGENTDECK_GITHUB_CACHE"]
@@ -943,7 +1013,9 @@ def refresh(ctx: Context) -> dict:
             "captured_end": datetime.now(UTC).isoformat(),
             "production_revision": _git("rev-parse", "HEAD", cwd=PROD_CHECKOUT),
             "scrubbed_rows": scrubbed,
-            "files": [_file_entry(p) for p in (db_target, cache_target, *poller_files)],
+            "files": [
+                _file_entry(p) for p in (db_target, cache_target, *poller_files, *beside_files)
+            ],
         }
         _write_json(MANIFEST_FILE, manifest)
     finally:
@@ -1100,13 +1172,23 @@ def status(ctx: Context) -> None:
         ctx.out(f"web: {active or 'unknown'} (starts on the first request to staging)")
 
 
+def _running_units(unit_dir: Path) -> tuple[str, ...]:
+    """The staging units to stop: the Work services twin only once it is installed (#4016)."""
+    installed = (unit_dir / STAGING_SERVICES_UNIT).exists()
+    return (
+        STAGING_WEB_UNIT,
+        STAGING_RUNTIME_UNIT,
+        *((STAGING_SERVICES_UNIT,) if installed else ()),
+    )
+
+
 def fence(ctx: Context) -> None:
     for path in install_fence(unit_dir=ctx.unit_dir, path_value=ctx.manager_path()):
         ctx.out(f"wrote {path}")
     _systemctl(ctx.run, "daemon-reload")
     # A running staging keeps the environment it started with; stop it so the next request
     # starts it fenced. The socket keeps listening.
-    _systemctl(ctx.run, "stop", STAGING_WEB_UNIT, STAGING_RUNTIME_UNIT)
+    _systemctl(ctx.run, "stop", *_running_units(ctx.unit_dir))
 
 
 def check(ctx: Context) -> None:

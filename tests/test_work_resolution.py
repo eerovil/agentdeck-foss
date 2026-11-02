@@ -16,6 +16,7 @@ WORK_ID = "github_issue:eerovil/agentdeck#2147"
 
 def _resolution(**fields) -> WorkResolution:
     parts = {
+        "background": "The Work page shows what a Work is about and why it changed.",
         "problem": "The Work page could not say why a change was made.",
         "solution": "A Work-owned record the verify worker writes.",
         "rationale": "Rebuilding it from chats was rejected: chats age out.",
@@ -49,7 +50,7 @@ def test_a_resolution_write_replaces_the_one_record_and_keeps_the_title(tmp_path
     assert first is not None and first.run_id == "run-1" and first.updated_at is not None
 
     again = db.set_work_resolution(
-        _resolution(correctness="The selected suite passed.", run_id="run-2")
+        _resolution(correctness="The selected suite passed.", run_id="run-2", background="")
     )
 
     reopened = Db(tmp_path / "control.sqlite3")
@@ -57,6 +58,7 @@ def test_a_resolution_write_replaces_the_one_record_and_keeps_the_title(tmp_path
     assert stored == again
     assert stored.correctness == "The selected suite passed." and stored.run_id == "run-2"
     assert stored.session_key == ""  # the whole record is replaced, provenance included
+    assert first.background and stored.background == ""  # the background too (#3928)
     assert reopened.work_titles() == {WORK_ID: "Named"}
     rows = reopened._conn.execute("SELECT COUNT(*) FROM work_metadata").fetchone()[0]
     assert rows == 1
@@ -183,11 +185,27 @@ def test_the_work_page_shows_the_resolution_only_once_one_is_written(tmp_path, m
 
     page = client.get(work_href(WORK_ID)).text
     assert "data-work-resolution" in page
-    for heading in ("Problem", "Solution", "Why this solution", "Why we believe it is correct"):
-        assert f'<h4 class="wd-title-xs">{heading}</h4>' in page
+    assert '<h3 class="wd-title-sm">Summary</h3>' in page
+    headings = (
+        "Background",
+        "Problem",
+        "Solution",
+        "Why this solution",
+        "Why we believe it is correct",
+    )
+    found = [page.index(f'<h4 class="wd-title-xs">{heading}</h4>') for heading in headings]
+    assert found == sorted(found)  # the background first (#3928)
     assert '<div class="wd-resolution-text" data-wd-resolution="rationale">' in page
     assert "<p>Line one.\nLine two.</p>" in page
     assert page.index('id="work-sec-result"') < page.index('id="work-sec-resolution"')
+
+    # Written early, a part not known yet has no heading at all (#3928).
+    app.state.control_db.set_work_resolution(_resolution(solution="", rationale="", correctness=""))
+    page = client.get(work_href(WORK_ID)).text
+    assert '<h4 class="wd-title-xs">Background</h4>' in page
+    assert '<h4 class="wd-title-xs">Problem</h4>' in page
+    assert '<h4 class="wd-title-xs">Solution</h4>' not in page
+    assert 'data-wd-resolution="correctness"' not in page
 
 
 def test_the_work_diagram_opens_the_live_page_then_the_merged_copy(tmp_path, monkeypatch):
@@ -320,11 +338,17 @@ async def test_the_worker_writes_its_own_works_resolution_and_a_retry_replaces_i
     url = f"/api/sessions/{key}/work-resolution"
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as client:
         assert (await client.get(url)).json() == {"work_id": WORK_ID, "resolution": None}
+        # The first turn's write: only what is known yet (#3928).
+        early = await client.put(url, json={"background": "B: what it is.", "problem": "P"})
+        assert early.status_code == 200
+        assert early.json()["resolution"]["background"] == "B: what it is."
+        assert early.json()["resolution"]["solution"] == ""
         first = await client.put(url, json=_BODY)
         assert first.status_code == 200
         body = first.json()["resolution"]
         assert body["run_id"] == "run-1" and body["session_key"] == key
         assert body["rationale"] == _BODY["rationale"]
+        assert body["background"] == ""  # a four-part write from an older guide still works
 
         again = await client.put(url, json={**_BODY, "correctness": "The selected suite passed."})
         assert again.status_code == 200
@@ -366,8 +390,9 @@ async def test_the_worker_records_its_live_check_apart_from_the_resolution(tmp_p
 @pytest.mark.parametrize(
     ("body", "detail"),
     [
-        ({**_BODY, "rationale": "   "}, "rationale must not be empty"),
+        ({**_BODY, "problem": "   "}, "problem must not be empty"),
         ({**_BODY, "problem": "x" * 9000}, "problem is longer than"),
+        ({**_BODY, "background": "x" * 9000}, "background is longer than"),
     ],
 )
 async def test_an_empty_or_runaway_part_is_refused(tmp_path, body, detail):

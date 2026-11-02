@@ -1,12 +1,13 @@
-"""Move the deck chat's page to another chat, and back, by asking (#3816).
+"""Move a chat's page to another chat, and back, by asking (#3816, #3857).
 
-In voice mode the owner asks the deck chat to jump to another chat ("open the chat on
-#3814"). The deck chat finds it (``GET /api/view/chats`` lists them) and calls
-``POST /api/view/open-chat``. The jump is published on ``JUMP_TOPIC``, which only a
-stream showing the deck chat subscribes to, so only pages showing the deck chat move,
-by the owner's decision on #3816; a page showing anything else is left alone. The page
-opens the chat in place (``static/chat_jump.js``), and voice mode carries on there as
-it does into any chat opened (#3548), once the deck chat's reply has been read.
+In voice mode the owner asks the chat they are in to jump to another chat ("open the
+chat on #3814"). That chat finds it (``GET /api/view/chats`` lists them) and calls
+``POST /api/view/open-chat``, naming itself as ``from``; the deck chat may leave it out.
+The jump is published on that chat's own jump topic (``jump_topic``), which every
+stream showing a chat subscribes to for its chat alone, so only pages showing the chat
+that asked move; a page showing anything else is left alone. The page opens the chat
+in place (``static/chat_jump.js``), and voice mode carries on there as it does into any
+chat opened (#3548), once the asking chat's reply has been read.
 
 The way back is the fast agent's (``voice_helper``, by the owner's decision on #3816):
 in any other chat it spots a request to go back to the deck chat, in any words, and the
@@ -39,27 +40,35 @@ class ChatJump:
     at: float
 
 
+def jump_topic(chat: str) -> str:
+    """The topic a jump away from ``chat`` (its ``chat_identity_key``) is published on."""
+    return f"{JUMP_TOPIC}:{chat}"
+
+
 class ChatJumps:
     def __init__(self, bus) -> None:
         self._bus = bus
-        self.latest: ChatJump | None = None
+        # Each chat's latest jump, by its ``chat_identity_key``.
+        self._latest: dict[str, ChatJump] = {}
 
-    def jump(self, path: str, title: str) -> ChatJump:
-        """Move every page showing the deck chat to ``path``."""
-        jump = ChatJump(uuid.uuid4().hex, path, title, time.monotonic())
-        self.latest = jump
-        self._bus.publish(JUMP_TOPIC)
+    def jump(self, chat: str, path: str, title: str) -> ChatJump:
+        """Move every page showing ``chat`` to ``path``."""
+        now = time.monotonic()
+        jump = ChatJump(uuid.uuid4().hex, path, title, now)
+        self._latest = {key: kept for key, kept in self._latest.items() if now - kept.at <= FRESH_S}
+        self._latest[chat] = jump
+        self._bus.publish(jump_topic(chat))
         return jump
 
-    def fresh(self) -> ChatJump | None:
-        jump = self.latest
+    def fresh(self, chat: str) -> ChatJump | None:
+        jump = self._latest.get(chat)
         if jump is None or time.monotonic() - jump.at > FRESH_S:
             return None
         return jump
 
-    def listening(self) -> int:
-        """How many streams showing the deck chat would hear a jump now."""
-        return self._bus.subscribers(JUMP_TOPIC)
+    def listening(self, chat: str) -> int:
+        """How many streams showing ``chat`` would hear a jump now."""
+        return self._bus.subscribers(jump_topic(chat))
 
 
 def work_matches(cards, ref: str) -> list:

@@ -109,13 +109,18 @@ def write_shared_cache(snapshot: UsageSnapshot, account: Account, cache_dir: Pat
         _write_cache_file(legacy_usage_cache_path(account, cache_dir), payload)
         if account.provider_id == "claude_code":
             # Claude's hard circuit is opened by CLI evidence about either current usage window.
-            # A later meter read proves health only when both windows are present and sub-limit;
-            # a partial payload is not evidence that the missing exhausted window recovered.
+            # A later meter read proves health only when every window the account has is present
+            # and sub-limit. The weekly one is always required. A plan may have no five-hour
+            # window at all: the meter then answers ``"five_hour": null`` on every read (main
+            # since 2026-10-30, #3947), never only now and then, so that is no window to wait on.
+            windows = (snapshot.seven_day_pct,)
+            if snapshot.five_hour_pct is not None:
+                windows = (snapshot.five_hour_pct, snapshot.seven_day_pct)
             account_health.reconcile_healthy_usage(
                 cache_dir,
                 account.key,
                 fetched_at=snapshot.fetched_at,
-                percentages=(snapshot.five_hour_pct, snapshot.seven_day_pct),
+                percentages=windows,
             )
     except OSError as exc:
         log.warning("could not write shared usage cache for %s: %s", account.key, exc)

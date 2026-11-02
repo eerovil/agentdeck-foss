@@ -30,7 +30,12 @@ Recognition and Piper each have their own lock (#3766): one model call at a time
 per engine, and a phrase heard while the deck reads a reply aloud is not held
 behind Piper. Whisper and Parakeet share the recognition lock.
 
-    POST /transcribe   body: 16-bit mono WAV   -> {"text", "language", "seconds", "segments"}
+    POST /transcribe   body: 16-bit mono WAV   -> {"text", "language", "seconds", "segments",
+                                                    "snr_db", "engine", "speech_s"}
+                       snr_db: speech against the rest of the phrase in dB, or
+                       null when either is too short to measure (#3934)
+                       engine: the one that heard it, ``parakeet`` after a fallback
+                       speech_s: seconds of speech Silero found in it (#3934)
                        segments: ``text`` in its parts, in order, each
                        ``{"text", "unsure"}``: whether Whisper doubted it (#3817);
                        Parakeet has no doubt scores and gives none
@@ -53,6 +58,7 @@ import glob
 import io
 import json
 import logging
+import math
 import os
 import re
 import socket
@@ -106,6 +112,19 @@ UNSURE_LOGPROB = -0.6
 # it keeps the last language heard.
 SURE_LANGUAGE = 0.7
 SURE_LANGUAGE_FLOOR = 0.3
+# A letter neither Finnish nor English writes, loan letters aside. Forced to Finnish,
+# turbo still drifted into Icelandic ("Njóti, þetta var svona til að...", #3925), so
+# such a phrase is heard again by Parakeet, which writes only the words spoken.
+FOREIGN_LETTER = re.compile(r"[^\W\d_a-zA-ZåäöÅÄÖéÉšŠžŽüÜ]")
+# A phrase with less speech than this is a fragment: with Finnish pinned, one Whisper
+# writes in another language ("Ningún.") is noise, dropped rather than heard again,
+# which once cost 32 s of Parakeet on a busy CPU (#3934).
+SHORT_SPEECH_S = 1.0
+# With Finnish pinned, a fragment whose every kept segment Whisper heard only on a
+# retry (its sure first try failed, so it sampled again at a higher temperature) is
+# noise too. On the owner's 200 kept phrases (#4020) all 7 such were noise ("Let's
+# go.", "Thank you, Mark Rouse.", "Oh, oh, oh."), and no real phrase was retried;
+# a short real word Whisper heard on its first try ("Se" as "Set.") is kept.
 # Silero VAD closes a stretch of speech after this much quiet. It must be shorter
 # than the page's own pause (`HOST_PAUSE_MS` in voice_mode.js, 800 ms), or the
 # quiet tail every phrase ends with is kept for Whisper to make words of.
@@ -114,6 +133,8 @@ VAD_PAD_MS = 200
 # Silero's own odds reject noise and clicks (measured: none kept even with no
 # minimum); this only drops slivers, so a clipped "ei" or "stop" still counts.
 VAD_MIN_SPEECH_MS = 100
+# The noise reading needs this much speech and this much of the rest (#3934).
+SNR_MIN_S = 0.2
 MAX_BODY = 30 * 1024 * 1024
 ENGINES = ("whisper", "parakeet")
 CONFIG = "~/.config/agentdeck/config.toml"
@@ -199,6 +220,15 @@ def speech_only(samples):
     them. faster-whisper ships the model, which runs on the CPU in milliseconds.
     """
     import numpy as np
+
+    chunks = speech_spans(samples)
+    if not chunks:
+        return None
+    return np.concatenate([samples[chunk["start"] : chunk["end"]] for chunk in chunks])
+
+
+def speech_spans(samples) -> list[dict]:
+    """The stretches of ``samples`` Silero VAD hears speech in, as ``{"start", "end"}``."""
     from faster_whisper.vad import VadOptions, get_speech_timestamps
 
     options = VadOptions(
@@ -206,10 +236,29 @@ def speech_only(samples):
         min_silence_duration_ms=VAD_SILENCE_MS,
         speech_pad_ms=VAD_PAD_MS,
     )
-    chunks = get_speech_timestamps(samples, options)
-    if not chunks:
+    return get_speech_timestamps(samples, options)
+
+
+def snr_db(samples, spans: list[dict]) -> float | None:
+    """How much louder the speech is than the rest of the phrase, in decibels (#3934).
+
+    The deck keeps it beside each phrase so the bench can score models in quiet and
+    in noise apart. None when either side is under ``SNR_MIN_S``: too little to
+    measure."""
+
+    def power(part) -> float:
+        return math.fsum(float(x) * float(x) for x in part)
+
+    total = len(samples)
+    spans = [(max(0, s["start"]), min(total, s["end"])) for s in spans]
+    said = sum(max(0, end - start) for start, end in spans)
+    least = int(SNR_MIN_S * SAMPLE_RATE)
+    if said < least or total - said < least:
         return None
-    return np.concatenate([samples[chunk["start"] : chunk["end"]] for chunk in chunks])
+    speech = math.fsum(power(samples[start:end]) for start, end in spans)
+    noise = max(power(samples) - speech, 0.0)
+    ratio = max(speech / said, 1e-12) / max(noise / (total - said), 1e-12)
+    return round(10 * math.log10(ratio), 1)
 
 
 def choose_language(scores: dict, previous: str = "") -> tuple[str, float]:
@@ -302,17 +351,42 @@ class Speech:
         # phrase is never held behind a reply being read (#3766).
         self.recognition_lock = threading.Lock()
         self.voice_lock = threading.Lock()
+        # One Parakeet load at a time: the warm-up loads it outside the recognition
+        # lock, and a phrase needing it meanwhile waits for that load (#3925).
+        self.parakeet_lock = threading.Lock()
         self.warming: threading.Thread | None = None
 
     def transcribe(self, data: bytes, previous: str = "", only: str = "") -> dict:
+        heard = self.recognize(data, previous, only)
+        try:
+            samples = read_wav(data)
+            heard["snr_db"] = snr_db(samples, speech_spans(samples))
+        except Exception:  # noqa: BLE001 - the reading is for the bench, never the words
+            log.exception("noise reading failed")
+            heard["snr_db"] = None
+        return heard
+
+    def recognize(self, data: bytes, previous: str = "", only: str = "") -> dict:
         only = only if only in LANGUAGES else ""
         if self.args.engine == "parakeet" or self.whisper_failed:
             return self.transcribe_parakeet(data, previous, only)
         try:
-            return self.transcribe_whisper(data, previous, only)
+            heard = self.transcribe_whisper(data, previous, only)
         except Exception as exc:  # CUDA errors come as RuntimeError, or worse
             log.warning("Whisper failed (%s); Parakeet hears this phrase", exc)
             return self.transcribe_parakeet(data, previous, only)
+        short = heard.get("speech_s", SHORT_SPEECH_S) < SHORT_SPEECH_S
+        retried = heard.pop("retried", False)
+        if retried and short and only == "fi":
+            log.info("dropped %r: a fragment Whisper heard only on a retry", heard["text"])
+            return {**heard, "text": "", "segments": []}
+        if FOREIGN_LETTER.search(heard["text"]) and short and only == "fi":
+            log.info("dropped %r: another language in a fragment", heard["text"])
+            return {**heard, "text": "", "segments": []}
+        if FOREIGN_LETTER.search(heard["text"]):
+            log.warning("Whisper wrote another language; Parakeet hears this phrase")
+            return self.transcribe_parakeet(data, previous, only or heard["language"])
+        return heard
 
     def warm(self) -> None:
         """Load the speech-to-text model behind the request, so the first phrase
@@ -334,8 +408,10 @@ class Speech:
                         except Exception as exc:  # the card missing, out of memory
                             log.warning("Whisper failed to load (%s); Parakeet hears", exc)
                 if self.args.engine == "parakeet" or self.whisper_failed:
-                    if self.parakeet is None:
-                        self.parakeet = self.load_parakeet()
+                    self.loaded_parakeet()
+            # Whisper's spare for a phrase it writes in another language (#3925),
+            # loaded outside the recognition lock: its first load took a minute here.
+            self.loaded_parakeet()
         except Exception:  # noqa: BLE001 - the phrase that needs it reports it
             log.exception("speech model warm-up failed")
 
@@ -369,7 +445,13 @@ class Speech:
             speech = speech_only(samples)
             if speech is None:
                 log.info("no speech in %.1fs of audio", len(samples) / SAMPLE_RATE)
-                return {"text": "", "language": only or previous or "en", "seconds": 0.0}
+                return {
+                    "text": "",
+                    "language": only or previous or "en",
+                    "seconds": 0.0,
+                    "speech_s": 0.0,
+                    "engine": "whisper",
+                }
             if only:
                 # The deck listens for one language only (#3417): no guess to get wrong.
                 language, share = only, 1.0
@@ -385,6 +467,7 @@ class Speech:
             )
             kept = []
             parts = []
+            retries = []
             for segment in segments:
                 # The words and Whisper's doubt, so a phantom that got through
                 # can be told apart from speech afterwards (#3439).
@@ -399,6 +482,7 @@ class Speech:
                 )
                 if not phantom:
                     kept.append(segment.text.strip())
+                    retries.append(bool(segment.temperature))
                     unsure = segment.avg_logprob < UNSURE_LOGPROB
                     parts.append({"text": segment.text.strip(), "unsure": unsure})
             text = " ".join(kept).strip()
@@ -412,7 +496,11 @@ class Speech:
             "text": text,
             "language": language,
             "seconds": round(time.monotonic() - started, 2),
+            "speech_s": round(len(speech) / SAMPLE_RATE, 2),
             "segments": parts,
+            "engine": "whisper",
+            # Every kept segment heard only on a retry: ``recognize`` reads and removes it.
+            "retried": bool(retries) and all(retries),
         }
 
     def transcribe_parakeet(self, data: bytes, previous: str = "", only: str = "") -> dict:
@@ -421,19 +509,37 @@ class Speech:
         language = only or (previous if previous in LANGUAGES else "en")
         samples = read_wav(data)
         with self.recognition_lock:
-            if self.parakeet is None:
-                self.parakeet = self.load_parakeet()
+            parakeet = self.loaded_parakeet()
             started = time.monotonic()
             speech = speech_only(samples)
             if speech is None:
                 log.info("no speech in %.1fs of audio", len(samples) / SAMPLE_RATE)
-                return {"text": "", "language": language, "seconds": 0.0}
-            text = self.parakeet(speech)
+                return {
+                    "text": "",
+                    "language": language,
+                    "seconds": 0.0,
+                    "speech_s": 0.0,
+                    "engine": "parakeet",
+                }
+            text = parakeet(speech)
             phantom = is_phantom_text(text)
             log.info("%s %r", "dropped" if phantom else "kept", text)
         seconds = round(time.monotonic() - started, 2)
         log.info("heard %.1fs of speech in %.2fs", len(speech) / SAMPLE_RATE, seconds)
-        return {"text": "" if phantom else text, "language": language, "seconds": seconds}
+        return {
+            "text": "" if phantom else text,
+            "language": language,
+            "seconds": seconds,
+            "speech_s": round(len(speech) / SAMPLE_RATE, 2),
+            "engine": "parakeet",
+        }
+
+    def loaded_parakeet(self):
+        """Parakeet, loaded once however many ask for it at the same time."""
+        with self.parakeet_lock:
+            if self.parakeet is None:
+                self.parakeet = self.load_parakeet()
+            return self.parakeet
 
     def load_parakeet(self):
         """Samples to text with the Parakeet model in ``--parakeet-model``, on the CPU."""

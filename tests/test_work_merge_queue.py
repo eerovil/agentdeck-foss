@@ -10,6 +10,7 @@ from __future__ import annotations
 import pytest
 
 from agentdeck import work_release
+from agentdeck.review_history import ReviewEvent
 from agentdeck.work_release import (
     MERGED,
     Policy,
@@ -52,6 +53,7 @@ class Deck:
         self.starred: set[str] = set()
         self.changed: dict[tuple[str, str], str] = {}  # (pull, head) -> a diff that changed
         self.store_path = tmp_path / "work-release.json"
+        self.events: list[ReviewEvent] = []  # each head's review history (#3956)
         for n in works:
             ref, head = pull(100 + n), f"{n:x}" * 40
             self.pulls[ref] = Pull(ref, "OPEN", False, head, "MERGEABLE", "CLEAN", "green")
@@ -79,8 +81,16 @@ class Deck:
                 tell=lambda chat, message_id, text: self.told.append((message_id, text)),
                 clock=lambda: self.now,
                 later=self.later,
+                review_event=self.note,
+                reviews=lambda ref: [event for event in self.events if event.pull == ref],
             ),
         )
+
+    def note(self, pull, head, kind, key, at=None, data=None):
+        if all(event.key != key for event in self.events):
+            seq = len(self.events) + 1
+            at = self.now if at is None else at
+            self.events.append(ReviewEvent(pull, head.lower(), at, kind, key, data or {}, seq))
 
     def later(self, delay, look):
         timer = [self.now + delay, look, False]
@@ -374,8 +384,7 @@ def test_the_merge_queue_api_reads_and_reorders(deck):
     deck.base = 1  # master moved: both are behind
     for n in (2, 3):
         head = deck.pulls[pull(100 + n)].head
-        passed = {pull(100 + n): {"head": head, "digest": DIGEST}}
-        deck.service.store.put(work(n), {"passes": passed})
+        deck.note(pull(100 + n), head, "pass", f"p{n}", data={"digest": DIGEST})
     deck.service.store.queues[REPO] = [
         {"pull": pull(102), "work": work(2), "at": 1.0, "rounds": 1},
         {"pull": pull(103), "work": work(3), "at": 2.0, "rounds": 0},

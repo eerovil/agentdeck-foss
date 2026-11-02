@@ -68,6 +68,8 @@ class Target:
     ownership_label: str
     spec_only_label: str = ""
     evidence_repository: str = ""
+    # The repository the form lands on when only the project is known (#3882).
+    project_default: bool = False
 
 
 @dataclass(frozen=True)
@@ -108,6 +110,7 @@ def targets(board) -> tuple[Target, ...]:
         if not labels:
             continue
         evidence = scope.artifact_repositories[0] if scope.artifact_repositories else ""
+        home = _project_home(scope)
         for repository in scope.issue_repositories:
             found.setdefault(
                 repository.lower(),
@@ -118,9 +121,26 @@ def targets(board) -> tuple[Target, ...]:
                     ownership_label=labels[0],
                     spec_only_label=scope.spec_only_label,
                     evidence_repository=evidence,
+                    project_default=repository.lower() == home,
                 ),
             )
     return tuple(found[key] for key in sorted(found))
+
+
+def _project_home(scope) -> str:
+    """The issue repository a project's new Work goes to by default, lowercased (#3882).
+
+    A project's own issue tracker — an issue repository that holds no code and borrows
+    another's checkout, such as an ``issues`` tracker — else the first in sorted order. The
+    sorted first alone put such a project's Works in a code repository like ``docker``.
+    """
+    repositories = sorted(item.lower() for item in scope.issue_repositories)
+    borrowing = {
+        str(repository).lower()
+        for repository, _code in getattr(scope, "borrowed_workspaces", ()) or ()
+    }
+    trackers = [item for item in repositories if item in borrowing]
+    return (trackers or repositories or [""])[0]
 
 
 def target_for(options: Iterable[Target], repository: object) -> Target | None:

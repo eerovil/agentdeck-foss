@@ -461,7 +461,7 @@ def buttons(
             # turn is started again by a message (#2944). Read from the derived kind, since a
             # stopped turn is in Needs answer too (#2956).
             derived = getattr(card, "derived", None)
-            asks = derived is None or getattr(derived, "kind", "") == "question"
+            asks = derived is None or getattr(derived, "kind", "") in {"question", "asked_in_chat"}
             label = LABELS[action] if asks else "Message"
             found.append(ActionButton(action, label, href))
         elif action == OPEN:

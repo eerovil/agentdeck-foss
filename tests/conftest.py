@@ -12,11 +12,13 @@ pytest processes alike (`browser_slot`).
 from __future__ import annotations
 
 import asyncio
+import atexit
 import itertools
 import json
 import math
 import os
 import re
+import shutil
 import tempfile
 import time
 import uuid
@@ -62,6 +64,32 @@ os.environ["AGENTDECK_JOB_LANES"] = str(Path(__file__).with_name("fixtures") / "
 for _name in ("GIT_ASKPASS", "SSH_ASKPASS", "SUDO_ASKPASS"):
     os.environ.pop(_name, None)
 os.environ["GIT_TERMINAL_PROMPT"] = "0"
+
+# No test may write into the host's live runtime folder (#3952). The usage pollers, the
+# pickle file cache and the runtime socket all default to `$XDG_RUNTIME_DIR/agentdeck`, so a
+# poller a test built without `cache_dir` overwrote the deck's real usage reading for
+# `claude_code:main` with a fixture reply, and account choice read it for two minutes.
+# Assigned, not defaulted: a queued suite inherits the runtime's environment. The live value
+# is kept, first process wins, so the guard test can prove nothing resolves under it.
+LIVE_RUNTIME_DIR_ENV = "AGENTDECK_TEST_LIVE_RUNTIME_DIR"
+os.environ.setdefault(LIVE_RUNTIME_DIR_ENV, os.environ.get("XDG_RUNTIME_DIR", ""))
+_scratch_runtime_dir = tempfile.mkdtemp(prefix="agentdeck-test-run-")  # mode 0700
+os.environ["XDG_RUNTIME_DIR"] = _scratch_runtime_dir
+atexit.register(shutil.rmtree, _scratch_runtime_dir, ignore_errors=True)
+
+# No test may read or write the host's webhook streams or the deck's files beside them
+# (#3966). A test app built from a default `AppConfig` tailed the live streams, and its
+# chat notes pass wrote the live deck's one-time repair marker, so the deck never ran it.
+# An environment variable, so a deck a test starts in a child process inherits it.
+# Assigned, not defaulted: a queued suite inherits the runtime's environment.
+_scratch_share_dir = tempfile.mkdtemp(prefix="agentdeck-test-share-")  # mode 0700
+os.environ["AGENTDECK_WEBHOOK_STATE_DIR"] = str(Path(_scratch_share_dir) / "github-webhooks")
+# Each test app builds the Work router and the merge release inside itself (#4016), the
+# small in-process stand-in for the services process: no test needs a second process.
+# Not the production switch (``[services] in_web``), so deleting the switch takes nothing
+# from the tests; the guard that the web starts none of them turns it off for its own app.
+os.environ["AGENTDECK_SERVICES_IN_PROCESS"] = "1"
+atexit.register(shutil.rmtree, _scratch_share_dir, ignore_errors=True)
 
 def pytest_configure(config: pytest.Config) -> None:
     """Block the service worker in every browser context that does not ask for it.
@@ -629,6 +657,7 @@ def _no_live_guesses(monkeypatch, tmp_path_factory):
 
     monkeypatch.setattr(voice_helper, "start_process", no_agent)
     monkeypatch.setattr(voice_helper, "_agents", {})
+    monkeypatch.setattr(voice_helper, "_voice_on", {})
     monkeypatch.setattr(voice_helper, "LOG_DIR", tmp_path_factory.mktemp("voice-log"))
     # Live prototyping's records (#3569) are files under the home directory too.
     from agentdeck import live_prototype

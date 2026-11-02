@@ -592,12 +592,103 @@ async def test_an_idle_process_left_in_a_deleted_worktree_is_restarted_there(tmp
     await _finished_turn(host, spawned, worktree, exit_process=False)
     worktree.rmdir()
 
-    result = await host.deliver("issue-1", "follow-up", delegated=False)
+    # A caller naming the deleted directory still means this chat (#3850 review).
+    result = await host.deliver(
+        "issue-1", "follow-up", cwd=str(worktree), delegated=False
+    )
 
     assert result.accepted
     assert spawned[0]["process"].returncode is not None
     assert spawned[1]["kwargs"]["cwd"] == str(repository)
     assert spawned[1]["args"][spawned[1]["args"].index("--resume") + 1] == "sid-abc"
+    # The one-time move note is not part of the guide's fingerprint, so the next
+    # message goes to the same process (#3850).
+    spawned[1]["process"].stdout.emit({"type": "result", "subtype": "success"})
+    await _settle()
+    await host.deliver("issue-1", "next", delegated=False)
+    assert len(spawned) == 2
+    await host.stop()
+
+
+async def test_an_idle_process_with_an_older_guide_is_resumed_with_todays(
+    tmp_path, monkeypatch
+):
+    """#3850: a held process keeps its start-time guide; the next idle message renews it."""
+    from agentdeck.providers.claude_code import worker as worker_mod
+
+    host, spawned = _host(tmp_path)
+    await _finished_turn(host, spawned, tmp_path, exit_process=False)
+    record = host._records["issue-1"]
+
+    # Same guide: the running process takes the message.
+    await host.deliver("issue-1", "same guide", delegated=False)
+    assert len(spawned) == 1  # and that turn is still running below
+
+    def guide(**kwargs):
+        return "today's guide " + str(kwargs["session_token"])
+
+    monkeypatch.setattr(worker_mod, "agentdeck_session_instructions", guide)
+    old_fingerprint = record.guide_fingerprint
+    first = spawned[0]["process"]
+
+    async def kept(message: str, **kwargs) -> None:
+        """Delivered into the running process, which keeps its old guide."""
+        result = await host.deliver("issue-1", message, delegated=False, **kwargs)
+        assert result.accepted
+        assert len(spawned) == 1 and first.returncode is None
+        assert first.stdin.lines[-1]["message"]["content"][0]["text"] == message
+        assert record.guide_fingerprint == old_fingerprint
+
+    # Busy in any way the restart would cut, or no slot for it: the message goes in.
+    await kept("mid-turn")
+    await kept("steer", require_active=True)
+    first.stdout.emit({"type": "result", "subtype": "success"})
+    await _settle()
+    host._live["issue-1"].background_agents["agent-1"] = time.time()
+    await kept("while an agent runs")
+    host._live["issue-1"].background_agents.clear()
+    first.stdout.emit({"type": "result", "subtype": "success"})
+    await _settle()
+    monkeypatch.setattr(host, "_background_shell_tasks", lambda *_: frozenset({"t1"}))
+    await kept("while a shell runs")
+    first.stdout.emit({"type": "result", "subtype": "success"})
+    await _settle()
+    monkeypatch.setattr(host, "_background_shell_tasks", lambda *_: frozenset())
+    cap = host.max_workers
+    monkeypatch.setattr(host, "max_workers", 0)
+    await kept("over the cap", automated=True)
+    first.stdout.emit({"type": "result", "subtype": "success"})
+    await _settle()
+    monkeypatch.setattr(host, "max_workers", cap)
+
+    result = await host.deliver(
+        "issue-1", "new guide", delegated=False, delivery_id="d-new"
+    )
+
+    assert result.accepted
+    assert spawned[0]["process"].returncode is not None
+    args = spawned[1]["args"]
+    assert args[args.index("--resume") + 1] == "sid-abc"
+    assert args[args.index("--append-system-prompt") + 1] == guide(
+        session_token=record.session_token
+    )
+    assert spawned[1]["process"].stdin.lines[-1]["message"]["content"][0]["text"] == (
+        "new guide"
+    )
+    # A retry is answered from its receipt, and the renewed process is not restarted.
+    await host.deliver("issue-1", "new guide", delegated=False, delivery_id="d-new")
+    assert len(spawned) == 2
+    spawned[1]["process"].stdout.emit({"type": "result", "subtype": "success"})
+    await _settle()
+    await host.deliver("issue-1", "again", delegated=False)
+    assert len(spawned) == 2
+
+    # A record from before the field existed counts as out of date, once.
+    spawned[1]["process"].stdout.emit({"type": "result", "subtype": "success"})
+    await _settle()
+    record.guide_fingerprint = None
+    await host.deliver("issue-1", "after upgrade", delegated=False)
+    assert len(spawned) == 3
     await host.stop()
 
 
@@ -2449,8 +2540,9 @@ async def test_the_classifier_fallback_gate_is_surfaced_not_denied(tmp_path):
     await host.stop()
 
 
-def _emit_safety_check(proc, request_id: str) -> None:
-    # The shape Claude Code 2.1.280 sends in bypass mode (#2342).
+def _emit_safety_check(proc, request_id: str, reason_type: str = "safetyCheck") -> None:
+    # The shape Claude Code 2.1.280 sends in bypass mode (#2342). 2.1.308 sends a
+    # check on one part of a chained command as "subcommandResults" (#3867).
     proc.stdout.emit(
         {
             "type": "control_request",
@@ -2461,19 +2553,20 @@ def _emit_safety_check(proc, request_id: str) -> None:
                 "input": {"command": "rm -f $E/*.png"},
                 "decision_reason": 'Dangerous rm operation on possibly-empty variable path: '
                 '$E/*.png (rewrite it as "${E:?}"/*.png or use a literal path)',
-                "decision_reason_type": "safetyCheck",
+                "decision_reason_type": reason_type,
                 "classifier_approvable": False,
             },
         }
     )
 
 
-async def test_a_safety_check_in_bypass_is_refused_with_its_reason(tmp_path):
+@pytest.mark.parametrize("reason_type", ["safetyCheck", "subcommandResults"])
+async def test_a_safety_check_in_bypass_is_refused_with_its_reason(tmp_path, reason_type):
     host, spawned = _host(tmp_path, start_bypassed=True)
     await host.deliver("issue-1", "start", cwd=str(tmp_path), delegated=False)
     proc = spawned[0]["process"]
 
-    _emit_safety_check(proc, "s1")
+    _emit_safety_check(proc, "s1", reason_type)
     await _settle()
 
     assert host.snapshot()["workers"]["issue-1"]["pending_interaction"] is None
@@ -2486,12 +2579,13 @@ async def test_a_safety_check_in_bypass_is_refused_with_its_reason(tmp_path):
     await host.stop()
 
 
-async def test_a_safety_check_with_bypass_off_still_asks_the_boss(tmp_path):
+@pytest.mark.parametrize("reason_type", ["safetyCheck", "subcommandResults"])
+async def test_a_safety_check_with_bypass_off_still_asks_the_boss(tmp_path, reason_type):
     host, spawned = _host(tmp_path)
     await host.deliver("issue-1", "start", cwd=str(tmp_path), delegated=False)
     proc = spawned[0]["process"]
 
-    _emit_safety_check(proc, "s1")
+    _emit_safety_check(proc, "s1", reason_type)
     await _settle()
 
     assert host.snapshot()["workers"]["issue-1"]["pending_interaction"]["id"] == "s1"

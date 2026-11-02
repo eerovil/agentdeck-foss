@@ -58,6 +58,7 @@ from ..session_secrets import (
     secret_notice,
 )
 from ..titles import MAX_TITLE_CHARS, normalize_agent_title, title_evidence_signature
+from ..voice_mode import answer_line
 from . import start_spares
 from .account_settings import (
     account_settings_context,
@@ -1485,6 +1486,7 @@ async def answer_interaction(request: Request, session_key: str) -> HTMLResponse
         values=lambda question_id: [
             *form.getlist(f"answer__{question_id}"), form.get(f"other__{question_id}")
         ],
+        voice_line=answer_line(form.get("voice_answer")),
     )
     with timing_span(request, "render"):
         view = SessionView(current=session, effective=session, interaction=remaining)
@@ -1542,8 +1544,11 @@ async def _answer_interaction(
     interaction_id: object,
     decision: object,
     values: Callable[[str], Iterable[object]],
+    voice_line: str | None = None,
 ):
-    """Answer the chat's pending interaction; (its session, the questions still open)."""
+    """Answer the chat's pending interaction; (its session, the questions still open).
+
+    ``voice_line`` goes on the end of the last answer to a question box (#3876)."""
     account, session, provider = resolve_current_leg(request, session_key)
     session_key = session.key
     bind_action(request, session_key=session.key, provider=account.provider_id)
@@ -1590,6 +1595,15 @@ async def _answer_interaction(
     ):
         raise HTTPException(status_code=422, detail="answers are too long")
     answer_text = _interaction_answer_text(interaction, answers)
+    # Never on a secret: the agent would get a wrong password.
+    if (
+        voice_line
+        and answers
+        and interaction.kind == "question"
+        and not any(q.secret for q in interaction.questions)
+    ):
+        last = answers[next(reversed(answers))]
+        last[-1] = f"{last[-1]}\n\n{voice_line}"
     with timing_span(request, "runtime"):
         result = await provider.answer_interaction(
             account,

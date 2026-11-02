@@ -451,6 +451,10 @@ class Collector:
             account.key in self._initial_scan_attempts for account in self.accounts
         )
 
+    def initial_scans_settled(self) -> bool:
+        """``wait_initial_scans`` without the wait: a collector never started has none."""
+        return not self._tasks or self.initial_scans_finished()
+
     async def wait_initial_scans(self, timeout: float) -> bool:
         """Wait until every account has had its first scan attempt; False on ``timeout``.
 

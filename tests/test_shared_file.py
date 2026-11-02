@@ -7,7 +7,7 @@ import time
 from agentdeck.shared_file import SharedFile, add_drained_hook, refresh_shared_files
 from agentdeck.wake_on import WakeOnRegistry, WakeRequest
 from agentdeck.work_release import ReleaseStore
-from agentdeck.work_router import PendingActions, ReviewedHeads
+from agentdeck.work_router import KeyFile, PendingActions
 
 
 def _wait(id: str, chat: str = "chat-1") -> WakeRequest:
@@ -84,11 +84,11 @@ def test_a_queue_edit_keeps_the_other_workers_release_facts(tmp_path):
 
 
 def test_router_lists_keep_both_workers_entries(tmp_path):
-    heads_new, heads_old = ReviewedHeads(tmp_path / "h.json"), ReviewedHeads(tmp_path / "h.json")
+    heads_new, heads_old = KeyFile(tmp_path / "h.json"), KeyFile(tmp_path / "h.json")
     assert "x" not in heads_new
     heads_old.add("x")
     heads_new.add("y")
-    fresh_heads = ReviewedHeads(tmp_path / "h.json")
+    fresh_heads = KeyFile(tmp_path / "h.json")
     assert "x" in fresh_heads and "y" in fresh_heads
 
     pending_new = PendingActions(tmp_path / "p.json")

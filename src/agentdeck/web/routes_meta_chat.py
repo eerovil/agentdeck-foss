@@ -15,7 +15,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from .. import meta_chat
 from ..attachments import cleanup_uploaded_files, display_message
@@ -219,29 +219,64 @@ async def view_chats(request: Request) -> JSONResponse:
 
 
 class OpenChat(BaseModel):
-    # A chat's session key, from ``GET /api/view/chats``.
+    # A chat: its session key from ``GET /api/view/chats``, or the ``/chats/<id>`` path
+    # (or bare id) an earlier ``opened`` gave.
     chat: str = ""
     # Or a Work, as ``owner/repo#n``, ``repo#n`` or its number: the chat it opens into.
     work: str = ""
+    # The chat asking, whose pages move (#3857): its session key or token, or its path.
+    # Left out, it is the deck chat.
+    source: str = Field("", alias="from")
+
+
+def _chat_session_key(state, ref: str) -> str | None:
+    """The session ``ref`` names: a session key or token, a chat id, or the
+    ``/chats/<id>`` or ``/sessions/<key>`` path the deck links a chat by."""
+    ref = ref.strip().rstrip("/")
+    for prefix in ("/chats/", "/sessions/"):
+        if ref.startswith(prefix):
+            ref = ref[len(prefix) :]
+    if not ref:
+        return None
+    if ref in state.sessions:
+        return ref
+    if (key := state.session_key_for_token(ref)) is not None:
+        return key
+    chat = state.chat_by_id(ref)
+    if chat is None:
+        return None
+    current = state.current_session_for_chat(chat)
+    if current is not None:
+        return current.key
+    return next((leg for leg in reversed(chat.legs) if leg in state.sessions), None)
 
 
 @router.post("/api/view/open-chat")
 async def view_open_chat(request: Request, body: OpenChat) -> JSONResponse:
-    """Open a chat on every page showing the deck chat (#3816).
+    """Open a chat on every page showing the chat that asked (#3816, #3857).
 
-    The deck chat calls this when the owner asks, often by voice, to go to another chat;
-    voice mode carries on there. ``pages`` is how many pages showing the deck chat heard
-    it, so 0 means none moved. A Work number several projects share answers 409 with
-    their ids, and an unknown one 404.
+    A chat calls this when the owner asks, often by voice, to go to another chat, naming
+    itself as ``from``; voice mode carries on there. Without ``from`` the deck chat's
+    pages move. ``pages`` is how many pages showing the asking chat heard it, so 0 means
+    none moved, and ``why`` then says why. A Work number several projects share answers
+    409 with their ids, and an unknown one 404.
     """
     _require_same_origin(request)
     state = get_state(request)
     db = get_db(request)
+    if body.source.strip():
+        source_key = _chat_session_key(state, body.source)
+        if source_key is None:
+            return JSONResponse(
+                {"error": f"no chat {body.source.strip()!r} to move from"}, status_code=404
+            )
+    else:
+        source_key = meta_chat.deck_chat_session_key(state, db)
     if body.chat.strip():
-        session = state.sessions.get(body.chat.strip())
+        key = _chat_session_key(state, body.chat)
+        session = state.sessions.get(key) if key is not None else None
         if session is None:
             return JSONResponse({"error": f"no chat {body.chat.strip()!r}"}, status_code=404)
-        key = session.key
         path = state.chat_path_for_session(key)
         title = session.display_title
     elif body.work.strip():
@@ -264,8 +299,26 @@ async def view_open_chat(request: Request, body: OpenChat) -> JSONResponse:
         key, path, title = card.chat_key, card.chat_href, card.title
     else:
         raise HTTPException(status_code=400, detail="name a chat or a Work")
-    if key and meta_chat.is_deck_chat(state, db, key):
-        return JSONResponse({"error": "that is the deck chat itself"}, status_code=409)
+    if source_key is None:
+        return JSONResponse(
+            {
+                "opened": path,
+                "title": title,
+                "pages": 0,
+                "why": 'there is no deck chat; name the chat asking as "from" (your session key)',
+            }
+        )
+    source = state.chat_identity_key(source_key)
+    if key and state.chat_identity_key(key) == source:
+        return JSONResponse({"error": "that is the chat you are in"}, status_code=409)
     jumps = request.app.state.chat_jumps
-    jump = jumps.jump(path, title)
-    return JSONResponse({"opened": jump.path, "title": jump.title, "pages": jumps.listening()})
+    jump = jumps.jump(source, path, title)
+    answer = {"opened": jump.path, "title": jump.title, "pages": jumps.listening(source)}
+    if not answer["pages"]:
+        answer["why"] = (
+            "no page is showing the asking chat now, so none moved; give the owner the link"
+            if body.source.strip()
+            else "no page is showing the deck chat now, so none moved; from any other chat "
+            'name it as "from" (your session key), so the pages showing it move'
+        )
+    return JSONResponse(answer)

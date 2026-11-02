@@ -65,7 +65,6 @@ def test_each_run_happens_once_a_window_and_skips_say_why():
     runs, skipped = auto_dream.candidates(
         [
             reading(age_s=3600),
-            reading("claude_code:alt", five=None),
             reading("codex:codex", five=75.0),
             reading("cursor:cursor"),
         ],
@@ -75,11 +74,12 @@ def test_each_run_happens_once_a_window_and_skips_say_why():
     assert runs == []
     assert skipped == [
         "claude_code:main: the usage reading is stale",
-        "claude_code:alt: the 5-hour meter is missing",
         "codex:codex: the 5-hour meter is at 75%",
     ]
-    # Codex may have no 5-hour window at all (#2560): its week decides alone.
+    # An account may have no 5-hour window at all, Codex (#2560) and Claude (#3947) alike:
+    # its week decides alone.
     assert due(reading("codex:codex", five=None)) == [("codex:codex", "early", 5)]
+    assert due(reading("claude_code:main", five=None)) == [("claude_code:main", "early", 5)]
 
 
 def test_a_final_run_goes_before_an_early_one_then_the_earlier_reset():

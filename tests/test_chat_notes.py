@@ -9,6 +9,8 @@ from __future__ import annotations
 import asyncio
 import gzip
 import json
+import sqlite3
+import threading
 from pathlib import Path
 
 import pytest
@@ -64,10 +66,11 @@ def comment_body(
     ).encode()
 
 
-def deliver(root: Path, body: bytes) -> None:
+def deliver(root: Path, body: bytes, received_at: str | None = None) -> None:
     WebhookLog(root).append(
         body=body,
         headers={"X-GitHub-Delivery": f"d-{next(counter)}", "X-GitHub-Event": "issue_comment"},
+        received_at=received_at,
     )
 
 
@@ -116,12 +119,38 @@ def test_own_comments_on_the_chats_items_become_its_notes(root, store, service, 
     deliver(root, comment_body(502, number=4, pull_request=True, created="2026-10-17T06:00:00Z"))
     deliver(root, comment_body(503, login="eerovil"))  # a person's comment
     deliver(root, comment_body(504, number=9))  # an item no chat owns
+    # GitHub stamped this one an hour late (#3966): it shows when it arrived.
+    deliver(
+        root,
+        comment_body(505, created="2026-10-17T07:57:58Z"),
+        received_at="2026-10-17T06:58:00.852894+00:00",
+    )
     apply_stream(root, service)
 
     notes = store.chat_notes("chat-1")
-    assert [(n.comment_id, n.number, n.is_pull) for n in notes] == [(501, 3, False), (502, 4, True)]
+    assert [(n.comment_id, n.number, n.is_pull) for n in notes] == [
+        (501, 3, False),
+        (502, 4, True),
+        (505, 3, False),
+    ]
+    assert [n.created_at for n in notes] == [
+        "2026-10-17T05:00:00Z",
+        "2026-10-17T06:00:00Z",
+        "2026-10-17T06:58:00Z",
+    ]
     assert notes[0].body == "Two questions"
-    assert reads == [("eerovil/agentdeck", 501), ("eerovil/agentdeck", 502)]
+    assert reads == [("eerovil/agentdeck", n) for n in (501, 502, 505)]
+    # A later edit keeps the corrected time; a record with no arrival keeps GitHub's.
+    deliver(
+        root,
+        comment_body(
+            505, action="edited", created="2026-10-17T07:57:58Z", updated="2026-10-17T08:30:00Z"
+        ),
+        received_at="2026-10-17T08:30:01+00:00",
+    )
+    apply_stream(root, service)
+    assert store.chat_notes("chat-1")[-1].created_at == "2026-10-17T06:58:00Z"
+    assert chat_notes._no_later_than_arrival("2026-10-17T07:57:58Z", "") == ("2026-10-17T07:57:58Z")
     assert notes[0].body_html.startswith("<p>Rendered 501</p>")
 
 
@@ -178,6 +207,99 @@ def test_the_one_time_backfill_reads_archives_and_the_live_file(root, store, ser
     assert not (root.parent / BACKFILL_MARKER).exists()
 
 
+def test_the_one_time_time_repair_moves_notes_stored_before_the_fix(root, store, service, reads):
+    # Kept before #3966 with GitHub's hour-late time, and one kept with a right time.
+    deliver(root, comment_body(501, created="2026-10-17T07:57:58Z"), "2026-10-17T06:58:00+00:00")
+    deliver(root, comment_body(502, created="2026-10-17T06:10:00Z"), "2026-10-17T06:10:02+00:00")
+    deliver(
+        root,
+        comment_body(503, number=9, created="2026-10-17T07:59:00Z"),
+        "2026-10-17T06:59:00+00:00",
+    )  # no chat owns it
+    for comment_id, created in ((501, "2026-10-17T07:57:58Z"), (502, "2026-10-17T06:10:00Z")):
+        store.save_chat_note(
+            chat_notes.ChatNote(
+                "eerovil/agentdeck",
+                comment_id,
+                "chat-1",
+                3,
+                False,
+                BOT,
+                "u",
+                "Done.",
+                None,
+                created,
+                created,
+            )
+        )
+
+    assert service.repair_times() == 1
+    notes = store.chat_notes("chat-1")
+    assert [(n.comment_id, n.created_at) for n in notes] == [
+        (502, "2026-10-17T06:10:00Z"),
+        (501, "2026-10-17T06:58:00Z"),
+    ]
+    assert reads == []
+    assert (root.parent / chat_notes.TIME_REPAIR_MARKER).exists()
+    assert service.repair_times() == 0
+
+
+def test_a_halted_or_failed_time_repair_is_not_marked_done(root, store, service):
+    for comment_id in (501, 502):
+        deliver(
+            root,
+            comment_body(comment_id, created="2026-10-17T07:57:58Z"),
+            "2026-10-17T06:58:00+00:00",
+        )
+        store.save_chat_note(
+            chat_notes.note_from(
+                next(
+                    d
+                    for d in WebhookTailer(root, consumer="peek").read()
+                    if f'"id": {comment_id},' in d.raw_body.decode()
+                ),
+                frozenset({BOT}),
+            )[1]._replace(chat_id="chat-1", created_at="2026-10-17T07:57:58Z")
+        )
+    marker = root.parent / chat_notes.TIME_REPAIR_MARKER
+    # The first write holds the repair thread mid-pass while the deck shuts down.
+    entered, release = threading.Event(), threading.Event()
+    move = store.move_chat_note_earlier
+
+    def held_move(note):
+        entered.set()
+        release.wait(5)
+        return move(note)
+
+    store.move_chat_note_earlier = held_move
+
+    async def shut_down_mid_pass():
+        repair = asyncio.create_task(asyncio.to_thread(service.repair_times))
+        await asyncio.to_thread(entered.wait, 5)
+        stopping = asyncio.create_task(service.stop())
+        await asyncio.sleep(0.05)
+        assert not stopping.done()  # stop() waits for the thread
+        release.set()
+        await stopping
+        return await repair
+
+    assert asyncio.run(shut_down_mid_pass()) == 1
+    assert not marker.exists()
+
+    # The next start runs it again and finishes it.
+    store.move_chat_note_earlier = move
+    service._halt.clear()  # as start() does
+    assert service.repair_times() == 1
+    assert [n.created_at for n in store.chat_notes("chat-1")] == ["2026-10-17T06:58:00Z"] * 2
+    marker.unlink()
+
+    # A write that fails (the database already closed) aborts the pass unmarked.
+    store.close()
+    with pytest.raises(sqlite3.Error):
+        service.repair_times()
+    assert not marker.exists()
+
+
 def test_the_card_shows_githubs_rendering_with_images_through_the_deck(root, store, service):
     deliver(root, comment_body(501))
     apply_stream(root, service)
@@ -231,3 +353,26 @@ def test_the_image_route_serves_only_an_image_a_note_shows(
     # A file no note shows, and a type the route never serves, are not there.
     assert client.get(path.replace("shot.png", "secret.png")).status_code == 404
     assert client.get(path.replace("shot.png", "shot.svg")).status_code == 404
+
+
+def test_no_test_reaches_the_live_webhook_streams():
+    """#3966: a test deck's default streams folder, and the files beside it, are scratch,
+    in a child process too."""
+    import subprocess
+    import sys
+
+    from agentdeck.config import AppConfig
+
+    live = Path("~/.local/share/agentdeck").expanduser()
+    assert not AppConfig().github_webhook.path.is_relative_to(live)
+    child = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from agentdeck.config import AppConfig; print(AppConfig().github_webhook.path)",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert child.stdout.strip() == str(AppConfig().github_webhook.path)

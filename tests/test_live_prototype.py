@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import colorsys
+import re
 import subprocess
+from pathlib import Path
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -66,7 +69,27 @@ async def test_agent_registers_link_records_steps_and_page_shows_them(tmp_path):
         # A diagram ask is sent to the guide's "Diagrams" part, which uses this page (#3822).
         assert "draw it as a file in the repository it describes" in trigger
         assert "Diagrams (#3822)" in guide.text
+        assert "One diagram per feature (#3860)" in guide.text
         assert "?bare=1" in guide.text
+        # A GitHub copy of a diagram gets the deck's light box colours as `classDef` lines,
+        # so GitHub shows them too (#3927); they follow diagram_frame.js's palette.
+        static = Path(live_prototype.__file__).parent / "web/static"
+        frame_js = (static / "diagram_frame.js").read_text()
+        hues = re.search(r"var HUES = \{([^}]*)\}", frame_js)[1]
+
+        def hex_of(hue, sat, light):
+            rgb = colorsys.hls_to_rgb(hue / 360, light / 100, sat / 100)
+            return "#" + "".join(f"{round(c * 255):02x}" for c in rgb)
+
+        named = re.findall(r"(\w+): (\d+)", hues)
+        assert len(named) == 6
+        for name, hue in named:
+            h = int(hue)
+            line = (
+                f"classDef {name} fill:{hex_of(h, 88, 88)},stroke:{hex_of(h, 70, 46)},"
+                f"color:{hex_of(h, 60, 24)}"
+            )
+            assert line in guide.text
 
         # A step before any link has nowhere to show.
         early = await client.post(f"{API}/steps", json={"summary": "x"})

@@ -174,10 +174,70 @@ async def test_start_agent_assigns_this_decks_person_where_another_deck_takes_un
     assert overview.front.needs_you == ()
     front = client.get("/", params={"chats": "0"}).text
     assert 'data-front-collapse="other-decks" data-front-shut' in front
-    assert "@coworker · PR #90 draft" in front
+    # #3855: drawn like your own row, its status from GitHub alone; no row read yet, so the
+    # open list's draft says Building, and the backfill is asked to read it.
+    assert 'data-other-deck-status="building"' in front
+    assert "Building</span> on @coworker&#39;s deck" in front
+    assert ("eerovil/agentdeck", 90, "") in overview.unsized and overview.merge_watch == ()
     page = client.get(work_href(WORK.work_id)).text
-    assert "data-other-deck" in page and "Take over" in page
+    assert "data-other-deck" in page and "Take over" in page and 'id="work-result"' in page
     assert 'id="work-message"' not in page and 'value="start"' not in page
+
+    # Its row read and the reviewer's pass at its head seen in the webhook log: Reviewed,
+    # sized like your own, and still never merge-watched.
+    from agentdeck.github_cache import GitHubMetadata, GitHubMetadataCache
+    from agentdeck.issue_marks import cache_key
+
+    cache_path = tmp_path / "marks.sqlite3"
+    monkeypatch.setenv("AGENTDECK_GITHUB_CACHE", str(cache_path))
+    GitHubMetadataCache(cache_path).offer(
+        cache_key(f"eerovil/agentdeck#{WORK.number}"),
+        GitHubMetadata({"heads": {"abc1234": {"id": 7, "url": "https://x/c7", "kind": "passed"}}},
+                       terminal=True),
+    )
+    head = "abc1234" + "0" * 33
+    row = {"state": "OPEN", "headRefOid": head, "isDraft": False, "baseRefName": "master",
+           "changedFiles": 1, "files": [{"path": "src/a.py", "additions": 5, "deletions": 1,
+                                         "changeType": "MODIFIED"}]}
+    app.state.issues.cached_pulls = lambda wanted: {ref: row for ref in wanted}
+    await app.state.work_overview.refresh()
+    overview = await app.state.work_overview.current()
+    assert overview.other_decks[0].status.key == "reviewed" and overview.merge_watch == ()
+    assert not [ref for ref in overview.unsized if ref[1] == 90]
+    front = client.get("/", params={"chats": "0"}).text
+    assert 'data-other-deck-status="reviewed"' in front and "+5/&minus;1 · 1 file" in front
+    page = client.get(work_href(WORK.work_id)).text
+    assert "Reviewed on @coworker" in page and 'href="https://x/c7"' in page
+    assert "data-wd-output-size" in page
+
+    # Two pull requests: each lists its own verdict, and findings on one are not hidden by a
+    # pass on the other (#3855 review).
+    GitHubMetadataCache(cache_path).offer(
+        cache_key(f"eerovil/agentdeck#{WORK.number}"),
+        GitHubMetadata({"heads": {
+            "abc1234": {"id": 9, "url": "https://x/c9", "kind": "passed"},
+            "def5678": {"id": 8, "url": "https://x/c8", "kind": "findings"},
+        }}, terminal=True),
+    )
+    two = _backlog(
+        _issue(WORK.number, labels=["agent"], assignees=["Coworker"]),
+        pulls=[_pull(90, f"agent/issue-{WORK.number}"), _pull(91, f"agent/issue-{WORK.number}")],
+    )
+    app.state.issues.cached = lambda: two
+    other = dict(row, headRefOid="def5678" + "0" * 33)
+    app.state.issues.cached_pulls = lambda wanted: {
+        ref: (row if ref[1] == 90 else other) for ref in wanted
+    }
+    page = client.get(work_href(WORK.work_id)).text
+    assert 'data-other-deck-status="findings"' in page
+    lines = {
+        number: page.split(f'data-wd-output="https://github.com/eerovil/agentdeck/pull/{number}"',
+                           1)[1].split("</li>", 1)[0]
+        for number in (90, 91)
+    }
+    assert 'href="https://x/c9"' in lines[90] and 'data-wd-output-verdict="passed"' in lines[90]
+    assert 'href="https://x/c8"' in lines[91] and 'data-wd-output-verdict="findings"' in lines[91]
+    app.state.issues.cached = lambda: theirs
 
     taken = client.post(work_href(WORK.work_id) + "/take-over",
                         data={"client_action_id": "press-0002"})
@@ -185,9 +245,9 @@ async def test_start_agent_assigns_this_decks_person_where_another_deck_takes_un
     assert taken.status_code == 200 and "Took over" in taken.text
     assert [argv for argv, _stdin, _repo in gh.calls] == [
         ["/usr/bin/gh", "issue", "edit", "2147", "--repo", "eerovil/agentdeck",
-         "--remove-assignee", "coworker", "--add-assignee", "me"],
+         "--remove-assignee", "Coworker", "--add-assignee", "me"],
         ["/usr/bin/gh", "issue", "comment", "2147", "--repo", "eerovil/agentdeck",
-         "--body", "@me took this over from @coworker's deck."],
+         "--body", "@me took this over from @Coworker's deck."],
     ]
     # A replay answers with what the press did; once the issue is this deck's, a new press
     # is refused. Neither writes.
@@ -220,11 +280,11 @@ async def test_start_here_takes_an_unstarted_issue_and_says_why_a_comment_failed
                               "--add-assignee", "me", "--add-label", "agent"]
     gh = _Gh((0, b"", b""), (1, b"", b"boom"))
     monkeypatch.setattr(gh_cli, "run_once", gh)
-    outcome, text = await take_over("gh", "o/r", 5, assignees=("them", "me", "other"),
+    outcome, text = await take_over("gh", "o/r", 5, assignees=("Them", "ME", "other"),
                                     person="me", start_label="agent", started=True)
-    assert outcome == "done" and "@them's deck stops its agent" in text and "boom" in text
+    assert outcome == "done" and "@Them's deck stops its agent" in text and "boom" in text
     # Every other assignee goes, or one left first would keep it on another deck.
-    assert gh.calls[0][0][-4:] == ["--remove-assignee", "them,other", "--add-assignee", "me"]
+    assert gh.calls[0][0][-4:] == ["--remove-assignee", "Them,other", "--add-assignee", "me"]
     gh = _Gh((1, b"", b"denied"))
     monkeypatch.setattr(gh_cli, "run_once", gh)
     outcome, _ = await take_over("gh", "o/r", 5, assignees=("them",), person="me",
@@ -248,6 +308,8 @@ def test_other_decks_works_are_the_issues_another_deck_has():
     found = {item.ref.number: item for item in other_deck_works(backlog, now=NOW, mine=leaves)}
     assert sorted(found) == [1, 2, 5]
     assert found[1].started and found[1].assignee == "coworker" and found[1].pull["number"] == 90
+    # Take over sends every assignee as GitHub spells it: gh removes only an exact match (#3852).
+    assert found[1].assignees == ("Coworker",)
     assert not found[2].started and found[2].pull is None and found[2].start_label == "agent"
     assert found[5].assignee == ""
     # Where this deck takes unassigned issues, the unassigned one is its own.
@@ -258,3 +320,55 @@ def test_other_decks_works_are_the_issues_another_deck_has():
     assert other_deck_works(backlog, now=NOW, mine=None) == ()
     assert other_deck_works(_backlog(_issue(1, labels=["agent"], assignees=["x"]), age_s=7200.0),
                             now=NOW, mine=leaves) == ()
+
+
+def test_another_decks_status_comes_from_github_alone():
+    """#3855: the first rule that holds, and a verdict counts only at the current head."""
+    from dataclasses import replace
+
+    from agentdeck.issue_marks import IssueMarks, Mark
+    from agentdeck.work_facts import OutputFact, WorkFacts
+    from agentdeck.work_overview import other_deck_status
+
+    (item,) = other_deck_works(
+        _backlog(_issue(1, labels=["agent", "Spec-Only"], assignees=["them"])),
+        now=NOW, mine=lambda r, a: a == "me",
+    )
+    head = "abc1234" + "0" * 33
+
+    def pr(*, draft=False, at=head):
+        output = OutputFact("https://github.com/o/r/pull/9", "o/r", 9, "branch", "open", at,
+                            draft=draft)
+        return replace(item, facts=WorkFacts(outputs=(output,)))
+
+    def key(work, **kwargs):
+        return other_deck_status(work, spec_label="spec-only", **kwargs).key
+
+    passed = Mark(5, head="abc1234", kind="passed")
+    found = Mark(6, head="abc1234", url="https://x/6", kind="findings")
+    assert key(replace(item, started=False)) == "unstarted"
+    assert key(pr(), marks=IssueMarks(verdicts=(passed,))) == "reviewed"
+    assert key(pr(), marks=IssueMarks(verdicts=(found, passed))) == "findings"
+    assert key(pr(), marks=IssueMarks(verdicts=(passed, replace(found, id=4)))) == "reviewed"
+    # A verdict for an older head is no verdict; neither is no mark at all.
+    assert key(pr(at="f" * 40), marks=IssueMarks(verdicts=(passed,))) == "in_review"
+    assert key(pr()) == "in_review"
+    assert key(pr(draft=True), marks=IssueMarks(verdicts=(passed,))) == "building"
+    # Two ready pull requests are judged each on its own head: a newer pass on one never
+    # covers findings on the other, and Reviewed needs a pass on both.
+    other = OutputFact("https://github.com/o/r/pull/8", "o/r", 8, "branch", "open", "d" * 40)
+    both = replace(pr(), facts=WorkFacts(outputs=(*pr().outputs, other)))
+    on_other = Mark(9, head="ddddddd", kind="findings")
+    assert key(both, marks=IssueMarks(verdicts=(on_other, replace(passed, id=10)))) == "findings"
+    assert key(both, marks=IssueMarks(verdicts=(passed,))) == "in_review"
+    assert key(both, marks=IssueMarks(verdicts=(passed, replace(on_other, kind="passed")))) == (
+        "reviewed")
+    # The spec waits only while it is the issue's newest comment and the label is on.
+    spec = IssueMarks(spec=Mark(8, url="https://x/8"))
+    status = other_deck_status(item, marks=spec, newest_comment=8, spec_label="spec-only")
+    assert status.key == "spec" and status.link == "https://x/8"
+    assert key(item, marks=spec, newest_comment=9) == "working"
+    assert other_deck_status(item, marks=spec, newest_comment=8, spec_label="").key == "working"
+    # The open list's pull request, its row not read yet.
+    listed = replace(item, pull={"url": "u", "draft": False})
+    assert key(listed) == "in_review"

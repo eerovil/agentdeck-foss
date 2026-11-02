@@ -10,6 +10,7 @@ from agentdeck import deck_notices
 from agentdeck.db import Db
 from agentdeck.models import TranscriptEvent
 from agentdeck.scheduled_messages import ScheduledMessage
+from agentdeck.voice_mode import VOICE_LINE_FI
 from agentdeck.web.render import register_filters, render_transcript_events
 
 TS = datetime(2026, 10, 16, 14, 23, tzinfo=UTC)
@@ -112,7 +113,8 @@ def test_deck_messages_render_as_markers_and_a_persons_own_stay_messages(tmp_pat
     side_chat = "Context: Work for eerovil/agentdeck#3200.\n\nplease look at the CSS"
     events = [
         TranscriptEvent(seq=1, role="user", text=brief, ts=TS),
-        TranscriptEvent(seq=2, role="user", text=WAKE, ts=now),
+        # Sent while voice mode was on, so it ends in the voice line (#3875).
+        TranscriptEvent(seq=2, role="user", text=f"{WAKE}\n\n{VOICE_LINE_FI}", ts=now),
         TranscriptEvent(seq=3, role="user", text="Continue", ts=TS),
         TranscriptEvent(seq=4, role="user", text=side_chat, ts=TS),
         TranscriptEvent(seq=5, role="user", text="Pick one", answer="A", ts=TS),

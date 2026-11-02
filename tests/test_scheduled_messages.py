@@ -232,6 +232,29 @@ async def test_a_wake_on_message_waits_for_the_runtime_instead_of_failing(tmp_pa
     assert [call[3] for call in injector.calls] == ["wake-on:1"]
 
 
+async def test_a_deck_message_gains_the_voice_line_as_it_goes(tmp_path):
+    """The line is asked for when the row goes, and the row keeps its own text (#3875)."""
+    store = Db(tmp_path / "agentdeck.db")
+    now = datetime.now(UTC)
+    for id_ in ("wake-on:1", "wake-on:2"):
+        store.record_scheduled_message(
+            ScheduledMessage(id=id_, chat_id="chat-1", text="Merged", due_at=now, created_at=now)
+        )
+    injector = _HeldInjector()
+    asked = []
+
+    def voice_line(message, target):
+        asked.append((message.id, target.session.key))
+        return "(Voice mode: speak.)" if message.id == "wake-on:1" else ""
+
+    service = ScheduledMessageService(
+        store, injector, _held_target(reachable={"up": True}), voice_line=voice_line
+    )
+    await _sweep(service, now)
+    assert [call[0] for call in injector.calls] == ["Merged\n\n(Voice mode: speak.)", "Merged"]
+    assert asked == [("wake-on:1", "codex:test:sid"), ("wake-on:2", "codex:test:sid")]
+
+
 async def test_a_held_message_waits_until_the_chat_can_take_it_again(tmp_path):
     """The runtime is back but the chat's controls are not projected yet (#2847)."""
     from agentdeck.models import Capability

@@ -66,6 +66,7 @@
     var wanted = form.getAttribute('data-new-work-default') || lastRepository();
     if (wanted && Array.from(select.options).some(function (o) { return o.value === wanted; })) {
       select.value = wanted;
+      form._newWorkChosen = true;
     }
     followFilter(form);
     sync(form);
@@ -80,16 +81,32 @@
     var project = front && front.onlyProject ? front.onlyProject() : '';
     var select = form.querySelector('[data-new-work-repository]');
     if (!project || !select) return;
-    var current = select.selectedOptions[0];
+    var current = kept(select);
     if (current && current.getAttribute('data-project') === project) return;
     var options = Array.from(select.options).filter(function (o) {
       return o.getAttribute('data-project') === project;
     });
     if (!options.length) return;
-    var last = lastRepository();
-    var pick = options.filter(function (o) { return o.value === last; })[0] || options[0];
+    var pick = projectPick(options);
     select.value = pick.value;
+    form._newWorkChosen = true;
     sync(form);
+  }
+
+  // The selected option, unless it is only the browser's automatic first one (#3882): a
+  // project that sorts first must still land on its own default.
+  function kept(select) {
+    var form = select.form;
+    return form && (form._newWorkPicked || form._newWorkChosen) ? select.selectedOptions[0] : null;
+  }
+
+  // Within one project's options: the one last filed to, else the project's own default
+  // (its issue tracker, #3882), else its first.
+  function projectPick(options) {
+    var last = lastRepository();
+    return options.filter(function (o) { return o.value === last; })[0]
+      || options.filter(function (o) { return o.hasAttribute('data-project-default'); })[0]
+      || options[0];
   }
 
   function followFilters() {
@@ -127,7 +144,7 @@
   // The option for the project (or whole `owner/repo`) named first in the text, or null.
   // A bare repository name is not enough: `example-org/issues` would claim every
   // description that says "issues". Within a named project, a pick already there stays,
-  // else the one last filed to, else its first repository.
+  // else `projectPick`'s.
   function named(select, text) {
     var lower = text.toLowerCase();
     var best = null;
@@ -147,13 +164,12 @@
     });
     if (!best || wholeName) return best;
     var project = best.getAttribute('data-project');
-    var current = select.selectedOptions[0];
+    var current = kept(select);
     if (current && current.getAttribute('data-project') === project) return current;
     var inProject = Array.prototype.filter.call(select.options, function (o) {
       return o.getAttribute('data-project') === project;
     });
-    var last = lastRepository();
-    return inProject.filter(function (o) { return o.value === last; })[0] || inProject[0];
+    return projectPick(inProject);
   }
 
   function choose(form, value) {
@@ -164,6 +180,7 @@
       select.value = value;
       sync(form);
     }
+    form._newWorkChosen = true;
     var note = form.querySelector('[data-new-work-guessed]');
     if (note) note.hidden = false;
   }

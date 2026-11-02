@@ -23,6 +23,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
 
+from . import review_history
 from .chat_identity import ChatIdentity, ChatLinkConflict
 from .composer_phrases import ComposerPhrase
 from .context_delivery import ContextDelivery
@@ -37,6 +38,7 @@ from .models import (
     UsageSnapshot,
 )
 from .questions import OpenQuestion
+from .review_history import ReviewEvent
 from .scheduled_messages import HeldAttachment, ScheduledMessage
 from .sqlite_open import create_schema, use_wal
 from .work import WorkRef
@@ -625,8 +627,9 @@ CREATE TABLE IF NOT EXISTS work_opened (
 );
 -- Work-owned metadata (#2328, ``work_resolution``): a custom title the operator gave the Work
 -- on this deck (NULL is the derived title; the GitHub issue is never renamed), and the
--- resolution the verify worker writes: problem, solution, why this solution, why it is
--- correct. Every resolution write replaces all four parts; the Run and chat that wrote it
+-- resolution the Work's agent writes: background, problem, solution, why this solution, why
+-- it is correct (``background_summary``, migration 18, #3928). Every resolution write
+-- replaces all five parts; the Run and chat that wrote it
 -- last are kept as provenance. ``agent_title`` is the name a worker gave the Work when it
 -- filed its report (#2474): the operator's ``title`` still wins over it. ``live_check_*`` is
 -- the agent's check of the merged change in the live app (#3141), written apart from the
@@ -648,7 +651,8 @@ CREATE TABLE IF NOT EXISTS work_metadata (
     live_check_result TEXT,
     live_check_note TEXT,
     live_check_at TEXT,
-    live_check_session_key TEXT
+    live_check_session_key TEXT,
+    background_summary TEXT
 );
 -- Where a person moved a wayfinder map's boxes (#3627): one JSON object per map Work, box key
 -- to ``[x, y]``, the same on every device. A box not named keeps the server's layout.
@@ -889,22 +893,20 @@ CREATE TABLE IF NOT EXISTS poller_review_verdicts (
 CREATE INDEX IF NOT EXISTS idx_poller_review_verdicts_recorded
     ON poller_review_verdicts(recorded_at);
 
--- Which commit a ChatGPT review chat was opened about, per pull request it covers
--- (#2088, #2637). The head at the moment the deck wrote the chat is the head that chat
--- reviews — and comparing it with the pull request's current head is what lets the chip
--- and the Work's review step say whether the latest commit has been reviewed. Keyed by
--- the chat and the pull request: a Work's chat lists several, and two reviews of one pull
--- request are two chats. Only the deck's own calls write here, so a chat we have no row
--- for is a chat from before this existed, which renders as silence.
-CREATE TABLE IF NOT EXISTS chat_review_heads (
-    chat_repository TEXT NOT NULL,
-    chat_number INTEGER NOT NULL,
-    target_repo TEXT NOT NULL,
-    target_number INTEGER NOT NULL,
-    head_sha TEXT NOT NULL,
-    recorded_at TEXT NOT NULL,
-    PRIMARY KEY (chat_repository, chat_number, target_repo, target_number)
+-- Each pull request head's review history (#3957): one dated row per event (checklist sent,
+-- review asked, chat opened, verdict ...), read by ``review_history.head_review``. ``key`` is
+-- the event's own id, so a replayed webhook adds nothing; ``at`` is its own time in epoch
+-- seconds. A pull request's rows go when it merges or closes.
+CREATE TABLE IF NOT EXISTS review_events (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    pull TEXT NOT NULL,
+    head TEXT NOT NULL,
+    at REAL NOT NULL,
+    kind TEXT NOT NULL,
+    key TEXT NOT NULL UNIQUE,
+    data TEXT NOT NULL DEFAULT '{}'
 );
+CREATE INDEX IF NOT EXISTS idx_review_events_pull ON review_events(pull, head);
 
 -- A note a chat shows but its agent never sees (#3227): a comment the deck's own GitHub
 -- account posted on the chat's issue or one of its pull requests, from the webhook log.
@@ -3959,8 +3961,10 @@ class Db:
             return {}
         return {str(work_id): str(title) for work_id, title in rows}
 
-    def work_start_chat_titles(self) -> dict[str, str]:
-        """The name each Work's own agent chat gave itself, by Work id (#3597).
+    def work_start_chats(self) -> dict[str, tuple[str, str]]:
+        """Each Work's own agent chat, by Work id (#3597): the name it gave itself and the
+        session key it started under, so a caller can tell whether that chat is in other Works too
+        (#3964).
 
         A Work agent names its chat, not its Work, so this is the Work's name when nothing
         better is set. Only the chat's own name counts: a Deckhand guess or a name the operator
@@ -3983,7 +3987,7 @@ class Db:
                     " )) AS session_key"
                     " FROM work_actions a LEFT JOIN session_tokens t ON t.token = a.action_id"
                     " WHERE a.action_id LIKE 'work-start-%')"
-                    " SELECT own.work_id, g.title FROM own"
+                    " SELECT own.work_id, g.title, own.session_key FROM own"
                     " LEFT JOIN chat_legs mine ON mine.session_key = own.session_key"
                     " LEFT JOIN chat_legs leg ON leg.chat_id = mine.chat_id"
                     " JOIN generated_titles g"
@@ -3993,7 +3997,7 @@ class Db:
         except sqlite3.Error as exc:
             log.debug("work start chat title read failed: %s", exc)
             return {}
-        return {str(work_id): str(title) for work_id, title in rows}
+        return {str(work_id): (str(title), str(key)) for work_id, title, key in rows}
 
     def set_work_agent_title(self, work_id: str, title: str, session_key: str) -> bool:
         """Set the name a worker gave its Work; an empty one clears it. Never touches the
@@ -4027,7 +4031,7 @@ class Db:
                 row = self._conn.execute(
                     "SELECT problem_summary, solution_summary, decision_rationale,"
                     " correctness_summary, resolution_updated_at, resolution_run_id,"
-                    " resolution_session_key FROM work_metadata"
+                    " resolution_session_key, background_summary FROM work_metadata"
                     " WHERE work_id = ? AND resolution_updated_at IS NOT NULL",
                     (work_id,),
                 ).fetchone()
@@ -4049,6 +4053,7 @@ class Db:
             updated,
             str(row[5] or ""),
             str(row[6] or ""),
+            background=str(row[7] or ""),
         )
 
     def set_work_resolution(self, resolution: WorkResolution) -> WorkResolution | None:
@@ -4059,7 +4064,8 @@ class Db:
                 self._conn.execute(
                     "INSERT INTO work_metadata (work_id, problem_summary, solution_summary,"
                     " decision_rationale, correctness_summary, resolution_updated_at,"
-                    " resolution_run_id, resolution_session_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+                    " resolution_run_id, resolution_session_key, background_summary)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
                     " ON CONFLICT(work_id) DO UPDATE SET"
                     " problem_summary = excluded.problem_summary,"
                     " solution_summary = excluded.solution_summary,"
@@ -4067,7 +4073,8 @@ class Db:
                     " correctness_summary = excluded.correctness_summary,"
                     " resolution_updated_at = excluded.resolution_updated_at,"
                     " resolution_run_id = excluded.resolution_run_id,"
-                    " resolution_session_key = excluded.resolution_session_key",
+                    " resolution_session_key = excluded.resolution_session_key,"
+                    " background_summary = excluded.background_summary",
                     (
                         resolution.work_id,
                         resolution.problem,
@@ -4077,6 +4084,7 @@ class Db:
                         stamp,
                         resolution.run_id or None,
                         resolution.session_key or None,
+                        resolution.background,
                     ),
                 )
         except sqlite3.Error as exc:
@@ -4464,57 +4472,83 @@ class Db:
         )
         return _poller_review_verdict(rows[0]) if rows else None
 
-    # --- which commit each ChatGPT review chat is about (#2088) ---
+    # --- each pull request head's review history (#3957) ---
 
-    def record_chat_review_head(
-        self,
-        chat_repository: str,
-        chat_number: int,
-        target_repo: str,
-        target_number: int,
-        head_sha: str,
-    ) -> None:
-        """Remember the commit a review chat was opened about for one pull request.
+    def append_review_event(
+        self, pull: str, head: str, kind: str, key: str, at: float, data: dict | None = None
+    ) -> bool:
+        """Append one review event; ``False`` when its key is already stored (or the write
+        failed), so a replay adds nothing."""
+        try:
+            with self._lock, self._conn:
+                cursor = self._conn.execute(
+                    "INSERT OR IGNORE INTO review_events(pull, head, at, kind, key, data)"
+                    " VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        pull.lower(),
+                        head.lower(),
+                        float(at),
+                        kind,
+                        key,
+                        json.dumps(data or {}, sort_keys=True),
+                    ),
+                )
+            return cursor.rowcount > 0
+        except sqlite3.Error as exc:
+            self._log_failure("write", exc)
+            return False
 
-        An upsert, because the same chat can be written twice: a create whose reconcile
-        handed the chat to another caller still ends with both callers holding the same
-        chat number and the same heads, and a retry must not become a second row.
-        """
-        self._write(
-            "INSERT INTO chat_review_heads("
-            " chat_repository, chat_number, target_repo, target_number, head_sha,"
-            " recorded_at) VALUES (?, ?, ?, ?, ?, ?)"
-            " ON CONFLICT(chat_repository, chat_number, target_repo, target_number)"
-            " DO UPDATE SET head_sha=excluded.head_sha, recorded_at=excluded.recorded_at",
-            (
-                chat_repository,
-                int(chat_number),
-                target_repo.casefold(),
-                int(target_number),
-                head_sha,
-                datetime.now(UTC).isoformat(),
-            ),
+    def has_review_event(self, key: str) -> bool:
+        """Whether an event under ``key`` is stored; ``False`` when unreadable too."""
+        return bool(self._query("SELECT 1 FROM review_events WHERE key = ?", (key,)))
+
+    def review_events(self, pull: str) -> list[ReviewEvent]:
+        """Every review event of ``owner/repo#n``, all heads, in arrival order."""
+        return self._review_rows(" WHERE pull = ?", (pull.lower(),))
+
+    def _review_rows(self, where: str, params: tuple) -> list[ReviewEvent]:
+        rows = self._query(
+            "SELECT seq, pull, head, at, kind, key, data FROM review_events"
+            + where
+            + " ORDER BY seq",
+            params,
         )
+        events = []
+        for seq, pull_ref, head, at, kind, key, data in rows:
+            try:
+                loaded = json.loads(data or "{}")
+            except ValueError:
+                loaded = {}
+            events.append(
+                ReviewEvent(
+                    pull=pull_ref,
+                    head=head,
+                    at=float(at),
+                    kind=kind,
+                    key=key,
+                    data=loaded if isinstance(loaded, dict) else {},
+                    seq=int(seq),
+                )
+            )
+        return events
+
+    def all_review_events(self) -> dict[str, list[ReviewEvent]]:
+        """Every open pull request's review history, by ``owner/repo#n``, in arrival order:
+        one read per pass of the Work cards (#3956)."""
+        found: dict[str, list[ReviewEvent]] = {}
+        for event in self._review_rows("", ()):
+            found.setdefault(event.pull, []).append(event)
+        return found
 
     def chat_review_heads(self, chat_repository: str) -> dict[int, dict[tuple[str, int], str]]:
-        """Every recorded chat in this chat repository: chat number to each pull request's
-        commit, the pull request keyed by its casefolded repository and number (#2637).
+        """Which commit each review chat in this chat repository was opened about, per pull
+        request it covers (#2088, #2637): its ``chat`` rows in the review history (#3956)."""
+        rows = self._review_rows(" WHERE kind = 'chat'", ())
+        return review_history.chat_heads(rows, chat_repository)
 
-        Read whole rather than one chat at a time: a session page draws a handful of
-        chips on every stream tick, and this only ever holds a few rows per review chat
-        this deck opened.
-        """
-        rows = self._query(
-            "SELECT chat_number, target_repo, target_number, head_sha FROM chat_review_heads"
-            " WHERE chat_repository = ? COLLATE NOCASE",
-            (chat_repository,),
-        )
-        found: dict[int, dict[tuple[str, int], str]] = {}
-        for row in rows:
-            if row[3]:
-                pull = (str(row[1]).casefold(), int(row[2]))
-                found.setdefault(int(row[0]), {})[pull] = row[3]
-        return found
+    def drop_review_events(self, pull: str) -> None:
+        """Forget ``owner/repo#n``'s review history: it merged or closed."""
+        self._write("DELETE FROM review_events WHERE pull = ?", (pull.lower(),))
 
     # --- notes a chat shows and its agent never sees (#3227) ---
 
@@ -4556,6 +4590,24 @@ class Db:
                 note.updated_at,
             ),
         )
+
+    def move_chat_note_earlier(self, note: ChatNote) -> bool:
+        """Set the kept note's time to ``note.created_at`` when that is earlier (#3966).
+
+        Raises ``sqlite3.Error`` rather than reporting a failed write as no change, so the
+        one-time repair is not marked done over it."""
+        with self._lock, self._conn:
+            cursor = self._conn.execute(
+                "UPDATE chat_notes SET created_at = ?"
+                " WHERE repository = ? AND comment_id = ? AND created_at > ?",
+                (
+                    note.created_at,
+                    note.repository.casefold(),
+                    int(note.comment_id),
+                    note.created_at,
+                ),
+            )
+        return cursor.rowcount == 1
 
     def set_chat_note_html(
         self, repository: str, comment_id: int, updated_at: str, body_html: str

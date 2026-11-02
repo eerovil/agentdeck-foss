@@ -50,7 +50,12 @@ deliveries are the deck's own echo):
   never reviewed: the worker marks it ready when its changes are done (``gh pr ready``), and
   turns it back to draft when findings arrive. A new head whose diff has the review digest of
   the last head sent for review only merged its base, and is not reviewed (#3314): the chat is
-  told the verdict on that diff stands, and the release keeps it for the new head.
+  told the verdict on that diff stands, and the release keeps it for the new head. Before
+  each such review the chat gets the pre-review checklist instead (#3880), and the review
+  waits until the agent says it went through it (``pre_review_done``), with no time limit
+  (owner's choice). A push while the checklist waits sends nothing more; the review reads
+  the head current when the agent is done. Marking it ready again at a new head sends that
+  head's checklist (#3896). A review asked for again skips it.
 * **A review asked for again at an unchanged head** (#3183) — the agent's ``POST
   /api/sessions/<key>/review-request`` (``ask_again``) with a note saying what changed, such as
   a walkthrough the reviewer asked for, and nothing else could ever start the next review. A
@@ -106,9 +111,9 @@ These are best effort, not absolute (operator decision on #2895, ADR 0008). Acce
   session API checks for an already-ready head in the background; a restart or a failed
   read drops that check, and a Work side chat's own registration does not run it. The next
   event on that pull request, or the worker marking it ready again, asks.
-* **A very old head can be reviewed twice.** ``ReviewedHeads`` keeps the newest
-  ``MAX_STARTED`` heads, so a pull request left open past that many review starts and
-  turned ready again at an unchanged head may be asked about once more.
+* **Two web workers may both take a head's last ask again.** The caps count the ``asked``
+  events in the head's review history, and a start in flight in the other worker of a hot
+  reload is not one yet.
 * **An ask while a review of the head is already asked for keeps no note of its own**
   (owner's decision on #3453). It answers "already asked" and the agent waits on the review
   already coming; if that is the head's first review still starting, the new note is not
@@ -131,7 +136,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from . import wayfinder_lists, wayfinder_map
+from . import review_history, wayfinder_lists, wayfinder_map
 from .poller_engine import github_authority
 from .poller_engine.authorization import reviewer_logins
 from .review_refs import REVIEWER_OFF_TEXT, ReviewBusy, ReviewError, ReviewOff
@@ -147,10 +152,35 @@ from .work_signals import MARKER as START_MARKER
 log = logging.getLogger(__name__)
 
 CONSUMER = "work-router"
-STARTED_FILENAME = "work-router-reviews.json"
 PENDING_FILENAME = "work-router-pending.json"
 #: The Works whose issue went to another deck, as ``handed-over:<work id>`` (#3731).
 HANDED_OVER_FILENAME = "work-router-handed-over.json"
+#: The router's own review records before each head's review history replaced them (#3955):
+#: deleted at start, with nothing copied over.
+RETIRED_FILENAMES = ("work-router-reviews.json", "work-router-pre-review.json")
+#: Where the reviewer's own rules live inside its repository, linked from the checklist (#3880).
+REVIEW_POLICY_PATH = "blob/main/skills/github-repo-reviewer/references/review-policy.md"
+#: What the agent reads before each review of a ready head (#3880): the points it most often
+#: forgot, which cost a whole review round each. Short on purpose (owner's choice: five items).
+PRE_REVIEW_TEXT = """AgentDeck: before {pull} at {short} goes to review, check these.\
+ The reviewer checks each one and sends the pull request back if it is missing.
+
+1. Diagrams: each `docs/diagrams/` file whose `## Boxes` names a file you changed is edited,\
+ or the Work summary says why not. The issue's diagram comment matches.
+2. The issue has the `Use-case walkthrough:` line, and for a visible change the screenshots\
+ with the `Ease of use and look:` line.
+3. Every numbered decision in the spec, every owner answer and the owner's latest comment on\
+ the issue is done.
+4. The tests cover the other cases too: events in another order or shape, two at once, a\
+ restart, and for a page a live update and a 390px phone.
+5. The Work summary is current, and the body says `Refs #<issue>` (`Closes` only if the\
+ issue asks).
+
+Fix and push what is missing, keeping it ready, then call `POST\
+ $AGENTDECK_URL/api/sessions/<session-key>/pre-review-done` with\
+ `{{"pull_request": "{pull}"}}`: the review of its head then starts, and this chat waits on\
+ it. The review waits until you call it, and reads the head current then, even after more\
+ pushes or a draft and ready again.{policy}"""
 #: A pending action's back-off (``watch_retry.Backoff``): its first wait and its ceiling.
 RETRY_FIRST_S = 60.0
 RETRY_MAX_S = 30 * 60.0
@@ -164,17 +194,15 @@ MAX_AGAIN = 2
 #: (#3453), counted apart from ``MAX_AGAIN``; past that the owner is asked.
 MAX_NO_VERDICT = 2
 #: Starts the request id of an ask after no verdict. Request ids are otherwise hex, so this
-#: prefix tells the two counts apart in the one ledger.
+#: prefix tells the two kinds of ask apart.
 NO_VERDICT = "nv"
-#: Marks an ask's place under the cap before its review started (``_reserve_again``).
-RESERVED = "?"
 
-#: How many reviewed heads are remembered. A head older than this many review starts is
-#: long since reviewed or abandoned, so forgetting it costs at most one repeat press.
-MAX_STARTED = 2000
-#: How many pull requests' reviewed diff digests are remembered, and how many heads of each.
-MAX_DIGESTS = 500
-MAX_HEAD_DIGESTS = 8
+#: A ready head with no checklist, no review and no verdict for this long is caught by the
+#: backstop (#3903): long enough for a ready event and the router to act on it first.
+READY_GRACE_S = 5 * 60.0
+#: The backstop looks at most this often, however many deliveries wake it.
+SWEEP_GAP_S = 60.0
+
 #: A message is a nudge with a link, not a copy of the thread: a long comment is cut here.
 MAX_BODY = 4000
 
@@ -618,16 +646,6 @@ def classify(
     return None
 
 
-def _pull_maps(raw: object, name: str) -> dict[str, dict[str, str]]:
-    """``raw[name]`` as ``{pull: {head: text}}``, anything else left out."""
-    value = raw.get(name) if isinstance(raw, dict) else None
-    return {
-        pull: {head: text for head, text in heads.items() if isinstance(text, str)}
-        for pull, heads in (value.items() if isinstance(value, dict) else ())
-        if isinstance(pull, str) and isinstance(heads, dict)
-    }
-
-
 async def _gh_lines(repository: str, argv: list[str]) -> list[str] | None:
     """A ``gh`` read's output lines, or ``None`` when it failed."""
     from . import gh_cli
@@ -721,181 +739,42 @@ async def no_code_between(
     return all(is_doc_path(name) or name not in outside for name in touched)
 
 
-class ReviewedHeads:
-    """The heads a review was already asked for, in one small JSON file.
-
-    Written once the review start answered with a chat that names the head (or failed in a
-    way that may have written). A start cut off by a crash is asked for again when the
-    uncommitted delivery is replayed; the review path reuses the open chat it may already
-    have written. Re-read whenever the other web worker of a hot reload wrote it (#3070).
-
-    Beside them, the review digest of each pull request's diff at the heads a review started
-    for (#3314): a later head with the same digest only brought the branch up to its base, and
-    is not reviewed again (``WorkRouterService._unchanged``).
-    """
+class KeyFile:
+    """A set of keys in one small JSON file, re-read whenever the other web worker of a hot
+    reload wrote it (#3070): the Works handed to another deck (#3731)."""
 
     def __init__(self, path: Path | str) -> None:
         self.path = Path(path).expanduser()
         self._file = SharedFile(self.path, prefix=".work-router.")
         self._keys: list[str] = []
-        #: ``owner/repo#n`` -> {head: digest}, oldest first; the newest ``MAX_DIGESTS`` pulls.
-        self._digests: dict[str, dict[str, str]] = {}
-        #: ``owner/repo#n`` -> {head: the head whose verdict it keeps}, for skipped heads.
-        self._carried: dict[str, dict[str, str]] = {}
-        #: ``owner/repo#n`` -> {head (a verdict's short sha too): ""}: heads a verdict answered.
-        self._verdicts: dict[str, dict[str, str]] = {}
 
-    def _load(self) -> list[str]:
+    def _fresh(self) -> None:
+        if not self._file.stale():
+            return
         try:
             raw = self._file.read()
         except (OSError, ValueError):
             log.warning("work-router: ignoring unreadable %s", self.path)
-            return []
-        self._digests = _pull_maps(raw, "digests")
-        self._carried = _pull_maps(raw, "carried")
-        self._verdicts = _pull_maps(raw, "verdicts")
+            raw = {}
         keys = raw.get("heads") if isinstance(raw, dict) else None
-        return [key for key in keys if isinstance(key, str)] if isinstance(keys, list) else []
-
-    def _fresh(self) -> None:
-        if self._file.stale():
-            self._keys = self._load()
+        self._keys = [key for key in keys if isinstance(key, str)] if isinstance(keys, list) else []
 
     def __contains__(self, key: str) -> bool:
         self._fresh()
         return key in self._keys
 
-    def last_digest(self, pull: str) -> tuple[str, str]:
-        """``(head, digest)`` of the newest head of ``pull`` with a digest, or empty strings."""
-        self._fresh()
-        heads = self._digests.get(pull.lower()) or {}
-        return next(reversed(heads.items()), ("", ""))
-
-    def note_digest(self, pull: str, head: str, digest: str, *, carried_from: str = "") -> None:
-        """Write ``pull``'s diff digest at ``head``, as its newest; ``carried_from`` is the head
-        whose verdict it keeps, proven a base merge away (#3314)."""
-        if not digest:
-            return
-        with self._file.locked():
-            self._fresh()
-            pull, head = pull.lower(), head.lower()
-            heads = {key: value for key, value in (self._digests.get(pull) or {}).items()}
-            heads.pop(head, None)
-            heads[head] = digest.lower()
-            digests = {key: value for key, value in self._digests.items() if key != pull}
-            digests[pull] = dict(list(heads.items())[-MAX_HEAD_DIGESTS:])
-            self._digests = dict(list(digests.items())[-MAX_DIGESTS:])
-            carried = {key: value for key, value in (self._carried.get(pull) or {}).items()}
-            carried.pop(head, None)
-            if carried_from:
-                carried[head] = carried_from.lower()
-            others = {key: value for key, value in self._carried.items() if key != pull}
-            if carried:
-                others[pull] = dict(list(carried.items())[-MAX_HEAD_DIGESTS:])
-            self._carried = {key: others[key] for key in list(others)[-MAX_DIGESTS:]}
-            self._write(self._keys)
-
-    def note_verdict(self, pull: str, head: str) -> None:
-        """A verdict the release took answered ``pull`` at ``head`` (#3314 review)."""
-        head = (head or "").lower()
-        if len(head) < 7:
-            return
-        with self._file.locked():
-            self._fresh()
-            pull = pull.lower()
-            heads = dict(self._verdicts.get(pull) or {})
-            heads.pop(head, None)
-            heads[head] = ""
-            others = {key: value for key, value in self._verdicts.items() if key != pull}
-            others[pull] = dict(list(heads.items())[-MAX_HEAD_DIGESTS:])
-            self._verdicts = {key: others[key] for key in list(others)[-MAX_DIGESTS:]}
-            self._write(self._keys)
-
-    def answered(self, pull: str, head: str) -> bool:
-        """Whether a verdict answered ``head``, or a head it keeps the verdict of."""
-        self._fresh()
-        given = self._verdicts.get(pull.lower()) or {}
-        carried = self._carried.get(pull.lower()) or {}
-        current = head.lower()
-        for _ in range(MAX_HEAD_DIGESTS + 1):
-            if any(current.startswith(verdict) for verdict in given):
-                return True
-            current = carried.get(current, "")
-            if not current:
-                return False
-        return False
-
-    def same_change(self, pull: str, head: str, older: str) -> bool:
-        """Whether ``head`` keeps ``older``'s verdict: the same head, or carried from it through
-        proven base merges (``older`` may be a verdict's short sha)."""
-        self._fresh()
-        older = older.lower()
-        if len(older) < 7:
-            return False
-        carried = self._carried.get(pull.lower()) or {}
-        current = head.lower()
-        for _ in range(MAX_HEAD_DIGESTS + 1):
-            if current.startswith(older):
-                return True
-            current = carried.get(current, "")
-            if not current:
-                return False
-        return False
-
     def add(self, key: str) -> None:
         with self._file.locked():
-            if key in self:
-                return
-            self._write([*self._keys, key][-MAX_STARTED:])
+            if key not in self:
+                self._write([*self._keys, key])
 
     def discard(self, key: str) -> None:
         with self._file.locked():
             if key in self:
                 self._write([item for item in self._keys if item != key])
 
-    def count(self, prefix: str, exclude: str = "") -> int:
-        """How many remembered keys start with ``prefix`` but not ``exclude``: the asks
-        again of one head."""
-        self._fresh()
-        return sum(
-            1
-            for key in self._keys
-            if key.startswith(prefix) and not (exclude and key.startswith(exclude))
-        )
-
-    def heads(self, pull: str) -> set[str]:
-        """Every head of ``pull`` a review was asked for, as remembered (#3828 review)."""
-        self._fresh()
-        prefix = f"{pull.lower()}@"
-        return {
-            key.removeprefix(prefix).partition("+")[0].removesuffix(RESERVED)
-            for key in self._keys
-            if key.startswith(prefix)
-        }
-
-    def reserve(self, prefix: str, limit: int, key: str, exclude: str = "") -> bool:
-        """Add ``key`` unless ``limit`` keys already start with ``prefix``; whether it was.
-
-        One locked read-modify-write, so two web workers asking at once cannot both take the
-        last place under the cap (#3183 review).
-        """
-        with self._file.locked():
-            if key in self:
-                return True
-            if self.count(prefix, exclude) >= limit:
-                return False
-            self._write([*self._keys, key][-MAX_STARTED:])
-            return True
-
     def _write(self, keys: list[str]) -> None:
-        self._file.write(
-            {
-                "heads": keys,
-                "digests": self._digests,
-                "carried": self._carried,
-                "verdicts": self._verdicts,
-            }
-        )
+        self._file.write({"heads": keys})
         self._keys = keys
 
 
@@ -975,10 +854,23 @@ class PendingActions:
 
 
 class SwitchedRepositories:
-    """Which repositories' Works hear their own events, re-read when a manifest moves."""
+    """Which repositories' Works hear their own events, re-read when a manifest moves.
 
-    def __init__(self, poller_root: Path | str) -> None:
+    The manifests are looked at most once per ``ttl_s``: the release asks for every Work in
+    one pass, and a glob and stat per Work held the event loop for seconds (#3975).
+    """
+
+    def __init__(
+        self,
+        poller_root: Path | str,
+        *,
+        ttl_s: float = 2.0,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
         self.root = Path(poller_root).expanduser()
+        self.ttl_s = ttl_s
+        self._clock = clock
+        self._checked_at: float | None = None
         self._signature: tuple | None = None
         self._repositories: frozenset[str] = frozenset()
 
@@ -991,6 +883,10 @@ class SwitchedRepositories:
         return tuple(found)
 
     def __call__(self, repository: str) -> bool:
+        now = self._clock()
+        if self._checked_at is not None and 0 <= now - self._checked_at < self.ttl_s:
+            return repository.lower() in self._repositories
+        self._checked_at = now
         signature = self._current_signature()
         if signature != self._signature:
             from .poller_ops import work_repositories
@@ -1054,12 +950,13 @@ class WorkRouterService:
         schedule: Callable[[ScheduledMessage], ScheduledMessage | None],
         start_review: Callable[..., Awaitable[object]],
         reviewer_off: bool = False,
+        pre_review: bool = False,
+        review_policy: str = "",
         own_logins: Callable[[], Iterable[str]] | Iterable[str] = configured_own_logins,
         refusal: Callable[[str, str], str | None] = lambda chat_id, text: None,
         ready_head: Callable[[str, int], Awaitable[str]] | None = None,
         enabled: bool = True,
         watcher: WebhookWatcher | None = None,
-        reviewed: ReviewedHeads | None = None,
         exists: Callable[[str], bool] | None = None,
         pending: PendingActions | None = None,
         release: object | None = None,
@@ -1092,6 +989,9 @@ class WorkRouterService:
         wait_review: Callable[[str, str, bool], object] | None = None,
         mine: Callable[[str, str], bool] = lambda repository, assignee: True,
         interrupt: Callable[[str], Awaitable[bool]] | None = None,
+        ready_pulls: Callable[[], Iterable[tuple[str, int, str]]] | None = None,
+        review_event: review_history.Note = review_history.no_note,
+        reviews: Callable[[str], Iterable[review_history.ReviewEvent]] = lambda pull: (),
     ) -> None:
         self._enabled = bool(enabled)
         self._tailer = WebhookTailer(streams_root, consumer=CONSUMER)
@@ -1105,6 +1005,10 @@ class WorkRouterService:
         self._start_review = start_review
         # No Work reviewer at all (#3849): a ready head asks for nothing and stays unasked.
         self.reviewer_off = bool(reviewer_off)
+        # The agent's own pre-review before each review of a ready head (#3880).
+        self.pre_review_on = bool(pre_review)
+        # The reviewer's own rules, linked from the checklist; "" links nothing.
+        self._review_policy = review_policy
         self._start_work = start_work
         self._start_labels = start_labels
         self._spec_only_label = spec_only_label
@@ -1157,23 +1061,36 @@ class WorkRouterService:
         self._own_logins = own_logins if callable(own_logins) else frozenset(own_logins)
         self._refusal = refusal
         self._ready_head = ready_head
+        # The backstop for a ready head nobody started a review of (#3903): every pull request
+        # a Work registered whose cached row is open and not a draft, as ``(owner/repo, n,
+        # cached head)``, read locally.
+        self._ready_pulls = ready_pulls
+        # Each head's review history (#3957): appended to, and read for every review record
+        # the router keeps (#3955), ``reviews(owner/repo#n)`` giving every head's events.
+        self._note = review_event
+        self._reviews = reviews
+        #: ``owner/repo#n`` -> ``(cached head, since when it sat unstarted)``, ``None`` once
+        #: the backstop read it live: its grace, and no second read of the same row.
+        self._ready_since: dict[str, tuple[str, float | None]] = {}
+        self._sweep_wake = asyncio.Event()
+        self._swept_at: float | None = None
         self._in_flight: set[str] = set()
         # Starts whose issue closed or lost its label since: a late refusal does not revive
         # them (#3006).
         self._unwanted_starts: set[str] = set()
         # Repositories the deck is filing a New work in right now, and how many (#3590).
         self._filing: dict[str, int] = {}
+        #: The filings a web worker holds from across the socket (#4016): each a hold with an
+        #: end time, so a web that dies mid-filing cannot hold starts for ever.
+        self.filing_holds: Callable[[str], bool] = lambda repository: False
         self._checks: set[asyncio.Task] = set()
-        self.reviewed = reviewed or ReviewedHeads(
-            Path(streams_root).expanduser().parent / STARTED_FILENAME
-        )
         self.pending = pending or PendingActions(
             Path(streams_root).expanduser().parent / PENDING_FILENAME
         )
-        # Kept apart from the reviewed heads, whose cap would drop them (#3731).
-        self.handed_over = ReviewedHeads(
-            Path(streams_root).expanduser().parent / HANDED_OVER_FILENAME
-        )
+        self.handed_over = KeyFile(Path(streams_root).expanduser().parent / HANDED_OVER_FILENAME)
+        for name in RETIRED_FILENAMES:
+            with contextlib.suppress(OSError):
+                (Path(streams_root).expanduser().parent / name).unlink(missing_ok=True)
         self._exists = exists
         self._clock = clock
         # The deck's own release (``work_release``, step 2): it hears verdicts, pull request
@@ -1181,6 +1098,7 @@ class WorkRouterService:
         self._release = release
         self._task: asyncio.Task | None = None
         self._retry_task: asyncio.Task | None = None
+        self._sweep_task: asyncio.Task | None = None
         self._stop = asyncio.Event()
 
     @property
@@ -1193,15 +1111,19 @@ class WorkRouterService:
         self._stop.clear()
         self._task = asyncio.create_task(self._run(), name="work-router")
         self._retry_task = asyncio.create_task(self._retry_loop(), name="work-router-retry")
+        if self._ready_pulls is not None:
+            self._sweep_task = asyncio.create_task(self._sweep_loop(), name="work-router-sweep")
 
     async def stop(self) -> None:
         for check in list(self._checks):
             check.cancel()
-        retry, self._retry_task = self._retry_task, None
-        if retry is not None:
-            retry.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await retry
+        for name in ("_retry_task", "_sweep_task"):
+            loop_task = getattr(self, name)
+            setattr(self, name, None)
+            if loop_task is not None:
+                loop_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await loop_task
         task, self._task = self._task, None
         if task is None:
             return
@@ -1220,6 +1142,13 @@ class WorkRouterService:
         return True
 
     async def _run(self) -> None:
+        # Under the consumer's lock (#4002): a second process starting it waits, rather than
+        # skipping history or reading the same deliveries alongside this one.
+        async with self._tailer.held(self._stop) as holding:
+            if holding:
+                await self._route()
+
+    async def _route(self) -> None:
         self.skip_history()
         while True:
             try:
@@ -1264,6 +1193,157 @@ class WorkRouterService:
                 log.exception("work-router: retrying pending actions failed")
                 await asyncio.sleep(failures.failed())
 
+    async def _sweep_loop(self) -> None:
+        """Run the ready-head backstop at start, after deliveries and at its deadlines (#3903).
+
+        Not a timer (ADR 0007): it wakes when a switched delivery or a registration lands,
+        once at start (a restart's catch-up), and when a ready head's grace runs out; at most
+        once per ``SWEEP_GAP_S`` however many deliveries wake it.
+        """
+        failures = Backoff()
+        while True:
+            self._sweep_wake.clear()
+            try:
+                deadline = await self.sweep_ready()
+                failures.succeeded()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("work-router: ready-head backstop failed")
+                await asyncio.sleep(failures.failed())
+                continue
+            wait = None if deadline is None else max(0.0, deadline - self._clock())
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self._sweep_wake.wait(), timeout=wait)
+            gap = SWEEP_GAP_S - (self._clock() - (self._swept_at or 0.0))
+            if gap > 0:
+                await asyncio.sleep(gap)
+
+    def wake_sweep(self) -> None:
+        """Have the backstop look again: cached pull request rows were rewritten (#3903)."""
+        self._sweep_wake.set()
+
+    def _history(self, pull: str) -> list[review_history.ReviewEvent]:
+        """``pull``'s review history at every head; none when unreadable."""
+        try:
+            return list(self._reviews(pull.lower()))
+        except Exception:  # noqa: BLE001 - unread: nothing asked, as with no history
+            log.warning("work-router: %s's review history unreadable", pull, exc_info=True)
+            return []
+
+    def _spent(self, pull: str, head: str, again: str = "") -> bool:
+        """Whether ``pull``'s review at ``head`` was asked for (under the request id ``again``,
+        when given) or needs none: a verdict, a carried or a no-code pass, stands there."""
+        return any(
+            (event.kind == review_history.ASKED and str(event.data.get("again") or "") == again)
+            or (not again and event.kind in review_history.VERDICTS)
+            for event in review_history.at_head(self._history(pull), head)
+        )
+
+    def _head_moving(self, pull: str, head: str) -> bool:
+        """Whether something already moves ``pull`` at ``head`` towards a verdict: a review
+        asked, answered or kept pending, this head's pre-review checklist sent or kept to
+        send while the agent's checklist waits, or the router on it right now."""
+        key = f"{pull}@{head}"
+        if (
+            key in self._in_flight
+            or f"review:{key}" in self.pending
+            or f"message:work-event:pre-review:{key}" in self.pending
+            or self._spent(pull, head)
+        ):
+            return True
+        events = self._history(pull)
+        sent = any(
+            event.kind == review_history.CHECKLIST and not event.data.get("covered")
+            for event in review_history.at_head(events, head)
+        )
+        return self.pre_review_on and sent and review_history.checklist_waits(events)
+
+    def _working_through(self, pull: str, owner: Owner) -> bool:
+        """Whether an older head's checklist waits while the Work's agent is mid-turn: it is
+        likely working through it and pushing fixes, which that checklist already covers (its
+        review reads the head current at ``pre-review-done``). Idle, the new head gets its own
+        checklist, as a ready press would send it (#3904 review)."""
+        if not self.pre_review_held(pull):
+            return False
+        try:
+            return bool(self._busy(_work_id(owner)))
+        except Exception:  # noqa: BLE001 - unknown: taken as idle, so nothing is left silent
+            return False
+
+    async def sweep_ready(self) -> float | None:
+        """Start what a missed or misread ready event left unstarted (#3903); the next deadline.
+
+        Every Work's registered pull request whose cached row is open and ready, at a head
+        with no checklist sent, no review asked or pending and no verdict, that stayed so for
+        ``READY_GRACE_S``: its head is read live once and acted on as a ready press would be
+        (``check_registered``): that head's checklist, or its review if the agent cleared it.
+        One that still has nothing moving it is stuck: an ``unstarted`` event in its history,
+        which the Work's card and page show until any later event at that head. A draft, a
+        closed one and a head already moving cost no GitHub read; neither does a ready one
+        inside its grace or already looked at.
+        """
+        self._swept_at = self._clock()
+        if self.reviewer_off or self._ready_pulls is None or self._ready_head is None:
+            return None
+        rows = list(self._ready_pulls())
+        now = self._clock()
+        seen: dict[str, tuple[str, float | None]] = {}
+        deadline: float | None = None
+        for repository, number, cached in rows:
+            repository, cached = repository.lower(), (cached or "").lower()
+            pull = f"{repository}#{number}"
+            if not cached or not self._switched(repository) or self._head_moving(pull, cached):
+                continue
+            owner = self._owner_of_pull(repository, number)
+            if owner is None or self._is_paused(owner) or self._finished(_work_id(owner)):
+                continue
+            if self._working_through(pull, owner):
+                # Looked at again once the turn may have ended; a local read, no GitHub one.
+                again = now + READY_GRACE_S
+                deadline = again if deadline is None else min(deadline, again)
+                continue
+            known, since = self._ready_since.get(pull, ("", now))
+            since = now if known != cached else since
+            seen[pull] = (cached, since)
+            if since is None:
+                continue  # read live already: the next row written for it is looked at afresh
+            due = since + READY_GRACE_S
+            if now < due:
+                deadline = due if deadline is None else min(deadline, due)
+                continue
+            try:
+                head = (await self._ready_head(repository, number) or "").lower()
+            except Exception:  # noqa: BLE001 - unreadable now: looked at again after the grace
+                log.warning("work-router: %s#%s unreadable", repository, number, exc_info=True)
+                seen[pull] = (cached, now)
+                retry = now + READY_GRACE_S
+                deadline = retry if deadline is None else min(deadline, retry)
+                continue
+            seen[pull] = (cached, None)
+            if not head or self._head_moving(pull, head):
+                # Turned back to draft, closed, or pushed to a head already moving: the cached
+                # row was behind.
+                continue
+            log.warning(
+                "work-router: %s ready at %s with no checklist or review; starting it", pull,
+                head[:12],
+            )
+            try:
+                await self._review(
+                    owner, Event(REVIEW, repository, number, True, head=head), checklist_again=True
+                )
+            except Exception:  # noqa: BLE001 - shown stuck; the other pull requests go on
+                log.warning("work-router: starting %s@%s failed", pull, head[:12], exc_info=True)
+            if not self._head_moving(pull, head):
+                # Shown stuck on the Work until any later event at that head (#3956).
+                self._note(
+                    pull, head, review_history.UNSTARTED, f"unstarted:{pull}@{head}@{now:.0f}"
+                )
+                log.warning("work-router: %s@%s still has no review started", pull, head[:12])
+        self._ready_since = seen
+        return deadline
+
     async def settle_without_reviewer(self) -> None:
         """Answer every review kept pending, at once, on a deck with no reviewer (#3849).
 
@@ -1293,7 +1373,7 @@ class WorkRouterService:
         for key, entry in due:
             if now - float(entry.get("since", now)) > PENDING_MAX_AGE_S:
                 log.warning("work-router: dropping %s, still not done after a day", key)
-                self._drop_pending(key)
+                self.pending.discard(key)
             elif entry.get("kind") == MESSAGE:
                 self._deliver(
                     ScheduledMessage(
@@ -1345,7 +1425,7 @@ class WorkRouterService:
         again = str(entry.get("again") or "")
         owner = self._owner_of_pull(repository, number) if isinstance(number, int) else None
         if owner is None or not head:
-            self._drop_pending(key)
+            self.pending.discard(key)
             return
         if self._ready_head is not None:
             try:
@@ -1358,16 +1438,16 @@ class WorkRouterService:
                 # Pushed past, turned back to draft or closed: this head is nobody's to review
                 # any more, and the current one (if ready) is asked for in its place. A request
                 # to ask again was about the old head only: the new one gets its own review.
-                self._drop_pending(key)
+                self.pending.discard(key)
                 if not current:
                     return
                 head, again = current, ""
                 entry = {}
-        if entry and self._passed_since(owner, repository, number, head, entry.get("since")):
+        if entry and self._passed_since(f"{repository}#{number}", head, entry.get("since")):
             # Kept while another review of this head ran, which then passed it (#3324): a
             # review now would only re-open a release that already waits for a person's Merge.
             log.info("work-router: %s passed since it was asked for; not reviewed", key)
-            self._drop_pending(key)
+            self.pending.discard(key)
             return
         note = str(entry.get("note") or "") if again else ""
         # Only the agent's own request reviews a diff an earlier head's review read (#3314).
@@ -1377,20 +1457,13 @@ class WorkRouterService:
             asked=bool(entry.get("asked")),
         )
 
-    def _passed_since(
-        self, owner: Owner, repository: str, number: int, head: str, since: object
-    ) -> bool:
-        """Whether the release recorded a pass of this head after ``since`` (#3324)."""
-        read = getattr(self._release, "passed_since", None)
-        if read is None or not isinstance(since, (int, float)):
+    def _passed_since(self, pull: str, head: str, since: object) -> bool:
+        """Whether ``pull``'s pass at ``head`` stands, dated ``since`` or later (#3324)."""
+        if not isinstance(since, (int, float)):
             return False
-        try:
-            return bool(read(_work_id(owner), f"{repository}#{number}", head, float(since)))
-        except Exception:  # noqa: BLE001 - unread: reviewed as asked
-            log.warning(
-                "work-router: could not read %s#%s's pass", repository, number, exc_info=True
-            )
-            return False
+        events = review_history.at_head(self._history(pull), head)
+        verdict = review_history.standing_verdict(events)
+        return review_history.passed(verdict) and verdict.at >= since
 
     def switched(self, repository: str) -> bool:
         """Whether ``repository``'s Works hear their own events: a poller manifest declares it."""
@@ -1422,6 +1495,8 @@ class WorkRouterService:
         for delivery in batch:
             if not self._switched(delivery.stream):
                 continue
+            # Any news from a switched repository is a reason for the backstop to look (#3903).
+            self._sweep_wake.set()
             await self._load_owner(delivery)
             settled = False
             if self._release is not None:
@@ -1463,14 +1538,18 @@ class WorkRouterService:
             if event.kind == CLOSE:
                 self._hold_close(delivery, owner, event)
                 continue
-            reviewed = (
-                event.kind == REVIEW
-                and f"{event.repository}#{event.number}@{event.head}" in self.reviewed
+            reviewed = event.kind == REVIEW and self._spent(
+                f"{event.repository}#{event.number}", event.head
             )
-            if event.kind == REVIEW and (event.confirm or reviewed):
+            if event.kind == REVIEW and (
+                event.confirm or reviewed or (event.explicit and self._checklist_waits(event))
+            ):
                 # A draft-looking push, or a ready event naming a head already reviewed while
                 # a push may be landing behind it (#2983): the live head decides, before a
-                # paused Work is resumed for it.
+                # paused Work is resumed for it. So does a ready press while a checklist
+                # waits: pushed and marked ready at once, GitHub names the old head in it and
+                # the new one only in the push after, which the waiting checklist keeps
+                # quiet (#3896).
                 head = await self._live_ready_head(event.repository, event.number)
                 if not head:
                     continue
@@ -1501,7 +1580,7 @@ class WorkRouterService:
                     except Exception:  # noqa: BLE001 - a stale wait times out on its own
                         log.warning("work-router: ending review waits failed", exc_info=True)
                 if sent and event.verdict:
-                    await self._note_answered(event, owner)
+                    await self._note_answered(delivery, event, owner)
                 if event.comment_id:
                     self._background(
                         self._ack(event.repository, event.comment_id), "work-router-ack"
@@ -2015,6 +2094,8 @@ class WorkRouterService:
                 )
                 log.info("work-router: unreadable verdict on %s#%s: %s", repository, number, answer)
                 return False
+            # Dated by the comment itself, so a verdict delivered late is not the newest (#3957).
+            posted = _when(_text(comment.get("created_at")))
             # One verdict line per pull request, in one comment, each taken on its own (#3161).
             settled = True
             for command in commands:
@@ -2024,7 +2105,14 @@ class WorkRouterService:
                 # still merges.
                 work_id = _work_id(owner)
                 answer = await release.on_verdict(
-                    work_id, command.verdict, command.head, command.digest, targets, by=login
+                    work_id,
+                    command.verdict,
+                    command.head,
+                    command.digest,
+                    targets,
+                    by=login,
+                    source=f"comment:{comment.get('id')}" if comment.get("id") else "",
+                    at=posted.timestamp() if posted is not None else None,
                 )
                 log.info("work-router: verdict on %s#%s: %s", repository, number, answer)
                 settled = settled and verdict_settled(str(answer or ""))
@@ -2050,14 +2138,16 @@ class WorkRouterService:
         elif delivery.event == "status" and _text(payload.get("state")).lower() != "pending":
             # Drone's results arrive as commit statuses, which name a commit (#3019).
             await release.on_status(repository, _text(payload.get("sha")).lower())
-        elif delivery.event == "check_suite" and action == "completed":
-            suite = payload.get("check_suite")
+        elif delivery.event in {"check_suite", "check_run"} and action == "completed":
+            # A finished run too, not only its suite: GitHub can send the suite's ``completed``
+            # before the rollup reads its last run done (#3911).
+            suite = payload.get(delivery.event)
             pulls = suite.get("pull_requests") if isinstance(suite, dict) else None
             for item in pulls if isinstance(pulls, list) else ():
                 number = item.get("number") if isinstance(item, dict) else None
                 owner = self._owner_of_pull(repository, number) if isinstance(number, int) else None
                 if owner is not None:
-                    await release.evaluate(_work_id(owner))
+                    await release.on_checks_done(_work_id(owner))
         return False
 
     async def _maybe_start(self, delivery: Delivery) -> None:
@@ -2115,7 +2205,8 @@ class WorkRouterService:
         self, delivery: Delivery, repository: str, number: int, names: list[str], assignee: str
     ) -> None:
         """Start a Work a label or an assignment delivery asks for, unless a filing holds it."""
-        if self._filing.get(repository) and not delivery.delivery_id.startswith("deck-filed:"):
+        filing = self._filing.get(repository) or self.filing_holds(repository)
+        if filing and not delivery.delivery_id.startswith("deck-filed:"):
             # The deck may be filing this very issue with its agent already running (#3590):
             # tried again after the back-off, by when that start has spent the Work's. A New
             # work filed with its assignee (#3731) sends an assignment delivery too.
@@ -2384,6 +2475,7 @@ class WorkRouterService:
         """
         if not self._enabled or self._ready_head is None or not self._switched(repository):
             return
+        self._sweep_wake.set()
         check = asyncio.create_task(
             self.check_registered(repository, number), name="work-router-registered"
         )
@@ -2412,9 +2504,14 @@ class WorkRouterService:
             return False
         if not head:
             return True
-        await self._review(owner, Event(REVIEW, repository, number, True, head=head))
-        key = f"{repository}#{number}@{head}"
-        return key in self.reviewed or f"review:{key}" in self.pending
+        # A registration is a deliberate look, like a ready press: a new head gets its own
+        # checklist even while an older one waits, so a missed ready event is not silent (#3896).
+        await self._review(
+            owner, Event(REVIEW, repository, number, True, head=head), checklist_again=True
+        )
+        pull = f"{repository}#{number}"
+        held = self.pre_review_held(pull)
+        return self._spent(pull, head) or f"review:{pull}@{head}" in self.pending or held
 
     def _verdict_pulls(self, event: Event, owner: Owner) -> list[str] | None:
         """The pull requests a verdict is about: the one it was posted on, else the Work's own
@@ -2456,55 +2553,23 @@ class WorkRouterService:
                 " starts on its own once the open review chat closes; keep waiting for its"
                 " verdict"
             )
-        prefix, exclude, limit = _cap(key, no_verdict)
-        if self.reviewed.count(prefix, exclude) >= limit:
+        asks = [
+            event
+            for event in review_history.at_head(self._history(f"{repository}#{number}"), head)
+            if event.kind == review_history.ASKED
+            and str(event.data.get("again") or "")
+            and bool(event.data.get("no_verdict")) == no_verdict
+        ]
+        if len(asks) >= (MAX_NO_VERDICT if no_verdict else MAX_AGAIN):
             return _cap_refusal(repository, number, head, no_verdict)
         return ""
-
-    def _reserve_again(self, event: Event, head: str, again: str) -> str:
-        """Take one of the head's ``MAX_AGAIN`` places for this ask, or say why not (#3183).
-
-        The place is held as ``<key>+<id>?`` from now on and written down as pending, so it is
-        counted against the cap even by another web worker, and the ask is retried rather than
-        lost if its start does not happen now. ``_review`` turns it into the started key.
-        """
-        key = f"{event.repository}#{event.number}@{head}"
-        # The retry first, then the place (operator's choice on #3183): a crash between the two
-        # leaves a retry that may run one review past the cap, never a place with no review.
-        self.pending.put(
-            f"review:{key}+{again}",
-            {
-                "kind": REVIEW,
-                "repository": event.repository,
-                "number": event.number,
-                "head": head,
-                "again": again,
-                "note": event.note if again else "",
-            },
-            self._clock(),
-        )
-        no_verdict = again.startswith(NO_VERDICT)
-        prefix, exclude, limit = _cap(key, no_verdict)
-        if not self.reviewed.reserve(prefix, limit, f"{key}+{again}{RESERVED}", exclude):
-            self.pending.discard(f"review:{key}+{again}")
-            return _cap_refusal(event.repository, event.number, head, no_verdict)
-        return ""
-
-    def _drop_pending(self, key: str) -> None:
-        """Give up a pending action; an ask's place under the cap goes with it (#3183).
-
-        Its review never started, so the place it held is freed, and a later ask can use it.
-        """
-        self.pending.discard(key)
-        if key.startswith("review:") and "+" in key:
-            self.reviewed.discard(key.removeprefix("review:") + RESERVED)
 
     async def _ready_again(
         self, delivery: Delivery, owner: Owner, repository: str, number: int, head: str
     ) -> None:
         """Answer a ready press at a head a review was already asked for, in four ways (#3584).
 
-        ``reviewed`` only says a review was asked for, not that a verdict came: told "already
+        An ``asked`` event only says a review was asked for, not that a verdict came: told "already
         reviewed" while its review still ran or had ended with nothing, workers waited for a
         review that never came, or toggled draft and ready again. In order: the head passed;
         a verdict with findings answered it; its review chat is still open (or unknown: a
@@ -2518,11 +2583,11 @@ class WorkRouterService:
         if self.reviewer_off:
             self._send_refusal(delivery, owner, REVIEWER_OFF_TEXT)
             return
-        if self._passed_since(owner, repository, number, head, 0.0):
+        if self._passed_since(pull, head, 0.0):
             # The head already passed (#3341): there is nothing to ask again.
             self._send_refusal(delivery, owner, f"{at} already has a review pass")
             return
-        if self.reviewed.answered(pull, head):
+        if review_history.answered(self._history(pull), head):
             self._send_refusal(
                 delivery,
                 owner,
@@ -2650,12 +2715,11 @@ class WorkRouterService:
                 f"{pull} is not open and ready for review (a draft, closed, or unreadable now):"
                 " mark it ready with `gh pr ready` instead"
             )
-        key = f"{pull}@{head}"
         why = self._again_refusal(repository, number, head, no_verdict=no_verdict)
         if why:
             raise AgainRefused(why)
         kind = NO_VERDICT if no_verdict else ""
-        again = kind + secrets.token_hex(6) if key in self.reviewed else ""
+        again = kind + secrets.token_hex(6) if self._spent(pull, head) else ""
         if again and not note.strip():
             # The note is the only thing that tells the reviewer what changed at a commit it
             # already reviewed; without one the new chat reads as a duplicate (#3344).
@@ -2663,28 +2727,25 @@ class WorkRouterService:
                 f"{pull} at {head[:12]} was already reviewed: say in the note what changed"
                 " since (a person's decision, a posted walkthrough)"
             )
-        if again:
-            asked = Event(REVIEW, repository, number, True, head=head, again=again, note=note)
-            why = self._reserve_again(asked, head, again)
-            if why:
-                raise AgainRefused(why)
+        # Its ``asked`` event ends a checklist still waiting (#3933), so the Work page does not
+        # say it waits on it for good.
         await self._review(
             owner,
             Event(REVIEW, repository, number, True, head=head, again=again, note=note),
             asked=True,
         )
-        spent = f"{key}+{again}" if again else key
         return {
             "pull_request": pull,
             "head": head,
             "again": bool(again),
-            "outcome": "asked" if spent in self.reviewed else "pending",
+            "outcome": "asked" if self._spent(pull, head, again) else "pending",
         }
 
-    async def _note_answered(self, event: Event, owner: Owner) -> None:
+    async def _note_answered(self, delivery: Delivery, event: Event, owner: Owner) -> None:
         """Write down that findings or an escalation answered the review of each pull request
-        they are about, at its live head when that head was sent for review and the text
-        names its commit id and no other head sent for review (#3828 review).
+        they are about, as a ``findings`` or ``escalated`` event at its live head, when that
+        head was sent for review and the text names its commit id and no other head sent for
+        review (#3828 review).
 
         Only such a head may pass on the owner's acceptance (``accept``): the review was
         asked for and came back with something for the owner to accept. Findings about an
@@ -2695,6 +2756,10 @@ class WorkRouterService:
         named = {token.lower() for token in _SHA_RE.findall(event.text)}
         if not named:
             return
+        # Dated by the comment itself, so a late delivery is not the newest (#3957), and sent:
+        # this runs only once its message was stored.
+        comment = delivery.payload.get("comment")
+        posted = _when(_text(comment.get("created_at"))) if isinstance(comment, dict) else None
         pulls = self._verdict_pulls(event, owner)
         if pulls is None:
             read = getattr(getattr(self._release, "ports", None), "pulls", None)
@@ -2714,17 +2779,21 @@ class WorkRouterService:
             # Exactly one head sent for review named, the live one (owner's decision on the
             # second #3828 escalation): text about an older head that mentions the new one
             # in passing names two, and marks nothing.
-            sent = self.reviewed.heads(f"{repository}#{number}")
-            judged = {item for item in sent if any(item.startswith(t) for t in named)}
-            if judged == {head}:
-                self.reviewed.note_verdict(f"{repository}#{number}", head)
+            pull = f"{repository}#{number}"
+            asked = {e.head for e in self._history(pull) if e.kind == review_history.ASKED}
+            if {item for item in asked if any(item.startswith(t) for t in named)} == {head}:
+                escalated = ESCALATED_ASK in event.text
+                kind = review_history.ESCALATED if escalated else review_history.FINDINGS
+                at = posted.timestamp() if posted is not None else None
+                key = f"answered:{delivery.delivery_id}:{pull}"
+                self._note(pull, head, kind, key, at=at, data={"told": True})
 
     async def accept(self, repository: str, number: int, note: str) -> dict:
         """Count the review of the pull request's ready head as a pass, because the owner
         accepted its findings with no code change (#3828).
 
         Only at a head whose review came back with findings or an escalation
-        (``ReviewedHeads.answered``), so no diff the reviewer never finished passes this way.
+        (``review_history.answered``), so no diff the reviewer never finished passes this way.
         Raises ``AgainRefused`` with the reason otherwise; answers the release's ``outcome``
         (``review pass recorded for …``).
         """
@@ -2741,7 +2810,7 @@ class WorkRouterService:
                 f"{pull} is not open and ready for review (a draft, closed, or unreadable now):"
                 " mark it ready with `gh pr ready` first"
             )
-        if f"{pull}@{head}" not in self.reviewed or not self.reviewed.answered(pull, head):
+        if not review_history.answered(self._history(pull), head):
             # Asked for is not answered (#3828 review): a review still running has returned
             # nothing the owner could have accepted.
             raise AgainRefused(
@@ -2884,10 +2953,13 @@ class WorkRouterService:
             return ""
         if not re.fullmatch(r"[0-9a-f]{64}", digest):
             return ""
-        before, known = self.reviewed.last_digest(pull)
+        events = self._history(pull)
+        before, known = review_history.last_digest(events)
         if not skip or not known or known != digest or before == head.lower():
             return digest
-        if not self.reviewed.answered(pull, before):
+        # Its standing verdict only: one a review was asked for again after is still awaited.
+        verdict = review_history.standing_verdict(review_history.at_head(events, before))
+        if verdict is None:
             # Its review has not come back (#3314 review): still running, failed or never
             # started. No verdict stands yet, so the new head is reviewed as any other.
             return digest
@@ -2905,7 +2977,10 @@ class WorkRouterService:
         if not proven:
             return digest
         key = f"{pull}@{head}"
-        self.reviewed.note_digest(pull, head, digest, carried_from=before)
+        # Written as the head's own verdict, copied from the one it keeps: so the head needs no
+        # review, and a later base merge of it compares with this digest.
+        data = {**verdict.data, "digest": digest, "carried_from": before}
+        self._note(pull, head, verdict.kind, f"carried:{key}", data=data)
         now = datetime.now(UTC)
         delivered = self._deliver(
             ScheduledMessage(
@@ -2928,7 +3003,6 @@ class WorkRouterService:
             # No verdict will come for this head, so the chat's wait on one ends here.
             with contextlib.suppress(Exception):
                 self._on_verdict(owner[0], [pull])
-        self.reviewed.add(key)
         self.pending.discard(f"review:{key}")
         log.info("work-router: %s has %s's diff; not reviewed again", key, before[:12])
         return ""
@@ -2959,7 +3033,7 @@ class WorkRouterService:
         if head.startswith(old) or old.startswith(head):
             if not event.explicit:
                 return False
-        elif not self.reviewed.same_change(pull, head, old):
+        elif not review_history.same_change(self._history(pull), head, old):
             try:
                 proven = self._no_code is not None and bool(
                     await self._no_code(event.repository, event.number, old, head, before)
@@ -2979,24 +3053,20 @@ class WorkRouterService:
         log.info("work-router: %s@%s answers its no-code review: %s", pull, head[:12], answer)
         if not answer.startswith(PASS_RECORDED):
             return False
-        key = f"{pull}@{head}"
-        if self._digest is not None and not head.startswith(old):
-            # So a later base merge of this head is not reviewed either (#3314).
-            with contextlib.suppress(Exception):
-                digest = (await self._digest(pull, head) or "").lower()
-                if re.fullmatch(r"[0-9a-f]{64}", digest):
-                    self.reviewed.note_digest(pull, head, digest, carried_from=old)
-        self.reviewed.add(key)
-        self.pending.discard(f"review:{key}")
+        # Its pass, in the history with the head's digest, is what spends the head.
+        self.pending.discard(f"review:{pull}@{head}")
         return True
 
-    async def _review(self, owner: Owner, event: Event, *, asked: bool = False) -> None:
+    async def _review(
+        self, owner: Owner, event: Event, *, asked: bool = False, checklist_again: bool = False
+    ) -> None:
         """Start the review of ``event``'s head. ``asked`` is the agent's own request, which
-        reviews even a diff an earlier head's review read (#3314)."""
+        reviews even a diff an earlier head's review read (#3314). ``checklist_again`` sends a
+        new head its own checklist while an older head's waits, as a ready press does."""
         pull = f"{event.repository}#{event.number}"
         key = f"{pull}@{event.head}" + (f"+{event.again}" if event.again else "")
         pending_key = f"review:{key}"
-        if key in self.reviewed:
+        if self._spent(pull, event.head, event.again):
             self.pending.discard(pending_key)
             return
         if key in self._in_flight:
@@ -3004,11 +3074,11 @@ class WorkRouterService:
         if self.reviewer_off:
             # Nothing pending, nothing reviewed (#3849): kept, it was retried for a day while
             # every later ask heard "already asked, keep waiting".
-            self._drop_pending(pending_key)
+            self.pending.discard(pending_key)
             self._tell_no_reviewer(owner, pull, event.head)
             return
         # In memory while it runs, so a registration check and an event for the same head
-        # never ask twice; on disk only once it returned (see ``ReviewedHeads``).
+        # never ask twice; in the history only once it returned (``_note_asked``).
         self._in_flight.add(key)
         try:
             digest = ""
@@ -3016,11 +3086,114 @@ class WorkRouterService:
                 return
             if not event.again:
                 digest = await self._unchanged(owner, pull, event.head, skip=not asked)
-                if not digest and key in self.reviewed:
+                if not digest and self._spent(pull, event.head):
                     return
+            if (
+                self.pre_review_on
+                and not asked
+                and not event.again
+                and self._held_for_checklist(
+                    owner, pull, event, again=event.explicit or checklist_again
+                )
+            ):
+                return
             await self._ask_reviewer(owner, event, pull, key, digest, asked=asked)
         finally:
             self._in_flight.discard(key)
+
+    def _held_for_checklist(
+        self, owner: Owner, pull: str, event: Event, *, again: bool = False
+    ) -> bool:
+        """Whether the review of ``event``'s head waits on the agent's pre-review (#3880).
+
+        The first ready head sends the checklist and opens the hold; a push while it is open
+        sends nothing more. Marking it ready again at a new head (turned back to draft and
+        pushed), or registering it again (``again``), sends that head's checklist, so the one for
+        an older head never leaves it silent (#3896); the same head's is absorbed by its message
+        id. A head the agent cleared goes on to review.
+        """
+        events = self._history(pull)
+        if any(
+            item.kind == review_history.CHECKLIST_DONE
+            for item in review_history.at_head(events, event.head)
+        ):
+            return False
+        # Nothing to retry while the agent works through it: ``pre_review_done`` asks.
+        self.pending.discard(f"review:{pull}@{event.head}")
+        if review_history.checklist_waits(events) and not again:
+            covered = f"checklist-covered:{pull}@{event.head}"
+            self._note(pull, event.head, review_history.CHECKLIST, covered, data={"covered": True})
+            return True
+        now = datetime.now(UTC)
+        policy = f" The reviewer's full rules: {self._review_policy}" if self._review_policy else ""
+        text = PRE_REVIEW_TEXT.format(pull=pull, short=event.head[:12], policy=policy)
+        # A row the store refuses is kept pending and sent later by ``_deliver`` itself.
+        self._deliver(
+            ScheduledMessage(
+                id=f"work-event:pre-review:{pull}@{event.head}",
+                chat_id=owner[0],
+                text=text,
+                due_at=now,
+                created_at=now,
+            )
+        )
+        # The hold is this event: it waits until a checklist-done or an ask follows it.
+        self._note(
+            pull, event.head, review_history.CHECKLIST, f"work-event:pre-review:{pull}@{event.head}"
+        )
+        log.info("work-router: %s@%s waits on its pre-review", pull, event.head)
+        return True
+
+    def _checklist_waits(self, event: Event) -> bool:
+        """Whether ``event``'s pull request has a pre-review checklist waiting (#3896)."""
+        return self.pre_review_held(f"{event.repository}#{event.number}")
+
+    def pre_review_held(self, pull: str) -> bool:
+        """Whether ``owner/repo#n``'s review waits on its agent's checklist (#3880 review)."""
+        return self.pre_review_on and review_history.checklist_waits(self._history(pull))
+
+    async def pre_review_done(self, repository: str, number: int) -> dict:
+        """The agent went through the pre-review checklist (#3880): review the pull request's
+        ready head now, and register the chat's wait on its verdict.
+
+        Raises ``AgainRefused`` with the reason when it is not ready, or its ready head was
+        already asked about. Answers ``asked``, ``pending`` (the start is retried on its own)
+        or ``not reviewed`` (its diff was already reviewed, and the chat was told so).
+
+        A ready head nobody asked about is asked about even with no checklist waiting: a
+        reload that cut off an earlier call between dropping the hold and asking (#3893), or a
+        ready event the deck never acted on (#3896), left it so, and the agent says it went
+        through the checklist.
+        """
+        repository = repository.lower()
+        pull = f"{repository}#{number}"
+        owner = self._owner_of_pull(repository, number)
+        if owner is None:
+            raise AgainRefused(f"no Work's chat registered {pull}")
+        head = await self._live_ready_head(repository, number)
+        if not head:
+            raise AgainRefused(
+                f"{pull} is not open and ready for review (a draft, closed, or unreadable now):"
+                " mark it ready with `gh pr ready`, then call this again"
+            )
+        key = f"{pull}@{head}"
+        if self._spent(pull, head):
+            # The agent's own review request asked first (#3933), and its ask ended the hold.
+            raise AgainRefused(
+                f"no pre-review checklist waits for {pull}: a review of {head[:12]} was already"
+                " asked for, and its verdict comes to this chat; push a fix and mark it ready"
+                " for the next one"
+            )
+        self._note(pull, head, review_history.CHECKLIST_DONE, f"checklist-done:{key}")
+        await self._review(owner, Event(REVIEW, repository, number, True, head=head))
+        if self._spent(pull, head):
+            outcome = "asked"
+        elif f"review:{key}" in self.pending:
+            outcome = "pending"
+        else:
+            return {"pull_request": pull, "head": head, "outcome": "not reviewed"}
+        waits = self._wait_on_review(owner, pull, asked=True)
+        return {"pull_request": pull, "head": head, "outcome": outcome, "waiting": bool(waits)}
 
     async def _ask_reviewer(
         self, owner: Owner, event: Event, pull: str, key: str, digest: str, *, asked: bool
@@ -3048,7 +3221,7 @@ class WorkRouterService:
             log.info("work-router: review of %s is busy; kept pending", key)
         except ReviewOff:
             # No reviewer at all (#3849): it never starts, so nothing is kept to retry.
-            self._drop_pending(pending_key)
+            self.pending.discard(pending_key)
             self._tell_no_reviewer(owner, pull, event.head)
         except ReviewError as exc:
             # Refused before anything was written (``open_review`` finds the open chat
@@ -3057,9 +3230,8 @@ class WorkRouterService:
             log.warning("work-router: review of %s refused: %s; kept pending", key, exc)
         except Exception:  # noqa: BLE001 - one review that could not start must not stop routing
             # It may have written and pressed: spent, as an uncertain start always is.
-            self.reviewed.add(key)
-            self.reviewed.discard(key + RESERVED)
             self.pending.discard(pending_key)
+            self._note_asked(pull, event, digest, uncertain=True)
             log.warning("work-router: review of %s could not start", key, exc_info=True)
         else:
             if not covers(outcome, pull, event.head):
@@ -3069,11 +3241,18 @@ class WorkRouterService:
                 self.pending.put(pending_key, retry, self._clock())
                 log.info("work-router: %s left an older chat open; kept pending", key)
                 return
-            self.reviewed.note_digest(pull, event.head, digest)
-            self.reviewed.add(key)
-            self.reviewed.discard(key + RESERVED)
             self.pending.discard(pending_key)
+            self._note_asked(pull, event, digest)
             log.info("work-router: review of %s asked for (Work %s)", key, work)
+
+    def _note_asked(self, pull: str, event: Event, digest: str, *, uncertain: bool = False) -> None:
+        """The ``asked`` event of ``event``'s head (#3957), once per ask-again request."""
+        data = {"digest": digest, "again": event.again, "note": event.note}
+        data.update(no_verdict=event.again.startswith(NO_VERDICT), uncertain=uncertain)
+        # A head is asked once (``_spent``) unless asked again under a request id (#3344), so
+        # the head and that id name one ask; its retry or a replay writes nothing new.
+        key = f"asked:{pull}@{event.head}+{event.again}"
+        self._note(pull, event.head, review_history.ASKED, key, data=data)
 
 
 class AgainRefused(ValueError):
@@ -3099,13 +3278,6 @@ def _review_ended(row, now: float) -> bool:
     else:
         return False
     return age is not None and age >= STOP_SETTLE_S
-
-
-def _cap(key: str, no_verdict: bool) -> tuple[str, str, int]:
-    """``(prefix, exclude, limit)`` of the asks again of ``key`` of one kind (#3453)."""
-    if no_verdict:
-        return f"{key}+{NO_VERDICT}", "", MAX_NO_VERDICT
-    return f"{key}+", f"{key}+{NO_VERDICT}", MAX_AGAIN
 
 
 def _cap_refusal(repository: str, number: int, head: str, no_verdict: bool) -> str:
@@ -3245,14 +3417,33 @@ def work_pulls(state, work_id: str) -> tuple[str, ...]:
     """Every pull request registered for this Work, as ``owner_of_pull`` places it.
 
     The release's set: a pull request counts for the Work its registering chat joined, never
-    by what its body says. Lowercased ``owner/repo#n``.
+    by what its body says. Lowercased ``owner/repo#n``. One walk of the whole deck
+    (``pulls_by_work``): a caller asking about many Works takes ``pulls_lookup`` instead.
+    """
+    return pulls_lookup(state)(work_id)
+
+
+def pulls_lookup(state) -> Callable[[str], tuple[str, ...]]:
+    """``work_pulls`` for any Work, from one walk of the deck taken now (#3993).
+
+    A commit status asks about every Work the release keeps; calling ``work_pulls`` for each
+    of almost a thousand walked thousands of registrations each time and held the web event
+    loop for a minute per status.
+    """
+    placed = pulls_by_work(state)
+    return lambda work_id: placed.get(work_id.partition(":")[2].lower(), ())
+
+
+def pulls_by_work(state) -> dict[str, tuple[str, ...]]:
+    """Each Work's registered pull requests, keyed by lowercased ``owner/repo#n`` of the Work.
 
     One walk of the registrations and one Work projection for the whole deck (#2954): asking
     ``owner_of_pull`` for each of thousands of registered pull requests walked them all again
-    and rebuilt the projection's key every time, and the release asks every couple of seconds
-    while a job runs, holding the event loop for seconds each time.
+    and rebuilt the projection's key every time.
     """
-    wanted = work_id.partition(":")[2].lower()
+    from . import work_counter
+
+    work_counter.count(work_counter.PULL_WALK)
     legs_by_pull: dict[tuple[str, int], dict[str, str]] = {}
     for leg, refs in tuple(state.session_pull_requests.items()):
         for ref in refs:
@@ -3265,12 +3456,12 @@ def work_pulls(state, work_id: str) -> tuple[str, ...]:
             projected = state.work_projection()
         return projected
 
-    found: set[str] = set()
+    found: dict[str, set[str]] = {}
     for (repository, number), legs in legs_by_pull.items():
         owner = _place_pull(state, legs, projection)
-        if owner is not None and owner[1].lower() == wanted:
-            found.add(f"{repository}#{number}")
-    return tuple(sorted(found))
+        if owner is not None:
+            found.setdefault(owner[1].lower(), set()).add(f"{repository}#{number}")
+    return {work: tuple(sorted(pulls)) for work, pulls in found.items()}
 
 
 def work_busy(state, work_id: str) -> bool:

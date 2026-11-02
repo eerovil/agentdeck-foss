@@ -25,7 +25,8 @@
 //    projects persist in localStorage under
 //    `agentdeck-front-hidden-projects` as `{project: true}`. Like folding it is a generated
 //    stylesheet, so a pushed row is hidden before it paints; the group headers, their NEW
-//    pills and the counts line are then recounted without the hidden rows.
+//    pills and the counts line are then recounted without the hidden rows, and the All Works
+//    links (`data-all-works`) open the list on the one project shown alone (#3873).
 // 3. The deck chat can switch the tabs on every open page (#3814, `view_commands.py`): its
 //    command arrives as a `view` event in the top bar's hidden slot.
 (function () {
@@ -305,6 +306,19 @@
     if (!document.body || !document.body.classList.contains('front-page')) return;
     recountProjects(hidden);
     projectTabs(hidden);
+    allWorksLinks();
+  }
+
+  // The All Works links open the list on the project the tabs show alone (#3873); All, or
+  // several projects held together, open it whole. The count-bearing "more active" and
+  // "quiet" links count every project, so they stay whole.
+  function allWorksLinks() {
+    if (!document.body || !document.body.classList.contains('front-page')) return;
+    var project = onlyProject();
+    var href = project ? '/works?project=' + encodeURIComponent(project) : '/works';
+    Array.prototype.forEach.call(document.querySelectorAll('.front-page a[data-all-works]'), function (link) {
+      if (link.getAttribute('href') !== href) link.setAttribute('href', href);
+    });
   }
 
 
@@ -450,6 +464,14 @@
   // parsed, so a folded group or a hidden project is never painted first and hidden after.
   apply();
   window.AgentDeckFront = {apply: apply, onlyProject: onlyProject};
+  // A live push redraws the links with a plain `/works`, so each one is set again as it is
+  // reached for, by press, keyboard or a long-press's open in new tab, as well as after a swap.
+  ['pointerdown', 'focusin', 'click'].forEach(function (type) {
+    document.addEventListener(type, function (e) {
+      if (e.target && e.target.closest && e.target.closest('a[data-all-works]')) allWorksLinks();
+    }, true);
+  });
+  document.addEventListener('htmx:sseMessage', allWorksLinks);
   document.addEventListener('DOMContentLoaded', apply);
   document.addEventListener('htmx:afterSwap', apply);
   // A desktop Work or chat page mounts the front page beside itself after loading (#3114).

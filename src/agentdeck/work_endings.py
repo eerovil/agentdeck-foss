@@ -4,8 +4,9 @@ A Work the deck runs itself rests in one of a few states, each with an owner: a 
 the question box (the person), a wake-on or a test run (an event), a ready pull request (the
 reviewer, which the deck starts by itself), a reviewed and tested one (the person's Merge), or
 a closed issue. A turn that ends in none of them — the agent forgot to close the issue, asked
-in plain text, or only reported — used to rest as "Stopped" in Needs answer, where it asked a
-person for nothing in particular. That is the agent ending its turn wrongly, never a state.
+in plain text anywhere but its last paragraph (#3887), or only reported — used to rest as
+"Stopped" in Needs answer, where it asked a person for nothing in particular. That is the
+agent ending its turn wrongly, never a state.
 
 So the deck asks once: one message to the Work's chat, naming the ways to end a turn. If the
 answering turn ends the same way, or nothing starts within ``work_derived.NUDGE_GRACE``, the
@@ -38,8 +39,9 @@ STORE_FILENAME = "work-endings.json"
 NUDGE_TEXT = (
     "AgentDeck: your last turn on {ref} ended without a next step, so the Work has nothing to"
     " wait on. End every turn in one of these ways:\n"
-    "- you need a person's decision: ask it in the question box (your structured question"
-    " tool), not in the text of your reply;\n"
+    "- you need a person's decision: a pick between named options goes in the question box"
+    " (your structured question tool); an open question goes as the last paragraph of your"
+    " reply;\n"
     "- you wait on CI, a merge or a deploy: register a wake-on for it;\n"
     "- you wait on long local work (a render, a long build): run it as an `agentdeck job`,"
     " which wakes you when it ends, or register a time wait (a wake-on with"

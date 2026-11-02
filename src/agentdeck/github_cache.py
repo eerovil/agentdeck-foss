@@ -20,12 +20,19 @@ import sqlite3
 import threading
 import time
 import uuid
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 log = logging.getLogger(__name__)
+
+# One writer at a time per cache file within this process, keyed by its resolved path.
+_WRITE_LOCKS: dict[Path, threading.Lock] = {}
+_WRITE_LOCKS_GUARD = threading.Lock()
+# A row read that failed, as against a row that is absent.
+_UNREAD = object()
 
 
 @dataclass(frozen=True)
@@ -96,6 +103,8 @@ class GitHubMetadataCache:
         ).expanduser()
         self._locks: dict[str, asyncio.Lock] = {}
         self._connections = threading.local()
+        with _WRITE_LOCKS_GUARD:
+            self._write_lock = _WRITE_LOCKS.setdefault(self.path.resolve(), threading.Lock())
         self._prepare()
 
     def _connect(self) -> sqlite3.Connection:
@@ -121,6 +130,23 @@ class GitHubMetadataCache:
         self._connections.handle = connection
         return connection
 
+    @contextmanager
+    def _writing(self) -> Iterator[None]:
+        """Queue this process's writers to the file before SQLite sees them (#3914).
+
+        Since #3739 a resolve's claims and stores run on several worker threads at once,
+        each on its own connection, so they met only in SQLite's busy handler. Under load
+        one commit outlasted the other's two-second busy timeout, and that write was
+        lost. Waiting here is bounded by the same timeout; past it the write goes on to
+        SQLite, which still decides, so a caller never waits longer than twice that.
+        """
+        acquired = self._write_lock.acquire(timeout=2.0)
+        try:
+            yield
+        finally:
+            if acquired:
+                self._write_lock.release()
+
     def _discard_connection(self) -> None:
         """Throw this thread's handle away after a SQLite error.
 
@@ -140,7 +166,7 @@ class GitHubMetadataCache:
     def _prepare(self) -> None:
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            with self._connect() as connection:
+            with self._writing(), self._connect() as connection:
                 connection.execute(
                     """
                     CREATE TABLE IF NOT EXISTS github_metadata_v1 (
@@ -320,7 +346,7 @@ class GitHubMetadataCache:
         """
         try:
             payload = json.dumps(metadata.value, separators=(",", ":"), sort_keys=True)
-            with self._connect() as connection:
+            with self._writing(), self._connect() as connection:
                 connection.execute(
                     """
                     INSERT INTO github_metadata_v1
@@ -348,7 +374,7 @@ class GitHubMetadataCache:
         """
         try:
             payload = json.dumps(value, separators=(",", ":"), sort_keys=True)
-            with self._connect() as connection:
+            with self._writing(), self._connect() as connection:
                 cursor = connection.execute(
                     "UPDATE github_metadata_v1 SET payload = ? WHERE key = ? AND fetched_at > 0",
                     (payload, key),
@@ -366,7 +392,7 @@ class GitHubMetadataCache:
         the row would leave its readers with nothing meanwhile. A terminal row too, whose day
         long TTL would otherwise hold the old value. A key with no row is left absent."""
         try:
-            with self._connect() as connection:
+            with self._writing(), self._connect() as connection:
                 cursor = connection.execute(
                     "UPDATE github_metadata_v1 SET fetched_at = 1 WHERE key = ? AND fetched_at > 1",
                     (key,),
@@ -385,7 +411,7 @@ class GitHubMetadataCache:
         them keeps the next read on the ordinary miss path, lease and all.
         """
         try:
-            with self._connect() as connection:
+            with self._writing(), self._connect() as connection:
                 cursor = connection.execute(
                     "DELETE FROM github_metadata_v1 WHERE key LIKE ? ESCAPE '\\'",
                     (prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
@@ -407,7 +433,7 @@ class GitHubMetadataCache:
         ignore_backoff: bool = False,
     ) -> tuple[str | None, GitHubLookup]:
         try:
-            with self._connect() as connection:
+            with self._writing(), self._connect() as connection:
                 connection.execute("BEGIN IMMEDIATE")
                 row = connection.execute(
                     """
@@ -461,7 +487,7 @@ class GitHubMetadataCache:
     ) -> bool:
         try:
             payload = json.dumps(metadata.value, separators=(",", ":"), sort_keys=True)
-            with self._connect() as connection:
+            with self._writing(), self._connect() as connection:
                 cursor = connection.execute(
                     """
                     UPDATE github_metadata_v1 SET
@@ -471,6 +497,65 @@ class GitHubMetadataCache:
                     """,
                     (payload, int(metadata.terminal), now, key, token),
                 )
+            return cursor.rowcount == 1
+        except (TypeError, sqlite3.Error) as exc:
+            self._discard_connection()
+            log.debug("GitHub metadata cache save failed: %s", exc)
+            return False
+
+    def _row_version(self, key: str) -> tuple[str | None, float] | None | object:
+        """``key``'s row as ``(payload, fetched_at)``, None when there is no row, or
+        ``_UNREAD`` when the file could not be read."""
+        try:
+            with self._connect() as connection:
+                row = connection.execute(
+                    "SELECT payload, fetched_at FROM github_metadata_v1 WHERE key = ?", (key,)
+                ).fetchone()
+        except sqlite3.Error as exc:
+            self._discard_connection()
+            log.debug("GitHub metadata cache read failed: %s", exc)
+            return _UNREAD
+        return None if row is None else (row[0], float(row[1]))
+
+    def _store_unleased(
+        self,
+        key: str,
+        metadata: GitHubMetadata,
+        started: float,
+        seen: tuple[str | None, float] | None,
+    ) -> bool:
+        """Store a fetch made without a lease only over the row ``seen`` before it began.
+
+        Any write since then (a webhook's offer, revise or expire, another fetch's store)
+        changed the payload or ``fetched_at``, and any lease token, even one past its
+        time, belongs to a fetch that may still store a newer answer; either keeps the row
+        as it is, so an older snapshot never replaces a newer one (#3917 review). That
+        fetch, or the next ordinary claim, settles the row instead.
+        """
+        try:
+            payload = json.dumps(metadata.value, separators=(",", ":"), sort_keys=True)
+            with self._writing(), self._connect() as connection:
+                if seen is None:
+                    cursor = connection.execute(
+                        """
+                        INSERT INTO github_metadata_v1
+                            (key, payload, terminal, fetched_at, lease_until, lease_token)
+                        VALUES (?, ?, ?, ?, 0, NULL)
+                        ON CONFLICT(key) DO NOTHING
+                        """,
+                        (key, payload, int(metadata.terminal), started),
+                    )
+                else:
+                    cursor = connection.execute(
+                        """
+                        UPDATE github_metadata_v1 SET
+                            payload = ?, terminal = ?, fetched_at = ?,
+                            lease_until = 0, lease_token = NULL
+                        WHERE key = ? AND payload IS ? AND fetched_at = ?
+                            AND lease_token IS NULL
+                        """,
+                        (payload, int(metadata.terminal), started, key, seen[0], seen[1]),
+                    )
             return cursor.rowcount == 1
         except (TypeError, sqlite3.Error) as exc:
             self._discard_connection()
@@ -492,7 +577,7 @@ class GitHubMetadataCache:
 
     def _back_off(self, key: str, now: float, token: str) -> None:
         try:
-            with self._connect() as connection:
+            with self._writing(), self._connect() as connection:
                 connection.execute(
                     """
                     UPDATE github_metadata_v1
@@ -585,11 +670,19 @@ class GitHubMetadataCache:
             cached: GitHubLookup,
             token: str,
         ) -> tuple[str, GitHubLookup]:
+            # Without a lease, note the row as it stands before fetching: the answer may
+            # replace only that row, never one a webhook revised or expired meanwhile.
+            seen = await asyncio.to_thread(self._row_version, key) if not token else None
             metadata = await fetch()
             if metadata is None:
                 await asyncio.to_thread(self._back_off, key, checked_at, token)
                 return (key, cached)
             if not token:
+                # The claim timed out on a busy file, so no row holds our lease. Keep
+                # GitHub's answer anyway: dropping it left the next peek with nothing, a
+                # spent fetch shown as "not cached" (#3914).
+                if seen is not _UNREAD:
+                    await asyncio.to_thread(self._store_unleased, key, metadata, checked_at, seen)
                 return (key, GitHubLookup(metadata.value, True, True, age_s=0.0))
             if not await asyncio.to_thread(self._store, key, metadata, checked_at, token):
                 # Our lease ran out mid-fetch. A result a later fetch already stored wins;

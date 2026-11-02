@@ -385,6 +385,72 @@ def _tell_deck_filed(stdout: str, environment: dict[str, str]) -> None:
         _note(f"the deck is starting the Work for {found[-1]}")
 
 
+def _tell_deck_ready(argv: list[str], environment: dict[str, str], remote: str | None) -> None:
+    """Tell the deck a pull request was just marked ready, so its cached row is read again
+    and the Work router's backstop sees it even if GitHub's ready event is dropped (#3903).
+
+    Best effort and quiet, as ``_tell_deck_filed``: GitHub's own event still comes. Turning
+    it back to a draft (``--undo``) tells nothing. With no number or URL the branch is sent
+    (the one named, or the checkout's own), and the deck reads the registered pull request
+    whose cached row has that head branch.
+    """
+    base = environment.get("AGENTDECK_URL", "").strip().rstrip("/")
+    if not base or "--undo" in argv:
+        return
+    repository = target_repo(argv, remote=remote)
+    found = re.search(r"github\.com/([^/\s]+/[^/\s]+)/pull/(\d+)", " ".join(argv))
+    number: int | None = None
+    branch = ""
+    if found:
+        repository, number = found.group(1), int(found.group(2))
+    else:
+        positionals = [part for part in argv[2:] if not part.startswith("-")]
+        pairs = zip(argv, argv[1:], strict=False)
+        flagged = {value for name, value in pairs if name in ("-R", "--repo")}
+        bare = [part for part in positionals if part not in flagged]
+        if bare and bare[0].lstrip("#").isdigit():
+            number = int(bare[0].lstrip("#"))
+        elif bare:
+            branch = bare[0]  # ``gh pr ready <branch>``
+        else:
+            branch = _current_branch()
+    # ``--repo`` is ``owner/name``; the checkout's remote is a git URL.
+    named = re.search(r"github\.com[:/]([^/\s:]+)/([^/\s]+?)(?:\.git)?/?$", repository)
+    if named:
+        repository = f"{named.group(1)}/{named.group(2)}"
+    if not re.fullmatch(r"[\w.-]+/[\w.-]+", repository):
+        return
+    body = json.dumps({"repository": repository, "number": number, "branch": branch})
+    request = urllib.request.Request(
+        f"{base}/api/works/pr-ready",
+        data=body.encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=_DECK_TIMEOUT_S):  # noqa: S310
+            pass
+    except Exception as exc:  # noqa: BLE001 — GitHub's own event is still on its way
+        _note(f"could not tell the deck {repository} is ready for review ({exc})")
+
+
+def _current_branch() -> str:
+    """The checkout's current branch, which ``gh pr ready`` with no argument marks; ``""``
+    when git cannot say (a detached head reads ``HEAD``)."""
+    try:
+        done = subprocess.run(  # noqa: S603 — fixed argv, no shell
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=_DECK_TIMEOUT_S,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    branch = (done.stdout or "").strip()
+    return "" if branch == "HEAD" else branch
+
+
 def _quota(cache: GitHubMetadataCache, environment: dict[str, str]) -> limits.RateLimits:
     """Read real-call headers, using ``/rate_limit`` only to fill cold-start gaps."""
     store = shared_limits.RateLimitStore(cache.path)
@@ -635,6 +701,8 @@ def main(argv: list[str] | None = None) -> int:
             code = _passthrough(arguments, environment, cache, kind="write")
         if decision.invalidates and code == 0:
             cache.invalidate(decision.invalidates)
+        if (decision.group, decision.verb) == ("pr", "ready") and code == 0:
+            _tell_deck_ready(arguments, environment, remote)
         return code
 
     plain = _view_without_comments(decision, arguments)

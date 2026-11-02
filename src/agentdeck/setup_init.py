@@ -55,7 +55,13 @@ APP_RECORD = "~/.config/agentdeck/github-app.json"
 # The state of an App creation waiting for its code, for an `--app-code` rerun.
 APP_PENDING = "~/.config/agentdeck/github-app-pending.json"
 PROJECTS = Path("~/.config/agentdeck/projects")
-DECK_UNITS = ("agentdeck.socket", "agentdeck.service", "agentdeck-codex.service")
+DECK_UNITS = (
+    "agentdeck.socket",
+    "agentdeck.service",
+    "agentdeck-codex.service",
+    # The Work router and the merge release (#4016); it stands down while `[services] in_web`.
+    "agentdeck-services.service",
+)
 DEFAULT_REPO_NAME = "agent-tasks"
 _NAME = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$")
 _REPO = re.compile(r"^([A-Za-z0-9-]+)/([A-Za-z0-9._-]+)$")
@@ -784,7 +790,15 @@ def step_services(instance_id: str) -> None:
     systemctl = ["systemctl", "--user"]
     for command in (
         [*systemctl, "daemon-reload"],
-        [*systemctl, "enable", "--now", "agentdeck.socket", "agentdeck-codex", "agentdeck"],
+        [
+            *systemctl,
+            "enable",
+            "--now",
+            "agentdeck.socket",
+            "agentdeck-codex",
+            "agentdeck-services",
+            "agentdeck",
+        ],
         [*systemctl, "enable", "--now", poller_host.timer_unit(instance_id)],
         # Keeps the deck and the timer running after logout, as the README's manual setup does.
         ["loginctl", "enable-linger", getpass.getuser()],

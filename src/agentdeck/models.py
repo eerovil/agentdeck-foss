@@ -1193,6 +1193,10 @@ class TranscriptEvent:  # normalized transcript line (parsed from v0.2)
     subagent_name: str | None = None
     subagent_identities: tuple[tuple[str, str], ...] = ()  # spawn output id/name pairs
     image_media_types: tuple[str, ...] = ()  # safe raster images on this message
+    # Each text part, stripped, of a user line that carries more than one. Claude
+    # Code writes messages that queued up behind a busy turn as one line with a
+    # part per message, so this is what lets each be matched to its send (#3931).
+    text_parts: tuple[str, ...] = ()
     # This event is the runtime reporting that the turn failed, not the model
     # replying. Providers write their failures into the transcript in the shape
     # of an ordinary message, so without this the deck cannot tell an apology

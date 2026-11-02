@@ -42,6 +42,11 @@ knows and the chat's title, so it can tell "Agent Dick" was AgentDeck.
 No Claude account with room, a failure or a timeout means no answer: the page sends
 the words as heard.
 
+Words that plainly stop mid-thought get a third line, ``MORE`` (#3934): the page then
+sends nothing, listens on with the words kept and waits up to 6 s of quiet for the
+rest, rather than sending half a thought at a pause. It is dropped on noise and on
+the way back to the deck chat, which send nothing.
+
 Its SAY line is no longer spoken at once (#3799): the chat usually says the same in
 its own 🔊 note, so the owner heard it twice. The page holds it, and when the chat
 says nothing aloud for 5 s after a send while it works, it asks ``narrate``: the
@@ -75,7 +80,7 @@ import logging
 import re
 import shutil
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import quote
@@ -122,7 +127,7 @@ does the actual work: you never do it, never say it is done, and never answer \
 questions about the work yourself.
 
 Each message gives you what speech recognition heard the person say, and sometimes \
-what the agent said aloud since. Answer with exactly two lines:
+what the agent said aloud since. Answer with two lines, or three with MORE:
 SAY: one short spoken acknowledgement, {say_language}. You may name what \
 it is about in a few words, such as "The login bug, got it." or "Passing that on." \
 Never promise or describe an action, never say what you or the agent will do, and \
@@ -138,6 +143,10 @@ the agent asked a question is the Finnish "juu".
 Words in "[unsure: …]" are words speech recognition itself doubted. Copy each such \
 part into RELAY exactly as heard, brackets included, so the agent can ask what was \
 meant; never fix or drop it, and never write NONE for a phrase with one.
+When the words plainly stop in the middle of a thought, so the person is surely about \
+to go on (a sentence cut off after "että", "ja", "koska" or "and", or "there are three \
+options" with none of them named yet), add a third line with only MORE. A finished \
+sentence, a question or a command never gets it.
 
 Never add, guess or promise anything beyond what was heard.
 
@@ -159,6 +168,8 @@ a language is Finnish.\
 # In any chat but the deck chat, the way back to it (#3816): the fast agent spots the ask
 # and the page opens the deck chat, without sending the words to the chat it is in.
 BACK = "BACK"
+# The fast agent's third line for words that stop mid-thought (#3934).
+MORE = "MORE"
 BACK_RULE = """\
 When the person asks to go back to the deck chat, in any words or language ("back to \
 the deck chat", "go to deck chat", "takaisin deck chattiin"), answer with the one line \
@@ -222,6 +233,8 @@ class Answer:
     relay: str | None
     # The person asked to go back to the deck chat (#3816): nothing is sent or said.
     back: bool = False
+    # The words stop mid-thought (#3934): the page waits a little for the rest.
+    more: bool = False
 
 
 @dataclass
@@ -253,6 +266,16 @@ _closing: set[asyncio.Task] = set()
 # arrived after its ``end`` and starts nothing (#3510 review).
 _ended_runs: dict[str, None] = {}
 MAX_ENDED_RUNS = 100
+# Chats whose page has voice mode on, by the key the page sent, each with its voice
+# mode spells still on, one per tab (#3875): the deck's own messages to them ask for a
+# spoken answer too. Kept apart from ``_agents``, which an idle fast agent leaves; a
+# web restart forgets it until the page's next ``warm``.
+_voice_on: dict[str, set[str]] = {}
+
+
+def voice_on_keys() -> tuple[str, ...]:
+    """The chats whose page has voice mode on, as the keys their pages sent."""
+    return tuple(_voice_on)
 
 
 def system_prompt(projects=(), title: str = "", finnish: bool = False, back: bool = False) -> str:
@@ -351,6 +374,13 @@ def parse(reply: str, heard: str, question: bool = False, back: bool = False) ->
     ``back``: a BACK line is the ask to go back to the deck chat (#3816).
     A phrase with doubted words reaches the chat as heard, marks and all, whatever the
     reply: never as a guessed "Juu.", a jump to the deck chat or noise (#3817)."""
+    more = any(line.strip().strip(".").upper() == MORE for line in reply.splitlines())
+    answer = _parse_short(reply, heard, question, back)
+    # Noise and a jump send nothing, so nothing waits for more of them.
+    return replace(answer, more=True) if more and answer.relay is not None else answer
+
+
+def _parse_short(reply: str, heard: str, question: bool, back: bool) -> Answer:
     if UNSURE.search(heard):
         return _parse(reply, heard)
     if back and any(line.strip().strip(".").upper() == BACK for line in reply.splitlines()):
@@ -518,6 +548,7 @@ async def heard(
                 "outcome": outcome,
                 "reply": reply,
                 "say": answer.say if answer else None,
+                **({"more": True} if answer is not None and answer.more else {}),
                 "relay": answer.relay if answer else text,
                 **({"back": True} if answer is not None and answer.back else {}),
                 "fresh": fresh,
@@ -549,6 +580,7 @@ async def warm(app, key: str, run: str = "") -> None:
     names the voice mode spell; one already ended starts nothing."""
     if run and run in _ended_runs:
         return
+    _voice_on.setdefault(key, set()).add(run)
     agent = _agents.setdefault(key, _Agent(key))
     agent.used = time.monotonic()
     _arm(agent)
@@ -841,6 +873,13 @@ async def end(key: str, run: str = "") -> None:
         _ended_runs[run] = None
         while len(_ended_runs) > MAX_ENDED_RUNS:
             _ended_runs.pop(next(iter(_ended_runs)))
+    # Only the spell that ended: one on another tab of the chat stays on. An end with
+    # no spell named ends them all.
+    spells = _voice_on.get(key, set())
+    if run:
+        spells.discard(run)
+    if not run or not spells:
+        _voice_on.pop(key, None)
     agent = _agents.get(key)
     if agent is not None:
         await _forget(agent)

@@ -17,7 +17,10 @@ Standard library only and no ``agentdeck`` import, so it reads whichever
 checkout it is pointed at. Exits non-zero when ``runtime.py`` is missing or a
 file does not parse; the deploy then assumes the runtime moved.
 
-Usage: runtime_paths.py [REPO]   (defaults to this script's repository)
+``--services`` lists the services process's files instead (#4016): the Work router and the
+merge release, which the deploy restarts after the web when one of them moved.
+
+Usage: runtime_paths.py [--services] [REPO]   (defaults to this script's repository)
 """
 
 from __future__ import annotations
@@ -50,6 +53,16 @@ ROOTS = (
     "src/agentdeck/providers/instructions.py",
     "src/agentdeck/providers/usage.py",
 )
+
+
+# The services process (``agentdeck services``), walked the same way.
+SERVICES_FIXED = (
+    "pyproject.toml",
+    "uv.lock",
+    "systemd/agentdeck-services.service",
+    "src/agentdeck/__main__.py",
+)
+SERVICES_ROOTS = ("src/agentdeck/services_process.py",)
 
 
 def _module_file(repo: Path, dotted: str) -> Path | None:
@@ -92,13 +105,13 @@ def _imports(repo: Path, path: Path) -> set[str]:
     return {name for name in names if name == PACKAGE or name.startswith(PACKAGE + ".")}
 
 
-def runtime_paths(repo: Path) -> list[str]:
+def runtime_paths(repo: Path, roots=ROOTS, fixed=FIXED) -> list[str]:
     seen: set[Path] = set()
-    if not (repo / ROOTS[0]).is_file():
-        raise FileNotFoundError(f"{ROOTS[0]} is missing from {repo}")
+    if not (repo / roots[0]).is_file():
+        raise FileNotFoundError(f"{roots[0]} is missing from {repo}")
     # The other roots are reached from the runtime anyway; naming them only keeps
     # a lazily imported worker module listed if that import ever moves.
-    pending = [repo / root for root in ROOTS if (repo / root).is_file()]
+    pending = [repo / root for root in roots if (repo / root).is_file()]
     while pending:
         path = pending.pop()
         if path in seen:
@@ -112,13 +125,17 @@ def runtime_paths(repo: Path) -> list[str]:
                 if found is not None and found not in seen:
                     pending.append(found)
     walked = {str(path.relative_to(repo)) for path in seen}
-    return sorted(walked | set(FIXED))
+    return sorted(walked | set(fixed))
 
 
 def main(argv: list[str]) -> int:
-    repo = Path(argv[1]) if len(argv) > 1 else Path(__file__).resolve().parent.parent
+    args = argv[1:]
+    services = "--services" in args
+    args = [arg for arg in args if arg != "--services"]
+    repo = Path(args[0]) if args else Path(__file__).resolve().parent.parent
+    roots, fixed = (SERVICES_ROOTS, SERVICES_FIXED) if services else (ROOTS, FIXED)
     try:
-        paths = runtime_paths(repo.resolve())
+        paths = runtime_paths(repo.resolve(), roots, fixed)
     except (OSError, SyntaxError, ValueError) as exc:
         print(f"runtime_paths: {exc}", file=sys.stderr)
         return 1

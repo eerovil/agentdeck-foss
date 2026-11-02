@@ -1307,11 +1307,13 @@ async def test_the_first_message_says_whether_the_project_merges_on_its_own(
     #3098: it is also told where its screenshots go, when its project has an evidence
     repository (here only the auto-releasing one does).
     #3134: an issue carrying the spec-only label is told to write the spec, not build it.
-    #3147: it is told which repositories its CI or its review proves, so it runs no job there."""
+    #3147: it is told which repositories its CI or its review proves, so it runs no job there.
+    #3919: and which need its CI green beside the job."""
     evidence = '[[repos]]\nid = "agent-evidence"\nholds_artifacts = true\n'
     proven = (
         '[[repos]]\nid = "store"\nholds_code = true\nverification = "github_checks"\n'
         '[[repos]]\nid = "docs"\nholds_code = true\nverification = "review_only"\n'
+        '[[repos]]\nid = "games"\nholds_code = true\ngithub_checks_required = true\n'
     )
     _manifest(
         tmp_path / "poller",
@@ -1345,6 +1347,8 @@ async def test_the_first_message_says_whether_the_project_merges_on_its_own(
             + work_start.CI_TESTS_TEXT.format(repos="`eerovil/store`")
             + " "
             + work_start.REVIEW_ONLY_TEXT.format(repos="`eerovil/docs`")
+            + " "
+            + work_start.CHECKS_REQUIRED_TEXT.format(repos="`eerovil/games`")
         )
     if auto_release:
         wanted += (

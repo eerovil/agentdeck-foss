@@ -620,6 +620,8 @@ def test_the_workspace_is_served_only_inside_the_work_page(tmp_path):
         "/works/{work_id:path}/visibility",
         "/works/{work_id:path}/star",
         "/api/works/{work_id:path}/star",
+        # An agent's message to the chat running another Work (#3908); no workspace.
+        "/api/works/{work_id:path}/message",
         "/api/works/{work_id:path}/map-layout",
         "/api/works/{work_id:path}/question",
         # Rename (#2328) stores this deck's own name for the Work; no workspace.
@@ -637,6 +639,8 @@ def test_the_workspace_is_served_only_inside_the_work_page(tmp_path):
         "/works/seen",
         # The staging population report (#2250) reads the built overview; no workspace.
         "/api/works/filed",
+        # An agent's `gh pr ready` (#3903) re-reads a pull request's row; no workspace.
+        "/api/works/pr-ready",
         "/api/works/population",
         # What needs the owner (#3773) reads the same overview; no workspace.
         "/api/works/needs-you",

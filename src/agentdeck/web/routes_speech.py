@@ -15,6 +15,12 @@ the wake log, joined by the page's phrase id, which ``scripts/wake_report.py`` r
 to compare the two checks; a phrase either check woke on, or the detector nearly
 did, keeps its audio there for 30 days.
 
+With ``[speech] keep_audio_days`` set, every transcribed phrase also keeps its
+audio, words and the service's noise reading in ``keep_audio_dir`` for that many
+days, which ``scripts/speech_bench.py`` runs other speech-to-text models on, quiet
+and noisy apart (#3499, back in #3934). A voice-mode probe (``source=probe``, the
+phrase so far, sent again whole once it ends) is not kept.
+
 ``/api/voice/heard`` gives a phrase heard in voice mode to the chat's fast agent
 (``voice_helper``) and returns what to say and what to send; a 503 there means the
 page sends the words as heard and says its own acknowledgement.
@@ -47,7 +53,9 @@ import io
 import json
 import logging
 import re
+import threading
 import time
+import uuid
 import wave
 from collections import OrderedDict
 from datetime import datetime
@@ -84,6 +92,12 @@ KEEP_AUDIO_S = 30 * 86400
 RECENT_PHRASES = 20
 _recent_audio: OrderedDict[str, bytes] = OrderedDict()
 MAX_ID_CHARS = 40
+# Phrases kept for comparing speech-to-text models (#3499, #3934), and where each
+# came from: 🎧 voice mode or 🎤 dictation.
+KEPT_LOG = "kept.jsonl"
+SOURCES = ("voice", "dictation")
+ENGINES = ("whisper", "parakeet")
+_kept_lock = threading.Lock()
 # The speech service's warm-ups (#3766), held so none is collected before it ends;
 # nothing awaits them.
 _stt_warming: set[asyncio.Task] = set()
@@ -139,7 +153,7 @@ async def status(request: Request) -> JSONResponse:
 
 @router.post("/api/speech/transcribe")
 async def transcribe(request: Request) -> JSONResponse:
-    """A recorded phrase (16-bit WAV) as ``{"text", "language", "segments"}``:
+    """A recorded phrase (16-bit WAV) as ``{"text", "language", "speech_s", "segments"}``:
     ``segments`` are the text's parts in order, each ``{"text", "unsure"}``, and voice
     mode marks the ones Whisper doubted for the agent (#3817)."""
     _require_same_origin(request)
@@ -153,14 +167,19 @@ async def transcribe(request: Request) -> JSONResponse:
         path = f"/transcribe?language={previous}"
     else:
         path = "/transcribe"
+    started = time.monotonic()
     reply = await _forward(request, path, content=audio, headers={"Content-Type": "audio/wav"})
     heard = reply.json()
     language = pinned if pinned in LANGUAGES else heard.get("language")
+    await _keep_phrase(request, audio, heard, pinned, time.monotonic() - started)
     parts = heard.get("segments") if isinstance(heard.get("segments"), list) else []
+    speech_s = heard.get("speech_s")
     return JSONResponse(
         {
             "text": str(heard.get("text") or ""),
             "language": language if language in LANGUAGES else "en",
+            # Seconds of speech in it: voice mode drops a fragment of junk (#3934).
+            "speech_s": speech_s if type(speech_s) in (int, float) else None,
             "segments": [
                 {"text": part["text"], "unsure": part.get("unsure") is True}
                 for part in parts
@@ -168,6 +187,47 @@ async def transcribe(request: Request) -> JSONResponse:
             ],
         }
     )
+
+
+async def _keep_phrase(
+    request: Request, audio: bytes, heard: dict, pinned: str, took_s: float
+) -> None:
+    """Keep the phrase for the bench when ``[speech] keep_audio_days`` asks; a write
+    that fails is logged and never costs the phrase its words."""
+    speech = get_config(request).speech
+    source = request.query_params.get("source", "")
+    if speech.keep_audio_days <= 0 or source == "probe":
+        return
+    snr = heard.get("snr_db")
+    line = {
+        "id": _phrase_id(request.query_params.get("id")) or uuid.uuid4().hex[:12],
+        "source": source if source in SOURCES else "",
+        "engine": heard.get("engine") if heard.get("engine") in ENGINES else "",
+        "text": str(heard.get("text") or ""),
+        "language": heard.get("language"),
+        "only": pinned if pinned in LANGUAGES else "",
+        "snr_db": snr if isinstance(snr, (int, float)) and not isinstance(snr, bool) else None,
+        "seconds": _seconds(audio),
+        "ms": round(took_s * 1000),
+    }
+    try:
+        await asyncio.to_thread(
+            _write_kept,
+            Path(speech.keep_audio_dir).expanduser(),
+            line,
+            audio,
+            speech.keep_audio_days * 86400,
+        )
+    except OSError:
+        log.exception("could not keep a phrase in %s", speech.keep_audio_dir)
+
+
+def _write_kept(folder: Path, line: dict, audio: bytes, keep_s: float) -> None:
+    """One kept phrase, its old lines' expiry and its own line as one step: phrases
+    heard at once each run in their own thread, and an expiry rewriting the log must
+    not lose a line another phrase appends meanwhile (#3934 review)."""
+    with _kept_lock:
+        _write_log(folder, KEPT_LOG, line, audio, keep_s, expire_lines=True)
 
 
 def _seconds(audio: bytes) -> float:
@@ -182,11 +242,20 @@ def _write_wake_log(folder: Path, line: dict, audio: bytes | None) -> None:
     _write_log(folder, WAKE_LOG, line, audio, KEEP_AUDIO_S)
 
 
-def _write_log(folder: Path, name: str, line: dict, audio: bytes | None, keep_s: float) -> None:
+def _write_log(
+    folder: Path,
+    name: str,
+    line: dict,
+    audio: bytes | None,
+    keep_s: float,
+    expire_lines: bool = False,
+) -> None:
     """One line of the log ``name``, and the phrase's audio beside it when given.
 
     Every line also drops audio older than ``keep_s``, so recordings expire
-    whether or not anything new is kept."""
+    whether or not anything new is kept. With ``expire_lines`` the log's own lines
+    past ``keep_s`` go too, so kept phrases' words last no longer than their audio
+    (#3934); the wake log keeps its lines."""
     folder.mkdir(parents=True, exist_ok=True)
     if audio is not None and line.get("id"):
         target = folder / f"{line['id']}.wav"
@@ -199,8 +268,36 @@ def _write_log(folder: Path, name: str, line: dict, audio: bytes | None, keep_s:
                 old.unlink(missing_ok=True)
         except FileNotFoundError:
             pass
+    if expire_lines:
+        _expire_lines(folder / name, cutoff)
     with (folder / name).open("a", encoding="utf-8") as log_file:
         log_file.write(json.dumps({"at": round(time.time(), 3), **line}) + "\n")
+
+
+def _expire_lines(path: Path, cutoff: float) -> None:
+    """``path`` without its lines from before ``cutoff``. Lines are written oldest
+    first, so a first line still in time means nothing is rewritten."""
+    try:
+        with path.open(encoding="utf-8") as log_file:
+            first = log_file.readline()
+    except FileNotFoundError:
+        return
+    if not first or _line_at(first) >= cutoff:
+        return
+    lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+    keep = "".join(text for text in lines if _line_at(text) >= cutoff)
+    spare = path.with_name(path.name + ".tmp")
+    spare.write_text(keep, encoding="utf-8")
+    spare.replace(path)
+
+
+def _line_at(text: str) -> float:
+    """A log line's time; a line that cannot be read counts as expired."""
+    try:
+        at = json.loads(text).get("at")
+    except (ValueError, AttributeError):
+        return 0.0
+    return at if isinstance(at, (int, float)) and not isinstance(at, bool) else 0.0
 
 
 def _phrase_id(value: object) -> str:
@@ -212,7 +309,9 @@ def _phrase_id(value: object) -> str:
 async def wake(request: Request) -> JSONResponse:
     """A phrase heard while waiting (16-bit WAV) as the wake word detector's
     ``{"woken", "score", "speech_after"}`` (#3476). ``?id=`` names the phrase in the
-    wake log."""
+    wake log. ``?window=1`` marks the last moments of microphone sound sent every
+    0.4 s while a reply is read (#3842): a few a second, so only one that woke or
+    nearly did is logged."""
     _require_same_origin(request)
     audio = await _audio(request)
     speech = get_config(request).speech
@@ -238,9 +337,12 @@ async def wake(request: Request) -> JSONResponse:
         while len(_recent_audio) > RECENT_PHRASES:
             _recent_audio.popitem(last=False)
     keep = result["woken"] or result["score"] > NEAR_MISS
+    window = request.query_params.get("window") == "1"
+    if window and not keep:
+        return JSONResponse(result)
     line = {
         "id": phrase,
-        "check": "detector",
+        "check": "window" if window else "detector",
         "mode": speech.wake,
         "seconds": _seconds(audio),
         "ms": round((time.monotonic() - started) * 1000),
@@ -340,7 +442,8 @@ def _background(warming: set[asyncio.Task], coroutine) -> None:
 @router.post("/api/voice/heard")
 async def voice_heard(request: Request) -> JSONResponse:
     """``{"session_key", "text", "aloud"}`` heard in voice mode, as the fast agent's
-    ``{"say", "relay"}``: what to say now and what to send the chat (null: nothing)."""
+    ``{"say", "relay", "more"}``: what to say now, what to send the chat (null: nothing),
+    and whether the words stop mid-thought, so the page waits for the rest (#3934)."""
     _require_same_origin(request)
     body = await _json_object(request)
     key = str(body.get("session_key") or "").strip()
@@ -363,7 +466,8 @@ async def voice_heard(request: Request) -> JSONResponse:
             return JSONResponse({"say": "", "relay": text})
         jump = {"path": state.chat_path_for_session(deck_key), "title": meta_chat.SPOKEN_TITLE}
         return JSONResponse({"say": "", "relay": None, "jump": jump})
-    return JSONResponse({"say": answer.say, "relay": answer.relay})
+    more = {"more": True} if answer.more else {}
+    return JSONResponse({"say": answer.say, "relay": answer.relay, **more})
 
 
 @router.post("/api/voice/narrate")

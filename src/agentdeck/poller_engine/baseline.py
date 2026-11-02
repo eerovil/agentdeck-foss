@@ -33,6 +33,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 __all__ = [
@@ -62,10 +63,26 @@ MAX_FAILURES = 200
 # construction.  Seeing the header is how a bounded read of the end of a log proves it holds
 # the whole list rather than the tail of one.
 _SUMMARY_HEADER = "short test summary info"
-_SUMMARY_LINE = re.compile(r"^(?:FAILED|ERROR)\s+(\S+)")
+_SUMMARY_LINE = re.compile(r"^(?:FAILED|ERROR)\s+(.+)$")
+# A parametrized id may hold spaces (``test_x[everything else]``), so an id with brackets runs to
+# the first ``]`` that ends the line or precedes pytest's `` - `` reason separator; reading only
+# up to the first space made the rerun collect nothing (#3865). The summary line alone cannot
+# tell an id holding ``] - `` from its reason, so a recorded failed id settles that when given.
+_SUMMARY_ID = re.compile(r"\S*?\[.*?\](?=\s+-\s|\s*$)|\S+")
 
 
-def extract_failures(text: str, *, succeeded: bool = False) -> tuple[tuple[str, ...], bool]:
+def _summary_id(body: str, known: Sequence[str]) -> str:
+    """The test id a summary line's text after ``FAILED``/``ERROR`` opens with."""
+    recorded = [node for node in known if body == node or body.startswith(f"{node} - ")]
+    if recorded:
+        return max(recorded, key=len)
+    match = _SUMMARY_ID.match(body)
+    return match.group(0) if match else body
+
+
+def extract_failures(
+    text: str, *, succeeded: bool = False, known: Sequence[str] = ()
+) -> tuple[tuple[str, ...], bool]:
     """The failing test ids in a run's output, and whether that list is provably complete.
 
     ``text`` is the end of a log, so a list is only complete when the summary header that
@@ -77,6 +94,9 @@ def extract_failures(text: str, *, succeeded: bool = False) -> tuple[tuple[str, 
     pytest prints the summary section only when it has something to put in it, so an all-pass
     suite -- exactly the green baseline every card wants to compare against -- would be filed
     as an unreadable failure list and never recorded.
+
+    ``known`` is the ids the run itself recorded as failing, where it kept a per-test record;
+    each summary line reads as the longest of them it opens with, and as the pattern otherwise.
     """
     if succeeded:
         return (), True
@@ -89,7 +109,7 @@ def extract_failures(text: str, *, succeeded: bool = False) -> tuple[tuple[str, 
         match = _SUMMARY_LINE.match(line.strip())
         if match is None:
             continue
-        node = match.group(1)
+        node = _summary_id(match.group(1).strip(), known)
         if node not in unique:
             unique.add(node)
             seen.append(node)

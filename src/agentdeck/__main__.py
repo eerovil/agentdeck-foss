@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import base64
 import contextlib
 import json
@@ -19,7 +20,7 @@ import httpx
 import uvicorn
 from uvicorn.main import STARTUP_FAILURE
 
-from . import shutdown
+from . import loop_watchdog, shutdown
 from .app import create_app
 from .command_artifact_client import ArtifactClientError, request_artifact
 from .command_artifacts import ACCOUNT_KEY_ENV
@@ -69,6 +70,11 @@ def main() -> None:
         return
     if len(sys.argv) > 1 and sys.argv[1] == "codex-runtime":
         _codex_runtime(sys.argv[2:])
+        return
+    if len(sys.argv) > 1 and sys.argv[1] == "services":
+        from .services_process import main as services_main
+
+        services_main(sys.argv[2:])
         return
     if len(sys.argv) > 1 and sys.argv[1] == "restart-runtime":
         _restart_runtime(sys.argv[2:])
@@ -162,6 +168,20 @@ class _WebServer(uvicorn.Server):
     def handle_exit(self, sig, frame) -> None:
         shutdown.signal_shutdown()
         super().handle_exit(sig, frame)
+
+    async def startup(self, sockets=None) -> None:
+        await super().startup(sockets)
+        # Here rather than in the app's lifespan: a test that builds the app must not
+        # start a watchdog thread that outlives it (#3970).
+        self._loop_watchdog = asyncio.create_task(loop_watchdog.watch(), name="loop-watchdog")
+
+    async def shutdown(self, sockets=None) -> None:
+        watchdog = getattr(self, "_loop_watchdog", None)
+        if watchdog is not None:
+            watchdog.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await watchdog
+        await super().shutdown(sockets)
 
 
 def _local_deck_url() -> str:

@@ -81,6 +81,37 @@ def test_one_chat_can_belong_to_two_works():
     assert projection.works_for_chat("chat-1") == (WORK_A, WORK_B)
 
 
+def test_a_chat_joins_only_the_works_it_saved_itself():
+    """#2552, #3975: registered, Run and side-chat evidence join; a read URL or a parent's
+    Work does not, and each chat's Works keep the projection's order."""
+    work_c = WorkRef("eerovil/agentdeck", 2150)
+    work_d = WorkRef("eerovil/agentdeck", 2160)
+    projection = build_work_projection(
+        [
+            WorkChatFacts(
+                "mixed",
+                registered=(("k", B),),
+                issue_urls=(("k", A_URL),),
+                runs=(("k", work_c.work_id),),
+                bindings=(
+                    WorkBinding("k", work_d.work_id, "side_chat"),
+                    WorkBinding("k", WorkRef("eerovil/agentdeck", 2170).work_id, "delegated", "p"),
+                ),
+            ),
+            WorkChatFacts("reader", issue_urls=(("r", A_URL),)),
+            WorkChatFacts("other", registered=(("o", A),)),
+        ]
+    )
+
+    order = [work.ref for work in projection.works]
+    joined = projection.works_chat_joined("mixed")
+    assert set(joined) == {WORK_B, work_c, work_d}
+    assert list(joined) == [ref for ref in order if ref in joined]
+    assert projection.works_chat_joined("reader") == ()
+    assert projection.works_chat_joined("other") == (WORK_A,)
+    assert projection.works_chat_joined("nobody") == ()
+
+
 def test_two_independent_chats_share_one_work():
     # A worker found by its dispatch plus a fresh review chat registered later.
     projection = build_work_projection(

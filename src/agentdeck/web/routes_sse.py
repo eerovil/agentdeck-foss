@@ -19,10 +19,10 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from markupsafe import escape
 
-from .. import mac_runner, meta_chat, work_counter
+from .. import mac_runner, work_counter
 from ..board_watch import BOARD_TOPIC
 from ..chat_board import TOPIC as CHAT_BOARD_TOPIC
-from ..chat_jump import JUMP_TOPIC
+from ..chat_jump import JUMP_TOPIC, jump_topic
 from ..chat_notes import TOPIC as CHAT_NOTES_TOPIC
 from ..chat_transcript import chat_event_id, parse_chat_event_id, switch_into_leg
 from ..models import (
@@ -40,7 +40,6 @@ from .chat_board_page import chat_board_context
 from .deps import (
     get_accounts,
     get_chat_renders,
-    get_db,
     get_injector,
     get_shared_fragments,
     get_state,
@@ -201,11 +200,11 @@ def needs_you_event(shared, templates) -> str:
     )
 
 
-def jump_event(jumps) -> str:
-    """The deck chat's latest jump to another chat as a ``chat_jump`` event (#3816), or
+def jump_event(jumps, chat: str) -> str:
+    """``chat``'s latest jump to another chat as a ``chat_jump`` event (#3816, #3857), or
     nothing. Sent only when it is published, never as a prime, so a page that reconnects
     is not moved by an old request."""
-    jump = jumps.fresh() if jumps is not None else None
+    jump = jumps.fresh(chat) if jumps is not None else None
     if jump is None:
         return ""
     payload = json.dumps({"id": jump.id, "path": jump.path, "title": jump.title})
@@ -265,6 +264,7 @@ async def _stream(request: Request) -> AsyncIterator[str]:
                 index_context = await works_index_context(
                     request.app,
                     request.query_params.get("repo", ""),
+                    project=request.query_params.get("project", ""),
                 )
             except Exception:  # noqa: BLE001 -- the page keeps its rows; the next change retries it
                 logger.exception("works index read failed")
@@ -1047,12 +1047,11 @@ async def _tail_session(
             (leg_key, leg_index, offset, seq, _tail_revision()), read
         )
 
-    # Only a page showing the deck chat moves when it jumps to another chat (#3816).
+    # A page moves when the chat it shows jumps to another chat, and only then (#3857).
     jumps = getattr(request.app.state, "chat_jumps", None)
-    deck_page = jumps is not None and meta_chat.is_deck_chat(state, get_db(request), leg_key)
-    with state.bus.subscribe(
-        *sorted(chat_topics), *CHAT_PAGE_TOPICS, *((JUMP_TOPIC,) if deck_page else ())
-    ) as sidebar_sub:
+    jump_chat = state.chat_identity_key(leg_key)
+    jump_topics = (jump_topic(jump_chat),) if jumps is not None else ()
+    with state.bus.subscribe(*sorted(chat_topics), *CHAT_PAGE_TOPICS, *jump_topics) as sidebar_sub:
         watching_needs_you(request)
         presentation = state.session_presentation()
         yield format_sse("usage", _limit_bars(session.account_key))
@@ -1341,7 +1340,11 @@ async def _tail_session(
                 yield mac
             if NEEDS_YOU_TOPIC in sidebar_dirty:
                 yield needs_you_event(shared, templates)
-            if JUMP_TOPIC in sidebar_dirty and (jump := jump_event(jumps)):
+            if (
+                jump_topics
+                and jump_topics[0] in sidebar_dirty
+                and (jump := jump_event(jumps, jump_chat))
+            ):
                 yield jump
             if VIEW_TOPIC in sidebar_dirty and (view_change := view_event(request)):
                 yield view_change

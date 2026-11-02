@@ -78,7 +78,30 @@ def check(text: str, repository: str) -> engine_config.Manifest:
     if not report.ok:
         problems = "; ".join(f"{p.location}: {p.what}" for p in report.problems)
         raise JoinError(f"{repository}/{SHARED_PATH} has problems: {problems}")
+    _check_reviewers(raw, repository)
     return manifest
+
+
+def _check_reviewers(raw: dict, repository: str) -> None:
+    """Refuse a file that merges on a review pass its reviewer may not send (#3901).
+
+    Where ``auto_release`` is on, a ``/reviewed`` needs Release, which only the file grants, so
+    a reviewer of ``[reviewers]`` it does not name there has every pass thrown away: holdfast
+    ran three clean reviews of one pull request and merged none. ``test_poller_projects``
+    holds the committed projects to the same rule.
+    """
+    if not (raw.get("capabilities") or {}).get(engine_config.AUTO_RELEASE):
+        return
+    release = ((raw.get("authorization") or {}).get("release") or {}).get("allow") or []
+    named = {str(login).strip().lower() for login in release}
+    missing = sorted(github_authority.reviewer_logins() - named)
+    if missing:
+        listed = ", ".join(f'"{login}"' for login in missing)
+        raise JoinError(
+            f"{repository}/{SHARED_PATH} merges on its own (auto_release) but its reviewer"
+            f" cannot pass a pull request: add allow = [{listed}] under [authorization.release],"
+            " or turn auto_release off so a person's Merge follows each pass"
+        )
 
 
 # --- this machine's half ----------------------------------------------------------------------

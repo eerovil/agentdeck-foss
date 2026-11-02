@@ -1018,7 +1018,8 @@ def test_an_open_work_with_no_review_in_play_says_chatgpt_reviewed():
 @private_feature(_chat_board)
 def test_the_work_reads_finished_review_chats_off_the_chat_board(tmp_path):
     from agentdeck.chat_board import ChatBoardService, ChatRow
-    from agentdeck.web.work_view import _chat_reviews, _review_heads
+    from agentdeck.review_history import ReviewEvent
+    from agentdeck.web.work_view import _chat_reviews
 
     service = ChatBoardService(
         tmp_path / "streams", repository="eerovil/review-chats", store_path=tmp_path / "b.json"
@@ -1041,16 +1042,22 @@ def test_the_work_reads_finished_review_chats_off_the_chat_board(tmp_path):
         # #2637: credited to each pull request it covered, never to the issue in its title.
         6: {pr: "eeeeeee", ("acmecorp/lib", 4): "fffffff"},
     }
-    state = SimpleNamespace(chat_review_heads=lambda repository: heads)
+    # Each opening is a ``chat`` row in its pull request's review history (#3956).
+    history: dict[str, list[ReviewEvent]] = {}
+    for chat, pulls in heads.items():
+        for (repository, number), head in pulls.items():
+            ref = f"{repository}#{number}"
+            data = {"chat": f"eerovil/review-chats#{chat}"}
+            history.setdefault(ref, []).append(ReviewEvent(ref, head, 1.0, "chat", ref, data))
     app = SimpleNamespace(state=SimpleNamespace(chat_board=service))
 
-    assert _chat_reviews(app, _review_heads(app, state)) == {
+    assert _chat_reviews(app, history) == {
         pr: ("aaaaaaa", "bbbbbbb", "eeeeeee"),
         ("acmecorp/lib", 4): ("fffffff",),
     }
 
     service._enabled = False
-    assert _chat_reviews(app, _review_heads(app, state)) == {}
+    assert _chat_reviews(app, history) == {}
 
 
 # --- what an automatic wait reads as, and where it is listed (#2573) ------------------------

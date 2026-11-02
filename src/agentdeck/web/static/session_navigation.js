@@ -699,8 +699,8 @@
     }
   }
 
-  // Another script opening a chat in place, as a click on its card would: the deck chat's
-  // jump to another chat and back (#3816, chat_jump.js), which voice mode carries on into.
+  // Another script opening a chat in place, as a click on its card would: a chat's jump
+  // to another chat and back (#3816, chat_jump.js), which voice mode carries on into.
   window.AgentDeckSessionNavigation = {
     open: function (path) { return openSession(null, path, true); }
   };

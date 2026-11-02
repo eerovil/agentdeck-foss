@@ -53,7 +53,14 @@ from ..public_origin import public_origin
 from ..restart_nudge import NUDGE_MESSAGE, RestartNudgeRegistry
 from ..state import OPERATOR_PRESENCE_IDLE_AFTER_S
 from ..titles import normalize_agent_title, title_evidence_signature
-from ..wake_on import KIND_DEPLOYMENT, KIND_REVIEW, WakeRequestError, parse_request
+from ..wake_on import (
+    KIND_COMMIT,
+    KIND_DEPLOYMENT,
+    KIND_REVIEW,
+    WakeRequest,
+    WakeRequestError,
+    parse_request,
+)
 from ..work import work_id_for
 from .chat_successor import reserve_chat_successor
 from .deps import (
@@ -645,6 +652,73 @@ async def note_filed_issue(request: Request, body: FiledIssueRequest) -> dict:
     return answer
 
 
+class ReadyPressRequest(BaseModel):
+    repository: str
+    number: int | None = None
+    branch: str = ""
+
+
+#: How many of a repository's registered pull requests one ``gh pr ready`` re-reads at most.
+READY_PRESS_MAX = 4
+
+
+@router.post("/works/pr-ready")
+async def note_ready_press(request: Request, body: ReadyPressRequest) -> dict:
+    """A Work agent's ``gh pr ready`` on this host, told by the deck's ``gh`` shim (#3903).
+
+    GitHub's ready event can be dropped, and then the cached row still says draft, so the
+    Work router's backstop never looks at it. This re-reads the pull request's row from
+    GitHub at once, which wakes that backstop (``IssueResolver.on_pull_rows``). Only a pull
+    request a chat registered in a switched repository is read: the named one, or with no
+    number (``gh pr ready`` on a branch) the open registered one whose cached row has that
+    head branch. Only when no cached row names the branch is each open registered one read,
+    at most ``READY_PRESS_MAX``. Nothing the caller says is trusted but which pull request
+    to read.
+    """
+    repository = body.repository.strip().lower()
+    answer = {"repository": repository, "refreshed": 0}
+    router_service = getattr(request.app.state, "work_router", None)
+    issues = getattr(request.app.state, "issues", None)
+    if router_service is None or issues is None or not router_service.switched(repository):
+        return answer
+    state = request.app.state.app_state
+    registered = sorted(
+        {
+            ref.identity
+            for refs in tuple(state.session_pull_requests.values())
+            for ref in refs
+            if ref.identity[0] == repository
+            and (body.number is None or ref.number == body.number)
+        }
+    )
+    if body.number is None and registered:
+        try:
+            rows = issues.cached_pulls(registered)
+        except Exception:  # noqa: BLE001 - unreadable: every registered one is a candidate
+            rows = {}
+        registered = [
+            ref
+            for ref in registered
+            if str((rows.get(ref) or {}).get("state") or "open").lower() == "open"
+            and not (rows.get(ref) or {}).get("mergedAt")
+        ]
+        on_branch = [
+            ref
+            for ref in registered
+            if body.branch and (rows.get(ref) or {}).get("headRefName") == body.branch
+        ]
+        registered = on_branch or registered
+    if not registered:
+        return answer
+    try:
+        answer["refreshed"] = await issues.refresh_pull_rows(
+            registered[-READY_PRESS_MAX:], limit=READY_PRESS_MAX
+        )
+    except Exception:  # noqa: BLE001 - the webhook and the backstop's other wakes remain
+        log.warning("ready press on %s could not be read back", repository, exc_info=True)
+    return answer
+
+
 def _changed_lately(stamp: object) -> bool:
     try:
         when = datetime.fromisoformat(str(stamp or "").replace("Z", "+00:00"))
@@ -832,7 +906,8 @@ async def delete_session_title(request: Request, session_key: str) -> dict:
 
 
 # --- Work resolution --------------------------------------------------------
-# The verify worker writes its Work's decision record while the final suite runs (#2328). The
+# The Work's agent writes its Work's summary (#2328): the background and the problem after its
+# first look at the issue (#3928), the whole record before review. The
 # Work and Run are the deck's own answer for this chat (its latest Run binding, as by-token
 # reports them), never something the caller types, and every write replaces the Work's one
 # record, so a retried or later write never leaves a duplicate or stale summary behind.
@@ -840,9 +915,11 @@ async def delete_session_title(request: Request, session_key: str) -> dict:
 
 class WorkResolutionRequest(BaseModel):
     problem: str
-    solution: str
-    rationale: str
-    correctness: str
+    # Written early, the parts not known yet are left empty (#3928); only the problem is required.
+    background: str = ""
+    solution: str = ""
+    rationale: str = ""
+    correctness: str = ""
     # Which Work, for a chat with no Run that joined several (#2552).
     work_id: str = ""
 
@@ -853,6 +930,7 @@ def _resolution_payload(work_id: str, resolution: Any) -> dict:
     return {
         "work_id": work_id,
         "resolution": {
+            "background": resolution.background,
             "problem": resolution.problem,
             "solution": resolution.solution,
             "rationale": resolution.rationale,
@@ -951,8 +1029,8 @@ async def put_work_resolution(
     binding = _session_run(request, session_key, session.key, work_id=body.work_id)
     try:
         parts = {
-            name: normalize_part(name, getattr(body, name))
-            for name in ("problem", "solution", "rationale", "correctness")
+            name: normalize_part(name, getattr(body, name), required=name == "problem")
+            for name in ("background", "problem", "solution", "rationale", "correctness")
         }
     except ResolutionError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -1343,6 +1421,18 @@ async def post_session_wake_on(
                 "already_happened": True,
                 "deployment": done.payload(),
             }
+    if fields.get("kind") == KIND_COMMIT:
+        # A result already stored for the commit (#3863): the agent's own read of GitHub can
+        # lag the webhook, and a second wait on a met check stayed open.
+        wanted = {key: value for key, value in fields.items() if key != "timeout_s"}
+        probe = WakeRequest(id="", session_key=session_key, chat_id="", **wanted)
+        done_ci = await asyncio.to_thread(service.seen_result, probe)
+        if done_ci is not None:
+            return {
+                **_wake_on_payload(request, session_key, service),
+                "already_happened": True,
+                "result": done_ci.summary,
+            }
     try:
         registered = service.register(
             session_key, get_state(request).chat_identity_key(session_key), **fields
@@ -1507,6 +1597,39 @@ async def post_session_review_accepted(
     except AgainRefused as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return {"session_key": session_key, **accepted}
+
+
+class PreReviewDoneBody(BaseModel):
+    pull_request: str
+
+
+@router.post("/sessions/{session_key}/pre-review-done")
+async def post_session_pre_review_done(
+    request: Request, session_key: str, body: PreReviewDoneBody
+) -> dict:
+    """The Work's agent went through the pre-review checklist (#3880): its pull request's
+    ready head goes to review now, and the chat waits on the verdict."""
+    from ..work_router import AgainRefused
+
+    session_key, _session = resolve_chat_key(request, session_key)
+    ref = _pull_request_ref(body.pull_request)
+    state = get_state(request)
+    if ref.identity not in {held.identity for held in state.pull_requests_for(session_key)}:
+        raise HTTPException(
+            status_code=409,
+            detail=f"this chat has not registered {ref.repository}#{ref.number};"
+            " register it first (POST …/pull-requests)",
+        )
+    router_service = getattr(request.app.state, "work_router", None)
+    if router_service is None or not router_service.enabled:
+        raise HTTPException(
+            status_code=409, detail="this deck does not route Work events, so it starts no review"
+        )
+    try:
+        done = await router_service.pre_review_done(ref.repository, ref.number)
+    except AgainRefused as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"session_key": session_key, **done}
 
 
 # --- deck-owned Claude workers -------------------------------------------

@@ -1635,9 +1635,7 @@ class JobQueue:
         job = self._jobs[job_id]
         classification = _result_class(job, state=state, exit_code=exit_code)
         output_bytes, output_sha256, excerpt = _log_identity(job.log_path)
-        failures, failures_complete = extract_failures(
-            read_tail(job.log_path, limit=FAILURE_SUMMARY_CHARS), succeeded=state == DONE
-        )
+        failures, failures_complete = _read_failures(job, succeeded=state == DONE)
         result_id = hashlib.sha256(
             json.dumps(
                 {
@@ -2312,6 +2310,21 @@ def _git(*args: str, cwd: str) -> str:
     return done.stdout.strip()
 
 
+def _read_failures(job: Job, *, succeeded: bool = False) -> tuple[tuple[str, ...], bool]:
+    """The failing test ids in this job's log, each made whole by the per-test record when the
+    suite kept one: a parametrized id can hold `` - `` itself (#3865)."""
+    if succeeded:
+        return extract_failures("", succeeded=True)
+    known = [
+        timing.test
+        for timing in read_timings(timings_path_for_log(job.log_path))
+        if timing.outcome in {"failed", "error"}
+    ]
+    return extract_failures(
+        read_tail(job.log_path, limit=FAILURE_SUMMARY_CHARS), succeeded=succeeded, known=known
+    )
+
+
 def _failures_present_on_base(job: Job) -> tuple[str, ...] | None:
     """Which of this run's failing tests its merge base already has, or None if unknown.
 
@@ -2322,7 +2335,7 @@ def _failures_present_on_base(job: Job) -> tuple[str, ...] | None:
     import re
     import subprocess
 
-    failures, _complete = extract_failures(read_tail(job.log_path, limit=FAILURE_SUMMARY_CHARS))
+    failures, _complete = _read_failures(job)
     base = str((job.tested_workspace or {}).get("base_head") or "")
     if not failures or not base:
         return None

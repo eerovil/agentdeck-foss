@@ -1,6 +1,17 @@
 {# One normalized transcript event. Tool calls stay as compact history rows;
    large tool outputs remain hidden. Empty Codex reasoning events are private
    liveness heartbeats and update the activity marker without rendering here. #}
+{#- The queued sends this line is the transcript of, so the page drops their
+    pending rows. Space-separated: Claude Code writes messages queued behind a busy
+    turn as one line (#3931). -#}
+{%- set observed_attrs -%}
+{%- if observed_message | default(false) -%}
+{%- set also = observed_message.also | default([]) -%}
+{%- set action_ids = ([observed_message.client_action_id] + also | map(attribute=1) | list) | select | list -%}
+{{ " " }}data-observed-queue-id="{{ ([observed_message.id] + also | map(attribute=0) | list) | join(' ') }}"
+{%- if action_ids %} data-observed-action-id="{{ action_ids | join(' ') }}"{% endif -%}
+{%- endif -%}
+{%- endset -%}
 {%- if e.subagent_status -%}
 <details class="ev tool subagent-update {{ e.subagent_status | replace(' ', '-') }}">
   <summary>
@@ -43,7 +54,7 @@
     (#3377): one grey line with its time, and the full text behind a tap. It keeps its
     anchor and is a turn boundary for static/tool_call_groups.js, so the reply before it
     is not folded away as part of the automatic turn after it. #}
-<details id="event-{{ event_id }}" class="ev deck-notice" data-event-seq="{{ e.seq }}" data-event-id="{{ event_id }}" data-event-session-key="{{ session_key }}"{% if observed_message | default(false) %} data-observed-queue-id="{{ observed_message.id }}"{% if observed_message.client_action_id %} data-observed-action-id="{{ observed_message.client_action_id }}"{% endif %}{% endif %}>
+<details id="event-{{ event_id }}" class="ev deck-notice" data-event-seq="{{ e.seq }}" data-event-id="{{ event_id }}" data-event-session-key="{{ session_key }}"{{ observed_attrs }}>
   <summary>
     <span class="deck-notice-dot" aria-hidden="true">●</span>
     <span class="deck-notice-label">{{ deck_label or e.notice }}</span>
@@ -52,7 +63,7 @@
   {% if e.text %}<div class="ev-text">{{ e.text | display_message }}</div>{% endif %}
 </details>
 {%- elif e.answer -%}
-<div id="event-{{ event_id }}" class="ev user{% if e.subagent %} sub{% endif %}" data-event-seq="{{ e.seq }}" data-event-id="{{ event_id }}" data-event-session-key="{{ session_key }}"{% if observed_message | default(false) %} data-observed-queue-id="{{ observed_message.id }}"{% if observed_message.client_action_id %} data-observed-action-id="{{ observed_message.client_action_id }}"{% endif %}{% endif %}>
+<div id="event-{{ event_id }}" class="ev user{% if e.subagent %} sub{% endif %}" data-event-seq="{{ e.seq }}" data-event-id="{{ event_id }}" data-event-session-key="{{ session_key }}"{{ observed_attrs }}>
   <div class="ev-head">
     <span class="ev-role">you</span>
     <span class="ev-head-meta">
@@ -60,11 +71,11 @@
     </span>
   </div>
   {% if e.text %}<div class="ev-text">{{ e.text | display_message }}</div>{% endif %}
-  <div class="ev-text ev-answer" title="your answer to the agent's question"><bdi>{{ e.answer }}</bdi></div>
+  <div class="ev-text ev-answer" title="your answer to the agent's question"><bdi>{{ e.answer | display_message }}</bdi></div>
 </div>
 {%- elif e.role == 'tool' or (not e.text and not e.question and not e.tool_name and not e.image_media_types) -%}
 {%- else -%}
-<div id="event-{{ event_id }}" class="ev {{ e.role }}{% if e.failed %} failed{% endif %}{% if e.subagent %} sub{% endif %}" data-event-seq="{{ e.seq }}" data-event-id="{{ event_id }}" data-event-session-key="{{ session_key }}"{% if observed_message | default(false) %} data-observed-queue-id="{{ observed_message.id }}"{% if observed_message.client_action_id %} data-observed-action-id="{{ observed_message.client_action_id }}"{% endif %}{% endif %}>
+<div id="event-{{ event_id }}" class="ev {{ e.role }}{% if e.failed %} failed{% endif %}{% if e.subagent %} sub{% endif %}" data-event-seq="{{ e.seq }}" data-event-id="{{ event_id }}" data-event-session-key="{{ session_key }}"{{ observed_attrs }}>
   <div class="ev-head">
     <span class="ev-role">{{ e.role }}{% if e.subagent %} · {{ e.subagent }}{% endif %}</span>
     <span class="ev-head-meta">

@@ -239,6 +239,9 @@ def _derived(card: WorkCard, row_reason: str, made) -> OperatorAttention:
         # The reviewer's escalation is a question for the owner too (#3216), and so is a
         # posted spec waiting for approval (#3247).
         return made(NEEDS_ANSWER, row_reason, OPEN)
+    if kind == "asked_in_chat":
+        # The agent's reply asks the person something (#3887): a message answers it.
+        return made(NEEDS_ANSWER, row_reason, ANSWER, OPEN)
     if kind == "ready":
         # The release checked the review and the tests at these heads itself (#2960).
         return OperatorAttention(

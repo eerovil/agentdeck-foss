@@ -71,6 +71,10 @@
   <p class="wd-status-summary">{% if status.summary_href %}<a href="{{ status.summary_href|issue_href }}" data-wd-summary-link target="_blank" rel="noopener">{{ status.summary }}</a>{% else %}{{ status.summary }}{% endif %}</p>
   {%- if status.detail %}<p class="wd-status-detail">{{ status.detail }}</p>{% endif %}
   {%- if detail.approval_cleared %}<p class="wd-status-detail" data-work-merge-cleared>{{ detail.approval_cleared }}</p>{% endif %}
+  {#- What a standing Merge press waits for now (#3869), when the receipt above is another press's. #}
+  {%- if detail.approval_waits and detail.merge_approved and detail.last_action_followed != detail.approval_waits %}<p class="wd-status-detail" data-work-merge-armed>{{ detail.approval_waits }}</p>{% endif %}
+  {#- A review that waits on the agent's pre-review checklist, with no time limit (#3880). #}
+  {%- if detail.pre_review_waits %}<p class="wd-status-detail" data-work-pre-review>{{ detail.pre_review_waits }}</p>{% endif %}
   {#- An unfinished Work that cannot be paused says why (#2559). #}
   {%- set why = detail.pause_refusal %}
   {%- if why %}<p class="wd-status-detail" data-work-pause-refused>Pause is not offered: {{ why[:1] | lower }}{{ why[1:] }}</p>{% endif %}
@@ -189,13 +193,14 @@
   {%- endif %}
 </section>
 {%- elif section == "resolution" %}
-{#- The Work's own decision record (#2328): what the problem was, what changed, why this
-    solution over the alternatives, and why it is believed correct. Written by the verify
-    worker; nothing at all is shown before it is. #}
+{#- The Work's own summary (#2328): what the issue is about, what the problem was, what
+    changed, why this solution over the alternatives, and why it is believed correct. The
+    Work's agent writes the first two early (#3928) and the rest before review; a part not
+    written yet has no heading, and nothing at all is shown before the first write. #}
 {%- set resolution = detail.resolution %}
 {%- if resolution %}
 <section class="wd-section wd-resolution" id="work-resolution" data-work-resolution>
-  <h3 class="wd-title-sm">Resolution</h3>
+  <h3 class="wd-title-sm">Summary</h3>
   {%- for name, heading, blocks in resolution.display_parts() %}
   <h4 class="wd-title-xs">{{ heading }}</h4>
   <div class="wd-resolution-text" data-wd-resolution="{{ name }}">

@@ -440,6 +440,137 @@ async def test_resolving_never_touches_sqlite_on_the_event_loop(tmp_path):
     ]
 
 
+async def test_a_claim_that_timed_out_still_keeps_the_fetched_answer(tmp_path):
+    """#3914: under load a claim waited out its busy timeout on another thread's write,
+    fetched without a lease, and threw the answer away, so the next peek said "not
+    cached" for a list GitHub had just returned."""
+    cache = GitHubMetadataCache(tmp_path / "github.sqlite3")
+    real_claim = cache._claim
+
+    def locked_claim(key, **kwargs):
+        # What `_claim` returns once "database is locked" outlasts the busy timeout.
+        blocker = sqlite3.connect(cache.path, timeout=0)
+        blocker.execute("BEGIN IMMEDIATE")
+        try:
+            cache._connect().execute("PRAGMA busy_timeout = 0")
+            return real_claim(key, **kwargs)
+        finally:
+            blocker.rollback()
+            blocker.close()
+
+    cache._claim = locked_claim
+
+    async def fetch():
+        return GitHubMetadata([{"number": 990}])
+
+    lookup = await cache.resolve("pull-list:v1:o/r", fetch)
+
+    assert lookup.value == [{"number": 990}]
+    peeked = cache.peek("pull-list:v1:o/r")
+    assert peeked.value == [{"number": 990}]
+    assert peeked.complete is True
+
+    # Such a fetch never replaces what landed while it was out (#3917 review): a
+    # webhook's newer row, or another fetch's live lease, stays as it is.
+    async def outrun_by_a_webhook():
+        cache.offer("pull-list:v1:o/r", GitHubMetadata([{"number": 991}]))
+        return GitHubMetadata([{"number": 990}])
+
+    await cache.resolve("pull-list:v1:o/r", outrun_by_a_webhook, force=True)
+    assert cache.peek("pull-list:v1:o/r").value == [{"number": 991}]
+
+    # A revise keeps the row's age and an expire only ages it; neither may be undone.
+    async def outrun_by_a_revise():
+        cache.revise("pull-list:v1:o/r", [{"number": 992}])
+        return GitHubMetadata([{"number": 990}])
+
+    await cache.resolve("pull-list:v1:o/r", outrun_by_a_revise, force=True)
+    assert cache.peek("pull-list:v1:o/r").value == [{"number": 992}]
+
+    async def outrun_by_an_expire():
+        cache.expire("pull-list:v1:o/r")
+        return GitHubMetadata([{"number": 990}])
+
+    await cache.resolve("pull-list:v1:o/r", outrun_by_an_expire, force=True)
+    expired = cache.peek("pull-list:v1:o/r")
+    assert (expired.value, expired.complete) == ([{"number": 992}], False)
+
+    # With nothing written meanwhile, an expired row is the one the answer replaces.
+    await cache.resolve("pull-list:v1:o/r", fetch)
+    assert cache.peek("pull-list:v1:o/r").value == [{"number": 990}]
+
+    other = GitHubMetadataCache(cache.path)
+
+    async def outrun_by_a_lease():
+        other._claim("issue:v1:o/r#1", force=False, fresh_after=None, now=time.time())
+        return GitHubMetadata({"title": "older"})
+
+    await cache.resolve("issue:v1:o/r#1", outrun_by_a_lease)
+    token, held = other._claim("issue:v1:o/r#1", force=False, fresh_after=None, now=time.time())
+    assert (token, held.reason, held.value) == (None, "leased", None)
+
+    # A lease past its time still belongs to a fetch that may store a newer answer.
+    slow = {}
+
+    async def outrun_by_a_slow_fetch():
+        long_ago = time.time() - other.LEASE_S - 60
+        slow["token"], _ = other._claim(
+            "pull-list:v1:o/r", force=True, fresh_after=None, now=long_ago
+        )
+        return GitHubMetadata([{"number": 989}])
+
+    await cache.resolve("pull-list:v1:o/r", outrun_by_a_slow_fetch, force=True)
+    assert slow["token"]
+    assert cache.peek("pull-list:v1:o/r").value == [{"number": 990}]
+    newer = GitHubMetadata([{"number": 993}])
+    assert other._store("pull-list:v1:o/r", newer, time.time(), slow["token"])
+    assert cache.peek("pull-list:v1:o/r").value == [{"number": 993}]
+
+
+async def test_writers_in_one_process_queue_instead_of_timing_out(tmp_path):
+    """#3914: two caches on one file share one write queue, so a claim made while the
+    other is mid-write waits its turn instead of failing on SQLite's busy timeout."""
+    import threading
+
+    path = tmp_path / "github.sqlite3"
+    writer, cache = GitHubMetadataCache(path), GitHubMetadataCache(path)
+    assert writer._write_lock is cache._write_lock
+    holding, done = threading.Event(), threading.Event()
+
+    def other_write():
+        with writer._writing():
+            blocker = sqlite3.connect(path)
+            blocker.execute("BEGIN IMMEDIATE")
+            holding.set()
+            time.sleep(0.05)
+            blocker.rollback()
+            blocker.close()
+        done.set()
+
+    real_claim, tokens = cache._claim, []
+
+    def impatient_claim(key, **kwargs):
+        cache._connect().execute("PRAGMA busy_timeout = 0")  # SQLite alone would fail at once
+        result = real_claim(key, **kwargs)
+        tokens.append(result[0])
+        return result
+
+    cache._claim = impatient_claim
+
+    async def fetch():
+        return GitHubMetadata([{"number": 990}])
+
+    thread = threading.Thread(target=other_write)
+    thread.start()
+    holding.wait()
+    await cache.resolve("pull-list:v1:o/r", fetch)
+    thread.join()
+
+    assert done.is_set()
+    assert tokens and tokens[0]  # a real lease, not the failed-claim fallback
+    assert cache.peek("pull-list:v1:o/r").value == [{"number": 990}]
+
+
 async def test_a_sqlite_failure_throws_the_reused_handle_away(tmp_path):
     """A failed statement can leave the handle mid-transaction.
 

@@ -1697,6 +1697,24 @@ async def test_a_finished_run_records_what_it_failed(tmp_path):
     assert final.environment.startswith(f"{LOCAL}:")
 
 
+def test_a_failure_list_reads_a_parametrized_id_whole_from_the_per_test_record(tmp_path):
+    """An id holding `] - ` cannot be told from pytest's reason on the summary line alone; the
+    record the suite's conftest kept names it whole (#3865)."""
+    from agentdeck.test_timings import TimingRecorder, timings_path_for_log
+
+    log = tmp_path / "job.log"
+    test = "tests/test_a.py::test_one[foo] - bar]"
+    log.write_text(f"=== short test summary info ===\nFAILED {test} - AssertionError\n")
+    recorder = TimingRecorder(timings_path_for_log(log), worker="gw0")
+    recorder.start(test)
+    recorder.report(test, "call", "failed")
+    recorder.stop(test)
+    job = MagicMock(log_path=str(log))
+
+    assert jobs_module._read_failures(job) == ((test,), True)
+    assert jobs_module._read_failures(job, succeeded=True) == ((), True)
+
+
 async def test_a_clean_run_becomes_the_baseline_a_later_branch_run_finds(tmp_path):
     repo = tmp_path / "repo"
     base = _baseline_repo(repo)

@@ -847,17 +847,107 @@ class OtherDeckWork:
     start_label: str
     pull: Mapping[str, Any] | None = None
     updated: datetime | None = None
-    # Every assignee, lowercased: Take over removes them all, or a second one could stay
-    # ahead of this deck's person.
+    # Every assignee, spelled as GitHub spells them: Take over removes them all, or a second
+    # one could stay ahead of this deck's person, and ``gh --remove-assignee`` matches a login
+    # letter for letter, so a lowercased one removes nobody (#3852).
     assignees: tuple[str, ...] = ()
+    # The same facts your own Work reads (#3855): its pull requests, sized from the cached
+    # rows, and its status from what GitHub shows (``other_deck_status``).
+    facts: WorkFacts | None = None
+    status: OtherDeckStatus | None = None
+    # Each pull request's own verdict at its head, by URL: ``issue_marks.Mark``.
+    verdicts: tuple[tuple[str, Any], ...] = ()
 
     @property
     def work_id(self) -> str:
         return self.ref.work_id
 
     @property
+    def outputs(self) -> tuple[OutputFact, ...]:
+        return self.facts.outputs if self.facts is not None else ()
+
+    @property
+    def diffstat(self) -> DiffStat | None:
+        return diffstat(self.outputs)
+
+    @property
+    def targets(self) -> tuple[str, ...]:
+        return target_branches(self.outputs)
+
+    def verdict_for(self, url: str) -> Any:
+        """The reviewer's newest verdict on this pull request's current head, or None."""
+        return next((mark for at, mark in self.verdicts if at == url), None)
+
+    @property
+    def whose(self) -> str:
+        return f"@{self.assignee}'s deck" if self.assignee else "another deck"
+
+    @property
     def href(self) -> str:
         return work_href(self.ref.work_id)
+
+
+@dataclass(frozen=True)
+class OtherDeckStatus:
+    """Another deck's Work's status line, from GitHub alone (#3855).
+
+    ``tone`` is the Work page's own (``is-<tone>``); ``link`` the comment it rests on, if any.
+    """
+
+    key: str
+    headline: str
+    tone: str
+    link: str = ""
+
+
+def other_deck_status(
+    item: OtherDeckWork,
+    *,
+    marks: Any = None,
+    newest_comment: int | None = None,
+    spec_label: str = "",
+) -> OtherDeckStatus:
+    """What another deck's Work is doing, as far as its issue and pull requests say (#3855).
+
+    The first that holds: not started; a ready pull request reviewed at its head, or with
+    findings at its head newer than any pass there; one ready with neither, in review; only a
+    draft one, building; the spec waiting for approval (the spec-only label on, and the spec
+    the issue's newest comment); else working. ``marks`` is ``issue_marks.IssueMarks``. Each
+    ready pull request is judged by its own head's newest verdict: findings on any one say so,
+    and Reviewed needs a pass on every one. A verdict for an older head does not count, and
+    nothing the other deck keeps to itself (a question, a stuck chat, a Merge button) is ever
+    guessed.
+    """
+    if not item.started:
+        return OtherDeckStatus("unstarted", "Not started", "idle")
+    open_ = [output for output in item.outputs if output.is_open]
+    if not open_ and item.pull is not None:
+        # The open list knows it; its row is not read yet.
+        draft = bool(item.pull.get("draft"))
+        open_ = [OutputFact(str(item.pull.get("url") or ""), "", 0, "", "open", "", draft=draft)]
+    ready = [output for output in open_ if not output.draft]
+    if ready:
+        # ``issue_marks.FINDINGS`` and ``PASSED``, spelled out to keep this module light.
+        verdicts = [
+            marks.verdict(output.head) if marks is not None and output.head else None
+            for output in ready
+        ]
+        found = next((mark for mark in verdicts if mark and mark.kind == "findings"), None)
+        if found:
+            return OtherDeckStatus("findings", "Review found problems", "problem", found.url)
+        if all(mark and mark.kind == "passed" for mark in verdicts):
+            return OtherDeckStatus("reviewed", "Reviewed", "done", verdicts[0].url)
+        return OtherDeckStatus("in_review", "In review", "active")
+    if open_:
+        return OtherDeckStatus("building", "Building", "active")
+    spec = getattr(marks, "spec", None)
+    if (
+        spec is not None
+        and spec.id == newest_comment
+        and spec_label.strip().casefold() in {label.casefold() for label in item.labels}
+    ):
+        return OtherDeckStatus("spec", "Spec waiting for approval", "idle", spec.url)
+    return OtherDeckStatus("working", "Working", "active")
 
 
 def other_deck_works(
@@ -910,7 +1000,7 @@ def other_deck_works(
                     pull=pulls[0] if pulls else None,
                     updated=_stamp(issue.updated_at) or opened,
                     assignees=tuple(
-                        login.strip().lower() for login in issue.assignees if login.strip()
+                        login.strip() for login in issue.assignees if login.strip()
                     ),
                 )
             )

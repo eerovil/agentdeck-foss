@@ -422,6 +422,14 @@ class JobsConfig(BaseModel):
         return Path(self.state_dir).expanduser()
 
 
+# Overrides the streams folder's default; the test suite points it at scratch (#3966).
+WEBHOOK_STATE_DIR_ENV = "AGENTDECK_WEBHOOK_STATE_DIR"
+
+
+def _default_webhook_state_dir() -> str:
+    return os.environ.get(WEBHOOK_STATE_DIR_ENV) or "~/.local/share/agentdeck/github-webhooks"
+
+
 class GitHubWebhookConfig(BaseModel):
     """The raw per-repository webhook streams on this host (#1601).
 
@@ -439,10 +447,15 @@ class GitHubWebhookConfig(BaseModel):
     ``<repo>.jsonl.1.gz``, older archives shift down, and the last one is dropped.
     Set ``rotate_bytes`` to 0 to keep the pre-#1622 behaviour of never rotating,
     and ``keep_rotations`` to 0 to discard a full stream instead of archiving it.
+
+    The deck keeps its own files beside the streams, in ``state_dir``'s parent: the release
+    store, the endings ledger, the router's files, the wake-on registry, the tailers'
+    offsets and the image cache (``store_path``). So a second deck on this host needs a
+    ``state_dir`` whose *parent* is its own, not just a folder of its own (#3962).
     """
 
     enabled: bool = True
-    state_dir: str = "~/.local/share/agentdeck/github-webhooks"
+    state_dir: str = Field(default_factory=_default_webhook_state_dir)
     secret_env: str = "AGENTDECK_WEBHOOK_SECRET"
     rotate_bytes: int = ROTATE_BYTES
     keep_rotations: int = KEEP_ROTATIONS
@@ -457,6 +470,29 @@ class GitHubWebhookConfig(BaseModel):
     @property
     def path(self) -> Path:
         return Path(self.state_dir).expanduser()
+
+    @property
+    def store_path(self) -> Path:
+        """The folder of the files the deck keeps beside the streams."""
+        return self.path.parent
+
+
+class ServicesConfig(BaseModel):
+    """The services process: the Work router, the merge release and the backstop (#4016).
+
+    ``in_web`` is the switch back: on, the web runs them itself and ``agentdeck services``
+    stands down, read at each start, so going back needs no deploy. On by default until the
+    cutover, so a deck that deploys this before it installs ``agentdeck-services.service``
+    keeps its router; the cutover sets it off. It lives only until the move's 7-day check
+    passes (#4017). ``enabled`` runs them at all; unset follows
+    ``github_webhook.enabled``, so staging, whose streams are off, can still run them in its
+    services twin over a copied stream (#4018). ``socket`` overrides the socket's path, as
+    ``AGENTDECK_SERVICES_SOCKET`` does.
+    """
+
+    in_web: bool = True
+    enabled: bool | None = None
+    socket: str = ""
 
 
 class ChatBoardConfig(BaseModel):
@@ -654,6 +690,11 @@ class SpeechConfig(BaseModel):
     not shrink, so the Finnish default ``1.5`` reads a reply about a third faster
     than the voice's own pace (#3543).
 
+    ``keep_audio_days`` keeps every transcribed phrase's audio, words and noise
+    reading in ``keep_audio_dir`` for that many days, for ``scripts/speech_bench.py``
+    to compare speech-to-text models on, quiet and noisy apart (#3499, back in #3934).
+    ``0``, the default, keeps nothing.
+
     ``engine``, ``whisper_model`` and ``parakeet_model`` are read by the speech
     service itself when it starts, not by the deck (#3509): ``"parakeet"``, the
     default, runs the Parakeet TDT model in the folder ``parakeet_model`` (Orukeet,
@@ -682,6 +723,8 @@ class SpeechConfig(BaseModel):
     voice_fi: str = Field(default="fi_FI-harri-medium", pattern=r"^[A-Za-z0-9_-]+$")
     speed_en: float = Field(default=1.0, ge=0.5, le=3)
     speed_fi: float = Field(default=1.5, ge=0.5, le=3)
+    keep_audio_days: int = Field(default=0, ge=0, le=90)
+    keep_audio_dir: str = "~/.local/share/agentdeck/speech/kept"
     engine: Literal["whisper", "parakeet"] = "parakeet"
     parakeet_model: str = "~/.local/share/agentdeck/speech/models/orukeet"
     whisper_model: str = Field(default="large-v3-turbo", pattern=r"^[A-Za-z0-9._/~-]+$")
@@ -730,7 +773,8 @@ class AppConfig(BaseModel):
     jobs: JobsConfig = JobsConfig()
     push: PushConfig = PushConfig()
     poller: PollerConfig = Field(default_factory=PollerConfig)
-    github_webhook: GitHubWebhookConfig = GitHubWebhookConfig()
+    github_webhook: GitHubWebhookConfig = Field(default_factory=GitHubWebhookConfig)
+    services: ServicesConfig = ServicesConfig()
     chat_board: ChatBoardConfig = ChatBoardConfig()
     review: ReviewConfig = ReviewConfig()
     auto_dream: AutoDreamConfig = AutoDreamConfig()

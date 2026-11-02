@@ -157,6 +157,29 @@ def test_observed_queue_object_can_be_collected_while_correlation_survives(tmp_p
 
 
 
+def test_merged_line_keeps_every_send_after_their_queue_objects_go(young_heap):
+    """One Claude line carrying two queued sends keeps both ids for a page (#3931)."""
+    service = _service()
+    first = service._begin_delivery(KEY, "first\n", client_action_id="action-first", after_seq=0)
+    second = service._begin_delivery(KEY, "second", client_action_id="action-second", after_seq=0)
+    event = SimpleNamespace(
+        role="user", seq=1, ts=datetime.now(UTC), queued=False, text="first\n\nsecond",
+        text_parts=("first", "second"), image_media_types=(), answer=None,
+    )
+    service.observe_transcript(KEY, [event])
+    references = (weakref.ref(first), weakref.ref(second))
+    ids = (first.id, second.id)
+    del first, second
+    for index in range(20):
+        item = service._begin_delivery(KEY, str(index))
+        service._finish_delivery(KEY, item, InjectResult(False, "synthetic refusal"))
+    gc.collect()
+    assert [reference() for reference in references] == [None, None]
+    observed = service.observe_transcript(KEY, [event])[1]
+    assert (observed.id, observed.client_action_id) == (ids[0], "action-first")
+    assert observed.also == ((ids[1], "action-second"),)
+
+
 def test_observed_correlations_expire_after_ui_reconnect_window():
     service = _service()
     first = service._begin_delivery(KEY, "first", after_seq=0)

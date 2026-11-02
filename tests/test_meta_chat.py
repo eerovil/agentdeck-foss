@@ -214,18 +214,22 @@ async def test_a_first_start_lost_to_a_restart_still_blocks_a_second_one(tmp_pat
     assert len(starts) == 1
 
 
-async def test_the_deck_chat_moves_only_its_own_page_to_another_chat(tmp_path):
-    """#3816: the deck chat names a chat; only a stream showing the deck chat carries the
-    jump, once, as it is made and never in a prime."""
+async def test_a_chat_moves_only_its_own_pages_to_another_chat(tmp_path):
+    """#3816, #3857: the deck chat, or any chat naming itself as ``from``, names a chat;
+    only a stream showing the asking chat carries the jump, once, as it is made and
+    never in a prime."""
     import asyncio
 
-    from agentdeck.chat_jump import JUMP_TOPIC
+    from agentdeck.chat_jump import jump_topic
     from agentdeck.web.routes_sse import _session_stream
 
     app, _starts, _sends = _app(tmp_path, idle_minutes=5)
     state = app.state.app_state
     other = replace(state.sessions[KEY], key="claude_code:main:sid2", session_id="sid2")
+    work = replace(state.sessions[KEY], key="claude_code:main:sid3", session_id="sid3")
     state.update_session(other)
+    state.update_session(work)
+    state.budget_db.record_session_token("work-token", work.key)
     state.set_generated_title(other.key, "The login bug", "sig", source="agent")
 
     class Page:
@@ -242,29 +246,54 @@ async def test_the_deck_chat_moves_only_its_own_page_to_another_chat(tmp_path):
             assert "data-chat-jump" not in frame
         return frame
 
+    def listening(key):
+        return state.bus.subscribers(jump_topic(state.chat_identity_key(key)))
+
     deck, elsewhere = _session_stream(Page(), KEY), _session_stream(Page(), other.key)
+    working = _session_stream(Page(), work.key)
     try:
-        # Each stream subscribes at its first frame; only the deck chat's hears jumps.
-        await asyncio.wait_for(anext(deck), 5)
-        await asyncio.wait_for(anext(elsewhere), 5)
-        assert state.bus.subscribers(JUMP_TOPIC) == 1
+        # Each stream subscribes at its first frame, to its own chat's jumps alone.
+        for stream in (deck, elsewhere, working):
+            await asyncio.wait_for(anext(stream), 5)
+        assert [listening(key) for key in (KEY, other.key, work.key)] == [1, 1, 1]
         async with _client(app) as client:
             chats = (await client.get("/api/view/chats")).json()["chats"]
             title = state.sessions[other.key].display_title
             assert "The login bug" in title
-            assert [(c["key"], c["title"]) for c in chats] == [(other.key, title)]
-            for body, status in (({"chat": "nope"}, 404), ({"chat": KEY}, 409), ({}, 400)):
+            assert (other.key, title) in [(c["key"], c["title"]) for c in chats]
+            for body, status in (
+                ({"chat": "nope"}, 404),
+                ({"chat": KEY}, 409),
+                ({}, 400),
+                ({"chat": other.key, "from": "nope"}, 404),
+                ({"chat": work.key, "from": "work-token"}, 409),
+            ):
                 assert (await client.post("/api/view/open-chat", json=body)).status_code == status
-            assert app.state.chat_jumps.latest is None
+            assert app.state.chat_jumps.fresh(state.chat_identity_key(KEY)) is None
             answer = await client.post("/api/view/open-chat", json={"chat": other.key})
-        path = state.chat_path_for_session(other.key)
-        assert answer.json() == {"opened": path, "title": title, "pages": 1}
-        frame = await frames_until_jump(deck)
+            path = state.chat_path_for_session(other.key)
+            assert answer.json() == {"opened": path, "title": title, "pages": 1}
+            frame = await frames_until_jump(deck)
+            # A Work's chat, named by its token, moves its own page, to the chat
+            # ``opened`` named; the deck chat's page has nothing more to hear.
+            answer = await client.post(
+                "/api/view/open-chat", json={"chat": path, "from": "work-token"}
+            )
+            assert answer.json() == {"opened": path, "title": title, "pages": 1}
+            moved = await frames_until_jump(working)
+            assert app.state.chat_jumps.fresh(state.chat_identity_key(other.key)) is None
     finally:
-        await deck.aclose()
-        await elsewhere.aclose()
+        for stream in (deck, elsewhere, working):
+            await stream.aclose()
     assert f"&#34;path&#34;: &#34;{path}&#34;" in frame
     assert frame.count("event: chat_jump") == 1
+    assert f"&#34;path&#34;: &#34;{path}&#34;" in moved
+    # With no page showing the asking chat, the answer says why none moved.
+    async with _client(app) as client:
+        answer = (
+            await client.post("/api/view/open-chat", json={"chat": other.key, "from": work.key})
+        ).json()
+    assert answer["pages"] == 0 and "no page is showing" in answer["why"]
 
 
 def test_a_jump_finds_a_work_by_any_spelling_of_its_reference():

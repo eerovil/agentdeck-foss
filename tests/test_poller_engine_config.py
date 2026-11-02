@@ -918,6 +918,31 @@ def test_a_repo_may_hold_code_without_holding_issues(tmp_path):
     assert draft.manifest.auto_deploy_repos() == frozenset({"store"})
 
 
+@pytest.mark.parametrize(
+    ("verification", "value", "ok"),
+    [
+        ("agentdeck_job", "true", True),
+        ("github_checks", "true", False),
+        ("agentdeck_job", '"yes"', False),
+    ],
+)
+def test_checks_required_only_beside_a_verification_job(tmp_path, verification, value, ok):
+    """#3919: a job and the repository's own CI both prove it; nothing else takes the flag."""
+    manifest, overlay = _with_fork()
+    manifest = manifest.replace(
+        'verification = "agentdeck_job"\n',
+        f'verification = "{verification}"\ngithub_checks_required = {value}\n',
+    )
+    draft = _inspect(tmp_path, manifest=manifest, overlay=overlay)
+    assert draft.ok is ok, draft.report.render()
+    if ok:
+        assert draft.manifest.repo("fork").github_checks_required
+    else:
+        assert any(
+            p.location.endswith(".github_checks_required") for p in draft.report.problems
+        )
+
+
 def test_a_code_only_repo_is_named_to_the_worker_but_never_worked_in(tmp_path):
     """#1578: the brief has to say the fork exists; no card may be dispatched into it."""
     manifest, overlay = _with_fork()

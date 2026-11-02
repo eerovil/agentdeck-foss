@@ -158,6 +158,12 @@ MAX_NOTE = 80
 #: A commit status or deployment status in one of these states is a result; anything
 #: else (``pending``, ``queued``, ``in_progress``) is a run still going.
 _TERMINAL_STATUS = frozenset({"success", "failure", "error"})
+#: The deliveries that report CI on a commit, finished or not.
+_CI_EVENTS = {"check_suite", "check_run", "workflow_run", "status"}
+#: Check conclusions that say nothing about the commit: a job skipped by its ``if:``, such as a
+#: deploy that runs only on ``main``. An unnamed commit wait woke on one and its agent had to
+#: read the checks by hand and wait again (#3910); a wait naming the check still takes it.
+_NO_RESULT = frozenset({"skipped", "neutral"})
 
 _REPOSITORY_RE = re.compile(r"^([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)$")
 #: An ``owner/repo#n`` or ``repo#n`` in a reviewer's closing line.
@@ -474,6 +480,8 @@ def match(request: WakeRequest, delivery: Delivery) -> Outcome | None:
     if request.sha and not sha.lower().startswith(request.sha):
         return None
     if request.name and not _name_matches(request.name, name):
+        return None
+    if request.kind == KIND_COMMIT and not request.name and conclusion.lower() in _NO_RESULT:
         return None
     label = {
         "check_suite": "check suite",
@@ -804,29 +812,9 @@ def seen_deployments(
     Only the last ``tail_bytes`` are read, so an old deploy or one in a rotated archive is
     not seen: an empty answer proves nothing, like the stream itself.
     """
-    path = _stream_path(Path(streams_root).expanduser(), repository)
-    if path is None:
-        return [], None
-    try:
-        with path.open("rb") as handle:
-            start = max(0, handle.seek(0, 2) - tail_bytes)
-            handle.seek(start)
-            lines = handle.read().split(b"\n")
-    except OSError:
-        return [], None
-    if start:
-        lines = lines[1:]  # cut mid-record
     newest: dict[str, SeenDeploy] = {}
     done: SeenDeploy | None = None
-    for line in lines:
-        if b"deployment_status" not in line:
-            continue
-        try:
-            record = json.loads(line)
-        except ValueError:
-            continue
-        if not isinstance(record, dict) or record.get("event") != "deployment_status":
-            continue
+    for record in _tail_records(streams_root, repository, tail_bytes, {"deployment_status"}):
         seen = _seen_deploy(record)
         if seen is None:
             continue
@@ -841,6 +829,120 @@ def seen_deployments(
         ):
             done = seen
     return sorted(newest.values(), key=_when, reverse=True), done
+
+
+def _tail_records(
+    streams_root: Path | str, repository: str, tail_bytes: int, events: set[str]
+) -> Iterable[dict]:
+    """The records of ``events`` in the last ``tail_bytes`` of a repository's stream, in
+    the order they were stored."""
+    path = _stream_path(Path(streams_root).expanduser(), repository)
+    if path is None:
+        return []
+    try:
+        with path.open("rb") as handle:
+            start = max(0, handle.seek(0, 2) - tail_bytes)
+            handle.seek(start)
+            lines = handle.read().split(b"\n")
+    except OSError:
+        return []
+    if start:
+        lines = lines[1:]  # cut mid-record
+    records = []
+    for line in lines:
+        if not any(event.encode() in line for event in events):
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(record, dict) and record.get("event") in events:
+            records.append(record)
+    return records
+
+
+def _subject(event: str, payload: dict) -> tuple[str, str, datetime | None]:
+    """``(sha, name, when)`` a CI delivery is about, finished or not; ``when`` is the
+    source's own time of that state (``None`` when it has none that parses)."""
+    if event == "status":
+        return (
+            _text(payload.get("sha")),
+            _text(payload.get("context")),
+            _instant(payload.get("updated_at") or payload.get("created_at")),
+        )
+    run = payload.get(event)
+    if not isinstance(run, dict):
+        return "", "", None
+    if event == "check_suite":
+        app = run.get("app")
+        name = _text(app.get("name")) if isinstance(app, dict) else ""
+        return _text(run.get("head_sha")), name, _instant(run.get("updated_at"))
+    if event == "check_run":
+        when = _instant(run.get("completed_at") or run.get("started_at"))
+        return _text(run.get("head_sha")), _text(run.get("name")), when
+    return _text(run.get("head_sha")), _text(run.get("name")), _instant(run.get("updated_at"))
+
+
+def _instant(value: object) -> datetime | None:
+    try:
+        moment = datetime.fromisoformat(_text(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
+
+
+def seen_result(
+    streams_root: Path | str, request: WakeRequest, *, tail_bytes: int = DEPLOY_TAIL_BYTES
+) -> Outcome | None:
+    """A finished result a commit wait would fire on, already in the end of the stream and
+    not started again since (#3863), else ``None``.
+
+    An agent whose one read of GitHub lagged registered a second wait on a check the first
+    had already met; it stayed open, and its Work read Waiting over Ready for merge. A
+    result is per check: its newest state by the source's own time decides, not by arrival
+    (GitHub can deliver an older success after a newer re-run), so a check re-run since (a
+    ``pending`` status, a ``created`` run) is still waited on. A check with a delivery whose
+    time does not parse, or a finished and an unfinished state at the same time, is waited
+    on too. Like ``seen_deployments``, an empty answer proves nothing.
+    """
+    if request.kind != KIND_COMMIT or not request.sha:
+        return None
+    #: Per check: (its newest state's time, that state's outcome); None once unknowable.
+    newest: dict[tuple[str, str], tuple[datetime, Outcome | None] | None] = {}
+    for record in _tail_records(streams_root, request.repository, tail_bytes, _CI_EVENTS):
+        delivery = Delivery(
+            stream=request.repository,
+            delivery_id=str(record.get("delivery_id") or ""),
+            event=str(record.get("event") or ""),
+            received_at=str(record.get("received_at") or ""),
+            headers={},
+            raw_body=_raw(record),
+            offset=0,
+        )
+        sha, name, when = _subject(delivery.event, delivery.payload)
+        if not sha.lower().startswith(request.sha) or (
+            request.name and not _name_matches(request.name, name)
+        ):
+            continue
+        key = (delivery.event, name.lower())
+        if key in newest and newest[key] is None:
+            continue
+        if when is None:
+            newest[key] = None
+            continue
+        outcome = match(request, delivery)
+        held = newest.get(key)
+        if held is None or when > held[0] or (when == held[0] and outcome is None):
+            newest[key] = (when, outcome)
+    done = [held for held in newest.values() if held is not None and held[1] is not None]
+    return max(done, key=lambda held: held[0])[1] if done else None
+
+
+def _raw(record: dict) -> bytes:
+    try:
+        return raw_body(record)
+    except (ValueError, KeyError, TypeError):
+        return b""
 
 
 @dataclass(frozen=True)
@@ -1179,6 +1281,31 @@ class WakeOnRegistry:
             self.on_change()
 
 
+def register(
+    registry: WakeOnRegistry,
+    session_key: str,
+    chat_id: str,
+    *,
+    timeout_s: float,
+    asked: bool = False,
+    clock: Callable[[], float] = time.time,
+    **fields,
+) -> WakeRequest:
+    """Store one wait in ``registry``: the service's ``register``, and the services process's,
+    which keeps the registry without the service (#4016)."""
+    now = clock()
+    request = WakeRequest(
+        id=secrets.token_hex(6),
+        session_key=session_key,
+        chat_id=chat_id,
+        registered_at=now,
+        deadline=now + timeout_s,
+        asked_at=now if asked else 0.0,
+        **fields,
+    )
+    return registry.add(request)
+
+
 class WakeOnService:
     """Tail the streams and send each registered chat its one wake message.
 
@@ -1275,21 +1402,18 @@ class WakeOnService:
         """``seen_deployments`` over this service's streams."""
         return seen_deployments(self._streams_root, repository, sha=sha, name=name)
 
+    def seen_result(self, request: WakeRequest) -> Outcome | None:
+        """``seen_result`` over this service's streams."""
+        return seen_result(self._streams_root, request)
+
     def register(
         self, session_key: str, chat_id: str, *, timeout_s: float, asked: bool = False, **fields
     ) -> WakeRequest:
         """Store one wait; ``asked`` is a review wait the chat asked for the review of now."""
-        now = self._clock()
-        request = WakeRequest(
-            id=secrets.token_hex(6),
-            session_key=session_key,
-            chat_id=chat_id,
-            registered_at=now,
-            deadline=now + timeout_s,
-            asked_at=now if asked else 0.0,
-            **fields,
+        return register(
+            self.registry, session_key, chat_id, timeout_s=timeout_s, asked=asked,
+            clock=self._clock, **fields,
         )
-        return self.registry.add(request)
 
     def start(self) -> None:
         if not self._enabled or self._task is not None:

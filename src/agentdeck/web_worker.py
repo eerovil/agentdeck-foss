@@ -13,6 +13,7 @@ from collections.abc import Callable
 import uvicorn
 from fastapi import FastAPI
 
+from . import loop_watchdog
 from .app import create_app
 from .config import config_path, load_config
 from .error_reporting import initialize_error_reporting
@@ -108,6 +109,7 @@ class _ReadyServer(uvicorn.Server):
         self._idle_timeout_s = idle_timeout_s
         self._control_task: asyncio.Task[None] | None = None
         self._idle_task: asyncio.Task[None] | None = None
+        self._loop_watch_task: asyncio.Task[None] | None = None
         self.idle_exit = False
 
     def _web_activity(self) -> WebActivity:
@@ -215,14 +217,18 @@ class _ReadyServer(uvicorn.Server):
             self._control_loop(), name="web-worker-control"
         )
         self._start_idle_watchdog()
+        # Here rather than in the app's lifespan: a test that builds the app must not
+        # start a watchdog thread that outlives it (#3970).
+        self._loop_watch_task = asyncio.create_task(loop_watchdog.watch(), name="loop-watchdog")
 
     async def serve_listener(self, listener: socket.socket) -> None:
         try:
             await self.serve(sockets=[listener])
         finally:
-            if self._idle_task is not None:
-                self._idle_task.cancel()
-                await asyncio.gather(self._idle_task, return_exceptions=True)
+            for task in (self._idle_task, self._loop_watch_task):
+                if task is not None:
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
             if self._ready_fd >= 0:
                 os.close(self._ready_fd)
             os.close(self._command_fd)

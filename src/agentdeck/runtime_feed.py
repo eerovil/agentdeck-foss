@@ -371,8 +371,19 @@ class FeedSubscription:
 class RuntimeFeedClient:
     """The web process's one held ``GET /changes``, fanned out to subscriptions."""
 
-    def __init__(self, transport: httpx.AsyncBaseTransport | None = None) -> None:
+    def __init__(
+        self,
+        transport: httpx.AsyncBaseTransport | None = None,
+        *,
+        socket_path: Callable[[], Any] = runtime_socket_path,
+        kinds: frozenset[str] = KINDS,
+        name: str = "runtime-change-feed",
+    ) -> None:
         self._transport = transport
+        # The services process serves the same feed over its own socket (#4016).
+        self._socket_path = socket_path
+        self._kinds = kinds
+        self._name = name
         self.mode = DOWN
         self._subs: set[FeedSubscription] = set()
         self._listeners: list[Callable[[frozenset[str]], None]] = []
@@ -414,7 +425,7 @@ class RuntimeFeedClient:
         if self._task is None or self._task.done():
             if not self._subs:
                 return
-            self._task = asyncio.create_task(self._run(), name="runtime-change-feed")
+            self._task = asyncio.create_task(self._run(), name=self._name)
 
     def _set_mode(self, mode: str) -> None:
         if mode != self.mode:
@@ -429,7 +440,7 @@ class RuntimeFeedClient:
         for sub in list(self._subs):
             if items is None or any(sub.matches(item) for item in items):
                 sub.notify()
-        kinds = KINDS if items is None else frozenset(kind_of(item) for item in items)
+        kinds = self._kinds if items is None else frozenset(kind_of(item) for item in items)
         if kinds:
             for listener in list(self._listeners):
                 try:
@@ -438,7 +449,7 @@ class RuntimeFeedClient:
                     log.exception("runtime feed listener failed")
 
     def _client(self) -> httpx.AsyncClient:
-        transport = self._transport or httpx.AsyncHTTPTransport(uds=str(runtime_socket_path()))
+        transport = self._transport or httpx.AsyncHTTPTransport(uds=str(self._socket_path()))
         return httpx.AsyncClient(
             transport=transport,
             base_url="http://agentdeck-runtime",
@@ -460,7 +471,7 @@ class RuntimeFeedClient:
                     if response.status_code == 404:
                         since = epoch = None
                         if self.mode != LEGACY:
-                            log.info("the runtime has no change feed; reading on the old cadence")
+                            log.info("%s: no change feed; reading on the old cadence", self._name)
                             self._set_mode(LEGACY)
                         await asyncio.sleep(LEGACY_REPROBE_S)
                         continue
@@ -470,7 +481,7 @@ class RuntimeFeedClient:
                     new_epoch = str(data["epoch"])
                 except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
                     if self.mode == FEED:
-                        log.info("runtime change feed lost: %s", exc)
+                        log.info("%s lost: %s", self._name, exc)
                         # Everything is suspect: let every consumer find out for itself.
                         self._deliver(None)
                     since = epoch = None

@@ -120,6 +120,12 @@ def _drop_message_pins(connection: sqlite3.Connection) -> None:
     connection.execute("DROP TABLE IF EXISTS message_pins")
 
 
+def _drop_chat_review_heads(connection: sqlite3.Connection) -> None:
+    """Drop ``chat_review_heads``: each review chat's heads are its ``chat`` rows in the
+    review history now, and the old rows go with it, as nothing is copied (#3956)."""
+    connection.execute("DROP TABLE IF EXISTS chat_review_heads")
+
+
 def _widen_chat_review_heads(connection: sqlite3.Connection) -> None:
     """Key ``chat_review_heads`` by chat *and* pull request (#2637).
 
@@ -279,6 +285,12 @@ MIGRATIONS = (
         (("session_pull_requests", "work_id", "TEXT NOT NULL DEFAULT ''"),),
     ),
     Migration(17, "drop pinned messages", (), _drop_message_pins),
+    Migration(
+        18,
+        "a Work summary's background",
+        (("work_metadata", "background_summary", "TEXT"),),
+    ),
+    Migration(19, "drop chat_review_heads", (), _drop_chat_review_heads),
 )
 
 

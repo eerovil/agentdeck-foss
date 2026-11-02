@@ -347,9 +347,14 @@ async def test_a_work_that_stops_again_is_new_until_its_page_is_opened(tmp_path,
     assert page.count('data-front-toggle="') >= 2
     assert 'data-front-summary="new"' in page
 
+    # The open asks for a rebuild, run here: one left to the test client's own event loop
+    # races this test's rebuild, and its clear dies with that loop (#3915).
+    rebuilds = []
+    monkeypatch.setattr(service, "refresh_soon", lambda: rebuilds.append(1))
     opened = client.get(work_href(WORK.work_id))
     # Its own page leaves it out of the top bar's list before the rebuild has run (#3289).
     assert 'class="needs-you-menu" data-new="0"' in opened.text
+    assert rebuilds == [1]
     await app.state.work_overview.refresh()
     await asyncio.gather(*service._push_tasks)
     # Opened, its notification is cleared on every device, once (#3365).
@@ -689,8 +694,9 @@ async def test_the_top_bar_list_stays_open_through_a_push_and_opening_a_work_cle
     tmp_path, monkeypatch
 ):
     """#3239 in the only place it is real: an open list survives the push that adds a Work,
-    and opening that Work from the list takes it off on the Work page's own top bar. A Work
-    that stops again while its page is on screen is marked read by that page (#3289)."""
+    and opening that Work from the list takes it off on the top bar of the page it opens: its
+    chat, which a row links to once the Work has one (#3263). A Work that stops again while
+    its chat is on screen is marked read by that page (#3289)."""
     import os
     from pathlib import Path
 
@@ -733,8 +739,12 @@ async def test_the_top_bar_list_stays_open_through_a_push_and_opening_a_work_cle
             )
 
         await page.locator("#needs-you-slot summary").click()
+        # The row opens the chat the Work opens into, not the Work page (#3263).
+        (row,) = (await app.state.work_overview.current()).front.needs_you
+        assert row.card.chat_href.startswith("/chats/")
+        await expect(item).to_have_attribute("href", row.card.chat_href)
         await item.click()
-        await page.wait_for_url(f"**{work_href(WORK.work_id)}")
+        await page.wait_for_url(f"**{row.card.chat_href}")
         await expect(page.locator("#needs-you-slot .needs-you-menu")).to_have_attribute(
             "data-new", "0", timeout=10_000
         )

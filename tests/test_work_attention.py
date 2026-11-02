@@ -453,7 +453,7 @@ def _output(
 
 def test_the_size_sums_every_counted_output_across_repositories():
     outputs = (
-        _output(1),
+        _output(1, "merged"),
         _output(2, "merged", size=(5, 5, 3), new=(6, 2)),
         _output(3, "closed", size=(99, 99, 9), new=(None, None)),
     )
@@ -461,8 +461,18 @@ def test_the_size_sums_every_counted_output_across_repositories():
     # A pull request closed without merging is not part of what the Work changes.
     assert diffstat(outputs) == DiffStat(15, 7, 4, 6, 2)
     # One output's split unknown keeps the size but drops the split, never half of it (#3617).
-    unsplit = diffstat((outputs[0], _output(4, new=(None, None))))
+    unsplit = diffstat((_output(1), _output(4, new=(None, None))))
     assert unsplit == DiffStat(20, 4, 2) and not unsplit.split
+    # While one is open, a merged one (even of unknown size) is history: only the open count,
+    # a draft among them (#4010).
+    draft = replace(_output(5, size=(3, 1, 1)), draft=True)
+    pending = (*outputs, _output(4, "merged", size=(None, None, None)), _output(6), draft)
+    assert diffstat(pending) == DiffStat(13, 3, 2, 0, 0)
+    assert diffstat(pending[::-1]) == DiffStat(13, 3, 2, 0, 0)
+    # A state not resolved yet is not open (#3187): out beside an open one, in without one.
+    unresolved = _output(7, "", size=(50, 50, 5))
+    assert diffstat((*pending, unresolved)) == DiffStat(13, 3, 2, 0, 0)
+    assert diffstat((*outputs, unresolved)) == DiffStat(65, 57, 9, 6, 2)
 
 
 @pytest.mark.parametrize(
@@ -502,6 +512,8 @@ def test_the_target_is_named_only_when_it_is_not_master():
     assert target_branches((_output(1), _output(2, base=""))) == ()
     assert target_branches((_output(1), _output(2, base="release"))) == ("release",)
     assert target_branches((_output(1, "closed", base="old"),)) == ()
+    # A merged one's target is history while another is open (#4010).
+    assert target_branches((_output(1, "merged", base="release"), _output(2))) == ()
 
 
 def test_the_size_comes_from_the_cached_row_and_is_on_the_card(tmp_path):

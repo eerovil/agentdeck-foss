@@ -644,6 +644,27 @@ def test_the_work_page_shows_merge_when_ready_then_approved_then_cleared(
     assert "data-work-merge-approved" not in offered
     approved = status(approval="approved")
     assert "data-work-merge-approved" in approved and 'value="withdraw_merge"' in approved
+    # #3869: what an armed press waits for stays in sight after another press, once.
+    from agentdeck.web.work_view import render_changed_sections
+
+    waits = {"approval": "approved", "approval_waits": "Merge armed: now x."}
+    after_star = status(last_action=_press("star", ago_s=10), **waits)
+    assert 'data-work-merge-armed>Merge armed: now x.</p>' in after_star
+    after_merge = status(last_action=_press("merge", ago_s=10), **waits)
+    assert after_merge.count("Merge armed: now x.") == 1, "the receipt says it already"
+    # Only the wait moved: the live page renders the status again (#3869 review).
+    detail = WorkDetail(card=card, workspace=None, chats=(), verifications=(), **waits)
+    before = render_changed_sections(app.state.templates, detail, previous={})
+    moved = replace(detail, approval_waits="Merge armed: now y.")
+    after = render_changed_sections(app.state.templates, moved, previous=before)
+    assert "now y." in after["status"][1]
+    # #3880: a review waiting on the agent's pre-review checklist says so, and moves live.
+    held = "Pre-review: waiting for the agent to go through its checklist on o/r#9."
+    assert f"data-work-pre-review>{held}</p>" in status(pre_review_waits=held)
+    released = render_changed_sections(
+        app.state.templates, replace(detail, pre_review_waits=held), previous=before
+    )
+    assert held in released["status"][1]
     cleared = status(approval="offered", approval_cleared="Merge approval cleared: x changed.")
     assert "data-work-merge-cleared" in cleared and "x changed." in cleared
     assert "approve_merge" not in status()
@@ -753,9 +774,10 @@ async def test_a_needs_you_row_carries_no_action_and_swaps_in_place(
         assert await page.evaluate("() => document.documentElement.scrollWidth") <= width
         before = await row.get_attribute("data-work-rev")
 
-        # A live update replaces the row whole; its menu comes back open.
+        # A live update replaces the row whole. The chat is renamed, a real change to the
+        # card: the first pass already shows the chat, so adding it again changes nothing.
         await row.evaluate("el => { el.__before = true; }")
-        _add(app, "claude_code:test:worker", UI_WORK, title="Worker chat")
+        _add(app, "claude_code:test:worker", UI_WORK, title="Worker chat, renamed")
         await app.state.work_overview.refresh()
         await page.wait_for_function(
             "([id, rev]) => { const el = document.querySelector("
@@ -855,3 +877,14 @@ def test_a_merge_press_reads_as_done_once_the_work_merged():
 
     assert open_.last_action_followed == ""
     assert merged.last_action_followed == "Merge asked; merged"
+    # #3869: while the press stands, its receipt says what it waits for now, not what held it
+    # when pressed; the merge still reads as done.
+    line = "Merge armed: it merges with no second press once nothing holds it. Now: x."
+    armed = WorkDetail(
+        _idle(), None, (), (), last_action=merge, approval="approved", approval_waits=line
+    )
+    assert armed.last_action_followed == line
+    assert replace(armed, card=merged.card).last_action_followed == "Merge asked; merged"
+    when_ready = replace(armed, last_action=_press("approve_merge", ago_s=60))
+    assert when_ready.last_action_followed == line
+    assert replace(armed, approval="offered").last_action_followed == ""

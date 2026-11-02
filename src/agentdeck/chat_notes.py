@@ -39,7 +39,9 @@ import hashlib
 import json
 import logging
 import re
+import threading
 from collections.abc import Callable, Iterable
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -53,6 +55,7 @@ log = logging.getLogger(__name__)
 
 CONSUMER = "chat-notes"
 BACKFILL_MARKER = "chat-notes-backfill.json"
+TIME_REPAIR_MARKER = "chat-notes-time-repair.json"
 _BACKFILL_BATCH = 200
 TOPIC = "chat_notes"
 _READ_TIMEOUT_S = 20.0
@@ -117,9 +120,27 @@ def note_from(delivery: Delivery, own_logins: frozenset[str]) -> tuple[str, Chat
         url=url,
         body=body if isinstance(body, str) else "",
         body_html=None,
-        created_at=created,
+        created_at=_no_later_than_arrival(created, delivery.received_at),
         updated_at=updated,
     )
+
+
+def _no_later_than_arrival(created: str, received_at: str) -> str:
+    """GitHub's ``created_at``, or the delivery's arrival when GitHub's is later (#3966).
+
+    A comment cannot be created after the deck heard of it, yet GitHub stamped every comment
+    of 2026-11-01 08:00-09:00 UTC an hour late (the hour US clocks went back), so those
+    notes showed in the future and out of order. The arrival is GitHub's form, so the
+    table still sorts by text.
+    """
+    try:
+        made = datetime.fromisoformat(created.replace("Z", "+00:00"))
+        heard = datetime.fromisoformat(received_at.replace("Z", "+00:00"))
+    except ValueError:
+        return created
+    if made.tzinfo is None or heard.tzinfo is None or made <= heard:
+        return created
+    return heard.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def rendered_html(body_html: str | None) -> str | None:
@@ -231,24 +252,33 @@ class ChatNotesService:
         self._read_html = read_html
         self._scanned = scanned
         self._marker = Path(streams_root).expanduser().parent / BACKFILL_MARKER
+        self._time_marker = Path(streams_root).expanduser().parent / TIME_REPAIR_MARKER
         self._task: asyncio.Task | None = None
         self._backfill_task: asyncio.Task | None = None
         self._stop = asyncio.Event()
+        # The time repair runs in a thread a cancelled task cannot stop: ``stop`` asks it
+        # to halt and waits for it before the database closes.
+        self._halt = threading.Event()
+        self._repair_idle = threading.Event()
+        self._repair_idle.set()
 
     def start(self) -> None:
         if not self._enabled or self._task is not None:
             return
         self._stop.clear()
+        self._halt.clear()
         self._task = asyncio.create_task(self._run(), name="chat-notes")
-        if not self._marker.exists():
+        if not self._marker.exists() or not self._time_marker.exists():
             self._backfill_task = asyncio.create_task(self._backfill(), name="chat-notes-backfill")
 
     async def stop(self) -> None:
+        self._halt.set()
         backfill, self._backfill_task = self._backfill_task, None
         if backfill is not None:
             backfill.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await backfill
+        await asyncio.to_thread(self._repair_idle.wait, 30)
         task, self._task = self._task, None
         if task is None:
             return
@@ -286,7 +316,12 @@ class ChatNotesService:
             # Owners come from the sessions, so wait for their first scan.
             if self._scanned is not None:
                 await self._scanned()
-            await self.backfill()
+            if not self._marker.exists():
+                await self.backfill()
+            if not self._time_marker.exists():
+                # Reads the whole log (hundreds of MB) off the event loop.
+                if await asyncio.to_thread(self.repair_times):
+                    self._on_change()
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -301,27 +336,54 @@ class ChatNotesService:
         """
         seen = 0
         for repository in self._tailer.streams():
-            path = self._tailer.path_for(repository)
-            archives = sorted(
-                (int(p.name[len(path.name) + 1 : -3]), p)
-                for p in path.parent.glob(f"{path.name}.*.gz")
-                if p.name[len(path.name) + 1 : -3].isdigit()
-            )
-            sources = [p for _, p in reversed(archives)] + [path]
             batch: list[Delivery] = []
-            for source in sources:
-                for delivery in _comment_records(source, repository.slug):
-                    batch.append(delivery)
-                    if len(batch) >= _BACKFILL_BATCH:
-                        seen += len(batch)
-                        await self.apply(batch)
-                        batch = []
+            for delivery in self._stored_comments(repository):
+                batch.append(delivery)
+                if len(batch) >= _BACKFILL_BATCH:
+                    seen += len(batch)
+                    await self.apply(batch)
+                    batch = []
             if batch:
                 seen += len(batch)
                 await self.apply(batch)
         self._marker.write_text(json.dumps({"done": True, "comments": seen}))
         log.info("chat notes backfill looked at %d comments", seen)
         return seen
+
+    def repair_times(self) -> int:
+        """Once, move each kept note GitHub stamped later than it arrived back to its
+        arrival (#3966), then mark it done. Adds no note and reads nothing from GitHub.
+        Returns how many notes moved; the caller announces the change. A halt or a failed
+        write leaves it unmarked, so the next start runs it again."""
+        self._repair_idle.clear()
+        try:
+            own = self._own_logins()
+            moved = 0
+            for repository in self._tailer.streams():
+                for delivery in self._stored_comments(repository):
+                    if self._halt.is_set():
+                        log.info("chat notes time repair halted; the next start retries")
+                        return moved
+                    found = note_from(delivery, own)
+                    # Raises on a failed write.
+                    if found is not None and self._store.move_chat_note_earlier(found[1]):
+                        moved += 1
+        finally:
+            self._repair_idle.set()
+        self._time_marker.write_text(json.dumps({"done": True, "moved": moved}))
+        log.info("chat notes time repair moved %d notes", moved)
+        return moved
+
+    def _stored_comments(self, repository) -> Iterable[Delivery]:
+        """Every ``issue_comment`` delivery kept for ``repository``, oldest archive first."""
+        path = self._tailer.path_for(repository)
+        archives = sorted(
+            (int(p.name[len(path.name) + 1 : -3]), p)
+            for p in path.parent.glob(f"{path.name}.*.gz")
+            if p.name[len(path.name) + 1 : -3].isdigit()
+        )
+        for source in [p for _, p in reversed(archives)] + [path]:
+            yield from _comment_records(source, repository.slug)
 
     def _owner(self, note: ChatNote) -> Owner | None:
         find = self._owner_of_pull if note.is_pull else self._owner_of_issue

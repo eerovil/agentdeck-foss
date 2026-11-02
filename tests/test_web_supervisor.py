@@ -452,6 +452,17 @@ def in_process_workers(tmp_path: Path, monkeypatch):
             threading.current_thread().server = self
 
     app = _small_deck(tmp_path / "runtime.sock")
+    # The real watchdog starts a thread per worker; record its life instead.
+    app.state.loop_watch = []
+
+    async def watch() -> None:
+        app.state.loop_watch.append("started")
+        try:
+            await asyncio.Event().wait()
+        finally:
+            app.state.loop_watch.append("stopped")
+
+    monkeypatch.setattr(web_worker.loop_watchdog, "watch", watch)
     monkeypatch.setattr(web_supervisor.subprocess, "Popen", _ThreadWorker)
     monkeypatch.setattr(web_supervisor, "_LOOP_POLL_S", 0.01)
     monkeypatch.setattr(web_worker, "_ReadyServer", _RecordedServer)
@@ -816,6 +827,8 @@ def test_an_unobserved_worker_stops_itself_and_the_socket_can_start_it_again(
     assert not pid_file.exists()
     # Its app counted as serving only once the supervisor activated it (#3584).
     assert in_process_workers.state.wake_on.accepting == [False, True]
+    # The served worker watched its loop for blocks, and stopped watching on exit (#3970).
+    assert in_process_workers.state.loop_watch == ["started", "stopped"]
 
 
 async def test_a_request_arriving_during_the_runtime_probe_cancels_the_stop() -> None:

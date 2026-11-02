@@ -24,7 +24,7 @@ from agentdeck.app import create_app
 from agentdeck.assistant import AssistantInsight, AssistantView
 from agentdeck.config import AccountConfig, AppConfig, HistoryConfig, PollerConfig
 from agentdeck.context_delivery import ContextDelivery
-from agentdeck.db import Db
+from agentdeck.db import ChatNote, Db
 from agentdeck.git_context import GitContext, PullRequestContext
 from agentdeck.host_stats import HostStats
 from agentdeck.inject import DelegationStatus, InjectionStatus
@@ -45,10 +45,13 @@ from agentdeck.providers.claude_code.provider import worker_type
 from agentdeck.providers.delivery import DeliveryReceipts
 
 
-def _app_with_state(tmp_path, *, with_transcript=False, extra_accounts=()):
+def _app_with_state(tmp_path, *, with_transcript=False, extra_accounts=(), services_in_web=False):
     import json
 
+    from agentdeck.config import ServicesConfig
+
     config = AppConfig(
+        services=ServicesConfig(in_web=services_in_web),
         history=HistoryConfig(db_path=str(tmp_path / "budgets.db")),
         accounts=[
             AccountConfig(provider="claude_code", label="test", config_dir=str(tmp_path)),
@@ -4350,6 +4353,9 @@ async def test_session_bottom_follow_stops_on_manual_scroll_and_resumes_near_end
               <div class="ev user pending-message" data-pending-message data-queue-id="2">
                 <div class="ev-text">queued message</div>
               </div>
+              <div class="ev user pending-message" data-pending-message data-queue-id="3">
+                <div class="ev-text">job finished</div>
+              </div>
             </div>
             <div id="tool-activity"></div>
             <form class="inject-form"><div id="inject-result"></div></form>
@@ -4403,7 +4409,8 @@ async def test_session_bottom_follow_stops_on_manual_scroll_and_resumes_near_end
                     bubbles: true, detail: {successful: true, elt: form}
                   }));
                   appendTranscript(
-                    '<div class="ev user" data-observed-queue-id="1" style="min-height:80px">' +
+                    // One line can carry several queued sends (#3931).
+                    '<div class="ev user" data-observed-queue-id="1 3" style="min-height:80px">' +
                     '<div class="ev-text">queued message</div></div>'
                   );
                   swap(status);
@@ -6130,6 +6137,8 @@ def test_transcript_user_message_renders_attached_images(tmp_path):
 
 
 def test_transcript_user_message_renders_observed_pending_identity(tmp_path):
+    from types import SimpleNamespace
+
     from agentdeck.inject import QueuedMessage
     from agentdeck.models import TranscriptEvent
     from agentdeck.web.render import render_transcript_events
@@ -6145,8 +6154,22 @@ def test_transcript_user_message_renders_observed_pending_identity(tmp_path):
         observed_messages={7: item},
     )
 
-    assert 'data-observed-queue-id="41"' in html
+    assert '" data-observed-queue-id="41"' in html
     assert 'data-observed-action-id="action-41"' in html
+
+    # One line carrying several queued sends names them all (#3931).
+    merged = render_transcript_events(
+        app.state.templates,
+        [event],
+        session_key="claude_code:test:sid1",
+        observed_messages={
+            7: SimpleNamespace(
+                id=41, client_action_id=None, also=((42, "action-42"), (43, None))
+            )
+        },
+    )
+    assert 'data-observed-queue-id="41 42 43"' in merged
+    assert 'data-observed-action-id="action-42"' in merged
 
 
 async def test_transcript_image_is_served_outside_the_html_response(tmp_path):
@@ -8391,9 +8414,48 @@ async def test_a_diagram_file_draws_full_screen_and_a_tapped_box_shows_its_note(
         await expect(page.locator("#dc-legend")).to_be_hidden()
         note = await inner.locator(".mm-pop").text_content()
         heading = await inner.locator(".mm-headings").count()
+        # A diagram comment the agent posted on GitHub shows in its chat as a note. GitHub's
+        # rendering is a placeholder its own page fills in, so the deck draws it (#3927),
+        # its named colour winning over the `classDef` the comment adds for GitHub.
+        coloured = source + "\n  class b amber\n  classDef amber fill:#fbe6c5,stroke:#c78623"
+        plain = coloured.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        comment = ChatNote(
+            repository="eerovil/agentdeck",
+            comment_id=901,
+            chat_id=app.state.app_state.chat_identity_key("claude_code:test:sid1"),
+            number=3,
+            is_pull=False,
+            author="agentdeck-eerovil[bot]",
+            url="https://github.com/eerovil/agentdeck/issues/3#issuecomment-901",
+            body="diagram",
+            body_html=None,
+            created_at="2099-01-01T00:00:00Z",
+            updated_at="2099-01-01T00:00:00Z",
+        )
+        app.state.control_db.save_chat_note(comment)
+        app.state.control_db.set_chat_note_html(
+            comment.repository,
+            comment.comment_id,
+            comment.updated_at,
+            "<p><strong>Order flow</strong></p>"
+            '<section class="js-render-needs-enrichment" data-type="mermaid">'
+            f'<div class="js-render-enrichment-target" data-plain="{plain}">'
+            '<div class="render-plaintext-hidden"><pre lang="mermaid">'
+            f"<code>{plain}</code></pre></div></div></section>"
+            "<h2>Colours</h2><ul><li><strong>amber</strong>: a question</li></ul>",
+        )
         await page.goto(f"{base}/sessions/claude_code:test:sid1")
         await page.locator(".ev.assistant .md-code").wait_for()
         chat_frames = await page.locator(".ev.assistant iframe").count()
+        noted = page.frame_locator(".transcript .chat-note iframe.md-diagram")
+        ready = noted.locator("g.node", has_text="Ready?").locator("rect, polygon").first
+        await ready.wait_for(state="attached", timeout=30000)
+        note_fill = await ready.evaluate("r => r.style.fill")
+        amber = await page.evaluate(
+            "() => { const d = document.createElement('div');"
+            " d.style.color = 'hsl(36 88% 88%)'; return d.style.color; }"
+        )
+        note_code = await page.locator('.transcript .chat-note pre[lang="mermaid"]').count()
 
         # On the live page, a tapped box goes with the suggestion sent about it. The diagram
         # has its own slot (#3827), and on a phone it starts with the panel hidden.
@@ -8449,6 +8511,7 @@ async def test_a_diagram_file_draws_full_screen_and_a_tapped_box_shows_its_note(
     assert note == "Ready?Checks stock"
     assert heading == 1
     assert chat_frames == 0
+    assert note_fill == amber and note_code == 0
     assert "About the box \u201cReady?\u201d in the diagram: Split it in two" in sent[0]
     assert picked_after_clear
     assert panel_at_start and composing == [True, False] and panel_after_clear

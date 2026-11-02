@@ -68,9 +68,13 @@
   // The microphone, recorded until closed. A listener takes the samples through
   // `sink`; while there is none and `keep` is set they wait in `carry`, so words
   // said while voice mode's last phrase is being transcribed are kept.
-  function Capture(ctx, stream) {
+  function Capture(ctx, stream, headset) {
     var self = this;
+    this.ctx = ctx;
     this.stream = stream;
+    // Whether it was opened for a Bluetooth headset (`micSettings`, #3842).
+    this.headset = !!headset;
+    this.closed = false;
     this.rate = ctx.sampleRate;
     this.sink = null;
     this.keep = false;
@@ -85,9 +89,88 @@
     this.source.connect(this.node);
     // A processor only runs while connected onward; it writes silence.
     this.node.connect(ctx.destination);
+    // A headset that connects or leaves while it records (#3842).
+    this.onDevices = function () { self.rematch(); };
+    if (navigator.mediaDevices.addEventListener) {
+      navigator.mediaDevices.addEventListener('devicechange', this.onDevices);
+    }
+  }
+
+  // The microphone let go of, the recording chain kept: its listener hears
+  // silence until `attach` brings a stream in (#3842).
+  Capture.prototype.release = function () {
+    try { this.source.disconnect(); } catch (e) { /* gone */ }
+    this.stream.getTracks().forEach(function (track) { track.stop(); });
+  };
+
+  Capture.prototype.attach = function (stream) {
+    this.stream = stream;
+    this.source = this.ctx.createMediaStreamSource(stream);
+    this.source.connect(this.node);
+  };
+
+  // Opened the wrong way for what is connected now (a headset connected or left,
+  // or device names hidden until the first permission), its stream is swapped for
+  // one opened the right way (#3842), under the same listener. The old stream is
+  // let go of first: Chrome on Android picks call mode by the first microphone
+  // stream open and keeps it until the last one closes, so with both open the
+  // phone would stay in the old mode. Should the new open fail, the old way is
+  // opened again. Run once the microphone is allowed and on every device change;
+  // one check runs at a time, and a change during it is checked again once it ends.
+  Capture.prototype.rematch = function () {
+    var self = this;
+    if (this.closed) return;
+    if (this.rematching) { this.rematchAgain = true; return; }
+    this.rematching = true;
+    function open(headset) {
+      return navigator.mediaDevices.getUserMedia({ audio: micConstraints(headset) })
+        .then(function (stream) {
+          if (self.closed) { stream.getTracks().forEach(function (t) { t.stop(); }); return; }
+          self.attach(stream);
+          self.headset = headset;
+        });
+    }
+    micSettings().then(function (audio) {
+      var headset = audio.echoCancellation;
+      if (self.closed || headset === self.headset) return null;
+      var was = self.headset;
+      self.release();
+      return open(headset).catch(function () { return open(was); });
+    }).catch(function () { /* nothing to record from; the listener hears silence */ })
+      .then(function () {
+        self.rematching = false;
+        var again = self.rematchAgain;
+        self.rematchAgain = false;
+        if (again) self.rematch();
+      });
+  };
+
+  // How to open the microphone (#3842). Asking Chrome on Android for echo
+  // cancelling, noise suppression or auto gain opens a call-type recording, which
+  // puts the phone in call mode: its volume keys set the call volume, and replies
+  // read aloud stay quiet even at full volume. So the microphone is opened plain,
+  // except with a Bluetooth headset, whose own microphone only listens in call
+  // mode (the owner's choice: the phone may be in a pocket). A browser that hides
+  // device labels (before the first permission) counts as having no headset.
+  function micConstraints(headset) {
+    return { echoCancellation: headset, noiseSuppression: headset, autoGainControl: headset };
+  }
+
+  function micSettings() {
+    var devices = navigator.mediaDevices;
+    if (!devices || !devices.enumerateDevices) return Promise.resolve(micConstraints(false));
+    return devices.enumerateDevices().then(function (list) {
+      return micConstraints(list.some(function (device) {
+        return device.kind === 'audioinput' && /bluetooth/i.test(device.label || '');
+      }));
+    }, function () { return micConstraints(false); });
   }
 
   Capture.prototype.close = function () {
+    this.closed = true;
+    if (navigator.mediaDevices.removeEventListener) {
+      navigator.mediaDevices.removeEventListener('devicechange', this.onDevices);
+    }
     this.sink = null;
     try { this.source.disconnect(); this.node.disconnect(); } catch (e) { /* gone */ }
     this.stream.getTracks().forEach(function (track) { track.stop(); });
@@ -140,8 +223,18 @@
   var NOISE_WINDOW_MS = 3000;
   var STEADY_MS = 1000;
   var PAUSE_TAIL = 8;
+  // The line in a silent room. It was 0.015, but the phone's plain microphone (no
+  // auto gain, #3842) hears a quiet speaker at 0.009 to 0.016 in a room of 0.001:
+  // two seconds of words never started a phrase, and only a louder syllable did,
+  // so the phrase began mid-sentence (#4020).
+  var QUIETEST_LINE = 0.005;
+  // The owner's soft sentence ends measured 0.38 to 0.5 of the phrase's level, and
+  // the quiet after them under 0.05 (#4026).
+  var SOFT_SHARE = 0.2;
   function Gate(chunkMs) {
-    this.floor = 0.005;
+    // Until a room is heard, the line is QUIETEST_LINE: quiet words from the first
+    // chunk start a phrase (#4020 review).
+    this.floor = QUIETEST_LINE / 2.5;
     this.size = Math.max(1, Math.round(NOISE_WINDOW_MS / chunkMs));
     this.steady = Math.max(2, Math.round(STEADY_MS / chunkMs));
     this.recent = [];
@@ -172,9 +265,16 @@
     return level > line;
   };
   // How loud a chunk must be to be more than the room: 2.5 times a quiet room, but
-  // never more than 0.05 over a loud one, or a voice could not rise above it.
+  // never more than 0.05 over a loud one, or a voice could not rise above it, and
+  // never under QUIETEST_LINE.
   Gate.prototype.line = function () {
-    return Math.max(0.015, Math.min(this.floor * 2.5, this.floor + 0.05));
+    return Math.max(QUIETEST_LINE, Math.min(this.floor * 2.5, this.floor + 0.05));
+  };
+  // Whether a chunk the pause rules call quiet may still be words: a soft end of a
+  // sentence sits under half the speaker's level but well over the room (#4026).
+  // Voice mode keeps a phrase going through such chunks unless they are steady.
+  Gate.prototype.sound = function (level) {
+    return level > Math.max(this.line(), this.speech * SOFT_SHARE);
   };
   function held(levels) {
     var low = Math.min.apply(null, levels);
@@ -237,7 +337,7 @@
 
   // Voice mode (#3401) records for the host with the same microphone code.
   window.AgentDeckDictation = {
-    Capture: Capture, wav: wav, loudness: loudness, Gate: Gate, watchSlow: watchSlow
+    Capture: Capture, micSettings: micSettings, wav: wav, loudness: loudness, Gate: Gate, watchSlow: watchSlow
   };
 
   if (!Recognition && !canRecord) return;
@@ -273,12 +373,15 @@
     // Made inside the tap, so a phone lets it run.
     var ctx = this.ctx = new Context();
     this.backlog.forEach(function (body) { self.send(body); });
-    navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+    var headset = false;
+    micSettings().then(function (audio) {
+      headset = audio.echoCancellation;
+      return navigator.mediaDevices.getUserMedia({ audio: audio });
     }).then(function (stream) {
       if (self.done) { stream.getTracks().forEach(function (t) { t.stop(); }); return; }
-      self.capture = new Capture(ctx, stream);
+      self.capture = new Capture(ctx, stream, headset);
       self.listen();
+      self.capture.rematch();
     }, function () {
       if (!self.done) self.fail('not-allowed');
     });
@@ -324,9 +427,10 @@
       if (self.aborted || self.failed) return null;
       // The language heard last, for a phrase too short to tell (`[speech] language
       // = "auto"`); a host listening for one language ignores it.
-      var hint = self.heard ? '?language=' + self.heard : '';
+      // `source` tells a kept phrase's 🎤 from 🎧 for the speech bench (#3934).
+      var hint = self.heard ? '&language=' + self.heard : '';
       var done = self.watch();
-      return fetch('/api/speech/transcribe' + hint, {
+      return fetch('/api/speech/transcribe?source=dictation' + hint, {
         method: 'POST', headers: { 'Content-Type': 'audio/wav' }, body: body
       }).then(function (response) { done(); return response; },
               function (error) { done(); throw error; }).then(function (response) {

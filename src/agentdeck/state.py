@@ -18,7 +18,7 @@ from functools import lru_cache
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Literal
 
-from . import job_view, work_counter
+from . import job_view, review_history, work_counter
 from .chat_identity import (
     ChatIdentity,
     ChatLinkConflict,
@@ -1440,21 +1440,56 @@ class AppState:
         target_number: int,
         head_sha: str,
     ) -> None:
-        """Remember the commit the review chat just opened covers for one pull request."""
+        """Remember the commit the review chat just opened covers for one pull request: a
+        ``chat`` row in that head's review history. Every opening path comes through here."""
         if self.db is None or not chat_repository or not head_sha:
             return
-        self.db.record_chat_review_head(
-            chat_repository, chat_number, target_repo, target_number, head_sha
-        )
+        chat = f"{chat_repository}#{chat_number}".lower()
+        pull = f"{target_repo}#{target_number}".lower()
+        key = f"chat:{chat}:{pull}@{head_sha.lower()}"
+        self.record_review_event(pull, head_sha, review_history.CHAT, key, data={"chat": chat})
+
+    def record_review_event(
+        self,
+        pull: str,
+        head: str,
+        kind: str,
+        key: str,
+        at: float | None = None,
+        data: dict | None = None,
+    ) -> bool:
+        """Append one event to ``pull``'s review history at ``head`` (#3957); a stored key
+        adds nothing. A new one wakes the Work cards, which read it (#3956). Whether the event
+        is stored, now or before under its key: the release fails closed on ``False``."""
+        if self.db is None or not pull or len(head or "") != 40 or not key:
+            return False
+        when = at if at is not None else datetime.now(UTC).timestamp()
+        if self.db.append_review_event(pull, head, kind, key, when, data):
+            self.bus.publish(REVIEWS_TOPIC)
+            return True
+        return self.db.has_review_event(key)
+
+    def forget_review_events(self, pull: str) -> None:
+        """Drop ``pull``'s review history: it merged or closed."""
+        if self.db is not None and pull:
+            self.db.drop_review_events(pull)
+            self.bus.publish(REVIEWS_TOPIC)
+
+    def review_events(self, pull: str) -> list[review_history.ReviewEvent]:
+        """``pull``'s review history, every head, in arrival order (#3956)."""
+        return self.db.review_events(pull) if self.db is not None and pull else []
+
+    def all_review_events(self) -> dict[str, list[review_history.ReviewEvent]]:
+        """Every open pull request's review history, by ``owner/repo#n`` (#3956)."""
+        return self.db.all_review_events() if self.db is not None else {}
 
     def chat_review_heads(self, chat_repository: str) -> dict[int, dict[tuple[str, int], str]]:
         """Which commit each ChatGPT review chat was opened about, per pull request (#2088,
-        #2637).
+        #2637): the ``chat`` rows of the review history (#3956).
 
         Read straight from the table on every ask, not cached: the rows are written by
         this same process as it opens chats, and a cache would have to be invalidated on
-        a write that happens far away from the chip that reads it. One small indexed read
-        per session tick is cheaper than that mistake.
+        a write that happens far away from the chip that reads it.
         """
         if self.db is None or not chat_repository:
             return {}

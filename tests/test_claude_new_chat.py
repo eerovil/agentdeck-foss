@@ -775,6 +775,31 @@ async def test_an_unrouted_question_stops_an_owned_worker_reading_as_working(tmp
     assert session.display_state == "idle"
     assert session.activity is None
 
+    # A question mark in a running turn's text is not a question box (#3923): the agent
+    # wrote "Now checking …: did it read X?" and went on to a tool call, and the Work read
+    # Needs answer meanwhile. Only the turn ending on it makes it the person's.
+    (transcript_dir / "sid-1.jsonl").write_text(
+        json.dumps(
+            {
+                "type": "assistant",
+                "sessionId": "sid-1",
+                "cwd": str(tmp_path),
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "Now checking: did it read X?"}],
+                },
+            }
+        )
+        + "\n"
+    )
+
+    (session,) = await provider.scan_sessions(account)
+
+    assert session.thinking is True
+    # The liveness sweep reads the newest event from its own cache, not the scan's read.
+    provider.sweep_liveness(account, [session], AppState())
+    assert session.thinking is True
+
 
 async def test_background_agent_keeps_owned_session_working_without_turn_controls(
     tmp_path,

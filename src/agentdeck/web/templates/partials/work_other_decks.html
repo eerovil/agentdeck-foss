@@ -1,20 +1,31 @@
 {# Issues another deck works (#3834), when several decks share a project: the ones its agent
-   works and its person's issues no agent has started yet. Each opens a read-only Work page
-   whose one control is Take over (or Start here). Empty renders nothing; shut until a person
-   opens it (`data-front-shut`), so it costs no height and never mixes into Needs you. #}
+   works and its person's issues no agent has started yet. Each row is drawn like your own
+   (#3855): diff icon, a status line from GitHub alone, size, age and repo#; it opens a
+   read-only Work page whose one control is Take over (or Start here). Empty renders nothing;
+   shut until a person opens it (`data-front-shut`), so it costs no height and never mixes into
+   Needs you. The rows carry no `data-work-id`, so nothing that counts or swaps your own Works
+   picks them up. #}
+{%- from "partials/work_macros.html" import size, diff_icon -%}
 {%- if work_overview.other_decks %}
 <details class="work-other-fold" id="work-other-decks-fold" data-front-collapse="other-decks" data-front-shut>
   <summary class="work-other-title">Other decks
     <span class="work-other-count">{{ work_overview.other_decks | length }}</span>
+    <span class="work-other-note">read only</span>
   </summary>
-  <ul class="work-other-rows">
+  <div class="work-other-rows">
     {%- for item in work_overview.other_decks %}
-    <li class="work-other-row{% if item.started %} is-working{% endif %}" data-other-deck-work="{{ item.work_id }}">
-      <a href="{{ item.href }}">{{ item.title or (item.ref.repository ~ "#" ~ item.ref.number) }}</a>
-      <span class="wo-state">{{ "@" ~ item.assignee if item.assignee else "unassigned" }} · {% if not item.started %}not started{% elif item.pull %}PR #{{ item.pull.number }}{{ " draft" if item.pull.draft }}{% else %}working{% endif %}</span>
-      {%- if item.updated %}<time class="wo-age" datetime="{{ item.updated.isoformat() }}" data-activity-age>{{ item.updated | reltime_ago }}</time>{% endif %}
-    </li>
+    {%- set status = item.status %}
+    <article class="fr fr-other-deck fr-tone-{{ status.tone if status else 'idle' }}" data-other-deck-work="{{ item.work_id }}"
+             data-other-deck-status="{{ status.key if status else '' }}">
+      <span class="fr-mark" aria-hidden="true"></span>
+      <a class="fr-body" href="{{ item.href }}" title="{{ item.ref.repository }}#{{ item.ref.number }}">
+        <span class="fr-title">{{ diff_icon(item) }}{{ item.title or (item.ref.repository ~ "#" ~ item.ref.number) }}</span>
+        <span class="fr-line"><span class="fr-what"><span class="fr-headline">{{ status.headline if status else "Working" }}</span> on {{ item.whose }}{{ size(item) }}</span>
+          <span class="fr-when">{%- if item.updated %}<time class="fr-age" datetime="{{ item.updated.isoformat() }}" data-activity-age>{{ item.updated | reltime_ago }}</time>{% endif %}<span class="fr-source fr-ref">{{ item.ref.repository.split("/")[-1] }}#{{ item.ref.number }}</span></span>
+        </span>
+      </a>
+    </article>
     {%- endfor %}
-  </ul>
+  </div>
 </details>
 {%- endif %}

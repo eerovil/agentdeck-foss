@@ -33,7 +33,9 @@ from markupsafe import Markup
 
 from .. import (
     live_prototype,
+    review_history,
     review_refs,
+    voice_helper,
     watch_retry,
     wayfinder_map,
     work_bugs,
@@ -41,7 +43,7 @@ from .. import (
     work_tree,
 )
 from ..board_watch import BOARD_TOPIC
-from ..chat_board import ESCALATED, NEEDS_YOU_LABELS
+from ..chat_board import NEEDS_YOU_LABELS
 from ..chat_board import TOPIC as CHAT_BOARD_TOPIC
 from ..chat_notes import TOPIC as CHAT_NOTES_TOPIC
 from ..jobs import WorkRows, rows_for_work
@@ -54,9 +56,10 @@ from ..review_refs import review_target
 from ..runtime_feed import RUNTIME_TOPIC
 from ..staging_deploys import staging_copy
 from ..state import REVIEWS_TOPIC, chat_topic
-from ..wake_on import KIND_PULL_REQUEST, KIND_REVIEW, NeedsYouStop, WakeRequest
+from ..wake_on import KIND_COMMIT, KIND_PULL_REQUEST, KIND_REVIEW, NeedsYouStop, WakeRequest
 from ..work import Work, WorkRef, work_id_for
 from ..work_actions import (
+    APPROVE_MERGE,
     BRING_BACK,
     ActionButton,
     WorkActionPress,
@@ -107,6 +110,7 @@ from ..work_overview import (
     front_page_works,
     in_inventory,
     other_activity,
+    other_deck_status,
     other_deck_works,
     unplaced_chats,
     unstarted_issues,
@@ -265,6 +269,10 @@ _PENDING_JOB_STATES = frozenset({"queued", "running"})
 # next step (#2890). A command that never finishes (a server left running) must not hold the
 # Work forever.
 BACKGROUND_HOLD = timedelta(hours=2)
+#: How long a review with no live facts (an ask with no chat yet, or a chat the board has not
+#: seen) reads as in review. Past it nothing of the deck's can start a reviewer on it, so it
+#: reads stuck rather than "In review" for good (#3956 review).
+UNSEEN_REVIEW_GRACE = timedelta(hours=1)
 
 
 async def current_work_ids(app: Any, queue: Sequence[dict]) -> frozenset[str]:
@@ -403,12 +411,14 @@ class _Pass:
     # The names Works' own agent chats gave themselves, by Work id (#3597).
     chat_titles: dict[str, str] = field(default_factory=dict)
     # The commits finished ChatGPT review chats covered, by the pull request each reviewed
-    # (#2411): the chat board's rows in memory and one local read of the recorded heads.
+    # (#2411): the chat board's rows in memory and the review history's ``chat`` rows.
     chat_reviews: dict[tuple[str, int], tuple[str, ...]] = field(default_factory=dict)
-    # The still-open review chats, keyed the same way (#2895, D7 rule 6; #2943).
-    open_reviews: dict[tuple[str, int], tuple[OpenReview, ...]] = field(default_factory=dict)
-    # The review chats that escalated to the owner, keyed the same way (#3216).
-    escalated_reviews: dict[tuple[str, int], EscalatedReview] = field(default_factory=dict)
+    # Each open pull request's review history by ``owner/repo#n``, one read per pass (#3956):
+    # what a Work's review status is read from, head by head.
+    review_events: dict[str, tuple[review_history.ReviewEvent, ...]] = field(default_factory=dict)
+    # The live facts of each review chat on the board by its number (#2895, #2943): an open
+    # one's, or one about to be opened again; ``None`` for one that closed.
+    review_chats: dict[int, OpenReview | None] = field(default_factory=dict)
     # Each visible Deckhand card's rendered attention state, by session key: one walk of the
     # insights per pass, not one per Work card (#2841).
     insight_states: dict[str, str] = field(default_factory=dict)
@@ -486,15 +496,15 @@ class _PassReads:
     backlog: Any
     titles: dict[str, str]
     agent_titles: dict[str, str]
-    chat_titles: dict[str, str]
-    review_heads: dict[int, dict[tuple[str, int], str]]
+    chat_titles: dict[str, tuple[str, str]]
+    review_events: dict[str, tuple[review_history.ReviewEvent, ...]]
     pending_message_ids: frozenset[str]
     message_handoffs: dict[str, datetime]
 
 
 def _pass_reads(app: Any) -> _PassReads:
     """The pass's file and database reads: the Poller board, the cached backlog, the control
-    DB's names, and the recorded review heads. Each holds its own lock or
+    DB's names, and the review history. Each holds its own lock or
     reads files, so ``gather_pass_off_loop`` runs this in a thread (#2841)."""
     board, backlog = _board_and_backlog(app)
     scheduler = getattr(app.state, "scheduled_messages", None)
@@ -514,7 +524,7 @@ def _pass_reads(app: Any) -> _PassReads:
         titles=_custom_titles(app),
         agent_titles=_agent_titles(app),
         chat_titles=_chat_titles(app),
-        review_heads=_review_heads(app, app.state.app_state),
+        review_events=_review_events(app.state.app_state),
         pending_message_ids=pending_message_ids,
         message_handoffs=message_handoffs,
     )
@@ -555,45 +565,49 @@ def gather_pass(app: Any, reads: _PassReads | None = None) -> _Pass:
         open_pulls=_open_pulls(backlog),
         titles=reads.titles,
         agent_titles=reads.agent_titles,
-        chat_titles=reads.chat_titles,
-        chat_reviews=_chat_reviews(app, reads.review_heads),
-        open_reviews=_open_reviews(app, reads.review_heads),
-        escalated_reviews=_escalated_reviews(app, reads.review_heads),
+        chat_titles=own_chat_titles(
+            reads.chat_titles, projection, lambda key: state.chat_identity_key(key, chats)
+        ),
+        chat_reviews=_chat_reviews(app, reads.review_events),
+        review_events=reads.review_events,
+        review_chats=_review_chats(app),
         insight_states=assistant_insight_states(assistant) if assistant is not None else {},
         pending_message_ids=reads.pending_message_ids,
         message_handoffs=reads.message_handoffs,
     )
 
 
-def _review_heads(app: Any, state: Any) -> dict[int, dict[tuple[str, int], str]]:
-    """The recorded commit of every review chat in the chat board's repository (#2411)."""
-    service = chat_board_service(app.state)
-    if service is None:
+def _review_events(state: Any) -> dict[str, tuple[review_history.ReviewEvent, ...]]:
+    """Every open pull request's review history, in one read (#3956)."""
+    read = getattr(state, "all_review_events", None)
+    if read is None:
         return {}
     try:
-        return state.chat_review_heads(service.repository)
-    except Exception:  # noqa: BLE001 -- an unreadable record credits no review, as before
-        logger.debug("chat review heads unreadable for the Work overview", exc_info=True)
-        _degraded("chat_reviews")
+        return {pull: tuple(events) for pull, events in read().items()}
+    except Exception:  # noqa: BLE001 -- unreadable: no review is credited, as before
+        logger.debug("review history unreadable for the Work overview", exc_info=True)
+        _degraded("review_events")
         return {}
 
 
 def _chat_reviews(
-    app: Any, heads: Mapping[int, Mapping[tuple[str, int], str]], *, state: str = "closed"
+    app: Any, history: Mapping[str, Sequence[review_history.ReviewEvent]]
 ) -> dict[tuple[str, int], tuple[str, ...]]:
     """What the chat's ChatGPT chip calls reviewed, for the Work's Review step (#2411).
 
     A review chat opened by hand is on the chat board, and the deck recorded the commit it
     was opened about, but the instance's reviewer never hears of it. Only a finished review
     with a recorded commit counts: an unknown commit is never credited to the current head.
-    ``state="open"`` reads the reviews still running instead (#2895).
     """
     service = chat_board_service(app.state)
-    if service is None or not heads:
+    if service is None or not history:
         return {}
+    heads = review_history.chat_heads(
+        (event for events in history.values() for event in events), service.repository
+    )
     found: dict[tuple[str, int], tuple[str, ...]] = {}
     for row in list(service.board.rows.values()):
-        if row.state != state or review_target(row.title) is None:
+        if row.state != "closed" or review_target(row.title) is None:
             continue
         # Each pull request the chat covered, not the chat's title: a Work's chat is titled
         # by its issue and covers every pull request it listed (#2637).
@@ -604,14 +618,9 @@ def _chat_reviews(
 
 @dataclass(frozen=True)
 class OpenReview:
-    """One still-open review chat about one pull request (#2895, #2943)."""
+    """The live facts of one still-open review chat, by its number (#2895, #2943)."""
 
     chat: int
-    head: str  # the commit the deck recorded when it opened the chat
-    #: The newest review chat the deck recorded for this pull request, open or closed: its
-    #: head is the deck's own latest word on the pull request's head, which the card's cached
-    #: copy can lag behind.
-    newest: bool = False
     opened_at: datetime | None = None
     #: The last sign of a reviewer: the opening, the chat's own activity, a fallback start.
     active_at: datetime | None = None
@@ -632,15 +641,15 @@ class OpenReview:
     stopped_by_ours: bool = False
 
 
-def _open_reviews(
-    app: Any, heads: Mapping[int, Mapping[tuple[str, int], str]]
-) -> dict[tuple[str, int], tuple[OpenReview, ...]]:
-    """The open review chats of each pull request, with when each opened and was last
-    worked on (#2943). The chat board's rows in memory, the recorded heads and one read of
-    the fallback reviewer's ledger; no GitHub call."""
+def _review_chats(app: Any) -> dict[int, OpenReview | None]:
+    """Each review chat on the board by number: an open one with when it opened and was last
+    worked on (#2943), one about to be opened again (#3192), or ``None`` for one that closed.
+    The chat board's rows in memory and one read of the fallback reviewer's ledger; no
+    GitHub call. Which pull request and head a chat is about is the review history's."""
     service = chat_board_service(app.state)
-    if service is None or not heads:
+    if service is None:
         return {}
+
     def _moment(value: str) -> datetime | None:
         try:
             at = datetime.fromisoformat((value or "").replace("Z", "+00:00"))
@@ -648,10 +657,6 @@ def _open_reviews(
             return None
         return at if at.tzinfo is not None else None
 
-    newest: dict[tuple[str, int], int] = {}
-    for chat, pulls in heads.items():
-        for key in pulls:
-            newest[key] = max(newest.get(key, 0), chat)
     fallback = getattr(app.state, "review_fallback", None)
     started: dict[int, tuple[float, bool]] = {}
     quiet: float | None = None
@@ -670,9 +675,12 @@ def _open_reviews(
             logger.debug("last ChatGPT start unreadable for the Work overview", exc_info=True)
     from ..review_fallback import start_failed_on
 
-    found: dict[tuple[str, int], tuple[OpenReview, ...]] = {}
+    found: dict[int, OpenReview | None] = {}
     for row in list(service.board.rows.values()):
-        if row.state != "open" or review_target(row.title) is None:
+        if review_target(row.title) is None:
+            continue
+        if row.state != "open":
+            found[row.number] = None
             continue
         opened = _moment(row.created_at)
         moments = [at for at in (opened, _moment(row.updated_at)) if at is not None]
@@ -697,21 +705,17 @@ def _open_reviews(
             if quiet is not None and active is not None and not reviewing
             else None
         )
-        for key, head in heads.get(row.number, {}).items():
-            review = OpenReview(
-                chat=row.number,
-                head=head,
-                newest=newest.get(key) == row.number,
-                opened_at=opened,
-                active_at=active,
-                reviewing=reviewing,
-                stuck_at=stuck_at,
-                held=held,
-                start_failed=start_failed_on(row, start),
-                held_why=service.board.block_reason(row.number) if blocked else "",
-                stopped_by_ours=ours_stopped,
-            )
-            found[key] = (*found.get(key, ()), review)
+        found[row.number] = OpenReview(
+            chat=row.number,
+            opened_at=opened,
+            active_at=active,
+            reviewing=reviewing,
+            stuck_at=stuck_at,
+            held=held,
+            start_failed=start_failed_on(row, start),
+            held_why=service.board.block_reason(row.number) if blocked else "",
+            stopped_by_ours=ours_stopped,
+        )
     if fallback is not None and fallback.enabled:
         # A give-up whose next chat the deck is about to open (#3192): the review is still
         # the deck's, not an agent's turn that ended without a next step.
@@ -722,60 +726,44 @@ def _open_reviews(
             if row is None:
                 continue
             at = datetime.fromtimestamp(gave_up, UTC)
-            for key, head in heads.get(number, {}).items():
-                review = OpenReview(
-                    chat=number,
-                    head=head,
-                    newest=newest.get(key) == number,
-                    opened_at=_moment(row.created_at),
-                    active_at=at,
-                    reopen_until=at + timedelta(seconds=REOPEN_WITHIN_S),
-                )
-                found[key] = (*found.get(key, ()), review)
+            found[number] = OpenReview(
+                chat=number,
+                opened_at=_moment(row.created_at),
+                active_at=at,
+                reopen_until=at + timedelta(seconds=REOPEN_WITHIN_S),
+            )
     return found
 
 
-@dataclass(frozen=True)
-class EscalatedReview:
-    """A pull request's newest review chat, closed by a reviewer escalating to the owner."""
+def _head_review(snapshot: Any, output: Any) -> tuple[review_history.HeadReview, bool]:
+    """``output``'s review at the head the card holds, read from its history (#3956), and
+    whether a newer head's ask stood in for it.
 
-    chat: int
-    ref: str  # the chat as ``owner/repo#n``
-    head: str  # the commit the deck recorded when it opened the chat
-    at: datetime | None  # when the reviewer escalated
-    url: str = ""  # the escalation comment, with the reviewer's question; "" when not named
-
-
-def _escalated_reviews(
-    app: Any, heads: Mapping[int, Mapping[tuple[str, int], str]]
-) -> dict[tuple[str, int], EscalatedReview]:
-    """Each pull request whose newest review chat ended escalated to the owner (#3216).
-
-    Neither a pass nor findings: the reviewer asks the owner a question and reviews nothing
-    more by itself, so the Work waits on the owner rather than on a review. Only the newest
-    chat counts, so a review asked for again replaces it. The chat board's memory, no GitHub.
+    The card's cached head can lag the push a review was asked for (#2943): when the newest
+    ask or chat of the pull request is about another head and newer than anything at the
+    card's, that head's answer is used, but only for "in review", never for a verdict.
     """
-    service = chat_board_service(app.state)
-    if service is None or not heads:
-        return {}
-    newest: dict[tuple[str, int], int] = {}
-    for chat, pulls in heads.items():
-        for key in pulls:
-            newest[key] = max(newest.get(key, 0), chat)
-    found: dict[tuple[str, int], EscalatedReview] = {}
-    for number, (ending, at) in list(service.board.endings.items()):
-        if ending != ESCALATED:
-            continue
-        for key, head in heads.get(number, {}).items():
-            if newest.get(key) == number:
-                found[key] = EscalatedReview(
-                    number,
-                    f"{service.repository}#{number}",
-                    head,
-                    datetime.fromtimestamp(at, UTC),
-                    service.board.escalations.get(number, ""),
-                )
-    return found
+    history = getattr(snapshot, "review_events", None) or {}
+    rows = history.get(f"{output.repository}#{output.number}".lower(), ())
+    here = review_history.at_head(rows, output.head)
+    asks = [event for event in rows if event.kind in (review_history.ASKED, review_history.CHAT)]
+    newest = max(asks, key=lambda event: (event.at, event.seq), default=None)
+    if (
+        newest is not None
+        and newest not in here
+        and all((event.at, event.seq) < (newest.at, newest.seq) for event in here)
+    ):
+        found = review_history.head_review(e for e in rows if e.head == newest.head)
+        lag = review_history.HeadReview(
+            review_since=found.review_since, review_chat=found.review_chat
+        )
+        return lag, True
+    return review_history.head_review(here), False
+
+
+def _chat_number(ref: str) -> int | None:
+    number = (ref or "").rpartition("#")[2]
+    return int(number) if number.isdigit() else None
 
 
 def _custom_titles(app: Any) -> dict[str, str]:
@@ -802,22 +790,38 @@ def _agent_titles(app: Any) -> dict[str, str]:
         return {}
 
 
-def _chat_titles(app: Any) -> dict[str, str]:
-    """The names Works' own agent chats gave themselves, by Work id (#3597)."""
+def _chat_titles(app: Any) -> dict[str, tuple[str, str]]:
+    """The names Works' own agent chats gave themselves, and the session key each started
+    under, by Work id (#3597)."""
     control = getattr(app.state, "control_db", None)
     if control is None:
         return {}
     try:
-        return control.work_start_chat_titles()
+        return control.work_start_chats()
     except Exception:  # noqa: BLE001 -- an unreadable name is the derived title, never a gap
         logger.debug("Work-start chat titles unreadable", exc_info=True)
         return {}
 
 
+def own_chat_titles(
+    starts: Mapping[str, tuple[str, str]], projection: Any, chat_key: Callable[[str], str]
+) -> dict[str, str]:
+    """Each Work's own chat's name, for a chat in that Work alone (#3964).
+
+    A chat in other Works too went on to one of them: asked for v2 and v3 after v1 merged,
+    the v1 Work's chat renamed itself "v3", and the v1 card read "v3". Which Works a chat is
+    in is the Work projection's answer, the same one the cards' status reads."""
+    return {
+        work_id: title
+        for work_id, (title, key) in starts.items()
+        if len(projection.works_for_chat(chat_key(key))) <= 1
+    }
+
+
 def start_chat_title(snapshot: Any, work_id: str) -> str:
     """The name the chat the deck started for this Work gave itself, "" for none (#3597).
 
-    Only that chat (``Db.work_start_chat_titles``): a helper, reviewer or rescue chat in the
+    Only that chat (``Db.work_start_chats``): a helper, reviewer or rescue chat in the
     Work never names it."""
     return snapshot.chat_titles.get(work_id, "")
 
@@ -885,6 +889,34 @@ def time_deadline(now: datetime, *values: Any) -> datetime | None:
 WORK_INPUTS_TOPIC = "work_inputs"
 
 
+def _deck_reviews_key(app: Any, snapshot: Any) -> tuple[tuple, tuple[int, int], tuple]:
+    """The deck-wide part of every card's derived key, worked out once per pass (#4014).
+
+    Every review chat on the board, the review history's size and newest row, and the
+    review chats the deck already started a reviewer on: none is the card's own, and with
+    thousands of review chats reading them once per card was half the web loop's CPU. The
+    deck starts reviewers only after a pass built its cards, so the pass reads one answer.
+    """
+
+    def read() -> tuple[tuple, tuple[int, int], tuple]:
+        chats = getattr(snapshot, "review_chats", None) or {}
+        reviews = tuple(sorted(chats.items(), key=lambda item: item[0]))
+        # The review history, which every review line reads (#3956): any new row or a pull
+        # request's rows dropped moves it.
+        history = getattr(snapshot, "review_events", None) or {}
+        events = [event for rows in history.values() for event in rows]
+        reviewed = (len(events), max((event.seq for event in events), default=0))
+        endings = getattr(app.state, "work_endings", None)
+        retried = tuple(
+            number
+            for number, _review in reviews
+            if endings is not None and endings.review_started(number)
+        )
+        return reviews, reviewed, retried
+
+    return _per_pass(("deck_reviews", id(snapshot)), read)
+
+
 def _derived_key(app: Any, snapshot: Any, ref: WorkRef) -> tuple:
     """What a derived status reads beyond the chats, for the card cache (#2895 step 3)."""
     if not _switched(app, ref.repository):
@@ -897,26 +929,15 @@ def _derived_key(app: Any, snapshot: Any, ref: WorkRef) -> tuple:
     wake_on = getattr(app.state, "wake_on", None)
     registry = getattr(wake_on, "registry", None)
     waits = tuple(registry.for_chat(owner[0])) if registry is not None and owner else ()
-    reviews = tuple(sorted((getattr(snapshot, "open_reviews", None) or {}).items()))
-    escalated = tuple(sorted((getattr(snapshot, "escalated_reviews", None) or {}).items()))
+    reviews, reviewed, retried = _deck_reviews_key(app, snapshot)
     # The release's Ready for merge and the deck's one request for a next step (#2960).
     awaiting = tuple(sorted(_awaiting_merge(app, ref.work_id).items()))
-    # And the passes behind it, which a Ready for merge line names (#2992).
-    passed = tuple(sorted(_pass_marks(app, ref.work_id)))
     # Its place in the deck's merge queue (#3022).
     queued = tuple(_queue_places(app, ref.work_id))
     # What its own pull request waits for (#3097).
     held = _pr_hold(app, ref.work_id, ())
     endings = getattr(app.state, "work_endings", None)
     asked = endings.get(ref.work_id) if endings is not None else (None, None)
-    retried = tuple(
-        sorted(
-            review.chat
-            for _key, chats in reviews
-            for review in chats
-            if endings is not None and endings.review_started(review.chat)
-        )
-    )
     handoffs = getattr(snapshot, "message_handoffs", None) or {}
     handed = (owner[0] in handoffs, handoffs.get(owner[0])) if owner else (False, None)
     # The check of its merged change in the live app (#3141).
@@ -925,8 +946,8 @@ def _derived_key(app: Any, snapshot: Any, ref: WorkRef) -> tuple:
     pending = getattr(snapshot, "pending_message_ids", None) or frozenset()
     retrying = tuple(sorted(i for i in pending if i.startswith(QUOTA_RETRY_ID_PREFIX)))
     return (
-        owner, waits, reviews, escalated, awaiting, passed, asked, retried, queued, handed, held,
-        live, retrying,
+        owner, waits, reviews, reviewed, awaiting, asked, retried, queued, handed, held, live,
+        retrying,
     )
 
 
@@ -1003,11 +1024,18 @@ def derived_for(
     if not _switched(app, ref.repository):
         return None
     state = snapshot.state
-    owner = owner_of_issue(
-        state, ref.repository, ref.number, projection=getattr(snapshot, "projection", None)
-    )
+    projection = getattr(snapshot, "projection", None)
+    owner = owner_of_issue(state, ref.repository, ref.number, projection=projection)
+    # The issue closed with nothing left open, and its chat is in other Works too (#3964): the
+    # chat went on to one of those, so its turn, question or stop is not this Work's. One chat
+    # asked for v2 and v3 after v1 merged showed "Working" on all three cards.
+    moved_on = False
+    if owner is not None and card.finished_at is not None:
+        if not any(output.is_open for output in card.outputs):
+            works_for = getattr(projection or state.work_projection(), "works_for_chat", None)
+            moved_on = works_for is not None and len(works_for(owner[0])) > 1
     session = None
-    if owner is not None:
+    if owner is not None and not moved_on:
         chat = state.chat_by_id(owner[0])
         session = state.current_session_for_chat(chat) if chat is not None else None
         session = session or state.sessions.get(owner[0])
@@ -1037,55 +1065,56 @@ def derived_for(
         session is not None
         and (_leg_working(session, getattr(snapshot, "presentation", None)) or stalled)
     )
-    # D7 rule 6, "no verdict at its head", read from the deck's own record of review chats: a
-    # ready pull request is in review only while a review chat opened about it is still open,
-    # at the card's head or at the newest head the deck recorded for it (#2943: the card's
-    # cached head can lag the push the review was opened for). A verdict of any kind, from any
-    # reviewer, ends that chat.
-    reviewing = getattr(snapshot, "open_reviews", None) or {}
+    # D7 rule 6, "no verdict at its head", and every other review line, read from each open
+    # pull request's review history at the head the card holds (#3956): the newest event wins,
+    # so a pass recorded a moment before its chat closes is answered, and a review asked for
+    # again replaces an escalation. A ready pull request is in review while an ask or a review
+    # chat about its head is newer than any verdict there; that chat's own live facts come
+    # from the chat board by its number, and a chat the board saw close with no verdict ended
+    # that review.
+    chats = getattr(snapshot, "review_chats", None) or {}
+    answers: list[tuple[Any, review_history.HeadReview]] = []
     review: Any = None
-    reviewed_output: Any = None
-    for output in card.outputs:
-        if output.settled or output.draft:
-            continue
-        head = output.head.lower()
-        chats = reviewing.get((output.repository.casefold(), output.number), ())
-        review = next(
-            (
-                chat
-                for chat in chats
-                if chat.newest
-                or (head and len(chat.head) >= 7 and head.startswith(chat.head.lower()))
-            ),
-            None,
-        )
-        if review is not None:
-            review, reviewed_output = (output.number, review), output
-            break
-    # The reviewer escalated an open pull request's current head to the owner (#3216).
-    escalations = getattr(snapshot, "escalated_reviews", None) or {}
     escalated: Any = None
+    unstarted: tuple[int, str] | None = None
     for output in card.outputs:
-        found = escalations.get((output.repository.casefold(), output.number))
-        head = output.head.lower()
+        if output.settled:
+            continue
+        found, lag = _head_review(snapshot, output)
+        if not lag:
+            answers.append((output, found))
+        if output.draft:
+            continue
         if (
-            not output.settled
-            and found is not None
-            and (not head or (len(found.head) >= 7 and head.startswith(found.head.lower())))
+            escalated is None
+            and found.verdict == review_history.ESCALATED
+            and found.review_since is None
         ):
             escalated = (output, found)
-            break
+        if unstarted is None and found.unstarted:
+            unstarted = (output.number, output.head)
+        number = _chat_number(found.review_chat)
+        if review is None and found.review_since is not None:
+            live = chats.get(number) if number is not None else None
+            if number is None or number not in chats or live is not None:
+                review = (output.number, found, number, live)
     # Every open pull request reviewed and tested, a person's Merge all that is missing: the
     # release's own answer, at the heads it was given for (#2960).
     ready = _ready_for_merge(app, ref.work_id, card.outputs)
-    ready_reviewed_at, ready_review_chat = _ready_review(app, ref.work_id, ready)
-    if review is not None and ready is not None:
-        # The pass is recorded from the verdict comment, a few seconds before its review chat
-        # closes: a chat opened before that pass is answered, not still reviewing (#3324).
-        passed_at, _ = _ready_review(app, ref.work_id, reviewed_output)
-        opened = review[1].opened_at
-        if passed_at is not None and opened is not None and _aware(opened) <= passed_at:
-            review = None
+    if ready is not None and not any(output is ready and found.passed for output, found in answers):
+        # The release's Ready predates a review asked for since: its pass no longer stands
+        # (``standing_verdict``), so the Work is not Ready, whatever that review became.
+        ready = None
+    passed = next(
+        (
+            found
+            for output, found in answers
+            if output is ready and found.passed
+        ),
+        None,
+    )
+    ready_reviewed_at = _stamp(passed.verdict_at) if passed is not None else None
+    ready_review_chat = passed.verdict_chat if passed is not None else ""
     # Its place in the deck's merge queue (#3022): the open pull request nearest the front.
     queue_place, queued = None, None
     for place in sorted(_queue_places(app, ref.work_id), key=lambda row: row[1]):
@@ -1109,15 +1138,36 @@ def derived_for(
     # ready Work drops it rather than reading "Waiting on pull request …" (#3003). A wait on
     # anything else (a render, CI elsewhere) still comes first.
     # Any other wait on its own pull request says what that pull request waits for (#3097).
+    # A CI wait on the head of a pull request the Ready covers is met by the same Ready: the release
+    # calls that head tested (#3863: a duplicate drone wait, left open after CI went green,
+    # read "Waiting" over Ready for merge).
     own_pulls = {(o.repository.casefold(), o.number) for o in card.outputs}
+    own_heads = {
+        (o.repository.casefold(), o.head.lower())
+        for o in card.outputs
+        if not o.settled and not o.draft and o.head
+    }
     pr_waits: list[tuple[str, datetime | None]] = []
     if registry is not None and owner is not None:
+        # A chat that moved on to another Work (#3964) waits for that Work: only a wait that
+        # names this Work's own pull request or head is still this Work's.
+        all_heads = {
+            (o.repository.casefold(), o.head.lower()) for o in card.outputs if o.head
+        }
         for wait in registry.for_chat(owner[0]):
             own = (
                 wait.kind == KIND_PULL_REQUEST
                 and (wait.repository.casefold(), wait.number) in own_pulls
             )
-            if own and ready is not None:
+            if moved_on and not (
+                (
+                    wait.kind in {KIND_PULL_REQUEST, KIND_REVIEW}
+                    and (wait.repository.casefold(), wait.number) in own_pulls
+                )
+                or _waits_on_own_head(wait, all_heads)
+            ):
+                continue
+            if ready is not None and (own or _waits_on_own_head(wait, own_heads)):
                 continue
             until = datetime.fromtimestamp(wait.deadline, UTC) if wait.deadline else None
             (pr_waits if own else waits).append((_wait_words(wait, own_pulls), until))
@@ -1151,7 +1201,7 @@ def derived_for(
 
     handoffs = getattr(snapshot, "message_handoffs", None) or {}
     handed, handed_until = False, None
-    if owner is not None and owner[0] in handoffs:
+    if owner is not None and not moved_on and owner[0] in handoffs:
         handed_at = handoffs[owner[0]]
         if ended_at is None or handed_at > (
             ended_at if ended_at.tzinfo is not None else ended_at.replace(tzinfo=UTC)
@@ -1173,7 +1223,7 @@ def derived_for(
             chat_href = str(chat_path(session.key) or "")
         except Exception:  # noqa: BLE001 -- the line stands without a link
             chat_href = ""
-    pr_hold = _pr_hold(app, ref.work_id, card.outputs) if pr_waits else _PrHold()
+    pr_hold = _pr_hold(app, ref.work_id, answers) if pr_waits else _PrHold()
     moved = [
         _aware(at)
         for at in (ended_at, pr_hold.since, pr_hold.findings_at, pr_hold.passed_at)
@@ -1221,6 +1271,12 @@ def derived_for(
     merged = not pr_open and any(output.state == "merged" for output in card.outputs)
     live = _live_state(app, ref.work_id) if card.awaiting_finish or merged else _LiveState()
     spec = _posted_spec(app, ref, card, owner[0] if owner is not None else "")
+    live_review = review[3] if review is not None else None
+    review_since = _stamp(review[1].review_since) if review is not None else None
+    unseen = review is not None and live_review is None and review_since is not None
+    stuck_at = live_review.stuck_at if live_review is not None else None
+    if unseen and review_since is not None:
+        stuck_at = review_since + UNSEEN_REVIEW_GRACE
     inputs = DerivedInputs(
         question=question,
         running=running,
@@ -1249,26 +1305,29 @@ def derived_for(
         # A person finished it (D15): it stays finished until a message wakes its chat.
         finished=_still_finished(app, ref.work_id, card, session),
         review_pr=review[0] if review is not None else None,
-        review_since=review[1].opened_at if review is not None else None,
-        review_active=review[1].active_at if review is not None else None,
-        review_stuck_at=review[1].stuck_at if review is not None else None,
-        review_chat=review[1].chat if review is not None else None,
-        review_held=bool(review is not None and review[1].held),
-        review_held_why=review[1].held_why if review is not None else "",
-        review_stopped_by_ours=bool(review is not None and review[1].stopped_by_ours),
-        review_reopen_until=review[1].reopen_until if review is not None else None,
-        review_start_failed=review[1].start_failed if review is not None else "",
-        review_retried=bool(
+        review_unstarted=unstarted,
+        review_since=review_since,
+        review_active=live_review.active_at if live_review is not None else review_since,
+        review_stuck_at=stuck_at,
+        review_chat=review[2] if review is not None else None,
+        review_held=bool(live_review is not None and live_review.held),
+        review_held_why=live_review.held_why if live_review is not None else "",
+        review_stopped_by_ours=bool(live_review is not None and live_review.stopped_by_ours),
+        review_reopen_until=live_review.reopen_until if live_review is not None else None,
+        review_start_failed=live_review.start_failed if live_review is not None else "",
+        review_retried=unseen
+        or bool(
             review is not None
+            and review[2] is not None
             and (
-                review[1].stopped_by_ours
-                or (endings is not None and endings.review_started(review[1].chat))
+                (live_review is not None and live_review.stopped_by_ours)
+                or (endings is not None and endings.review_started(review[2]))
             )
         ),
         escalated_pr=escalated[0].number if escalated is not None else None,
-        escalated_at=escalated[1].at if escalated is not None else None,
-        escalated_chat=escalated[1].ref if escalated is not None else "",
-        escalated_url=escalated[1].url if escalated is not None else "",
+        escalated_at=_stamp(escalated[1].verdict_at) if escalated is not None else None,
+        escalated_chat=escalated[1].verdict_chat if escalated is not None else "",
+        escalated_url=escalated[1].verdict_url if escalated is not None else "",
         waits=tuple(waits),
         pr_waits=tuple(pr_waits),
         pr_hold=pr_hold.words,
@@ -1363,46 +1422,48 @@ class _PrHold:
     passed_at: datetime | None = None
 
 
-def _pr_hold(app: Any, work_id: str, outputs: Sequence[Any]) -> _PrHold:
+def _pr_hold(
+    app: Any, work_id: str, answers: Sequence[tuple[Any, review_history.HeadReview]]
+) -> _PrHold:
     """The release's last hold of this Work, a reviewer's findings since, and its last pass.
 
-    A Work the release has not looked at since this was recorded reads from its passes alone:
-    an open pull request with no pass at the head the card holds is not reviewed there, which
-    is how a lost pass looked (#3097).
+    ``answers`` is each open pull request's review at the head the card holds (#3956). A Work
+    the release has not looked at since this was recorded reads from those alone: an open
+    pull request with no pass at its head is not reviewed there, which is how a lost pass
+    looked (#3097).
     """
-    from ..work_release import same_commit
-
     store = getattr(getattr(app.state, "work_release", None), "store", None)
     try:
         entry = store.get(work_id) if store is not None else {}
     except Exception:  # noqa: BLE001 -- unreadable: the wait stands without its reason
         return _PrHold()
     entry = entry if isinstance(entry, Mapping) else {}
-    passes = entry.get("passes") if isinstance(entry.get("passes"), Mapping) else {}
-    stamps = [_stamp(row.get("at")) for row in passes.values() if isinstance(row, Mapping)]
-    passed_at = max((at for at in stamps if at is not None), default=None)
+    passes = [found for _output, found in answers if found.passed]
+    passed_at = max((_stamp(found.verdict_at) for found in passes), default=None)
     hold = entry.get("hold") if isinstance(entry.get("hold"), Mapping) else {}
     since = _stamp(hold.get("since"))
     words, person = str(hold.get("words") or ""), bool(hold.get("person"))
     if not hold and entry.get("needs_verify"):
         words = "no test run started"
-    elif not hold:
-        offered = [o for o in outputs if not o.settled and not o.draft and o.head]
-        for output in offered:
-            row = passes.get(f"{output.repository}#{output.number}".lower()) or {}
-            if not same_commit(output.head, str(row.get("head") or "")):
-                words = "not reviewed at its head"
-                break
-    findings = entry.get("findings") if isinstance(entry.get("findings"), Mapping) else {}
-    found_at = _stamp(findings.get("at"))
+    elif not hold and any(
+        not output.draft and output.head and not found.passed
+        for output, found in answers
+    ):
+        words = "not reviewed at its head"
+    findings = max(
+        (found for _output, found in answers if found.findings_at is not None),
+        key=lambda found: found.findings_at or 0.0,
+        default=None,
+    )
+    found_at = _stamp(findings.findings_at) if findings is not None else None
     if found_at is not None and since is not None and found_at < since:
-        found_at = None  # answered by a push since: the hold moved on
+        found_at = None  # answered since: the hold moved on
     return _PrHold(
         words=words,
         person=person,
         since=since,
         findings_at=found_at,
-        findings_told=bool(findings.get("told")),
+        findings_told=bool(found_at is not None and findings.findings_told),
         passed_at=passed_at,
     )
 
@@ -1429,6 +1490,19 @@ def _open_deck_verification(job: Any, work_id: str) -> bool:
     )
 
 
+def _waits_on_own_head(wait: Any, own_heads: set[tuple[str, str]]) -> bool:
+    """Whether ``wait`` is a CI wait on the head of a pull request a Ready covers."""
+    sha = str(wait.sha or "").lower()
+    return (
+        wait.kind == KIND_COMMIT
+        and len(sha) >= 7
+        and any(
+            repository == wait.repository.casefold() and head.startswith(sha)
+            for repository, head in own_heads
+        )
+    )
+
+
 def _wait_words(wait: Any, own_pulls: set[tuple[str, int]]) -> str:
     """What a Work's line says it waits on, never naming a pull request (#3720)."""
     if wait.kind not in {KIND_PULL_REQUEST, KIND_REVIEW}:
@@ -1436,20 +1510,6 @@ def _wait_words(wait: Any, own_pulls: set[tuple[str, int]]) -> str:
     own = (wait.repository.casefold(), wait.number) in own_pulls
     what = "its pull request" if own else "another pull request"
     return what if wait.kind == KIND_PULL_REQUEST else f"the review of {what}"
-
-
-def _pass_marks(app: Any, work_id: str) -> list[tuple[str, str, str]]:
-    """``(pull, when, review chat)`` per recorded review pass, for the card cache (#2992)."""
-    store = getattr(getattr(app.state, "work_release", None), "store", None)
-    try:
-        passes = store.get(work_id).get("passes") or {} if store is not None else {}
-        return [
-            (str(pull), str(row.get("at") or ""), str(row.get("chat") or ""))
-            for pull, row in passes.items()
-            if isinstance(row, dict)
-        ]
-    except Exception:  # noqa: BLE001 -- unreadable: nothing to name
-        return []
 
 
 def _queue_places(app: Any, work_id: str) -> list[tuple[str, int, int, int]]:
@@ -1470,6 +1530,27 @@ def _release_read(release: Any, name: str, work_id: str) -> str:
         return str(read(work_id) or "") if read is not None else ""
     except Exception:  # noqa: BLE001 -- unreadable: nothing offered
         return ""
+
+
+def _pre_review_waits(app: Any, state: Any, work_id: str) -> str:
+    """The line naming the Work's pull requests whose review waits on the agent's pre-review
+    checklist (#3880), which has no time limit; "" when none does."""
+    from ..work_router import work_pulls
+
+    held = getattr(getattr(app.state, "work_router", None), "pre_review_held", None)
+    if held is None:
+        return ""
+    try:
+        pulls = [pull for pull in work_pulls(state, work_id) if held(pull)]
+    except Exception:  # noqa: BLE001 -- unreadable: the page stands without the line
+        logger.debug("pre-review holds unreadable for %s", work_id, exc_info=True)
+        return ""
+    if not pulls:
+        return ""
+    return (
+        f"Pre-review: waiting for the agent to go through its checklist on {', '.join(pulls)}."
+        " The review starts once it has."
+    )
 
 
 def _awaiting_merge(app: Any, work_id: str) -> dict:
@@ -1537,21 +1618,6 @@ def _waiting_on_tests(app: Any, work_id: str) -> bool:
         return bool(store.get(work_id).get("needs_verify"))
     except Exception:  # noqa: BLE001 -- unreadable: the full list of endings is asked
         return False
-
-
-def _ready_review(app: Any, work_id: str, ready: Any) -> tuple[datetime | None, str]:
-    """When the pass behind a Ready for merge was recorded, and its review chat (#2992)."""
-    if ready is None:
-        return None, ""
-    store = getattr(getattr(app.state, "work_release", None), "store", None)
-    try:
-        passes = store.get(work_id).get("passes") or {} if store is not None else {}
-        passed = passes.get(f"{ready.repository}#{ready.number}".lower()) or {}
-        at = passed.get("at")
-        when = datetime.fromtimestamp(float(at), UTC) if at else None
-        return when, str(passed.get("chat") or "")
-    except Exception:  # noqa: BLE001 -- the line stands without its review
-        return None, ""
 
 
 def _ready_for_merge(app: Any, work_id: str, outputs: Sequence[Any]) -> Any:
@@ -2760,8 +2826,26 @@ def owner_in_chat(state: Any, request: WakeRequest) -> bool:
     ``base.html`` closes its streams once the page is hidden otherwise.
     """
     key = request.session_key
-    keys = {request.chat_id, key, state.chat_identity_key(key)}
-    return any(state.bus.subscribers(chat_topic(each)) for each in keys)
+    return chat_has_page(state, (request.chat_id, key))
+
+
+def chat_has_page(state: Any, keys: Iterable[str]) -> bool:
+    """Whether a page of the chat any of ``keys`` names is open: shown, or hidden in
+    voice mode (#3464). A chat ID, a session key or a leg's key all name it."""
+    names = {name for key in keys if key for name in (key, state.chat_identity_key(key))}
+    return any(state.bus.subscribers(chat_topic(each)) for each in names)
+
+
+def voice_mode_on(state: Any, keys: Iterable[str]) -> bool:
+    """Whether a page of the chat ``keys`` name has voice mode on (#3875): it said so
+    with ``/api/voice/warm`` and not ``/end``, and a page of the chat is still open,
+    so a tab closed without turning it off stops counting."""
+    keys = tuple(key for key in keys if key)
+    chat = {state.chat_identity_key(key) for key in keys}
+    on = voice_helper.voice_on_keys()
+    if not any(key in keys or state.chat_identity_key(key) in chat for key in on):
+        return False
+    return chat_has_page(state, keys)
 
 
 def needs_you_stops(
@@ -2962,6 +3046,21 @@ def unsized_pulls(cards: Sequence[WorkCard]) -> tuple[tuple[str, int, str], ...]
     return tuple(dict.fromkeys(found))
 
 
+def other_deck_pulls(items: Sequence[OtherDeckWork]) -> tuple[tuple[str, int, str], ...]:
+    """Another deck's pull requests whose row has no size yet, or no row at all (#3855).
+
+    No chat of this deck registered them, so nothing else ever reads their row: the backfill
+    reads it once, and again only when a push dropped its file list.
+    """
+    found = (
+        (output.repository, output.number, output.head)
+        for item in items
+        for output in item.outputs
+        if output.repository and not output.settled and not output.file_list
+    )
+    return tuple(dict.fromkeys(found))
+
+
 def open_pull_rows(cards: Sequence[WorkCard]) -> tuple[tuple[str, int, str], ...]:
     """Listed Works' open pull requests, each with its head (#3217).
 
@@ -3028,7 +3127,7 @@ _RESTING_KINDS = frozenset(
     {
         "question", "waiting", "queued", "review", "ready", "closed", "finished", "scheduled",
         "pr_held", "pr_stuck", "live_failed", "not_live", "review_escalated", "spec_wait",
-        "parked",
+        "parked", "asked_in_chat",
     }
 )
 
@@ -3693,19 +3792,25 @@ async def _load_work_overview(
     records = {work_id: item.record for work_id, item in facts.items() if item.record is not None}
     # A Work with a chat on this deck shows as one already, even after it went to another.
     held_here = {item.ref.work_id for item in candidates if getattr(item, "work", None)}
-    return WorkOverview(
-        tuple(cards),
-        0,
-        archived,
-        other,
-        other_hidden,
-        other_decks=tuple(
+    other_decks = dress_other_decks(
+        app,
+        tuple(
             item
             for item in other_deck_works(
                 snapshot.backlog, now=now, mine=getattr(app.state, "deck_claims", None)
             )
             if item.work_id not in held_here
         ),
+        snapshot.backlog,
+    )
+    listed_cards = [built[work_id][0] for work_id in listed]
+    return WorkOverview(
+        tuple(cards),
+        0,
+        archived,
+        other,
+        other_hidden,
+        other_decks=other_decks,
         front=front_sections(
             folded([*rows, *tree_rows]), now=now, max_active=MAX_DASHBOARD_WORKS, hidden=hidden
         ),
@@ -3713,9 +3818,13 @@ async def _load_work_overview(
             *unresolved_issues(candidates, records, snapshot.backlog),
             *stopped_open_issues(cards, facts),
         ),
-        unsized=unsized_pulls([built[work_id][0] for work_id in listed]),
-        open_rows=open_pull_rows([built[work_id][0] for work_id in listed]),
-        merge_watch=merge_watch_pulls([built[work_id][0] for work_id in listed]),
+        # Another deck's pull requests are sized and kept current like your own (#3855), but
+        # never merge-watched: this deck merges none of them.
+        unsized=tuple(
+            dict.fromkeys((*unsized_pulls(listed_cards), *other_deck_pulls(other_decks)))
+        ),
+        open_rows=open_pull_rows([*listed_cards, *other_decks]),
+        merge_watch=merge_watch_pulls(listed_cards),
         work_chat_ids=owned_chat_ids(snapshot.projection),
         projection=snapshot.projection,
         degraded=tuple(degraded),
@@ -4294,6 +4403,10 @@ class WorkDetail:
     # The release's ``approval`` for an early Merge (#3320), and its line once one was cleared.
     approval: str = ""
     approval_cleared: str = ""
+    # While a press stands and something holds it: what it waits for (#3869).
+    approval_waits: str = ""
+    # A pull request whose review waits on the agent's pre-review checklist (#3880).
+    pre_review_waits: str = ""
     # The issue's parent and sub-issues (#3622), or None when it is in no tree.
     tree: work_tree.WorkTree | None = None
     # The Diagram button (#3827), or None while no chat of the Work has drawn one.
@@ -4382,8 +4495,9 @@ class WorkDetail:
     def last_action_followed(self) -> str:
         """The newest press in the past tense once it was acted on, else "" (#2460).
 
-        A Merge is acted on once the Work merged; until then the press's own receipt says what
-        comes next.
+        A Merge is acted on once the Work merged. Until then a press that still stands says
+        what it waits for now (#3869), not what held it when pressed: a base update after the
+        press and its long re-test made the press look ignored.
         """
         press = self.last_action
         if press is None or press.state != "sent" or press.reserved is None:
@@ -4392,6 +4506,8 @@ class WorkDetail:
             outputs = self.card.outputs
             if any(o.state == "merged" for o in outputs) and all(o.settled for o in outputs):
                 return "Merge asked; merged"
+        if press.action in {MERGE, APPROVE_MERGE} and self.merge_approved:
+            return self.approval_waits
         return ""
 
     @property
@@ -4624,6 +4740,8 @@ async def load_work_detail(
         resolution=resolution,
         approval=_release_read(release, "approval", ref.work_id),
         approval_cleared=_release_read(release, "approval_cleared", ref.work_id),
+        approval_waits=_release_read(release, "approval_waits", ref.work_id),
+        pre_review_waits=_pre_review_waits(app, snapshot.state, ref.work_id),
         tree=tree,
         diagram=await asyncio.to_thread(work_diagram, app, ref, chats),
         message_target=message_target(card, chats, _can_send(app)),
@@ -4946,7 +5064,7 @@ SECTION_INPUTS: dict[str, Callable[[WorkDetail, Any], tuple]] = {
         # here so a control that starts reading something else cannot go stale.
         d.attention, d.buttons, d.finish_control, d.pause_control, d.star_control,
         d.pause_refusal, d.last_action_followed, d.bring_back, d.merge_approval_control,
-        d.approval, d.approval_cleared, d.diagram,
+        d.approval, d.approval_cleared, d.approval_waits, d.pre_review_waits, d.diagram,
     ),
     # The issue's parent and sub-issues (#3622), each line as the front page last drew it.
     "tree": lambda d, line: (d.tree,),
@@ -5237,4 +5355,58 @@ def other_deck_work(app: Any, ref: WorkRef) -> OtherDeckWork | None:
     found = other_deck_works(
         backlog, now=datetime.now(UTC), mine=getattr(app.state, "deck_claims", None)
     )
-    return next((item for item in found if item.work_id == ref.work_id), None)
+    item = next((item for item in found if item.work_id == ref.work_id), None)
+    return dress_other_decks(app, (item,), backlog)[0] if item is not None else None
+
+
+def _spec_label(app: Any, repository: str) -> str:
+    try:
+        policy = app.state.work_release.ports.policy(repository)
+    except Exception:  # noqa: BLE001 -- no policy read: no spec-only label known
+        return ""
+    return str(getattr(policy, "spec_only_label", "") or "")
+
+
+def dress_other_decks(
+    app: Any, items: Sequence[OtherDeckWork], backlog: Any
+) -> tuple[OtherDeckWork, ...]:
+    """Each of another deck's Works with the facts your own read and its status (#3855).
+
+    Local reads only, as ``gather_facts``: the cached open pull requests joined to the issue,
+    their cached rows, and the marks and newest comment the webhook log left
+    (``issue_marks``, ``issue_latest_comment``). No GitHub call.
+    """
+    from ..issue_latest_comment import newest_comment_id
+    from ..issue_marks import issue_marks
+
+    if not items:
+        return ()
+    by_issue = _open_pulls(backlog)
+    inputs = [
+        (item, by_issue.get(f"{item.ref.repository}#{item.ref.number}".lower(), ()))
+        for item in items
+    ]
+    urls = [url for item, pulls in inputs for url in discovery_urls(item.ref, pulls)]
+    rows = _cached_pulls(app, urls)
+    labels: dict[str, str] = {}
+    dressed = []
+    for item, pulls in inputs:
+        item = replace(item, facts=work_facts(item.ref, rows=rows, open_pulls=pulls))
+        key = f"{item.ref.repository}#{item.ref.number}"
+        repository = item.ref.repository.lower()
+        if repository not in labels:
+            labels[repository] = _spec_label(app, item.ref.repository)
+        marks = issue_marks(key)
+        status = other_deck_status(
+            item,
+            marks=marks,
+            newest_comment=newest_comment_id(key),
+            spec_label=labels[repository],
+        )
+        verdicts = tuple(
+            (output.url, mark)
+            for output in item.outputs
+            if output.head and (mark := marks.verdict(output.head)) is not None
+        )
+        dressed.append(replace(item, status=status, verdicts=verdicts))
+    return tuple(dressed)

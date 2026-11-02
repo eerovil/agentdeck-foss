@@ -29,6 +29,7 @@
       <option value="{{ target.repository }}" data-project="{{ target.project }}"
               data-evidence="{{ target.evidence_repository }}"
               data-spec-only="{{ '1' if target.spec_only_label else '' }}"
+              {% if target.project_default %}data-project-default{% endif %}
               {% if target.repository == new_work.default %}selected{% endif %}>{{ target.repository }}</option>
       {% endfor %}
     </select>

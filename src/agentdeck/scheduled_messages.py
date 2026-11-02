@@ -136,6 +136,7 @@ class ScheduledMessageService:
         on_change: Callable[[str], None] | None = None,
         on_delivering: Callable[[str], None] | None = None,
         on_delivered: Callable[[str, str], None] | None = None,
+        voice_line: Callable[[ScheduledMessage, ScheduledTarget], str] | None = None,
         bus=None,
     ) -> None:
         self._store = store
@@ -149,6 +150,10 @@ class ScheduledMessageService:
         self._on_delivered = on_delivered or (
             lambda _session_key, _message: None
         )
+        # The line a deck message gains while its chat is in voice mode (#3875), asked
+        # as it goes, so it follows voice mode then rather than at scheduling. The row
+        # keeps its own text.
+        self._voice_line = voice_line or (lambda _message, _target: "")
         self._wake = asyncio.Event()
         self._task: asyncio.Task | None = None
         self._chat_tasks: dict[str, asyncio.Task] = {}
@@ -189,6 +194,11 @@ class ScheduledMessageService:
             self._blocked.discard(message.chat_id)
             self._wake.set()
         return recorded
+
+    def note_stored(self) -> None:
+        """Another process stored rows (the services process, #4016): look at every chat."""
+        self._blocked.clear()
+        self._wake.set()
 
     def exists(self, message_id: str) -> bool:
         """Whether any row, in any state, is stored under this id."""
@@ -346,11 +356,12 @@ class ScheduledMessageService:
                 if message.attachments
                 else {}
             )
+            line = self._voice_line(message, target)
             result = await self._injector.start(
                 target.account,
                 target.session,
                 target.provider,
-                message.text,
+                f"{message.text}\n\n{line}" if line else message.text,
                 **uploads,
                 effort=message.effort,
                 client_action_id=message.id,

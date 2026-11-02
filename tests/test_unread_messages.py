@@ -17,7 +17,7 @@ import pytest
 from worker_harness import claude_host as _host
 from worker_harness import settle as _settle
 
-from agentdeck.providers.claude_code.transcripts import read_message_texts
+from agentdeck.providers.claude_code.transcripts import read_messages
 from agentdeck.revival import BACKGROUND, CUT_OFF, revival_message
 
 pytestmark = pytest.mark.anyio
@@ -86,19 +86,35 @@ async def test_messages_written_into_a_running_turn_are_quoted_after_a_death(tmp
     await fresh.stop()
 
 
+def _user_parts(at: float, *parts: str) -> dict:
+    content = [{"type": "text", "text": part} for part in parts]
+    return {"type": "user", "timestamp": _iso(at), "message": {"role": "user", "content": content}}
+
+
 async def test_a_message_the_transcript_shows_read_is_not_quoted(tmp_path):
-    """Read as its own turn, or delivered into the open turn: either way it landed."""
-    session_id = await _steer_into_running_turn(tmp_path, "read as a turn", "read mid-turn", "lost")
+    """Read as its own turn, or delivered into the open turn: either way it landed.
+
+    Messages read together are one line with a part each, so each is read (#3931);
+    a line that is one message of several parts never lends a part to another.
+    """
+    session_id = await _steer_into_running_turn(
+        tmp_path, "read as a turn", "read mid-turn", "lost", "alpha\nbeta", "alpha", "one", "two"
+    )
     now = time.time()
     _transcript(
         tmp_path,
         session_id,
-        [_user("read as a turn", now), _queued_command("read mid-turn", now)],
+        [
+            _user("read as a turn", now),
+            _queued_command("read mid-turn", now),
+            _user_parts(now, "alpha", "beta"),
+            _user_parts(now, "two\n", "one"),
+        ],
     )
 
     fresh, _ = _host(tmp_path)
 
-    assert [entry["text"] for entry in fresh.unread_messages("issue-1")] == ["lost"]
+    assert [entry["text"] for entry in fresh.unread_messages("issue-1")] == ["lost", "alpha"]
     await fresh.stop()
 
 
@@ -298,7 +314,7 @@ async def test_a_read_far_behind_a_long_turn_still_counts(tmp_path):
     await fresh.stop()
 
 
-def test_read_message_texts_ignores_subagents_and_older_lines(tmp_path):
+def test_read_messages_ignores_subagents_and_older_lines(tmp_path):
     now = time.time()
     path = _transcript(
         tmp_path,
@@ -308,10 +324,14 @@ def test_read_message_texts_ignores_subagents_and_older_lines(tmp_path):
             _user("a subagent prompt", now, isSidechain=True),
             _enqueue(now),
             _user("  read  ", now),
+            _user_parts(now, "one\n", "two"),  # read together, one line (#3931)
         ],
     )
 
-    assert read_message_texts(path, since=now - 60) == {"read": 1}
+    assert read_messages(path, since=now - 60) == [
+        ("one\n\ntwo", ("one", "two")),
+        ("read", ()),
+    ]
 
 
 def test_the_revival_message_quotes_the_lost_messages_oldest_first():

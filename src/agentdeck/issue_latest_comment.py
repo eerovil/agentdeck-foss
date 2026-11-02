@@ -26,7 +26,7 @@ import asyncio
 import contextlib
 import logging
 import os
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 
 from .github_cache import GitHubMetadata, GitHubMetadataCache
@@ -52,6 +52,9 @@ def _comment_id(value: object) -> int | None:
 class LatestCommentService:
     """Tail the streams and keep each issue's newest comment id. Web-process owned."""
 
+    # Each consumer keeps its own offset; a subclass (``issue_marks``) names its own.
+    consumer = CONSUMER
+
     def __init__(
         self,
         streams_root: Path | str,
@@ -59,10 +62,14 @@ class LatestCommentService:
         cache: GitHubMetadataCache | None = None,
         enabled: bool = True,
         watcher: WebhookWatcher | None = None,
+        on_change: Callable[[], None] | None = None,
     ) -> None:
         self._enabled = bool(enabled)
+        # Says only "look again" when ``apply`` reports a change; this class's own anchors
+        # report none, since a link's anchor refreshes on its own next render.
+        self.on_change = on_change
         self._cache = cache or GitHubMetadataCache()
-        self._tailer = WebhookTailer(streams_root, consumer=CONSUMER)
+        self._tailer = WebhookTailer(streams_root, consumer=self.consumer)
         # The web process's one shared watch (#2865); None opens a private one.
         self._watcher = watcher
         self._task: asyncio.Task | None = None
@@ -72,7 +79,7 @@ class LatestCommentService:
         if not self._enabled or self._task is not None:
             return
         self._stop.clear()
-        self._task = asyncio.create_task(self._run(), name="issue-latest-comment")
+        self._task = asyncio.create_task(self._run(), name=self.consumer)
 
     async def stop(self) -> None:
         task, self._task = self._task, None
@@ -87,7 +94,8 @@ class LatestCommentService:
         while True:
             try:
                 async for batch in self._tailer.watch(stop_event=self._stop, watcher=self._watcher):
-                    self.apply_batch(batch)
+                    if self.apply_batch(batch) and self.on_change is not None:
+                        self.on_change()
                     self._tailer.commit()
                 return  # the stop event ended the watch
             except asyncio.CancelledError:
@@ -97,9 +105,12 @@ class LatestCommentService:
                 log.exception("issue latest-comment pass failed; retrying")
                 await asyncio.sleep(5)
 
-    def apply_batch(self, batch: Iterable[Delivery]) -> None:
+    def apply_batch(self, batch: Iterable[Delivery]) -> bool:
+        """Apply every delivery; True when any ``apply`` reported a change worth a look."""
+        changed = False
         for delivery in batch:
-            self.apply(delivery)
+            changed = bool(self.apply(delivery)) or changed
+        return changed
 
     def apply(self, delivery: Delivery) -> None:
         """Apply one delivery. Idempotent, and indifferent to arrival order."""

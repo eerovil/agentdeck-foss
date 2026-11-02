@@ -138,10 +138,8 @@ def candidates(
             skipped.append(f"{key}: the usage reading is stale")
             continue
         five_hour = snapshot.five_hour_pct
-        if not _number(five_hour) and key.partition(":")[0] != "codex":
-            # dream.py refuses a Claude reading without one; only Codex may lack it (#2560).
-            skipped.append(f"{key}: the 5-hour meter is missing")
-            continue
+        # An account may have no 5-hour window at all, Codex's (#2560) and Claude's (#3947)
+        # alike; then its week decides alone, as in dream.py.
         if _number(five_hour) and five_hour >= FIVE_HOUR_STOP_PCT:
             skipped.append(f"{key}: the 5-hour meter is at {five_hour:.0f}%")
             continue

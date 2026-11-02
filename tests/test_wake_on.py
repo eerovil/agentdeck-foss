@@ -36,6 +36,7 @@ from agentdeck.wake_on import (
     WakeRequestError,
     parse_request,
     registry_path,
+    seen_result,
     timeout_message,
 )
 from agentdeck.webhook_tailer import WebhookTailer
@@ -382,6 +383,15 @@ def test_a_commit_wait_takes_the_first_finished_result_on_that_commit(root, serv
         sha=SHA,
         context="drone",
     )
+    # A job its ``if:`` skipped says nothing about the commit (#3910).
+    for delivery, conclusion in (("d3s", "skipped"), ("d3n", "NEUTRAL")):
+        deliver(
+            root,
+            event="check_run",
+            delivery=delivery,
+            action="completed",
+            check_run={"head_sha": SHA, "name": "deploy", "conclusion": conclusion},
+        )
     deliver(
         root,
         event="status",
@@ -479,6 +489,19 @@ def test_a_commit_wait_wakes_on_a_completed_check_run(root, service, scheduled):
         scheduled[0].text
     )
     assert "(https://github.com/eerovil/agentdeck/runs/9)" in scheduled[0].text
+    # A wait that names a check takes it even skipped: that is the answer it asked for.
+    register(service, commit=f"eerovil/agentdeck@{SHA}", name="deploy")
+    deliver(
+        root,
+        event="check_run",
+        delivery="d4",
+        action="completed",
+        check_run={"head_sha": SHA, "name": "deploy", "conclusion": "skipped"},
+    )
+    drain(service)
+    assert "check run deploy on eerovil/agentdeck@abcdef123456 finished: skipped" in (
+        scheduled[-1].text
+    )
 
 
 def test_a_name_filter_waits_for_the_named_check(root, service, scheduled):
@@ -1232,6 +1255,57 @@ def test_the_session_guide_offers_the_wait_next_to_the_no_polling_rule():
         assert '{"needs_you": "all"}' in flat
 
 
+def test_a_finished_check_is_seen_in_each_ci_shape_until_it_runs_again(root, monkeypatch):
+    """#3863: a commit wait registered after its check finished is answered at once, for a
+    check suite, a check run and a workflow run; a re-run since, an unfinished and a finished
+    state at one time, or a delivery with no time keeps the wait."""
+    from agentdeck import github_webhook_log
+    from agentdeck.wake_on import KIND_COMMIT, WakeRequest
+
+    # Durability is not under test, and an fsync per delivery is most of the test's time.
+    monkeypatch.setattr(github_webhook_log.os, "fsync", lambda _fd: None)
+
+    def run(event, n, *, done, at, name="ci", **extra):
+        body = {"head_sha": SHA, "status": "completed" if done else "in_progress", **extra}
+        if done:
+            body["conclusion"] = "success"
+        if event == "check_suite":
+            body.update(app={"name": name}, updated_at=at)
+        elif event == "check_run":
+            body.update(name=name, **({"completed_at": at} if done else {"started_at": at}))
+        else:
+            body.update(name=name, updated_at=at)
+        action = "completed" if done else ("rerequested" if event == "check_suite" else "requested")
+        deliver(root, event=event, delivery=f"{event}{n}", action=action, **{event: body})
+
+    def seen(name):
+        wait = WakeRequest(
+            id="",
+            session_key="s",
+            chat_id="c",
+            kind=KIND_COMMIT,
+            repository="eerovil/agentdeck",
+            sha=SHA[:12],
+            name=name,
+        )
+        return seen_result(root, wait)
+
+    t = "2026-10-29T10:0{}:00Z".format
+    for event in ("check_suite", "check_run", "workflow_run"):
+        run(event, 1, done=True, at=t(1), name=f"{event} green")
+        # Re-run at 10:05, its old success delivered after it.
+        run(event, 2, done=False, at=t(5), name=f"{event} again")
+        run(event, 3, done=True, at=t(1), name=f"{event} again")
+        found = seen(f"{event} green")
+        assert found is not None and found.summary.endswith("finished: success"), event
+        assert seen(f"{event} again") is None, event
+    run("check_run", 4, done=True, at=t(1), name="tie")
+    run("check_run", 5, done=False, at=t(1), name="tie")
+    run("check_run", 6, done=True, at=t(1), name="untimed")
+    run("check_run", 7, done=False, at="", name="untimed")
+    assert seen("tie") is None and seen("untimed") is None
+
+
 @pytest.mark.anyio
 async def test_the_api_registers_lists_and_cancels_a_wait(tmp_path):
     config = AppConfig(
@@ -1261,6 +1335,27 @@ async def test_the_api_registers_lists_and_cancels_a_wait(tmp_path):
             deployment_status={"state": state, "environment": environment, "updated_at": at},
             deployment={"sha": sha, "environment": environment},
         )
+    # #3863: drone went green on SHA, and a second CI wait on it was kept open. A check
+    # re-run since (``pending`` again) is still waited on, even when GitHub delivered the
+    # older success after it: the status's own time orders them, not arrival.
+    for n, (context, state, at) in enumerate(
+        [
+            ("drone/push", "pending", "10:00"),
+            ("drone/push", "success", "10:05"),
+            ("drone/pr", "pending", "10:09"),
+            ("drone/pr", "success", "10:05"),
+        ]
+    ):
+        deliver(
+            tmp_path / "github-webhooks",
+            event="status",
+            delivery=f"ci{n}",
+            repository=abacus,
+            sha=SHA,
+            context=context,
+            state=state,
+            updated_at=f"2026-10-29T{at}:00Z",
+        )
     # A worker registers from its token before the deck has scanned its transcript.
     app.state.app_state.session_key_has_token = lambda candidate: candidate == key
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -1272,6 +1367,17 @@ async def test_the_api_registers_lists_and_cancels_a_wait(tmp_path):
         not_there = await client.post(
             f"/api/sessions/{key}/wake-on",
             json={"deployment": f"Northwind/abacus@{SHA[:10]}", "name": "staging"},
+        )
+        green = await client.post(
+            f"/api/sessions/{key}/wake-on",
+            json={"commit": f"northwind/abacus@{SHA}", "name": "drone/push"},
+        )
+        rerun = await client.post(
+            f"/api/sessions/{key}/wake-on",
+            json={"commit": f"northwind/abacus@{SHA}", "name": "drone/pr"},
+        )
+        await client.delete(
+            f"/api/sessions/{key}/wake-on", params={"id": rerun.json()["registered"]["id"]}
         )
         await client.delete(
             f"/api/sessions/{key}/wake-on", params={"id": not_there.json()["registered"]["id"]}
@@ -1346,18 +1452,58 @@ async def test_the_api_registers_lists_and_cancels_a_wait(tmp_path):
                 raise AgainRefused("never sent for review")
             return {"pull_request": f"{repository}#{number}", "outcome": "review pass recorded"}
 
-        app.state.work_router = SimpleNamespace(enabled=True, ask_again=ask_again, accept=accept)
+        async def pre_review_done(repository, number):
+            if number != 9:
+                raise AgainRefused("no pre-review checklist waits for it")
+            return {"pull_request": f"{repository}#{number}", "outcome": "asked"}
+
+        app.state.work_router = SimpleNamespace(
+            enabled=True, ask_again=ask_again, accept=accept, pre_review_done=pre_review_done
+        )
         app.state.app_state.add_pull_request(key, PullRequestRef.parse("eerovil/agentdeck#9"))
         # #3828: the owner's acceptance passes the head with no review and no wait.
         accepted = await client.post(
             f"/api/sessions/{key}/review-accepted",
             json={"pull_request": "eerovil/agentdeck#9", "note": " accept as is "},
         )
+        # #3880: the agent went through its pre-review checklist; an unregistered one is refused.
+        checked = await client.post(
+            f"/api/sessions/{key}/pre-review-done", json={"pull_request": "eerovil/agentdeck#9"}
+        )
+        checked_other = await client.post(
+            f"/api/sessions/{key}/pre-review-done", json={"pull_request": "eerovil/agentdeck#8"}
+        )
+        assert checked.status_code == 200 and checked.json()["outcome"] == "asked"
+        assert checked_other.status_code == 409 and "register it first" in checked_other.text
         blank_accept = await client.post(
             f"/api/sessions/{key}/review-accepted",
             json={"pull_request": "eerovil/agentdeck#9", "note": " "},
         )
         after_accept = await client.get(f"/api/sessions/{key}/wake-on")
+        # #4016: the request crosses the services socket to the router and back, as it does
+        # once the router runs in agentdeck-services.service.
+        import httpx
+
+        from agentdeck import services_link
+        from agentdeck.services_process import create_services_app
+
+        services_app = create_services_app(app.state.config, watchdog=False)
+        crossed = []
+
+        class Services:
+            async def call(self, target, method, args, kwargs):
+                crossed.append((target, method))
+                return await ask_again(*args, **kwargs)
+
+        services_app.state.services = Services()
+        app.state.work_router = services_link.RouterLink(
+            app.state.config,
+            services_link.SocketTransport(
+                lambda: tmp_path / "services.sock", transport=httpx.ASGITransport(services_app)
+            ),
+            app.state.app_state,
+        )
+        app.state.work_router.reviewer_off = False
         again = await client.post(
             f"/api/sessions/{key}/review-request",
             json={
@@ -1386,6 +1532,10 @@ async def test_the_api_registers_lists_and_cancels_a_wait(tmp_path):
             {k: v for k, v in item.items() if k != "time"} for item in reply.json()["latest"]
         ] == latest
     assert "already_happened" not in not_there.json()
+    assert green.json()["already_happened"] is True and "registered" not in green.json()
+    assert green.json()["result"].startswith("commit status drone/push on northwind/abacus@")
+    assert green.json()["result"].endswith("finished: success")
+    assert rerun.json()["registered"]["kind"] == "commit"
     assert not_there.json()["registered"]["kind"] == "deployment"
     assert unregistered.status_code == 409
     assert blank.status_code == 422 and "what changed" in blank.text
@@ -1401,6 +1551,7 @@ async def test_the_api_registers_lists_and_cancels_a_wait(tmp_path):
     assert [item["kind"] for item in after_accept.json()["waits"]] == ["pull_request", "review"]
     assert again.status_code == 200, again.text
     assert asks == [("eerovil/agentdeck", 9, "no verdict", True)]
+    assert crossed == [("router", "ask_again")]
     assert again.json()["registered"]["kind"] == "review"
     assert made.status_code == 200, made.text
     wait = made.json()["registered"]

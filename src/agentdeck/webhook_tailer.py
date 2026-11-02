@@ -84,6 +84,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import fcntl
 import gzip
 import hashlib
 import json
@@ -108,6 +109,8 @@ log = logging.getLogger(__name__)
 # crash, which is one batch, plus the head of a freshly truncated stream. A few thousand
 # GUIDs is tens of kilobytes of state file and covers both with room to spare.
 DEDUPE_WINDOW = 4096
+# How often a consumer waiting for another process's lock on its name looks again (#4002).
+LOCK_POLL_S = 1.0
 
 # Bytes of the stream head hashed into the rotation fingerprint. One record is far larger
 # than this, so the window always lands inside the first delivery — enough to tell one
@@ -252,8 +255,9 @@ class WebhookTailer:
     re-reads from the last committed offset — an uncommitted pass leaves no trace.
 
     Not safe to share between processes under one consumer name: the last writer's state
-    file wins. Every consumer in #1626 runs in a single process, and a second one wants
-    its own name rather than a lock.
+    file wins. So ``watch`` holds the name's lock (``held``) while it reads (#4002): during a
+    web reload's overlap, or the deploy that moves a consumer to the services process, the
+    second runner waits for the first to exit instead of reading the same deliveries twice.
     """
 
     def __init__(
@@ -283,6 +287,7 @@ class WebhookTailer:
         self._pending: dict[str, _StreamState] = {}
         self._pending_seen: OrderedDict[str, None] = OrderedDict()
         self._loaded = False
+        self._lock_fd: int | None = None
 
     # -- discovery ---------------------------------------------------------------
 
@@ -652,6 +657,54 @@ class WebhookTailer:
 
     # -- watching ----------------------------------------------------------------
 
+    async def _lock(self, stop_event: asyncio.Event | None) -> int | None:
+        """Take the consumer name's lock, waiting while another process holds it."""
+        path = self.state_path.with_name(f"{self.consumer}.lock")
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        waiting = False
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return fd
+            except BlockingIOError:
+                if not waiting:
+                    log.info(
+                        "webhook consumer %s waits for another process to let go", self.consumer
+                    )
+                    waiting = True
+                if stop_event is not None and stop_event.is_set():
+                    os.close(fd)
+                    return None
+                try:
+                    await asyncio.sleep(LOCK_POLL_S)
+                except BaseException:
+                    os.close(fd)
+                    raise
+
+    @contextlib.asynccontextmanager
+    async def held(self, stop_event: asyncio.Event | None = None) -> AsyncIterator[bool]:
+        """Hold this consumer name's lock for the block; ``False`` if stopped while waiting.
+
+        One process at a time reads under a name (#4002). Held already by this tailer, the
+        block just runs.
+        """
+        if self._lock_fd is not None:
+            yield True
+            return
+        fd = await self._lock(stop_event)
+        if fd is None:
+            yield False
+            return
+        self._lock_fd = fd
+        try:
+            yield True
+        finally:
+            self._lock_fd = None
+            with contextlib.suppress(OSError):
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
     async def watch(
         self,
         *,
@@ -689,6 +742,29 @@ class WebhookTailer:
         see the hint-over-truth rules in the module docstring.
         """
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        async with self.held(stop_event) as holding:
+            if not holding:
+                return
+            batches = self._watch(
+                stop_event=stop_event,
+                watcher=watcher,
+                heartbeat=heartbeat,
+                keepalive_s=keepalive_s,
+                yield_on_reset=yield_on_reset,
+            )
+            async with contextlib.aclosing(batches):
+                async for batch in batches:
+                    yield batch
+
+    async def _watch(
+        self,
+        *,
+        stop_event: asyncio.Event | None,
+        watcher: WebhookWatcher | None,
+        heartbeat: Callable[[], None] | None,
+        keepalive_s: float | None,
+        yield_on_reset: bool,
+    ) -> AsyncIterator[list[Delivery]]:
         owned = watcher is None
         if watcher is None:
             watcher = WebhookWatcher(self.root, keepalive_s=keepalive_s)

@@ -195,6 +195,22 @@ def test_the_general_lessons_reach_every_claude_home_and_codex(tmp_path):
 
 
 @shipped("docs/agents/lessons.md")
+def test_a_bare_relative_skill_dir_has_the_working_directory_as_its_home(tmp_path):
+    # As dirname has it: `claude`'s home is `.`, and `cursor` is created under it.
+    (tmp_path / "claude").mkdir()
+    (tmp_path / "codex").mkdir()
+    env = {**os.environ, "CLAUDE_SKILL_DIRS": "claude", "CURSOR_SKILL_DIRS": "cursor"}
+    env["CODEX_HOME"] = "codex"
+    script = ROOT / "scripts" / "install-skills.sh"
+    subprocess.run(["bash", str(script)], check=True, capture_output=True, cwd=tmp_path, env=env)
+    block = f"{START}\n{LESSONS.read_text().strip()}\n{END}"
+    assert block in (tmp_path / "CLAUDE.md").read_text()
+    assert block in (tmp_path / "codex" / "AGENTS.md").read_text()
+    assert not (tmp_path / "claude" / "CLAUDE.md").exists()
+    assert (tmp_path / "cursor" / "dream" / "SKILL.md").is_file()
+
+
+@shipped("docs/agents/lessons.md")
 def test_the_lessons_block_is_replaced_and_hand_written_rules_survive(tmp_path):
     main = tmp_path / "claude-main"
     main.mkdir()

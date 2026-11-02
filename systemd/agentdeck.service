@@ -2,6 +2,9 @@
 Description=agentdeck dashboard
 After=network-online.target tailscaled.service agentdeck-codex.service
 Wants=agentdeck-codex.service
+# The Work router and the merge release (#4016). Wants, not Requires: pages keep serving
+# while it is down, and a Merge press then says the merge service is restarting.
+Wants=agentdeck-services.service
 
 [Service]
 WorkingDirectory=%h/agentdeck

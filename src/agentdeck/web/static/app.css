@@ -2557,6 +2557,13 @@ button.fr-action:disabled { opacity: .5; cursor: progress; }
 .work-other-fold > summary::-webkit-details-marker { display: none; }
 .work-other-count { text-transform: none; letter-spacing: 0; }
 .work-other-decks .work-other-count { margin-left: .35rem; }
+.work-other-note { margin-left: .5rem; text-transform: none; letter-spacing: 0; }
+/* Another deck's Works (#3855): your own row's shape, the stripe in its status's hue. */
+.work-other-decks .work-other-rows { margin-top: .2rem; }
+.front-page .fr-other-deck.fr-tone-active { --cat: var(--cat-working); }
+.front-page .fr-other-deck.fr-tone-problem { --cat: var(--crit); }
+.front-page .fr-other-deck.fr-tone-done { --cat: var(--cat-finished); }
+.wd-other-deck-take { margin-left: auto; }
 .work-other-need { margin-left: .25rem; text-transform: none; letter-spacing: 0; color: var(--warn); }
 .front-chats { margin: .3rem 0 1rem; font-size: .8rem; }
 .front-chats a { color: var(--muted); }

@@ -372,7 +372,10 @@ async def test_a_retry_is_made_at_its_time_with_no_chat_changing(tmp_path, monke
     service._bus = EventBus()  # nothing is ever published on it
     service.start()
     try:
-        await asyncio.wait_for(moved.wait(), timeout=2)
+        # Only a guard against a retry that never comes: a pass returns as soon as the
+        # move starts. Each of the five store writes on the way waits on the disk, and on
+        # a busy host each took up to 0.9 s, so 2 s timed out a retry that worked (#3979).
+        await asyncio.wait_for(moved.wait(), timeout=30)
     finally:
         await service.stop()
     assert len(started) == 2

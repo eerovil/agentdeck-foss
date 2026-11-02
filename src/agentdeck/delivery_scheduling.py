@@ -8,7 +8,7 @@ account (``usage_move``) still choose with it:
 * a hard-quota circuit takes an account out of the running;
 * new work starts where the most budget is left per hour (#2757);
 * an account about to lose unspent subscription budget moves to the front (#1965);
-* a new card skips an account whose five-hour window is nearly full (#3580);
+* a new card skips an account with a nearly full window, five-hour or weekly (#3580, #3977);
 * otherwise the operator's order;
 * an account whose usage window will refuse a turn is passed over, and when every account
   would refuse, the one whose block clears first still gets the work (#1519, #1726).
@@ -118,35 +118,46 @@ def _budget_pace_first(
     return promoted
 
 
-# A five-hour window this full is about to stop the chat mid-turn (#3580).
-FIVE_HOUR_NEAR_FULL_PCT = 90.0
+# A window this full is about to stop the chat mid-turn (#3580): the five-hour one within
+# hours, a weekly or monthly one within the Work (#3977).
+NEAR_FULL_PCT = {"five_hour": 90.0, "seven_day": 90.0, "month": 90.0}
+_WINDOW_NAMES = {"five_hour": "five-hour", "seven_day": "seven-day", "month": "monthly"}
 
 
-def _five_hour_room_first(
+def _room_first(
     order: list[str],
     usage_cache: Path | None,
     usage_targets: Mapping[str, float],
     notes: list[str],
+    planned_resets: Mapping[str, datetime] | None = None,
 ) -> list[str]:
-    """A new card skips an account whose five-hour window is nearly full (#3580).
+    """A new card skips an account with a nearly full window (#3580, #3977).
 
-    The budget rankings ignore the five-hour window, so on their own they pile every new card
-    onto one account until that window runs out and stops its chats mid-turn. Accounts of the
-    leading account's provider at ``FIVE_HOUR_NEAR_FULL_PCT`` or more move behind those with
-    room, each keeping their order. When none has room, or nothing reads, the order stands.
-    An account its operator opted out with a target of 0 never counts as having room.
+    The budget rankings ignore the five-hour window, and the expiring-budget rule promotes an
+    account a few points short of its target however little it has left, so on their own they
+    pile every new card onto one account until a window runs out and stops its chats mid-turn.
+    Accounts of the leading account's provider with any window at ``NEAR_FULL_PCT`` or more
+    move behind those with room, each keeping their order. When none has room, or nothing
+    reads, the order stands. An account its operator opted out with a target of 0 never
+    counts as having room.
     """
     provider = target_of(order[0])[0]
     slots = [index for index, name in enumerate(order) if target_of(name)[0] == provider]
     if len(slots) < 2:
         return order
     now = datetime.now(UTC)
-    full: dict[str, float] = {}
+    full: dict[str, tuple[str, float]] = {}
     for index in slots:
         name = order[index]
-        for window, pct, resets in usage.account_window_readings(usage_cache, name, now=now):
-            if window == "five_hour" and pct >= FIVE_HOUR_NEAR_FULL_PCT and resets > now:
-                full[name] = pct
+        readings = usage.account_window_readings(
+            usage_cache, name, now=now, planned_reset=plan_for(planned_resets, name)
+        )
+        for window, pct, resets in readings:
+            limit = NEAR_FULL_PCT.get(window)
+            if limit is None or pct < limit or resets <= now:
+                continue
+            if name not in full or pct > full[name][1]:
+                full[name] = (window, pct)
     roomy = [
         order[index]
         for index in slots
@@ -161,11 +172,11 @@ def _five_hour_room_first(
         promoted[index] = name
     if promoted[0] != order[0]:
         before = order[0]
-        why = (
-            f"{before}'s five-hour window is {full[before]:.0f}% full"
-            if before in full
-            else f"{before} is opted out and {', '.join(full)} nearly full for five hours"
-        )
+        if before in full:
+            window, pct = full[before]
+            why = f"{before}'s {_WINDOW_NAMES.get(window, window)} window is {pct:.0f}% full"
+        else:
+            why = f"{before} is opted out and {', '.join(full)} nearly full"
         notes.append(f"{why} — starting the card on {promoted[0]} instead")
     return promoted
 
@@ -188,7 +199,7 @@ def choose_account(
     budget each account has left per hour (#2757) rather than by the operator's order alone.
     ``planned_resets`` is ``Db.planned_resets``: an account a person will reset soon has its
     budget end then, aimed at 100%, so it is offered the work first (#3379). A cold card
-    then skips an account whose five-hour window is nearly full (#3580).
+    then skips an account with a nearly full window, five-hour or weekly (#3580, #3977).
     """
     order = [name for name in accounts if name]
     if not order:
@@ -208,7 +219,7 @@ def choose_account(
         order = _budget_pace_first(order, usage_cache, usage_targets, notes, planned_resets)
     order = _expiring_budget_first(order, usage_cache, usage_targets, notes, planned_resets)
     if cold:
-        order = _five_hour_room_first(order, usage_cache, usage_targets, notes)
+        order = _room_first(order, usage_cache, usage_targets, notes, planned_resets)
     refused: list[tuple[str, str, datetime | None]] = []
     for name in order:
         reason, clears_at = usage.account_refusal_detail(usage_cache, name)

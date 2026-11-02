@@ -283,6 +283,7 @@ _DERIVED_TONES = {
     "not_live": ATTENTION,  # part of its merge is not running yet (#3220)
     "review_escalated": ATTENTION,  # the reviewer asks the owner (#3216)
     "spec_wait": ATTENTION,  # a person approves the posted spec (#3247)
+    "asked_in_chat": ATTENTION,  # the agent's reply asks the person something (#3887)
 }
 _DERIVED_WAITS = frozenset(
     {"review", "review_queued", "waiting", "queued", "scheduled", "parked", "reviving"}
@@ -314,6 +315,7 @@ _DERIVED_HEADLINES = {
     "not_live": "Needs you",
     "review_escalated": "Needs you",
     "spec_wait": "Needs you",
+    "asked_in_chat": "Needs you",
 }
 
 
@@ -344,6 +346,9 @@ def derived_story(card: WorkCard) -> WorkStatus:
             "Open the review chat and read why the reviewer stopped"
             if derived.review_held
             else "Open the review chat and see why no reviewer is running"
+            if derived.review_chat is not None
+            # No review chat at all (#3903): nothing started one for the ready head.
+            else "Start its review from the Work page"
         ),
         "ready": "Merge it, or send a follow-up",
         "unfinished": "Read its last message and tell it what to do next",
@@ -353,6 +358,7 @@ def derived_story(card: WorkCard) -> WorkStatus:
         "not_live": "Deploy what is not running yet, then tell the agent to check it again",
         "review_escalated": "Read the reviewer's question and answer it in the chat",
         "spec_wait": "Read the spec, then approve it or say what to change",
+        "asked_in_chat": "Answer the question in the chat",
     }.get(derived.kind, NOTHING_NEEDED)
     return WorkStatus(
         tone=ACTIVE if live else _DERIVED_TONES.get(derived.kind, IDLE),
@@ -864,6 +870,7 @@ _DERIVED_RANKS = {
     "unfinished": 1, "review_stuck": 1,
     "ready": 1, "closed": 3, "pr_stuck": 1, "pr_held": 2, "live_failed": 2,
     "not_live": 2, "review_escalated": 0, "spec_wait": 0,
+    "asked_in_chat": 0,
 }
 
 

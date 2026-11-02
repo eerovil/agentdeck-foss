@@ -3,6 +3,7 @@ from typing import get_args
 import pytest
 
 from agentdeck.providers.instructions import (
+    LOOK_CHECK_LINE,
     SESSION_GUIDE_OPEN,
     USE_CASE_WALKTHROUGH_LINE,
     USE_CASE_WALKTHROUGH_NOT_APPLICABLE,
@@ -43,9 +44,17 @@ def test_primary_session_guide_covers_agentdeck_action_contracts():
     assert "never invent one" in guide
     assert "structured user-input" in guide
     assert "Never infer approval" in guide
+    # #3857: any chat can move its own pages to another chat, not only the deck chat.
+    assert '`"from": "<session-key>"`' in flat and "/api/view/open-chat" in flat
     # Wayfinder's decision habits, for every agent (#3690).
     assert "the last is **None of these**" in flat
     assert "`Changes assumed: <detail> — <why>`" in flat
+    # #4005: a choice cheap to undo is decided, not asked.
+    assert "Do not ask about a choice that is cheap to undo" in flat
+    assert "rough size in code, and how hard it is to undo" in flat
+    assert "Pick the safest option, the one that fixes the most" in flat
+    # A Sentry report like #3999's is a harmless visible change, not a reason to ask.
+    assert "at most in a small, harmless way (a test, a log line, a report to Sentry)" in flat
     # #3845: a review finding on an assumed detail is the agent's to settle.
     assert "is yours to settle, not the person's" in flat
     assert "act on it only once the person keeps it" in flat
@@ -364,6 +373,9 @@ def test_guide_tells_a_session_how_to_register_related_work_and_title():
     # the owner #2801 had no label when it did (#2802).
     assert "adds that project's ownership label (`agent`) by itself" in flat_guide
     assert "check the issue's labels before you report" in flat_guide
+    # Another Work's agent never reads its issue's later edits or comments (#3908).
+    assert "$AGENTDECK_URL/api/works/<owner>/<repo>/<issue number>/message" in flat_guide
+    assert '{"text": "<what changed>", "from": "<session-key>"}' in flat_guide
     assert (
         "An issue you file for someone else to do is not registered; "
         "mention it in your reply instead." in flat_guide
@@ -461,9 +473,16 @@ def test_work_session_guide_says_what_the_deck_reads_and_names_no_poller():
         assert "`gh pr ready --undo`" in flat
         assert "--verification --session-token" in flat
         # The Work page's summary (#3093): nothing but the Work agent writes it.
-        assert "/work-resolution` with JSON `problem`" in flat
+        assert "/work-resolution` with JSON `background`" in flat
+        # ... with its background and problem from the first turn on (#3928).
+        assert "Write the Work's summary before your first turn ends" in flat
+        assert "leaving the parts you do not know yet empty" in flat
         # Every Work keeps a diagram (#3827): an old one is edited, a chore draws none.
         assert "First list `docs/diagrams/` on your branch" in flat
+        # ... read by its boxes, one per feature, and redrawn on review fixes (#3860).
+        assert "read each diagram's title and `## Boxes`" in flat
+        assert "one diagram per feature" in flat and "never the issue" in flat
+        assert "review fixes too, carries the diagram's edit" in flat
         assert "however small the change" in flat
         assert "the Work page's Diagram button opens your live page" in flat
         # ... and shown on the issue in one comment, edited in place.
@@ -472,9 +491,17 @@ def test_work_session_guide_says_what_the_deck_reads_and_names_no_poller():
         assert "post them in one comment on the issue" in flat
         assert "(a prototype is not one)" in flat
         assert "/blob/<commit-sha>/<path>?raw=1" in flat
+        # ... and judged as their user would before the pull request is ready (#3877).
+        assert "as the person who will use it, not only whether it works" in flat
+        assert "does it look professional" in flat
+        assert f"add the line {LOOK_CHECK_LINE} to the screenshots comment" in flat
         assert "Never merge a pull request yourself" in flat
         # #3437: a verified live check closes the issue, with no ask; a merge never does.
-        assert "write `Refs #<issue>`, never `Closes`" in flat
+        assert "write `Refs #<issue>`, not `Closes`" in flat
+        # ... unless the issue asks for `Closes`, as #3838 did (#3880).
+        assert "unless the issue itself asks for `Closes`" in flat
+        # Marking ready sends the pre-review checklist first (#3880).
+        assert "short pre-review checklist" in flat and "`pre-review-done`" in flat
         assert "Do not ask a person whether to close it" in flat
         # The reviewer's walkthrough line (#3338), in the very form the poller brief asks for.
         assert f"opening with the line {USE_CASE_WALKTHROUGH_LINE}" in flat

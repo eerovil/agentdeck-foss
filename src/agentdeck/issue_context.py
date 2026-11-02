@@ -30,6 +30,7 @@ time; a stored grouping taxonomy would be the boss-facing roll-up #414 rejected.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
@@ -518,6 +519,9 @@ class IssueResolver:
         self._gh = shutil.which("gh")
         self._metadata = metadata_cache or GitHubMetadataCache(cache_path)
         self._command_limit = asyncio.Semaphore(4)
+        #: Told when ``refresh_pull_rows`` rewrote rows from GitHub, so the Work router's
+        #: backstop looks again at a row that was a draft (#3903); None tells nobody.
+        self.on_pull_rows: Callable[[], object] | None = None
 
     def read_board(self) -> BoardView:
         return poller_ops.read_board(self._poller_root)
@@ -634,7 +638,11 @@ class IssueResolver:
         size; ``git_context``'s own fetch, through this resolver's shared cache.
         """
         resolver = GitContextResolver(metadata_cache=self._metadata)
-        return await resolver.refresh_pulls(refs, limit=limit)
+        read = await resolver.refresh_pulls(refs, limit=limit)
+        if read and self.on_pull_rows is not None:
+            with contextlib.suppress(Exception):
+                self.on_pull_rows()
+        return read
 
     def cached(self) -> IssueBacklog:
         """The last shared issue lists, without refreshing or calling GitHub."""

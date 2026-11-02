@@ -732,6 +732,50 @@ def test_a_filed_issue_is_told_to_the_deck_so_its_work_starts_now(
     assert "could not tell the deck" in capsys.readouterr().err
 
 
+
+def test_a_ready_press_is_told_to_the_deck_so_its_row_is_read_again(
+    shim, tmp_path, monkeypatch, capsys
+):
+    """#3903: a dropped ready event left the cached row a draft; the deck re-reads it now."""
+    told: list[tuple[str, dict]] = []
+
+    class Answer:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def urlopen(request, timeout):
+        told.append((request.full_url, json.loads(request.data)))
+        return Answer()
+
+    monkeypatch.setattr(main.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(main, "_current_branch", lambda: "agent/issue-5")
+    monkeypatch.setenv("AGENTDECK_URL", "http://127.0.0.1:9/")
+
+    assert main.main(["pr", "ready", "https://github.com/o/r/pull/13"]) == 0
+    assert main.main(["pr", "ready", "12", "--repo", "o/r", "--undo"]) == 0
+    environment = {"AGENTDECK_URL": "http://127.0.0.1:9/"}
+    main._tell_deck_ready(["pr", "ready", "--repo", "o/r", "#12"], environment, None)
+    # The current branch's, in a checkout whose remote is a git URL.
+    main._tell_deck_ready(["pr", "ready"], environment, "git@github.com:o/r.git")
+    main._tell_deck_ready(["pr", "ready", "fix/x", "-R", "o/r"], environment, None)
+    url = "http://127.0.0.1:9/api/works/pr-ready"
+    assert told == [
+        (url, {"repository": "o/r", "number": 13, "branch": ""}),
+        (url, {"repository": "o/r", "number": 12, "branch": ""}),
+        (url, {"repository": "o/r", "number": None, "branch": "agent/issue-5"}),
+        (url, {"repository": "o/r", "number": None, "branch": "fix/x"}),
+    ], "turning it back to a draft tells nothing"
+
+    def down(request, timeout):
+        raise OSError("down")
+
+    monkeypatch.setattr(main.urllib.request, "urlopen", down)
+    main._tell_deck_ready(["pr", "ready", "12", "--repo", "o/r"], environment, None)
+    assert "could not tell the deck" in capsys.readouterr().err
+
 def test_the_opt_out_files_the_issue_as_written(shim, tmp_path, monkeypatch, capsys):
     _managed(tmp_path)
     monkeypatch.setenv("AGENTDECK_NO_OWNER_LABEL", "1")

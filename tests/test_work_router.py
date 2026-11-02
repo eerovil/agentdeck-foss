@@ -18,6 +18,7 @@ import pytest
 from public_copy import private_feature
 
 from agentdeck import chat_review as _chat_review
+from agentdeck import review_history
 from agentdeck.github_webhook_log import Repository, WebhookLog
 from agentdeck.models import PullRequestRef
 from agentdeck.poller_ops import work_repositories
@@ -28,12 +29,13 @@ from agentdeck.work_router import (
     HANDED_OVER,
     MESSAGE,
     REVIEW,
-    ReviewedHeads,
+    AgainRefused,
     SwitchedRepositories,
     WorkRouterService,
     classify,
     owner_of_issue,
     owner_of_pull,
+    pulls_lookup,
     work_pulls,
 )
 
@@ -80,6 +82,7 @@ def comment(
             "html_url": f"https://github.com/c/{delivery}",
             "id": kw.pop("comment_id", 100),
             "author_association": kw.pop("comment_association", "OWNER"),
+            **({"created_at": kw.pop("created_at")} if "created_at" in kw else {}),
         },
         **kw,
     )
@@ -108,7 +111,7 @@ def root(tmp_path):
 
 
 class Harness:
-    def __init__(self, root) -> None:
+    def __init__(self, root, history: list | None = None) -> None:
         self.root = root
         self.scheduled: list = []
         self.reviews: list[tuple[str, str]] = []
@@ -126,6 +129,8 @@ class Harness:
         self.rereads: list[tuple[str, int]] = []
         self.asks: list[dict] = []
         self.verdicts: list[tuple] = []
+        # The deck's database outlives a restart, so a restarted harness may share it.
+        self.history: list[review_history.ReviewEvent] = [] if history is None else history
 
         async def start_review(pull: str, work: str, **asks) -> None:
             self.reviews.append((pull, work))
@@ -161,8 +166,39 @@ class Harness:
             acknowledge=self._acknowledge,
             spec_only_label=lambda repository: "Spec-Only",
             on_verdict=lambda chat, pulls: self.verdicts.append((chat, pulls)),
+            review_event=self.note,
+            reviews=self.reviews_of,
         )
         self.acknowledged: list[tuple[str, int]] = []
+
+    def note(self, pull, head, kind, key, at=None, data=None) -> bool:
+        """The deck's review history (``state.record_review_event``), in memory."""
+        if all(event.key != key for event in self.history):
+            when = self.now if at is None else at
+            event = review_history.ReviewEvent(
+                pull.lower(), head.lower(), when, kind, key, dict(data or {}), len(self.history)
+            )
+            self.history.append(event)
+        return True
+
+    def reviews_of(self, pull: str) -> list:
+        return [event for event in self.history if event.pull == pull.lower()]
+
+    def asked(self, pull: str, head: str, **data) -> None:
+        """A review of ``pull`` at ``head`` was asked for before."""
+        again = data.get("again", "")
+        self.note(pull, head, review_history.ASKED, f"asked:{pull}@{head}+{again}", data=data)
+
+    def answered(self, pull: str, head: str, kind: str = review_history.CHANGES) -> None:
+        self.note(pull, head, kind, f"{kind}:{pull}@{head}@{len(self.history)}")
+
+    def agains(self, pull: str, head: str) -> int:
+        """How many times ``pull`` at ``head`` was asked about again."""
+        events = review_history.at_head(self.reviews_of(pull), head)
+        return sum(1 for e in events if e.kind == review_history.ASKED and e.data.get("again"))
+
+    def kinds(self, pull: str, head: str) -> list[str]:
+        return [e.kind for e in review_history.at_head(self.reviews_of(pull), head)]
 
     async def _acknowledge(self, repository: str, comment_id: int) -> None:
         self.acknowledged.append((repository, comment_id))
@@ -551,7 +587,7 @@ async def test_a_verdict_the_release_already_told_is_not_sent_again(root, harnes
         async def on_verdict(self, *_args, **_kwargs):
             return next(answers)
 
-        async def stale_findings(self, work_id, text, repository):
+        async def stale_findings(self, work_id, text, repository, source=""):
             # The branch has left bbbbbbb; the release reads that (#3192).
             assert repository == "eerovil/agentdeck" and not text.startswith("/claude")
             return "moved past bbbbbbb" if "at bbbbbbb" in text else ""
@@ -927,16 +963,16 @@ async def test_each_head_is_sent_to_the_reviewer_once(root, harness):
         ("eerovil/agentdeck#9", "eerovil/agentdeck#7"),
         ("eerovil/agentdeck#9", "eerovil/agentdeck#7"),
     ]
-    assert "eerovil/agentdeck#9@" + "1" * 40 in harness.service.reviewed
+    assert harness.service._spent("eerovil/agentdeck#9", "1" * 40)
 
 
 async def test_a_reviewed_head_survives_a_restart(root, harness):
     pull_event(root, "d1")
     await harness.drain()
-    again = Harness(root)
+    again = Harness(root, harness.history)
     pull_event(root, "d2", action="synchronize")
     await again.drain()
-    assert again.reviews == [], "the head is remembered on disk"
+    assert again.reviews == [], "the head is remembered in its history"
 
 
 async def test_an_unregistered_pull_request_is_not_reviewed(root, harness):
@@ -1016,13 +1052,14 @@ async def test_a_tickets_answer_rebuilds_its_maps_lists(root, harness):
     assert harness.scheduled == []  # nothing is sent to any chat
 
 
-def test_reviewed_heads_keep_only_the_newest(tmp_path, monkeypatch):
-    monkeypatch.setattr("agentdeck.work_router.MAX_STARTED", 3)
-    heads = ReviewedHeads(tmp_path / "heads.json")
-    for key in "abcd":
-        heads.add(key)
-    fresh = ReviewedHeads(tmp_path / "heads.json")
-    assert "a" not in fresh and all(key in fresh for key in "bcd")
+def test_the_routers_old_review_files_are_deleted_at_start(root):
+    """#3955: each head's review history replaced them, with nothing copied over."""
+    root.parent.mkdir(parents=True, exist_ok=True)
+    for name in ("work-router-reviews.json", "work-router-pre-review.json"):
+        (root.parent / name).write_text("{}")
+    (root.parent / "work-router-pending.json").write_text("{}")
+    Harness(root)
+    assert sorted(path.name for path in root.parent.iterdir()) == ["work-router-pending.json"]
 
 
 # --- which repositories the router covers ---
@@ -1070,10 +1107,13 @@ def test_the_repositories_are_reread_when_a_manifest_changes(tmp_path):
     body = 'contract = 1\n[board]\norg = "Eerovil"\nproject_number = 1\n'
     body += '[[repos]]\nid = "agentdeck"\nholds_issues = true\n'
     _manifest(tmp_path, "agentdeck", body)
-    switched = SwitchedRepositories(tmp_path)
+    now = [0.0]
+    switched = SwitchedRepositories(tmp_path, clock=lambda: now[0])
     assert switched("eerovil/agentdeck")
     assert not switched("eerovil/notes")
     _manifest(tmp_path, "agentdeck", body + '[[repos]]\nid = "notes"\n')
+    assert not switched("eerovil/notes"), "within the TTL the manifests are not looked at"
+    now[0] += switched.ttl_s
     assert switched("EEROVIL/notes"), "a different size is a different manifest"
 
 
@@ -1210,6 +1250,13 @@ def test_work_pulls_places_every_pull_with_one_projection():
         "eerovil/other#9",
     )
     assert work_pulls(state, "github_issue:eerovil/agentdeck#8") == ("eerovil/agentdeck#10",)
+    # #3993: one walk answers every Work, the same as asking each.
+    builds.clear()
+    lookup = pulls_lookup(state)
+    for work_id in ("github_issue:eerovil/agentdeck#7", "github_issue:EEROVIL/agentdeck#8"):
+        assert lookup(work_id) == work_pulls(state, work_id)
+    assert lookup("github_issue:eerovil/agentdeck#6") == ()
+    assert len(builds) == 3, "one projection for the lookup, one per work_pulls"
 
 
 async def test_a_busy_reviewer_leaves_the_head_for_the_next_event(root, harness):
@@ -1222,19 +1269,21 @@ async def test_a_busy_reviewer_leaves_the_head_for_the_next_event(root, harness)
     harness.service._start_review = busy
     pull_event(root, "d1")
     await harness.drain()
-    assert "eerovil/agentdeck#9@" + SHA not in harness.service.reviewed
+    assert not harness.service._spent("eerovil/agentdeck#9", SHA)
     pull_event(root, "d2", action="synchronize")
     await harness.drain()
     assert len(harness.reviews) == 2, "asked again on the next event"
 
 
 async def test_an_ask_again_that_cannot_start_now_keeps_its_place_and_note(root, harness):
-    """#3183 review: an old review chat that would not close leaves the ask pending, counted
-    against the cap, and its retry carries the agent's note into the new chat."""
+    """#3183 review: an old review chat that would not close leaves the ask pending, and its
+    retry carries the agent's note into the new chat. Only a started ask counts against the
+    cap (#3955); one still pending turns the next ask away as busy."""
     from agentdeck.chat_review import ReviewBusy
+    from agentdeck.work_router import AgainBusy
 
     pull = "eerovil/agentdeck#9"
-    harness.service.reviewed.add(f"{pull}@{OLD}")
+    harness.asked(pull, OLD)
     harness.heads[("eerovil/agentdeck", 9)] = OLD
     calls = []
 
@@ -1245,46 +1294,37 @@ async def test_an_ask_again_that_cannot_start_now_keeps_its_place_and_note(root,
 
     harness.service._start_review = busy_once
     asked = await harness.service.ask_again("eerovil/agentdeck", 9, "owner keeps it")
-    assert asked["outcome"] == "pending"
-    assert harness.service.reviewed.count(f"{pull}@{OLD}+") == 1
+    assert asked["outcome"] == "pending" and harness.agains(pull, OLD) == 0
+    with pytest.raises(AgainBusy):
+        await harness.service.ask_again("eerovil/agentdeck", 9, "again")
     harness.now += 3600
     await harness.service.retry_pending()
     assert calls[1] == {"note": "owner keeps it", "again": True}
-    assert harness.service.reviewed.count(f"{pull}@{OLD}+") == 1
+    assert harness.agains(pull, OLD) == 1
     assert not harness.service.pending.entries
 
-    # An ask whose retry is dropped (the head moved on) frees its place under the cap.
+    # An ask whose retry is dropped (the head moved on) never counts.
     calls.clear()
     await harness.service.ask_again("eerovil/agentdeck", 9, "walkthrough posted")
-    assert harness.service.reviewed.count(f"{pull}@{OLD}+") == 2
     harness.heads[("eerovil/agentdeck", 9)] = ""
     harness.now += 3600
     await harness.service.retry_pending()
-    assert harness.service.reviewed.count(f"{pull}@{OLD}+") == 1
+    assert harness.agains(pull, OLD) == 1 and not harness.service.pending.entries
 
     # #3324: kept while the running review of that head passes it, the ask is answered, not
     # reviewed: a new review re-opened a Work already waiting for its Merge.
     harness.heads[("eerovil/agentdeck", 9)] = OLD
-    passes: list[float] = []
-
-    pull_ = pull
-
-    class Release:
-        def passed_since(self, work, pull, head, since):
-            assert (work, pull, head) == ("github_issue:eerovil/agentdeck#7", pull_, OLD)
-            return any(at >= since for at in passes)
-
-    harness.service._release = Release()
     calls.clear()
     harness.service._start_review = busy_once  # busy at first again
     await harness.service.ask_again("eerovil/agentdeck", 9, "owner keeps it")
     assert len(calls) == 1 and harness.service.pending.entries
-    passes.append(harness.now + 5)
+    harness.now += 5
+    harness.answered(pull, OLD, review_history.PASS)
     harness.now += 3600
     await harness.service.retry_pending()
     assert len(calls) == 1, "no review of a head that passed since the ask"
     assert not harness.service.pending.entries
-    assert harness.service.reviewed.count(f"{pull}@{OLD}+") == 1, "its place is freed"
+    assert harness.agains(pull, OLD) == 1
 
 
 async def test_a_refused_review_leaves_the_head_for_the_next_event(root, harness):
@@ -1297,7 +1337,7 @@ async def test_a_refused_review_leaves_the_head_for_the_next_event(root, harness
     harness.service._start_review = refused
     pull_event(root, "d1")
     await harness.drain()
-    assert "eerovil/agentdeck#9@" + SHA not in harness.service.reviewed
+    assert not harness.service._spent("eerovil/agentdeck#9", SHA)
     pull_event(root, "d2", action="synchronize")
     await harness.drain()
     assert len(harness.reviews) == 2, "a start that wrote nothing is asked again"
@@ -1307,7 +1347,6 @@ async def test_a_deck_with_no_reviewer_keeps_nothing_pending_and_says_so_once(ro
     # #3849: the public copy's reviewer is off. Kept pending, the refusal was retried for a day
     # and every later ask heard "already asked, keep waiting".
     from agentdeck.review_refs import ReviewOff
-    from agentdeck.work_router import AgainRefused
 
     harness.service.reviewer_off = True
     harness.heads[("eerovil/agentdeck", 9)] = SHA
@@ -1315,7 +1354,7 @@ async def test_a_deck_with_no_reviewer_keeps_nothing_pending_and_says_so_once(ro
     pull_event(root, "d2", action="synchronize")  # the same head again
     await harness.drain()
     assert harness.reviews == [] and not harness.service.pending.entries
-    assert "eerovil/agentdeck#9@" + SHA not in harness.service.reviewed
+    assert not harness.service._spent("eerovil/agentdeck#9", SHA)
     assert [message.chat_id for message in harness.scheduled] == ["chat-a"]
     assert "no Work reviewer" in harness.scheduled[0].text
     with pytest.raises(AgainRefused, match="no Work reviewer"):
@@ -1337,7 +1376,6 @@ async def test_a_deck_with_no_reviewer_keeps_nothing_pending_and_says_so_once(ro
     )
     # Tried again since, so its next attempt is still to come: the loop alone would wait.
     harness.service.pending.put(f"review:eerovil/agentdeck#9@{SHA}+ab12", {}, harness.now)
-    harness.service.reviewed.add(f"eerovil/agentdeck#9@{SHA}+ab12?")
     restarted = Harness(root)  # read back from disk, as after the upgrade's restart
     restarted.heads[("eerovil/agentdeck", 9)] = SHA
     restarted.service.reviewer_off = True
@@ -1349,7 +1387,7 @@ async def test_a_deck_with_no_reviewer_keeps_nothing_pending_and_says_so_once(ro
     with contextlib.suppress(asyncio.CancelledError):
         await loop
     assert not restarted.service.pending.entries and restarted.reviews == []
-    assert restarted.service.reviewed.count(f"eerovil/agentdeck#9@{SHA}+") == 0, "place freed"
+    assert restarted.agains("eerovil/agentdeck#9", SHA) == 0
     assert [message.chat_id for message in restarted.scheduled] == ["chat-a"]
     assert "no Work reviewer" in restarted.scheduled[0].text
 
@@ -1402,8 +1440,297 @@ async def test_registering_a_ready_pull_request_starts_its_review(root, harness)
 
 
 OLD = "c" * 40
+MID = "b" * 40
 NEW = "a" * 40
 
+
+async def test_a_ready_head_waits_on_the_agents_pre_review(root, harness):
+    """#3880: each ready head first sends the agent its checklist; the review starts only
+    once it says it went through it, at the head current then, and only for that head."""
+    harness.service.pre_review_on = True
+    done = harness.service.pre_review_done
+    with pytest.raises(AgainRefused, match="not open and ready"):
+        await done("eerovil/agentdeck", 9)
+    harness.heads[("eerovil/agentdeck", 9)] = OLD
+    pull_event(root, "d1", sha=OLD)
+    await harness.drain()
+    assert harness.reviews == []
+    [checklist] = harness.scheduled
+    assert checklist.id == f"work-event:pre-review:eerovil/agentdeck#9@{OLD}"
+    assert "Diagrams" in checklist.text
+    assert '{"pull_request": "eerovil/agentdeck#9"}' in checklist.text
+    assert harness.service.pre_review_held("EEROVIL/agentdeck#9")
+    # The hold is in the history: after a restart a replayed ready event sends no second one.
+    first = harness.service
+    harness.service = WorkRouterService(
+        root,
+        switched=first._switched,
+        owner_of_issue=first._chat_of_issue,
+        owner_of_pull=first._chat_of_pull,
+        schedule=first._schedule,
+        start_review=first._start_review,
+        own_logins=OWN,
+        ready_head=first._ready_head,
+        exists=first._exists,
+        clock=first._clock,
+        pre_review=True,
+        review_policy="https://example.test/review-policy.md",
+        review_event=harness.note,
+        reviews=harness.reviews_of,
+    )
+    done = harness.service.pre_review_done
+    pull_event(root, "d1b", sha=OLD)
+    await harness.drain()
+    assert harness.reviews == [] and len(harness.scheduled) == 1
+    # A fix pushed while it waits sends nothing more, and a draft cannot be done.
+    harness.heads[("eerovil/agentdeck", 9)] = ""
+    with pytest.raises(AgainRefused, match="not open and ready"):
+        await done("eerovil/agentdeck", 9)
+    harness.heads[("eerovil/agentdeck", 9)] = NEW
+    pull_event(root, "d2", action="synchronize", sha=NEW)
+    await harness.drain()
+    assert harness.reviews == [] and len(harness.scheduled) == 1
+    # #3896: turned back to draft, pushed and marked ready again while the older head's
+    # checklist went unanswered: the new head gets its own, once.
+    harness.heads[("eerovil/agentdeck", 9)] = ""
+    pull_event(root, "d2a", action="synchronize", draft=True, sha=MID)
+    await harness.drain()
+    assert len(harness.scheduled) == 1, "a push while draft sends nothing"
+    harness.heads[("eerovil/agentdeck", 9)] = MID
+    # Pushed and marked ready at once, GitHub's ready event still names the old head, and the
+    # push after it is a plain push: the live head decides (seen live on #3898).
+    pull_event(root, "d2b", sha=OLD)
+    pull_event(root, "d2c", action="synchronize", sha=MID)
+    pull_event(root, "d2d", sha=OLD)  # its replay
+    await harness.drain()
+    assert harness.reviews == [] and len(harness.scheduled) == 2
+    assert harness.scheduled[-1].id == f"work-event:pre-review:eerovil/agentdeck#9@{MID}"
+    # Its ready event missed, registering the pull request again sends the new head's too.
+    harness.heads[("eerovil/agentdeck", 9)] = NEW
+    assert await harness.service.check_registered("eerovil/agentdeck", 9)
+    assert harness.reviews == [] and len(harness.scheduled) == 3
+    assert harness.scheduled[-1].id == f"work-event:pre-review:eerovil/agentdeck#9@{NEW}"
+    # #3893, #3896: with no checklist waiting (a reload cut a call off, or a ready event was
+    # never acted on), the ready head nobody asked about is still asked about.
+    harness.note("eerovil/agentdeck#9", NEW, review_history.CHECKLIST_DONE, "cut-off")
+    assert (await done("EEROVIL/agentdeck", 9))["outcome"] == "asked"
+    assert harness.service._spent("eerovil/agentdeck#9", NEW)
+    with pytest.raises(AgainRefused, match="no pre-review checklist waits"):
+        await done("eerovil/agentdeck", 9)
+    assert not harness.service.pre_review_held("eerovil/agentdeck#9")
+    assert len(harness.reviews) == 1
+    # A replayed ready event of the reviewed head asks nothing; the next fix's head does.
+    pull_event(root, "d3", action="ready_for_review", sha=NEW)
+    await harness.drain()
+    harness.heads[("eerovil/agentdeck", 9)] = SHA
+    pull_event(root, "d4", sha=SHA)
+    await harness.drain()
+    assert len(harness.reviews) == 1
+    assert harness.scheduled[-1].id == f"work-event:pre-review:eerovil/agentdeck#9@{SHA}"
+    assert "full rules: https://example.test/review-policy.md" in harness.scheduled[-1].text
+    assert "full rules" not in checklist.text, "no policy configured, no link"
+    # #3933: the agent's own review request asked first, so pre-review-done is refused; the
+    # checklist is done with, not left waiting on the Work page for good.
+    assert harness.service.pre_review_held("eerovil/agentdeck#9")
+    harness.asked("eerovil/agentdeck#9", SHA)
+    with pytest.raises(AgainRefused, match="no pre-review checklist waits"):
+        await done("eerovil/agentdeck", 9)
+    assert not harness.service.pre_review_held("eerovil/agentdeck#9")
+    # A review asked for again skips it, and clears a checklist still waiting.
+    harness.note("eerovil/agentdeck#9", SHA, review_history.CHECKLIST, "sent-again")
+    assert harness.service.pre_review_held("eerovil/agentdeck#9")
+    assert (await harness.service.ask_again("eerovil/agentdeck", 9, "walkthrough posted"))["again"]
+    assert len(harness.reviews) == 2
+    assert not harness.service.pre_review_held("eerovil/agentdeck#9")
+    # #3896: a ready head no checklist was ever sent for is asked about when the agent says so.
+    harness.pulls[("eerovil/agentdeck", 10)] = ("chat-a", "eerovil/agentdeck#7")
+    harness.heads[("eerovil/agentdeck", 10)] = OLD
+    assert (await done("eerovil/agentdeck", 10))["outcome"] == "asked"
+    assert harness.reviews[-1] == ("eerovil/agentdeck#10", "eerovil/agentdeck#7")
+    # Each step is in its head's history, the router's only record of it (#3955).
+    noted = [(event.head, event.kind, event.data) for event in harness.history]
+    keys = [event.key for event in harness.history]
+    kinds = [(head, kind) for head, kind, _data in noted]
+    assert (NEW, "checklist", {"covered": True}) in noted, "a push while it waits"
+    # (a replay writes the same key again, which the table absorbs)
+    sent = [head for head, kind, data in noted if kind == "checklist" and not data]
+    assert list(dict.fromkeys(sent)) == [OLD, MID, NEW, SHA]
+    done_at = keys.index(f"checklist-done:eerovil/agentdeck#9@{NEW}")
+    assert kinds[done_at + 1] == (NEW, "asked") and noted[done_at + 1][2]["again"] == ""
+    # An ask is keyed by its head and ask-again id alone: its retry or replay is the same row.
+    assert f"asked:eerovil/agentdeck#9@{NEW}+" in keys
+    again = [data for head, kind, data in noted if (head, kind) == (SHA, "asked")]
+    assert again[-1]["note"] == "walkthrough posted" and again[-1]["again"]
+
+
+async def test_a_ready_head_nobody_started_is_caught_by_the_backstop(root, harness):
+    """#3903: a ready head with no checklist, review or verdict past the grace gets its
+    checklist with no event; one read per such pull request, none for drafts or moving heads;
+    a restart in between only restarts the grace; one still not moving shows stuck."""
+    reads: list[tuple[str, int]] = []
+    cached: dict[tuple[str, int], str] = {}
+    busy = [False]
+
+    def stuck(head: str) -> bool:
+        events = review_history.at_head(harness.reviews_of("eerovil/agentdeck#9"), head)
+        return review_history.head_review(events).unstarted
+
+    async def ready_head(repository: str, number: int) -> str:
+        reads.append((repository, number))
+        return harness.heads.get((repository, number), "")
+
+    def fresh() -> WorkRouterService:
+        harness.service = WorkRouterService(
+            root,
+            switched=lambda repository: repository.lower() in harness.switched,
+            owner_of_issue=lambda repository, number: harness.issues.get((repository, number)),
+            owner_of_pull=lambda repository, number: harness.pulls.get((repository, number)),
+            schedule=harness.service._schedule,
+            start_review=harness.service._start_review,
+            own_logins=OWN,
+            ready_head=ready_head,
+            exists=harness.service._exists,
+            clock=lambda: harness.now,
+            pre_review=True,
+            ready_pulls=lambda: [(*ref, head) for ref, head in cached.items()],
+            busy=lambda work_id: busy[0],
+            review_event=harness.note,
+            reviews=harness.reviews_of,
+        )
+        return harness.service
+
+    service = fresh()
+    pull = "eerovil/agentdeck#9"
+    # Marked ready at OLD and its ready event dropped: only the cached row says so. #10 is a
+    # draft (no cached ready row) and #11 is no Work's.
+    harness.heads[("eerovil/agentdeck", 9)] = OLD
+    cached[("EEROVIL/agentdeck", 9)] = OLD.upper()
+    cached[("eerovil/agentdeck", 11)] = NEW
+    harness.heads[("eerovil/agentdeck", 11)] = NEW
+    # Two at once, the second in a project just added: switched is all it takes, with no
+    # setting of its own. Its ready event was dropped too.
+    harness.switched.add("eerovil/fresh")
+    harness.pulls[("eerovil/fresh", 10)] = ("chat-b", "eerovil/fresh#1")
+    cached[("eerovil/fresh", 10)] = MID
+    harness.heads[("eerovil/fresh", 10)] = MID
+    assert await service.sweep_ready() == harness.now + 300
+    harness.now += 299
+    assert await service.sweep_ready() == 1300.0
+    assert reads == [] and harness.scheduled == []
+    # A restart in between restarts the grace; nothing is lost.
+    service = fresh()
+    harness.now += 1
+    assert await service.sweep_ready() == harness.now + 300
+    harness.now += 300
+    assert await service.sweep_ready() is None
+    assert sorted(reads) == [("eerovil/agentdeck", 9), ("eerovil/fresh", 10)]
+    assert sorted(item.id for item in harness.scheduled) == [
+        f"work-event:pre-review:{pull}@{OLD}",
+        f"work-event:pre-review:eerovil/fresh#10@{MID}",
+    ]
+    await service.sweep_ready()
+    assert len(reads) == 2, "a head whose checklist waits costs no read"
+    # The late ready event, after the backstop acted, sends nothing more.
+    pull_event(root, "late", sha=OLD)
+    await harness.drain()
+    assert len(harness.scheduled) == 2 and harness.reviews == []
+    # #3904 review: OLD's checklist still waits and a new head is ready, its event dropped.
+    # While the agent is mid-turn it is working through that checklist: nothing, no read.
+    # Once its chat is idle, the new head gets its own checklist.
+    other = "d" * 40
+    harness.heads[("eerovil/agentdeck", 9)] = other
+    cached[("EEROVIL/agentdeck", 9)] = other
+    busy[0] = True
+    assert await service.sweep_ready() == harness.now + 300
+    harness.now += 300
+    await service.sweep_ready()
+    assert len(reads) == 3 and len(harness.scheduled) == 2  # (+1: the late event's own read)
+    busy[0] = False
+    await service.sweep_ready()
+    harness.now += 300
+    await service.sweep_ready()
+    assert harness.scheduled[-1].id == f"work-event:pre-review:{pull}@{other}"
+    assert service.pre_review_held(pull) and len(reads) == 4
+    # #3933: the agent's own review request asked for that head: its ask ends the checklist,
+    # after a restart too, with no read.
+    harness.asked(pull, other)
+    service = fresh()
+    assert not service.pre_review_held(pull)
+    await service.sweep_ready()
+    assert len(reads) == 4
+    # The agent went through it and the review was asked; it pushed MID and marked it ready,
+    # and the ready event named OLD (#3899's shape) and was not acted on: the cached row says
+    # MID, and nothing moves it.
+    harness.asked(pull, OLD)
+    harness.heads[("eerovil/agentdeck", 9)] = MID
+    cached[("EEROVIL/agentdeck", 9)] = MID
+    await service.sweep_ready()
+    harness.now += 300
+    await service.sweep_ready()
+    # (the late ready event read its live head itself: #3899)
+    assert reads[-1] == ("eerovil/agentdeck", 9) and len(reads) == 5
+    assert harness.scheduled[-1].id == f"work-event:pre-review:{pull}@{MID}"
+    assert harness.reviews == []
+    # A head nothing could start, even the backstop (the next cause nobody has seen yet):
+    # stuck in its history, which the cards read (#3956); once it moves, no longer.
+    harness.note(pull, MID, review_history.CHECKLIST_DONE, "done-mid")
+    harness.heads[("eerovil/agentdeck", 9)] = NEW
+    cached[("EEROVIL/agentdeck", 9)] = NEW
+
+    async def broken(*args, **kwargs):
+        raise RuntimeError("an unseen cause")
+
+    service._review = broken
+    await service.sweep_ready()
+    harness.now += 300
+    await service.sweep_ready()
+    assert stuck(NEW) and not stuck(MID)
+    reads_before = len(reads)
+    await service.sweep_ready()
+    assert len(reads) == reads_before, "a stuck head is not read again"
+    harness.asked(pull, NEW)
+    await service.sweep_ready()
+    assert not stuck(NEW)
+    # A deck with no reviewer reads nothing.
+    harness.now += 1000
+    cached[("EEROVIL/agentdeck", 9)] = SHA
+    service.reviewer_off = True
+    await service.sweep_ready()
+    harness.now += 300
+    assert await service.sweep_ready() is None and len(reads) == reads_before
+
+
+async def test_a_refreshed_cache_row_wakes_the_backstop_with_no_delivery(
+    root, harness, monkeypatch
+):
+    """#3903 review: a dropped ready event leaves the cached row a draft; the refresh that
+    rewrites it wakes the backstop, and the grace's own deadline does the rest."""
+    from agentdeck import work_router
+
+    monkeypatch.setattr(work_router, "SWEEP_GAP_S", 0.0)
+    monkeypatch.setattr(work_router, "READY_GRACE_S", 0.0)
+    cached: dict[tuple[str, int], str] = {}
+    service = harness.service
+    service._ready_pulls = lambda: [(*ref, head) for ref, head in cached.items()]
+    service.pre_review_on = True
+    loop = asyncio.create_task(service._sweep_loop())
+    try:
+        await asyncio.sleep(0.01)
+        assert harness.scheduled == []  # the row says draft: nothing to look at
+        harness.heads[("eerovil/agentdeck", 9)] = OLD
+        cached[("eerovil/agentdeck", 9)] = OLD
+        service.wake_sweep()  # what ``IssueResolver.refresh_pull_rows`` calls
+        for _ in range(50):
+            await asyncio.sleep(0.01)
+            if harness.scheduled:
+                break
+        assert [item.id for item in harness.scheduled] == [
+            f"work-event:pre-review:eerovil/agentdeck#9@{OLD}"
+        ]
+    finally:
+        loop.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await loop
 
 async def test_ready_then_push_reviews_the_new_head(root, harness):
     """#2941's order: ready at an already-reviewed head, then a push whose payload says draft.
@@ -1411,7 +1738,7 @@ async def test_ready_then_push_reviews_the_new_head(root, harness):
     Marked ready at a reviewed head no longer asks for its review again (#3344): the chat is
     told to ask with a note instead, and the push still gets its own review.
     """
-    harness.service.reviewed.add(f"eerovil/agentdeck#9@{OLD}")
+    harness.asked("eerovil/agentdeck#9", OLD)
     harness.heads[("eerovil/agentdeck", 9)] = OLD  # the push has not landed yet
     pull_event(root, "d1", action="ready_for_review", sha=OLD)
     await harness.drain()
@@ -1422,7 +1749,7 @@ async def test_ready_then_push_reviews_the_new_head(root, harness):
     await harness.drain()
     assert harness.reviews == [("eerovil/agentdeck#9", "eerovil/agentdeck#7")]
     assert harness.asks == [{}]
-    assert f"eerovil/agentdeck#9@{NEW}" in harness.service.reviewed
+    assert harness.service._spent("eerovil/agentdeck#9", NEW)
 
 
 async def test_a_head_that_only_merged_its_base_is_not_reviewed_again(root, harness):
@@ -1451,18 +1778,19 @@ async def test_a_head_that_only_merged_its_base_is_not_reviewed_again(root, harn
     pull_event(root, "d1b", action="synchronize", sha=synced)
     await harness.drain()
     assert harness.asks == [{}, {}] and compared == [] and not harness.scheduled
-    harness.service.reviewed.note_verdict(pull, synced[:12])  # the release took a verdict
+    harness.answered(pull, synced)  # the release took a verdict
     pull_event(root, "d2", action="synchronize", sha=NEW)
     await harness.drain()
     assert len(harness.asks) == 2 and compared == [(synced, NEW)]
     [told] = harness.scheduled
     assert told.id == f"work-unchanged:{pull}@{NEW}" and "verdict on that diff stands" in told.text
     assert harness.verdicts == [("chat-a", [pull])]
-    # The release credits the old head's verdict to the new one, across a restart, short shas
-    # too; never the other way round.
-    reread = ReviewedHeads(harness.service.reviewed.path)
-    assert reread.same_change(pull, NEW, synced[:12])
-    assert not reread.same_change(pull, synced, NEW) and reread.answered(pull, NEW)
+    # The new head's history has the old head's verdict, carried; the release credits the old
+    # head's verdict to the new one, short shas too, never the other way round.
+    assert harness.kinds(pull, NEW) == ["changes"]
+    events = harness.reviews_of(pull)
+    assert review_history.same_change(events, NEW, synced[:12])
+    assert not review_history.same_change(events, synced, NEW)
     # A person settled a finding: the agent's ask reviews the head after all.
     harness.heads[("eerovil/agentdeck", 9)] = NEW
     await harness.service.ask_again("eerovil/agentdeck", 9, "owner accepts the gap")
@@ -1471,7 +1799,8 @@ async def test_a_head_that_only_merged_its_base_is_not_reviewed_again(root, harn
     pull_event(root, "d4", action="synchronize", sha=moved)  # same digest, files touched
     pull_event(root, "d5", action="synchronize", sha="f" * 40)  # its digest unread
     await harness.drain()
-    assert len(harness.asks) == 6 and not reread.same_change(pull, moved, third)
+    events = harness.reviews_of(pull)
+    assert len(harness.asks) == 6 and not review_history.same_change(events, moved, third)
 
     # A review event deferred by a busy reviewer is still skipped when its retry runs.
     async def busy(pull, work, **asks):
@@ -1479,8 +1808,8 @@ async def test_a_head_that_only_merged_its_base_is_not_reviewed_again(root, harn
 
     harness.service._start_review = busy
     digests["1" * 40] = digests["2" * 40] = "f" * 64
-    harness.service.reviewed.note_digest(pull, "1" * 40, "f" * 64)
-    harness.service.reviewed.note_verdict(pull, "1" * 40)
+    harness.asked(pull, "1" * 40, digest="f" * 64)
+    harness.answered(pull, "1" * 40)
     pull_event(root, "d6", action="synchronize", sha="2" * 40)
     harness.service._base_only = lambda *args: asyncio.sleep(0, result=False)
     await harness.drain()
@@ -1491,6 +1820,23 @@ async def test_a_head_that_only_merged_its_base_is_not_reviewed_again(root, harn
     await harness.service.retry_pending()
     assert not harness.service.pending.entries
     assert harness.scheduled[-1].id == f"work-unchanged:{pull}@{'2' * 40}"
+
+    # A pass, then a review asked for again, then a base merge before its verdict (#3972
+    # review): that pass does not stand, so nothing is carried and the new head is reviewed.
+    started = []
+
+    async def start(pull, work, **asks):
+        started.append(asks)
+
+    harness.service._start_review = start
+    passed, merged = "3" * 40, "4" * 40
+    digests[passed] = digests[merged] = "c" * 64
+    harness.asked(pull, passed, digest="c" * 64)
+    harness.answered(pull, passed, review_history.PASS)
+    harness.asked(pull, passed, again="x", digest="")
+    pull_event(root, "d7", action="synchronize", sha=merged)
+    await harness.drain()
+    assert started == [{}] and harness.kinds(pull, merged) == ["asked"]
 
 
 async def test_fixing_a_no_code_review_starts_no_new_review(root, harness, monkeypatch):
@@ -1513,16 +1859,14 @@ async def test_fixing_a_no_code_review_starts_no_new_review(root, harness, monke
         async def no_code_fixed(self, work, ref, head):
             fixed.append((work, ref, head))
             self.held = None
+            harness.answered(ref, head, review_history.PASS)
             return f"review pass recorded for {ref} at {head[:12]}"
-
-        def passed_since(self, work, ref, head, since):
-            return any(item[1:] == (ref, head) for item in fixed)
 
     harness.service._release = Release()
     harness.service._no_code = lambda repo, n, old, new, before: asyncio.sleep(
         0, result=new == NEW and before == frozenset({"src/a.py"})
     )
-    harness.service.reviewed.add(f"{pull}@{OLD}")
+    harness.asked(pull, OLD)
     harness.heads[("eerovil/agentdeck", 9)] = OLD
     pull_event(root, "d1", action="synchronize", sha=OLD)  # a push is not "fixed"
     pull_event(root, "d2", action="ready_for_review", sha=OLD)
@@ -1538,7 +1882,7 @@ async def test_fixing_a_no_code_review_starts_no_new_review(root, harness, monke
     pull_event(root, "d3", action="synchronize", sha=NEW)
     await harness.drain()
     assert harness.asks == [] and fixed[-1][2] == NEW
-    assert f"{pull}@{NEW}" in harness.service.reviewed
+    assert harness.service._spent(pull, NEW)
     pull_event(root, "d4", action="synchronize", sha=third)
     await harness.drain()
     assert harness.asks == [{}] and len(fixed) == 2
@@ -1624,8 +1968,18 @@ async def test_an_owner_accepting_findings_passes_the_reviewed_head_with_no_revi
     with pytest.raises(AgainRefused, match="nothing at it to accept"):
         await harness.service.accept("eerovil/agentdeck", 9, "accept as is")
     assert accepted == []
-    comment(root, "d5", body=f"Review loop escalated to the operator\n\nAt `{NEW[:12]}`: X?")
+    # Dated by the comment, not its late delivery: an ask made after it still stands (#3972
+    # review); told, as its message was stored.
+    harness.now = datetime(2026, 11, 1, 12, tzinfo=UTC).timestamp()
+    harness.asked(pull, NEW, again="later")
+    body = f"Review loop escalated to the operator\n\nAt `{NEW[:12]}`: X?"
+    comment(root, "d5", body=body, created_at="2026-11-01T11:00:00Z")
+    harness.now += 600
     await harness.drain()
+    answer_row = review_history.head_review(review_history.at_head(harness.reviews_of(pull), NEW))
+    assert answer_row.verdict == "escalated" and answer_row.findings_told
+    assert answer_row.verdict_at == datetime(2026, 11, 1, 11, tzinfo=UTC).timestamp()
+    assert answer_row.review_since == harness.now - 600, "the newer ask still waits"
     answer = await harness.service.accept("EerOvil/AgentDeck", 9, "accept as is")
     assert answer == {
         "pull_request": pull,
@@ -1655,7 +2009,7 @@ async def test_a_reviewed_head_is_reviewed_again_on_request_at_most_twice(root, 
     pull_event(root, "d0b", action="synchronize", sha=OLD)
     await harness.drain()
     assert harness.asks == [{}]
-    assert f"{pull}@{OLD}" in harness.service.reviewed
+    assert harness.service._spent(pull, OLD)
     harness.asks.clear()
     harness.reviews.clear()
     asked = await harness.service.ask_again("eerovil/agentdeck", 9, "owner keeps it")
@@ -1687,10 +2041,8 @@ async def test_a_reviewed_head_is_reviewed_again_on_request_at_most_twice(root, 
         await harness.service.ask_again("eerovil/agentdeck", 9, "once more")
     assert len(harness.reviews) == 4
 
-    # The cap is one locked step on the shared file: a second worker's view of the same
-    # file cannot take a place the first already filled (#3183 review).
-    other = ReviewedHeads(harness.service.reviewed.path)
-    assert not other.reserve(f"{pull}@{OLD}+", 2, f"{pull}@{OLD}+x?")
+    # The caps count the head's asks in its history (#3955): each kind has two.
+    assert harness.agains(pull, OLD) == 4
 
     harness.service._in_flight.add(f"{pull}@{NEW}")
     harness.heads[("eerovil/agentdeck", 9)] = NEW
@@ -1715,7 +2067,7 @@ async def test_a_ready_press_at_a_head_under_review_says_where_its_review_is(roo
     waits: list[tuple[str, str, bool]] = []
     harness.service._review_chat = lambda ref, head: (chat, rows[head]) if head in rows else None
     harness.service._wait_review = lambda chat_id, ref, asked: waits.append((chat_id, ref, asked))
-    harness.service.reviewed.add(f"{pull}@{OLD}")
+    harness.asked(pull, OLD)
     harness.heads[("eerovil/agentdeck", 9)] = OLD
 
     def stamp(ago: float) -> str:
@@ -1750,7 +2102,7 @@ async def test_a_ready_press_at_a_head_under_review_says_where_its_review_is(roo
     await press("r6")  # past the cap, a person decides
     assert len(harness.asks) == 2 and "after a review with no verdict" in harness.scheduled[-1].text
     # A verdict with findings: fix them, nothing is asked and nothing waits.
-    harness.service.reviewed.note_verdict(pull, OLD[:12])
+    harness.answered(pull, OLD)
     count = len(waits)
     await press("r7")
     assert "has findings: fix them" in harness.scheduled[-1].text
@@ -1758,12 +2110,12 @@ async def test_a_ready_press_at_a_head_under_review_says_where_its_review_is(roo
 
 
 async def test_a_ready_event_at_a_reviewed_head_reviews_the_live_head(root, harness):
-    harness.service.reviewed.add(f"eerovil/agentdeck#9@{OLD}")
+    harness.asked("eerovil/agentdeck#9", OLD)
     harness.heads[("eerovil/agentdeck", 9)] = NEW  # the push landed before the read
     pull_event(root, "d1", action="ready_for_review", sha=OLD)
     await harness.drain()
     assert harness.reviews == [("eerovil/agentdeck#9", "eerovil/agentdeck#7")]
-    assert f"eerovil/agentdeck#9@{NEW}" in harness.service.reviewed
+    assert harness.service._spent("eerovil/agentdeck#9", NEW)
 
 
 async def test_a_push_to_a_real_draft_starts_nothing(root, harness):
@@ -1914,11 +2266,11 @@ async def test_a_new_head_while_the_old_heads_chat_is_held_is_asked_again(root, 
     harness.service._start_review = held
     pull_event(root, "d1", action="synchronize")
     await harness.drain()
-    assert "eerovil/agentdeck#9@" + SHA not in harness.service.reviewed
+    assert not harness.service._spent("eerovil/agentdeck#9", SHA)
     pull_event(root, "d2", action="synchronize")  # the next event, once the chat is let go
     await harness.drain()
     assert len(harness.reviews) == 2
-    assert "eerovil/agentdeck#9@" + SHA in harness.service.reviewed
+    assert harness.service._spent("eerovil/agentdeck#9", SHA)
 
 
 def test_covers_reads_the_chats_own_commits():
@@ -1980,7 +2332,7 @@ async def test_one_synchronize_while_the_old_chat_is_held_is_reviewed_later(root
     harness.now += 61
     await harness.service.retry_pending()
     assert len(harness.reviews) == 2
-    assert "eerovil/agentdeck#9@" + SHA in harness.service.reviewed
+    assert harness.service._spent("eerovil/agentdeck#9", SHA)
     assert not harness.service.pending.entries
 
 

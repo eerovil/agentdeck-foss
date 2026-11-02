@@ -98,6 +98,11 @@ CI_TESTS_TEXT = (
     "what they fail."
 )
 REVIEW_ONLY_TEXT = "In {repos}, the review alone proves a pull request: there is no test run."
+#: A verification-job repository whose own CI runs the rest of its suite (#3919).
+CHECKS_REQUIRED_TEXT = (
+    "In {repos}, a pull request needs both a green verification job and its own GitHub "
+    "checks green on the same head: the deck merges only once both are."
+)
 
 #: Where the Work's agent commits its screenshots (#3098): the project's evidence repository,
 #: in the folder the Poller's workers used (``<repo>/issue-<number>``), so one evidence
@@ -253,6 +258,7 @@ def _merge_text(app: Any, repository: str) -> str:
     for repos, template in (
         (getattr(policy, "github_checks", ()), CI_TESTS_TEXT),
         (getattr(policy, "review_only", ()), REVIEW_ONLY_TEXT),
+        (getattr(policy, "checks_required", ()), CHECKS_REQUIRED_TEXT),
     ):
         if repos:
             texts.append(template.format(repos=", ".join(f"`{repo}`" for repo in sorted(repos))))
@@ -266,7 +272,16 @@ def _merge_text(app: Any, repository: str) -> str:
 # overrule instead. The one deliberate exception is disagreement (#3234): on #3228 the owner
 # asked to be grilled on their own choices, and arguing against them caught five real problems,
 # so a worker that doubts a choice now challenges it unasked, with no cap, while the spec is open.
+# A loose idea is the other exception (#3887): deciding everything at once turned it into a
+# pick-one choice before its owner had thought it through, so it is talked through first.
 SPEC_ONLY_QUESTION_RULE = (
+    "First judge the request. If it is a loose idea (a wish or a problem, with no concrete "
+    "change named), talk it through in this chat before any spec (#3887): say the idea back "
+    "in your own words, offer a few angles to react to, not doing it included, one line "
+    "each, and end your reply with one or two open questions as its last paragraph, not in "
+    "the question box. Follow the person's lead turn by turn, and write the spec when they "
+    "say so, or agree when you say the direction looks settled; mark what they said or "
+    "agreed `(chosen)`. "
     "The person reviewing this spec reads every decision in it before anything is built, so a "
     "question only adds a round trip. Decide everything you can, and list each choice as a "
     "numbered **Decisions** item (D1, D2, …) right after the summary, one line each with its "

@@ -1,9 +1,9 @@
-// The deck chat's jump to another chat (#3816, `chat_jump.py`).
+// A chat's jump to another chat (#3816, #3857, `chat_jump.py`).
 //
-// Only a page showing the deck chat receives one, as a `chat_jump` event in the chat's
-// hidden slot, and opens that chat in place as a click on its card would, so voice mode
-// carries on there (#3548). With voice mode on, it waits until the deck chat's reply has
-// been read (`AgentDeckVoiceJump` in voice_mode.js). The way back, said in that chat,
+// Only a page showing the chat that asked receives one, as a `chat_jump` event in the
+// chat's hidden slot, and opens that chat in place as a click on its card would, so voice
+// mode carries on there (#3548). With voice mode on, it waits until the asking chat's
+// reply has been read (`AgentDeckVoiceJump` in voice_mode.js). The way back, said in that chat,
 // is voice mode's own: the fast agent spots it and calls `AgentDeckChatJump.go`.
 (function () {
   'use strict';

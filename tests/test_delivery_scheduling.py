@@ -138,7 +138,7 @@ def test_a_new_card_skips_an_account_whose_five_hour_window_is_nearly_full(tmp_p
     assert opted.account == ALT
     # The leader need not be the full one: an opted-out main ahead of a full alt (review, #3582).
     third = "claude_code:third"
-    level = [(name, 95.0, timedelta(hours=100)) for name in (MAIN, ALT, third)]
+    level = [(name, 85.0, timedelta(hours=160)) for name in (MAIN, ALT, third)]
     three = _place(
         tmp_path / "three",
         weekly=level,
@@ -148,6 +148,26 @@ def test_a_new_card_skips_an_account_whose_five_hour_window_is_nearly_full(tmp_p
     )
     assert three.account == third
     assert any("opted out" in note for note in three.notes)
+
+
+def test_a_new_card_skips_an_account_whose_week_is_nearly_spent(tmp_path):
+    """#3977: alt at 91% of its week, resetting in 29 hours, was 4 points short of its target,
+    so the expiring-budget rule put it ahead of main at 60% with 64 hours to go."""
+    weekly = [(MAIN, 60.0, timedelta(hours=64)), (ALT, 91.0, timedelta(hours=29))]
+    placement = _place(tmp_path / "issue", weekly=weekly, accounts=(ALT, MAIN))
+    assert placement.account == MAIN
+    assert any("seven-day window is 91% full" in note for note in placement.notes)
+    assert _place(tmp_path / "order", weekly=weekly).account == MAIN
+    # A week that already reset has refilled, so it no longer counts as nearly spent.
+    reset = [(MAIN, 60.0, timedelta(hours=64)), (ALT, 91.0, -timedelta(hours=1))]
+    assert _place(tmp_path / "reset", weekly=reset, accounts=(ALT, MAIN)).account == ALT
+
+    # With real room left the sooner reset still leads.
+    roomy = [(MAIN, 60.0, timedelta(hours=64)), (ALT, 80.0, timedelta(hours=29))]
+    assert _place(tmp_path / "roomy", weekly=roomy).account == ALT
+    # When both are nearly spent, the order and the expiring rule stand.
+    both = [(MAIN, 92.0, timedelta(hours=64)), (ALT, 91.0, timedelta(hours=29))]
+    assert _place(tmp_path / "both", weekly=both).account == ALT
 
 
 def test_equal_paces_keep_the_operators_order(tmp_path):

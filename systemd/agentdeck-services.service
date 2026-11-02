@@ -1,0 +1,35 @@
+# The deck's Work services (#4016): the Work router, the merge release and the
+# missed-start backstop, out of the web process so a slow walk over every pull
+# request delays a merge, never a page. The web reaches it over its own socket,
+# %t/agentdeck-services/services.sock: never the runtime's %t/agentdeck folder,
+# which systemd empties on every runtime restart. Nothing that must outlive a
+# restart lives in RuntimeDirectory: its caller key and the consumers' offsets stay
+# under ~/.local/share/agentdeck.
+#
+# The deploy restarts it (stop, then start) right after the web reload when a
+# file it loads moved (scripts/runtime_paths.py --services). It owns no agent
+# process, so it waits for no idle chat. With `[services] in_web = true` in the
+# config (the switch back, #4017, and the default until the cutover sets it off)
+# it stands down at start and the web runs them.
+#
+# Install: ln -s ~/agentdeck/systemd/agentdeck-services.service ~/.config/systemd/user/
+#          systemctl --user daemon-reload && systemctl --user enable --now agentdeck-services
+[Unit]
+Description=agentdeck Work services (router, merge release, backstop)
+After=network-online.target agentdeck-codex.service
+
+[Service]
+WorkingDirectory=%h/agentdeck
+ExecStart=%h/agentdeck/.venv/bin/agentdeck services
+Restart=on-failure
+RestartSec=5
+Environment=AGENTDECK_CONFIG=%h/.config/agentdeck/config.toml
+# Optional centralized error reporting (#1514); its reports are tagged `services`,
+# so this process's own freezes are counted apart from the web's (#3999).
+#Environment=AGENTDECK_SENTRY_DSN=
+RuntimeDirectory=agentdeck-services
+RuntimeDirectoryMode=0700
+KillMode=control-group
+
+[Install]
+WantedBy=default.target

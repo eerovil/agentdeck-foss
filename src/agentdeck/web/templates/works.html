@@ -7,7 +7,7 @@
    however much history there is; each row opens the Work's own page. #}
 {#- The default list and the Hidden list stream their rows (#3228); the archive is a paged
     search with no stream, so there the top bar's live icons keep their own small one (#2864, #3239). #}
-{% block body_sse %}{% if view == "hidden" %}sse-connect="/events?view=works-hidden"{% elif view != "archived" %}sse-connect="/events?{{ {'view': 'works-index', 'repo': repo} | urlencode }}"{% endif %}{% endblock %}
+{% block body_sse %}{% if view == "hidden" %}sse-connect="/events?view=works-hidden"{% elif view != "archived" %}sse-connect="/events?{{ {'view': 'works-index', 'repo': repo} | urlencode }}{% if project %}&amp;{{ {'project': project} | urlencode }}{% endif %}"{% endif %}{% endblock %}
 {% block topbar_sse %}{% if view == "archived" %} sse-connect="/events/topbar"{% endif %}{% endblock %}
 {% block topbar_nav %}<a class="back" href="{{ '/works' if view == 'archived' else '/' }}" aria-label="{{ 'back to the Works' if view == 'archived' else 'back to the dashboard' }}">←</a>{% endblock %}
 
@@ -68,12 +68,13 @@
   <div class="works-head">
     <h1 class="wd-title">Works</h1>
     {#- The project filter (#2467): folded shut beside the heading so the list starts where it
-        did; its summary names the chosen repository, so a filtered list says so while shut. #}
-    {%- if repositories | length > 1 or repo %}
+        did; its summary names the chosen repository, so a filtered list says so while shut.
+        The front page's All Works link brings its project tab as `project` (#3873). #}
+    {%- if repositories | length > 1 or repo or project %}
     <details class="works-projects">
-      <summary class="toggle-btn filter-chip{% if repo %} on{% endif %}" data-works-project-summary>{{ repo or "All projects" }}</summary>
+      <summary class="toggle-btn filter-chip{% if repo or project %} on{% endif %}" data-works-project-summary>{{ repo or project or "All projects" }}</summary>
       <nav class="filter-row" aria-label="Filter the Works by project">
-        <a class="toggle-btn filter-chip{% if not repo %} on{% endif %}" href="/works"{% if not repo %} aria-current="page"{% endif %}>All</a>
+        <a class="toggle-btn filter-chip{% if not repo and not project %} on{% endif %}" href="/works"{% if not repo and not project %} aria-current="page"{% endif %}>All</a>
         {%- for name in repositories %}
         <a class="toggle-btn filter-chip{% if name == repo %} on{% endif %}" href="/works?{{ {'repo': name} | urlencode }}" data-works-project="{{ name }}"{% if name == repo %} aria-current="page"{% endif %}>{{ name }}</a>
         {%- endfor %}

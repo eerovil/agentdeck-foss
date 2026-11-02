@@ -734,6 +734,14 @@ class ClaudeCodeProvider(SessionProvider):
             return None
         return _pending_from_dict(workers.pending_interaction(session_id))
 
+    def _asks_by_tool(self, scan_read: _RootScanRead | None, path: Path | None) -> bool:
+        """The transcript's newest event is an unanswered question tool call (#1878, #3923)."""
+        if scan_read is not None:
+            last_ev = scan_read.last_event
+        else:
+            last_ev = self._cached_last_event(path) if path is not None else None
+        return bool(last_ev is not None and last_ev.question)
+
     def _runtime_changed(self, account: Account, state) -> None:
         sessions = state.sessions_for_account(account.key)
         # sweep_liveness applies the refresh and publishes once through AppState
@@ -819,9 +827,11 @@ class ClaudeCodeProvider(SessionProvider):
             # waiting on the person just the same: without a prompt tool the
             # turn stays open and only the transcript shows the ask, so keying
             # on the routed interaction alone left the chat reading as working
-            # with no label at all (#1878).
+            # with no label at all (#1878). Only the tool call counts: a question
+            # mark in the running turn's text is the agent thinking aloud, and the
+            # turn ending on it is what makes it a question for the person (#3923).
             actionable_interaction=(
-                (turn_held or bool(session.question))
+                (turn_held or self._asks_by_tool(scan_read, transcript_path))
                 and not native_background_active
             ),
             stalled_evidence=stalled,

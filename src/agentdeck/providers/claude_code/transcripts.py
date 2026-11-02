@@ -16,7 +16,6 @@ import html
 import json
 import logging
 import re
-from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from typing import NamedTuple
@@ -184,6 +183,26 @@ def _text_from_content(content: object) -> _Content:
         answer=answer,
         image_media_types=image_media_types,
     )
+
+
+def _text_parts(content: object) -> tuple[str, ...]:
+    """Each text part of a user message that carries several, stripped (#3931).
+
+    Messages that queue up behind a busy turn come out of the CLI's queue
+    together and are written as one line, a text part per message. Empty for a
+    line with one part, and for a tool result, which is never a sent message.
+    """
+    if not isinstance(content, list) or _looks_like_tool_result(content):
+        return ()
+    parts = tuple(
+        block["text"].strip()
+        for block in content
+        if isinstance(block, dict)
+        and block.get("type") == "text"
+        and isinstance(block.get("text"), str)
+        and block["text"].strip()
+    )
+    return parts if len(parts) > 1 else ()
 
 
 def _image_sources(content: object) -> tuple[tuple[str, str], ...]:
@@ -512,6 +531,7 @@ def _event_from_line(seq: int, data: dict) -> TranscriptEvent | None:
             queued=True,
             ts=(_parse_ts(data.get("timestamp")) or _parse_ts(attachment.get("timestamp"))),
             image_media_types=image_media_types,
+            text_parts=_text_parts(attachment.get("prompt")),
         )
     if ltype == "queue-operation":
         # A message typed while the agent was busy. Only the "enqueue" carries
@@ -583,6 +603,7 @@ def _event_from_line(seq: int, data: dict) -> TranscriptEvent | None:
         # failed instead of as a healthy finished chat (#1463).
         failed=data.get("isApiErrorMessage") is True,
         image_media_types=image_media_types,
+        text_parts=_text_parts(content) if role == "user" else (),
     )
 
 
@@ -968,8 +989,8 @@ def _may_carry_read_message(raw: bytes) -> bool:
     return b'"user"' in raw or b'"queued_command"' in raw
 
 
-def read_message_texts(path: Path, *, since: float) -> Counter[str]:
-    """How many times the chat has actually read each message text since ``since``.
+def read_messages(path: Path, *, since: float) -> list[tuple[str, tuple[str, ...]]]:
+    """Each message line the chat has actually read since ``since``, newest first.
 
     A message written into a turn that is still running is only *queued* by the
     CLI: the ``enqueue`` queue-operation it writes carries no text in stream-json
@@ -978,30 +999,38 @@ def read_message_texts(path: Path, *, since: float) -> Counter[str]:
     the open turn. A message with neither was never read, and dies with the
     process (#2898). Texts are stripped, which is how they are compared.
 
-    Counted rather than collected, because the same text sent twice and read once
-    is one message still unread. The walk covers the whole file back to
-    ``since``: a turn can print far more after reading a message than any fixed
-    window, and a read missed there would be quoted to the chat a second time.
+    Each line is its stripped text and, when it carries several, its parts:
+    messages read together are written as one line, a part each (#3931). Lines
+    rather than counted texts, so the caller can match a line whole before it
+    falls back to its parts, and a line's parts never stand in for another send.
+
+    The walk covers the whole file back to ``since``: a turn can print far more
+    after reading a message than any fixed window, and a read missed there would
+    be quoted to the chat a second time.
     """
-    texts: Counter[str] = Counter()
+    lines: list[tuple[str, tuple[str, ...]]] = []
     try:
         limit = path.stat().st_size
     except OSError:
-        return texts
+        return lines
     for obj in objects_backwards(path, prefilter=_may_carry_read_message, limit=limit):
         stamp = _parse_ts(obj.get("timestamp"))
         if stamp is not None and stamp.timestamp() < since:
             break
         text: str | None = None
+        content: object = None
         if obj.get("type") == "user" and not obj.get("isSidechain"):
             text = _user_content_text(obj)
+            message = obj.get("message")
+            content = message.get("content") if isinstance(message, dict) else None
         elif obj.get("type") == "attachment":
             attachment = obj.get("attachment")
             if isinstance(attachment, dict) and attachment.get("type") == "queued_command":
-                text = _text_from_content(attachment.get("prompt")).text
+                content = attachment.get("prompt")
+                text = _text_from_content(content).text
         if text and text.strip():
-            texts[text.strip()] += 1
-    return texts
+            lines.append((text.strip(), _text_parts(content)))
+    return lines
 
 
 def transcript_meta(path: Path, *, head: int = 65536, tail: int = 32768) -> TranscriptMeta:

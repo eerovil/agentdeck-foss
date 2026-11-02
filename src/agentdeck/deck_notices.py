@@ -17,6 +17,8 @@ import re
 from collections.abc import Iterable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 
+from .voice_mode import without_voice_line
+
 #: ``scheduled_messages`` ID prefixes the deck writes for its own messages to a chat.
 DECK_KINDS = frozenset({"wake-on", "work-release", "work-ending", "work-event", "work-handover"})
 
@@ -68,6 +70,7 @@ def notice_kind(
     """
     if not text:
         return None
+    text = without_voice_line(text)
     sent = [(kind_of_record(rid), at) for rid, at in records.get(text, ())]
     sent = [(kind, at) for kind, at in sent if kind is not None]
     if sent:
@@ -88,7 +91,11 @@ def notice_kind(
 
 def candidate_texts(events: Iterable) -> list[str]:
     """The user texts worth looking up in the delivery records."""
-    return [e.text for e in events if e.role == "user" and e.text and not e.answer]
+    # A deck message sent while voice mode was on ends in the voice line (#3875); its
+    # record holds the text without it.
+    return [
+        without_voice_line(e.text) for e in events if e.role == "user" and e.text and not e.answer
+    ]
 
 
 def _short(repo_ref: re.Match) -> str:

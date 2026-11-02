@@ -64,13 +64,25 @@ def test_a_failure_list_is_read_from_the_summary_pytest_prints_last():
         "=========== short test summary info ============\n"
         "FAILED tests/test_a.py::test_one - AssertionError: nope\n"
         "ERROR tests/test_b.py::test_two\n"
-        "========== 1 failed, 2 errors in 4.10s =========\n"
+        "FAILED tests/test_c.py::test_three[everything else] - assert [1] == [2]\n"
+        "ERROR tests/test_c.py::test_four[two words]\n"
+        "========== 2 failed, 2 errors in 4.10s =========\n"
     )
 
     failures, complete = baseline.extract_failures(text)
 
-    assert failures == ("tests/test_a.py::test_one", "tests/test_b.py::test_two")
+    assert failures == (
+        "tests/test_a.py::test_one",
+        "tests/test_b.py::test_two",
+        "tests/test_c.py::test_four[two words]",
+        "tests/test_c.py::test_three[everything else]",
+    )
     assert complete is True
+    # An id holding `] - ` reads whole only with the run's own record of what failed.
+    summary = "short test summary info\nFAILED tests/d.py::test_x[foo] - bar] - AssertionError\n"
+    assert baseline.extract_failures(summary)[0] == ("tests/d.py::test_x[foo]",)
+    known = ["tests/d.py::test_x[foo] - bar]", "tests/d.py::test_x[foo]"]
+    assert baseline.extract_failures(summary, known=known)[0] == (known[0],)
 
 
 def test_an_all_pass_run_is_a_complete_empty_failure_list():

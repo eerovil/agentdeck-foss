@@ -177,6 +177,23 @@ def test_a_missing_clone_goes_into_a_fresh_checkouts_folder(tmp_path, monkeypatc
     ]
 
 
+def test_a_file_that_merges_on_its_own_must_let_its_reviewer_pass(monkeypatch):
+    """#3901: holdfast's reviewer held no Release, so three clean passes merged nothing."""
+    monkeypatch.setattr(github_authority, "reviewer_logins", lambda: frozenset({"rev[bot]"}))
+    merging = SHARED + (
+        "\n[capabilities]\nguarded_release = true\nmerge_review = true\nauto_release = true\n"
+    )
+    try:
+        project_join.check(merging, "acme/issues")
+    except project_join.JoinError as error:
+        assert 'allow = ["rev[bot]"] under [authorization.release]' in str(error)
+    else:
+        raise AssertionError("took a file whose reviewer cannot pass")
+
+    project_join.check(merging + '\n[authorization.release]\nallow = ["Rev[bot]"]\n', "acme/x")
+    project_join.check(SHARED, "acme/issues")  # a person's Merge follows each pass
+
+
 def test_join_refuses_a_deck_that_names_no_person(tmp_path, monkeypatch):
     _instance, activations, _timers = _deck(tmp_path, monkeypatch, person="")
     opener, _seen = _github("abc123")

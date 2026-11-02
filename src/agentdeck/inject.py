@@ -206,6 +206,9 @@ class _ObservedMessage:
     event_at: datetime | None
     event_fingerprint: bytes
     linked_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    # The other sends the same transcript line carries, as (id, action id) pairs:
+    # Claude Code writes messages queued behind a busy turn as one line (#3931).
+    also: tuple[tuple[int, str | None], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -613,6 +616,63 @@ class InjectionService:
             == _observed_event_fingerprint(event.text, event.image_media_types)
         )
 
+    @staticmethod
+    def _durable_matches(
+        items: list[QueuedMessage], event: TranscriptEvent, event_ts: datetime | None
+    ) -> list[QueuedMessage]:
+        """The in-flight sends this durable user event is the transcript of.
+
+        Its whole text first, which is every case but one. Claude Code writes
+        messages that queued up behind a busy turn as one line with a text part
+        per message, so when the whole text matches nothing each part is matched
+        to a send of its own; a part cannot say which image was its, so only a
+        send without uploads matches one (#3931).
+        """
+
+        def eligible(item: QueuedMessage) -> bool:
+            return (
+                item.state in ("running", "accepted")
+                and (item.after_seq is None or event.seq > item.after_seq)
+                and (
+                    event_ts is not None
+                    and event_ts
+                    >= item.created_at.replace(
+                        microsecond=(item.created_at.microsecond // 1000) * 1000
+                    )
+                    or (event_ts is None and event.queued and item.after_seq is not None)
+                )
+            )
+
+        whole = next(
+            (
+                item
+                for item in items
+                if eligible(item)
+                and _delivery_text_matches(item.text, event.text)
+                and item.image_media_types == event.image_media_types
+            ),
+            None,
+        )
+        if whole is not None:
+            return [whole]
+        matches: list[QueuedMessage] = []
+        for part in getattr(event, "text_parts", ()):
+            match = next(
+                (
+                    item
+                    for item in items
+                    if item not in matches
+                    and eligible(item)
+                    and not item.images
+                    and not item.files
+                    and _delivery_text_matches(item.text.strip(), part)
+                ),
+                None,
+            )
+            if match is not None:
+                matches.append(match)
+        return matches
+
     def observe_transcript(
         self, session_key: str, events: list[TranscriptEvent]
     ) -> dict[int, QueuedMessage | _ObservedMessage]:
@@ -647,49 +707,33 @@ class InjectionService:
                 # The provider rewrote this seq. Never let the old optimistic
                 # action ID claim a different durable event.
                 self._observed.pop(observed_key, None)
-            match = next(
-                (
-                    item
-                    for item in items
-                    if item.state in ("running", "accepted")
-                    and _delivery_text_matches(item.text, event.text)
-                    and item.image_media_types == event.image_media_types
-                    and (item.after_seq is None or event.seq > item.after_seq)
-                    and (
-                        event_ts is not None
-                        and event_ts
-                        >= item.created_at.replace(
-                            microsecond=(item.created_at.microsecond // 1000) * 1000
-                        )
-                        or (
-                            event_ts is None
-                            and event.queued
-                            and item.after_seq is not None
-                        )
-                    )
-                ),
-                None,
-            )
-            if match is None:
+            matches = self._durable_matches(items, event, event_ts)
+            if not matches:
                 continue
-            match.state = "observed"
-            match.observed_seq = event.seq
-            match.observed_at = event_ts
-            # The transcript carries the message, which is the strongest evidence
-            # there is that the provider took the send — stronger than the call
-            # returning. It can land while `provider.inject` is still awaited, and
-            # `_finish_delivery` returns early for an already-observed item, so
-            # announcing only from there would miss exactly this ordering (#2003).
-            self._announce_handover(session_key, match)
+            for match in matches:
+                match.state = "observed"
+                match.observed_seq = event.seq
+                match.observed_at = event_ts
+                # The transcript carries the message, which is the strongest
+                # evidence there is that the provider took the send — stronger
+                # than the call returning. It can land while `provider.inject` is
+                # still awaited, and `_finish_delivery` returns early for an
+                # already-observed item, so announcing only from there would miss
+                # exactly this ordering (#2003).
+                self._announce_handover(session_key, match)
+            first = matches[0]
             observed = _ObservedMessage(
-                match.id,
-                match.client_action_id,
+                first.id,
+                first.client_action_id,
                 event_ts,
                 _observed_event_fingerprint(event.text, event.image_media_types),
+                also=tuple((item.id, item.client_action_id) for item in matches[1:]),
             )
             self._observed[observed_key] = observed
             self._prune_observed_correlations()
-            links[event.seq] = match
+            # One send keeps its own queue item as the link; a line carrying
+            # several links the compact record, the one that names them all.
+            links[event.seq] = first if len(matches) == 1 else observed
             changed = True
         if changed:
             self._snapshot(session_key)

@@ -25,7 +25,6 @@ import signal
 import sys
 import time
 import uuid
-from collections import Counter
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -69,6 +68,7 @@ from ..instructions import (
     agentdeck_session_instructions,
     relocation_notice,
     resolve_session_role,
+    session_guide_fingerprint,
     stored_session_role,
 )
 from ..usage import read_shared_cache
@@ -116,6 +116,9 @@ CLOSED_QUESTIONS_MAX = 50
 # ``--allow-dangerously-skip-permissions``, which every owned worker gets; that
 # flag makes the mode available without turning it on.
 BYPASS_PERMISSIONS_MODE = "bypassPermissions"
+# The ``decision_reason_type`` of a safety check bypass does not lift: a single
+# command's own, and one on a part of a chained command (#2342, #3867).
+_BYPASS_SAFETY_REASON_TYPES = frozenset({"safetyCheck", "subcommandResults"})
 # Where a new owned chat's switch starts is the host's ``start_bypassed``
 # (#2319, a setting since #3748 so a public install runs in its configured mode).
 # Only a new record takes it: a saved record keeps its own choice, and one
@@ -388,6 +391,12 @@ class WorkerRecord:
     # because that directory was gone (#2524). Set by the move, told to the resumed
     # process once in its system prompt, and cleared by that spawn.
     relocated_from: str | None = None
+    # Which AgentDeck guide the running process was started with, as
+    # ``session_guide_fingerprint``. A held process outlives the runtime restart that
+    # brings a new guide (#3248), so the next idle delivery compares this with today's
+    # and restarts the process when they differ (#3850). None: started before this
+    # field existed, so treated as out of date.
+    guide_fingerprint: str | None = None
     # The transcript line the next turn resumes at, after a person rolled the chat back
     # to before one of their messages (#3474). The CLI branches the same session file
     # there, and a plain resume afterwards follows that branch, so it is cleared once a
@@ -1605,23 +1614,38 @@ class ClaudeWorkerHost:
             default=0.0,
         )
         path = self._transcript_path(rec, None)
-        read: Counter[str] = Counter()
-        if path is not None:
-            read = transcripts_mod.read_message_texts(
-                path, since=since - UNREAD_CLOCK_SLACK_S
-            )
-        unread: list[dict[str, Any]] = []
-        # Oldest first, one transcript read per sent message: the same text sent
-        # twice and read once leaves the later copy unread.
-        for entry in entries:
-            text = entry.get("text")
-            if not isinstance(text, str) or not text.strip():
-                continue
-            if read[text.strip()] > 0:
-                read[text.strip()] -= 1
-                continue
-            unread.append(dict(entry))
-        return unread
+        lines = (
+            transcripts_mod.read_messages(path, since=since - UNREAD_CLOCK_SLACK_S)
+            if path is not None
+            else []
+        )
+        texts = [
+            text.strip() if isinstance(text := entry.get("text"), str) else ""
+            for entry in entries
+        ]
+        read = [not text for text in texts]
+
+        def take(text: str, *, part: bool) -> bool:
+            # Oldest first, one read per sent message: the same text sent twice
+            # and read once leaves the later copy unread. A part cannot say whose
+            # images it carried, so only a send without any matches one.
+            for index, entry in enumerate(entries):
+                if read[index] or texts[index] != text:
+                    continue
+                if part and entry.get("images"):
+                    continue
+                read[index] = True
+                return True
+            return False
+
+        # Every line whole first, then the parts of the lines nothing matched:
+        # messages read together are one line with a part each (#3931), and a
+        # line that is one message must never lend its parts to another send.
+        unmatched = [parts for text, parts in lines if not take(text, part=False)]
+        for parts in unmatched:
+            for text in parts:
+                take(text, part=True)
+        return [dict(entry) for index, entry in enumerate(entries) if not read[index]]
 
     def unread_dropped(self, key: str) -> int:
         """How many older queued messages the bounded list let go (#2898).
@@ -2093,6 +2117,21 @@ class ClaudeWorkerHost:
                 # A caller that named the deleted directory meant this chat, not a
                 # new one in a directory that is not there.
                 cwd = None
+            if (
+                rec is not None
+                and live is not None
+                and not (fresh or require_active or context_maintenance or context_rollover)
+                and self._guide_refresh_due(rec, live)
+                # The restarted process is a spawn and needs a slot; the running one
+                # was steered past the cap. Refused, it keeps its old guide for now.
+                and await self._admit_interactive(
+                    key, role, exclude=live, automated=automated
+                )
+            ):
+                log.info("claude worker %s: guide changed; restarting idle process", key)
+                self._live.pop(key, None)
+                await self._terminate(live)
+                live = None
             try:
                 image_blocks = [
                     await asyncio.to_thread(self._image_block, path) for path in images or []
@@ -3122,6 +3161,31 @@ class ClaudeWorkerHost:
             return None
         return continued_chat_cwd(recorded)
 
+    def _current_guide(self, rec: WorkerRecord) -> str:
+        """The guide a process started for ``rec`` now gets, without a relocation note."""
+        return agentdeck_session_instructions(
+            role=resolve_session_role(delegated=rec.delegated, role=rec.role),
+            provider="claude_code",
+            session_token=rec.session_token,
+        )
+
+    def _guide_refresh_due(self, rec: WorkerRecord, live: _LiveWorker) -> bool:
+        """Whether an idle process holds an older guide than today's (#3850).
+
+        Claude reads the guide only from ``--append-system-prompt`` at start, so the one
+        way to hand a running chat a new one is to end it and resume the same session.
+        Never while a turn, a Claude-native background agent or a background shell runs:
+        ending the process would cut that work, so a later idle delivery refreshes it.
+        """
+        if not rec.session_id or live.process.returncode is not None:
+            return False
+        if rec.guide_fingerprint == session_guide_fingerprint(self._current_guide(rec)):
+            return False
+        self._sync_background_agents(rec, live)
+        if not self._is_idle(rec.key, live, time.time()) or live.background_agents:
+            return False
+        return not self._background_shell_tasks(rec, live)
+
     async def _relocate(
         self, key: str, rec: WorkerRecord, live: _LiveWorker | None
     ) -> _LiveWorker | None:
@@ -3507,6 +3571,8 @@ class ClaudeWorkerHost:
             process, holder = await self._launch(
                 command, scope_unit, scope_prefix, cwd=rec.cwd, env=env
             )
+        # A spare is taken only when its argv matches, so this is the guide it holds.
+        rec.guide_fingerprint = session_guide_fingerprint(self._current_guide(rec))
         return self._register_spawn(
             key,
             rec,
@@ -3951,6 +4017,11 @@ class ClaudeWorkerHost:
         gate. The switch means nobody is asked, so the runtime refuses the call
         itself and hands Claude the check's reason, which says how to rewrite
         the command. Anything else, a question included, is left to the boss.
+
+        A check on one part of a chained command (``cd x && rm -f y/*``) comes
+        as ``subcommandResults`` rather than ``safetyCheck`` (#3867). With
+        bypass on, nothing but a safety check makes a subcommand ask, so both
+        are refused alike.
         """
         if event.get("type") != "control_request":
             return None
@@ -3959,7 +4030,7 @@ class ClaudeWorkerHost:
         if (
             not isinstance(request, dict)
             or request.get("subtype") != "can_use_tool"
-            or request.get("decision_reason_type") != "safetyCheck"
+            or request.get("decision_reason_type") not in _BYPASS_SAFETY_REASON_TYPES
             or not isinstance(request_id, str)
         ):
             return None

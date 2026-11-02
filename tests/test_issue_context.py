@@ -829,3 +829,23 @@ async def test_reading_a_parents_sub_issues_relinks_a_child_that_lost_its_parent
     cache.expire(key)
     assert resolver.held_sub_issues("eerovil/agentdeck", 9) == (tuple(listed), False)
     assert resolver.held_blocked_by("eerovil/agentdeck", 9) == (None, False)
+
+
+async def test_refreshed_pull_rows_wake_the_work_routers_backstop(tmp_path, monkeypatch):
+    """#3903 review: a refresh that rewrote rows tells ``on_pull_rows``; one that read none
+    does not."""
+    from agentdeck import git_context
+
+    read = [1]
+
+    async def refresh_pulls(self, refs, *, limit):
+        return read[0]
+
+    monkeypatch.setattr(git_context.GitContextResolver, "refresh_pulls", refresh_pulls)
+    resolver = IssueResolver(poller_root=tmp_path, cache_path=tmp_path / "cache.db")
+    woken: list[int] = []
+    resolver.on_pull_rows = lambda: woken.append(1)
+    assert await resolver.refresh_pull_rows([("eerovil/agentdeck", 9)], limit=4) == 1
+    read[0] = 0
+    await resolver.refresh_pull_rows([("eerovil/agentdeck", 9)], limit=4)
+    assert woken == [1]

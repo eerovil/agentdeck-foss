@@ -6,10 +6,12 @@ so they survive a restart and are queryable from SQL rather than rebuilt from ch
 - **A custom title.** The operator may rename a Work on its page. The name is this deck's own:
   the GitHub issue keeps its title. With none set, the Work is called what ``work_title`` has
   always derived (the issue's cached title, then a chat's), and clearing the name restores that.
-- **The resolution**, a short engineering decision record in four parts: the problem and its
-  root cause, the solution, why this solution rather than the alternatives, and why it is
-  believed correct. The worker that runs the final verification writes it while the suite
-  runs, and writes it again when the result is known or a fix changes the solution. Every
+- **The resolution**, the Work's summary in five parts: the background (what the thing the
+  issue is about is), the problem and its root cause, the solution, why this solution rather
+  than the alternatives, and why it is believed correct. The Work's agent writes the
+  background and the problem after its first look at the issue (#3928), leaving the parts it
+  does not know yet empty, and the whole record before review and when a result or a fix
+  changes it. Only the problem is required; the page leaves an empty part out. Every
   write replaces the whole record, so a retried write or a later round never leaves a stale
   or duplicate summary behind; the Run and chat that wrote it last are kept as provenance.
   The page shows each part in full, broken into its paragraphs and bullet lists (#2459).
@@ -28,6 +30,7 @@ MAX_PART = 8000
 
 # The four parts, in the order the Work page shows them: (field, heading).
 PARTS = (
+    ("background", "Background"),
     ("problem", "Problem"),
     ("solution", "Solution"),
     ("rationale", "Why this solution"),
@@ -45,15 +48,22 @@ class WorkResolution:
     updated_at: datetime | None = None
     run_id: str = ""
     session_key: str = ""
+    # Last, with a default, so the four-part constructions keep their positions (#3928).
+    background: str = ""
 
     def parts(self) -> tuple[tuple[str, str, str], ...]:
         """(field, heading, text) for every part, in page order."""
         return tuple((name, heading, getattr(self, name)) for name, heading in PARTS)
 
     def display_parts(self) -> tuple[tuple[str, str, tuple[Block, ...]], ...]:
-        """(field, heading, blocks) for every part, in page order, as the Work page shows it."""
+        """(field, heading, blocks) for every written part, in page order, as the page shows it.
+
+        A part left empty is not known yet (#3928), so it has no heading either.
+        """
         return tuple(
-            (name, heading, resolution_blocks(text)) for name, heading, text in self.parts()
+            (name, heading, resolution_blocks(text))
+            for name, heading, text in self.parts()
+            if text.strip()
         )
 
 
@@ -106,9 +116,10 @@ def normalize_title(value: object) -> str:
     return text[:MAX_TITLE].rstrip()
 
 
-def normalize_part(name: str, value: object) -> str:
+def normalize_part(name: str, value: object, *, required: bool = True) -> str:
+    """One part, trimmed and bounded; empty is refused only for a ``required`` part."""
     text = str(value or "").replace("\r\n", "\n").strip()
-    if not text:
+    if not text and required:
         raise ResolutionError(f"{name} must not be empty")
     if len(text) > MAX_PART:
         raise ResolutionError(f"{name} is longer than {MAX_PART} characters")

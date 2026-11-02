@@ -43,6 +43,10 @@ WORK_SECTION = "work_section"
 # One Run or workspace fragment rendered for a Work page section (#3228).
 WORK_FRAGMENT = "work_fragment"
 
+# One walk of every registered pull request to place each in its Work (``pulls_by_work``):
+# the deck-wide walk the release once ran per Work, freezing pages for a minute (#3993, #4016).
+PULL_WALK = "pull_walk"
+
 _counts: Counter[str] = Counter()
 
 

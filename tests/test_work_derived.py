@@ -19,6 +19,7 @@ from agentdeck import mac_runner as _mac_runner
 from agentdeck.web.work_view import WORK_INPUTS_TOPIC
 from agentdeck.work import WorkRef
 from agentdeck.work_derived import (
+    ASKED_IN_CHAT,
     CLOSED,
     CUT_OFF,
     DIED,
@@ -46,6 +47,7 @@ from agentdeck.work_derived import (
     WAITING,
     WORKING,
     DerivedInputs,
+    asked_in_last_paragraph,
     derived_status,
     first_sentence,
     progress_sentence,
@@ -296,6 +298,9 @@ def test_the_work_page_reads_the_derived_line(fields, headline, summary):
         ({"closed": True, "live_pending": True, "waits": (("AgentDeck deploy", None),)},
          "active", None, []),
         ({"running": True}, "active", None, []),
+        # #3887: a reply ending on an open question is answered by a message.
+        ({"ended_at": AT, "asks": True, "last_text": "Two angles.\n\nWhat bugs you most?"},
+         "needs_you", "needs_answer", ["Answer", "Open", "Hide"]),
         ({"waits": (("its tests", None),)}, "active", None, []),
         ({"finished": True}, "finished", None, []),
         ({"cut_off": True, "cut_off_at": AT, "reviving": True}, "active", None, []),
@@ -433,6 +438,64 @@ def test_an_ended_rows_line_quotes_the_agent():
         'the agent ended without a next step · last said "The final test run passed."'
         " · 09:40"
     )
+
+
+def test_a_reply_ending_on_a_question_waits_for_the_answer_and_is_never_asked():
+    """#3887: an open question goes in the reply, not the box; the deck must not prod it."""
+    ideas = "So the itch is the spec flow. Angles: a or b?\n\n" "What annoyed you today? Or both?"
+    found = status(last_text=ideas, ended_at=AT, asks=True)
+    assert (found.kind, found.line, found.bug) == (
+        ASKED_IN_CHAT, 'Needs you — answer in the chat: "What annoyed you today?"', False
+    )
+    # A `?` before the last paragraph, or only in a trailing code block, is not the ask.
+    assert asked_in_last_paragraph("Why did it fail? Found it.\n\nFixed and pushed.") == ""
+    assert asked_in_last_paragraph("Done.\n\n```\nwhy?\n```") == ""
+    assert asked_in_last_paragraph("Which one?\n\n```\nx\n```\n") == "Which one?"
+    # Formatted questions still ask (#3887 review); the quote drops the emphasis marks.
+    for formatted in (
+        "**Mitä haluaisit kokeilla?**",
+        "Mitä haluaisit kokeilla? 🙂",
+        "Mitä haluaisit kokeilla?🙂",
+        "_Mitä haluaisit kokeilla?_ Kerro vapaasti.",
+        "Mitä haluaisit kokeilla?🙂 Kerro vapaasti.",
+        "Mitä haluaisit kokeilla?_🙂 Kerro vapaasti.",
+        "Mitä haluaisit kokeilla?\" Kerro vapaasti.",
+        "Pick one: [this](https://x.example/a?b) or that — Mitä haluaisit kokeilla?)",
+    ):
+        assert "Mitä haluaisit kokeilla?" in asked_in_last_paragraph(f"Idea.\n\n{formatted}")
+    assert asked_in_last_paragraph("**Mitä haluaisit kokeilla?**") == "Mitä haluaisit kokeilla?"
+    # No question in the last paragraph, formatted or not: today's path.
+    for plain in ("**Done.** 🙂", "See [the link](https://x.example/?q=1).", "Pushed ✅"):
+        assert asked_in_last_paragraph(f"Why? Found it.\n\n{plain}") == "", plain
+    assert status(last_text="Done. Pushed.", ended_at=AT, asks=True).kind == ENDED
+    # Its answer to the deck's own request for a next step counts too: not the bug.
+    nudged = status(last_text=ideas, ended_at=AT, asks=True, nudged_at=AT - timedelta(minutes=1))
+    assert nudged.kind == ASKED_IN_CHAT
+    # A parked Work stays Parked; a running turn and an open box read as themselves.
+    assert status(last_text=ideas, ended_at=AT, parked=True).kind == PARKED
+    assert status(last_text=ideas, running=True).kind == WORKING
+    assert status(last_text=ideas, question="Which day?").kind == QUESTION
+    # The person's answer handed to the chat reads Working before its turn shows as running.
+    handed = status(last_text=ideas, ended_at=AT, handed=True, handed_until=NOW + HANDOFF_GRACE)
+    assert handed.kind == WORKING
+    # #3905: merged, a deploy wake-on registered, the owner asked for more and the reply asks
+    # them back: Needs you, not Live checking. The same holds over a review or a closed issue.
+    deploy = (("a deployment in o/r@5206c2b", NOW + timedelta(hours=2)),)
+    merged = status(last_text=ideas, ended_at=AT, asks=True, merged=True, waits=deploy)
+    assert (merged.kind, merged.live_checking, merged.line.startswith("Needs you")) == (
+        ASKED_IN_CHAT, False, True
+    )
+    pending = status(last_text=ideas, ended_at=AT, closed=True, live_pending=True, waits=deploy)
+    assert pending.kind == ASKED_IN_CHAT
+    assert status(last_text=ideas, ended_at=AT, review_pr=9).kind == ASKED_IN_CHAT
+    # A turn a restart cut off, or one that died, still reads as that, question or not.
+    cut = status(last_text=ideas, merged=True, waits=deploy, cut_off=True, cut_off_at=AT)
+    assert cut.kind != ASKED_IN_CHAT
+    assert status(last_text=ideas, merged=True, died=True, died_at=AT).kind == DIED
+    # Without the question the wait reads Live checking, and a recorded check goes on as today.
+    assert status(last_text="Deploying.", ended_at=AT, merged=True, waits=deploy).live_checking
+    verified = status(last_text="Checked live.", closed=True, live_result="verified")
+    assert verified.kind == CLOSED
 
 
 def test_a_question_opens_the_chat_that_asked_it():
@@ -621,6 +684,40 @@ def test_a_chat_waiting_on_the_macs_approval_needs_you_not_a_next_step(monkeypat
     assert found("https://mac.example:8443/#x").kind == UNFINISHED
     marks["chat-a"] = SimpleNamespace(state="finished", detail="")
     assert found("https://mac.example:8443/#x").kind == UNFINISHED
+
+
+def test_a_chats_reply_ending_on_a_question_renders_as_needs_you_with_answer():
+    """#3887: from the chat's real last text to the rendered Work page: Needs answer, the
+    question quoted, and Answer opening the message box rather than a prod for a next step."""
+    from fastapi.templating import Jinja2Templates
+
+    from agentdeck import app as app_mod
+    from agentdeck.web import render as render_mod
+    from agentdeck.web.work_view import WorkDetail, derived_for, render_work_sections
+
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            work_router=SimpleNamespace(switched=lambda repository: True),
+            assistant=None,
+            wake_on=None,
+            control_db=None,
+        )
+    )
+    text = "Two angles: a lighter spec, or none.\n\nWhat annoyed you most last time?"
+    state = _state(_session(key="chat-a", last_text=text))
+    asked = derived_for(app, SimpleNamespace(state=state), WORK, card())
+    assert (asked.kind, asked.line) == (
+        ASKED_IN_CHAT, 'Needs you — answer in the chat: "What annoyed you most last time?"'
+    )
+    row = front_row(card(derived=asked), current=True)
+    assert row.section == "needs_you" and row.attention.category == "needs_answer"
+    templates = Jinja2Templates(directory=str(app_mod._TEMPLATES_DIR))
+    render_mod.register_filters(templates)
+    detail = WorkDetail(card=card(derived=asked), workspace=None, chats=(), verifications=())
+    box = dict(render_work_sections(templates, detail))["status"]
+    assert 'data-wd-derived="asked_in_chat"' in box and "Needs answer" in box
+    assert "What annoyed you most last time?" in box and "without a next step" not in box
+    assert 'href="#work-message"' in box and ">Answer<" in box
 
 
 def test_the_real_router_answers_which_repositories_are_switched(tmp_path):
@@ -842,6 +939,13 @@ def test_a_turn_ended_with_a_background_command_running_is_not_working():
     assert derived_for(app, snapshot, WORK, card()).kind == WORKING
 
 
+def _event(kind, head, at, pull="eerovil/agentdeck#9", **data):
+    """One row of a pull request's review history (#3956), dated by a datetime."""
+    from agentdeck.review_history import ReviewEvent
+
+    return ReviewEvent(pull, head, at.timestamp(), kind, f"{kind}:{head}:{at}", data)
+
+
 def _derived_with_reviews(
     open_reviews,
     *,
@@ -854,16 +958,18 @@ def _derived_with_reviews(
     waits=(),
     entry=None,
     ended=AT,
-    escalated=None,
+    history=(),
+    closed=(),
 ):
+    """``open_reviews`` (``(repository, number) -> (_open(...), ...)``) are review chats opened
+    at their heads and still open; ``passes`` (``pull -> {"head", "at", "chat"}``) pass verdicts;
+    ``history`` any further rows; ``closed`` the chats the board saw close."""
     from agentdeck.web.work_view import derived_for
     from agentdeck.work_facts import OutputFact
 
     release = SimpleNamespace(
         store=SimpleNamespace(
-            get=lambda work_id: {
-                "awaiting_merge": awaiting or {}, "passes": passes or {}, **(entry or {})
-            }
+            get=lambda work_id: {"awaiting_merge": awaiting or {}, **(entry or {})}
         )
     )
     app = SimpleNamespace(
@@ -887,17 +993,38 @@ def _derived_with_reviews(
         head=head,
         draft=draft,
     )
+    rows = list(history)
+    chats: dict = {number: None for number in closed}
+    for (repo, number), reviews in (open_reviews or {}).items():
+        for at_head, review in reviews:
+            opened = review.opened_at or AT
+            chat = f"eerovil/review-chats#{review.chat}"
+            rows.append(_event("chat", at_head, opened, f"{repo}#{number}", chat=chat))
+            chats[review.chat] = review
+    if passes is None:
+        # The release writes a Ready only on a pass that stands (#3956): one for each such head.
+        at = AT.timestamp()
+        passes = {pull: {"head": head, "at": at} for pull, head in (awaiting or {}).items()}
+    for pull, row in passes.items():
+        at = datetime.fromtimestamp(row["at"], UTC)
+        data = {"chat": row["chat"]} if row.get("chat") else {}
+        rows.append(_event("pass", row["head"], at, pull, **data))
+    history_by_pull: dict = {}
+    for seq, event in enumerate(rows, 1):
+        history_by_pull.setdefault(event.pull, []).append(replace(event, seq=seq))
     session = _session(last_text="Fixed it.", last_message_at=ended)
     snapshot = SimpleNamespace(
-        state=_state(session), open_reviews=open_reviews, escalated_reviews=escalated or {}
+        state=_state(session),
+        review_events={pull: tuple(events) for pull, events in history_by_pull.items()},
+        review_chats=chats,
     )
     return derived_for(app, snapshot, WORK, card(outputs=(output,)))
 
 
-def _open(head, *, chat=5, newest=False, **fields):
+def _open(head, *, chat=5, **fields):
     from agentdeck.web.work_view import OpenReview
 
-    return OpenReview(chat=chat, head=head, newest=newest, **fields)
+    return head, OpenReview(chat=chat, **fields)
 
 
 def test_in_review_only_while_a_review_chat_about_that_head_is_open():
@@ -907,29 +1034,48 @@ def test_in_review_only_while_a_review_chat_about_that_head_is_open():
     # The chat ended (any verdict, any reviewer): the head is no longer in review, and the
     # agent is asked for its next step.
     assert _derived_with_reviews({}).kind == ENDED
-    # A chat about an older head, with a newer chat on record, says nothing about the new one.
-    assert _derived_with_reviews(reviewing, head="b" * 40).kind == ENDED
+    # A chat about an older head says nothing about a newer one the history answered.
+    newer = [_event("changes", "b" * 40, AT + timedelta(minutes=10))]
+    assert _derived_with_reviews(reviewing, head="b" * 40, history=newer).kind == ENDED
+    # #3956: a chat the board saw close with no verdict ended that review; an ask with no
+    # chat yet (the deck's own reviewer) is in review from the ask.
+    opened = [_event("chat", "a" * 40, AT, chat="eerovil/review-chats#5")]
+    assert _derived_with_reviews({}, history=opened, closed=(5,)).kind == ENDED
+    recent = datetime.now(UTC) - timedelta(minutes=5)  # derived_for reads the real clock
+    asked = [_event("asked", "a" * 40, recent)]
+    assert _derived_with_reviews({}, history=asked).kind == REVIEW
+    # #3956 review: with no live facts (an ask with no chat, or a chat the board never saw,
+    # maybe past its backfill) it reads stuck after an hour, never "In review" for good.
+    unseen = [_event("chat", "a" * 40, AT, chat="eerovil/review-chats#77")]
+    for aged in ([_event("asked", "a" * 40, AT)], unseen):
+        found = _derived_with_reviews({}, history=aged)
+        assert found.kind == REVIEW_STUCK and found.line.startswith("Needs you — no reviewer")
+    fresh = [_event("chat", "a" * 40, recent, chat="eerovil/review-chats#77")]
+    found = _derived_with_reviews({}, history=fresh)
+    assert found.kind == REVIEW
+    assert abs(found.deadline - (recent + timedelta(hours=1))) < timedelta(seconds=1)
+    # #3956 review: a sibling's chat that lists this passed head (#3341) is not its review.
+    awaiting = {"eerovil/agentdeck#9": "a" * 40}
+    passed = {"eerovil/agentdeck#9": {"head": "a" * 40, "at": AT.timestamp()}}
+    later = AT + timedelta(minutes=1)
+    sibling = {("eerovil/agentdeck", 9): (_open("a" * 40, chat=8, opened_at=later),)}
+    assert _derived_with_reviews(sibling, awaiting=awaiting, passes=passed).kind == READY
     # A pull request in another repository than the card's is keyed by its own repository.
-    other = {("eerovil/review-chats", 9): (_open("A" * 12),)}
+    other = {("eerovil/review-chats", 9): (_open("A" * 40),)}
     assert _derived_with_reviews(other, repository="eerovil/Review-Chats").kind == REVIEW
     assert _derived_with_reviews(other).kind == ENDED
 
 
 def test_a_reviewers_escalation_needs_the_owner_not_a_review_wait():
     """#3216: agentdeck#3200's review escalated to the owner; its Work read waiting for review."""
-    from agentdeck.web.work_view import EscalatedReview
-
     at = AT + timedelta(minutes=5)
-    escalated = {
-        ("eerovil/agentdeck", 9): EscalatedReview(
-            5914, "eerovil/review-chats#5914", "a" * 40, at, "https://github.com/eerovil/agentdeck/issues/3200#issuecomment-6223939073"
-        )
-    }
+    url = "https://github.com/eerovil/agentdeck/issues/3200#issuecomment-6223939073"
+    escalated = [_event("escalated", "a" * 40, at, chat="eerovil/review-chats#5914", url=url)]
     waits = (SimpleNamespace(
         kind="review", repository="eerovil/agentdeck", number=9, deadline=UNTIL.timestamp(),
         target="the review of pull request eerovil/agentdeck#9",
     ),)
-    found = _derived_with_reviews({}, escalated=escalated, waits=waits)
+    found = _derived_with_reviews({}, history=escalated, waits=waits)
     assert found.kind == REVIEW_ESCALATED and found.at == at
     assert found.line.startswith(
         "Needs you — the reviewer escalated it to you (review-chats#5914) · "
@@ -938,8 +1084,10 @@ def test_a_reviewers_escalation_needs_the_owner_not_a_review_wait():
     assert derived_story(card(derived=found)).summary_href == "https://github.com/eerovil/agentdeck/issues/3200#issuecomment-6223939073"
     row = front_row(card(derived=found), current=False)
     assert (row.section, row.attention.category) == ("needs_you", "needs_answer")
-    # A push moves past the escalated head, and a newer review chat replaces it upstream.
-    assert _derived_with_reviews({}, escalated=escalated, head="b" * 40).kind == ENDED
+    # A push moves past the escalated head, and a review asked again replaces it.
+    assert _derived_with_reviews({}, history=escalated, head="b" * 40).kind == ENDED
+    again = [*escalated, _event("asked", "a" * 40, datetime.now(UTC))]
+    assert _derived_with_reviews({}, history=again, waits=waits).kind == REVIEW
 
 
 def test_ready_for_merge_once_the_release_waits_only_for_a_person():
@@ -947,7 +1095,7 @@ def test_ready_for_merge_once_the_release_waits_only_for_a_person():
     a person's Merge, and read Stopped under Needs answer."""
     awaiting = {"eerovil/agentdeck#9": "a" * 40}
     found = _derived_with_reviews({}, awaiting=awaiting)
-    assert (found.kind, found.line, found.pr) == (READY, "Ready for merge", 9)
+    assert (found.kind, found.pr) == (READY, 9) and found.line.startswith("Ready for merge")
     row = front_row(card(derived=found), current=False)
     assert (row.section, row.attention.category) == ("needs_you", "ready_for_merge")
     assert [button.label for button in row.buttons] == ["Merge", "Open", "Hide"]
@@ -958,10 +1106,10 @@ def test_ready_for_merge_once_the_release_waits_only_for_a_person():
         {}, repository="northwind/abacus",
         awaiting={"northwind/abacus#9": "a" * 40},
     )
-    assert (other.line, other.pr) == ("Ready for merge", 9)
+    assert other.line.startswith("Ready for merge") and other.pr == 9
     # A review still open wins: the release only answers for a reviewed head.
     reviewing = {("eerovil/agentdeck", 9): (_open("a" * 40),)}
-    assert _derived_with_reviews(reviewing, awaiting=awaiting).kind == REVIEW
+    assert _derived_with_reviews(reviewing, awaiting=awaiting, passes={}).kind == REVIEW
     # #3324: the pass is recorded from the verdict comment and its chat closes seconds
     # later. The chat that passed it is answered, while a chat opened after it reviews again.
     at = (AT + timedelta(minutes=4)).timestamp()
@@ -971,25 +1119,34 @@ def test_ready_for_merge_once_the_release_waits_only_for_a_person():
     assert found.kind == READY
     assert front_row(card(derived=found), current=False).attention.category == "ready_for_merge"
     again = {("eerovil/agentdeck", 9): (_open("a" * 40, opened_at=AT + timedelta(minutes=5)),)}
-    assert _derived_with_reviews(again, awaiting=awaiting, passes=passes).kind == REVIEW
+    # A review asked again writes its ask beside its chat (#3956 review: a chat alone is not one).
+    ask = [_event("asked", "a" * 40, AT + timedelta(minutes=5))]
+    found = _derived_with_reviews(again, awaiting=awaiting, passes=passes, history=ask)
+    assert found.kind == REVIEW
     # The rest of issues#791's sequence on that same head: a later review escalates to the
     # owner, who answers; a re-review the agent asks for then passes clean, Merge and all.
-    from agentdeck.web.work_view import EscalatedReview
-
-    escalated = {
-        ("eerovil/agentdeck", 9): EscalatedReview(
-            6384, "eerovil/review-chats#6384", "a" * 40, AT + timedelta(minutes=7)
-        )
-    }
-    found = _derived_with_reviews({}, awaiting=awaiting, passes=passes, escalated=escalated)
+    chat = "eerovil/review-chats#6384"
+    escalated = [_event("escalated", "a" * 40, AT + timedelta(minutes=7), chat=chat)]
+    found = _derived_with_reviews({}, awaiting=awaiting, passes=passes, history=escalated)
     assert found.kind == REVIEW_ESCALATED, "the escalation still waits for the owner"
     assert front_row(card(derived=found), current=False).attention.category == "needs_answer"
+    # #3859: the owner accepts it instead (``review-accepted``): its row at that head after the
+    # escalation answers it, though no newer review chat replaces the escalated one.
+    accepted = [*escalated, _event("accepted", "a" * 40, AT + timedelta(minutes=8))]
+    found = _derived_with_reviews({}, awaiting=awaiting, history=accepted)
+    assert found.kind == READY
+    assert front_row(card(derived=found), current=False).attention.category == "ready_for_merge"
+    elsewhere = [*escalated, _event("accepted", "b" * 40, AT + timedelta(minutes=8))]
+    found = _derived_with_reviews({}, awaiting=awaiting, history=elsewhere)
+    assert found.kind == REVIEW_ESCALATED, "a pass at another head answers nothing at this one"
     # The re-review's chat replaces the escalated one upstream (only the newest counts).
     opened = AT + timedelta(minutes=9)
     rereview = {("eerovil/agentdeck", 9): (_open("a" * 40, chat=6386, opened_at=opened),)}
-    assert _derived_with_reviews(rereview, awaiting=awaiting, passes=passes).kind == REVIEW
+    reask = [_event("asked", "a" * 40, opened)]
+    found = _derived_with_reviews(rereview, awaiting=awaiting, passes=passes, history=reask)
+    assert found.kind == REVIEW
     passes["eerovil/agentdeck#9"]["at"] = (AT + timedelta(minutes=12)).timestamp()
-    found = _derived_with_reviews(rereview, awaiting=awaiting, passes=passes)
+    found = _derived_with_reviews(rereview, awaiting=awaiting, passes=passes, history=reask)
     assert found.kind == READY, "its chat still open for a few seconds after the pass"
     row = front_row(card(derived=found), current=False)
     assert row.attention.category == "ready_for_merge"
@@ -1016,18 +1173,22 @@ def test_a_closed_issue_with_an_open_pull_request_follows_the_pull_request():
 def test_a_wait_on_its_own_pull_request_does_not_hide_ready_for_merge():
     """#3003: trailhead issues#667, #679 and #680 were reviewed and tested, and read "Waiting on
     pull request …" because their agents waited for their own pull request to merge."""
-    from agentdeck.wake_on import KIND_PULL_REQUEST, KIND_TIME, WakeRequest
+    from agentdeck.wake_on import KIND_COMMIT, KIND_PULL_REQUEST, KIND_TIME, WakeRequest
 
-    def wait(kind, repository="eerovil/agentdeck", number=9, note=""):
+    def wait(kind, repository="eerovil/agentdeck", number=9, note="", sha=""):
         return WakeRequest(
             id=f"w-{kind}-{number}", session_key="s", chat_id="chat-a", kind=kind,
             repository=repository, number=number, deadline=(NOW + timedelta(days=1)).timestamp(),
-            note=note,
+            note=note, sha=sha,
         )
 
     awaiting = {"eerovil/agentdeck#9": "a" * 40}
     own = (wait(KIND_PULL_REQUEST, repository="eerovil/AgentDeck"),)
     assert _derived_with_reviews({}, awaiting=awaiting, waits=own).kind == READY
+    # #3863: docker#241 also kept a CI wait on its reviewed, tested head.
+    ci = wait(KIND_COMMIT, number=None, sha="a" * 12)
+    assert _derived_with_reviews({}, awaiting=awaiting, waits=(*own, ci)).kind == READY
+    assert _derived_with_reviews({}, waits=(ci,)).kind == WAITING
     # Not ready yet: the same wait is what the Work waits on, and says what the pull request
     # itself waits for (#3097).
     fresh = datetime.now(UTC) - timedelta(minutes=5)
@@ -1047,13 +1208,19 @@ def test_a_wait_on_its_own_pull_request_does_not_hide_ready_for_merge():
     since = (datetime.now(UTC) - timedelta(minutes=30)).timestamp()
     tests = {"hold": {"why": "x", "words": "no test run started", "since": since}}
     assert "— no test run started," in _derived_with_reviews({}, waits=own, entry=tests).line
-    told = {**tests, "findings": {"at": since + 60, "told": True}}
-    assert ", sent to the agent, until" in _derived_with_reviews({}, waits=own, entry=told).line
-    lost = {**tests, "findings": {"at": since + 60, "told": False}}
-    assert "not sent: no chat owns it" in _derived_with_reviews({}, waits=own, entry=lost).line
-    # Findings from before the hold moved (a push since) are answered.
-    old = {**tests, "findings": {"at": since - 60, "told": False}}
-    assert "findings" not in _derived_with_reviews({}, waits=own, entry=old).line
+    after = datetime.fromtimestamp(since + 60, UTC)
+    told = [_event("changes", "a" * 40, after, told=True)]
+    found = _derived_with_reviews({}, waits=own, entry=tests, history=told)
+    assert ", sent to the agent, until" in found.line
+    lost = [_event("findings", "a" * 40, after, told=False)]
+    found = _derived_with_reviews({}, waits=own, entry=tests, history=lost)
+    assert "not sent: no chat owns it" in found.line
+    # Findings from before the hold moved are answered; findings at another head say nothing.
+    old = [_event("changes", "a" * 40, datetime.fromtimestamp(since - 60, UTC))]
+    assert "findings" not in _derived_with_reviews({}, waits=own, entry=tests, history=old).line
+    moved = [_event("changes", "b" * 40, after, told=True)]
+    found = _derived_with_reviews({}, waits=own, entry=tests, history=moved)
+    assert "asked for changes" not in found.line
     # #3097: store#3553 was reviewed and green, and held by the spec-only label.
     held = {"hold": {"why": "y", "words": "held: spec-only label", "person": True, "since": since}}
     found = _derived_with_reviews({}, waits=own, entry=held)
@@ -1065,6 +1232,8 @@ def test_a_wait_on_its_own_pull_request_does_not_hide_ready_for_merge():
         wait(KIND_PULL_REQUEST, number=10),
         wait(KIND_PULL_REQUEST, repository="eerovil/other"),
         wait(KIND_TIME, repository="", number=None, note="the render"),
+        wait(KIND_COMMIT, number=None, sha="b" * 12),
+        wait(KIND_COMMIT, repository="eerovil/other", number=None, sha="a" * 12),
     ):
         assert _derived_with_reviews({}, awaiting=awaiting, waits=(other,)).kind == WAITING
 
@@ -1538,10 +1707,19 @@ def test_no_ledger_no_request(tmp_path):
 def test_in_review_at_the_newest_recorded_head_when_the_cards_head_lags():
     """#2943: my-tasks#36 read Stopped while review chat #5151 was open at PR #37's
     current head, because the card's cached head had not caught up with the push yet."""
-    reviewing = {("eerovil/agentdeck", 9): (_open("9b421fca4333", chat=5151, newest=True),)}
+    reviewing = {("eerovil/agentdeck", 9): (_open("9b421fca4333" + "0" * 28, chat=5151),)}
     assert _derived_with_reviews(reviewing, head="de10ceba8af9" + "0" * 28).kind == REVIEW
     # And with no cached head at all.
     assert _derived_with_reviews(reviewing, head="").kind == REVIEW
+    # #3956: never a verdict, though: the newer head's pass is not the card's head's.
+    passes = {"eerovil/agentdeck#9": {"head": "9b421fca4333" + "0" * 28, "at": AT.timestamp()}}
+    awaiting = {"eerovil/agentdeck#9": "de10ceba8af9" + "0" * 28}
+    found = _derived_with_reviews({}, head=awaiting["eerovil/agentdeck#9"], passes=passes)
+    assert found.kind == ENDED
+    # Nor does an ask at an older head than the card's newest row stand in for it.
+    newer = [_event("changes", "de10ceba8af9" + "0" * 28, AT + timedelta(minutes=5))]
+    found = _derived_with_reviews(reviewing, head="de10ceba8af9" + "0" * 28, history=newer)
+    assert found.kind == ENDED
 
 
 def test_in_review_says_since_when_and_turns_to_needs_you_once_nobody_reviews():
@@ -1562,7 +1740,7 @@ def test_in_review_says_since_when_and_turns_to_needs_you_once_nobody_reviews():
     assert story.headline == "Needs you" and story.summary.startswith("no reviewer since")
     # Still inside the window: in review, since the chat opened, and it flips by itself.
     soon = now + timedelta(minutes=5)
-    fresh = replace(quiet, stuck_at=soon)
+    fresh = (quiet[0], replace(quiet[1], stuck_at=soon))
     found = _derived_with_reviews({("eerovil/agentdeck", 9): (fresh,)})
     assert found.kind == REVIEW and found.line.startswith("In review — since ")
     assert found.deadline == soon
@@ -1579,6 +1757,21 @@ def test_the_stuck_rule_on_its_own():
     )
     assert found.kind == REVIEW_STUCK
     assert found.line == "Needs you — no reviewer since 09:40"
+    # #3903: a ready head nothing started a review of, not even the router's backstop.
+    found = status(review_unstarted=(9, "abcdef1234567890"))
+    assert found.kind == REVIEW_STUCK and found.pr == 9 and found.review_chat is None
+    assert found.line == "Needs you — ready at abcdef1, no review started"
+    assert derived_story(card(derived=found)).you == "Start its review from the Work page"
+    # Another pull request of the Work under review does not hide it (#3903 review).
+    found = status(review_pr=8, review_since=AT, review_unstarted=(9, "abcdef1234567890"))
+    assert found.kind == REVIEW_STUCK and found.pr == 9
+    # The card reads it from its open ready head's history (#3956): until anything after it.
+    unstarted = [_event("unstarted", "a" * 40, AT)]
+    found = _derived_with_reviews({}, history=unstarted)
+    assert found.kind == REVIEW_STUCK and found.pr == 9
+    assert _derived_with_reviews({}, history=unstarted, draft=True).kind != REVIEW_STUCK
+    started = [*unstarted, _event("asked", "a" * 40, datetime.now(UTC))]
+    assert _derived_with_reviews({}, history=started).kind == REVIEW
     # #2974: a reviewer that ran and stopped (its chat labelled blocked) is not "no reviewer".
     found = status(
         review_pr=9, review_since=AT, review_active=AT, review_stuck_at=stuck_at,
@@ -1626,39 +1819,37 @@ def test_the_stuck_rule_on_its_own():
     assert gone.kind not in {REVIEW, REVIEW_QUEUED, REVIEW_STUCK}
 
 
-def test_open_review_chats_are_read_by_the_pull_request_they_cover():
+@private_feature(_chat_board)
+def test_review_chats_are_read_by_number_open_or_closed():
+    """#3956: which pull request and head a chat is about is the review history's; the board
+    says only whether it is still open."""
     from agentdeck.chat_board import ChatRow
     from agentdeck.web import work_view
 
     rows = {
         5: ChatRow(number=5, title="Review eerovil/agentdeck#9", state="open"),
         6: ChatRow(number=6, title="Review eerovil/agentdeck#9", state="closed"),
+        7: ChatRow(number=7, title="Fix eerovil/agentdeck#9", state="open"),
     }
-    heads = {5: {("eerovil/agentdeck", 9): "a" * 40}, 6: {("eerovil/agentdeck", 9): "b" * 40}}
     service = SimpleNamespace(board=SimpleNamespace(rows=rows))
     app = SimpleNamespace(state=SimpleNamespace())
     original = work_view.chat_board_service
     work_view.chat_board_service = lambda state: service
     try:
-        opened = work_view._chat_reviews(app, heads, state="open")
-        closed = work_view._chat_reviews(app, heads)
+        found = work_view._review_chats(app)
     finally:
         work_view.chat_board_service = original
-    assert opened == {("eerovil/agentdeck", 9): ("a" * 40,)}
-    assert closed == {("eerovil/agentdeck", 9): ("b" * 40,)}
+    assert set(found) == {5, 6} and found[5].chat == 5 and found[6] is None
 
 
 @private_feature(_chat_board)
 def test_open_review_chats_carry_their_opening_activity_and_quiet_moment():
-    """#2943: what the In review line reads — when the chat opened, its last sign of a
-    reviewer (the chat's own activity or a fallback start), and whether its head is the
-    newest the deck recorded for that pull request."""
+    """#2943: what the In review line reads — when the chat opened and its last sign of a
+    reviewer (the chat's own activity or a fallback start), by the chat's number."""
     from agentdeck.chat_board import ChatBoard, ChatRow
     from agentdeck.chat_review import StartState
     from agentdeck.web import work_view
 
-    pull = ("eerovil/agentdeck", 9)
-    stopped = ("eerovil/agentdeck", 12)
     rows = {
         5: ChatRow(
             number=5,
@@ -1685,12 +1876,6 @@ def test_open_review_chats_carry_their_opening_activity_and_quiet_moment():
     }
     gave_up = datetime.now(UTC).replace(microsecond=0) - timedelta(minutes=1)
     endings = {8: ("gave_up", gave_up.timestamp())}
-    other = ("eerovil/agentdeck", 10)
-    asking = ("eerovil/agentdeck", 13)
-    heads = {
-        4: {asking: "e" * 40},
-        5: {pull: "a" * 40}, 6: {stopped: "b" * 40}, 7: {pull: "c" * 40}, 8: {other: "d" * 40}
-    }
     last_start = datetime(2026, 10, 12, 17, 37, tzinfo=UTC)
     fallback = SimpleNamespace(
         enabled=True,
@@ -1718,11 +1903,11 @@ def test_open_review_chats_carry_their_opening_activity_and_quiet_moment():
     board.unblocked = {7: 20.0}
     work_view.chat_board_service = lambda state: SimpleNamespace(board=board)
     try:
-        found = work_view._open_reviews(app, heads)
+        found = work_view._review_chats(app)
     finally:
         work_view.chat_board_service = original
     # #3356: our own reviewer stopped it, so it is stuck at once, with the reason it gave.
-    [ours] = found[stopped]
+    ours = found[6]
     assert ours.stopped_by_ours and ours.held_why == "Unable to publish findings."
     assert ours.stuck_at == ours.active_at == datetime(2026, 10, 12, 17, 40, tzinfo=UTC)
     # A person's own `blocked` after our reviewer ended, with no `Blocked:` since: not failed.
@@ -1730,7 +1915,7 @@ def test_open_review_chats_carry_their_opening_activity_and_quiet_moment():
     board.blocks[6] = [[1, "Unable to publish findings.", last_start.timestamp() - 60]]
     work_view.chat_board_service = lambda state: SimpleNamespace(board=board)
     try:
-        [manual] = work_view._open_reviews(app, heads)[stopped]
+        manual = work_view._review_chats(app)[6]
     finally:
         work_view.chat_board_service = original
     assert manual.held and not manual.stopped_by_ours
@@ -1738,19 +1923,19 @@ def test_open_review_chats_carry_their_opening_activity_and_quiet_moment():
     del board.blocks[6]  # and with no `Blocked:` comment at all
     work_view.chat_board_service = lambda state: SimpleNamespace(board=board)
     try:
-        [bare] = work_view._open_reviews(app, heads)[stopped]
+        bare = work_view._review_chats(app)[6]
     finally:
         work_view.chat_board_service = original
     assert bare.held and not bare.stopped_by_ours and bare.held_why == ""
-    [waiting_on_you] = found[asking]
+    waiting_on_you = found[4]
     assert waiting_on_you.held and not waiting_on_you.stopped_by_ours
     assert waiting_on_you.stuck_at == waiting_on_you.active_at + timedelta(minutes=30)
     # The give-up's next chat is the deck's to open: still in review until it tries no more.
-    [reopening] = found[other]
-    assert reopening.chat == 8 and reopening.newest and reopening.stuck_at is None
+    reopening = found[8]
+    assert reopening.chat == 8 and reopening.stuck_at is None
     assert reopening.active_at == gave_up and reopening.reopen_until == gave_up + timedelta(hours=1)
-    quiet, running = found[pull]
-    assert (quiet.chat, quiet.newest, running.chat, running.newest) == (5, False, 7, True)
+    quiet, running = found[5], found[7]
+    assert (quiet.chat, running.chat) == (5, 7)
     assert quiet.opened_at == datetime(2026, 10, 12, 17, 17, 44, tzinfo=UTC)
     assert quiet.active_at == last_start and not quiet.reviewing
     assert quiet.stuck_at == last_start + timedelta(minutes=30)
@@ -1765,10 +1950,10 @@ def test_open_review_chats_carry_their_opening_activity_and_quiet_moment():
     app.state.review_fallback = None
     work_view.chat_board_service = lambda state: SimpleNamespace(board=board)
     try:
-        found = work_view._open_reviews(app, heads)
+        found = work_view._review_chats(app)
     finally:
         work_view.chat_board_service = original
-    assert all(review.stuck_at is None for review in found[pull])
+    assert found[5].stuck_at is None and found[7].stuck_at is None and found[8] is None
 
 
 def test_a_review_going_quiet_is_a_moment_the_card_cache_and_refresher_wake_for():
@@ -1805,6 +1990,64 @@ def test_the_stall_flag_is_read_as_the_provider_set_it():
     assert derived_for(_app(), snapshot, WORK, card()).kind == STALLED
     session.stalled = False
     assert derived_for(_app(), snapshot, WORK, card()).kind == UNFINISHED
+
+
+def test_a_chat_that_moved_on_to_another_work_leaves_a_closed_one_closed():
+    """#3964: one chat asked for v2 and v3 after v1 merged showed "Working" on all three."""
+    from agentdeck.web.work_view import derived_for
+
+    def output(number, state):
+        return OutputFact(
+            url=f"https://github.com/eerovil/agentdeck/pull/{number}",
+            repository="eerovil/agentdeck",
+            number=number,
+            found_by="registered",
+            state=state,
+        )
+
+    other = WorkRef("eerovil/agentdeck", 2896)
+    joined = [WORK, other]
+    state = _state(_session(stalled=True))
+    projection = state.work_projection()
+    projection.works_for_chat = lambda chat_id: tuple(joined)
+    snapshot = SimpleNamespace(state=state, presentation=None, projection=projection)
+    merged = (output(9, "merged"),)
+    closed = card(outputs=merged, awaiting_finish=True, finished_at=AT)
+    assert derived_for(_app(), snapshot, WORK, closed).kind == CLOSED
+    # Its own pull request still open, or the chat in this Work alone: the turn is this Work's.
+    pending = card(outputs=(output(9, "open"),), awaiting_finish=True, finished_at=AT)
+    assert derived_for(_app(), snapshot, WORK, pending).kind == STALLED
+    assert derived_for(_app(), snapshot, WORK, card(outputs=merged)).kind == STALLED
+    # A message just handed to the idle chat starts its turn on the other Work, not this one.
+    state.sessions["chat-a"].stalled = False
+    snapshot.message_handoffs = {"chat-a": datetime.now(UTC)}
+    assert derived_for(_app(), snapshot, WORK, closed).kind == CLOSED
+    assert derived_for(_app(), snapshot, WORK, card(outputs=merged)).kind == WORKING
+    # Its live check is still asked: the chat's wait on the other Work's pull request is not
+    # this Work's, and a deploy wait on its own merged head is (review of #3965).
+    snapshot.message_handoffs = {}
+    from agentdeck.wake_on import KIND_COMMIT, KIND_PULL_REQUEST
+
+    def wait(kind, **fields):
+        base = dict(kind=kind, repository="eerovil/agentdeck", number=0, sha="",
+                    deadline=None, target="")
+        return SimpleNamespace(**{**base, **fields})
+
+    waits = [wait(KIND_PULL_REQUEST, number=10, target="#10")]
+    live = _app()
+    live.state.wake_on = SimpleNamespace(registry=SimpleNamespace(for_chat=lambda c: waits))
+    asked = {"live_check_asked": {"at": AT.timestamp()}}
+    live.state.work_release = SimpleNamespace(store=SimpleNamespace(get=lambda w: asked))
+    headed = card(outputs=(replace(output(9, "merged"), head="abc1234def"),),
+                  awaiting_finish=True, finished_at=AT)
+    found = derived_for(live, snapshot, WORK, headed)
+    assert "pull request" not in found.line and found.kind != WORKING
+    waits.append(wait(KIND_COMMIT, sha="abc1234", target="deploy of abc1234"))
+    found = derived_for(live, snapshot, WORK, headed)
+    assert found.line == "Live checking — waiting on deploy of abc1234"
+    state.sessions["chat-a"].stalled = True
+    joined.pop()
+    assert derived_for(_app(), snapshot, WORK, closed).kind == STALLED
 
 
 @pytest.mark.parametrize(
@@ -1855,7 +2098,16 @@ def test_ready_for_merge_names_the_clean_review_behind_it():
     bare = _derived_with_reviews({}, awaiting=awaiting, passes=passes)
     assert bare.summary == f"reviewed clean {clock(at)}" and not bare.review_ref
     assert derived_story(card(derived=bare)).summary_href == ""
-    assert _derived_with_reviews({}, awaiting=awaiting).summary == ""
+    # #3956 review: a Ready with no pass standing at its head is not Ready, whatever the
+    # release's record still says: pass, a review asked again, its chat closed with no verdict.
+    assert _derived_with_reviews({}, awaiting=awaiting, passes={}).kind != READY
+    reasked = [
+        _event("pass", "a" * 40, at),
+        _event("asked", "a" * 40, at + timedelta(minutes=1)),
+        _event("chat", "a" * 40, at + timedelta(minutes=1), chat="eerovil/review-chats#9"),
+    ]
+    found = _derived_with_reviews({}, awaiting=awaiting, passes={}, history=reasked, closed=(9,))
+    assert found.kind != READY
 
 
 def test_no_derived_line_names_a_pull_request():
@@ -1938,6 +2190,45 @@ def test_a_manifests_paused_label_is_part_of_the_cached_cards_key(monkeypatch):
     before = key()
     label["value"] = "on-hold"
     assert key() != before
+
+
+def test_a_pass_reads_the_deck_wide_review_inputs_once_not_once_per_card():
+    """#4014: every card's key read all 8,324 review chats' ``review_started``, about half
+    the web loop's CPU. Once per pass now; a card's key holds the same values."""
+    from agentdeck.web import work_view
+
+    calls = []
+
+    def review_started(chat):
+        calls.append(chat)
+        return chat % 2 == 0
+
+    app = _app()
+    app.state.work_endings = SimpleNamespace(
+        get=lambda work_id: (None, None), review_started=review_started
+    )
+    snapshot = SimpleNamespace(
+        state=SimpleNamespace(sessions={}),
+        projection=SimpleNamespace(get=lambda ref: None),
+        review_chats={number: None for number in (7, 3, 4, 1)},
+        review_events={"a#1": (SimpleNamespace(seq=5),), "a#2": (SimpleNamespace(seq=9),)},
+    )
+    refs = [WorkRef("eerovil/agentdeck", number) for number in range(1, 21)]
+    outside = work_view._derived_key(app, snapshot, refs[0])
+    assert len(calls) == 4
+    calls.clear()
+    token = work_view._PASS_REPOS.set({})
+    try:
+        keys = [work_view._derived_key(app, snapshot, ref) for ref in refs]
+        # Another snapshot in the same pass reads its own review chats, not the memo.
+        other = SimpleNamespace(**{**vars(snapshot), "review_chats": {2: None}})
+        assert work_view._derived_key(app, other, refs[0])[2] == ((2, None),)
+    finally:
+        work_view._PASS_REPOS.reset(token)
+    assert sorted(calls) == [1, 2, 3, 4, 7], "one call per review chat, not per card"
+    assert keys[0] == outside
+    assert outside[2] == ((1, None), (3, None), (4, None), (7, None))
+    assert outside[3] == (2, 9) and outside[6] == (4,)
 
 
 def test_a_stopped_work_whose_issue_still_reads_open_is_read_again():

@@ -1193,6 +1193,69 @@ def test_claude_queued_command_attachment_reconciles_pending_message():
     assert item.state == "observed"
 
 
+def test_claude_line_merging_queued_sends_reconciles_each_of_them():
+    """Two sends that queued behind a busy turn come back as one line (#3931).
+
+    The shape is the one Claude Code wrote in a real chat: a text part per
+    message, the first still ending in its newline. Each send is linked, none is
+    left to read "never acknowledged", and the line names both for the page.
+    """
+    from agentdeck.providers.claude_code.transcripts import _event_from_line
+
+    created = datetime(2026, 11, 1, 2, 19, 40, tzinfo=UTC)
+    reviewer = "AgentDeck event: the reviewer posted on issue o/r#203:\n\n/reviewed no-code\n"
+    job = "Your queued job f57357310ecf finished successfully.\nExit code: 0"
+    first = QueuedMessage(
+        1, reviewer, client_action_id="action-one", state="accepted",
+        created_at=created, after_seq=228,
+    )
+    second = QueuedMessage(2, job, state="accepted", created_at=created, after_seq=228)
+    bystander = QueuedMessage(3, "not in it", state="accepted", created_at=created)
+    event = _event_from_line(
+        230,
+        {
+            "type": "user",
+            "timestamp": "2026-11-01T02:19:46.577Z",
+            "message": {
+                "role": "user",
+                "content": [{"type": "text", "text": reviewer}, {"type": "text", "text": job}],
+            },
+        },
+    )
+    service = InjectionService(InjectConfig(enabled=True))
+    service._items["claude_code:test:sid"] = [first, second, bystander]
+
+    links = service.observe_transcript("claude_code:test:sid", [event])
+
+    assert (first.state, second.state, bystander.state) == ("observed", "observed", "accepted")
+    assert (links[230].id, links[230].also) == (1, ((2, None),))
+    assert service.observe_transcript("claude_code:test:sid", [event])[230] == links[230]
+    # A send whose own text is the whole line still matches it whole.
+    whole = QueuedMessage(4, f"{reviewer}\n{job}".strip(), state="accepted", created_at=created)
+    service._items["claude_code:test:other"] = [whole]
+    assert service.observe_transcript("claude_code:test:other", [event]) == {230: whole}
+    # Read inside an open turn, in the other order: a queued_command attachment.
+    # A send with an upload never matches a part, which cannot say whose it was.
+    attached = _event_from_line(
+        231,
+        {
+            "type": "attachment",
+            "timestamp": "2026-11-01T02:19:46.577Z",
+            "attachment": {
+                "type": "queued_command",
+                "prompt": [{"type": "text", "text": job}, {"type": "text", "text": reviewer}],
+            },
+        },
+    )
+    later = QueuedMessage(5, reviewer, state="accepted", created_at=created)
+    upload = QueuedMessage(
+        6, job, files=(Path("/nowhere"),), state="accepted", created_at=created
+    )
+    service._items["claude_code:test:third"] = [upload, later]
+    links = service.observe_transcript("claude_code:test:third", [attached])
+    assert (links[231], later.state, upload.state) == (later, "observed", "accepted")
+
+
 async def test_delivery_without_transcript_reaches_terminal_state(tmp_path):
     class Provider:
         async def inject(self, account, session, message, *, timeout_s):
@@ -5712,6 +5775,20 @@ async def test_owned_session_question_shows_stop_beside_send(tmp_path, monkeypat
             "answers": {"database": ["Postgres"]},
             "decision": "accept",
         }
+        # #3876: an answer sent while voice mode reads aloud asks for a spoken reply,
+        # but a secret answer is never changed.
+        from agentdeck.voice_mode import ANSWER_LINE_FI
+
+        voiced = {"interaction_id": "opaque-token", "answer__database": "Postgres",
+                  "decision": "accept", "voice_answer": "fi"}
+        headers = {"origin": "http://test"}
+        await client.post("/sessions/codex:test:sid/interaction", data=voiced, headers=headers)
+        assert answered["answers"] == {"database": [f"Postgres\n\n{ANSWER_LINE_FI}"]}
+        asked = interaction
+        interaction = replace(asked, questions=(replace(asked.questions[0], secret=True),))
+        await client.post("/sessions/codex:test:sid/interaction", data=voiced, headers=headers)
+        assert answered["answers"] == {"database": ["Postgres"]}
+        interaction = asked
         steer = await client.post(
             "/sessions/codex:test:sid/steer",
             data={"message": "Use SQLite instead"},
