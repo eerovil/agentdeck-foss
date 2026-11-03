@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import re
+import subprocess
+import sys
+import time
 from pathlib import Path
 
 import conftest
@@ -10,7 +13,9 @@ import pytest
 from conftest import (
     TIME_CAP_ENV,
     TIME_WARN_ENV,
+    charged_wait,
     cpu_wait_s,
+    machine_cpu_s,
     over_time_cap,
     seconds_from_env,
     slow_test_summary,
@@ -33,6 +38,51 @@ def test_time_spent_waiting_for_a_cpu_is_not_charged_to_the_test() -> None:
     # A wait the kernel could not report never makes a test look slower.
     assert "took 1.20 s" in over_time_cap("tests/t.py::x", [(1.2, -1.0)], 1.0)
     assert cpu_wait_s() >= 0.0
+
+
+def test_the_wait_of_the_processes_a_test_starts_is_not_charged_either(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A deploy script's processes used 0.2 s of CPU on a node whose tasks waited 3 s
+    # for every second they ran; the test's own thread, blocked on them, waited only
+    # 0.03 s (#4033).
+    assert charged_wait(own=0.03, children=0.2, wait_per_run=3.0, idle=0.9) == pytest.approx(0.63)
+    # A test that sleeps uses no CPU in child processes: a busy node takes nothing off.
+    assert charged_wait(own=0.0, children=0.0, wait_per_run=9.0, idle=2.0) == 0.0
+    # Never more than the time the test was not running itself.
+    assert charged_wait(own=0.03, children=0.4, wait_per_run=9.0, idle=0.5) == 0.5
+    assert charged_wait(own=0.03, children=0.4, wait_per_run=9.0, idle=-0.1) == 0.03
+
+    assert machine_cpu_s(tmp_path, {0}) == (0.0, 0.0)
+    (tmp_path / "proc").mkdir()
+    (tmp_path / "proc/schedstat").write_text(
+        "version 15\ntimestamp 5740416880\n"
+        "cpu0 0 0 0 0 0 0 3000000000 1000000000 5\n"
+        "domain0 0000000f 0 0 0 0 0 0 0 0 0 0\n"
+        "cpu1 0 0 0 0 0 0 1000000000 500000000 5\n"
+    )
+    assert machine_cpu_s(tmp_path, {0, 1}) == (4.0, 1.5)
+    assert machine_cpu_s(tmp_path, {1}) == (1.0, 0.5)
+    # macOS has no CPU affinity: plain wall time, not a crash.
+    monkeypatch.delattr(conftest.os, "sched_getaffinity", raising=False)
+    assert machine_cpu_s(tmp_path) == (0.0, 0.0)
+
+
+def test_a_sleeping_test_beside_busy_processes_is_charged_its_sleep() -> None:
+    # Two busy processes, standing in for the run's other workers, while this test only
+    # sleeps. Each is started inside the `try`, so a failed start still stops the others.
+    hogs: list[subprocess.Popen] = []
+    try:
+        for _ in range(2):
+            hogs.append(subprocess.Popen([sys.executable, "-c", "while True: pass"]))
+        start = conftest._clock()
+        time.sleep(0.2)
+        wall, waited = conftest.since(start)
+    finally:
+        for hog in hogs:
+            hog.kill()
+            hog.wait()
+    assert wall - waited >= 0.19
 
 
 def test_tests_over_the_warning_are_named_slowest_first() -> None:

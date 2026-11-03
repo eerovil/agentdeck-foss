@@ -76,6 +76,7 @@ _SHIM_ENVIRONMENT = (
     "AGENTDECK_GH_CONSUMER",
     "AGENTDECK_GH_CORE_FLOOR",
     "AGENTDECK_GH_FETCH_BUDGET",
+    "AGENTDECK_GH_FETCH_BURST",
     "AGENTDECK_GH_FRESH",
     "AGENTDECK_GH_GRAPHQL_FLOOR",
     "AGENTDECK_GH_SHIM_ACTIVE",
@@ -284,13 +285,38 @@ def test_the_hosts_own_shim_environment_never_reaches_a_test():
 
 
 def test_an_exhausted_session_bucket_stops_that_worker_only(shim, monkeypatch, capsys):
+    """The small cap holds until real headers show headroom, then lifts to the burst (#4052)."""
     monkeypatch.setenv("AGENTDECK_GH_FETCH_BUDGET", "2")
+    monkeypatch.setenv("AGENTDECK_GH_FETCH_BURST", "3")
 
+    # Cold start: PLENTY comes only from the untrusted /rate_limit estimate.
     assert main.main(["issue", "view", "1"]) == 0
     assert main.main(["issue", "view", "2"]) == 0
     refused = main.main(["issue", "view", "3"])
     assert refused == main.EXIT_REFUSED
-    assert "already made 2 live GitHub reads" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "already made 2 live GitHub reads" in err
+    assert "counts calls, not items" in err and "--limit 200" in err
+
+    header = rate_limits.HEADER_SOURCE
+    plenty = limits.RateLimits(core=4000, graphql=4000, core_source=header, graphql_source=header)
+    monkeypatch.setattr(main, "_quota", lambda *_: plenty)
+    assert main.main(["issue", "view", "3"]) == 0
+    assert main.main(["issue", "view", "4"]) == main.EXIT_REFUSED
+    assert "already made 3 live GitHub reads" in capsys.readouterr().err
+
+    path = limits.Path(os.environ["AGENTDECK_GITHUB_CACHE"])
+    budget = limits.FetchBudget(path)
+    tight = limits.RateLimits(core=2999, graphql=4000, core_source=header, graphql_source=header)
+    assert (budget.cap(plenty), budget.cap(tight)) == (3, 2)
+    # Unknown quota is not headroom, and a burst set below the base never shrinks it.
+    assert budget.cap(limits.RateLimits(core=4000, core_source=header)) == 2
+    assert limits.FetchBudget(path, burst=1).cap(plenty) == 2
+    # An operator's own budget with no burst of its own stays the ceiling; with none, 120/600.
+    monkeypatch.delenv("AGENTDECK_GH_FETCH_BURST")
+    assert limits.FetchBudget(path).cap(plenty) == 2
+    monkeypatch.delenv("AGENTDECK_GH_FETCH_BUDGET")
+    assert limits.FetchBudget(path).cap(plenty) == 600
 
     monkeypatch.setenv("AGENTDECK_SESSION_KEY", "acct:other-session")
     assert main.main(["issue", "view", "3"]) == 0

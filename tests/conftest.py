@@ -18,6 +18,7 @@ import json
 import math
 import os
 import re
+import resource
 import shutil
 import tempfile
 import time
@@ -1035,6 +1036,64 @@ def cpu_wait_s() -> float:
         return 0.0
 
 
+def machine_cpu_s(root: Path = Path("/"), cpus: set[int] | None = None) -> tuple[float, float]:
+    """Seconds the tasks on the CPUs this process may use have spent running, and waiting.
+
+    The kernel's per-CPU totals (`/proc/schedstat`, the seventh and eighth number of
+    each `cpu` line), summed over `cpus`, by default this process's CPU affinity. A
+    pod sees its whole node here. (0.0, 0.0) where the kernel does not keep them.
+    """
+    try:
+        if cpus is None:
+            cpus = os.sched_getaffinity(0)  # Linux only, like the counters it reads.
+        run = wait = 0
+        for line in (root / "proc/schedstat").read_text().splitlines():
+            fields = line.split()
+            if line.startswith("cpu") and int(fields[0][3:]) in cpus:
+                run, wait = run + int(fields[7]), wait + int(fields[8])
+        return run / 1e9, wait / 1e9
+    except (AttributeError, OSError, IndexError, ValueError):
+        return 0.0, 0.0
+
+
+def charged_wait(own: float, children: float, wait_per_run: float, idle: float) -> float:
+    """The CPU wait taken off a test's time.
+
+    Its own thread's, measured, plus its finished child processes', which the kernel
+    does not keep once they exit: estimated as their CPU time times how long the
+    machine's tasks waited per second they ran over the same time. A test that runs
+    a shell script spends its time in them (#4033). A test that sleeps uses no CPU
+    there, so a busy machine takes nothing off its sleep. Never more than the time
+    the test was not using a CPU itself (`idle`).
+
+    An estimate, from the machine and not this test's own processes, so it has a
+    known gap the owner accepted (#4033): on a crowded machine a test whose child
+    processes use some CPU and that then sleeps is let off part of its sleep, and
+    can pass the cap when both timed runs are crowded.
+    """
+    return max(own, min(own + children * wait_per_run, idle))
+
+
+def _clock() -> tuple[float, ...]:
+    children = resource.getrusage(resource.RUSAGE_CHILDREN)
+    return (
+        time.perf_counter(),
+        cpu_wait_s(),
+        time.thread_time(),
+        children.ru_utime + children.ru_stime,
+        *machine_cpu_s(),
+    )
+
+
+def since(start: tuple[float, ...]) -> tuple[float, float]:
+    """(wall, waited for a CPU) seconds since `start`, a `_clock()` reading."""
+    wall, own, ran, children, machine_run, machine_wait = (
+        now - then for then, now in zip(start, _clock(), strict=True)
+    )
+    wait_per_run = machine_wait / machine_run if machine_run > 0 else 0.0
+    return wall, charged_wait(own, children, wait_per_run, wall - ran - children)
+
+
 def unloaded_s(wall: float, waited: float) -> float:
     """How long a test's body would take with the pod to itself.
 
@@ -1078,12 +1137,12 @@ def retimed(run) -> tuple[float, float] | None:
     A second run that raises proves nothing about the test's speed — its fixtures
     were built for one run — so the caller never fails the test on it.
     """
-    before, start = cpu_wait_s(), time.perf_counter()
+    start = _clock()
     try:
         run()
     except _RERUN_RAISES:
         return None
-    return time.perf_counter() - start, cpu_wait_s() - before
+    return since(start)
 
 
 # `trylast`, so this wraps the body inside pytest's own output capture: the second run then
@@ -1097,9 +1156,9 @@ def pytest_runtest_call(item: pytest.Item):
     if limits == (None, None):
         yield
         return
-    before, start = cpu_wait_s(), time.perf_counter()
+    start = _clock()
     outcome = yield
-    timings = [(time.perf_counter() - start, cpu_wait_s() - before)]
+    timings = [since(start)]
     cap = limits[0]
     if outcome.excinfo is None and cap is not None and unloaded_s(*timings[0]) > cap:
         # Once more, with the same fixtures.

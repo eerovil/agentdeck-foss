@@ -511,7 +511,14 @@ BUDGET = "budget"
 GITHUB = "github"
 _REFUSAL_ADVICE = {
     QUOTA: "This is unknown, not empty: wait for quota rather than retrying.",
-    BUDGET: "This is unknown, not empty: wait for the hour to roll over rather than retrying.",
+    # The limit counts calls, not items (#4052): the way past it is fewer, bigger reads.
+    BUDGET: (
+        "This is unknown, not empty, and this chat has no live reads left until the hour "
+        "rolls over: wait for that rather than retrying. The limit counts calls, not items, "
+        "so read the rest many at once, for example `gh issue list -R <owner>/<repo> "
+        "--state all --search 'closed:>=YYYY-MM-DD' --json number,title,body,comments "
+        "--limit 200`, instead of one `view` per item. Helper subagents share this chat's limit."
+    ),
     GITHUB: (
         "GitHub was slow or failing for this read just now, and quota is fine. "
         "This is unknown, not empty: run it once more in a minute."
@@ -563,13 +570,14 @@ def _read(
     # for every other worker — so one session's exhausted bucket would fence
     # the host.  Out here a cache hit stays free, uncounted and ungated.
     if fresh or not cache.is_fresh(decision.key):
-        blocked = _quota(cache, environment).below_floor()
+        quota = _quota(cache, environment)
+        blocked = quota.below_floor()
         if blocked:
             return _refuse(
                 cache, decision, f"{blocked}, below the worker floor", environment=environment
             )
         budget = limits.FetchBudget(cache.path)
-        allowed, spent = budget.spend(limits.session_identity(environment))
+        allowed, spent = budget.spend(limits.session_identity(environment), cap=budget.cap(quota))
         if not allowed:
             return _refuse(
                 cache,

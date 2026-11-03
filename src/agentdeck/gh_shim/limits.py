@@ -13,7 +13,11 @@ So there are two gates, and they answer different failures:
   poller still has its whole reserve intact.  The ordering is the point: the
   poller must be the last thing standing, not the first thing throttled.
 * A **per-session token bucket**, because one runaway worker can drain
-  everything down to a shared floor by itself without ever crossing it.
+  everything down to a shared floor by itself without ever crossing it.  Its
+  size follows the quota left (#4052): a flat 120 stalled a chat reading a few
+  hundred issues while the account had thousands of calls to spare, so a chat
+  may go on to a larger cap while there is plenty of headroom, and falls back
+  to the small one once quota gets tight.
 
 Both live in the same SQLite file as the metadata cache.  A shim invocation is
 a short-lived process and cannot hold this in memory the way ``GitHubAdapter``
@@ -47,6 +51,13 @@ DEFAULT_GRAPHQL_FLOOR = 500
 DEFAULT_BUCKET_CAPACITY = 120
 DEFAULT_BUCKET_WINDOW_S = 3600.0
 
+# The larger cap a session may spend up to while the account has headroom well
+# above the floors (#4052).  A loop still stops here, at about a tenth of one
+# token's hourly quota, and at DEFAULT_BUCKET_CAPACITY once headroom is gone.
+DEFAULT_BURST_CAPACITY = 600
+BURST_CORE_HEADROOM = 3000
+BURST_GRAPHQL_HEADROOM = 1500
+
 # How long the shared view of remaining quota may be reused. The probes are
 # real requests, so this bounds both latency and their own small quota cost.
 LIMITS_TTL_S = 30.0
@@ -78,6 +89,17 @@ def bucket_capacity() -> int:
     return _non_negative_int("AGENTDECK_GH_FETCH_BUDGET", DEFAULT_BUCKET_CAPACITY)
 
 
+def burst_capacity() -> int:
+    """The larger cap, which an operator's own smaller budget still bounds.
+
+    An ``AGENTDECK_GH_FETCH_BUDGET`` set with no burst of its own is a ceiling
+    the operator chose, so the default burst must not quietly lift it.
+    """
+    if "AGENTDECK_GH_FETCH_BURST" not in os.environ and "AGENTDECK_GH_FETCH_BUDGET" in os.environ:
+        return bucket_capacity()
+    return _non_negative_int("AGENTDECK_GH_FETCH_BURST", DEFAULT_BURST_CAPACITY)
+
+
 @dataclass(frozen=True)
 class RateLimits:
     """Remaining quota, or the admission that we do not know it.
@@ -102,6 +124,23 @@ class RateLimits:
             source = f" ({self.graphql_source})" if self.graphql_source else ""
             return f"GraphQL quota is down to {self.graphql}{source}"
         return ""
+
+    def has_headroom(self) -> bool:
+        """Whether both resources are known, from real headers, to sit well above their floors.
+
+        Unknown is not headroom, and neither is the untrusted ``/rate_limit``
+        cold-start estimate: a session without a real reading keeps the small
+        cap rather than being licensed to spend the larger one.
+        """
+        trusted = shared_limits.HEADER_SOURCE
+        return (
+            self.core is not None
+            and self.graphql is not None
+            and self.core_source == trusted
+            and self.graphql_source == trusted
+            and self.core >= BURST_CORE_HEADROOM
+            and self.graphql >= BURST_GRAPHQL_HEADROOM
+        )
 
 
 def parse_rate_limit_headers(*responses: str) -> RateLimits:
@@ -253,10 +292,17 @@ class FetchBudget:
     calls, which a fixed window catches just as well and with one row.
     """
 
-    def __init__(self, path: Path, *, capacity: int | None = None) -> None:
+    def __init__(
+        self, path: Path, *, capacity: int | None = None, burst: int | None = None
+    ) -> None:
         self.path = path
         self.capacity = bucket_capacity() if capacity is None else capacity
+        self.burst = max(self.capacity, burst_capacity() if burst is None else burst)
         self._prepare()
+
+    def cap(self, quota: RateLimits) -> int:
+        """How many live fetches this window allows, given the quota left."""
+        return self.burst if quota.has_headroom() else self.capacity
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=2.0)
@@ -279,14 +325,21 @@ class FetchBudget:
         except sqlite3.Error as exc:
             log.debug("gh shim budget init failed: %s", exc)
 
-    def spend(self, session: str, *, now: float | None = None) -> tuple[bool, int]:
+    def spend(
+        self, session: str, *, cap: int | None = None, now: float | None = None
+    ) -> tuple[bool, int]:
         """Claim one live fetch.  Returns whether it was allowed, and the count.
+
+        ``cap`` is this claim's limit, from :meth:`cap`; the window's count is
+        shared, so a session that spent past the small cap while there was
+        headroom is refused as soon as headroom goes.
 
         A database this cannot reach must not become a fence: an unreachable
         budget allows the fetch, because refusing every read on a broken cache
         file would be a worse outage than the polling it guards against.
         """
         moment = time.time() if now is None else now
+        limit = self.capacity if cap is None else cap
         try:
             with self._connect() as connection:
                 connection.execute("BEGIN IMMEDIATE")
@@ -299,7 +352,7 @@ class FetchBudget:
                 )
                 if moment - started >= DEFAULT_BUCKET_WINDOW_S:
                     started, spent = moment, 0
-                if spent >= self.capacity:
+                if spent >= limit:
                     return (False, spent)
                 spent += 1
                 connection.execute(
