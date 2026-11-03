@@ -89,6 +89,12 @@ os.environ["AGENTDECK_WEBHOOK_STATE_DIR"] = str(Path(_scratch_share_dir) / "gith
 # Not the production switch (``[services] in_web``), so deleting the switch takes nothing
 # from the tests; the guard that the web starts none of them turns it off for its own app.
 os.environ["AGENTDECK_SERVICES_IN_PROCESS"] = "1"
+# No test may rewrite the host's `gh` or heavy-command shims (#4040). A test that spawns a
+# worker writes them through `worker_path`, pointed at the test venv's interpreter, so a
+# local run from a checkout deleted afterwards broke every worker's `gh` on the host.
+# Assigned, not defaulted: a queued suite inherits the runtime's environment.
+os.environ["AGENTDECK_GH_SHIM_DIR"] = str(Path(_scratch_share_dir) / "gh-shim")
+os.environ["AGENTDECK_HEAVY_SHIM_DIR"] = str(Path(_scratch_share_dir) / "heavy-shim")
 atexit.register(shutil.rmtree, _scratch_share_dir, ignore_errors=True)
 
 def pytest_configure(config: pytest.Config) -> None:

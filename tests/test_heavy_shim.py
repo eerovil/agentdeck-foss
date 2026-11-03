@@ -221,6 +221,27 @@ def test_every_program_a_heavy_command_starts_with_is_shadowed():
         assert program in classify.SHIMMED_PROGRAMS
 
 
+def test_no_test_rewrites_the_hosts_live_shims():
+    """#4040: both shims install into scratch by default, in a child process too."""
+    from agentdeck.gh_shim import install as gh_install
+
+    live = Path("~/.local/share/agentdeck").expanduser()
+    for directory in (gh_install.shim_dir(), install.shim_dir()):
+        assert not directory.is_relative_to(live), directory
+    child = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from agentdeck.gh_shim import install as g; from agentdeck.heavy_shim import install"
+            " as h; print(g.shim_dir(), h.shim_dir())",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert child.stdout.split() == [str(gh_install.shim_dir()), str(install.shim_dir())]
+
+
 def test_the_shim_installs_itself_first_on_a_workers_path(tmp_path, monkeypatch):
     monkeypatch.setenv(install.SHIM_DIR_ENV, str(tmp_path / "shim"))
 

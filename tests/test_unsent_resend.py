@@ -129,7 +129,7 @@ async def test_a_second_broken_connection_fails_the_send(tmp_path):
     await client.stop()
 
 
-async def test_a_fenced_send_waits_for_a_restarting_runtime_to_listen(tmp_path):
+async def test_a_fenced_send_waits_for_a_restarting_runtime_to_listen(tmp_path, monkeypatch):
     """A deploy restart leaves the socket missing for about a minute (#3567)."""
     gone = httpx.ConnectError("[Errno 2] No such file or directory")
     ok = httpx.Response(200, json={"accepted": True, "session_id": "s-1"})
@@ -143,16 +143,26 @@ async def test_a_fenced_send_waits_for_a_restarting_runtime_to_listen(tmp_path):
     assert len(posted) == 4
     await client.stop()
 
-    transport, posted = _flaky([gone] * 50)
+    # Each post takes 0.01 s on a fake clock, so the 0.03 s wait fits exactly
+    # three reposts however slow the host is (#4038).
+    clock = [0.0]
+
+    class _SlowlyGone(list):
+        def __getitem__(self, index):
+            clock[0] += 0.01
+            return gone
+
+    transport, posted = _flaky(_SlowlyGone())
+    monkeypatch.setattr(asyncio.get_running_loop(), "time", lambda: clock[0])
     client = ClaudeWorkerClient(_account(tmp_path), transport=transport)
-    client._RESTART_POLL_S = 0.01
+    client._RESTART_POLL_S = 0
     client.RUNTIME_RESTART_WAIT_S = 0.03
 
     result = await client.deliver("key-1", "hello", delivery_id="act-1")
 
     assert not result.accepted
     assert "No such file or directory" in result.reason
-    assert 2 < len(posted) < 50
+    assert len(posted) == 4
     await client.stop()
 
 
