@@ -88,6 +88,8 @@ log = logging.getLogger(__name__)
 # One JSON event per stdout line; large tool results can exceed asyncio's
 # default 64 KiB StreamReader limit (same rationale as the Codex app-server).
 STDOUT_LINE_LIMIT = 16 * 1024 * 1024
+# The CLI's own knob for the context size at which it auto-compacts (#4058).
+AUTO_COMPACT_WINDOW_ENV = "CLAUDE_CODE_AUTO_COMPACT_WINDOW"
 
 INTERRUPT_TIMEOUT_S = 15.0
 INIT_TIMEOUT_S = 30.0
@@ -792,6 +794,7 @@ class ClaudeWorkerHost:
         interactive_prompts: bool = True,
         classifier_skip_rules: list[str] | None = None,
         memory_max: str = "",
+        auto_compact_window: int = 0,
         hold_processes: bool = False,
         base_url: str | None = None,
         process_factory=None,
@@ -817,6 +820,9 @@ class ClaudeWorkerHost:
         # uncapped so a directly-constructed host — every test double — keeps the
         # plain spawn unless it opts in; the runtime passes the configured value.
         self.memory_max = memory_max
+        # Context size at which the CLI compacts (#4058); 0 leaves the CLI's default,
+        # as every directly-constructed host does unless it opts in.
+        self.auto_compact_window = auto_compact_window
         # Run each CLI under a holder so it outlives a runtime restart (#3248). Off for a
         # directly-constructed host, so a test double never starts one; the runtime turns
         # it on. It needs the worker's own scope: without one the holder would sit in the
@@ -3610,6 +3616,8 @@ class ClaudeWorkerHost:
         if rec.session_token:
             env[SESSION_TOKEN_ENV] = rec.session_token
         env[POLICY_MODE_ENV] = str((rec.command_artifacts or {}).get("mode") or "off")
+        if self.auto_compact_window:
+            env[AUTO_COMPACT_WINDOW_ENV] = str(self.auto_compact_window)
         # Reads through the caching, rate-limited `gh` rather than straight at
         # GitHub, so a worker cannot spend the reserve the poller holds for its
         # own wakes (#814). Writes still reach the real binary untouched.

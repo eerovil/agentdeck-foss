@@ -722,7 +722,7 @@ async def test_spawn_injects_agentdeck_url_but_not_session_key_when_fresh(tmp_pa
 
 
 async def test_resume_spawn_injects_session_key(tmp_path):
-    host, spawned = _host(tmp_path, base_url="http://127.0.0.1:8756")
+    host, spawned = _host(tmp_path, base_url="http://127.0.0.1:8756", auto_compact_window=200_000)
     await host.deliver("issue-1", "start", cwd=str(tmp_path), delegated=False)
     proc = spawned[0]["process"]
     proc.stdout.emit({"type": "system", "subtype": "init", "session_id": "sid-abc"})
@@ -736,14 +736,21 @@ async def test_resume_spawn_injects_session_key(tmp_path):
     env = spawned[1]["kwargs"]["env"]
     assert env["AGENTDECK_URL"] == "http://127.0.0.1:8756"
     assert env["AGENTDECK_SESSION_KEY"] == "claude_code:test:sid-abc"
+    # Both the fresh spawn and the revival compact early (#4058).
+    assert [s["kwargs"]["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] for s in spawned] == [
+        "200000",
+        "200000",
+    ]
     await host.stop()
 
 
-async def test_spawn_omits_agentdeck_url_without_base(tmp_path):
-    host, spawned = _host(tmp_path)  # no base_url configured
+async def test_spawn_omits_agentdeck_url_without_base(tmp_path, monkeypatch):
+    monkeypatch.delenv("CLAUDE_CODE_AUTO_COMPACT_WINDOW", raising=False)
+    host, spawned = _host(tmp_path)  # no base_url, no compact window configured
     await host.deliver("issue-1", "work it", cwd=str(tmp_path), delegated=False)
     env = spawned[0]["kwargs"]["env"]
     assert "AGENTDECK_URL" not in env
+    assert "CLAUDE_CODE_AUTO_COMPACT_WINDOW" not in env
     assert "AGENTDECK_SESSION_KEY" not in env
     await host.stop()
 

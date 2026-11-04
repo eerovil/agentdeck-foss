@@ -484,6 +484,13 @@ def test_the_real_gh_is_found_past_the_shims_own_directory(tmp_path, monkeypatch
 
     assert found == str(genuine)
 
+    # #4066: a shim in a directory `shim_dir` does not name (the host's, while the
+    # tests point the variable at scratch) is skipped too, not run as the real `gh`.
+    host = install.ensure_shim(tmp_path / "host-shim")
+    found = install.real_gh({"PATH": os.pathsep.join([str(host), str(elsewhere)])})
+
+    assert found == str(genuine)
+
 
 def test_an_unreadable_quota_is_unknown_and_does_not_fence_the_worker():
     assert limits.RateLimits().below_floor() == ""

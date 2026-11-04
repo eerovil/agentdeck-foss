@@ -1027,8 +1027,22 @@ def _git_contains(repo: Path, sha: str, revision: str) -> bool | None:
 _DECK_REPO = Path(__file__).resolve().parent.parent.parent
 
 
-def review_timeout_message(request: WakeRequest, minutes: int, review_chats: str = "") -> str:
-    """Send the worker to check the reviewer is moving, not just to wait again (#3389)."""
+def review_timeout_message(
+    request: WakeRequest, minutes: int, review_chats: str = "", reviewer_down: str = ""
+) -> str:
+    """Send the worker to check the reviewer is moving, not just to wait again (#3389).
+
+    ``reviewer_down`` says why no reviewer is starting at all, when the deck knows (#4064):
+    a fresh review would then only open another chat nobody reads, so the worker tells the
+    person instead.
+    """
+    if reviewer_down:
+        return (
+            f"AgentDeck wake-on: no verdict reached this chat for {request.target} within"
+            f" {minutes} minutes, and the reviewer is not running: {reviewer_down}. Do not"
+            " ask for a fresh review; it would only open another chat nobody reads. Tell the"
+            " person in the question box that reviews are down and why, and wait for them."
+        )
     where = (
         f"an issue titled `Review <owner/repo>#<your issue number>` in `{review_chats}`"
         if review_chats
@@ -1057,7 +1071,7 @@ def review_timeout_message(request: WakeRequest, minutes: int, review_chats: str
     )
 
 
-def timeout_message(request: WakeRequest, review_chats: str = "") -> str:
+def timeout_message(request: WakeRequest, review_chats: str = "", reviewer_down: str = "") -> str:
     if request.stopped:
         return stopped_message(request)
     if request.kind == KIND_TIME:
@@ -1073,7 +1087,7 @@ def timeout_message(request: WakeRequest, review_chats: str = "") -> str:
             " has ended. Register it again if you still want these messages."
         )
     if request.kind == KIND_REVIEW:
-        return review_timeout_message(request, minutes, review_chats)
+        return review_timeout_message(request, minutes, review_chats, reviewer_down)
     return (
         f"AgentDeck wake-on: nothing arrived for {request.target} within {minutes}"
         " minutes. A webhook can be dropped, so check its state once yourself, then carry"
@@ -1332,8 +1346,12 @@ class WakeOnService:
         review_chats: str = "",
         present: Callable[[WakeRequest], bool] = lambda request: True,
         skills_sha: Callable[[], str | None] = lambda: None,
+        reviewer_down: Callable[[], str] = lambda: "",
     ) -> None:
         self._enabled = bool(enabled)
+        # Why no reviewer is starting, in words, or "" (#4064): a review wait's timeout says
+        # so rather than sending the worker to ask for another chat nobody reads.
+        self._reviewer_down = reviewer_down
         self._streams_root = Path(streams_root).expanduser()
         # Whether the owner is in a needs-you wait's chat (#3464): only then is it woken,
         # by a Work or by its own timeout.
@@ -1668,7 +1686,13 @@ class WakeOnService:
                     log.info("wake-on: %s is away; ended %s", request.session_key, request.id)
                     self.registry.remove([request.id])
                     continue
-                self._fire(request, timeout_message(request, self._review_chats))
+                down = ""
+                if request.kind == KIND_REVIEW:
+                    try:
+                        down = self._reviewer_down()
+                    except Exception:  # noqa: BLE001 - a health read never blocks a wake
+                        log.warning("wake-on: reviewer health unreadable", exc_info=True)
+                self._fire(request, timeout_message(request, self._review_chats, down))
 
     def needs_you_waited(self) -> bool:
         """Whether any chat waits on Works needing the owner: the overview then rebuilds on

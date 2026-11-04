@@ -471,6 +471,7 @@ class ClaudeWorkerRuntime:
                 interactive_prompts=effective.interactive_prompts,
                 classifier_skip_rules=list(self.settings.classifier_skip_rules),
                 memory_max=effective.memory_max,
+                auto_compact_window=effective.auto_compact_window,
                 hold_processes=effective.hold_across_restarts,
                 base_url=self._base_url,
                 bind_session_token=self._budget_db.record_session_token,

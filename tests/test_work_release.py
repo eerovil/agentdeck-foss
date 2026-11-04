@@ -1296,6 +1296,8 @@ async def test_the_release_records_when_only_a_persons_merge_is_missing(fake):
     # Its agent is asked once to bring the summary's evidence up to date (#3199).
     ready = [text for _chat, key, text in fake.told if ":ready:" in key]
     assert len(ready) == 1 and f"{PR}@{HEAD[:12]}" in ready[0] and "correctness" in ready[0]
+    # ... still in Finnish, like the rest of the summary (#4056).
+    assert "in Finnish" in ready[0]
     assert await fake.service.evaluate(WORK) == AWAITING_MERGE
     assert len([key for _chat, key, _text in fake.told if ":ready:" in key]) == 1
     # Anything else holding it clears the record: here, a push past the reviewed head.

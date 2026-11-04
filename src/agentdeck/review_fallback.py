@@ -67,6 +67,10 @@ def parse_until(text: str, *, now: float | None = None) -> float:
     raise SwitchError(_OFF)
 
 
+def reviewer_down(config, accounts, *, now=None) -> str:
+    return ""
+
+
 def starred_check(state, is_starred):
     return lambda repository, number: False
 

@@ -219,6 +219,24 @@ def test_a_review_wait_ends_quietly_on_the_verdict_and_wakes_only_on_its_timeout
     assert "`Review <owner/repo>#<your issue number>` in `eerovil/review-chats`" in (
         timeout_message(default, "eerovil/review-chats")
     )
+    # #4064: when no reviewer can start, the timeout says so instead of sending the worker
+    # to ask for another chat nobody reads; a health read that fails changes nothing.
+    down = register(service, "claude_code:alt:four", review="eerovil/agentdeck#12")
+    broken = register(
+        service, "claude_code:alt:five", review="eerovil/agentdeck#12", timeout_minutes=30
+    )
+    service._reviewer_down = lambda: "ChatGPT has failed to start 3 times since 16:53 UTC"
+    clock.now += 21 * 60
+    service.expire_due()
+    service._reviewer_down = lambda: 1 / 0
+    clock.now += 10 * 60
+    service.expire_due()
+    texts = {message.id: message.text for message in scheduled}
+    assert "the reviewer is not running: ChatGPT has failed to start 3 times since 16:53 UTC." in (
+        texts[f"wake-on:{down.id}"]
+    )
+    assert "Do not ask for a fresh review" in texts[f"wake-on:{down.id}"]
+    assert "Check once that the reviewer is making progress" in texts[f"wake-on:{broken.id}"]
 
 
 @private_feature(_chat_board)

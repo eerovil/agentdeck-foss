@@ -248,6 +248,20 @@ def test_the_cap_is_configurable_with_a_documented_default():
     assert per_account.for_account("main").memory_max == "8G"
 
 
+def test_the_auto_compact_window_defaults_to_200k_and_is_bounded():
+    """#4058: compact near 200k, not at the 1M model's full window."""
+    assert ClaudeWorkersConfig().auto_compact_window == 200_000
+    assert ClaudeWorkersConfig(auto_compact_window=0).auto_compact_window == 0
+    per_account = ClaudeWorkersConfig(accounts={"alt": {"auto_compact_window": 300_000}})
+    assert per_account.for_account("alt").auto_compact_window == 300_000
+    assert per_account.for_account("main").auto_compact_window == 200_000
+    for bad in (99_999, 1_000_001, -1):
+        with pytest.raises(ValueError):
+            ClaudeWorkersConfig(auto_compact_window=bad)
+    with pytest.raises(ValueError):
+        ClaudeWorkersConfig(accounts={"alt": {"auto_compact_window": 50_000}})
+
+
 # --- the real thing --------------------------------------------------------
 
 

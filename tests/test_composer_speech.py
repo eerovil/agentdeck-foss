@@ -3027,7 +3027,7 @@ async def test_voice_mode_keeps_typing_and_stops_dictation(tmp_path):
     again too, both without saying "Voice mode on." again (#4007), and once tapped off,
     the next chat opened starts with it off. Asked to, it goes back to the deck chat,
     and the deck chat moves it on once its reply was read, naming the chat it arrives
-    in (#3816)."""
+    in (#3816). 🎤 on alone comes back only on a reload of the same chat (#4051)."""
     from conftest import async_playwright, wait_until
     from test_inject import _live_server
 
@@ -3121,6 +3121,35 @@ async def test_voice_mode_keeps_typing_and_stops_dictation(tmp_path):
         tapped_off = [await page.locator("[data-voice-button]").get_attribute("aria-pressed"),
                       await page.evaluate(
                           "() => document.documentElement.classList.contains('voice-on')")]
+
+        # 🎤 alone, used like dictation (#4051): a reload of the same chat starts it
+        # again, and any other chat opens with it off and the tab's carry forgotten.
+        await page.goto(f"{base_url}/sessions/codex:test:sid")
+        await _pick(page, "open")
+        await wait_until(page, "🎤 alone listens", _LISTENING)
+        await page.reload()
+        await wait_until(page, "🎤 alone listens again after the reload", _LISTENING)
+        quiet = """() => [document.documentElement.classList.contains('voice-on'),
+            document.querySelector('[data-voice-mic]').hasAttribute('data-voice-hears'),
+            __left.stream.getTracks().map((t) => t.readyState), __mic === __left,
+            sessionStorage.getItem('agentdeck.voiceCarry'),
+            sessionStorage.getItem('agentdeck.voiceArrive')]"""
+        await page.evaluate(other_chat)
+        await page.wait_for_timeout(300)
+        mic_only = await page.evaluate(quiet)
+        # Nor does a move asked for by voice carry 🎤 alone (the owner's choice on #4051).
+        await _pick(page, "open")
+        await wait_until(page, "🎤 alone listens in the other chat", _LISTENING)
+        await page.route("**/api/voice/heard", back_route)
+        await page.evaluate("""() => { window.__opened = []; window.__left = window.__mic;
+            AgentDeckSessionNavigation.open = (path) => { __opened.push(path);
+              document.querySelector('.transcript').dataset.sessionKey =
+                'codex:test:' + path.split('/').pop();
+              document.dispatchEvent(new CustomEvent('agentdeck:session-navigation')); }; }""")
+        await host.hear("take me back to the deck chat")
+        await wait_until(page, "it went to the deck chat", "() => __opened.length === 1")
+        await page.wait_for_timeout(300)
+        jumped_mic_only = [await page.evaluate("__opened"), await page.evaluate(quiet)]
         await browser.close()
 
     assert said == ["Voice mode on."]
@@ -3135,6 +3164,8 @@ async def test_voice_mode_keeps_typing_and_stops_dictation(tmp_path):
     assert went_on == ["/chats/deck", "/chats/bug"] and waited == 1
     assert heard_first == ["Taking you to the login bug.", "Now in: The login bug."]
     assert tapped_off == ["false", False]
+    assert mic_only == [False, False, ["ended"], True, None, None]
+    assert jumped_mic_only == [["/chats/deck"], [False, False, ["ended"], True, None, None]]
 
 
 # The frequency of every tone the page starts, the fake microphone's own included.

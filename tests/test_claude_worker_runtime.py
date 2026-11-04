@@ -95,7 +95,11 @@ async def test_runtime_host_applies_account_overrides(tmp_path):
                 "state_dir": str(tmp_path),
                 "start_bypassed": True,
                 "accounts": {
-                    "alt": {"permission_mode": "bypassPermissions", "start_bypassed": False}
+                    "alt": {
+                        "permission_mode": "bypassPermissions",
+                        "start_bypassed": False,
+                        "auto_compact_window": 0,
+                    }
                 },
             },
             "accounts": [
@@ -111,6 +115,9 @@ async def test_runtime_host_applies_account_overrides(tmp_path):
     assert app.state.claude_workers.host("main").start_bypassed is True
     assert app.state.claude_workers.host("alt").start_bypassed is False
     assert AppConfig().claude_workers.start_bypassed is False
+    # Early compaction reaches each account's host, and 0 opts one out (#4058).
+    assert app.state.claude_workers.host("main").auto_compact_window == 200_000
+    assert app.state.claude_workers.host("alt").auto_compact_window == 0
 
 
 @pytest.mark.parametrize(

@@ -379,17 +379,52 @@ def _line(token: str, pull: str, head: str, path: Path, root: Path, now: float) 
     }
 
 
+def account_refusal(config, key: str) -> str:
+    """Why this account would refuse a reviewer's first turn, or ``""`` (#4064).
+
+    An open hard-quota circuit or a usage window at its limit. A reviewer started there
+    dies at once, and the deck counted it as started: on 2026-11-04 every fallback review
+    went to the exhausted main account, three tries a chat, while the alt account had room.
+    Ignorance (no cache, unreadable) answers ``""``, as the delivery scheduler's does.
+    """
+    from .poller_engine.github import account_refusal as window_refusal
+    from .providers import account_health
+    from .providers.usage import shared_cache_dir
+
+    usage = getattr(config, "usage", None)
+    cache = shared_cache_dir(getattr(usage, "shared_cache_dir", "") or "")
+    reason, _ = account_health.refusal_detail(cache, key)
+    return reason or window_refusal(cache, key)
+
+
+def startable_account(config, accounts, provider_id: str, preferred: str = ""):
+    """``(account, why_none)``: the preferred account of this provider, or another of the
+    same provider when it would refuse a turn (#4064).
+
+    ``preferred`` empty means the first such account. When every one refuses, the preferred
+    one is returned anyway (a refusal clears in hours, and a start is what records the try)
+    with the reasons in ``why_none``; ``None`` when there is no account at all.
+    """
+    own = [item for item in accounts if item.provider_id == provider_id]
+    first = next((item for item in own if not preferred or item.key == preferred), None)
+    if first is None:
+        return None, ""
+    reasons = []
+    for item in [first, *(other for other in own if other is not first)]:
+        why = account_refusal(config, item.key)
+        if not why:
+            return item, ""
+        reasons.append(f"{item.key}: {why}")
+    return first, "; ".join(reasons)
+
+
 def deck_hooks(config, *, injector, state, accounts, providers) -> dict:
     """``start``, ``alive`` and ``checkout_of`` for ``AgentReviewer``, over the deck's own parts."""
     from .work_router import owner_of_pull
 
     def account_for(kind: str):
-        provider_id = PROVIDERS[kind]
         chosen = config.review.account.strip()
-        for account in accounts:
-            if account.provider_id == provider_id and (not chosen or account.key == chosen):
-                return account
-        return None
+        return startable_account(config, accounts, PROVIDERS[kind], chosen)[0]
 
     async def start(kind: str, cwd: Path, text: str, token: str) -> tuple[bool, str]:
         account = account_for(kind)

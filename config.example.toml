@@ -84,6 +84,10 @@ enabled = false
 # so a runaway one is killed alone instead of OOM-killing the whole host.
 # Default "8G"; "" spawns uncapped. Ignored where `systemd-run --user` is unusable.
 #memory_max = "8G"
+# Context tokens at which each worker's CLI compacts its history into a summary
+# (CLAUDE_CODE_AUTO_COMPACT_WINDOW). The 1M model otherwise waits until ~1M and
+# every call re-reads that history (#4058). Default 200000; 0 = the CLI's default.
+#auto_compact_window = 200000
 #state_dir = "~/.local/share/agentdeck/claude-workers"
 # Per-account fields inherit from the base section when omitted.
 #[claude_workers.accounts.alt]

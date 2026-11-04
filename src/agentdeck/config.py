@@ -227,6 +227,20 @@ class AssistantConfig(BaseModel):
     enabled: bool = False
 
 
+# Claude Code accepts an auto-compact window from 100k to 1M tokens; 0 here leaves
+# the CLI's own default, which on a 1M-context model is the whole 1M (#4058).
+AUTO_COMPACT_WINDOW_RANGE = (100_000, 1_000_000)
+
+
+def _valid_auto_compact_window(value: int) -> int:
+    low, high = AUTO_COMPACT_WINDOW_RANGE
+    if value != 0 and not low <= value <= high:
+        raise ValueError(
+            f"claude_workers auto_compact_window must be 0 or between {low} and {high}"
+        )
+    return value
+
+
 class ClaudeWorkerOverrides(BaseModel):
     """Per-account overrides for [claude_workers]; unset fields inherit the base.
 
@@ -242,6 +256,7 @@ class ClaudeWorkerOverrides(BaseModel):
     memory_max: str | None = None
     interactive_prompts: bool | None = None
     start_bypassed: bool | None = None
+    auto_compact_window: int | None = None
 
     @field_validator("max_workers")
     @classmethod
@@ -249,6 +264,11 @@ class ClaudeWorkerOverrides(BaseModel):
         if value is not None and value <= 0:
             raise ValueError("claude_workers accounts max_workers must be positive")
         return value
+
+    @field_validator("auto_compact_window")
+    @classmethod
+    def _valid_override_window(cls, value: int | None) -> int | None:
+        return value if value is None else _valid_auto_compact_window(value)
 
     @field_validator("stall_after_s")
     @classmethod
@@ -307,6 +327,12 @@ class ClaudeWorkersConfig(BaseModel):
     # the worker's own scope (memory_max above); false spawns the CLI directly, as before.
     hold_across_restarts: bool = True
     state_dir: str = "~/.local/share/agentdeck/claude-workers"
+    # Tokens of context at which a worker's CLI compacts its history into a summary,
+    # passed as CLAUDE_CODE_AUTO_COMPACT_WINDOW. On the 1M model the CLI otherwise
+    # waits until about 1M, and every call re-reads that whole history: calls past
+    # 200k were 53 % of a week's use, and compacting there would have saved about
+    # 30 % (#4058). 0 leaves the CLI's own default.
+    auto_compact_window: int = 200_000
     # Keyed by account label: [claude_workers.accounts.<label>]
     accounts: dict[str, ClaudeWorkerOverrides] = {}
 
@@ -335,6 +361,11 @@ class ClaudeWorkersConfig(BaseModel):
         if value < 0:
             raise ValueError("claude_workers.idle_after_s must be non-negative")
         return value
+
+    @field_validator("auto_compact_window")
+    @classmethod
+    def _valid_window(cls, value: int) -> int:
+        return _valid_auto_compact_window(value)
 
     @field_validator("stall_after_s")
     @classmethod

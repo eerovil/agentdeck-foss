@@ -64,6 +64,7 @@ from .push import PushService
 from .quota_retry import QuotaRetryService
 from .review_fallback import ReviewFallbackService
 from .review_fallback import deck_hooks as review_fallback_hooks
+from .review_fallback import reviewer_down as review_reviewer_down
 from .review_fallback import starred_check as review_fallback_starred
 from .run_execution import MAX_CONTINUATIONS
 from .scheduled_messages import ScheduledMessageService
@@ -416,6 +417,8 @@ def create_app(config: AppConfig) -> FastAPI:
         review_chats=config.chat_board.repository if config.chat_board.enabled else "",
         # A deck-deploy wait also waits for the deploy's bundled skills (#3584).
         skills_sha=skills_sha,
+        # A review wait's timeout says when no reviewer can start at all (#4064).
+        reviewer_down=lambda: review_reviewer_down(config, config.build_accounts()),
     )
     # A Work hears its own GitHub events (#2895, ADR 0008), and the deck merges a switched
     # Work itself (#2895 step 2): the Work router, the merge release and the missed-start

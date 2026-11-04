@@ -477,6 +477,9 @@ def test_work_session_guide_says_what_the_deck_reads_and_names_no_poller():
         # ... with its background and problem from the first turn on (#3928).
         assert "Write the Work's summary before your first turn ends" in flat
         assert "leaving the parts you do not know yet empty" in flat
+        # ... always in Finnish, over a guide's "respond in English" (#4056).
+        assert "Write every part in Finnish" in flat
+        assert "even where a guide says to respond in English" in flat
         # Every Work keeps a diagram (#3827): an old one is edited, a chore draws none.
         assert "First list `docs/diagrams/` on your branch" in flat
         # ... read by its boxes, one per feature, and redrawn on review fixes (#3860).

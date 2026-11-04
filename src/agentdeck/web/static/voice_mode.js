@@ -6,7 +6,8 @@
 // nothing keeps listening once reading aloud is off (#4025). A tap on 🎧 while something is
 // being read only stops that reading, and 🎧 stays on (#3779). Only how 🎤 listens is kept on the
 // device. Which of the two were on is kept for the tab while voice mode is on, so
-// the next chat opened starts with them on again (#3548).
+// the next chat opened starts with them on again (#3548); 🎤 alone, with 🎧 off, only
+// in the same chat, as on a reload (#4051).
 //
 // It needs the deck's speech service (`data-host-speech`, #3409), and listens and
 // speaks only through it: the page records the microphone, cuts each phrase at a
@@ -2839,11 +2840,15 @@
   // ---- into the next chat (#3548) -------------------------------------------
 
   // Kept for this tab only: a phone app opened again later starts with it off.
+  // The chat's key goes with it: 🎤 alone starts again only in the same chat.
   function remember(v) {
     var hears = !!v.hears;
     try {
-      if (v.reads || hears) sessionStorage.setItem(CARRY_KEY, JSON.stringify({ reads: !!v.reads, hears: hears, room: !!v.room }));
-      else sessionStorage.removeItem(CARRY_KEY);
+      if (v.reads || hears) {
+        sessionStorage.setItem(CARRY_KEY, JSON.stringify({ reads: !!v.reads, hears: hears, room: !!v.room, key: v.key }));
+      } else {
+        sessionStorage.removeItem(CARRY_KEY);
+      }
     } catch (e) { /* this chat only */ }
   }
 
@@ -2859,9 +2864,16 @@
 
   // A chat opened with voice mode on in the one left: it starts at once as the
   // taps left it. A browser that will not play without a tap on this page (a
-  // full load) pauses it instead, and a tap on 🎧 or 🎤 goes on.
+  // full load) pauses it instead, and a tap on 🎧 or 🎤 goes on. 🎤 on its own,
+  // used like dictation, starts again only in the same chat (a reload): any other
+  // chat or Work opens with it off, a move asked for by voice included (#4051).
   function carryOn() {
     var kept = !current() && carried();
+    if (kept && !kept.reads && kept.key !== sessionKey()) {
+      forget();
+      arrived();
+      return;
+    }
     var button = kept && document.querySelector('form [data-voice-button]');
     if (!button) return;
     var v = on(button.closest('form'));

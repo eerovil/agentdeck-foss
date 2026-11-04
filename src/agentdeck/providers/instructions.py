@@ -573,8 +573,11 @@ terminal report to file.
   behaviour changed), `rationale` (the alternatives and why this one) and
   `correctness` (what it meets and the evidence so far; never a test result
   before it exists). The Work page shows it; nothing else writes it. Start each
-  part with one plain sentence, then short detail, under about 120 words. Each
-  `PUT` replaces the whole record, so send every part you have each time.
+  part with one plain sentence, then short detail, under about 120 words. Write
+  every part in Finnish, whatever language the issue or this chat is in, even
+  where a guide says to respond in English: the owner reads the Work page in
+  Finnish (#4056). Keep code names, paths, commit ids and commands as they are.
+  Each `PUT` replaces the whole record, so send every part you have each time.
 - Keep a diagram of what this Work changes (#3827). First list `docs/diagrams/`
   on your branch and read each diagram's title and `## Boxes`, not just its file
   name (#3860): when a diagram's boxes name a file you change, edit it to
