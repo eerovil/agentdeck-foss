@@ -4,6 +4,7 @@
     from the webhook log; its chats and questions live on the other deck. The one control is
     Take over (Start here for one no agent has started), which reassigns the issue, so the
     hand-over stops the other deck's agent and starts one here. #}
+{%- from "partials/work_macros.html" import output_about %}
 {%- set other = other_deck %}
 {%- set whose = other.whose %}
 {%- set issue_label = other.ref.repository ~ "#" ~ other.ref.number %}
@@ -54,7 +55,8 @@
         {#- This pull request's own verdict at its head (#3855): one per pull request, so a
             pass on one never reads as the other's. #}
         {%- set verdict = other.verdict_for(output.url) %}
-        {%- if verdict %} · <a href="{{ verdict.url }}" target="_blank" rel="noopener" data-wd-output-verdict="{{ verdict.kind }}">{{ "reviewed" if verdict.kind == "passed" else "review found problems" }} at {{ output.head[:7] }}</a>{% endif %}</li>
+        {%- if verdict %} · <a href="{{ verdict.url }}" target="_blank" rel="noopener" data-wd-output-verdict="{{ verdict.kind }}">{{ "reviewed" if verdict.kind == "passed" else "review found problems" }} at {{ output.head[:7] }}</a>{% endif %}
+        {{- output_about(output, other.work_id) }}</li>
       {%- else %}
       <li data-wd-output="{{ other.pull.url }}"><a href="{{ other.pull.url }}" target="_blank" rel="noopener">PR #{{ other.pull.number }}</a> · <span class="wo-state">{{ "draft" if other.pull.draft else "open" }}</span></li>
       {%- endfor %}

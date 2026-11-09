@@ -115,12 +115,55 @@ async def test_star_on_the_work_page_marks_the_work_everywhere(tmp_path, monkeyp
     front = (await app.state.work_overview.current()).front
     (card,) = [row.card for row in (*front.needs_you, *front.active, *front.waiting)]
     assert card.starred
-    assert 'class="fr-star"' in client.get("/", params={"chats": "0"}).text
+    home = client.get("/", params={"chats": "0"}).text
+    assert 'class="fr-star"' in home
+    # In Starred above every other group, and the only row of it on the page (#4121).
+    assert home.index('id="works-starred"') < home.index(f'data-work-id="{WORK.work_id}"')
+    assert home.index(f'data-work-id="{WORK.work_id}"') < home.index('id="works-needs"')
+    assert home.count(f'data-work-id="{WORK.work_id}"') == 1
     assert 'data-work-star="unstar"' in client.get(work_href(WORK.work_id)).text
 
     assert client.post(work_href(WORK.work_id) + "/star", data={"action": "x"}).status_code == 422
     client.post(work_href(WORK.work_id) + "/star", data={"action": "unstar"})
     assert app.state.control_db.starred_works() == frozenset()
+
+
+@pytest.mark.asyncio
+async def test_a_star_moves_the_row_whole_between_parts_on_a_live_stream(tmp_path, monkeypatch):
+    """#4121: a stream holds rows per part, so a row a star moves comes whole in its new part,
+    both ways: a placeholder there would find no row to keep."""
+    from agentdeck.web.work_view import RowRenders, render_work_front
+
+    app, _record, _gh = _deck(tmp_path, monkeypatch, labels=["agent"])
+    service, stars = app.state.work_overview, app.state.control_db
+    sent: dict = {}
+    renders = RowRenders()
+
+    async def pushed():
+        await service.refresh()
+        overview = await service.current()
+        return {
+            part: render_work_front(app.state.templates, overview, part, renders=renders, sent=sent)
+            for part in ("starred", "active")
+        }
+
+    def whole(html):
+        return f'data-work-id="{WORK.work_id}"' in html and "data-work-same" not in html
+
+    def absent(html):
+        return f'data-work-id="{WORK.work_id}"' not in html
+
+    first = await pushed()
+    assert whole(first["active"]) and absent(first["starred"])
+
+    stars.star_work(WORK.work_id)
+    moved = await pushed()
+    assert whole(moved["starred"]) and absent(moved["active"])
+    assert "data-work-same" in (await pushed())["starred"]
+
+    stars.star_work(WORK.work_id, starred=False)
+    back = await pushed()
+    assert whole(back["active"]) and absent(back["starred"])
 
 
 @pytest.mark.asyncio
@@ -399,6 +442,47 @@ async def test_the_paused_group_folds_and_stays_folded_through_a_reload(tmp_path
         assert await toggle.get_attribute("aria-expanded") == "false"
         await toggle.click()
         await row.wait_for(state="visible")
+        await browser.close()
+
+
+@pytest.mark.browser
+@pytest.mark.asyncio
+async def test_a_star_moves_the_row_to_starred_and_back_live_on_a_phone(tmp_path, monkeypatch):
+    """#4121: an open page follows a star with no reload, at a phone's width, one row at a time."""
+    from conftest import async_playwright
+    from test_web import _live_server
+
+    app, _record, _gh = _deck(tmp_path, monkeypatch, labels=["agent"])
+    service, stars = app.state.work_overview, app.state.control_db
+    await service.refresh()
+    row = f'article[data-work-id="{WORK.work_id}"]'
+
+    async with _live_server(app) as base, async_playwright() as playwright:
+        browser = await playwright.chromium.launch()
+        page = await browser.new_page(
+            viewport={"width": 390, "height": 844}, service_workers="block"
+        )
+        await page.goto(base + "/?chats=0")
+        await page.locator(f"#works {row}").wait_for(timeout=15000)
+        assert await page.locator('[data-front-group="starred"]').count() == 0
+
+        stars.star_work(WORK.work_id)
+        await service.refresh()
+        await page.locator(f"#works-starred {row}").wait_for(timeout=15000)
+        await page.wait_for_function(
+            "sel => document.querySelectorAll(sel).length === 1", arg=row
+        )
+        assert await page.locator("#works-starred .fr-group-count").inner_text() == "1"
+        width = "document.documentElement.scrollWidth"
+        assert await page.evaluate(width) <= 390
+
+        stars.star_work(WORK.work_id, starred=False)
+        await service.refresh()
+        await page.locator(f"#works {row}").wait_for(timeout=15000)
+        await page.wait_for_function(
+            "sel => document.querySelectorAll(sel).length === 1", arg=row
+        )
+        assert await page.locator('[data-front-group="starred"]').count() == 0
         await browser.close()
 
 

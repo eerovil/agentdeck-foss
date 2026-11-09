@@ -169,6 +169,11 @@ ACKNOWLEDGEMENT_POLL_S = 1.0
 #: automatic resend. A message that goes unacknowledged twice is not retried
 #: again — at that point the resending is not helping and it is a person's call.
 MAX_DELIVERY_ATTEMPTS = 2
+# How `confirm_from_transcript` reads: a rollout can be hundreds of megabytes, and
+# a Mac retry comes every half minute. Pieces keep what is in memory small, and
+# the limit per call keeps one retry short; the next retry carries on (#4132).
+CONFIRM_CHUNK_BYTES = 4 * 1024 * 1024
+CONFIRM_BYTES_PER_CALL = 32 * 1024 * 1024
 
 #: Browser reconciliation metadata is best-effort UI state, not a provider
 #: delivery fence. Keep it long enough for a sleeping/reconnecting tab, but
@@ -251,6 +256,8 @@ class QueuedMessage:
     after_seq: int | None = None
     accepted_at: datetime | None = None
     attempts: int = 0
+    # Where `confirm_from_transcript` stopped, as (byte offset, seq).
+    confirm_cursor: tuple[int, int] = (0, 0)
 
     @property
     def image_media_types(self) -> tuple[str, ...]:
@@ -300,9 +307,12 @@ class QueuedMessage:
         Only the delivery loop's automatic resend puts an item back on its way
         with an attempt already spent, so this says the same thing to the person
         watching that the log line says: the first send was not acknowledged and
-        the deck is having another go by itself.
+        the deck is having another go by itself. The attempt is counted as the
+        send starts, so a running item has only spent an earlier one from two on.
         """
-        return self.attempts > 0 and self.state in ("queued", "running")
+        return (self.state == "queued" and self.attempts > 0) or (
+            self.state == "running" and self.attempts > 1
+        )
 
 
 def is_resendable(item: QueuedMessage) -> bool:
@@ -520,6 +530,69 @@ class InjectionService:
     def status(self, session_key: str) -> InjectionStatus | None:
         return self._status.get(session_key)
 
+    async def confirm_from_transcript(
+        self,
+        account: Account,
+        session: Session,
+        provider: SessionProvider,
+        item: QueuedMessage,
+    ) -> None:
+        """Walk the transcript from its start for a send nothing has linked yet.
+
+        Live reads only start at the cursor taken before the send. Live, a send
+        landed behind that cursor: the agent read and answered it, the watch then
+        saw "nothing moved" and resent, the runtime's fence swallowed the resend,
+        and the row sat `accepted` for good (#4132). The Mac retried that outcome
+        for an hour and anything waiting on it waited too.
+
+        Sends nothing, so it can never deliver twice. The cursor guard is dropped
+        for this item's timed lines alone; the exact text and the sent-after time
+        still have to match, and a Mac outcome's text carries its run id.
+
+        Each call reads at most `CONFIRM_BYTES_PER_CALL`, a piece at a time, and
+        the item keeps its place, so a retry reads only what the last one did not
+        and a search that found nothing costs nothing until the file grows. A
+        piece that ends inside one long line consumes nothing, so the piece
+        doubles; a line longer than the whole limit stops the walk there, and the
+        Mac gives up on that outcome after its hour, as it did before.
+        """
+        offset, seq = item.confirm_cursor
+        chunk = CONFIRM_CHUNK_BYTES
+        spent = 0
+        while spent < CONFIRM_BYTES_PER_CALL and item.state in ("running", "accepted"):
+            events, next_offset, next_seq = await provider.tail_transcript(
+                account, session, offset, seq, limit=chunk
+            )
+            spent += chunk
+            # Only a timed line can drop the cursor: its time still proves it came
+            # after the send. An untimed queue line has the cursor and nothing else.
+            kept, item.after_seq = item.after_seq, None
+            self.observe_transcript(session.key, [e for e in events if e.ts is not None])
+            item.after_seq = kept
+            self.observe_transcript(session.key, [e for e in events if e.ts is None])
+            if next_offset == offset:
+                chunk = min(chunk * 2, CONFIRM_BYTES_PER_CALL)
+                continue
+            offset, seq = next_offset, next_seq
+            item.confirm_cursor = (offset, seq)
+            chunk = CONFIRM_CHUNK_BYTES
+
+    def find_item(self, session_key: str, action_id: str) -> QueuedMessage | None:
+        """The newest queue item of one action, however far back it sits.
+
+        `status` shows only the latest few, while `start` checks the whole queue
+        for a repeat, so a caller that retries needs this lookup: after a dozen
+        newer messages its send is still queued, and `status` no longer has it.
+        """
+        return next(
+            (
+                item
+                for item in reversed(self._items.get(session_key, []))
+                if item.client_action_id == action_id
+            ),
+            None,
+        )
+
     def session_busy(self, session_key: str) -> bool:
         """Whether a turn is running in this chat right now.
 
@@ -627,6 +700,12 @@ class InjectionService:
         per message, so when the whole text matches nothing each part is matched
         to a send of its own; a part cannot say which image was its, so only a
         send without uploads matches one (#3931).
+
+        The images are compared by type first, then by how many there are: the
+        CLI re-encodes an image it finds too large, so a PNG sent can be written
+        down as a JPEG. A send that never matched held its whole queue (#4078).
+        The count alone says which send only when one send has it: of two alike,
+        linking the wrong one would release an upload the CLI has not read yet.
         """
 
         def eligible(item: QueuedMessage) -> bool:
@@ -643,16 +722,27 @@ class InjectionService:
                 )
             )
 
+        same_text = [
+            item
+            for item in items
+            if eligible(item) and _delivery_text_matches(item.text, event.text)
+        ]
         whole = next(
             (
                 item
-                for item in items
-                if eligible(item)
-                and _delivery_text_matches(item.text, event.text)
-                and item.image_media_types == event.image_media_types
+                for item in same_text
+                if item.image_media_types == event.image_media_types
             ),
             None,
         )
+        if whole is None:
+            same_count = [
+                item
+                for item in same_text
+                if len(item.images) == len(event.image_media_types)
+            ]
+            if len(same_count) == 1:
+                whole = same_count[0]
         if whole is not None:
             return [whole]
         matches: list[QueuedMessage] = []
@@ -1249,8 +1339,16 @@ class InjectionService:
         byte_offset: int,
         seq: int,
     ) -> None:
-        """Keep pending uploads available until their transcript event exists."""
-        deadline = asyncio.get_running_loop().time() + self.config.timeout_s
+        """Keep pending uploads available until their transcript event exists.
+
+        This holds every message queued behind the item, so the long deadline is
+        for a turn still running, which reads the message when it reaches it. A
+        chat with no turn running is not going to write it, so the queue moves on
+        after the same grace an acknowledgement gets (#4078).
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.config.timeout_s
+        idle_deadline = loop.time() + ACKNOWLEDGEMENT_GRACE_S
         while True:
             events, byte_offset, seq = await provider.tail_transcript(
                 account, session, byte_offset, seq
@@ -1258,7 +1356,10 @@ class InjectionService:
             self.observe_transcript(session.key, events)
             if item.state == "observed":
                 return
-            if asyncio.get_running_loop().time() >= deadline:
+            now = loop.time()
+            if now >= deadline or (
+                now >= idle_deadline and not self._session_busy(session.key)
+            ):
                 log.warning(
                     "timed out waiting for image transcript event in %s", session.key
                 )

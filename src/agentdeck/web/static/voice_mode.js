@@ -112,9 +112,10 @@
 // - While the agent works it listens too: "stop" alone presses Stop, and anything
 //   else is sent as a follow-up.
 // - Any listening with no words for 15 s (`[speech] idle_listen_seconds`, #3424)
-//   gives up with a low tone. Through the host it then waits for "Hey Jarvis"
-//   (#3425, #3476) until voice mode is turned off: each phrase still goes to the
-//   host, but only one with "Hey Jarvis" in it is acted on. The words after it are
+//   gives up with a low tone. With 🎧 off 🎤 then turns off (#4201); with 🎧 on,
+//   through the host it waits for "Hey Jarvis" (#3425, #3476) until voice mode is
+//   turned off: each phrase still goes to the host, but only one with "Hey Jarvis"
+//   in it is acted on. The words after it are
 //   sent as above; "Hey Jarvis" alone beeps and listens (#3781). Who hears the wake
 //   word is `data-voice-wake` (`[speech] wake`): 'detector' asks the host's wake
 //   word detector first and has Whisper transcribe only a phrase it woke on;
@@ -139,8 +140,11 @@
 //   and a question box needs the name or a tap. A tap is "talk now": from off
 //   (🎤 turns on in Jarvis), while it waits for the name or while a reply is read,
 //   it listens for one message and then waits for the name again. A tap while it
-//   listens sends what was heard and goes to Jarvis. A long press opens a menu of
-//   Jarvis, Always (all of the above: it listens after every reply and while the
+//   listens stops listening at once (#4201): no sound after it is heard, the bubble
+//   says "Sending…", what was heard is sent, and it goes to Jarvis. Jarvis is voice
+//   mode's only (#4201): with 🎧 off, 🎤 turns off where it would wait for the name,
+//   letting go of the microphone (at the tap, for a tap), and its menu has no
+//   Jarvis. A long press opens a menu of Jarvis, Always (all of the above: it listens after every reply and while the
 //   agent works, waiting for the name after the idle spell) and Off. "lopeta
 //   kuuntelu" said alone switches to Jarvis. The choice is carried to the next chat
 //   in the tab like 🎧 and 🎤, never kept on the device: a new voice mode starts in
@@ -175,7 +179,7 @@
   // The final reply can land a moment after the status leaves "thinking".
   var REPLY_SETTLE_MS = 1200;
   var REPLY_WAIT_MAX_MS = 4000;
-  var SPOKEN_MAX_CHARS = 300;
+  var SPOKEN_MAX_CHARS = 600;
   var QUICK_END_MS = 1000;
   var QUICK_ENDS_ALLOWED = 3;
   var MARK = '🔊';  // 🔊
@@ -252,8 +256,10 @@
   var WAITING = 'Say “Hey Jarvis” · tap 🎤 to talk';
   // The device-kept mode of #3540, cleared on load (#3787).
   var OLD_LISTEN_KEY = 'agentdeck.voiceListenMode';
+  // With 🎧 off there is no Jarvis (#4201): 🎤 listens for one message, or Always.
   var MIC_TITLE = {
     off: 'Tap to talk · hold for Jarvis, Always or Off',
+    plain: 'Tap to talk · hold for Always or Off',
     listening: 'Listening · tap when done · hold for the menu',
     waiting: 'Waiting for “Hey Jarvis” · tap to talk · hold for the menu'
   };
@@ -352,12 +358,13 @@
   // dictation's own, which `dictating()` reads.
   function showMic(v) {
     if (!v.mic) return;
-    var on = v.hears || listeningMode(v);
+    // A tap that stopped it with 🎧 off shows 🎤 off at once, while its words go (#4201).
+    var on = v.hears || (listeningMode(v) && !v.doneTap);
     if (on) v.mic.setAttribute('data-voice-hears', '');
     else v.mic.removeAttribute('data-voice-hears');
-    if (listeningMode(v)) v.mic.setAttribute('data-voice-state', v.mode);
+    if (on && listeningMode(v)) v.mic.setAttribute('data-voice-state', v.mode);
     else v.mic.removeAttribute('data-voice-state');
-    v.mic.title = !on ? MIC_TITLE.off : v.mode === 'waiting' ? MIC_TITLE.waiting : MIC_TITLE.listening;
+    v.mic.title = !on ? (v.reads ? MIC_TITLE.off : MIC_TITLE.plain) : v.mode === 'waiting' ? MIC_TITLE.waiting : MIC_TITLE.listening;
   }
 
   // A name for a waiting phrase or a spell of waiting in the wake log (#3476).
@@ -1500,14 +1507,27 @@
     stopListening(v);
     if (dictating()) { rest('Dictation is on'); return; }
     if (document.hidden && v.blocked.listen) { background(v, 'listen'); return; }
+    // "Hey Jarvis" is waited for only in voice mode proper, while 🎧 reads aloud
+    // (#4201): with 🎧 off, where it would wait for the name 🎤 turns off instead, so
+    // the branches below let go of the microphone, or rest on a question box.
+    var open = purpose === 'question' && v.question && v.question.tapped;
+    if (v.hears && !v.reads && !once && (purpose === 'wake' || (v.room && !open))) {
+      v.hears = false;
+      v.room = true;
+      remember(v);
+      showMic(v);
+      if (purpose === 'wake') purpose = working() ? 'turn' : 'answer';
+    }
     // Listening openly answers a question box unasked; the room state waits for the
     // name and takes the words after it as the answer, by the owner's decision on
-    // #3540, or for a tap on 🎤; with 🎤 off it rests until a tap answers it.
+    // #3540, or for a tap on 🎤; with 🎤 off it rests until a tap answers it, also
+    // on a box's next question after a tap that answered the last one turned 🎤 off
+    // with 🎧 off (#4201 review).
     var asked = purpose === 'question' && !once && !(v.question && v.question.tapped);
     if (asked && v.hears && v.room) purpose = 'wake';
-    else if (asked && !v.hears) {
+    else if (purpose === 'question' && !once && !v.hears) {
       v.purpose = purpose;
-      if (!v.hears) closeMicrophone(v);
+      closeMicrophone(v);
       rest(TAP_TO_ANSWER);
       return;
     }
@@ -1654,7 +1674,11 @@
         // phrase into the draft it is sent from (#3514). One its answer started
         // already listens.
         if (!listeningMode(v) || v.rec) return;
-      } else if (tapped) {
+      }
+      // Tapped done stops listening at once (#4201): no next listener here, so the
+      // sound after the tap is never heard; `listen` waits for the name with 🎧 on
+      // and turns 🎤 off with 🎧 off.
+      if (tapped) {
         listen(v.question ? 'question' : working() ? 'turn' : 'answer');
         return;
       }
@@ -2822,6 +2846,7 @@
     if (v.mic) {
       v.mic.removeAttribute('data-voice-hears');
       v.mic.removeAttribute('data-voice-state');
+      v.mic.title = MIC_TITLE.plain;
     }
     if (v.lock) { try { v.lock.release(); } catch (e) { /* gone */ } }
     closeMicrophone(v);
@@ -3009,6 +3034,9 @@
     if (!menu) return;
     var v = current();
     var picked = !(v && v.hears) ? 'off' : v.room ? 'jarvis' : 'open';
+    // Jarvis only with 🎧 on (#4201): without it, 🎤 waits for no name.
+    var jarvis = menu.querySelector('[data-voice-mic-mode="jarvis"]');
+    if (jarvis) jarvis.hidden = !(v && v.reads);
     menu.querySelectorAll('[data-voice-mic-mode]').forEach(function (item) {
       item.setAttribute('aria-checked', item.getAttribute('data-voice-mic-mode') === picked ? 'true' : 'false');
     });
@@ -3079,6 +3107,22 @@
     if (!v) v = on(mic.closest('form'));
     if (!v) return;
     if (paused(v)) { resumeFromPause(v); return; }
+    // Tapped again while a phrase cut by a tap with 🎧 off is still being
+    // transcribed (#4201 review): a new listener would abort it and lose its
+    // words. 🎤 turns back on now, and the listener that runs once the phrase is
+    // sent (`tapped` in its end) listens for the next message. Once the words are
+    // back and with the fast agent (`v.relaying`), a tap does nothing until that hand-over
+    // ends: a limit the owner accepted on the #4201 review.
+    if (!v.hears && v.doneTap && v.rec && !v.rec.aborted && listeningMode(v)) {
+      v.hears = true;
+      v.room = true;
+      v.once = true;
+      remember(v);
+      tone(880);
+      if (!v.captureReady) openMicrophone(v);
+      showMic(v);
+      return;
+    }
     if (!v.hears) {
       v.room = true;
       v.once = true;
@@ -3087,13 +3131,21 @@
     }
     if (v.mode === 'listening') {
       v.room = true;
+      // It stops listening at once (#4201): with 🎧 off 🎤 turns off here and the
+      // microphone is let go of now; with 🎧 on no sound after the tap is kept for
+      // the next phrase.
+      if (!v.reads) v.hears = false;
       remember(v);
       tone(330);
       clearTimeout(v.sendTimer);
       clearTimeout(v.holdTimer);
       // A phrase still being said or transcribed is sent once its words are back.
       var rec = v.rec;
-      if (rec && !rec.aborted && (rec.done || rec.cut())) { v.doneTap = true; return; }
+      var cut = rec && !rec.aborted && (rec.done || rec.cut());
+      if (!v.reads) closeMicrophone(v);
+      else if (v.capture) { v.capture.keep = false; v.capture.carry = []; }
+      if (cut || heard(v)) showStatus('Sending…');
+      if (cut) { v.doneTap = true; showMic(v); return; }
       if (heard(v)) { finish(v); return; }
       listen(v.question ? 'question' : working() ? 'turn' : 'answer');
       return;

@@ -287,9 +287,17 @@ class StartSpares:
         self._taken.add(name)
         return offer.token, offer.key
 
-    def claim_work(self, repository: str, *, account_key: str) -> tuple[str, str, str] | None:
+    def claim_work(
+        self,
+        repository: str,
+        *,
+        account_key: str,
+        model: str | None = None,
+        effort: str | None = None,
+    ) -> tuple[str, str, str] | None:
         """The ``(session token, worker key, worktree)`` of the Work spare a New work press
-        takes (#3590), or None for a cold start.
+        takes (#3590), or None for a cold start. A spare is booted with the account's default
+        model and effort, so a press that picked others (#4181) starts cold.
 
         No resend can reach it: the press is reserved before it starts anything, and a
         replay is answered from that reservation.
@@ -299,6 +307,8 @@ class StartSpares:
             offer is None
             or offer.shape.account_key != account_key
             or offer.shape.repository.lower() != repository.lower()
+            or (offer.shape.model or None) != (model or None)
+            or (offer.shape.effort or None) != (effort or None)
         ):
             return None
         del self._offers[WORK]

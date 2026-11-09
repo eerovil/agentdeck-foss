@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+import time
 from collections.abc import Iterable, Mapping
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -54,6 +55,10 @@ _INITIAL_SCAN_GRACE_S = 60.0
 # at once, it held the page that opened the chat for a third of a second before a byte of
 # it went out. The card still clears within this beat.
 _OPEN_SETTLE_S = 0.3
+# A read of the shared GitHub cache this slow is logged. It no longer holds the loop (#4130),
+# so it would otherwise go unseen, and what makes one this slow is still unproven.
+SLOW_CACHE_READ_S = 1.0
+
 # Activity at or before this moment never raises a card (#2599). Attention is
 # "stopped and not opened since", and most chats on a long-lived deck were never
 # opened at all — workers, delegated sessions, chats from before the read marker
@@ -103,6 +108,11 @@ class AssistantService:
         self._context_tasks: dict[str, asyncio.Task] = {}
         # A newer chat to resolve once its running resolve ends (#2865).
         self._context_reruns: dict[str, Session] = {}
+        # One look at the cache after a delivery at a time, and one more if another came.
+        self._freshen_task: asyncio.Task | None = None
+        self._freshen_again = False
+        # A pass and a delivery both sweep, and two sweeps at once could let the older read win.
+        self._freshen_lock = asyncio.Lock()
         self._force = True
         # When a pass woken by a chat being opened may run (``_OPEN_SETTLE_S``), in loop time.
         self._settle_until = 0.0
@@ -175,12 +185,14 @@ class AssistantService:
             for t in (
                 self._task,
                 self._session_watch_task,
+                self._freshen_task,
                 *self._context_tasks.values(),
             )
             if t is not None
         )
         self._task = None
         self._session_watch_task = None
+        self._freshen_task = None
         self._context_tasks.clear()
         for task in tasks:
             task.cancel()
@@ -529,6 +541,8 @@ class AssistantService:
         one. Looking is a field read on state the collector has already computed, so
         every eligible chat is looked at every time.
         """
+        # First, as the one wait in here before the cards: all that follows reads one moment.
+        await self._freshen_contexts_from_cache()
         # The loop supplies the accounts whose initial scan is still unknown.
         # Their chats get no card until they are read, and their git contexts
         # are kept rather than erased by absence.
@@ -563,7 +577,6 @@ class AssistantService:
         deferred_keys = {key for key in held if key.startswith(unread_prefixes)}
         deferred_keys |= unread_owner_keys & held
         self._contexts.retain({session.key for session in sessions} | deferred_keys)
-        self._freshen_contexts_from_cache()
         now = datetime.now(UTC)
 
         by_key = {session.key: session for session in sessions}
@@ -734,10 +747,31 @@ class AssistantService:
         subprocess, no model call — and it publishes nothing unless a context really
         moved, so a delivery that changes no pill changes no pixel either.
         """
-        if self._freshen_contexts_from_cache():
-            self.state.bus.publish("assistant")
+        running = self._freshen_task
+        if running is not None and not running.done():
+            self._freshen_again = True
+            return
+        try:
+            self._freshen_task = asyncio.get_running_loop().create_task(
+                self._freshen_after_deliveries(), name="assistant-freshen"
+            )
+        except RuntimeError:
+            # No running loop (a synchronous caller in a test or CLI). The next pass reads it.
+            return
 
-    def _freshen_contexts_from_cache(self) -> bool:
+    async def _freshen_after_deliveries(self) -> None:
+        while True:
+            self._freshen_again = False
+            try:
+                if await self._freshen_contexts_from_cache():
+                    self.state.bus.publish("assistant")
+            except Exception:
+                # The cache already holds the delivery, and the next pass reads it again.
+                log.exception("freshening contexts after a delivery failed")
+            if not self._freshen_again:
+                return
+
+    async def _freshen_contexts_from_cache(self) -> bool:
         """Adopt pull-request state the webhook streams already recorded (#1697).
 
         The deck list draws its work-item pills from ``self._contexts``, and until
@@ -751,12 +785,38 @@ class AssistantService:
 
         Returns whether any context moved, so a caller outside the analysis pass can
         tell a real change from a no-op instead of publishing on every sweep (#2042).
+
+        The read runs in a worker thread (#4130): the cache is shared with other processes
+        in rollback-journal mode, so each query can wait out another's write for its whole
+        busy timeout (#3739), and this one was on the loop's stack in a 5 s freeze.
+
+        Sweeps run one at a time, so each reads what the last one left: side by side, the older
+        of two reads could land first and turn the newer one away. A context replaced or
+        dropped during a read keeps what it became, since the read speaks for the one it was
+        given. It may still be behind the cache, so a read turned away is made once more.
         """
-        moved = self.context_resolver.reconcile_cached_pulls_many(dict(self._contexts.view))
-        if not moved:
-            return False
-        self._contexts.update(moved)
-        return True
+        moved_any = False
+        async with self._freshen_lock:
+            for _ in range(2):
+                given = dict(self._contexts.view)
+                started = time.monotonic()
+                read = await asyncio.to_thread(
+                    self.context_resolver.reconcile_cached_pulls_many, given
+                )
+                took = time.monotonic() - started
+                if took >= SLOW_CACHE_READ_S:
+                    log.warning("reading %d contexts' pull requests took %.1f s", len(given), took)
+                moved = {
+                    key: context
+                    for key, context in read.items()
+                    if self._contexts.get(key) is given[key]
+                }
+                if moved:
+                    self._contexts.update(moved)
+                    moved_any = True
+                if len(moved) == len(read):
+                    break
+        return moved_any
 
     def work_item_pills(self, sessions: Iterable[Session]) -> dict[str, WorkItemPill]:
         """One work-item pill per given session; absent key = no work item.

@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import pytest
 
-from agentdeck.gh_shim.classify import classify, is_terminal, ownership_label_to_add
+from agentdeck.gh_shim.classify import (
+    classify,
+    is_terminal,
+    misplaced_start_label,
+    ownership_label_to_add,
+)
 from agentdeck.poller_ops import LabelTarget
 
 ENV = {"GH_TOKEN": "t"}
@@ -163,3 +168,31 @@ def test_a_repository_two_manifests_declare_honours_either_ones_aliases():
 
     assert ownership_label_to_add(["issue", "create", "-l", "claude"], "o/r", targets) is None
     assert ownership_label_to_add(["issue", "create"], "o/r", targets) == "agent"
+
+
+@pytest.mark.parametrize(
+    ("argv", "repository", "found"),
+    [
+        # The incident: `agent` on a project whose start label is `claude` (#4141).
+        (["issue", "edit", "5", "--add-label", "agent"], "acmecorp/bazaar", ("agent", "claude")),
+        (["issue", "edit", "5", "--add-label=Agent,bug"], "AcmeCorp/Bazaar", ("agent", "claude")),
+        (["issue", "create", "-l", "agent"], "acmecorp/bazaar", ("agent", "claude")),
+        (
+            ["issue", "edit", "https://github.com/acmecorp/bazaar/issues/5", "--add-label=agent"],
+            "https://github.com/acmecorp/bazaar/issues/5",
+            ("agent", "claude"),
+        ),
+        # The right label, an alias, the right one beside the wrong one: nothing to say.
+        (["issue", "edit", "5", "--add-label", "claude"], "acmecorp/bazaar", None),
+        (["issue", "edit", "5", "--add-label", "claude"], "eerovil/agentdeck", None),
+        (["issue", "edit", "5", "--add-label", "agent,claude"], "acmecorp/bazaar", None),
+        # A label that starts nothing anywhere is just a label.
+        (["issue", "edit", "5", "--add-label", "bug"], "acmecorp/bazaar", None),
+        (["issue", "edit", "5", "--remove-label", "agent"], "acmecorp/bazaar", None),
+        # A repository no poller manages has no start label to name.
+        (["issue", "edit", "5", "--add-label", "agent"], "someone/else", None),
+        (["issue", "edit", "5", "--add-label", "agent"], "", None),
+    ],
+)
+def test_a_start_label_from_another_project_is_found(argv, repository, found):
+    assert misplaced_start_label(argv, repository, TARGETS) == found

@@ -14,7 +14,7 @@ that waits, the ask-again caps and the base-merge carry.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 
 #: The review checklist was sent to the Work's agent (``data.covered``: none was sent, as a
@@ -35,6 +35,15 @@ ESCALATED = "escalated"
 ACCEPTED = "accepted"
 #: The backstop started the ready head and nothing started.
 UNSTARTED = "unstarted"
+#: Only the GitHub check reads these three (#4152), so they stay out of ``KINDS``: a ready
+#: head the check should show as waiting, a person's Handled press on its red check
+#: (``data.by``), which is no pass and which nothing that merges reads, and a Re-run press the
+#: router turned down, which the check says since GitHub shows a press nothing by itself.
+SEEN = "seen"
+HANDLED = "handled"
+RERUN_REFUSED = "rerun-refused"
+#: A check run takes 65,535 characters of text; findings are kept up to here.
+FINDINGS_LIMIT = 60_000
 
 KINDS = frozenset(
     {
@@ -59,6 +68,31 @@ VERDICTS = frozenset({PASS, CHANGES, NO_CODE, FINDINGS, ESCALATED, ACCEPTED})
 Note = Callable[..., object]
 
 
+#: The GitHub check that shows a pull request's review (#4152). It mirrors the review history
+#: and is no CI result, so every read of a commit's CI leaves it out: the public copy's too,
+#: because a colleague's deck sees this check on the pull requests it merges.
+CHECK_NAME = "AgentDeck review"
+#: The check suite GitHub makes for that check run is named by the App that wrote it.
+_DECK_APP_PREFIX = "agentdeck-"
+
+
+def deck_check(name: object) -> bool:
+    """Whether a check run called ``name`` is the deck's own review check."""
+    return isinstance(name, str) and name.casefold() == CHECK_NAME.casefold()
+
+
+def deck_check_delivery(event: str, payload: dict) -> bool:
+    """Whether a ``check_run`` or ``check_suite`` delivery is about that check, not about CI."""
+    run = payload.get(event)
+    if not isinstance(run, dict):
+        return False
+    if event == "check_run":
+        return deck_check(run.get("name"))
+    app = run.get("app")
+    slug = app.get("slug") if isinstance(app, dict) else ""
+    return event == "check_suite" and str(slug or "").startswith(_DECK_APP_PREFIX)
+
+
 def no_note(*_args: object, **_kwargs: object) -> None:
     """The default writer: a service built without the deck's database keeps no history."""
 
@@ -72,6 +106,27 @@ class ReviewEvent:
     key: str
     data: dict = field(default_factory=dict)
     seq: int = 0
+
+
+@dataclass(frozen=True)
+class ShippedFollowUp:
+    """A pull request shipped at ``head`` with its review findings left to the follow-up issue
+    ``follow_up`` (``owner/repo#n``, "" until filed); kept after the merge (#4212). ``work``
+    is the issue of the Work that shipped it; ``base`` the base branch's commit when it
+    shipped, so ``base...head`` is exactly its change, ``merged`` its merge commit once
+    it merged ("" until known), and ``shipped`` when its review counted as passed (0 while
+    the press is unfinished: then it did not ship)."""
+
+    pull: str
+    head: str
+    follow_up: str = ""
+    findings: str = ""
+    url: str = ""
+    at: float = 0.0
+    work: str = ""
+    base: str = ""
+    merged: str = ""
+    shipped: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -118,6 +173,14 @@ def chat_heads(
     return found
 
 
+def clip_findings(text: str) -> str:
+    """Findings as kept on their event, for the GitHub check (#4152), saying when cut."""
+    text = (text or "").strip()
+    if len(text) <= FINDINGS_LIMIT:
+        return text
+    return text[:FINDINGS_LIMIT].rstrip() + "\n\n(Cut here: the findings are longer than this.)"
+
+
 def at_head(events: Iterable[ReviewEvent], head: str) -> list[ReviewEvent]:
     """The events written at ``head``, a full commit id or an abbreviation of at least 7."""
     head = (head or "").lower()
@@ -133,9 +196,35 @@ def full_head(events: Iterable[ReviewEvent], sha: str) -> str:
     return found.pop() if len(found) == 1 else ""
 
 
+def _unaccepted(events: Iterable[ReviewEvent]) -> list[ReviewEvent]:
+    """``events`` in time order, less the findings and escalations of a round the owner
+    already accepted: one dated after an ``accepted`` row with no ask between (#4069). The
+    owner may accept on the escalation's own comment, minutes before the chat board writes
+    the same escalation from its chat's closing line, and that copy must not undo the pass.
+    An acceptance made while a newer review is out ends no round: that review's findings
+    count."""
+    kept: list[ReviewEvent] = []
+    accepted: set[str] = set()  # per head: a pull request's whole history may be read
+    waiting: set[str] = set()  # heads with an ask nothing has answered yet
+    for event in sorted(events, key=lambda event: (event.at, event.seq)):
+        if event.kind == ASKED:
+            accepted.discard(event.head)
+            waiting.add(event.head)
+        elif event.kind == ACCEPTED:
+            if event.head not in waiting:
+                accepted.add(event.head)
+        elif event.head in accepted and event.kind in (FINDINGS, ESCALATED):
+            continue
+        elif event.kind in VERDICTS:
+            waiting.discard(event.head)
+        kept.append(event)
+    return kept
+
+
 def newest_verdict(events: Iterable[ReviewEvent]) -> ReviewEvent | None:
-    """The newest verdict among ``events`` (by its own time, then arrival), or ``None``."""
-    verdicts = [event for event in events if event.kind in VERDICTS]
+    """The newest verdict among ``events`` (by its own time, then arrival), or ``None``; the
+    findings or escalation of a round already accepted do not count (``_unaccepted``)."""
+    verdicts = [event for event in _unaccepted(events) if event.kind in VERDICTS]
     return max(verdicts, key=lambda event: (event.at, event.seq), default=None)
 
 
@@ -158,6 +247,46 @@ def answered(events: Iterable[ReviewEvent], head: str) -> bool:
     """Whether a verdict, findings or an escalation came back for ``head`` (or was carried to
     it from a head a base merge away): only then may the owner accept it as is (#3828)."""
     return newest_verdict(at_head(events, head)) is not None
+
+
+#: The verdicts a person may ship anyway, leaving their findings to a follow-up Work (#4212).
+SHIPPABLE = frozenset({CHANGES, FINDINGS, ESCALATED})
+
+
+def shippable(events: Iterable[ReviewEvent], head: str) -> ReviewEvent | None:
+    """The findings or escalation that ``head``'s review came back with, when the owner may
+    ship ``head`` now and leave them to a follow-up Work (#4212); else ``None``.
+
+    Only the newest verdict at the head, and only while no newer review was asked for: that
+    review may pass, and shipping must never skip a diff the reviewer has not finished."""
+    verdict = standing_verdict(at_head(events, head))
+    return verdict if verdict is not None and verdict.kind in SHIPPABLE else None
+
+
+_NOT_A_FINDING = ("/claude", "review findings", "#", "<!--", "**review")
+
+
+def first_finding(text: str, limit: int = 160) -> str:
+    """The first line of findings that says something: not the command, heading or marker
+    lines a reviewer's comment opens with; clipped to ``limit`` characters (#4212 D10)."""
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line or line.lower().startswith(_NOT_A_FINDING):
+            continue
+        return line if len(line) <= limit else line[: limit - 1].rstrip() + "…"
+    return ""
+
+
+def findings_text(events: Iterable[ReviewEvent], head: str) -> tuple[str, str]:
+    """``(text, url)`` of the newest findings kept at ``head``: the words the history kept, and
+    the comment they were posted in; either may be empty (#4212)."""
+    rows = [e for e in at_head(events, head) if e.kind in SHIPPABLE]
+    text = url = ""
+    for event in sorted(rows, key=lambda event: (event.at, event.seq)):
+        data = event.data or {}
+        text = str(data.get("text") or "").strip() or text
+        url = str(data.get("url") or "").strip() or url
+    return text, url
 
 
 def checklist_waits(events: Iterable[ReviewEvent]) -> bool:
@@ -204,13 +333,71 @@ def passed(event: ReviewEvent | None) -> bool:
     return event is not None and event.kind in (PASS, ACCEPTED)
 
 
+#: The note of the pass a Ship now press records (#4212).
+SHIP_NOTE = "Shipped now with its findings left to a follow-up Work"
+
+
+def ship_pass_head(events: Iterable[ReviewEvent], head: str) -> str:
+    """The head a Ship now press passed, when ``head``'s standing verdict is that pass or one
+    base updates carried from it, through any number of them; else "". Such a pass counts only
+    once its press finished (#4212 review): ``WorkRelease._verdict_at``, ``WorkRouter.ship_now``
+    and the Work page read it by this one rule. ``carried_from`` names only the head before,
+    so the chain is walked back to the press's own row, each head once."""
+    events = list(events)
+    verdict = standing_verdict(at_head(events, head))
+    if not _ship_pass(verdict):
+        return ""
+    seen = {verdict.head}
+    while older := str((verdict.data or {}).get("carried_from") or "").lower():
+        if older in seen:
+            break
+        seen.add(older)
+        before = standing_verdict(at_head(events, older))
+        if not _ship_pass(before):
+            return older  # the rows before were dropped: the head carried from is the best kept
+        verdict = before
+    return verdict.head.lower()
+
+
+def _ship_pass(event: ReviewEvent | None) -> bool:
+    return passed(event) and str((event.data or {}).get("note") or "") == SHIP_NOTE
+
+
+def background_chat(events: Sequence[ReviewEvent], chat: ReviewEvent) -> bool:
+    """Whether ``chat`` (a ``chat`` row among one pull request's ``events``) only listed this
+    pull request as already passed while it reviewed a sibling (#3341): its head's newest
+    verdict before it is a pass, with no ask between, and no ask at that head follows it
+    before the next chat (a review asked for again writes its chat a moment before its ask,
+    #3956 review). The rule ``head_review`` applies; the earlier-rounds list counts no such
+    chat as a round of this pull request (#4208 review)."""
+    def when(event: ReviewEvent) -> tuple[float, int]:
+        return (event.at, event.seq)
+
+    order = sorted(events, key=when)
+    head = chat.head.lower()
+    before = [e for e in order if when(e) < when(chat) and e.head.lower() == head]
+    verdicts = [e for e in _unaccepted(before) if e.kind in VERDICTS]
+    if not verdicts or verdicts[-1].kind not in (PASS, ACCEPTED):
+        return False
+    if any(e.kind == ASKED and when(e) > when(verdicts[-1]) for e in before):
+        return False
+    for event in order:
+        if when(event) <= when(chat):
+            continue
+        if event.kind == CHAT:
+            break
+        if event.kind == ASKED and event.head.lower() == head:
+            return False
+    return True
+
+
 def head_review(events: Iterable[ReviewEvent]) -> HeadReview:
     """The answer of one head's ``events``, whatever order they arrived in."""
     events = list(events)
     checklist = review = verdict_at = findings = None
     review_chat = verdict = chat = by = url = note = background = ""
     accepted = unstarted = told = False
-    for event in sorted(events, key=lambda event: (event.at, event.seq)):
+    for event in _unaccepted(events):
         data = event.data or {}
         unstarted = event.kind == UNSTARTED or (unstarted and event.kind not in KINDS)
         if event.kind == CHECKLIST:

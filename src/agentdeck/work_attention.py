@@ -256,6 +256,10 @@ def _derived(card: WorkCard, row_reason: str, made) -> OperatorAttention:
     if kind == "login_expired":
         # The account's sign-in expired (#3354): a person signs in again, not AgentDeck's bug.
         return made(NEEDS_RETRY, row_reason, ANSWER, OPEN)
+    if kind == "retry_cancelled":
+        # A person cancelled the retry at the reset (#4074): nothing starts it again, so it
+        # stays theirs, but the deck knows why it stopped and did nothing wrong.
+        return made(NEEDS_RETRY, row_reason, ANSWER, OPEN)
     if kind == "cut_off":
         # Its process died mid-turn and no revival is coming (#3008): a person starts it
         # again. Not filed as a bug: a restart or a memory kill is not the deck's defect.
@@ -274,8 +278,9 @@ def _derived(card: WorkCard, row_reason: str, made) -> OperatorAttention:
         return made(NEEDS_ANSWER, row_reason, OPEN, FINISH)
     if kind == "not_live":
         # Merged, but part of it is not running yet (#3220): someone deploys it, then the
-        # agent checks again; no Finish until then.
-        return made(NEEDS_ANSWER, row_reason, OPEN)
+        # agent checks again. Or the owner closes it unproven (#4126): the row says what is
+        # unproven, and only a person's Finish lets it go.
+        return made(NEEDS_ANSWER, row_reason, OPEN, FINISH)
     if kind == "pr_held":
         # The spec-only label (#3097): nothing in the deck merges it, a person decides.
         return made(RELEASE_BLOCKED, row_reason, OPEN, INSPECT)

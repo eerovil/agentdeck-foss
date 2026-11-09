@@ -7,13 +7,16 @@ providers translate their native session sources into these types.
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from collections.abc import Iterable
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
 from time import monotonic, time
+
+from .chat_use import ChatUse
 
 _ISSUE_URL_RE = re.compile(
     r"https://github\.com/[^/]+/([^/]+)/(?:issues|pull)/(\d+)"
@@ -57,6 +60,10 @@ SNAPSHOT_CONTEXT_MANAGEMENT_V1 = "context_management_v1"
 # with none of the history it asked for, so the deck offers a side chat only when the
 # runtime says it can make one.
 SNAPSHOT_FORK_V1 = "fork_v1"
+# The Codex runtime starts a thread with a session role and saves it (#4092). A runtime
+# without it drops the role, so a Work chat would start with no Work guide; the deck
+# refuses that start until the runtime has restarted onto this code.
+SNAPSHOT_ROLE_V1 = "role_v1"
 # The runtime can roll an idle chat back to before one of its messages, in place (#3474):
 # it ends the process and resumes the next turn at the line before that message. A web
 # process asking a runtime without it would hide the messages while the agent kept them.
@@ -610,6 +617,13 @@ class Session:
     last_progress: datetime | None = None
     tokens: TokenTotals | None = None  # summed from transcript usage blocks (v0.2)
     context_tokens: int | None = None  # context-window occupancy (input side of latest usage block)
+    # Just compacted, no size known until the next message (#4168).
+    context_compacted: bool = False
+    # When the last call's prompt cache counts as gone (#4169); None when not known, as
+    # on every provider that does not report it.
+    cache_expires_at: datetime | None = None
+    # The cost dot (#4163): set on display copies only, from ``AppState.chat_use``.
+    chat_use: ChatUse | None = None
     deep_link: str | None = None  # provider-native URL when applicable
     deep_link_label: str | None = None
     show_when_idle: bool = False  # keep in the dashboard after the native process exits
@@ -796,6 +810,9 @@ class InjectResult:
     reason: str | None = None
     session_id: str | None = None
     transcript_expected: bool = True
+    # The runtime could not be reached, or the connection broke before any answer: the
+    # write may be tried again once it is back (#4106). Web-side, like the field above.
+    runtime_unreachable: bool = False
 
     @classmethod
     def from_wire(cls, data: object, *, source: str = "runtime") -> InjectResult:
@@ -858,6 +875,19 @@ class PendingInteraction:
     # A Claude chat's open questions, kept by the deck past the turn that asked them (#3451):
     # any of them may be answered or dismissed on its own, so none is required.
     dismissible: bool = False
+
+    def fingerprint(self) -> str:
+        """What this box asks, the same whatever id the runtime gives it (#4106).
+
+        Codex hands a prompt replayed after a restart a new id, so an answer held
+        through the restart recognises its question by this instead. Everything but the
+        ids counts, a field added later too: a prompt that differs only in its folder,
+        link or choices asks for something else, and a held "allow" must not approve it.
+        """
+        asked = asdict(self)
+        for name in ("id", "thread_id", "turn_id"):
+            del asked[name]
+        return hashlib.sha256(json.dumps(asked, sort_keys=True).encode()).hexdigest()[:32]
 
     def answer_json(self) -> dict:
         """The API's shape of this interaction: everything needed to answer it (#590, #3481)."""

@@ -133,7 +133,10 @@ LIVE_NOTHING = "nothing_to_check"
 # Merged, but some of it is not running yet, such as a repository this deck does not deploy
 # (#3220): the Work stays open rather than reading as verified.
 LIVE_NOT_LIVE = "not_live"
-LIVE_RESULTS = (LIVE_VERIFIED, LIVE_FAILED, LIVE_NOTHING, LIVE_NOT_LIVE)
+# Live, but only a person can see whether it works, such as a page behind a production login
+# (#4210): the Work waits for a try outside Needs you, and its note says what to try.
+LIVE_NEEDS_PERSON = "needs_person"
+LIVE_RESULTS = (LIVE_VERIFIED, LIVE_FAILED, LIVE_NOTHING, LIVE_NOT_LIVE, LIVE_NEEDS_PERSON)
 # One line on a card; the details go on the issue.
 MAX_LIVE_NOTE = 500
 
@@ -157,6 +160,8 @@ class LiveCheck:
             return "live check failed" + (f": {self.note}" if self.note else "")
         if self.result == LIVE_NOT_LIVE:
             return "not live yet" + (f": {self.note}" if self.note else "")
+        if self.result == LIVE_NEEDS_PERSON:
+            return self.note or "try it in the app"
         return "checked live" + (f": {self.note}" if self.note else "")
 
 
@@ -166,6 +171,8 @@ def normalize_live_check(result: object, note: object) -> tuple[str, str]:
     if value not in LIVE_RESULTS:
         raise ResolutionError(f"result must be one of {', '.join(LIVE_RESULTS)}")
     text = " ".join(str(note or "").split())
+    if value == LIVE_NEEDS_PERSON and not text:
+        raise ResolutionError(f"{LIVE_NEEDS_PERSON} needs a note saying what to try")
     if len(text) > MAX_LIVE_NOTE:
         raise ResolutionError(f"note is longer than {MAX_LIVE_NOTE} characters")
     return value, text

@@ -7,6 +7,7 @@ records the death left behind, with nothing registered in advance.
 
 from __future__ import annotations
 
+import threading
 import time
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -875,6 +876,27 @@ async def test_a_registered_survivor_refused_at_capacity_is_retried_once_as_a_re
     assert "was killed while your turn was running" in messages[1]
     assert messages[2] == messages[1]
     assert sorted(nudges.ledger.load()) == ["claude_code:main:sid-1"]
+
+
+async def test_reading_background_tasks_at_boot_leaves_the_event_loop_free(tmp_path):
+    """The lookup reads whole transcripts; on the loop it held startup for 40 s (#4100)."""
+    state = _runtime(tmp_path)
+    now = time.time()
+    host = _host({"issue-1": _worker(last_delivery_at=now - 600, last_result_at=now - 500)})
+    lookup_threads = []
+
+    def outstanding(_key):
+        lookup_threads.append(threading.get_ident())
+        return frozenset()
+
+    host.outstanding_background_tasks = outstanding
+    state.claude_workers.hosts["main"] = host
+    nudges = state.restart_nudges
+    nudges.begin_boot()
+
+    await nudges.deliver_all()
+
+    assert lookup_threads and threading.get_ident() not in lookup_threads
 
 
 async def test_a_chat_already_told_its_background_task_died_is_left_alone_unflagged(

@@ -59,7 +59,7 @@ from ...models import (
 )
 from ...transcript_rollbacks import HIDDEN
 from .. import transcript_reader as transcript_reader_mod
-from .._filecache import FileCache, SharedFileCache, mtime_sig, size_mtime_sig
+from .._filecache import FileCache, SharedFileCache, size_mtime_sig
 from .._tailcache import TranscriptTailCache
 from ..base import (
     EffortChoice,
@@ -102,7 +102,7 @@ SHARED_SCAN_CACHE_ENTRIES = 8192
 class _RootScanRead:
     meta: transcripts_mod.TranscriptMeta
     last_event: TranscriptEvent | None
-    context_tokens: int | None
+    context: transcripts_mod.ContextReading
     task_ledger: transcripts_mod.TaskLedger
 
 
@@ -458,16 +458,18 @@ class ClaudeCodeProvider(SessionProvider):
         # so it needs the finer (size, mtime_ns) signature for the same reason
         # last-event does: a filesystem whose timestamps advance on a clock tick
         # rather than per write gives an append the mtime it already had, and the
-        # cache then answers with the text from before it (#1368). Context tokens
-        # are a number nobody reads a stale copy of for long, and stay on mtime.
+        # cache then answers with the text from before it (#1368). The context
+        # reading needs it too: it carries whether the chat was just compacted,
+        # and a compact appended in the same tick as the reply before it would
+        # otherwise keep the old size and no flag until the next write (#4175).
         self._meta_cache: FileCache[transcripts_mod.TranscriptMeta] = FileCache(
             size_mtime_sig, max_entries=SCAN_CACHE_ENTRIES
         )
         self._last_ev_cache: FileCache[TranscriptEvent | None] = FileCache(
             size_mtime_sig, max_entries=SCAN_CACHE_ENTRIES
         )
-        self._ctx_cache: FileCache[int | None] = FileCache(
-            mtime_sig, max_entries=SCAN_CACHE_ENTRIES
+        self._ctx_cache: FileCache[transcripts_mod.ContextReading] = FileCache(
+            size_mtime_sig, max_entries=SCAN_CACHE_ENTRIES
         )
         # The subagent row's task description, which ``transcript_meta`` cannot
         # carry: a sidechain's first user line. Memoized like the rest so the
@@ -689,6 +691,12 @@ class ClaudeCodeProvider(SessionProvider):
             return None
         return transcripts_mod.fork_ref(path, seq, turn_finished=not session.thinking)
 
+    def newest_fork(self, account: Account, session: Session) -> tuple[int, str] | None:
+        path = self._transcript_path(account, session)
+        if path is None:
+            return None
+        return transcripts_mod.newest_fork(path, turn_finished=not session.thinking)
+
     def rewind_refusal(self, account: Account, session: Session) -> str | None:
         client = self._workers.get(account.key)
         if client is None or not client.available:
@@ -733,6 +741,19 @@ class ClaudeCodeProvider(SessionProvider):
         if workers is None or not workers.available or not workers.owns(session_id):
             return None
         return _pending_from_dict(workers.pending_interaction(session_id))
+
+    def _last_seen_interaction(
+        self, account: Account, session_id: str
+    ) -> PendingInteraction | None:
+        workers = self._workers.get(account.key)
+        if workers is None:
+            return None
+        return _pending_from_dict(workers.pending_interaction(session_id))
+
+    def forget_held_interaction(self, account, session, question_ids) -> None:
+        workers = self._workers.get(account.key)
+        if workers is not None:
+            workers.forget_interaction(session.session_id, question_ids)
 
     def _asks_by_tool(self, scan_read: _RootScanRead | None, path: Path | None) -> bool:
         """The transcript's newest event is an unanswered question tool call (#1878, #3923)."""
@@ -1187,8 +1208,10 @@ class ClaudeCodeProvider(SessionProvider):
             )
         )
 
-    def _cached_context_tokens(self, path: Path) -> int | None:
-        return self._ctx_cache.get(path, transcripts_mod.last_context_tokens, None)
+    def _cached_context(self, path: Path) -> transcripts_mod.ContextReading:
+        return self._ctx_cache.get(
+            path, transcripts_mod.last_context_reading, transcripts_mod.ContextReading()
+        )
 
     def _prepare_scan_reads(
         self,
@@ -1213,7 +1236,7 @@ class ClaudeCodeProvider(SessionProvider):
                 _RootScanRead(
                     transcripts_mod.TranscriptMeta(),
                     None,
-                    None,
+                    transcripts_mod.ContextReading(),
                     transcripts_mod.TaskLedger(),
                 ),
             )
@@ -1233,7 +1256,7 @@ class ClaudeCodeProvider(SessionProvider):
         return _RootScanRead(
             meta=self._cached_meta(path),
             last_event=self._cached_last_event(path),
-            context_tokens=self._cached_context_tokens(path),
+            context=self._cached_context(path),
             task_ledger=self._cached_task_ledger(path),
         )
 
@@ -1529,7 +1552,7 @@ class ClaudeCodeProvider(SessionProvider):
                 transcripts_mod.trailing_question(last_text) if last_role == "agent" else None
             )
 
-            context_tokens = scan_read.context_tokens if scan_read is not None else None
+            context = scan_read.context if scan_read is not None else None
 
             last_write = _mtime(tpath) if tpath else (entry.started_at if entry else None)
 
@@ -1610,7 +1633,9 @@ class ClaudeCodeProvider(SessionProvider):
                 last_activity=last_activity,
                 last_progress=last_progress,
                 model=meta.model if tpath is not None else None,
-                context_tokens=context_tokens,
+                context_tokens=context.tokens if context else None,
+                context_compacted=context.compacted if context else False,
+                cache_expires_at=context.cache_expires_at if context else None,
                 deep_link=deep_link,
                 deep_link_label="open in claude.ai" if deep_link else None,
                 show_when_idle=False,
@@ -1895,7 +1920,9 @@ class ClaudeCodeProvider(SessionProvider):
         session.last_activity = last_progress or last_write
         session.last_progress = last_progress
         session.model = meta.model
-        session.context_tokens = scan_read.context_tokens
+        session.context_tokens = scan_read.context.tokens
+        session.context_compacted = scan_read.context.compacted
+        session.cache_expires_at = scan_read.context.cache_expires_at
         session.deep_link = deep_link
         session.deep_link_label = "open in claude.ai" if deep_link else None
         session.show_when_idle = False
@@ -2002,7 +2029,9 @@ class ClaudeCodeProvider(SessionProvider):
             last_role_now = s.last_role
             last_message_at_now = s.last_message_at
             model_now = s.model
-            context_now = s.context_tokens
+            context_now = transcripts_mod.ContextReading(
+                s.context_tokens, s.context_compacted, s.cache_expires_at
+            )
             last_ev_now = None
             tp = None
             background_active = None
@@ -2030,7 +2059,7 @@ class ClaudeCodeProvider(SessionProvider):
                     last_message_at_now = tmeta.last_message_at
                     model_now = tmeta.model or s.model
                     last_ev_now = self._cached_last_event(tp)  # cache hit (_activity read it)
-                    context_now = self._cached_context_tokens(tp)
+                    context_now = self._cached_context(tp)
             if last_ev_now is not None and last_ev_now.question:
                 # Unanswered AskUserQuestion → surface its prompt (see scan_sessions).
                 question_now = last_ev_now.question
@@ -2068,7 +2097,7 @@ class ClaudeCodeProvider(SessionProvider):
             if last_ev_now is not None:
                 s.last_event_seq = last_ev_now.seq
             s.question = question_now
-            s.context_tokens = context_now
+            s.context_tokens, s.context_compacted, s.cache_expires_at = context_now
             s.pid = pid_now
             s.deep_link = deep_link_now
             s.show_when_idle = False
@@ -2106,6 +2135,11 @@ class ClaudeCodeProvider(SessionProvider):
         )
 
     # --- transcripts (v0.2) --------------------------------------------
+
+    fitted_weights = True
+
+    def use_transcript(self, account: Account, session: Session) -> Path | None:
+        return self._transcript_path(account, session, tolerate_stale_miss=True)
 
     def _transcript_path(
         self, account: Account, session: Session, *, tolerate_stale_miss: bool = False
@@ -2214,13 +2248,18 @@ class ClaudeCodeProvider(SessionProvider):
         return await asyncio.to_thread(transcripts_mod.transcript_cursor, path)
 
     async def tail_transcript(
-        self, account: Account, session: Session, byte_offset: int, seq: int
+        self,
+        account: Account,
+        session: Session,
+        byte_offset: int,
+        seq: int,
+        limit: int | None = None,
     ) -> tuple[list[TranscriptEvent], int, int]:
         path = self._transcript_path(account, session)
         if path is None:
             return ([], byte_offset, seq)
         read = await asyncio.to_thread(
-            transcripts_mod.read_events, path, byte_offset=byte_offset, seq=seq
+            transcripts_mod.read_events, path, byte_offset=byte_offset, seq=seq, limit=limit
         )
         return (HIDDEN.visible(session.key, read.events), read.byte_offset, read.seq)
 

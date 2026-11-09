@@ -65,7 +65,8 @@ def test_each_run_happens_once_a_window_and_skips_say_why():
     runs, skipped = auto_dream.candidates(
         [
             reading(age_s=3600),
-            reading("codex:codex", five=75.0),
+            reading("claude_code:alt", five=75.0),
+            reading("codex:codex"),
             reading("cursor:cursor"),
         ],
         {},
@@ -74,11 +75,9 @@ def test_each_run_happens_once_a_window_and_skips_say_why():
     assert runs == []
     assert skipped == [
         "claude_code:main: the usage reading is stale",
-        "codex:codex: the 5-hour meter is at 75%",
+        "claude_code:alt: the 5-hour meter is at 75%",
     ]
-    # An account may have no 5-hour window at all, Codex (#2560) and Claude (#3947) alike:
-    # its week decides alone.
-    assert due(reading("codex:codex", five=None)) == [("codex:codex", "early", 5)]
+    # An account may have no 5-hour window at all (#3947): its week decides alone.
     assert due(reading("claude_code:main", five=None)) == [("claude_code:main", "early", 5)]
 
 
@@ -86,12 +85,20 @@ def test_a_final_run_goes_before_an_early_one_then_the_earlier_reset():
     assert due(
         reading("claude_code:alt", left=timedelta(hours=2)),
         reading("claude_code:main", left=timedelta(hours=3)),
-        reading("codex:codex", left=timedelta(minutes=40), week=90.0),
+        reading("claude_code:third", left=timedelta(minutes=40), week=90.0),
     ) == [
-        ("codex:codex", "final", 9),
+        ("claude_code:third", "final", 9),
         ("claude_code:alt", "early", 5),
         ("claude_code:main", "early", 5),
     ]
+
+
+@pytest.mark.parametrize(
+    "left", [timedelta(hours=4), timedelta(minutes=40)], ids=["early", "final"]
+)
+def test_a_codex_account_never_gets_an_automatic_dream(left):
+    # #4100: its 100 reader chats kept the Codex runtime from starting.
+    assert due(reading("codex:codex", left=left, week=20.0)) == []
 
 
 def test_a_start_is_recorded_only_once_accepted_and_never_while_a_dream_runs(tmp_path):

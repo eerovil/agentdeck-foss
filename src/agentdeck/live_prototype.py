@@ -83,7 +83,7 @@ the page and says what is wrong. Check only that the page still loads (one reque
    `GET .../live-prototype` before you change one. Keep them true to the prototype:
    a change that alters a use case's steps updates that use case.
 8. "Write the spec from what we picked: version <name> (<link>)": file one issue in
-   <repo> (it gets the `agent` label) for that version, with what the kept steps
+   <repo> (it gets that project's start label) for that version, with what the kept steps
    changed, the use cases, and the prototype's branch, so a Work builds the real
    pull request. Reply with its link. The person picks a version with the page's switch.
    Leave the dev server running until the person says they are done; then stop it

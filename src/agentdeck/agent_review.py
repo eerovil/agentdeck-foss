@@ -109,10 +109,18 @@ def brief(
         else ""
     )
     lanes = CODEX_LANES if name == NAMES[CODEX] else ""
+    # A pull request no Work owns is reviewed for its GitHub check, under its own name (#4152).
+    alone = (
+        "\nThis pull request belongs to no Work, so no agent acts on your findings: a person "
+        "reads them in the GitHub check. Send the findings and the verdict as below, and ask "
+        "for nothing else.\n"
+        if issue.lower() == pull.lower()
+        else ""
+    )
     return f"""You are AgentDeck's {name} reviewer. The deck started you to review pull request \
 {pull} at commit `{head}` for the Work {issue}. This directory is a throwaway checkout of that \
 commit, made for you; the deck removes it when you stop.
-{again}
+{alone}{again}
 - First check that `git rev-parse HEAD` is `{head}`. If it is not, stop and say so.
 - Run the installed `rate-my-pr` skill exactly once on this commit against its base: \
 `git diff origin/{base}...{head}`. Follow the repository's root guide (`AGENTS.md`, or \

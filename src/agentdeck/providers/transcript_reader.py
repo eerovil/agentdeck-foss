@@ -87,6 +87,9 @@ class TranscriptMeta:
     agent_nickname: str | None = None
     agent_role: str | None = None
     task_finished_at: datetime | None = None
+    # The error the latest turn's end record carries, as Codex wrote it. Codex marks a turn
+    # its account refused only here: it has no reply, and its end looks like any other (#4118).
+    turn_error: dict | None = None
     task_status: str | None = None
 
 

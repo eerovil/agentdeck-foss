@@ -14,11 +14,13 @@ nobody has touched in days, alone rather than start it all at the first pass aft
 Left alone besides: a closed issue, a pull request, an issue carrying its project's paused
 label, a Work paused on this deck, a Work a Poller card still holds, a Work whose deck start
 was already spent, and an issue another deck works because it is assigned to that deck's
-person (``work_claims``, #3731). A spec-only issue is started like any other, and its agent
-is told to write the spec (#3134). The issue list is the shared cache the refresher keeps warm, so
-a pass costs no GitHub call; a candidate's own record is re-read once before it is started,
-so a stale list never starts an issue a person has since closed or held back. Each start is
-logged as the backstop's, so a lost delivery stays visible.
+person (``work_claims``, #3731), and an issue whose ``start_work`` answers that a blocker holds
+it (``work_signals.start_unless_blocked``, #4216): it starts when its last blocker closes, and an
+unread blocker list is read again next pass. A spec-only issue is started like any other,
+and its agent is told to write the spec (#3134). The issue list is the shared cache the
+refresher keeps warm, so a pass costs no GitHub call; a candidate's own record is re-read
+once before it is started, so a stale list never starts an issue a person has since closed or
+held back. Each start is logged as the backstop's, so a lost delivery stays visible.
 """
 
 from __future__ import annotations
@@ -33,6 +35,7 @@ from datetime import datetime
 from .issue_context import IssueBacklog
 from .work import WorkRef
 from .work_claims import assignee_of
+from .work_signals import BLOCKED, BLOCKERS_UNREAD
 
 log = logging.getLogger(__name__)
 
@@ -193,6 +196,11 @@ class MissedStartBackstop:
             outcome = await self._start_work(repository, number, labels=labels)
         except Exception:  # noqa: BLE001 - one failed start must not stop the pass
             log.exception("work backstop: start of %s failed", work_id)
+            return False
+        if outcome in (BLOCKED, BLOCKERS_UNREAD):
+            # Held by ``start_unless_blocked`` (#4216): its last blocker closing starts it,
+            # and an unread list is read again next pass.
+            log.info("work backstop: %s not started: %s", work_id, outcome)
             return False
         log.warning(
             "work backstop: %s was labelled with no chat and no webhook delivery started it;"

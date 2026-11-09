@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from agentdeck import assistant as assistant_module
 from agentdeck.assistant import (
     ATTENTION_CUTOFF,
     AssistantInsight,
@@ -1416,7 +1418,7 @@ def _pr_session(tmp_path) -> Session:
     )
 
 
-def test_a_delivery_publishes_the_pill_the_cache_already_moved(tmp_path):
+async def test_a_delivery_publishes_the_pill_the_cache_already_moved(tmp_path):
     session = _pr_session(tmp_path)
     resolver = _StubResolver()
     resolver.moved_to = _pr_context("merged")
@@ -1427,6 +1429,7 @@ def test_a_delivery_publishes_the_pill_the_cache_already_moved(tmp_path):
     assistant._contexts.update({session.key: _pr_context("open")})
 
     assistant.freshen_pull_requests()
+    await assistant._freshen_task
 
     assert assistant._contexts.get(session.key).pull_requests[0].status == "merged"
     # The session list re-renders off the assistant topic, so that is the one to
@@ -1434,7 +1437,7 @@ def test_a_delivery_publishes_the_pill_the_cache_already_moved(tmp_path):
     assert published == ["assistant"]
 
 
-def test_a_delivery_that_moves_nothing_publishes_nothing(tmp_path):
+async def test_a_delivery_that_moves_nothing_publishes_nothing(tmp_path):
     """The update-only-on-real-change rule, enforced here rather than at the source.
 
     The consumer signals on a row it rewrote; whether the deck's own held context
@@ -1448,11 +1451,12 @@ def test_a_delivery_that_moves_nothing_publishes_nothing(tmp_path):
     assistant._contexts.update({session.key: _pr_context("open")})
 
     assistant.freshen_pull_requests()
+    await assistant._freshen_task
 
     assert published == []
 
 
-def test_a_delivery_does_not_force_a_deckhand_pass(tmp_path):
+async def test_a_delivery_does_not_force_a_deckhand_pass(tmp_path):
     """A pull request moving is no reason to re-triage every chat, which costs tokens."""
     resolver = _StubResolver()
     resolver.moved_to = _pr_context("merged")
@@ -1464,9 +1468,151 @@ def test_a_delivery_does_not_force_a_deckhand_pass(tmp_path):
     assistant._wake.clear()
 
     assistant.freshen_pull_requests()
+    await assistant._freshen_task
 
     assert assistant._force is False
     assert not assistant._wake.is_set()
+
+
+async def test_the_cache_read_leaves_the_loop_and_deliveries_meanwhile_cost_one_more(tmp_path):
+    """#4130: the read waits on a file other processes write, so the loop must not."""
+    session = _pr_session(tmp_path)
+    resolver = _StubResolver()
+    entered, leave = threading.Event(), threading.Event()
+    reads: list[int] = []
+
+    def read(contexts):
+        reads.append(threading.get_ident())
+        entered.set()
+        assert leave.wait(10)
+        return {}
+
+    resolver.reconcile_cached_pulls_many = read
+    assistant = _service(tmp_path, resolver=resolver)
+    assistant._contexts.update({session.key: _pr_context("open")})
+
+    assistant.freshen_pull_requests()
+    await asyncio.to_thread(entered.wait, 10)
+    assistant.freshen_pull_requests()
+    assistant.freshen_pull_requests()
+    leave.set()
+    await assistant._freshen_task
+
+    assert len(reads) == 2, "the first read may have missed them, so one more, not one each"
+    assert threading.get_ident() not in reads
+
+
+@pytest.mark.parametrize("replaced", ["newer", "gone"])
+async def test_a_context_changed_during_the_read_keeps_what_it_became(tmp_path, replaced):
+    session = _pr_session(tmp_path)
+    resolver = _StubResolver()
+    resolver.moved_to = _pr_context("merged")
+    newer = replace(_pr_context("closed"))
+    assistant = _service(tmp_path, resolver=resolver)
+    assistant._contexts.update({session.key: _pr_context("open")})
+    read = resolver.reconcile_cached_pulls_many
+
+    def read_then_change(contexts):
+        moved = read(contexts)
+        resolver.moved_to = None  # the look again finds nothing newer
+        if replaced == "newer":
+            assistant._contexts.update({session.key: newer})
+        else:
+            assistant._contexts.retain(())
+        return moved
+
+    resolver.reconcile_cached_pulls_many = read_then_change
+
+    assert await assistant._freshen_contexts_from_cache() is False
+    assert assistant._contexts.get(session.key) == (newer if replaced == "newer" else None)
+
+
+@pytest.mark.parametrize("first", ["pass", "delivery"])
+async def test_two_sweeps_take_turns_so_the_newer_read_is_the_one_kept(tmp_path, first):
+    """A pass and a delivery both saw "open": the older read must not turn the newer away."""
+    session = _pr_session(tmp_path)
+    resolver = _StubResolver()
+    assistant = _service(tmp_path, resolver=resolver)
+    opened, closed, merged = _pr_context("open"), _pr_context("closed"), _pr_context("merged")
+    assistant._contexts.update({session.key: opened})
+    entered = [threading.Event(), threading.Event()]
+    leave = [threading.Event(), threading.Event()]
+    seen: list[GitContext] = []
+
+    def read(contexts):
+        turn = len(seen)
+        seen.append(contexts[session.key])
+        entered[turn].set()
+        assert leave[turn].wait(10)
+        return {session.key: (closed, merged)[turn]}
+
+    resolver.reconcile_cached_pulls_many = read
+
+    def by_pass():
+        return asyncio.create_task(assistant._freshen_contexts_from_cache())
+
+    def by_delivery():
+        assistant.freshen_pull_requests()
+        return assistant._freshen_task
+
+    starts = (by_pass, by_delivery) if first == "pass" else (by_delivery, by_pass)
+    older = starts[0]()
+    await asyncio.to_thread(entered[0].wait, 10)
+    newer = starts[1]()
+    await asyncio.sleep(0.01)
+    assert not entered[1].is_set(), "the second sweep waits, whichever would have ended first"
+
+    leave[0].set()
+    await asyncio.to_thread(entered[1].wait, 10)
+    leave[1].set()
+    await asyncio.gather(older, newer)
+
+    assert seen == [opened, closed]
+    assert assistant._contexts.get(session.key) is merged
+
+
+async def test_a_read_turned_away_is_made_once_more(tmp_path):
+    """A context replaced during the read may be older than the delivery that started it."""
+    session = _pr_session(tmp_path)
+    resolver = _StubResolver()
+    assistant = _service(tmp_path, resolver=resolver)
+    assistant._contexts.update({session.key: _pr_context("open")})
+    resolved, merged = _pr_context("closed"), _pr_context("merged")
+    calls = []
+
+    def read(contexts):
+        calls.append(contexts[session.key])
+        if len(calls) == 1:
+            assistant._contexts.update({session.key: resolved})
+        return {session.key: merged}
+
+    resolver.reconcile_cached_pulls_many = read
+
+    assert await assistant._freshen_contexts_from_cache() is True
+    assert calls[1] is resolved and assistant._contexts.get(session.key) is merged
+
+
+async def test_a_failed_read_after_a_delivery_is_logged_and_the_next_one_runs(tmp_path, caplog):
+    resolver = _StubResolver()
+    resolver.reconcile_cached_pulls_many = lambda _contexts: 1 / 0
+    assistant = _service(tmp_path, resolver=resolver)
+
+    assistant.freshen_pull_requests()
+    await assistant._freshen_task
+
+    assert "freshening contexts after a delivery failed" in caplog.text
+    resolver.reconcile_cached_pulls_many = lambda _contexts: {}
+    assistant.freshen_pull_requests()
+    await assistant._freshen_task
+
+
+async def test_a_slow_cache_read_is_logged(tmp_path, caplog, monkeypatch):
+    monkeypatch.setattr(assistant_module, "SLOW_CACHE_READ_S", 0.0)
+    assistant = _service(tmp_path, resolver=_StubResolver())
+
+    await assistant._freshen_contexts_from_cache()
+
+    assert "pull requests took" in caplog.text
 
 
 def _reviewed(state, repo: str, sha: str, verdict: str = "pass") -> None:

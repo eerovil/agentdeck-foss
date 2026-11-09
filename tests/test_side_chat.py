@@ -89,6 +89,64 @@ def test_claude_cut_only_after_a_reply_that_ends_its_turn(tmp_path):
     assert claude_transcripts.fork_ref(path, 0) is None
     assert claude_transcripts.fork_ref(path, 99) is None
     assert claude_transcripts.fork_ref(tmp_path / "missing.jsonl", 6) is None
+    # A Work's side chat (#4199) picks the newest reply itself, even mid-turn.
+    assert claude_transcripts.newest_fork(path) == (9, "b-end")
+    assert claude_transcripts.newest_fork(path, turn_finished=False) == (6, "a-end")
+    working = _jsonl(
+        tmp_path / "working.jsonl",
+        [
+            *[json.loads(line) for line in path.read_text().splitlines()],
+            _prompt("third"),  # 10
+            _assistant("c-mid", _text("running the tests"), stop="tool_use"),  # 11
+            _assistant("c-tool", {"type": "tool_use", "name": "Bash"}, stop="tool_use"),  # 12
+            _tool_result(),  # 13
+        ],
+    )
+    assert claude_transcripts.newest_fork(working, turn_finished=False) == (9, "b-end")
+    assert claude_transcripts.fork_ref(working, 9, turn_finished=False) == "b-end"
+    assert claude_transcripts.newest_fork(tmp_path / "missing.jsonl") is None
+    fresh = _jsonl(tmp_path / "new.jsonl", [_prompt("hi")])
+    assert claude_transcripts.newest_fork(fresh) is None
+
+
+def test_claude_cut_never_goes_before_a_compaction(tmp_path):
+    """A resumed chat starts at its newest compaction, so Claude cannot find a cut before
+    it ("No message found with message.uuid"): a Work's side chat of a long turn that
+    compacted on its way failed to start (#4199)."""
+    compaction = {"type": "system", "subtype": "compact_boundary", "parentUuid": None}
+    summary = {
+        "type": "user",
+        "isCompactSummary": True,
+        "message": {"role": "user", "content": "This session is being continued..."},
+    }
+    rows = [
+        _prompt("first"),  # 1
+        _assistant("a-end", _text("done")),  # 2
+        _prompt("second"),  # 3
+        _assistant("b-tool", {"type": "tool_use", "name": "Bash"}, stop="tool_use"),  # 4
+        _tool_result(),  # 5
+        compaction,  # 6
+        summary,  # 7
+        _assistant("b-mid", _text("still on it"), stop="tool_use"),  # 8
+        _assistant("b-tool2", {"type": "tool_use", "name": "Bash"}, stop="tool_use"),  # 9
+        _tool_result(),  # 10
+    ]
+    running = _jsonl(tmp_path / "running.jsonl", rows)
+    assert claude_transcripts.fork_ref(running, 2) is None
+    assert claude_transcripts.fork_ref(running, 2, turn_finished=False) is None
+    # The running turn is the only one since: its words so far, not a refusal.
+    assert claude_transcripts.newest_fork(running, turn_finished=False) == (8, "b-mid")
+    just = _jsonl(tmp_path / "just.jsonl", rows[:7])
+    assert claude_transcripts.newest_fork(just, turn_finished=False) is None
+    done = _jsonl(
+        tmp_path / "done.jsonl",
+        [*rows, _assistant("b-end", _text("finished")), _prompt("third")],  # 11, 12
+    )
+    assert claude_transcripts.newest_fork(done, turn_finished=False) == (11, "b-end")
+    assert claude_transcripts.fork_ref(done, 11) == "b-end"
+    # With no compaction, a chat's first running turn has no finished reply: no cut.
+    first = _jsonl(tmp_path / "first.jsonl", [rows[0], *rows[7:10]])
+    assert claude_transcripts.newest_fork(first, turn_finished=False) is None
 
 
 def test_claude_cut_refuses_an_api_error_reply(tmp_path):
@@ -136,6 +194,11 @@ def test_codex_cut_only_after_a_completed_turns_last_message(tmp_path):
     running = _jsonl(tmp_path / "running.jsonl", _codex_rows(finish_second=False))
     assert codex_transcripts.fork_turn(running, 9) is None  # Codex cannot fork a live turn
     assert codex_transcripts.fork_turn(running, 5) == "t1"
+    # A Work's side chat (#4199): the newest completed turn's last message, even mid-turn.
+    assert codex_transcripts.newest_fork_seq(path) == 9
+    assert codex_transcripts.newest_fork_seq(running) == 5
+    unanswered = _jsonl(tmp_path / "e.jsonl", _codex_rows(finish_second=False)[:4])
+    assert codex_transcripts.newest_fork_seq(unanswered) is None
 
 
 # --- the Claude worker ---------------------------------------------------------
@@ -153,11 +216,11 @@ def test_claude_fork_command_copies_the_source_up_to_the_cut(tmp_path):
         "--resume-session-at",
         "line-uuid",
     ]
-    # The side chat is told its own token, never the source's: its copied history
-    # already holds the source's key (#2576).
+    # The side chat's guide points at its own shell's token, never the source's: its
+    # copied history already holds the source's key (#2576).
     tokened = host._command(None, fork_from=fork, session_token="side-token")
     guide = tokened[tokened.index("--append-system-prompt") + 1]
-    assert "agentdeck session-key side-token" in guide
+    assert "agentdeck session-key $AGENTDECK_SESSION_TOKEN" in guide
     # A revive of the side chat later resumes the side chat itself, never the source.
     revived = host._command("side-sid", fork_from=fork)
     assert revived[-2:] == ["--resume", "side-sid"]
@@ -191,11 +254,13 @@ async def test_claude_fork_spawns_once_with_the_cut_and_reports_the_new_session(
         permission_mode="plan",
         delegated=False,
         fork_from=ForkFrom("source-sid", "line-uuid"),
+        session_token="side-token",
     )
     await settle()
     assert result.accepted
     assert result.session_id == "sid-auto-1"
     assert len(spawned) == 1
+    assert spawned[0]["kwargs"]["env"]["AGENTDECK_SESSION_TOKEN"] == "side-token"
     args = list(spawned[0]["args"])
     assert args[args.index("--resume") + 1] == "source-sid"
     assert "--fork-session" in args

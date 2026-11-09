@@ -143,8 +143,13 @@ config_dir = "~/.claude"
 provider = "codex"
 label = "codex"
 config_dir = "~/.codex"
+#start_bypassed = false        # true: new chats start with "Bypass permissions" on (no sandbox, no
+                                # approvals); each chat can still switch it off. A delegated
+                                # worker or a chat with its own sandbox keeps that sandbox.
 
 #[[accounts]]
 #provider = "claude_code"
 #label = "alt"
 #config_dir = "~/.claude2"
+#week_scale = 2                # this account's week is half the main one's, so its tokens count
+                               # double in the chat cost numbers; default 1

@@ -209,6 +209,13 @@ def test_the_summary_names_both_states_for_the_pill_tooltip():
     assert mixed.summary == (
         "Job queue: 0 running, 2 waiting, 1 of them for this host to free memory"
     )
+    # The jobs' temp folder cannot be used (#4143): that is what the owner has to fix.
+    no_room = build_view([_wire("b", "queued")], memory_waiting=0, scratch_waiting=1)
+    assert no_room.summary == "Job queue: 0 running, 1 waiting for room on the jobs' disk"
+    both = build_view([_wire("b", "queued"), _wire("c", "queued")], scratch_waiting=1)
+    assert both.summary == (
+        "Job queue: 0 running, 2 waiting, 1 of them for room on the jobs' disk"
+    )
 
 
 def test_a_slot_held_outside_the_queue_becomes_a_row():
@@ -334,6 +341,7 @@ async def test_a_live_runtime_payload_becomes_the_view():
             json={
                 "jobs": [_wire("a", "running"), _wire("b", "queued")],
                 "memory_waiting": 1,
+                "scratch_waiting": 2,
             },
         )
 
@@ -343,7 +351,7 @@ async def test_a_live_runtime_payload_becomes_the_view():
         view = await read_job_queue(client)
 
     assert (view.running_count, view.queued_count) == (1, 1)
-    assert view.memory_waiting == 1
+    assert view.memory_waiting == 1 and view.scratch_waiting == 2
 
 
 async def test_a_payload_that_is_not_a_job_list_is_ignored():

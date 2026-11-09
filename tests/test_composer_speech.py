@@ -171,6 +171,10 @@ def test_the_chat_view_shows_a_mark_instead_of_the_voice_line():
     from agentdeck.web.render import card_preview, display_chat_message
 
     assert display_chat_message(f"Add a test\n\n{VOICE_LINE}") == "Add a test 🎧"
+    # A reply may run to 6 sentences (#4115); a message from before that is still hidden.
+    assert "at most 6 short spoken sentences" in VOICE_LINE
+    assert VOICE_LINE.replace("at most 6", "at most 3") in OLD_VOICE_LINES
+    assert VOICE_LINE_FI.replace("at most 6", "at most 3") in OLD_VOICE_LINES
     # A message sent before the line changed (#3407) still shows the mark.
     assert display_chat_message(f"Add a test\n\n{OLD_VOICE_LINES[0]}") == "Add a test 🎧"
     # The Finnish line asks for a Finnish answer and is hidden the same way (#3409).
@@ -205,6 +209,9 @@ def test_the_chat_view_shows_a_mark_instead_of_the_voice_line():
     from agentdeck.voice_mode import ANSWER_LINE, ANSWER_LINE_FI, OLD_ANSWER_LINES
 
     assert "question tool" in ANSWER_LINE_FI
+    assert "at most 6 short spoken" in ANSWER_LINE
+    assert ANSWER_LINE.replace("at most 6", "at most 3") in OLD_ANSWER_LINES
+    assert ANSWER_LINE_FI.replace("at most 6", "at most 3") in OLD_ANSWER_LINES
     for line in (ANSWER_LINE, ANSWER_LINE_FI, *OLD_ANSWER_LINES):
         result = (
             f'The user answered: "Ship it?"="Yes\n\n{line}". Read the answers carefully — '
@@ -1237,6 +1244,10 @@ async def test_an_answer_thrown_away_is_forgotten_and_the_waits_are_saved(monkey
             "timing": {"words": 210, "sent": 1210, "voice": 530.4, "bogus": 1, "sent_x": -1}})
         mm = await client.get("/api/voice/filler?language=fi")
 
+    # Six spoken sentences reach the fast agent whole (#4115).
+    long_line = "It ran again and passed. " * 40
+    assert voice_helper._clip(long_line, voice_helper.MAX_ALOUD_CHARS) == long_line.strip()
+
     agent = voice_helper._agents[key]
     assert told[0] == "Said aloud by the agent since:\nDone.\n\nHeard: Fix the"
     assert told[1] == (voice_helper.UNSPOKEN + "\n\nSaid aloud by the agent since:\nDone."
@@ -2171,13 +2182,15 @@ async def test_voice_mode_speaks_the_marked_paragraph_and_sends_what_it_hears(tm
         said_before = len(said)
         await page.evaluate(
             _TURN + """(['idle', 'Fixed it in https://x.test/a, /var/app.py and src/parser.py'
-                         + ' with <code>parse_all()</code> and/or a retry.<br><br>'
+                         + ' with <code>parse_all()</code> and/or a retry. '
+                         + 'It ran again and passed. '.repeat(12)
+                         + 'Those were the last words.<br><br>'
                          + '<pre><code>rm -rf build</code></pre>'])"""
         )
-        for _ in range(120):
-            if len(said) > said_before:
-                break
-            await page.wait_for_timeout(50)
+        # Read a sentence at a time (#3480): the host is asked for the next one only
+        # once the one before is ready, so the first alone is not the whole reading.
+        await _until(page, "the unmarked reply was read to its end",
+                     lambda: "More on screen." in said[said_before:])
         unmarked = " ".join(said[said_before:])
 
         # A short turn whose marked reply lands before the status leaves "thinking"
@@ -2635,6 +2648,8 @@ async def test_voice_mode_speaks_the_marked_paragraph_and_sends_what_it_hears(tm
     for code in ("rm -rf", "https", "/var", "src/", "parser.py", "parse_all", "auth"):
         assert code not in unmarked + " ".join(marked), code
     assert "and/or a retry" in unmarked
+    # Past the old 300 characters, and under the 600 read now (#4115).
+    assert "Those were the last words." in unmarked
     assert unmarked.startswith("Fixed it in") and unmarked.endswith("More on screen.")
     assert stopped == ["waiting", "Say “Hey Jarvis” · tap 🎤 to talk",
                        "OK, only after Hey Jarvis.", 0]
@@ -2853,7 +2868,8 @@ async def test_voice_mode_goes_on_in_a_hidden_tab_and_says_what_the_browser_refu
 @pytest.mark.browser
 @pytest.mark.parametrize(
     "kind",
-    ["question", "mcp_form", "secret", "mic", "jarvis", "finnish", "refreshed", "midway"])
+    ["question", "mcp_form", "secret", "mic", "jarvis", "finnish", "refreshed", "midway",
+     "mic_midway"])
 async def test_voice_mode_answers_a_question_box_by_number(tmp_path, monkeypatch, kind):
     """A question box is read with numbered options, "option two" ticks the second,
     and the box's own Submit sends it through the real route. An English box is read
@@ -2864,7 +2880,9 @@ async def test_voice_mode_answers_a_question_box_by_number(tmp_path, monkeypatch
     owner's decision on #3540). A box brought in by the page's own refresh, which a
     reconnected stream does not re-send, is asked too, and one swapped in again
     between two questions keeps the answer already given (#3799). An answer Whisper
-    doubted picks nothing and is asked for again (#3817)."""
+    doubted picks nothing and is asked for again (#3817). With 🎧 off, a tap that ends
+    the first answer of two turns 🎤 off, and the second question rests on "tap 🎤 to
+    answer" until the next tap answers it (#4201 review)."""
     from dataclasses import replace
 
     from conftest import async_playwright, wait_until
@@ -2887,7 +2905,7 @@ async def test_voice_mode_answers_a_question_box_by_number(tmp_path, monkeypatch
         # A secret choice: options only, so no password field gives it away (#3401 review).
         secret = replace(question.questions[0], secret=True, allow_other=False)
         box = {"pending": replace(question, questions=(secret,))}
-    elif kind == "midway":
+    elif kind in ("midway", "mic_midway"):
         second = _question_interaction("tok-1", "Cache", "Which cache?", "Redis", "None")
         box = {"pending": replace(question, questions=question.questions + second.questions)}
     else:
@@ -2916,7 +2934,7 @@ async def test_voice_mode_answers_a_question_box_by_number(tmp_path, monkeypatch
         await page.goto(f"{base_url}/sessions/codex:test:sid")
         await page.wait_for_selector("#pending-interaction form[data-interaction-kind]",
                                      timeout=10000)
-        if kind == "mic":
+        if kind in ("mic", "mic_midway"):
             await page.locator("form.inject-form [data-voice-mic]").click()
         elif kind == "jarvis":
             # The box arrives once Hey Jarvis is already waiting, as the stream swaps it in.
@@ -2980,7 +2998,24 @@ async def test_voice_mode_answers_a_question_box_by_number(tmp_path, monkeypatch
             await host.hear("option one")
             await _until(page, "it asked again", lambda: "Please say it again." in host.said[-1])
             await wait_until(page, "it listens for the answer again", _LISTENING)
-        if kind != "jarvis":
+        if kind == "mic_midway":
+            mic = page.locator("form.inject-form [data-voice-mic]")
+            host.wait = asyncio.Event()
+            await host.hear("option two")
+            await mic.click()
+            host.wait.set()
+            host.wait = None
+            status = page.locator(".voice-control .speech-status")
+            await wait_until(page, "the second question rests until a tap",
+                             """() => document.querySelector('.voice-control .speech-status')
+                                 .textContent === 'Answer on screen · tap 🎤 to answer'""",
+                             timeout=8000)
+            rested = [await status.text_content(),
+                      await page.locator("#pending-interaction form").count()]
+            await mic.click()
+            await wait_until(page, "a tap listens for the second answer", _LISTENING)
+            await host.hear("option one")
+        elif kind != "jarvis":
             await host.hear("option two")
         if kind == "midway":
             # The same box swapped in again while the second question is asked.
@@ -2998,7 +3033,9 @@ async def test_voice_mode_answers_a_question_box_by_number(tmp_path, monkeypatch
 
     if kind == "jarvis":
         assert unwoken == [{}, 1] and sent == []
-    if kind == "mic":
+    if kind == "mic_midway":
+        assert rested == ["Answer on screen · tap 🎤 to answer", 1]
+    if kind in ("mic", "mic_midway"):
         assert asked == "" and sent == []
     else:
         assert "Which database should we use?" in asked
@@ -3008,9 +3045,9 @@ async def test_voice_mode_answers_a_question_box_by_number(tmp_path, monkeypatch
     # While 🎧 reads aloud a question's last answer asks for a spoken reply (#3876).
     from agentdeck.voice_mode import ANSWER_LINE, ANSWER_LINE_FI
 
-    line = {"mic": "", "mcp_form": "", "finnish": f"\n\n{ANSWER_LINE_FI}"}.get(
+    line = {"mic": "", "mic_midway": "", "mcp_form": "", "finnish": f"\n\n{ANSWER_LINE_FI}"}.get(
         kind, f"\n\n{ANSWER_LINE}")
-    if kind == "midway":
+    if kind in ("midway", "mic_midway"):
         assert captured == {"answers": {"database": ["SQLite"], "cache": [f"Redis{line}"]},
                             "decision": "accept"}
         return
@@ -4376,7 +4413,10 @@ async def test_voice_mode_reads_with_headphones_and_listens_with_the_mic_its_way
     while it listens sends what was heard and goes back to Jarvis. A long press opens
     Jarvis, Always and Off: Always listens after each reply, with 🎧 off too, and then
     asks for no 🔊 line; Off lets go of the microphone. A fresh page starts in Jarvis,
-    and the mode the old menu kept on the device is dropped."""
+    and the mode the old menu kept on the device is dropped. With 🎧 off there is no
+    Jarvis (#4201): once its message is sent 🎤 turns off and lets go of the
+    microphone, and the menu has no Jarvis item. A tap while it listens stops at once:
+    the bubble says it is sending, and with 🎧 off the microphone is let go of then."""
     from conftest import async_playwright, wait_until
     from test_inject import _live_server
 
@@ -4485,7 +4525,14 @@ async def test_voice_mode_reads_with_headphones_and_listens_with_the_mic_its_way
         host.queue.append("and the lint")
         await page.evaluate("__mic.level(0.5)")
         await page.wait_for_timeout(500)
+        # What the bubble says from the tap on, since the words come back at once.
+        bubble = """() => { window.__said = []; new MutationObserver(() => __said.push(
+            document.querySelector('.voice-control .speech-status').textContent)).observe(
+            document.querySelector('.voice-control .speech-status'),
+            { childList: true, characterData: true, subtree: true }); }"""
+        await page.evaluate(bubble)
         await mic.click()
+        tapped_on = await page.evaluate("__said[0]")
         await page.evaluate("__mic.level(0)")
         await sends(4)
         await wait_until(page, "it waits again", state_is("waiting"), timeout=8000)
@@ -4526,10 +4573,51 @@ async def test_voice_mode_reads_with_headphones_and_listens_with_the_mic_its_way
         await wait_until(page, "a tap listens through voice mode", _LISTENING)
         fresh = [await page.evaluate("localStorage.getItem('agentdeck.voiceListenMode')"),
                  await mic.get_attribute("aria-pressed")]
+        # 🎧 off (#4201): once the message is sent 🎤 turns off, waiting for no name.
+        await host.hear("check the build")
+        await sends(6)
+        await wait_until(page, "🎤 alone turned off after the send", voice_off, timeout=8000)
+        plain = [await page.evaluate(tracks), await mic.get_attribute("title")]
+        # Tapped while still talking with 🎧 off: it says it sends, the microphone is
+        # let go of at the tap, and the words go once.
+        await mic.click()
+        await wait_until(page, "a tap listens with 🎧 off", _LISTENING)
+        host.queue.append("and the release notes")
+        await page.evaluate("__mic.level(0.5)")
+        await page.wait_for_timeout(500)
+        await page.evaluate(bubble)
+        host.wait = asyncio.Event()
+        await mic.click()
+        tapped_off = [await page.evaluate("__said[0]"), await page.evaluate(tracks),
+                      await mic.get_attribute("data-voice-hears"),
+                      await mic.get_attribute("data-voice-state")]
+        await page.evaluate("__mic.level(0)")
+        # Tapped again while those words are still with the host (#4201 review): they
+        # still go, once, and 🎤 then listens for the next message.
+        await page.wait_for_timeout(300)
+        await mic.click()
+        retapped = await mic.get_attribute("data-voice-hears")
+        host.wait.set()
+        host.wait = None
+        await sends(7)
+        await wait_until(page, "a tap listens once more", _LISTENING, timeout=8000)
         await _hold(page, mic)
         ticked = await page.evaluate("""() => [...document.querySelectorAll(
-            '[data-voice-mic-mode]')].map((b) => b.dataset.voiceMicMode + ':'
-            + b.getAttribute('aria-checked'))""")
+            '[data-voice-mic-mode]')].filter((b) => !b.hidden).map((b) => b.dataset.voiceMicMode
+            + ':' + b.getAttribute('aria-checked'))""")
+        # Tapped with nothing said, with 🎧 off: it stops at once, nothing transcribed.
+        await page.mouse.click(380, 100)
+        phrases = len(host.phrases)
+        await mic.click()
+        empty_tap = [await page.evaluate(voice_off), await page.evaluate(tracks)]
+        # No words for the idle spell, with 🎧 off: 🎤 turns off rather than waiting
+        # for "Hey Jarvis" (#4201).
+        await page.evaluate("""() => document.querySelector('[data-voice-button]')
+            .closest('.voice-control').setAttribute('data-voice-idle-seconds', '1')""")
+        await mic.click()
+        await wait_until(page, "a tap listens before the idle spell", _LISTENING)
+        await wait_until(page, "🎤 turned off after the idle spell", voice_off, timeout=6000)
+        idled = [await page.evaluate(tracks), len(host.phrases) - phrases]
         await browser.close()
 
     def has(body, words):
@@ -4543,13 +4631,20 @@ async def test_voice_mode_reads_with_headphones_and_listens_with_the_mic_its_way
     assert has(sent[1], "add a label") and "Jarvis" not in sent[1]
     assert has(sent[2], "run the tests")
     assert has(sent[3], "and the lint")
+    assert tapped_on == "Sending…"
     assert headphones_off == ["false", ["ended"], False]
     assert unread == []
     assert VOICE_LINE.split(" ")[0] not in sent[4] and has(sent[4], "and the docs")
-    assert len(sent) == 5
     assert off == ["ended"]
     assert fresh == [None, "false"]
-    assert ticked == ["jarvis:true", "open:false", "off:false"]
+    assert has(sent[5], "check the build")
+    assert plain == [["ended"], "Tap to talk · hold for Always or Off"]
+    assert tapped_off == ["Sending…", ["ended"], None, None]
+    assert has(sent[6], "and the release notes") and len(sent) == 7
+    assert retapped is not None
+    assert ticked == ["open:false", "off:false"]
+    assert empty_tap == [True, ["ended"]]
+    assert idled == [["ended"], 0]
 
 
 @pytest.mark.browser

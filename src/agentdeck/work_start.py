@@ -2,10 +2,11 @@
 
 The Poller makes no card (step 5a, and since #3732 it has no cards at all), so
 the ownership label landing on an issue no chat owns is the Work's start: the router calls
-``start_work_agent``, which starts one Claude chat with the ``work`` role in a checkout of the
-issue's repository. It is a Work side chat underneath (#2388): saved under its action id
-before the spawn, which is also its session token, so the chat joins the Work with no Run once
-it exists and its verification jobs prove the Work's head.
+``start_work_agent``, which starts one Claude chat (or Codex, when New work picked a Codex
+account, #4181) with the ``work`` role in a checkout of the issue's repository. It is a Work
+side chat underneath (#2388): saved under its action id before the spawn, which is also its
+session token, so the chat joins the Work with no Run once it exists and its verification jobs
+prove the Work's head.
 
 At most once per Work: the action id is derived from the Work id and reserved before the
 spawn, so a replayed delivery, a second label or a web restart mid-start never starts a second
@@ -30,10 +31,13 @@ over. When every one would refuse, the one whose block clears first still takes 
 A Work filed from the deck's New work form does not wait for GitHub (#3590): its agent starts
 the moment the form is pressed (``start_before_issue``), in a Work spare the form kept booted
 (``start_spares``) or, without one, a fresh ``.worktrees/work-spare-<hex>`` worktree, told only
-the request. Once GitHub answers with the number, ``bind_before_issue`` makes it the Work's one
-start, links the chat to the Work, has the claim service adopt that worktree onto
-``agent/issue-<n>`` (with an ``issue-<n>`` symlink beside it) and sends the agent the issue and
-the rest of its brief. A filing GitHub refused stops the agent (``stop_before_issue``).
+the request. The form may pick the Work's account, model and effort (#4181): the press passes
+them to the early start and saves them under the Work (``work_start_choices``) once the issue
+has its number, so the usual start, a usage move and Continue read the same pick. Once GitHub
+answers with the number, ``bind_before_issue`` makes it the Work's one start, links the chat
+to the Work, has the claim service adopt that worktree onto ``agent/issue-<n>`` (with an
+``issue-<n>`` symlink beside it) and sends the agent the issue and the rest of its brief. A
+filing GitHub refused stops the agent (``stop_before_issue``).
 
 The agent starts in the Work's own worktree, never the repository's shared main checkout
 (#3274): the runtime's claim service (``work_workspace_claims``, #2149) makes, or hands back,
@@ -53,14 +57,16 @@ import tomllib
 import uuid
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from .models import IssueRef
 from .work import WorkRef, work_id_for
+from .work_facts import work_finished_at
 from .work_side_chat import first_message, local_repository_checkout
 from .work_signals import SPEC_MARKER
-from .work_workspace import WorkspaceProbe
+from .work_workspace import WorkspaceProbe, parse_work_id
 from .work_workspace_claims import SPARE_PREFIX, GitHost
 
 log = logging.getLogger(__name__)
@@ -79,6 +85,12 @@ WAITS_FOR_MERGE = (
     "This project does not merge on its own: once a review passed and the tests are green on "
     "the same head, your pull request waits for a person to press Merge on the Work page. "
     "When it gets there, say in your final reply that it is ready for them to merge."
+)
+#: The repositories of such a project that merge on their own all the same (#4172).
+REPO_MERGES_ITSELF = (
+    "Except in {repos}: there the deck merges your pull request on its own once its review "
+    "passed and its tests are green, unless the same Work also has a pull request elsewhere "
+    "in this project, which holds them all for a person's Merge."
 )
 #: What the Work's agent is told on a deck with no Work reviewer (#3849): the role's review
 #: steps would otherwise have it wait on a verdict that never comes.
@@ -154,10 +166,16 @@ MAYBE_FILED_TEXT = (
 )
 #: A spare worktree no start took and nothing changed in this long is swept away.
 SPARE_SWEEP_AGE_S = 3600.0
+#: A closed issue's Work keeps its worktrees this long, for a follow-up in its chat (#4148).
+RELEASE_CLOSED_AFTER = timedelta(days=3)
+#: Removing a worktree can take a while on a busy disk.
+RELEASE_IDLE_TIMEOUT_S = 120.0
 
 #: The runtime's claim routes (``work_workspace_claims``); a test pins the spelling.
 ENSURE_PATH = "/work-workspaces/ensure"
 RELEASE_PATH = "/work-workspaces/release"
+RELEASE_IDLE_PATH = "/work-workspaces/release-idle"
+CLAIMS_PATH = "/work-workspaces/claims"
 #: A claim fetches the base and adds a worktree, and the router waits for the start, so
 #: past this the start goes on in the main checkout rather than hold every delivery.
 ENSURE_TIMEOUT_S = 30.0
@@ -168,15 +186,24 @@ def start_action_id(work_id: str) -> str:
     return "work-start-" + hashlib.sha256(work_id.encode()).hexdigest()[:20]
 
 
-def work_accounts(app: Any, repository: str = "") -> list[Any] | None:
-    """The Claude accounts this repository's Work may run on, in the project's order.
+#: Whose accounts a person may pick for a Work's agent in New work (#4181). The deck's own
+#: choice stays on Claude (``AUTO_PROVIDERS``): a Codex pool is far smaller.
+PICK_PROVIDERS = ("claude_code", "codex")
+AUTO_PROVIDERS = ("claude_code",)
+
+
+def work_accounts(
+    app: Any, repository: str = "", *, providers: tuple[str, ...] = AUTO_PROVIDERS
+) -> list[Any] | None:
+    """The accounts this repository's Work may run on, in the project's order.
 
     The project's own choice: its overlay's ``[worker] account`` and fallbacks, in order,
-    keeping only Claude accounts that may start a chat now. A project that names accounts
-    runs only on them, as its Poller would. A readable overlay that names none takes every
-    Claude account the new-chat form would offer. An unreadable overlay fails closed
-    (``None``). Only Claude: a Codex start cannot take the Work role yet (#2895). Work start
-    and the usage move (#3362) both choose from this list.
+    keeping only accounts of ``providers`` that may start a chat now. A project that names
+    accounts runs only on them, as its Poller would. A readable overlay that names none takes
+    every such account the new-chat form would offer. An unreadable overlay fails closed
+    (``None``). The deck's own choice is Claude only; a New work pick may also name a Codex
+    account (``PICK_PROVIDERS``). Work start and the usage move (#3362) both choose from
+    this list.
     """
     from .poller_ops import work_accounts
     from .providers import PROVIDERS
@@ -184,7 +211,7 @@ def work_accounts(app: Any, repository: str = "") -> list[Any] | None:
     inject = getattr(app.state.config, "inject", None)
     if inject is None or not inject.enabled:
         return None
-    claude = [account for account in app.state.accounts if account.provider_id == "claude_code"]
+    eligible = [account for account in app.state.accounts if account.provider_id in providers]
     preferred: tuple[str, ...] = ()
     poller = getattr(app.state.config, "poller", None)
     if repository and poller is not None:
@@ -199,10 +226,11 @@ def work_accounts(app: Any, repository: str = "") -> list[Any] | None:
             return None
         preferred = configured
     if preferred:
-        by_key = {account.key: account for account in claude}
-        claude = [by_key[key] for key in preferred if key in by_key]
-    provider = PROVIDERS["claude_code"]
-    return [account for account in claude if provider.can_start_session(account)]
+        by_key = {account.key: account for account in eligible}
+        eligible = [by_key[key] for key in preferred if key in by_key]
+    return [
+        account for account in eligible if PROVIDERS[account.provider_id].can_start_session(account)
+    ]
 
 
 def start_account(app: Any, repository: str = "") -> Any:
@@ -233,6 +261,51 @@ def start_account(app: Any, repository: str = "") -> Any:
     return startable.get(chosen)
 
 
+def chosen_account(app: Any, repository: str, choice: Any = None) -> Any:
+    """The account this Work's start runs on: the one picked in New work (#4181), else
+    ``start_account``'s. A picked account that may not start this repository's chat now is
+    ``None``: the start waits for it rather than running elsewhere."""
+    if choice is None or not choice.account_key:
+        return start_account(app, repository)
+    for account in work_accounts(app, repository, providers=PICK_PROVIDERS) or ():
+        if account.key == choice.account_key:
+            return account
+    log.warning("work start: the picked account %s may not start a chat now", choice.account_key)
+    return None
+
+
+def chosen_options(choice: Any, provider: Any) -> dict[str, str | None]:
+    """``start_new``'s model and effort for a New work pick; blank or unknown is the default."""
+    model = getattr(choice, "model", "") or ""
+    effort = getattr(choice, "effort", "") or ""
+    return {
+        "model": model if model and provider.is_valid_model(model) else None,
+        "effort": effort if effort and provider.is_valid_effort(effort) else None,
+    }
+
+
+def session_start_choice(app: Any, session_key: str) -> Any:
+    """What New work picked for the Work this chat is the own agent of, or None (#4181).
+
+    Only the Work's own agent chat, on any leg, follows the pick: a reviewer or helper chat
+    joined to the Work chooses for itself. The agent chat may later join other Works too (a
+    v2 asked of the same chat); the pick is still its own Work's."""
+    state = app.state.app_state
+    db = app.state.control_db
+    try:
+        chat = state.chat_identity_key(session_key)
+        owned = [
+            ref.work_id
+            for ref in state.work_projection().works_chat_joined(chat)
+            if (own := db.work_agent_chat(ref.work_id)) and state.chat_identity_key(own) == chat
+        ]
+    except Exception:  # noqa: BLE001 - an unreadable Work is the deck's own choice
+        log.exception("work start: could not read the Work of %s", session_key)
+        return None
+    # The agent of two Works (two started in one chat) has no one pick to follow.
+    return db.work_start_choice(owned[0]) if len(owned) == 1 else None
+
+
 def _merge_text(app: Any, repository: str) -> str:
     """Whether this repository's project merges on its own, and which of its repositories
     its CI or its review proves, for the first message; empty when its manifest cannot say,
@@ -255,6 +328,9 @@ def _merge_text(app: Any, repository: str) -> str:
         texts = [NO_REVIEWER]
     else:
         texts = [MERGES_ITSELF if getattr(policy, "auto_release", False) else WAITS_FOR_MERGE]
+        own = sorted(getattr(policy, "auto_release_repos", ()) or ())
+        if own and not getattr(policy, "auto_release", False):
+            texts.append(REPO_MERGES_ITSELF.format(repos=", ".join(f"`{repo}`" for repo in own)))
     for repos, template in (
         (getattr(policy, "github_checks", ()), CI_TESTS_TEXT),
         (getattr(policy, "review_only", ()), REVIEW_ONLY_TEXT),
@@ -520,6 +596,43 @@ async def release_work_worktrees(app: Any, work_id: str) -> None:
             log.info("work finish: %s kept: %s", item.get("path"), item.get("pending"))
 
 
+async def release_closed_work_worktrees(app: Any, now: datetime | None = None) -> dict[str, Any]:
+    """Give back idle worktrees of Works whose issue closed ``RELEASE_CLOSED_AFTER`` ago (#4148).
+
+    Only a person's Finish released a claim, and agents close their own issues, so finished
+    Works held about 5 GB more each day with no cleanup allowed near them. The close time is
+    the cached issue record's: a Work with no record, or a reopened one, keeps its worktrees.
+    """
+    client = app.state.runtime_http
+    response = await client.get(CLAIMS_PATH)
+    response.raise_for_status()
+    refs = {
+        claim["work_id"]: parse_work_id(claim["work_id"])
+        for claim in response.json()["claims"]
+        if not claim.get("release_requested_at")
+    }
+    known = {work_id: ref for work_id, ref in refs.items() if ref is not None}
+    records = await asyncio.to_thread(
+        app.state.issues.cached_issues, [(ref.repository, ref.number) for ref in known.values()]
+    )
+    cutoff = (now or datetime.now(UTC)) - RELEASE_CLOSED_AFTER
+    released = 0
+    kept: dict[str, str] = {}
+    for work_id, ref in sorted(known.items()):
+        closed_at = work_finished_at(records.get((ref.repository, ref.number)))
+        if closed_at is None or closed_at > cutoff:
+            continue
+        answer = await client.post(
+            RELEASE_IDLE_PATH, json={"work_id": work_id}, timeout=RELEASE_IDLE_TIMEOUT_S
+        )
+        answer.raise_for_status()
+        body = answer.json()
+        released += sum(1 for item in body["released"] if item.get("released"))
+        if body["kept"]:
+            kept[work_id] = body["kept"]
+    return {"released": released, "kept": kept}
+
+
 def checkout_candidates(app: Any) -> list[str]:
     """Folders on this host that may be a checkout: the Poller overlays' checkouts first, then
     the folders the side chat's start reads."""
@@ -580,15 +693,17 @@ async def start_work_agent(
     work_id = ref.work_id
     action_id = start_action_id(work_id)
     db = app.state.control_db
-    account = start_account(app, repository)
+    choice = db.work_start_choice(work_id)
+    account = chosen_account(app, repository, choice)
     if account is None:
-        log.warning("work start: no Claude account may start a chat for %s", work_id)
+        log.warning("work start: no account may start a chat for %s", work_id)
         return "no account"
     folder = await asyncio.to_thread(local_repository_checkout, ref, checkout_candidates(app))
     if not folder:
         log.warning("work start: no checkout of %s on this host for %s", repository, work_id)
         return "no checkout"
     provider = PROVIDERS[account.provider_id]
+    options = chosen_options(choice, provider)
     # A start refused before anything ran is not spent: free it, so this try can be the start.
     db.release_failed_work_action(action_id)
     if db.work_action(action_id) is not None:
@@ -602,8 +717,11 @@ async def start_work_agent(
     # A Work spare an open New work form kept for this repository takes it warm (#3590).
     from .web.start_spares import WORK
 
+    # Spares are Claude workers: a Codex pick always starts cold.
     spares = getattr(app.state, "start_spares", None)
-    taken = spares.claim_work(repository, account_key=account.key) if spares else None
+    if account.provider_id != "claude_code":
+        spares = None
+    taken = spares.claim_work(repository, account_key=account.key, **options) if spares else None
     token = taken[0] if taken is not None else action_id
     if taken is not None:
         db.claim_start_spare(action_id, taken[0], taken[1])
@@ -638,6 +756,7 @@ async def start_work_agent(
             session_token=token,
             origin="work",
             role="work",
+            **options,
             **({"worker_key": taken[1]} if taken is not None else {}),
         )
     except Exception:  # noqa: BLE001 - the spawn may have begun; never repeat it
@@ -805,23 +924,30 @@ def early_action_id(press: str) -> str:
 
 
 async def start_before_issue(
-    app: Any, repository: str, *, request: str, press: str
+    app: Any, repository: str, *, request: str, press: str, choice: Any = None
 ) -> EarlyStart | None:
     """Start the Work's agent for a New work press now, before its issue exists (#3590).
 
     ``request`` is the issue's body as it will be filed. ``None`` when nothing started (no
     account, no checkout, the start refused): the Work then starts the usual way once the
-    issue exists. Called once per reserved press, so it never starts twice.
+    issue exists. Called once per reserved press, so it never starts twice. ``choice`` is
+    the press's own pick of account, model and effort (#4181), or None.
     """
     from .providers import PROVIDERS
     from .web.start_spares import WORK
 
     timing = StartTiming(time.monotonic(), press=press)
-    account = start_account(app, repository)
+    account = chosen_account(app, repository, choice)
     if account is None:
         return None
+    if account.provider_id != "claude_code":
+        # The bind tells the agent its issue through its Claude worker's key; a Codex pick
+        # starts the usual way once the issue exists.
+        log.info("work start: %s starts once its issue is filed", account.key)
+        return None
+    options = chosen_options(choice, PROVIDERS[account.provider_id])
     spares = getattr(app.state, "start_spares", None)
-    taken = spares.claim_work(repository, account_key=account.key) if spares else None
+    taken = spares.claim_work(repository, account_key=account.key, **options) if spares else None
     timing.warm = taken is not None
     main = await asyncio.to_thread(local_repository_checkout, repository, checkout_candidates(app))
     if taken is not None:
@@ -848,6 +974,7 @@ async def start_before_issue(
             origin="work",
             role="work",
             worker_key=key,
+            **options,
         )
     except Exception:  # noqa: BLE001 - it may have begun: never start it again
         log.exception("work start: the early start in %s did not report", repository)

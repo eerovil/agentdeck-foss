@@ -17,6 +17,7 @@ from httpx import ASGITransport, AsyncClient
 from playwright.async_api import expect
 from starlette.datastructures import FormData, Headers, UploadFile
 
+from agentdeck import inject as inject_module
 from agentdeck.action_context import current_client_action_id
 from agentdeck.app import create_app
 from agentdeck.attachments import ATTACHMENT_HEADER, ATTACHMENT_MARKER, display_message
@@ -41,6 +42,7 @@ from agentdeck.models import (
     TranscriptDetail,
     TranscriptEvent,
     UsageSnapshot,
+    open_questions_id,
 )
 from agentdeck.providers.claude_code import transcripts as claude_transcripts
 from agentdeck.providers.codex import (
@@ -1069,14 +1071,14 @@ def test_transcript_observation_includes_attachment_signature(tmp_path):
     service = InjectionService(InjectConfig(enabled=True))
     service._items["codex:test:sid"] = [png, webp]
 
-    wrong_type = TranscriptEvent(
+    wrong_count = TranscriptEvent(
         seq=4,
         role="user",
         text="inspect",
         ts=queued_at + timedelta(seconds=1),
-        image_media_types=("image/jpeg",),
+        image_media_types=("image/png", "image/png"),
     )
-    assert service.observe_transcript("codex:test:sid", [wrong_type]) == {}
+    assert service.observe_transcript("codex:test:sid", [wrong_count]) == {}
 
     events = [
         TranscriptEvent(
@@ -1095,6 +1097,218 @@ def test_transcript_observation_includes_attachment_signature(tmp_path):
         ),
     ]
     assert service.observe_transcript("codex:test:sid", events) == {5: png, 6: webp}
+
+    # The CLI re-encodes a large image, so a PNG sent is written down as a JPEG (#4078).
+    reencoded = QueuedMessage(
+        3,
+        "inspect",
+        images=[Path("three.png")],
+        state="running",
+        created_at=queued_at,
+        after_seq=6,
+    )
+    service._items["codex:test:sid"] = [reencoded]
+    event = TranscriptEvent(
+        seq=7,
+        role="user",
+        text="inspect",
+        ts=queued_at + timedelta(seconds=4),
+        image_media_types=("image/jpeg",),
+    )
+    assert service.observe_transcript("codex:test:sid", [event]) == {7: reencoded}
+
+    # Two alike in flight: the JPEG cannot say which it was, so neither is claimed.
+    first, second = (
+        QueuedMessage(
+            id,
+            "inspect",
+            images=[Path(f"{id}.png")],
+            state="running",
+            created_at=queued_at,
+            after_seq=7,
+        )
+        for id in (4, 5)
+    )
+    service._items["codex:test:sid"] = [first, second]
+    assert service.observe_transcript("codex:test:sid", [replace(event, seq=8)]) == {}
+    assert (first.state, second.state) == ("running", "running")
+
+    # An exact match takes one of them, which leaves the JPEG only the other.
+    events = [
+        replace(event, seq=9, image_media_types=("image/png",)),
+        replace(event, seq=10),
+    ]
+    assert service.observe_transcript("codex:test:sid", events) == {
+        9: first,
+        10: second,
+    }
+
+
+@pytest.mark.parametrize("busy, leaves_the_wait", [(False, True), (True, False)])
+async def test_an_image_never_written_holds_the_queue_only_while_a_turn_runs(
+    tmp_path, monkeypatch, busy, leaves_the_wait
+):
+    """An idle chat is not going to write it, and messages wait behind it (#4078)."""
+    monkeypatch.setattr("agentdeck.inject.ACKNOWLEDGEMENT_GRACE_S", 0.0)
+
+    class Provider:
+        async def tail_transcript(self, account, session, byte_offset, seq):
+            return ([], byte_offset, seq)
+
+    service = InjectionService(
+        InjectConfig(enabled=True, timeout_s=60), session_busy=lambda _key: busy
+    )
+    account = Account("claude_code:test", "claude_code", "test", tmp_path)
+    session = Session("claude_code:test:sid", account.key, "sid", SessionStatus.IDLE)
+    wait = service._wait_for_durable_images(
+        account,
+        session,
+        Provider(),
+        QueuedMessage(1, "inspect", images=[Path("one.png")], state="running"),
+        0,
+        0,
+    )
+    if leaves_the_wait:
+        await asyncio.wait_for(wait, timeout=0.2)
+    else:
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(wait, timeout=0.15)
+
+
+@pytest.mark.parametrize("sent_before_the_event, confirmed", [(True, True), (False, False)])
+async def test_a_send_behind_its_cursor_is_found_in_the_whole_transcript(
+    tmp_path, sent_before_the_event, confirmed
+):
+    """The cursor guard goes; the text and the time still have to match (#4132)."""
+    event_at = datetime(2026, 11, 6, 10, 44, 55, tzinfo=UTC)
+    item = QueuedMessage(
+        1,
+        "Your Mac command expired (run r1)",
+        state="accepted",
+        created_at=event_at + timedelta(seconds=-2 if sent_before_the_event else 2),
+        after_seq=500,
+    )
+    event = TranscriptEvent(seq=101, role="user", text=item.text, ts=event_at)
+
+    class Provider:
+        async def tail_transcript(self, account, session, byte_offset, seq, limit):
+            if (byte_offset, seq) == (0, 0):
+                return ([event], 900, 200)
+            return ([], byte_offset, seq)
+
+    service = InjectionService(InjectConfig(enabled=True))
+    service._items["claude_code:test:sid"] = [item]
+    account = Account("claude_code:test", "claude_code", "test", tmp_path)
+    session = Session("claude_code:test:sid", account.key, "sid", SessionStatus.IDLE)
+
+    await service.confirm_from_transcript(account, session, Provider(), item)
+
+    assert (item.state == "observed") is confirmed
+    assert item.after_seq == 500
+
+
+@pytest.mark.parametrize(
+    "event_seq, after_seq, confirmed",
+    [(501, 500, True), (500, 500, False), (499, 500, False), (501, None, False)],
+)
+async def test_an_untimed_queue_line_keeps_the_cursor_in_the_transcript_walk(
+    tmp_path, event_seq, after_seq, confirmed
+):
+    """Its cursor is all that says it came after the send (#4132)."""
+    text = "Your Mac command expired (run r1)"
+    item = QueuedMessage(
+        1,
+        text,
+        state="accepted",
+        created_at=datetime(2026, 11, 6, 10, 44, 55, tzinfo=UTC),
+        after_seq=after_seq,
+    )
+    event = TranscriptEvent(seq=event_seq, role="user", text=text, ts=None, queued=True)
+
+    class Provider:
+        async def tail_transcript(self, account, session, byte_offset, seq, limit):
+            if (byte_offset, seq) == (0, 0):
+                return ([event], 900, 600)
+            return ([], byte_offset, seq)
+
+    service = InjectionService(InjectConfig(enabled=True))
+    service._items["claude_code:test:sid"] = [item]
+    account = Account("claude_code:test", "claude_code", "test", tmp_path)
+    session = Session("claude_code:test:sid", account.key, "sid", SessionStatus.IDLE)
+
+    await service.confirm_from_transcript(account, session, Provider(), item)
+
+    assert (item.state == "observed") is confirmed
+
+
+@pytest.mark.parametrize("found", [True, False])
+async def test_a_long_transcript_is_read_in_pieces_and_each_retry_carries_on(
+    tmp_path, monkeypatch, found
+):
+    """A Mac retry never reads the same bytes twice, nor the whole file (#4132)."""
+    monkeypatch.setattr(inject_module, "CONFIRM_CHUNK_BYTES", 200)
+    monkeypatch.setattr(inject_module, "CONFIRM_BYTES_PER_CALL", 800)
+    sent_at = datetime(2026, 11, 6, 10, 44, 55, tzinfo=UTC)
+    text = "Your Mac command expired (run r1)"
+
+    def line(said):
+        return json.dumps(
+            {
+                "type": "user",
+                "uuid": said[:8],
+                "timestamp": sent_at.isoformat().replace("+00:00", "Z"),
+                "message": {"role": "user", "content": said},
+            }
+        )
+
+    filler = [line(f"earlier message {n}") for n in range(40)]
+    longest = line("x" * 500)  # longer than a piece, so the piece has to grow
+    lines = [*filler, longest, line(text if found else "something else"), line("after")]
+    path = tmp_path / "chat.jsonl"
+    path.write_text("".join(f"{item}\n" for item in lines))
+    reads = []
+
+    class Provider:
+        async def tail_transcript(self, account, session, byte_offset, seq, limit):
+            read = claude_transcripts.read_events(
+                path, byte_offset=byte_offset, seq=seq, limit=limit
+            )
+            reads.append((byte_offset, read.byte_offset, limit))
+            return (read.events, read.byte_offset, read.seq)
+
+    item = QueuedMessage(
+        1, text, state="accepted", created_at=sent_at - timedelta(seconds=2), after_seq=9999
+    )
+    service = InjectionService(InjectConfig(enabled=True))
+    service._items["claude_code:test:sid"] = [item]
+    account = Account("claude_code:test", "claude_code", "test", tmp_path)
+    session = Session("claude_code:test:sid", account.key, "sid", SessionStatus.IDLE)
+
+    tries = 0
+    while item.state == "accepted" and item.confirm_cursor[0] < path.stat().st_size and tries < 50:
+        reads.clear()
+        await service.confirm_from_transcript(account, session, Provider(), item)
+        tries += 1
+        assert sum(limit for _start, _end, limit in reads) < 2 * 800
+
+    assert tries > 1
+    if found:
+        assert item.state == "observed"
+        assert item.observed_seq == len(lines) - 1
+        return
+    assert item.state == "accepted"
+    assert item.after_seq == 9999
+    # Nothing new in the file: a further retry consumes nothing.
+    reads.clear()
+    await service.confirm_from_transcript(account, session, Provider(), item)
+    assert {start for start, _end, _limit in reads} == {path.stat().st_size}
+
+    # The file grew: only the new line is read, and it settles the send.
+    with path.open("a") as handle:
+        handle.write(f"{line(text)}\n")
+    await service.confirm_from_transcript(account, session, Provider(), item)
+    assert item.state == "observed"
+    assert item.observed_seq == len(lines) + 1
 
 
 def test_transcript_observation_uses_provider_timestamp_precision():
@@ -2063,7 +2277,7 @@ async def test_a_long_refused_send_shows_why_outside_the_collapsed_preview(
     await app.state.injector.stop()
 
 
-def _continue_app(tmp_path, session_cwd=None, max_message_chars=1000):
+def _continue_app(tmp_path, session_cwd=None, max_message_chars=2000):
     config = AppConfig(
         history=HistoryConfig(db_path=str(tmp_path / "budgets.db")),
         inject=InjectConfig(enabled=True, max_message_chars=max_message_chars),
@@ -2347,22 +2561,15 @@ async def test_continue_chat_starts_cross_provider_with_transcript_fetch_prompt(
         assert received["cwd"] == tmp_path
         assert received["allow_over_budget"] is True
         assert received["model"] == selected_model
-        transcript_url = "http://test/sessions/codex:test:sid/transcript.json"
-        assert transcript_url in received["message"]
-        assert f"curl --fail --silent --show-error {transcript_url}" in received["message"]
-        assert "Before taking any substantive action" in received["message"]
-        assert "applies only to that source chat, not to this session" in received["message"]
+        # The new chat starts small and is told how to read the old one in parts,
+        # instead of being sent to read it all (#4169).
+        assert "transcript.json" not in received["message"]
+        assert "agentdeck chat-read codex:test:sid --outline" in received["message"]
+        assert "applies only to that old chat, not to this session" in received["message"]
+        # An idle source stays asleep: any message would pay for its whole context.
         for _ in range(10):
             await asyncio.sleep(0)
-            if departure:
-                break
-        assert departure["account"].key == "codex:test"
-        assert departure["session"].key == "codex:test:sid"
-        assert departure["message"].startswith("Source chat only:")
-        assert f"[Continue in new chat](http://test{starting_url})" in departure["message"]
-        assert "Do no more work in this chat" in departure["message"]
-        assert departure["message"].endswith("then stop.")
-        assert departure["kwargs"]["allow_over_budget"] is True
+        assert departure == {}
 
         waiting = await client.get(
             f"/partials/starting-chat/{starting_token}"
@@ -2455,6 +2662,321 @@ async def test_continue_chat_steers_an_active_source_to_stop_immediately(
     await app.state.injector.stop()
 
 
+async def test_continue_chat_does_not_wake_a_source_whose_turn_just_ended(
+    tmp_path, monkeypatch
+):
+    """A refused steer means the turn ended: queueing it would wake an idle chat (#4169)."""
+    (tmp_path / "claude-alt").mkdir()
+    app = _continue_app(tmp_path)
+    source = app.state.app_state.sessions["codex:test:sid"]
+    app.state.app_state.update_session(
+        replace(
+            source,
+            capabilities=frozenset(
+                {Capability.TRANSCRIPT, Capability.INJECT, Capability.STEER}
+            ),
+        )
+    )
+    steers = []
+
+    async def fake_cursor(account, session):
+        return 0, 0
+
+    async def fake_steer(account, session, message, **kwargs):
+        steers.append(message)
+        return InjectResult(False, "no active turn")
+
+    async def fake_inject(*args, **kwargs):
+        raise AssertionError("the source chat must stay asleep")
+
+    async def fake_start(account, cwd, message, **kwargs):
+        return InjectResult(True, session_id="continued-sid")
+
+    from agentdeck.providers import PROVIDERS
+
+    source_provider = PROVIDERS["codex"]
+    target_provider = PROVIDERS["claude_code"]
+    monkeypatch.setattr(source_provider, "transcript_cursor", fake_cursor)
+    monkeypatch.setattr(source_provider, "steer", fake_steer)
+    monkeypatch.setattr(source_provider, "inject", fake_inject)
+    monkeypatch.setattr(target_provider, "can_start_session", lambda account: True)
+    monkeypatch.setattr(target_provider, "start_session", fake_start)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            "/sessions/codex:test:sid/continue",
+            data={"account_key": "claude_code:alt"},
+            headers={"origin": "http://test"},
+        )
+        for _ in range(10):
+            await asyncio.sleep(0)
+
+    assert response.status_code == 202
+    assert len(steers) == 1
+    await app.state.injector.stop()
+
+
+def _cold_chat_app(tmp_path, **changes):
+    """A costly codex chat whose cache went a minute ago (#4169)."""
+    from agentdeck.chat_use import ChatUse
+
+    app = _continue_app(tmp_path)
+    state = app.state.app_state
+    source = state.sessions["codex:test:sid"]
+    gone = datetime.now(UTC) - timedelta(minutes=1)
+    state.update_session(replace(source, **({"cache_expires_at": gone} | changes)))
+    state.set_chat_use({"codex:test:sid": ChatUse("expensive", 200_000)})
+    return app, gone
+
+
+async def test_a_costly_chat_whose_cache_has_gone_asks_before_a_message_wakes_it(tmp_path):
+    """The bar is rendered hidden, marked to ask, and its read says the same (#4169)."""
+    app, gone = _cold_chat_app(tmp_path)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        page = await client.get("/sessions/codex:test:sid")
+        found = await client.get("/sessions/codex:test:sid/cold-chat")
+    bar = page.text.split("data-cold-chat", 1)[1].split("</div>\n</div>", 1)[0]
+    assert "data-ask" in bar and f'data-stamp="{gone.isoformat()}"' in bar
+    assert 'data-account-key="codex:test"' in bar
+    # 200k tokens written to the cache again: 0.056 % of the week.
+    assert "<strong data-cold-cost>0.056 %</strong>" in bar
+    assert found.json() == {"ask": True, "cost": "0.056", "stamp": gone.isoformat()}
+    await app.state.injector.stop()
+
+
+@pytest.mark.parametrize(
+    "changes, use",
+    [
+        ({"cache_expires_at": datetime.now(UTC) + timedelta(minutes=5)}, "expensive"),
+        ({"cache_expires_at": None}, "expensive"),
+        ({}, "middling"),
+        (
+            {
+                "capabilities": frozenset(
+                    {Capability.TRANSCRIPT, Capability.INJECT, Capability.STEER}
+                )
+            },
+            "expensive",
+        ),
+        ({"question": "Which one?"}, "expensive"),
+        ({"capabilities": frozenset({Capability.INJECT})}, "expensive"),
+        ({"cwd": None}, "expensive"),
+    ],
+    ids=[
+        "warm",
+        "unknown",
+        "not-costly",
+        "turn-running",
+        "own-question",
+        "no-transcript",
+        "no-cwd",
+    ],
+)
+async def test_a_chat_page_asks_nothing_when_waking_costs_little_or_cannot_be_avoided(
+    tmp_path, changes, use
+):
+    from agentdeck.chat_use import ChatUse
+
+    app, _gone = _cold_chat_app(tmp_path, **changes)
+    app.state.app_state.set_chat_use({"codex:test:sid": ChatUse(use, 200_000)})
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        found = await client.get("/sessions/codex:test:sid/cold-chat")
+    assert found.json() == {"ask": False}
+    await app.state.injector.stop()
+
+
+async def test_continue_puts_the_persons_message_first_and_watches_it_in_the_composer(
+    tmp_path, monkeypatch
+):
+    """The cold-chat bar's New chat: the old chat's account, its message, the note after."""
+    app = _continue_app(tmp_path)
+    received = []
+
+    async def fake_start(account, cwd, message, **kwargs):
+        received.append((account.key, message, kwargs.get("effort")))
+        return InjectResult(True, session_id="continued-sid")
+
+    async def fake_inject(*args, **kwargs):
+        raise AssertionError("the old chat must stay asleep")
+
+    from agentdeck.providers import PROVIDERS
+
+    provider = PROVIDERS["codex"]
+    monkeypatch.setattr(provider, "inject", fake_inject)
+    monkeypatch.setattr(provider, "can_start_session", lambda account: True)
+    monkeypatch.setattr(provider, "start_session", fake_start)
+    form = {
+        "mode": "transcript",
+        "account_key": "codex:test",
+        "result_id": "inject-result",
+    }
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        monkeypatch.setattr(provider, "user_message_refusal", lambda text: "Not that word.")
+        refused = await client.post(
+            "/sessions/codex:test:sid/continue",
+            data=form | {"message": "Stuck?"},
+            headers={"origin": "http://test"},
+        )
+        monkeypatch.setattr(provider, "user_message_refusal", lambda text: None)
+        secret = await client.post(
+            "/sessions/codex:test:sid/continue",
+            data=form | {"message": "/secret TOKEN hunter2"},
+            headers={"origin": "http://test"},
+        )
+        too_long = await client.post(
+            "/sessions/codex:test:sid/continue",
+            data=form | {"message": "x" * 2000},
+            headers={"origin": "http://test"},
+        )
+        response = await client.post(
+            "/sessions/codex:test:sid/continue",
+            data=form | {"message": "  Fix the button.  ", "effort": "high"},
+            headers={"origin": "http://test"},
+        )
+        for _ in range(10):
+            await asyncio.sleep(0)
+    assert refused.status_code == 422 and "Not that word." in refused.text
+    assert 'id="inject-result"' in refused.text
+    assert secret.status_code == 422 and "existing session" in secret.text
+    assert "hunter2" not in secret.text
+    assert too_long.status_code == 422 and "too long" in too_long.text
+    assert response.status_code == 202 and 'id="inject-result"' in response.text
+    assert [(key, effort) for key, _, effort in received] == [("codex:test", "high")]
+    first, note = received[0][1].split("\n\n", 1)
+    assert first == "Fix the button."
+    assert "agentdeck chat-read codex:test:sid --outline" in note
+    await app.state.injector.stop()
+
+
+@pytest.mark.browser
+async def test_the_cold_chat_bar_asks_on_a_phone_and_starts_a_new_chat(tmp_path, monkeypatch):
+    """At 390 px: the bar stands in the composer's place; Wake it gives the composer back
+    and is remembered; New chat sends the typed text through Continue, refuses a file it
+    could not carry, and closes the box once the new chat runs (#4169)."""
+    from agentdeck import issue_post
+
+    app, _gone = _cold_chat_app(tmp_path)
+    source = app.state.app_state.sessions["codex:test:sid"]
+    app.state.app_state.update_session(
+        replace(source, capabilities=frozenset({*source.capabilities, Capability.EFFORT}))
+    )
+    # The chat belongs to a Work, so its box offers to post to the issue.
+    chip = issue_post.shown_target("eerovil/agentdeck#4169")
+    monkeypatch.setattr(issue_post, "issue_post_target", lambda state, key: chip)
+    received = []
+    efforts = []
+
+    async def fake_start(account, cwd, message, **kwargs):
+        received.append(message)
+        efforts.append(kwargs.get("effort"))
+        return InjectResult(True, session_id="continued-sid")
+
+    from agentdeck.providers import PROVIDERS
+
+    provider = PROVIDERS["codex"]
+    monkeypatch.setattr(provider, "can_start_session", lambda account: True)
+    monkeypatch.setattr(provider, "start_session", fake_start)
+    async with _live_server(app) as base_url, async_playwright() as playwright:
+        browser = await playwright.chromium.launch()
+        context = await browser.new_context(
+            viewport={"width": 390, "height": 800}, service_workers="block"
+        )
+        page = await context.new_page()
+        await page.goto(f"{base_url}/sessions/codex:test:sid")
+        bar = page.locator("[data-cold-chat]")
+        await expect(bar).to_be_visible()
+        await expect(page.locator("form.inject-form")).to_be_hidden()
+        box = await bar.bounding_box()
+        assert box and box["x"] >= 0 and box["x"] + box["width"] <= 390
+        assert not await page.evaluate("document.documentElement.scrollWidth > innerWidth")
+
+        # Coming back to the tab asks again, with one read: here the chat woke elsewhere,
+        # then went cold on a new cache.
+        state = app.state.app_state
+        source = state.sessions["codex:test:sid"]
+        returned = "document.dispatchEvent(new Event('visibilitychange'))"
+        later = datetime.now(UTC) + timedelta(minutes=50)
+        state.update_session(replace(source, cache_expires_at=later))
+        await page.evaluate(returned)
+        await expect(page.locator("form.inject-form")).to_be_visible()
+        await expect(bar).to_be_hidden()
+        newer = datetime.now(UTC) - timedelta(seconds=5)
+        state.update_session(replace(source, cache_expires_at=newer))
+        await page.evaluate(returned)
+        await expect(bar).to_be_visible()
+        await expect(bar).to_have_attribute("data-stamp", newer.isoformat())
+
+        await bar.get_by_role("button", name="Wake it").click()
+        await expect(page.locator("form.inject-form")).to_be_visible()
+        await expect(bar).to_be_hidden()
+        await page.reload()
+        await expect(page.locator("form.inject-form")).to_be_visible()
+        await expect(bar).to_be_hidden()
+
+        await page.evaluate("localStorage.clear()")
+        await page.reload()
+        # A box ticked to post to the issue before New chat: a new chat posts nowhere.
+        await expect(bar).to_be_visible()
+        await page.wait_for_load_state("load")
+        await page.evaluate("document.querySelector('[data-issue-post-box]').checked = true")
+        assert await page.locator("[data-issue-post-box]").is_checked()
+        await bar.get_by_role("button", name="New chat").click()
+        await expect(page.locator("label[data-cold-label]")).to_have_text("This starts a new chat")
+        await expect(page.locator(".issue-post-menu")).to_be_hidden()
+        assert not await page.locator("[data-issue-post-box]").is_checked()
+        await expect(page.locator("#inject-message")).to_have_attribute(
+            "placeholder", "What should the new chat do?"
+        )
+        # The effort picked in the box carries to the new chat; the blank choice is the
+        # new-chat default, not this chat's effort, and says so.
+        await expect(page.locator(".effort-menu")).to_be_visible()
+        await expect(page.locator('#inject-effort option[value=""]')).to_have_text(
+            "New-chat default"
+        )
+        await page.locator(".effort-menu summary").click()
+        await page.locator("#inject-effort").select_option("high")
+        posts = []
+        page.on("request", lambda r: posts.append(r.url) if r.method == "POST" else None)
+        await page.locator("#inject-message").fill("Fix the button.")
+        # An attached file would not reach the new chat, so the start waits for its removal.
+        await page.locator("#inject-images").set_input_files(
+            files=[{"name": "shot.png", "mimeType": "image/png", "buffer": b"\x89PNG"}]
+        )
+        await page.locator("#inject-message").press("Enter")
+        await expect(page.locator("#inject-result")).to_contain_text("text only")
+        assert posts == [] and received == []
+        await page.locator(".paste-remove").click()
+        await page.locator("#inject-message").press("Enter")
+        await expect(page.locator("#inject-result")).to_contain_text("chat started")
+        for _ in range(200):
+            if received:
+                break
+            await asyncio.sleep(0.02)
+        assert received[0].startswith("Fix the button.\n\n") and efforts == ["high"]
+        # The box closes once the new chat runs: a second send starts nothing and wakes
+        # nothing.
+        await expect(page.locator("#inject-message")).to_be_hidden()
+        await expect(page.locator("#inject-message")).to_be_disabled()
+        await expect(page.locator(".inject-form .composer-actions")).to_be_hidden()
+        await page.evaluate("document.querySelector('form.inject-form').requestSubmit()")
+        await page.evaluate(returned)
+        await expect(bar).to_be_hidden()
+        await asyncio.sleep(0.2)
+        assert len(received) == 1 and len(posts) == 1
+
+        # A chat opened in place, as a phone opens a front-page row's chat, asks too.
+        other = await context.new_page()
+        await other.goto(f"{base_url}/")
+        await other.wait_for_function("window.AgentDeckSessionNavigation && window.htmx")
+        await other.evaluate("window.__samePage = true")
+        await other.evaluate("AgentDeckSessionNavigation.open('/sessions/codex:test:sid')")
+        await expect(other.locator("[data-cold-chat]")).to_be_visible()
+        await expect(other.locator("form.inject-form")).to_be_hidden()
+        assert await other.evaluate("window.__samePage") is True
+        await browser.close()
+    await app.state.injector.stop()
+
+
 async def test_continue_chat_keeps_the_destination_when_source_steering_is_uncertain(
     tmp_path, monkeypatch
 ):
@@ -2512,6 +3034,18 @@ async def test_continue_chat_leaves_a_link_and_stop_reply_in_the_source_chat(
 ):
     (tmp_path / "claude-alt").mkdir()
     app = _continue_app(tmp_path)
+    # Only a chat with a turn running hears about the move; an idle one is left
+    # asleep (#4169), so the source here is mid-turn and is steered.
+    source = app.state.app_state.sessions["codex:test:sid"]
+    app.state.app_state.update_session(
+        replace(
+            source,
+            thinking=True,
+            capabilities=frozenset(
+                {Capability.TRANSCRIPT, Capability.INJECT, Capability.STEER}
+            ),
+        )
+    )
     events = []
 
     async def fake_cursor(account, session):
@@ -2520,7 +3054,7 @@ async def test_continue_chat_leaves_a_link_and_stop_reply_in_the_source_chat(
     async def fake_read(account, session, after_seq=0):
         return [event for event in events if event.seq > after_seq]
 
-    async def fake_inject(account, session, message, **kwargs):
+    async def fake_steer(account, session, message, **kwargs):
         destination_url = message.split("](", 1)[1].split(")", 1)[0]
         delivered_at = datetime.now(UTC)
         events.extend(
@@ -2539,6 +3073,9 @@ async def test_continue_chat_leaves_a_link_and_stop_reply_in_the_source_chat(
         )
         return InjectResult(True)
 
+    async def fake_inject(*args, **kwargs):
+        raise AssertionError("an active source must be steered, not queued")
+
     async def fake_start(account, cwd, message, **kwargs):
         return InjectResult(True, session_id="continued-sid")
 
@@ -2548,6 +3085,7 @@ async def test_continue_chat_leaves_a_link_and_stop_reply_in_the_source_chat(
     target_provider = PROVIDERS["claude_code"]
     monkeypatch.setattr(source_provider, "transcript_cursor", fake_cursor)
     monkeypatch.setattr(source_provider, "read_transcript", fake_read)
+    monkeypatch.setattr(source_provider, "steer", fake_steer)
     monkeypatch.setattr(source_provider, "inject", fake_inject)
     monkeypatch.setattr(target_provider, "can_start_session", lambda account: True)
     monkeypatch.setattr(target_provider, "start_session", fake_start)
@@ -2861,15 +3399,23 @@ async def test_continue_chat_uses_repository_once_the_source_worktree_is_gone(
     started = {}
 
     async def fake_start(account, cwd, message, **kwargs):
-        started.update(cwd=cwd, message=message)
+        started.update(cwd=cwd, message=message, kwargs=kwargs)
         return InjectResult(True, session_id="new-sid")
 
+    from agentdeck import work_start
+    from agentdeck.db import StartChoice
     from agentdeck.providers import PROVIDERS
 
     monkeypatch.setattr(
         PROVIDERS["claude_code"], "can_start_session", lambda account: True
     )
     monkeypatch.setattr(PROVIDERS["claude_code"], "start_session", fake_start)
+    # #4181: the chat's Work picked a model and effort in New work; nothing is picked here.
+    monkeypatch.setattr(
+        work_start,
+        "session_start_choice",
+        lambda app_, key: StartChoice(model="opus", effort="high"),
+    )
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         detail = await client.get("/sessions/codex:test:sid")
@@ -2894,10 +3440,11 @@ async def test_continue_chat_uses_repository_once_the_source_worktree_is_gone(
 
     assert continued.status_code == 202
     assert started["cwd"] == repository
-    # The new agent is told its ground moved; the transcript link still points home.
+    assert (started["kwargs"].get("model"), started["kwargs"].get("effort")) == ("opus", "high")
+    # The new agent is told its ground moved; the reader still points home.
     assert f"That chat ran in {gone_worktree}, which no longer exists" in started["message"]
     assert f"you are starting in {repository} instead" in started["message"]
-    assert "http://test/sessions/codex:test:sid/transcript.json" in started["message"]
+    assert "chat-read codex:test:sid --outline" in started["message"]
     await app.state.injector.stop()
 
 
@@ -3388,6 +3935,250 @@ async def test_a_quota_retry_row_names_its_reset_instead_of_a_runtime_restart(tm
     assert "Usage limit" not in page.text
     assert chat_time(reset) in page.text
     assert "Waiting for the runtime to restart" not in page.text
+
+
+def _restarting_box(app, monkeypatch, interaction):
+    """A chat asking something when its runtime went away; returns what was forgotten (#4106)."""
+    from agentdeck.providers import PROVIDERS
+
+    _restarting_runtime(app, monkeypatch)
+    provider = PROVIDERS["codex"]
+    box = {"now": interaction}
+    forgotten = []
+
+    def forget(_account, _session, question_ids):
+        forgotten.append(set(question_ids))
+        box["now"] = None
+
+    monkeypatch.setattr(provider, "_last_seen_interaction", lambda _a, _s: box["now"])
+    monkeypatch.setattr(provider, "forget_held_interaction", forget)
+    return forgotten
+
+
+def _box(*, secret=False, kind="question", dismissible=False, questions=("q1",)):
+    return PendingInteraction(
+        id="tok-1",
+        kind=kind,
+        thread_id="sid",
+        turn_id=None,
+        title="Run it?" if kind != "question" else "Pick",
+        decisions=("accept", "decline") if kind != "question" else (),
+        questions=tuple(
+            InteractionQuestion(id=item, header="", prompt=f"{item}?", secret=secret)
+            for item in (questions if kind == "question" else ())
+        ),
+        dismissible=dismissible,
+    )
+
+
+async def _answer(app, data):
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        return await client.post(
+            "/sessions/codex:test:sid/interaction", data=data, headers={"origin": "http://test"}
+        )
+
+
+async def test_an_answer_during_a_restart_is_held_and_leaves_the_box(tmp_path, monkeypatch):
+    app = _web_app(tmp_path, max_message_chars=1000)
+    forgotten = _restarting_box(app, monkeypatch, _box())
+
+    answered = await _answer(app, {"interaction_id": "tok-1", "other__q1": "yes"})
+
+    assert answered.status_code == 200
+    assert 'id="held-messages"' in answered.text and 'hx-swap-oob="outerHTML"' in answered.text
+    assert "Waiting for the runtime to restart — answers by itself" in answered.text
+    assert "Cancel: the answer is not sent." in answered.text
+    (row,) = _held_rows(app)
+    assert row.text == "q1?: yes"
+    assert row.interaction_answer.answers == {"q1": ["yes"]}
+    assert row.interaction_answer.fingerprint == _box().fingerprint()
+    assert not row.interaction_answer.attempted
+    assert row.interaction_answer.session_key == "codex:test:sid"
+    resolve = app.state.scheduled_messages._resolve_answer_target
+    assert resolve(row.interaction_answer.session_key).session.key == "codex:test:sid"
+    assert resolve("codex:test:another-leg") is None
+    assert forgotten == [{"q1"}]
+
+
+async def test_the_same_answer_sent_twice_is_held_once(tmp_path, monkeypatch):
+    app = _web_app(tmp_path, max_message_chars=1000)
+    _restarting_box(app, monkeypatch, _box())
+    data = {"interaction_id": "tok-1", "other__q1": "yes"}
+
+    await _answer(app, data)
+    repeat = await _answer(app, data)
+
+    assert repeat.status_code == 200
+    assert len(_held_rows(app)) == 1
+
+
+async def test_a_different_answer_to_a_held_question_is_refused_not_acknowledged(
+    tmp_path, monkeypatch
+):
+    app = _web_app(tmp_path, max_message_chars=1000)
+    _restarting_box(app, monkeypatch, _box(kind="command_approval"))
+    await _answer(app, {"interaction_id": "tok-1", "decision": "accept"})
+
+    other_tab = await _answer(app, {"interaction_id": "tok-1", "decision": "decline"})
+
+    assert other_tab.status_code == 409
+    assert "different answer" in other_tab.text
+    assert [row.interaction_answer.decision for row in _held_rows(app)] == ["accept"]
+
+    _restarting_box(app, monkeypatch, _box())
+    await _answer(app, {"interaction_id": "tok-1", "other__q1": "yes"})
+    other_tab = await _answer(app, {"interaction_id": "tok-1", "other__q1": "no"})
+
+    assert other_tab.status_code == 409
+
+
+async def test_a_voice_answer_sent_twice_is_held_once(tmp_path, monkeypatch):
+    app = _web_app(tmp_path, max_message_chars=1000)
+    _restarting_box(app, monkeypatch, _box())
+    data = {"interaction_id": "tok-1", "other__q1": "yes", "voice_answer": "en"}
+
+    await _answer(app, data)
+    repeat = await _answer(app, data)
+
+    assert repeat.status_code == 200
+    (row,) = _held_rows(app)
+    assert row.interaction_answer.answers["q1"][0].startswith("yes\n\n")
+
+
+async def test_an_answer_to_a_closed_question_during_a_restart_is_still_refused(
+    tmp_path, monkeypatch
+):
+    app = _web_app(tmp_path, max_message_chars=1000)
+    _restarting_box(app, monkeypatch, None)
+
+    refused = await _answer(app, {"interaction_id": "tok-1", "other__q1": "yes"})
+
+    assert refused.status_code == 409
+    assert _held_rows(app) == ()
+
+
+async def test_a_held_answer_that_was_cancelled_can_be_given_again(tmp_path, monkeypatch):
+    app = _web_app(tmp_path, max_message_chars=1000)
+    _restarting_box(app, monkeypatch, _box())
+    data = {"interaction_id": "tok-1", "other__q1": "yes"}
+    await _answer(app, data)
+    (row,) = _held_rows(app)
+    assert app.state.scheduled_messages.cancel(row.id, row.chat_id)
+
+    _restarting_box(app, monkeypatch, _box())
+    await _answer(app, data)
+
+    (again,) = _held_rows(app)
+    assert again.id != row.id and again.state == "scheduled"
+
+
+async def test_a_secret_answer_is_never_held(tmp_path, monkeypatch):
+    app = _web_app(tmp_path, max_message_chars=1000)
+    forgotten = _restarting_box(app, monkeypatch, _box(secret=True))
+
+    refused = await _answer(app, {"interaction_id": "tok-1", "other__q1": "hunter2"})
+
+    assert refused.status_code == 503
+    assert "send it again in a minute" in refused.text
+    assert _held_rows(app) == ()
+    assert forgotten == []
+
+
+async def test_a_permission_prompt_and_a_dismissal_name_what_was_decided(tmp_path, monkeypatch):
+    app = _web_app(tmp_path, max_message_chars=1000)
+    _restarting_box(app, monkeypatch, _box(kind="command_approval"))
+    await _answer(app, {"interaction_id": "tok-1", "decision": "accept"})
+    assert [row.text for row in _held_rows(app)] == ["accept: Run it?"]
+
+    open_box = replace(
+        _box(dismissible=True, questions=("q1", "q2")), id=open_questions_id(["q1", "q2"])
+    )
+    forgotten = _restarting_box(app, monkeypatch, open_box)
+    await _answer(app, {"interaction_id": open_box.id, "decision": "dismiss:q2"})
+
+    assert "Dismissed: q2?" in [row.text for row in _held_rows(app)]
+    assert forgotten == [{"q2"}]
+
+
+async def test_the_api_says_when_an_answer_is_held(tmp_path, monkeypatch):
+    app = _web_app(tmp_path, max_message_chars=1000)
+    open_box = replace(
+        _box(dismissible=True, questions=("q1", "q2")), id=open_questions_id(["q1", "q2"])
+    )
+    _restarting_box(app, monkeypatch, open_box)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        answered = await client.post(
+            "/api/sessions/codex:test:sid/interaction",
+            json={"interaction_id": open_box.id, "answers": {"q1": "yes"}},
+            headers={"origin": "http://test"},
+        )
+
+    body = answered.json()
+    assert body["held"] is True
+    assert [question["id"] for question in body["remaining"]["questions"]] == ["q2"]
+
+
+async def test_an_answer_whose_connection_breaks_is_held_not_refused(tmp_path, monkeypatch):
+    from agentdeck.providers import PROVIDERS
+
+    app = _web_app(tmp_path, max_message_chars=1000)
+    state = app.state.app_state
+    session = state.sessions["codex:test:sid"]
+    state.update_session(
+        replace(session, capabilities=session.capabilities | {Capability.INTERACT})
+    )
+    provider = PROVIDERS["codex"]
+    monkeypatch.setattr(provider, "_actionable_interaction", lambda _a, _s: _box())
+    forgotten = []
+    monkeypatch.setattr(
+        provider, "forget_held_interaction", lambda _a, _s, ids: forgotten.append(set(ids))
+    )
+
+    async def lost(*_args, **_kwargs):
+        return InjectResult(False, "Codex runtime unavailable", runtime_unreachable=True)
+
+    monkeypatch.setattr(provider, "answer_interaction", lost)
+
+    answered = await _answer(app, {"interaction_id": "tok-1", "other__q1": "yes"})
+
+    assert answered.status_code == 200
+    (row,) = _held_rows(app)
+    assert row.text == "q1?: yes" and row.interaction_answer.attempted
+    assert "Cancel: the deck stops trying to send it." in answered.text
+    assert forgotten == [{"q1"}]
+
+    from agentdeck.scheduled_messages import QUESTION_GONE_MID_SEND_REASON
+
+    app.state.scheduled_messages._give_up(row, "not used", QUESTION_GONE_MID_SEND_REASON)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        page = await client.get("/sessions/codex:test:sid")
+    assert "May have been sent" in page.text
+    assert "Check the chat before you answer again." in page.text
+    assert "Not sent" not in page.text
+
+
+async def test_a_refused_answer_is_not_held(tmp_path, monkeypatch):
+    from agentdeck.providers import PROVIDERS
+
+    app = _web_app(tmp_path, max_message_chars=1000)
+    state = app.state.app_state
+    session = state.sessions["codex:test:sid"]
+    state.update_session(
+        replace(session, capabilities=session.capabilities | {Capability.INTERACT})
+    )
+    provider = PROVIDERS["codex"]
+    monkeypatch.setattr(provider, "_actionable_interaction", lambda _a, _s: _box())
+
+    async def refused(*_args, **_kwargs):
+        return InjectResult(False, "interaction_not_pending")
+
+    monkeypatch.setattr(provider, "answer_interaction", refused)
+
+    answered = await _answer(app, {"interaction_id": "tok-1", "other__q1": "yes"})
+
+    assert answered.status_code == 422
+    assert _held_rows(app) == ()
 
 
 async def test_a_restart_holds_nothing_it_cannot_keep(tmp_path, monkeypatch):
@@ -4795,7 +5586,7 @@ async def test_dashboard_renders_model_picker(tmp_path):
         dashboard = await client.get("/")
     assert 'id="new-chat-model"' in dashboard.text
     assert 'data-provider="codex"' in dashboard.text
-    assert 'data-default-model="Sol"' in dashboard.text
+    assert 'data-default-model="GPT-5.6 Sol"' in dashboard.text
     assert 'data-default-effort="Medium"' in dashboard.text
     assert "model_picker.js" in dashboard.text
     assert 'id="new-chat-effort"' in dashboard.text
@@ -9658,6 +10449,10 @@ async def test_an_open_new_work_form_keeps_a_work_spare_in_its_own_worktree(
     assert set(work) == {(start_spares.WORK, made[0], "work")}
     # Only a press in that repository on that account takes it, and only once.
     assert spares.claim_work("eerovil/other", account_key="claude_code:main") is None
+    # A press that picked a model or effort (#4181) is not what the spare was booted with.
+    picked = {"account_key": "claude_code:main"}
+    assert spares.claim_work("eerovil/agentdeck", **picked, model="opus") is None
+    assert spares.claim_work("eerovil/agentdeck", **picked, effort="high") is None
     taken = spares.claim_work("EEROVIL/agentdeck", account_key="claude_code:main")
     assert taken is not None and taken[2] == made[0]
     assert spares.claim_work("eerovil/agentdeck", account_key="claude_code:main") is None

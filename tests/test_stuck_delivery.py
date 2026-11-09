@@ -398,7 +398,15 @@ async def test_the_row_says_when_the_deck_is_having_another_go(tmp_path):
     ) as client:
         resending = await client.get(f"/sessions/{key}")
 
+        # The attempt is counted as the send starts: a first send has spent none.
+        item.state = "running"
+        injector._snapshot(key)
+        first_send = await client.get(f"/sessions/{key}")
+
         item.attempts = 2
+        injector._snapshot(key)
+        second_send = await client.get(f"/sessions/{key}")
+
         item.state = "accepted"
         item.accepted_at = datetime.now(UTC) - timedelta(
             seconds=ACKNOWLEDGEMENT_GRACE_S + 1
@@ -408,6 +416,8 @@ async def test_the_row_says_when_the_deck_is_having_another_go(tmp_path):
 
     assert "Sending again; the first send left no trace" in resending.text
     assert "Queued behind active turn" not in resending.text
+    assert "left no trace" not in first_send.text
+    assert "Sending again; the first send left no trace" in second_send.text
     assert "Sent twice; the agent never acknowledged it" in twice.text
 
 

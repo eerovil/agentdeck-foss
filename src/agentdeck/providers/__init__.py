@@ -57,6 +57,16 @@ def delivery_target_for(session: Session, accounts: list[Account]) -> DeliveryTa
     """
     if Capability.INJECT not in session.capabilities:
         return None
+    return chat_target_for(session, accounts)
+
+
+def chat_target_for(session: Session, accounts: list[Account]) -> DeliveryTarget | None:
+    """Resolve a chat's account and provider, whatever the chat can take now.
+
+    A held answer goes to the box, not into a new turn (#4106), so it needs this and
+    not ``delivery_target_for``: its chat may have lost INJECT for good, and the answer
+    must then learn the question is gone rather than wait out its limit.
+    """
     account = next((item for item in accounts if item.key == session.account_key), None)
     if account is None:
         return None
@@ -71,6 +81,7 @@ __all__ = [
     "RETIRED_PROVIDERS",
     "DeliveryTarget",
     "SessionProvider",
+    "chat_target_for",
     "delivery_target_for",
     "pending_interaction_for",
 ]

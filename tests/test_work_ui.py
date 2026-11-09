@@ -12,6 +12,7 @@ import hashlib
 import os
 import re
 import shutil
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import quote
@@ -21,6 +22,7 @@ import pytest
 from public_copy import private_feature
 
 from agentdeck import chat_review as _chat_review
+from agentdeck.chat_use import ChatUse
 from agentdeck.models import (
     BACKGROUND_TASK_ACTIVITY,
     IssueRef,
@@ -31,12 +33,15 @@ from agentdeck.models import (
 from agentdeck.poller_engine.workspace import WorkspaceSnapshot
 from agentdeck.poller_ops import BoardScope, BoardView
 from agentdeck.triage import AssistantInsight, AssistantView
+from agentdeck.web.render import SESSION_FRAGMENTS_BY_NAME, SessionView
 from agentdeck.work import WorkRef
 from agentdeck.work_overview import (
     VerificationSummary,
+    WorkChat,
     attribute_insights,
     build_work_card,
     compact_workspace,
+    newest_chat_use,
     summarize_verification,
     work_href,
 )
@@ -76,7 +81,13 @@ def _app(tmp_path, *, board: BoardView | None = None):
     app.state.issues.read_board = lambda: board or BoardView()
     # No issue record unless a test gives one: the metadata cache is the host's own.
     app.state.issues.cached_issues = lambda refs: {}
+    # No open blocker unless a test gives one: the live read is the host's own gh (#4216).
+    app.state.open_blockers = _no_blockers
     return app
+
+
+async def _no_blockers(repository, number):
+    return []
 
 
 def _closed(app, when_by_number: dict, *, updated: dict | None = None) -> None:
@@ -800,6 +811,7 @@ def test_the_front_page_is_work_first(tmp_path):
     # the board with the links off the page.
     order = [
         'id="front-summary"',
+        'id="front-starred"',
         'id="front-needs"',
         'id="front-release"',
         'id="front-stuck"',
@@ -1200,6 +1212,7 @@ async def test_recently_finished_goes_by_when_the_work_finished(tmp_path):
     """#2219 review: a Work closed today is Recently finished even when its chats went quiet
     a fortnight ago; rows are ordered and dated by GitHub's close time; and a comment on an
     issue closed long ago, which moves ``updatedAt``, does not make it newly finished."""
+    from agentdeck.web.work_view import render_work_front
     from agentdeck.work_story import FINISHED
 
     quiet_long, busy_late = WorkRef("eerovil/agentdeck", 3301), WorkRef("eerovil/agentdeck", 3302)
@@ -1217,6 +1230,8 @@ async def test_recently_finished_goes_by_when_the_work_finished(tmp_path):
     }
     # Someone commented on #3304 ten minutes ago, three weeks after it closed.
     _closed(app, closed, updated={3304: NOW - timedelta(minutes=10)})
+    state = app.state.app_state
+    state.set_chat_use({key: ChatUse("expensive", 170_000) for key in state.sessions})
 
     overview = await _overview(app)
 
@@ -1237,6 +1252,26 @@ async def test_recently_finished_goes_by_when_the_work_finished(tmp_path):
     finished = html.split('id="works-finished"', 1)[1].split("</section>", 1)[0]
     # Dated by the closing, not by the chat that went quiet two weeks ago.
     assert closed[3301].isoformat() in finished
+    # #4168: size does not expire, and waking a finished Work's chat is what the dot warns of.
+    assert finished.count('class="use-dot use-expensive"') == 3
+
+    # #4121: a star keeps a Work closed long ago on the page, in Starred, until the star goes.
+    app.state.control_db.star_work(commented.work_id)
+    overview = await _overview(app)
+    assert [row.card.work_id for row in overview.front.starred] == [commented.work_id]
+    assert _section_of(overview, commented) == FINISHED
+
+    # Nor does it take GitHub's close time: a record without ``closedAt`` is listed and drawn.
+    records = app.state.issues.cached_issues
+    app.state.issues.cached_issues = lambda refs: {
+        key: {name: value for name, value in record.items() if name != "closedAt"}
+        for key, record in records(refs).items()
+    }
+    overview = await _overview(app)
+    (row,) = overview.front.starred
+    assert row.card.work_id == commented.work_id and row.card.finished_at is None
+    html = render_work_front(app.state.templates, overview, "starred")
+    assert commented.work_id in html and "Finished" in html
 
 
 def test_a_finish_time_is_the_close_time_and_nothing_else():
@@ -1388,7 +1423,6 @@ async def test_an_open_work_page_builds_only_when_its_own_work_moved(tmp_path, m
 
     # A change only one section reads re-renders that section, with what a fresh render shows:
     # the workspace's rows from the card's own claims, the status's hide control.
-    from dataclasses import replace
 
     from agentdeck.web.work_view import render_changed_sections
     from agentdeck.work_hidden import HiddenWork
@@ -1445,10 +1479,12 @@ def test_the_older_slices_routes_are_the_work_page_now(tmp_path):
         "/works/{work_id:path}/star",  # Star and Unstar (#3116)
         "/api/works/{work_id:path}/star",  # the same for agents (#3116)
         "/api/works/{work_id:path}/message",  # another Work's agent changing its request (#3908)
+        "/api/works/{work_id:path}/start",  # a chat starting an issue with its own label (#4141)
         "/api/works/{work_id:path}/map-layout",  # a wayfinder map's moved boxes (#3627)
         "/api/works/{work_id:path}/question",  # its question boxes, for agents (#3481)
         "/works/{work_id:path}/title",  # the Work's own name on this deck (#2328)
         "/works/{work_id:path}/new-chat",  # a side chat for the Work (#2388)
+        "/works/{work_id:path}/side-chat",  # a copy of its working chat to ask in (#4199)
         "/works/new",  # file a new Work's issue from the deck (#2415)
         "/works/new/guess-project",  # New work's project guessed from its text (#3367)
         "/works/new/warm",  # an open New work form keeps a Work spare (#3590)
@@ -2363,6 +2399,54 @@ async def test_the_house_reaches_the_front_page_from_a_chat_opened_over_a_work(t
         await browser.close()
 
 
+@pytest.mark.browser
+@pytest.mark.asyncio
+async def test_a_pull_requests_text_stays_as_the_reader_left_it(tmp_path):
+    """#4137: a waiting pull request's description starts open, a live update does not spring
+    it open again once shut, and it folds by itself when the pull request merges."""
+    from conftest import async_playwright
+    from test_web import _live_server
+    from test_work_unstarted import _backlog, _issue, _pull
+
+    app = _browser_app(tmp_path)
+    backlog = _backlog(_issue(WORK.number, labels=["agent"]),
+                       pulls=[_pull(90, f"agent/issue-{WORK.number}")])
+    app.state.issues.read_board = lambda: backlog.board
+    app.state.issues.cached = lambda: backlog
+    row = {"state": "OPEN", "title": "First words", "body": "**What it does**", "isDraft": False,
+           "headRefOid": "a" * 40, "baseRefName": "master"}
+    app.state.issues.cached_pulls = lambda wanted: {ref: dict(row) for ref in wanted}
+    await app.state.work_overview.refresh()
+    fold = ".wd-output-about"
+
+    async def moved(**change):
+        row.update(change)
+        await app.state.work_overview.refresh()
+        await page.wait_for_function(
+            f"document.querySelector('{fold} > summary').textContent === {row['title']!r}"
+        )
+
+    async with _live_server(app) as base, async_playwright() as playwright:
+        browser = await playwright.chromium.launch()
+        page = await browser.new_page(viewport={"width": 390, "height": 800},
+                                      service_workers="block")
+        await page.goto(base + work_href(WORK.work_id))
+        assert await page.locator(fold).evaluate("el => el.open")
+        assert await page.locator(f"{fold} strong").text_content() == "What it does"
+
+        await page.locator(f"{fold} > summary").click()
+        await moved(title="Second words")
+        assert not await page.locator(fold).evaluate("el => el.open")
+
+        await page.locator(f"{fold} > summary").click()
+        await moved(title="Third words")
+        assert await page.locator(fold).evaluate("el => el.open")
+
+        await moved(title="Merged words", state="MERGED")
+        assert not await page.locator(fold).evaluate("el => el.open")
+        await browser.close()
+
+
 def test_work_page_disclosures_are_keyed_by_work(tmp_path):
     app = _app(tmp_path, board=_board())
     _add(app, "claude_code:test:worker", WORK)
@@ -2949,6 +3033,195 @@ def test_a_front_page_row_names_the_chat_its_work_opens_into(tmp_path):
     assert "data-chat-href" not in body(UNSTARTED)
 
 
+def _front_row(app, ref):
+    return re.search(
+        rf'<article[^>]*data-work-id="{re.escape(ref.work_id)}".*?</article>',
+        _client(app).get("/").text,
+        flags=re.S,
+    ).group(0)
+
+
+async def test_a_front_page_row_shows_its_newest_chats_dot(tmp_path):
+    """#4168: what the Work's next message costs. An older chat's size does not count, nor a
+    reviewer's or a helper's, however recent; a newest chat with no reading leaves no dot."""
+    app = _app(tmp_path, board=_board())
+    state = app.state.app_state
+    old = _add(app, "claude_code:test:old", WORK, last_activity=NOW - timedelta(hours=3))
+    newest = _add(app, "claude_code:test:newest", WORK, last_activity=NOW - timedelta(hours=2),
+                  thinking=True)  # mid-turn, so the front page lists the Work
+    reviewer = _add(app, "claude_code:test:reviewer", WORK, last_activity=NOW - timedelta(hours=1),
+                    initial_prompt="You are AgentDeck's Claude reviewer. Read the head.")
+    helper = _add(app, "claude_code:test:helper", WORK, last_activity=NOW - timedelta(minutes=9),
+                  parent_session_key=old)
+    use = ChatUse("middling", 120_000, 0.3)
+    big = ChatUse("expensive", 170_000)
+    state.set_chat_use({old: big, newest: use, reviewer: big, helper: big})
+
+    when = _front_row(app, WORK).split('class="fr-when"', 1)[1]
+    assert 'class="use-dot use-middling"' in when and f'title="{use.title}"' in when
+
+    state.set_chat_use({old: big, reviewer: big, helper: big})
+    await app.state.work_overview.refresh()
+    assert "use-dot" not in _front_row(app, WORK)
+
+
+def _use_row(key, minutes_ago, use, **fields):
+    return WorkChat(chat_id=key, session_key=key, title=key, href="/", working=False,
+                    background=False, last_activity=NOW - timedelta(minutes=minutes_ago),
+                    evidence=(), other_works=(), pull_requests=(), legs=(), use=use, **fields)
+
+
+def test_the_newest_chat_is_newest_by_activity_not_by_being_busy():
+    """#4168: ``work_chats`` lists a working chat first, however old, which is not the order
+    that says where the Work's next message goes."""
+    old = ChatUse("expensive", 170_000)
+    new = ChatUse("cheap", 60_000)
+    busy_old = replace(_use_row("old", 30, old), working=True)
+    assert newest_chat_use((busy_old, _use_row("new", 5, new))) == new
+    assert newest_chat_use((busy_old, _use_row("new", 5, None))) is None
+
+
+async def test_a_delegated_helper_with_no_parent_is_not_the_works_chat(tmp_path):
+    """#4168: a chat ``agentdeck delegate`` started is marked delegated and has no
+    ``parent_session_key``, which only a nested subagent has."""
+    app = _app(tmp_path, board=_board())
+    own = _add(app, "claude_code:test:own", WORK, last_activity=NOW - timedelta(hours=2),
+               thinking=True)
+    helper = _add(app, "claude_code:test:helper", WORK, is_delegated=True,
+                  last_activity=NOW - timedelta(minutes=9))
+    app.state.app_state.set_chat_use(
+        {own: ChatUse("cheap", 60_000), helper: ChatUse("expensive", 170_000)}
+    )
+
+    assert 'class="use-dot use-cheap"' in _front_row(app, WORK)
+
+
+def test_a_work_with_only_a_started_chat_goes_by_that_chat(tmp_path):
+    """#4168: a Work another chat started has no chat of its own, so its helper is its chat."""
+    app = _app(tmp_path, board=_board())
+    helper = _add(app, "claude_code:test:helper", WORK, parent_session_key="claude_code:test:p",
+                  thinking=True)
+    reviewer = _add(app, "claude_code:test:reviewer", OTHER, thinking=True,
+                    initial_prompt="You are AgentDeck's Codex reviewer. Read the head.")
+    big = ChatUse("expensive", 170_000)
+    app.state.app_state.set_chat_use({helper: big, reviewer: big})
+
+    assert 'class="use-dot use-expensive"' in _front_row(app, WORK)
+    assert "use-dot" not in _front_row(app, OTHER)
+
+
+def test_the_work_page_shows_the_dot_and_each_chats_own(tmp_path):
+    """#4168: the Work's in the line under its title, each chat's in the Chats fold."""
+    app = _app(tmp_path, board=_board())
+    old = _add(app, "claude_code:test:old", WORK, last_activity=NOW - timedelta(hours=3))
+    newest = _add(app, "claude_code:test:newest", WORK, last_activity=NOW - timedelta(hours=2))
+    app.state.app_state.set_chat_use(
+        {old: ChatUse("expensive", 170_000), newest: ChatUse("cheap", 60_000)}
+    )
+
+    page = _client(app).get(work_href(WORK.work_id)).text
+    source = page.split('class="wd-source"', 1)[1].split("</p>", 1)[0]
+    assert 'class="use-dot use-cheap"' in source
+    chats = page.split('id="work-chats"', 1)[1].split("</details>", 1)[0]
+    assert 'class="use-dot use-expensive"' in chats and 'class="use-dot use-cheap"' in chats
+
+
+async def test_the_chat_page_shows_the_dot_and_its_numbers_with_no_more_height(tmp_path):
+    """#4168: in the header row, and the numbers open from it, because a phone has no tooltip."""
+    app = _app(tmp_path)
+    chat = _add(app, "claude_code:test:chat", WORK)
+    use = ChatUse("expensive", 170_000, 0.8)
+    app.state.app_state.set_chat_use({chat: use})
+
+    page = _client(app).get(f"/sessions/{chat}").text
+
+    head = page.split('id="session-status"', 1)[1].split("</div>", 1)[0]
+    assert 'popovertarget="session-use-info"' in head and "use-dot use-expensive" in head
+    panel = page.split('id="session-use-info"', 1)[1].split("</div>\n</div>", 1)[0]
+    assert 'sse-swap="use-info"' in panel and "170k in context." in panel
+    assert "Last 24 hours: 0.8 % of the week." in panel
+
+
+def test_a_reading_moves_the_chat_pages_fragments_only_when_they_show_it(tmp_path):
+    """#4168: a new number swaps only the panel, so the header is not redrawn each minute."""
+    status, info = SESSION_FRAGMENTS_BY_NAME["status"], SESSION_FRAGMENTS_BY_NAME["use-info"]
+    chat = _session("claude_code:test:chat")
+
+    def view(use):
+        shown = replace(chat, chat_use=use)
+        return SessionView(current=shown, effective=shown)
+
+    seen = {}
+    status.changed(view(ChatUse("cheap", 60_000)), seen)
+    info.changed(view(ChatUse("cheap", 60_000)), seen)
+    assert not status.changed(view(ChatUse("cheap", 70_000)), seen)
+    assert info.changed(view(ChatUse("cheap", 70_000)), seen)
+    assert status.changed(view(ChatUse("middling", 120_000)), seen)
+
+
+@pytest.mark.browser
+@pytest.mark.asyncio
+async def test_a_cost_dot_arrives_on_an_open_phone_page(tmp_path):
+    """#4163: a reading reaches a page already open, with no reload, and fits a phone."""
+    from conftest import async_playwright
+    from test_web import _live_server
+
+    app = _browser_app(tmp_path)
+    await app.state.work_overview.refresh()
+    state = app.state.app_state
+    row = f'[data-work-id="{WORK.work_id}"]'
+    async with _live_server(app) as base, async_playwright() as playwright:
+        browser = await playwright.chromium.launch()
+        page = await browser.new_page(viewport={"width": 390, "height": 844},
+                                      service_workers="block")
+        await page.goto(base + "/")
+        await page.wait_for_selector(row)
+        assert await page.locator(f"{row} .use-dot").count() == 0
+
+        state.set_chat_use({key: ChatUse("expensive", 170_000, 0.8) for key in state.sessions})
+        await app.state.work_overview.refresh()
+
+        await page.wait_for_selector(f"{row} .fr-when .use-dot.use-expensive")
+        assert await page.evaluate("document.documentElement.scrollWidth") <= 390
+        await browser.close()
+
+
+@pytest.mark.browser
+@pytest.mark.asyncio
+async def test_a_new_reading_reaches_an_open_chat_page_and_leaves_its_panel_open(tmp_path):
+    """#4168: on a phone, a compact turns the header's dot green while the numbers are open,
+    the panel keeps its reader, and the header row is no taller."""
+    from conftest import async_playwright
+    from test_web import _live_server
+
+    app = _browser_app(tmp_path)
+    chat = "claude_code:test:worker"
+    state = app.state.app_state
+    state.set_chat_use({chat: ChatUse("expensive", 170_000, 0.8)})
+    async with _live_server(app) as base, async_playwright() as playwright:
+        browser = await playwright.chromium.launch()
+        page = await browser.new_page(viewport={"width": 390, "height": 844},
+                                      service_workers="block")
+        await page.goto(f"{base}/sessions/{chat}")
+        await page.wait_for_selector(".use-info-open .use-expensive")
+        height = (await page.locator(".session-detail-head").bounding_box())["height"]
+        await page.locator(".use-info-open").click()
+        await page.wait_for_selector("#session-use-info:popover-open")
+
+        state.set_chat_use({chat: ChatUse("cheap", None, 0.8)})
+
+        await page.wait_for_selector(".use-info-open .use-cheap")
+        await page.wait_for_function(
+            "document.querySelector('#session-use-info').textContent.includes('Just compacted')"
+        )
+        assert await page.locator("#session-use-info:popover-open").count() == 1
+        box = await page.locator("#session-use-info").bounding_box()
+        assert box["x"] >= 0 and box["x"] + box["width"] <= 390
+        assert (await page.locator(".session-detail-head").bounding_box())["height"] == height
+        assert await page.evaluate("document.documentElement.scrollWidth") <= 390
+        await browser.close()
+
+
 def test_opening_a_works_chat_counts_as_opening_the_work(tmp_path):
     """#2512: a phone's row opens the chat instead of the Work page, so opening a chat one
     Work owns is what clears that Work's new mark (#2283); a shared chat marks neither."""
@@ -2976,8 +3249,10 @@ async def test_a_phone_opens_a_shared_chat_with_the_work_it_tapped(tmp_path):
     from test_web import _live_server
 
     app = _browser_app(tmp_path)
+    # The fixture's worker chat is working too (#3984), so the shared chat has to be the more
+    # recent one: on a tie the Work opens whichever chat's random id sorts first (#4104).
     shared = _add(app, "claude_code:test:shared", WORK, OTHER, title="Spec weekly SEO audit",
-                  cwd=tmp_path, thinking=True)
+                  cwd=tmp_path, thinking=True, last_activity=NOW)
     # The shared chat alone keeps the other Work current, so its row opens that chat.
     _add(app, "claude_code:test:cleanup", OTHER, title="Remove legacy paths")
     await app.state.work_overview.refresh()

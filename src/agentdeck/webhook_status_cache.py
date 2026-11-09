@@ -121,6 +121,16 @@ def _keep_file_list(held: object, value: dict) -> None:
     value["files"] = held["files"]
 
 
+def _keep_body(held: object, value: dict) -> None:
+    """Carry the held row's description onto a payload with no ``body`` key (#4137).
+
+    A delivery with the key says what the description is now, an empty one included (GitHub
+    sends null); one without says nothing about it, so it must not blank a Work page's text.
+    """
+    if "body" not in value and isinstance(held, dict) and "body" in held:
+        value["body"] = held["body"]
+
+
 # What a held file list must still agree with to be carried onto a delivery (#2331).
 _FILE_LIST_FIELDS = ("headRefOid", "baseRefName", *(field for field, _ in _PULL_SIZE_FIELDS))
 
@@ -230,7 +240,7 @@ class WebhookStatusCacheService:
             try:
                 async for batch in self._tailer.watch(stop_event=self._stop, watcher=self._watcher):
                     self.apply_batch(batch)
-                    self._tailer.commit()
+                    await self._tailer.commit_off_loop()
                 return  # the stop event ended the watch
             except asyncio.CancelledError:
                 raise
@@ -388,6 +398,7 @@ class WebhookStatusCacheService:
         if not self._is_newer(held, value):
             return
         _keep_file_list(held, value)
+        _keep_body(held, value)
         self._cache.offer(
             key,
             GitHubMetadata(value, terminal=value["state"] == "closed"),
@@ -429,6 +440,9 @@ class WebhookStatusCacheService:
                 if "auto_merge" in pull
                 else {}
             ),
+            # Its description (#4137), not a pill field: an edit of it wakes nothing. A payload
+            # without the key leaves the row without, and ``_keep_body`` then keeps the held one.
+            **({"body": pull["body"] or ""} if "body" in pull else {}),
             # The pull request's size (#2236); a payload without it leaves the row without.
             **{
                 field: pull[key]

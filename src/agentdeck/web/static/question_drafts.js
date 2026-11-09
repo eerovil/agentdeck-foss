@@ -77,6 +77,10 @@
   // box is the first question's Dismiss: the answer typed was thrown away (#3749). It sends
   // the answer instead by clicking Submit answer: the form's own checks still run, and htmx
   // takes the decision from the button last clicked, not from requestSubmit's submitter.
+  // htmx wires a box the live update just swapped in only when the swap settles, a few
+  // milliseconds later; a click before that was a plain browser submit, a GET that put the
+  // typed answer in the page address (#4192). htmx.process wires it now, and does nothing
+  // to a form it already wired.
   document.addEventListener('keydown', function (event) {
     if (event.key !== 'Enter' || event.shiftKey || event.isComposing) return;
     var input = event.target;
@@ -86,6 +90,7 @@
     var submit = form.querySelector('button[name="decision"][value="accept"]');
     if (!submit) return;
     event.preventDefault();
+    if (window.htmx) window.htmx.process(form);
     submit.click();
   });
   // Any redraw of the box: the page's own submit swaps it, the live update pushes it as an

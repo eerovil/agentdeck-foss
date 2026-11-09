@@ -99,7 +99,7 @@ MAX_AGENTS = 3
 # The voice conversation a fresh process is given, newest last.
 HISTORY_LINES = 40
 MAX_HEARD_CHARS = 2000
-MAX_ALOUD_CHARS = 600
+MAX_ALOUD_CHARS = 1200
 MAX_SAY_CHARS = 300
 # A cleaned-up phrase this far from the words heard was reworded, not corrected.
 MIN_RELAY_SHARE = 0.5

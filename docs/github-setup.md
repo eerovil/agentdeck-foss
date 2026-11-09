@@ -18,6 +18,8 @@ Your App's key stays with you, its rate limit is yours, and its webhooks come to
 - **Repository permissions:** Contents, Issues and Pull requests: read and write. Actions,
   Checks, Commit statuses and Metadata: read only. Leave **Workflows** at No access: with it an
   agent could change a CI file on its own branch and run code with the repository's secrets.
+  A deck with a reviewer also shows each review as a GitHub check, which needs Checks at read
+  and write; refused, the deck logs it once an hour and goes on without the check.
 - **Organization permissions** (only if you will use an organization Project board):
   Projects, read and write.
 - **Where can this App be installed:** only on this account.

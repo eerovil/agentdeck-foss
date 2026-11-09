@@ -36,6 +36,7 @@ from agentdeck.host_slots import (
     heavy_slot_count,
     heavy_slot_is_held,
     heavy_slot_paths,
+    slot_root,
     take_a_slot,
 )
 from agentdeck.test_timings import TIMINGS_ENV, TimingRecorder
@@ -96,6 +97,9 @@ os.environ["AGENTDECK_SERVICES_IN_PROCESS"] = "1"
 # Assigned, not defaulted: a queued suite inherits the runtime's environment.
 os.environ["AGENTDECK_GH_SHIM_DIR"] = str(Path(_scratch_share_dir) / "gh-shim")
 os.environ["AGENTDECK_HEAVY_SHIM_DIR"] = str(Path(_scratch_share_dir) / "heavy-shim")
+# This host's temp folder setting is not the suite's: a queue under test would judge its own
+# temp folders by it, and wait for ever when they sit on that disk (#4143).
+os.environ.pop("AGENTDECK_JOB_SCRATCH", None)
 atexit.register(shutil.rmtree, _scratch_share_dir, ignore_errors=True)
 
 def pytest_configure(config: pytest.Config) -> None:
@@ -321,7 +325,7 @@ def pytest_runtest_logreport(report: pytest.TestReport) -> None:
 
 
 BROWSER_SLOT_ENV = "AGENTDECK_BROWSER_SLOTS"
-_SLOT_DIR = Path(tempfile.gettempdir()) / f"agentdeck-browser-slots-{os.getuid()}"
+_SLOT_DIR = slot_root() / f"agentdeck-browser-slots-{os.getuid()}"
 _SLOT_POLL_S = 0.05
 _SLOT_TIMEOUT_S = 900.0
 _open_slot_scopes = 0
@@ -500,7 +504,8 @@ def pytest_report_header() -> str:
     """Say the cap out loud. A run that is slow because it is queueing behind
     another pytest process's browser tests looks exactly like a run that is
     slow, and the slots are host-wide, so the neighbour is often not this run.
-    The directory is printed because `TMPDIR` decides how wide "host-wide" is.
+    The directory is `slot_root()`, not the temp folder: a queued job's `TMPDIR` differs
+    from a shell's (#4143), and the two must still share these slots.
     """
     return (
         f"browser slots: {browser_slot_count()} concurrent in {_SLOT_DIR} "

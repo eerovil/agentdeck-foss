@@ -19,6 +19,13 @@ reads another card's runs; the evidence is the verification and its own follow-u
     A verification that ended with no test result at all (no room on the cluster, killed,
     cut off by a restart), submitted again once.
 
+A rerun runs ``pytest`` on the failing ids, so only a verification that was itself a plain
+``pytest`` call is followed (#4197): a wrapper script builds its own environment (an image,
+containers, a flag that turns tests on), and the same ids run bare on the host are skipped,
+or fail for reasons the commit did not cause. And a rerun forgives a test only when its
+summary lists it as ``PASSED`` (the queue runs it with ``-rA``): exit 0 also covers a test
+that was skipped, deselected or never collected.
+
 A failure on a test the merge base does not have is the branch's own and is never forgiven,
 not even when a rerun passes it (#2552): a racy test a branch adds is that branch's bug. The
 queue records which failures exist on the merge base as ``base_present``; a row without that
@@ -51,6 +58,8 @@ __all__ = [
     "follow_up",
     "forgiveness",
     "no_test_result",
+    "not_pytest",
+    "runs_pytest",
     "unfollowable_tree",
 ]
 
@@ -114,7 +123,19 @@ def _followable(verification: dict) -> bool:
     return _result(verification) and _followable_but_for_tree(verification)
 
 
-def _followable_but_for_tree(verification: dict) -> bool:
+def runs_pytest(command: object) -> bool:
+    """Whether ``command`` is a plain ``pytest`` call: ``pytest``, ``uv run pytest``, a path
+    ending in ``/pytest``, or ``<python> -m pytest``. A script that runs pytest is not."""
+    parts = [str(part) for part in command] if isinstance(command, (list, tuple)) else []
+    if parts[:2] == ["uv", "run"]:
+        parts = parts[2:]
+    head = parts[0] if parts else ""
+    if head == "pytest" or head.endswith("/pytest"):
+        return True
+    return len(parts) >= 3 and parts[1:3] == ["-m", "pytest"]
+
+
+def _failed_on_tests(verification: dict) -> bool:
     failures = verification.get("failures") or ()
     return (
         verification.get("purpose") == "verification"
@@ -122,9 +143,26 @@ def _followable_but_for_tree(verification: dict) -> bool:
         and str(verification.get("result_class") or "") == "failure"
         and bool(verification.get("failures_complete"))
         and 0 < len(failures) <= MAX_FOLLOWED_FAILURES
+    )
+
+
+def _followable_but_for_tree(verification: dict) -> bool:
+    return (
+        _failed_on_tests(verification)
+        and runs_pytest(verification.get("command"))
         and not any(
             str(word).split("=", 1)[0] in _STOPS_EARLY for word in verification.get("command") or ()
         )
+    )
+
+
+def not_pytest(verification: object) -> bool:
+    """Whether this failed verification's failures go without a rerun because its command is
+    not a plain ``pytest`` call that a rerun could repeat (#4197)."""
+    return (
+        isinstance(verification, dict)
+        and _failed_on_tests(verification)
+        and not runs_pytest(verification.get("command"))
     )
 
 
@@ -170,12 +208,15 @@ def _passed_on_rerun(verification: dict, reruns: Iterable[dict]) -> dict[str, st
             continue
         requested = {str(test) for test in rerun.get("follow_tests") or ()}
         failures = {str(test) for test in rerun.get("failures") or ()}
+        # Only a test the rerun's summary lists as passed passed (#4197): exit 0 also covers
+        # one that was skipped or not collected, and a row from before the record has none.
+        ran = {str(test) for test in rerun.get("passed") or ()}
         # A failed rerun proves the others passed only when every failure it reported is one
         # of the tests it was asked to run. A collection or setup error names a file or module
         # instead, and then none of the requested tests may have run at all.
         if not failures <= requested:
             continue
-        for test in sorted(requested - failures):
+        for test in sorted((requested - failures) & ran):
             passed.setdefault(test, str(rerun.get("id") or ""))
     return passed
 

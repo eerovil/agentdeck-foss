@@ -144,6 +144,11 @@ def claude_permission_settings(allow_rules: list[str]) -> dict[str, Any]:
     }
 
 
+#: Longest skill description a worker's skill list carries. The list goes out with every
+#: chat, and Claude Code's own default of 1,536 costs about 2,600 more tokens each (#4080).
+SKILL_DESCRIPTION_CHARS = 200
+
+
 def ensure_claude_settings(
     root: Path, allow_rules: list[str] | None = None, *, capture: bool = True
 ) -> Path:
@@ -158,6 +163,7 @@ def ensure_claude_settings(
     name = "claude-command-artifact-hooks" if capture else "claude-worker-settings"
     target = root / f"{name}{'' if allow_rules else '-no-skip'}.json"
     settings = claude_permission_settings(allow_rules or [])
+    settings["skillListingMaxDescChars"] = SKILL_DESCRIPTION_CHARS
     if capture:
         hooks = hook_groups()
         for event, groups in settings["hooks"].items():

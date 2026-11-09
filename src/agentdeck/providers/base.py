@@ -174,6 +174,9 @@ class SessionProvider(ABC):
     # arg. The UI currently chooses models only at spawn; provider-specific turn
     # settings such as Codex effort use their own capability-gated controls.
     selectable_models: ClassVar[tuple[ModelChoice, ...]] = ()
+    # Whether ``chat_use``'s weights were fitted to this provider's tokens (#4163). Without
+    # them its chats show no cost dot rather than a guess.
+    fitted_weights: ClassVar[bool] = False
     selectable_efforts: ClassVar[tuple[EffortChoice, ...]] = ()
     # The quota windows this provider's meter actually reports, in the order the
     # header draws them. It is the render's window set, not the calibration
@@ -214,9 +217,11 @@ class SessionProvider(ABC):
     def interactions_unknown(self, account: Account) -> bool:
         """Whether this account's live interactions cannot be read now (#3487).
 
-        While the runtime restarts, ``pending_interaction`` answers ``None`` for every
-        chat, an open question included. A caller that acts on "nothing is asked" (the
-        Work pass asking an agent for its next step) checks this first. Default: never.
+        While the runtime restarts, ``pending_interaction`` shows only what was last
+        read (#4106): a question asked since cannot be there, and a web process that
+        started meanwhile has read nothing. A caller that acts on "nothing is asked"
+        (the Work pass asking an agent for its next step) checks this first. Default:
+        never.
         """
         del account
         return False
@@ -267,6 +272,13 @@ class SessionProvider(ABC):
         """Current context readings whose keyed-worker mapping is exact."""
         return ()
 
+    def use_transcript(self, account: Account, session: Session) -> Path | None:
+        """The file ``chat_use`` can read this chat's model calls from (#4163).
+
+        None for a provider whose token use has no ``fitted_weights``.
+        """
+        return None
+
     @abstractmethod
     def watch_paths(self, account: Account) -> list[Path]:  # for watchfiles (v0.2+)
         ...
@@ -314,9 +326,17 @@ class SessionProvider(ABC):
         return (0, 0)
 
     async def tail_transcript(
-        self, account: Account, session: Session, byte_offset: int, seq: int
+        self,
+        account: Account,
+        session: Session,
+        byte_offset: int,
+        seq: int,
+        limit: int | None = None,
     ) -> tuple[list[TranscriptEvent], int, int]:
-        """Incremental read from a cursor → (new_events, byte_offset, seq)."""
+        """Incremental read from a cursor → (new_events, byte_offset, seq).
+
+        ``limit`` caps the bytes one call reads; the returned cursor resumes it.
+        """
         return ([], byte_offset, seq)
 
     async def last_event(self, account: Account, session: Session) -> TranscriptEvent | None:
@@ -421,6 +441,24 @@ class SessionProvider(ABC):
         """
         return None
 
+    def newest_fork_seq(self, account: Account, session: Session) -> int | None:
+        """The line of ``session``'s newest reply a side chat can start after, or None.
+
+        Unlike ``fork_ref``'s chosen line, this is the deck's pick, made while the chat may
+        still be working (#4199): its newest finished turn.
+        """
+        return None
+
+    def newest_fork(self, account: Account, session: Session) -> tuple[int, str] | None:
+        """``(line, cut)`` for a Work's side chat of ``session`` (#4199), or None.
+
+        By default the newest finished turn ``newest_fork_seq`` picks, checked by
+        ``fork_ref``. A provider whose chats can lose their older history overrides it.
+        """
+        seq = self.newest_fork_seq(account, session)
+        cut = self.fork_ref(account, session, seq) if seq else None
+        return (seq, cut) if seq and cut else None
+
     def rewind_refusal(self, account: Account, session: Session) -> str | None:
         """Why ``session`` cannot be rolled back to before one of its messages, or None.
 
@@ -513,15 +551,48 @@ class SessionProvider(ABC):
     def pending_interaction(
         self, account: Account, session: Session
     ) -> PendingInteraction | None:
-        """Return only a currently actionable, runtime-available interaction.
+        """Return what the person is asked in this chat now.
 
         The INTERACT capability gate lives here once; a provider supplies only
         the read via ``_actionable_interaction``. Callers never re-check the
         capability — a session without INTERACT resolves to None.
+
+        The one exception is a chat whose runtime is restarting: INTERACT stays off,
+        because nothing can reach the agent, but the question is still open, so the
+        box keeps showing what was last read and its answer waits (#4106).
         """
+        if self.runtime_unreachable(account, session):
+            return self._last_seen_interaction(account, session.session_id)
         if Capability.INTERACT not in session.capabilities:
             return None
         return self._actionable_interaction(account, session.session_id)
+
+    def live_interaction(
+        self, account: Account, session: Session
+    ) -> PendingInteraction | None:
+        """The runtime's own view of what is asked, whatever the session last showed.
+
+        A held answer is delivered from here (#4106): the session's capabilities are
+        projected a moment after the runtime returns, and the answer need not wait.
+        """
+        return self._actionable_interaction(account, session.session_id)
+
+    def _last_seen_interaction(
+        self, account: Account, session_id: str
+    ) -> PendingInteraction | None:
+        """What this chat was last asked, read from the copy kept while the runtime is
+        away. Default: nothing, as for a provider with no interaction source."""
+        return None
+
+    def forget_held_interaction(
+        self, account: Account, session: Session, question_ids: Iterable[str]
+    ) -> None:
+        """Take an answer that is being held out of the box shown meanwhile (#4106).
+
+        ``question_ids`` are the questions it closed; a box that cannot be answered one
+        question at a time goes whole. The runtime's next read replaces this copy.
+        """
+        del account, session, question_ids
 
     def _actionable_interaction(
         self, account: Account, session_id: str
@@ -594,6 +665,24 @@ class SessionProvider(ABC):
         interaction = self._actionable_interaction(account, session.session_id)
         if interaction is None or interaction.id != interaction_id:
             return InjectResult(False, "interaction is no longer pending")
+        return await self._answer_actionable(
+            account, session, interaction, answers=dict(answers), decision=decision
+        )
+
+    async def answer_live_interaction(
+        self,
+        account: Account,
+        session: Session,
+        interaction: PendingInteraction,
+        *,
+        answers: Mapping[str, list[str]],
+        decision: str | None,
+    ) -> InjectResult:
+        """Deliver a held answer to ``interaction``, just read by ``live_interaction``.
+
+        Its admission happened when the person answered, and INTERACT may not be
+        projected yet, so ``answer_interaction``'s gate does not apply (#4106).
+        """
         return await self._answer_actionable(
             account, session, interaction, answers=dict(answers), decision=decision
         )

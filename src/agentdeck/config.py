@@ -526,6 +526,17 @@ class ServicesConfig(BaseModel):
     socket: str = ""
 
 
+class ReviewCheckConfig(BaseModel):
+    """The GitHub check that shows each pull request's review (#4152).
+
+    On, every ready pull request of a repository the deck follows gets a review and a check
+    named ``AgentDeck review``, a person's too. Staging must turn it off (its fence refuses
+    otherwise), and an edition without a reviewer never runs it.
+    """
+
+    enabled: bool = True
+
+
 class ChatBoardConfig(BaseModel):
     """The issue-as-chat board for one repository, and the nudges that work it (#1807).
 
@@ -642,6 +653,13 @@ class AccountConfig(BaseModel):
     provider: str
     label: str
     config_dir: str
+    # Start this Codex account's new chats with "Bypass permissions" on (#4092): no
+    # sandbox and no approvals. A delegated worker or a chat given its own sandbox
+    # keeps that sandbox. Claude's accounts set this under [claude_workers] instead.
+    start_bypassed: bool = False
+    # This account's week as a share of the main one (#4163): 2 means its week is half the
+    # size, so its tokens count double on the cost dots.
+    week_scale: float = Field(default=1.0, gt=0)
 
     @field_validator("provider")
     @classmethod
@@ -808,6 +826,7 @@ class AppConfig(BaseModel):
     services: ServicesConfig = ServicesConfig()
     chat_board: ChatBoardConfig = ChatBoardConfig()
     review: ReviewConfig = ReviewConfig()
+    review_check: ReviewCheckConfig = ReviewCheckConfig()
     auto_dream: AutoDreamConfig = AutoDreamConfig()
     meta_chat: MetaChatConfig = MetaChatConfig()
     speech: SpeechConfig = SpeechConfig()

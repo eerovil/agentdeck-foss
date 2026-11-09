@@ -90,6 +90,11 @@
   <span aria-hidden="true">▥</span><span>Move to extra</span>
 </button>
 {% endif %}
+{# Opened by the header's cost dot. A popover draws above the page, so it adds no height
+   and the pinned header's fixed height cannot clip it (#1993). #}
+<div id="session-use-info" class="use-info" popover>
+  <div id="session-use-numbers" sse-swap="use-info">{{ session_fragments["use-info"] | safe }}</div>
+</div>
 </div>
 
 <div class="detail-meta">
@@ -280,6 +285,18 @@
 {% include "partials/rollback_form.html" %}
 
 {% if can_inject %}
+{#- Asks before a message wakes a costly chat whose cache has gone (#4169). Hidden until
+    cold_chat.js shows it, so a page without scripts sends as before. #}
+<div class="cold-chat" data-cold-chat data-session-key="{{ session.key }}"
+     data-account-key="{{ session.account_key }}"
+     {%- if cold_chat %} data-ask data-stamp="{{ cold_chat.stamp }}"{% endif %} hidden>
+  <p class="cold-chat-text">This chat's cache has expired. Waking it costs about
+    <strong data-cold-cost>{{ cold_chat.cost if cold_chat else "" }} %</strong> of the week.</p>
+  <div class="cold-chat-buttons">
+    <button type="button" class="secondary" data-cold-wake>Wake it</button>
+    <button type="button" data-cold-new>New chat</button>
+  </div>
+</div>
 <form class="inject-form" hx-post="/sessions/{{ session.key }}/inject"
       hx-target="#inject-result" hx-swap="outerHTML" hx-disabled-elt="find button"
       hx-encoding="multipart/form-data" data-clear-on-send data-agentdeck-action="send">
@@ -287,7 +304,7 @@
   {#- Floats just above the pinned composer, so the composer never covers it (#2416). #}
   {% with notice = issue_post_notice, notice_oob = false %}{% include "partials/issue_post_notice.html" %}{% endwith %}
   {% endif %}
-  <label for="inject-message">Message</label>
+  <label for="inject-message" data-cold-label>Message</label>
   <div class="composer-input" data-composer-autocomplete>
     <textarea id="inject-message" class="send-on-enter" name="message" rows="3"{% if inject_max_chars %} maxlength="{{ inject_max_chars }}"{% endif %}
               placeholder="Send a follow-up…" autocomplete="off" aria-autocomplete="list"

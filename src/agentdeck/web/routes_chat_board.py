@@ -18,7 +18,15 @@ def releases_of(app):
     return None
 
 
-def note_review_head(app, outcome) -> str:
+def earlier_of(app):
+    return None
+
+
+def shipped_of(app):
+    return None
+
+
+def note_review_head(app, outcome, *, asked: bool = False) -> str:
     return ""
 
 

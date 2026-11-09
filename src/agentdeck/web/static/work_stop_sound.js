@@ -3,7 +3,12 @@
 // "Stopped" is the front page's own Recently stopped list (#2283): a live push that brings
 // in a new, unseen row there plays two soft notes. Each row's stop is `data-work-id` plus
 // `data-work-stopped` (when it stopped), so a Work that stops, resumes and stops again
-// chimes again, while a reconnect or a repeated push of the same rows does not.
+// chimes again, while a reconnect or a repeated push of the same rows does not. A starred
+// Work is listed in Starred alone (#4121), so a stop there counts the same, by the same rule
+// as Recently stopped: a closed issue or a Work no agent started is not a stop. A star moves
+// a row there with the stop it already had, which Recently stopped's cap may have kept out of
+// that list, so a stop the page already holds in another list is not a new one. Starred is
+// swapped first in a push, so a stop that is new in this push is in no other list yet.
 //
 // - Rows already on the page when it loads never chime; only a push can.
 // - One chime per push, however many Works stopped in it.
@@ -35,6 +40,7 @@
   var Context = window.AudioContext || window.webkitAudioContext;
   var audio = null;
   var known = new Set();
+  var listed = new Set();  // stops seen in the page's other lists, which never chime themselves
 
   function enabled() {
     try { return localStorage.getItem(SETTING_KEY) !== 'off'; } catch (e) { return true; }
@@ -136,7 +142,15 @@
 
   function rows() {
     var list = document.getElementById('works-stopped');
-    return list ? Array.prototype.slice.call(list.querySelectorAll('[data-work-id]')) : [];
+    var found = list ? Array.prototype.slice.call(list.querySelectorAll('[data-work-id]')) : [];
+    var starred = document.getElementById('works-starred');
+    if (!starred) return found;
+    return found.concat(Array.prototype.filter.call(
+      starred.querySelectorAll('[data-work-id][data-work-stopped]'),
+      function (row) {
+        var category = row.getAttribute('data-op-category');
+        return category !== 'issue_closed' && category !== 'unstarted';
+      }));
   }
 
   function reconcile() {
@@ -147,6 +161,7 @@
       if (known.has(stop)) return;
       known.add(stop);
       if (!row.hasAttribute('data-work-unseen')) return;
+      if (listed.has(stop) && row.closest('#works-starred')) return;
       if (hidden[row.getAttribute('data-work-project')]) return;
       fresh.push(stop);
     });
@@ -155,10 +170,20 @@
   }
 
   // The script is deferred, so the page is parsed and no push has been swapped in yet.
+  Array.prototype.forEach.call(document.querySelectorAll('[data-work-id][data-work-stopped]'), function (row) {
+    known.add(stopOf(row));
+  });
   rows().forEach(function (row) { known.add(stopOf(row)); });
 
   document.addEventListener('agentdeck:works-reconciled', function (event) {
-    if (event.target && event.target.id === 'works-stopped') reconcile();
+    var id = event.target && event.target.id;
+    if (id === 'works-stopped' || id === 'works-starred') {
+      reconcile();
+    } else if (event.target.querySelectorAll) {
+      Array.prototype.forEach.call(event.target.querySelectorAll('[data-work-id][data-work-stopped]'), function (row) {
+        listed.add(stopOf(row));
+      });
+    }
   });
   lead(false);
   // A page restored from the back-forward cache may have lost its place in line.

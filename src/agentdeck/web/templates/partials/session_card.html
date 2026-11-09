@@ -1,6 +1,7 @@
 {# One session row. `s` = Session. The transcript owns complete messages; cards
    intentionally carry bounded previews so a single long turn cannot dominate
    the page. #}
+{% from "partials/work_macros.html" import use_dot %}
 {% set card_prompt = s.last_prompt | card_preview %}
 {% set card_text = s.last_text | card_preview %}
 <a class="session {{ s.status }} wt-{{ s.worker_type or 'you' }}{% if selected_session_key == s.key %} selected{% endif %}"
@@ -20,6 +21,8 @@
     {% if s.generated_title and s.project_name %}<span class="session-project" title="{{ s.project_name }}">{{ s.project_name }}</span>{% endif %}
     {% set _kids = (children_of | default({})).get(s.key) %}
     {% if _kids %}{% set _working = _kids | selectattr('thinking') | list | length %}{% set _waiting = _kids | selectattr('question') | list | length %}<span class="subagent-toggle" data-subagents-toggle data-key="{{ s.key }}" data-parent-chat-key="{{ s.row_key }}" role="button" tabindex="0" aria-expanded="false" aria-label="show sub-agents" title="show sub-agents"><span class="subagent-caret" aria-hidden="true">▸</span>{{ _kids | length }} sub-agent{{ '' if _kids | length == 1 else 's' }}{% if _waiting %}<span class="subagent-hint waiting" title="{{ _waiting }} waiting on your answer">{{ _waiting }} waiting</span>{% elif _working %}<span class="subagent-hint working" title="{{ _working }} working now" aria-label="{{ _working }} working now"></span>{% endif %}</span>{% elif s.subagent_count %}<span class="subagent-badge" title="This chat is running spawned agents">{{ s.subagent_count }} sub-agent{{ '' if s.subagent_count == 1 else 's' }}</span>{% endif %}
+    {# In the row every card already has, so the dot never wraps the meta line (#4163). #}
+    {{ use_dot(s.chat_use) }}
     {% if s.issue_url %}<span class="gh-btn" role="button" tabindex="0" data-href="{{ s.issue_url|issue_href }}" title="Open GitHub issue" aria-label="open GitHub issue"><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M8 0c4.42 0 8 3.58 8 8a8.013 8.013 0 0 1-5.45 7.59c-.4.08-.55-.17-.55-.38 0-.27.01-1.13.01-2.2 0-.75-.25-1.23-.54-1.48 1.78-.2 3.65-.88 3.65-3.95 0-.88-.31-1.59-.82-2.15.08-.2.36-1.02-.08-2.12 0 0-.67-.22-2.2.82-.64-.18-1.32-.27-2-.27-.68 0-1.36.09-2 .27-1.53-1.03-2.2-.82-2.2-.82-.44 1.1-.16 1.92-.08 2.12-.51.56-.82 1.28-.82 2.15 0 3.06 1.86 3.75 3.64 3.95-.23.2-.44.55-.51 1.07-.46.21-1.61.55-2.33-.66-.15-.24-.6-.83-1.23-.82-.67.01-.27.38.01.53.34.19.73.9.82 1.13.16.45.68 1.31 2.69.94 0 .67.01 1.3.01 1.49 0 .21-.15.45-.55.38A7.995 7.995 0 0 1 0 8c0-4.42 3.58-8 8-8Z"/></svg></span>{% endif %}
     {% if s.deep_link %}<span class="cc-btn" role="button" tabindex="0" data-href="{{ s.deep_link }}" title="{{ s.deep_link_label or 'open session' }}" aria-label="{{ s.deep_link_label or 'open session' }}">{{ s.deep_link_label or 'open' }} ↗</span>{% endif %}
     {% if s.last_prompt or s.last_text %}<span class="expand-btn" data-expand role="button" tabindex="0" aria-label="expand messages" title="expand">⌄</span>{% endif %}

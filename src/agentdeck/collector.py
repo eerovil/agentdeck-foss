@@ -26,12 +26,21 @@ import contextlib
 import logging
 import time
 from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
 from watchfiles import Change, awatch
 
-from . import github_suspension, live_window, mac_runner, pid_watch, runtime_feed, watch_retry
+from . import (
+    chat_use,
+    github_suspension,
+    live_window,
+    mac_runner,
+    pid_watch,
+    runtime_feed,
+    watch_retry,
+)
 from .config import AppConfig
 from .deployment import deploy_state_dir, deployment_status
 from .host_stats import HostStatsSampler
@@ -76,6 +85,7 @@ class Collector:
         self._scan_locks: dict[str, asyncio.Lock] = {}
         self._companion_scans: set[asyncio.Task] = set()
         self._host_sampler = HostStatsSampler()
+        self._chat_use_meter = chat_use.ChatUseMeter()
         # Set to sweep an account's liveness now: a source write, a watched exit.
         self._liveness_wakes: dict[str, asyncio.Event] = {}
         self._runtime_feed_hold: runtime_feed.FeedSubscription | None = None
@@ -670,6 +680,44 @@ class Collector:
                 log.debug("host stats sample failed: %s", exc)
             await asyncio.sleep(self.config.polling.host_interval_s)
 
+    def _chat_use_readings(self, now: float) -> dict[str, chat_use.ChatUse]:
+        """Each loaded chat's reading (#4168), with what chats active in the last day added
+        since the last pass (#4163). Size does not expire, so a quiet chat keeps its dot."""
+        since = datetime.fromtimestamp(now - chat_use.WINDOW_S, UTC)
+        accounts = {account.key: account for account in self.accounts}
+        scales = {f"{acc.provider}:{acc.label}": acc.week_scale for acc in self.config.accounts}
+        transcripts = {}
+        chats = []
+        for session in list(self.state.sessions.values()):
+            account = accounts.get(session.account_key)
+            provider = self._provider(account) if account is not None else None
+            if provider is None or not provider.fitted_weights:
+                continue
+            scale = scales.get(account.key, 1.0)
+            chats.append((session, scale))
+            if session.last_activity and session.last_activity >= since:
+                path = provider.use_transcript(account, session)
+                if path is not None:
+                    transcripts[session.key] = (path, scale)
+        shares = self._chat_use_meter.measure(transcripts, now=now)
+        readings = {
+            session.key: chat_use.reading(
+                session.context_tokens, session.context_compacted, shares.get(session.key), scale
+            )
+            for session, scale in chats
+        }
+        return {key: use for key, use in readings.items() if use is not None}
+
+    async def _chat_use_loop(self) -> None:
+        while True:
+            try:
+                self.state.set_chat_use(
+                    await asyncio.to_thread(self._chat_use_readings, time.time())
+                )
+            except Exception as exc:  # noqa: BLE001 -- a dot never stops the deck
+                log.warning("chat use read failed: %s", exc)
+            await asyncio.sleep(chat_use.INTERVAL_S)
+
     async def _mac_waiting_loop(self) -> None:
         """Keep the top bar's Mac-approvals count, so no browser has to ask (#2864)."""
         while True:
@@ -699,6 +747,7 @@ class Collector:
         self._start_runtime_feed()
         self._tasks.append(asyncio.create_task(self._host_loop(), name="usage:host"))
         self._tasks.append(asyncio.create_task(self._mac_waiting_loop(), name="mac:waiting"))
+        self._tasks.append(asyncio.create_task(self._chat_use_loop(), name="chat:use"))
         self._tasks.append(
             asyncio.create_task(self._deployment_loop(), name="deployment:watch")
         )

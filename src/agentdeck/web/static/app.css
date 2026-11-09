@@ -693,6 +693,26 @@ body.usage-open .limit-bars { display: flex; }
 .ctx { font-variant-numeric: tabular-nums; white-space: nowrap; color: var(--live); }
 .ctx.warn { color: var(--warn); }
 .ctx.crit { color: var(--crit); font-weight: 600; }
+/* What a chat's next message will cost (#4163, #4168). */
+.use-dot { display: inline-block; flex: none; width: 8px; height: 8px; margin-right: .35em;
+  border-radius: 50%; background: var(--live); }
+/* Right, beside the card's buttons: on the left it stacks over the status dot. */
+.session-actions .use-dot { margin: 0 0 0 auto; }
+.session-actions .use-dot + .gh-btn, .session-actions .use-dot + .cc-btn,
+.session-actions .use-dot + .expand-btn { margin-left: 6px; }
+.use-middling { background: var(--warn); }
+.use-expensive { background: var(--crit); }
+/* The chat page's dot: a thumb-sized target in a header row of fixed height. */
+.use-info-open { display: inline-flex; align-items: center; justify-content: center;
+  width: 28px; height: 28px; margin: -6px -8px; padding: 0; border: 0; background: none;
+  cursor: pointer; }
+.use-info-open .use-dot { margin: 0; }
+.use-info { width: min(320px, calc(100vw - 32px)); margin: 56px auto auto; padding: 10px 12px;
+  border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: inherit;
+  font-size: 13px; line-height: 1.4; }
+.use-info p { margin: 0 0 6px; }
+.use-info p:last-child { margin-bottom: 0; }
+.use-info-level { font-weight: 600; }
 .empty { color: var(--muted); font-size: 13px; padding: 6px 2px; }
 a.session { display: block; text-decoration: none; color: inherit; }
 a.session:active { background: var(--panel2); }
@@ -2490,7 +2510,9 @@ body.local-file-page main { width: min(1100px, 100%); }
 .fr-side { display: flex; flex-direction: column; align-items: flex-end; gap: .2rem; color: var(--muted);
   font-size: .72rem; white-space: nowrap; }
 .fr-source { white-space: nowrap; }
-.fr-size, .fr-target, .fr-staging { white-space: nowrap; }
+.fr-size, .fr-target, .fr-staging, .fr-merge { white-space: nowrap; }
+/* Whether a Work's changes are merged (#4134): only what still needs merging stands out. */
+.fr-merge-unmerged { color: var(--cat-needs_retry, var(--warn)); }
 /* The diff square before a Work's title (#3617): colour by the lines in edited files. */
 .fr-diff { display: inline-flex; margin-right: .4em; vertical-align: -2px; color: var(--live); }
 .fr-diff svg { width: 14px; height: 14px; }
@@ -2634,6 +2656,7 @@ button.fr-action:disabled { opacity: .5; cursor: progress; }
 .fr-group-note { margin-left: auto; color: var(--muted); font-weight: 400; letter-spacing: 0; text-transform: none;
   text-decoration: none; }
 a.fr-group-note:hover, a.fr-group-note:focus-visible { color: var(--fg); }
+.fr-group-starred { --cat: var(--warn); }
 .fr-group-finished { --cat: var(--cat-finished); }
 .fr-group-working { --cat: var(--cat-working); }
 .fr-group-working .fr-group-mark { box-shadow: 0 0 0 3px color-mix(in srgb, var(--cat) 20%, transparent); }
@@ -2643,10 +2666,10 @@ a.fr-group-note:hover, a.fr-group-note:focus-visible { color: var(--fg); }
 .fr-group-live { --cat: var(--cat-finished); }
 .fr-group-live .fr-group-mark { background: transparent; border: 1.5px solid var(--cat); }
 /* A row grows to fit its whole title and detail line (#3386, replacing #2526's two-line limit);
-   its age and repo# end the detail line, and a fourth column exists only for the row's one button. */
+   its age and repo# end the detail line, and so do its buttons (#4210), drawn over the place the
+   unseen `.fr-room` copy keeps there: no column of their own narrows the text. */
 .front-page .fr { --cat: var(--muted); grid-template-columns: 3px 1rem minmax(0, 1fr); column-gap: .5rem;
   align-items: center; padding: .35rem 0; border-top: 0; border-bottom: 1px solid var(--line); }
-.front-page .fr:has(> .fr-side) { grid-template-columns: 3px 1rem minmax(0, 1fr) auto; }
 .front-page .fr::before { content: ""; align-self: stretch; width: 3px; border-radius: 2px; background: var(--cat); }
 .front-page .fr-mark { color: var(--cat); font-family: ui-monospace, monospace; font-weight: 600; }
 .front-page .fr-title { display: block; overflow: visible; white-space: normal; text-overflow: clip;
@@ -2681,7 +2704,24 @@ a.fr-tree:hover, a.fr-tree:focus-visible { color: var(--fg); text-decoration: un
   gap: .4rem; font-size: .72rem; }
 .fr-when .fr-age { flex: none; }
 .fr-when .fr-ref { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
-.front-page .fr-side { gap: .15rem; font-size: .7rem; }
+/* The buttons sit on the detail line's last line, as tall as it (1.35 x .78rem), centred on it. */
+.front-page .fr > .fr-side { grid-column: 3; grid-row: 1; align-self: end; justify-self: end;
+  flex-direction: row; align-items: center; gap: .4rem; margin-bottom: -.06rem; position: relative;
+  z-index: 1; }
+/* The buttons share the body's cell, so the row's other parts are placed by hand there. */
+.front-page .fr:has(> .fr-side)::before { grid-column: 1; grid-row: 1; }
+.front-page .fr:has(> .fr-side):has(> .fr-tree)::before { grid-row: 1 / span 2; }
+.front-page .fr:has(> .fr-side) > .fr-mark { grid-column: 2; grid-row: 1; }
+.front-page .fr:has(> .fr-side) > .fr-body { grid-column: 3; grid-row: 1; }
+.front-page .fr-room { float: right; display: inline-flex; align-items: center; gap: .4rem;
+  height: 1.05rem; margin-left: .5rem; overflow: hidden; visibility: hidden; }
+.front-page .fr-when > .fr-room { float: none; flex: none; margin-left: 0; }
+.front-page .fr-line > .fr-when:has(> .fr-room) { max-width: none; }
+.front-page .fr-side .fr-action, .front-page .fr-room .fr-action { min-height: 0; padding: .05rem .55rem;
+  font-size: .72rem; line-height: 1.35; white-space: nowrap; }
+/* Waiting for a try (#4210): Doesn't work, after Works, close, is a plain link. */
+.front-page .fr-tried > * + .fr-action { border: 0; padding: 0; background: none;
+  color: var(--muted); text-decoration: underline; font-weight: 500; }
 .fr-ref { font-family: ui-monospace, monospace; font-size: .66rem; }
 .front-page .fr.fr-cat-ready_for_merge, .fr-group-ready_for_merge { --cat: var(--cat-ready_for_merge); }
 .front-page .fr.fr-cat-merged_issue_open, .fr-group-merged_issue_open { --cat: var(--cat-merged_issue_open); }
@@ -2761,6 +2801,19 @@ a.fr-tree:hover, a.fr-tree:focus-visible { color: var(--fg); text-decoration: un
 .wd-resolution-text ul { margin: 0 0 .45rem; padding-left: 1.1rem; }
 .wd-resolution-text li { margin: 0 0 .2rem; }
 .wd-resolution-text > :last-child { margin-bottom: 0; }
+/* The issue's own text (#4101). Shut, a long one shows three lines in its summary, whose
+   small capitals it must not take; `work_view.ISSUE_PREVIEW_LINES` says the same three. */
+.wd-issue-text { overflow-wrap: anywhere; }
+.wd-issue-text pre { overflow-x: auto; }
+.wd-issue-text > :first-child { margin-top: 0; }
+.wd-issue-text > :last-child { margin-bottom: 0; }
+.wd-issue-preview { max-height: 4.35em; overflow: hidden; margin-top: .2rem; color: var(--fg);
+  font-size: .85rem; letter-spacing: 0; text-transform: none;
+  -webkit-mask-image: linear-gradient(to bottom, #000 70%, transparent);
+  mask-image: linear-gradient(to bottom, #000 70%, transparent); }
+/* A blank line would spend one of the three lines on nothing. */
+.wd-issue-preview br + br, .wd-issue-preview .code-copy { display: none; }
+.wd-issue[open] .wd-issue-preview { display: none; }
 .wd-resolution-behind { color: var(--warn); }
 .wd-section { margin: 0 0 .75rem; font-size: .85rem; }
 .wd-title-sm { margin: 0 0 .4rem; font-size: .8rem; letter-spacing: .06em; text-transform: uppercase;
@@ -2827,7 +2880,7 @@ a.fr-tree:hover, a.fr-tree:focus-visible { color: var(--fg); text-decoration: un
 /* New chat (#2388): beside Send on the text box's row, which is Send's height already, so shut
    it adds no height; the text box gives up the width. With no chat to message there is no text
    box row, so it shares the "no chat" line instead. */
-.wd-message:has(.wd-new-chat-open) textarea { flex-basis: 8rem; }
+.wd-message:has(.wd-new-chat-open) textarea { flex-basis: 4.5rem; }
 .wd-new-chat-open { flex: none; height: 2.1rem; margin: 0; padding: 0 .55rem; color: var(--muted);
   background: none; border: 1px solid var(--line); border-radius: var(--radius); font: inherit;
   font-size: .78rem; white-space: nowrap; cursor: pointer; }
@@ -2850,6 +2903,22 @@ a.fr-tree:hover, a.fr-tree:focus-visible { color: var(--fg); text-decoration: un
   border: 1px solid var(--remote); border-radius: var(--radius); font: inherit; font-size: .85rem; cursor: pointer; }
 .wd-new-chat-slot { margin: 0 0 .55rem; }
 .wd-new-chat-slot:empty { display: none; }
+/* Side chat (#4199): shares the "Goes to" line below the text box as a small text control, so it
+   adds no row on a phone, where Send and New chat already fill the box's row. A link while the
+   Work's side chat is fresh. */
+.wd-message .wd-side-chat { order: 3; height: auto; padding: 0; border: 0; font-size: .72rem;
+  line-height: normal; }
+a.wd-side-chat { text-decoration: none; }
+.wd-message:has(.wd-side-chat) .wd-message-to { flex: 1 1 calc(100% - 5rem); min-width: 0; }
+.wd-message:has([data-wd-no-target]):has(.wd-side-chat):has([data-work-new-chat-open]) .wd-message-to { flex-basis: calc(100% - 10rem); }
+.wd-side-chat[aria-disabled="true"] { opacity: .5; }
+/* Under 340 px no text box leaves room for New chat beside Send (#4199): it joins Side chat on
+   the "Goes to" line, as it does when the Work has no chat to message. */
+@media (max-width: 340px) {
+  .wd-message .wd-new-chat-open { order: 3; height: auto; padding: 0; border: 0; font-size: .72rem;
+    line-height: normal; }
+  .wd-message:has(.wd-side-chat):has([data-work-new-chat-open]) .wd-message-to { flex-basis: calc(100% - 10rem); }
+}
 .wd-message-result:empty { display: none; }
 .wd-receipt { margin: 0; font-size: .78rem; color: var(--muted); overflow-wrap: anywhere; }
 .wd-receipt.is-refused, .wd-receipt.is-uncertain, .wd-receipt.is-failed { color: var(--warn); }
@@ -2872,6 +2941,8 @@ a.fr-tree:hover, a.fr-tree:focus-visible { color: var(--fg); text-decoration: un
 .wd-facts > li { overflow-wrap: anywhere; }
 .wd-facts > li + li { margin-top: .15rem; }
 .wd-facts a { color: var(--fg); }
+.wd-output-about > summary { cursor: pointer; }
+.wd-output-about > .wd-issue-text { margin: .2rem 0 .4rem; padding-left: .6rem; border-left: 2px solid var(--line); }
 .wd-result .wk-verify, .wd-result .wk-review { margin: 0; }
 .wd-repo-name { font-weight: 600; }
 .wd-repo-branch, .wd-repo-state { color: var(--muted); }
@@ -2974,3 +3045,29 @@ details.ev.chat-note > summary .ev-time { margin-left: auto; flex: none; }
 .wm-arrow { fill: none; stroke: var(--muted); stroke-width: 1.5; }
 .wm-arrow.wm-from-done { opacity: .45; }
 .wm-head { fill: var(--muted); }
+
+/* Asks before a message wakes a costly chat whose cache has gone (#4169). */
+.cold-chat { position: sticky; bottom: 0; z-index: 5; margin: 12px -4px 0; padding: 12px;
+  padding-bottom: calc(12px + env(safe-area-inset-bottom, 0)); border: 1px solid var(--line);
+  border-radius: 10px; background: color-mix(in srgb, var(--panel) 94%, transparent);
+  box-shadow: 0 -8px 24px color-mix(in srgb, var(--bg) 70%, transparent);
+  backdrop-filter: blur(12px); }
+.cold-chat[hidden] { display: none; }
+.cold-chat-text { margin: 0 0 10px; }
+.cold-chat-buttons { display: flex; gap: 8px; }
+.cold-chat-buttons button { flex: 1; padding: 10px 12px; border: 0; border-radius: 8px;
+  color: white; background: var(--remote); font-weight: 600; }
+.cold-chat-buttons button.secondary { color: var(--remote); background: var(--panel2);
+  border: 1px solid var(--remote); }
+/* A new chat started from the composer says so on a line of its own, not in the
+   send badge's corner. */
+.inject-form > .inject-result.start-status { position: static; grid-column: 1 / -1;
+  width: auto; height: auto; min-height: 1.4em; margin: 8px 2px 0; padding: 0;
+  border-radius: 0; background: none; color: var(--muted); font-size: inherit;
+  font-weight: inherit; pointer-events: auto; }
+.inject-form > .inject-result.start-status.failed { color: var(--crit); }
+/* Once the new chat runs, the box keeps only the line that links to it (#4169). */
+.inject-form[data-cold-started] > :not(#inject-result) { display: none !important; }
+.inject-form[data-cold-started] > .inject-result.start-status { margin-top: 0; }
+.inject-form[data-cold-new-chat] .image-picker,
+.inject-form[data-cold-new-chat] .issue-post-menu { display: none !important; }

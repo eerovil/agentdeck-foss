@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import re
@@ -47,7 +48,7 @@ from ..providers import PROVIDERS
 from ..providers.codex.runtime_client import runtime_socket_path
 from ..public_origin import public_origin as deck_public_origin
 from ..run_execution import MAX_CONTINUATIONS, SAFE_STATES, read_outcomes
-from ..scheduled_messages import RUNTIME_HOLD, HeldAttachment, ScheduledMessage
+from ..scheduled_messages import RUNTIME_HOLD, HeldAnswer, HeldAttachment, ScheduledMessage
 from ..session_secrets import (
     SecretCommand,
     SecretCommandError,
@@ -66,7 +67,7 @@ from .account_settings import (
     saved_new_session_defaults,
 )
 from .action_timing import action_timing, bind_action, supplied_action_id, timing_span
-from .chat_successor import LOST_RECHECKS, transcript_continuation
+from .chat_successor import LOST_RECHECKS, continuation_note
 from .chat_successor import reserve_chat_successor as _reserve_chat_successor
 from .deps import (
     delegation_account,
@@ -303,6 +304,8 @@ _START_RESULT_IDS = {
     "poller-build-result": "poller-build-result",
     # A side chat started from a Work's page (#2388, ``routes_works.NEW_CHAT_RESULT_ID``).
     "work-new-chat-result": "work-new-chat-result",
+    # The side chat of a working Work (#4199, ``routes_works.SIDE_CHAT_RESULT_ID``).
+    "work-side-chat-result": "work-side-chat-result",
     # The deck chat's fresh start, watched in its composer's own slot (#3403).
     "inject-result": "inject-result",
 }
@@ -439,6 +442,18 @@ def _interaction_answer_text(interaction, answers: dict[str, list[str]]) -> str:
         for question in interaction.questions
         if question.id in answers
     )
+
+
+def _held_answer_text(
+    interaction, answer_text: str, decision: str | None, dismissed: str | None
+) -> str:
+    """What a held answer's row shows: a dismissal or a permission has no answer text."""
+    if answer_text:
+        return answer_text
+    if dismissed is not None:
+        prompt = next(q.prompt for q in interaction.questions if q.id == dismissed)
+        return f"Dismissed: {prompt}"
+    return f"{decision}: {interaction.title}" if decision else interaction.title
 
 
 @router.get("/sessions/{session_key}/transcript-images/{seq}/{image_index}")
@@ -710,6 +725,9 @@ def _render_bypass_permissions(
         {
             "session": session,
             "bypass_permissions_enabled": provider.bypass_permissions_on(account, session),
+            "bypass_permissions_next_turn": provider.permission_prompts_next_turn(
+                account, session
+            ),
             "bypass_permissions_error": error,
         },
     )
@@ -1478,7 +1496,7 @@ async def answer_interaction(request: Request, session_key: str) -> HTMLResponse
     _require_same_origin(request)
     with timing_span(request, "form"):
         form = await request.form()
-    session, remaining = await _answer_interaction(
+    session, remaining, held = await _answer_interaction(
         request,
         session_key,
         interaction_id=form.get("interaction_id"),
@@ -1490,11 +1508,15 @@ async def answer_interaction(request: Request, session_key: str) -> HTMLResponse
     )
     with timing_span(request, "render"):
         view = SessionView(current=session, effective=session, interaction=remaining)
-        return HTMLResponse(
-            SESSION_FRAGMENTS_BY_NAME["interaction"].render(
-                get_templates(request), view
+        templates = get_templates(request)
+        html = SESSION_FRAGMENTS_BY_NAME["interaction"].render(templates, view)
+        if held:
+            html += templates.get_template("partials/held_messages.html").render(
+                session_key=session.key,
+                held_messages=_held_rows(request, session.key),
+                held_oob=True,
             )
-        )
+        return HTMLResponse(html)
 
 
 class InteractionAnswer(BaseModel):
@@ -1521,7 +1543,7 @@ async def answer_interaction_json(
         key: [value] if isinstance(value, str) else value
         for key, value in body.answers.items()
     }
-    session, remaining = await _answer_interaction(
+    session, remaining, held = await _answer_interaction(
         request,
         session_key,
         interaction_id=body.interaction_id,
@@ -1533,7 +1555,127 @@ async def answer_interaction_json(
             "session_key": session.key,
             "answered": True,
             "remaining": remaining.answer_json() if remaining is not None else None,
+            # True when the runtime is restarting: the answer waits and goes by itself.
+            **({"held": True} if held else {}),
         }
+    )
+
+
+def _hold_answer(
+    request: Request,
+    account,
+    session,
+    provider,
+    interaction,
+    answers: dict[str, list[str]],
+    decision: str | None,
+    text: str,
+    closes: set[str],
+    *,
+    attempted: bool,
+) -> None:
+    """Keep an answer for a chat whose runtime is restarting (#4106).
+
+    A row id made of the answer itself lets a replay of this request find the same row.
+    A secret's value is never written down, so it waits for nothing: the person sends
+    it again, as a held send's secret does (#2847).
+    """
+    if any(question.secret and question.id in answers for question in interaction.questions):
+        raise HTTPException(
+            status_code=503, detail="The runtime is restarting; send it again in a minute."
+        )
+    chat_id = _held_chat_id(request, session.key)
+    row_id = "answer-" + hashlib.sha256(
+        json.dumps([chat_id, session.key, interaction.id, answers, decision]).encode()
+    ).hexdigest()[:32]
+    created_at = datetime.now(UTC)
+
+    def hold(message_id: str) -> ScheduledMessage | None:
+        return request.app.state.scheduled_messages.schedule(
+            ScheduledMessage(
+                id=message_id,
+                chat_id=chat_id,
+                text=text,
+                due_at=created_at,
+                created_at=created_at,
+                hold_reason=RUNTIME_HOLD,
+                interaction_answer=HeldAnswer(
+                    session.key,
+                    interaction.id,
+                    interaction.kind,
+                    interaction.fingerprint(),
+                    answers,
+                    decision,
+                    attempted,
+                ),
+            )
+        )
+
+    held = hold(row_id)
+    if held is not None and held.state not in ("scheduled", "dispatching"):
+        # The same answer was cancelled or refused earlier and the question is back: this
+        # is a new answer, and that settled row would never send it.
+        held = hold(f"{row_id}-{int(created_at.timestamp())}")
+    if held is None:
+        raise HTTPException(status_code=409, detail="This answer could not be kept.")
+    provider.forget_held_interaction(account, session, closes)
+
+
+def _repeats_held_answer(
+    request: Request,
+    session,
+    interaction,
+    interaction_id: object,
+    decision: object,
+    values: Callable[[str], Iterable[object]],
+    voice_line: str | None,
+) -> bool:
+    """Whether this request repeats an answer already held, now out of the box (#4106).
+
+    The first request took the question out, so the repeat would read as answering a
+    question that has gone. A stale page answering a question still open is not a repeat.
+    A different answer to a held question is refused: reporting it as held would hide
+    that the first one is what the agent gets.
+    """
+    if interaction is not None:
+        open_ids = {question.id for question in interaction.questions}
+        if interaction_id == interaction.id:
+            return False
+        if isinstance(decision, str) and decision.removeprefix("dismiss:") in open_ids:
+            return False
+        if any(str(value).strip() for key in open_ids for value in values(key) if value):
+            return False
+    held = [
+        item.interaction_answer
+        for item in _held_rows(request, session.key)
+        if item.interaction_answer is not None
+        and item.interaction_answer.session_key == session.key
+        and item.interaction_answer.interaction_id == interaction_id
+        and item.state != "failed"
+    ]
+    if not held:
+        return False
+    if any(_is_same_answer(answer, decision, values, voice_line) for answer in held):
+        return True
+    raise HTTPException(
+        status_code=409, detail="A different answer to this is already waiting to be sent."
+    )
+
+
+def _is_same_answer(
+    held: HeldAnswer,
+    decision: object,
+    values: Callable[[str], Iterable[object]],
+    voice_line: str | None,
+) -> bool:
+    """Whether a request gives what ``held`` keeps, leaving out the voice line added to it."""
+    if held.decision != (decision if isinstance(decision, str) else None):
+        return False
+    tail = f"\n\n{voice_line}" if voice_line else ""
+    return all(
+        [value.strip() for value in values(question) if isinstance(value, str) and value.strip()]
+        == [value.removesuffix(tail) for value in given]
+        for question, given in held.answers.items()
     )
 
 
@@ -1546,15 +1688,21 @@ async def _answer_interaction(
     values: Callable[[str], Iterable[object]],
     voice_line: str | None = None,
 ):
-    """Answer the chat's pending interaction; (its session, the questions still open).
+    """Answer the chat's pending interaction; (its session, the questions still open,
+    whether the answer is held for a runtime that is restarting).
 
     ``voice_line`` goes on the end of the last answer to a question box (#3876)."""
     account, session, provider = resolve_current_leg(request, session_key)
     session_key = session.key
     bind_action(request, session_key=session.key, provider=account.provider_id)
-    if Capability.INTERACT not in session.capabilities:
+    restarting = provider.runtime_unreachable(account, session)
+    if Capability.INTERACT not in session.capabilities and not restarting:
         raise HTTPException(status_code=403, detail="interaction unavailable")
     interaction = provider.pending_interaction(account, session)
+    if restarting and _repeats_held_answer(
+        request, session, interaction, interaction_id, decision, values, voice_line
+    ):
+        return session, interaction, True
     if interaction is None:
         raise HTTPException(status_code=409, detail="interaction is no longer pending")
     # A chat's open questions change as questions are asked and answered (#3451). Each
@@ -1604,28 +1752,41 @@ async def _answer_interaction(
     ):
         last = answers[next(reversed(answers))]
         last[-1] = f"{last[-1]}\n\n{voice_line}"
-    with timing_span(request, "runtime"):
-        result = await provider.answer_interaction(
+    given_decision = decision if isinstance(decision, str) else None
+    closed = set(answers) | ({dismissed} if dismissed else set())
+    held = restarting
+    if not restarting:
+        with timing_span(request, "runtime"):
+            result = await provider.answer_interaction(
+                account, session, interaction.id, answers=answers, decision=given_decision
+            )
+        held = result.runtime_unreachable
+        if not result.accepted and not held:
+            raise HTTPException(status_code=422, detail=result.reason)
+    if held:
+        _hold_answer(
+            request,
             account,
             session,
-            interaction.id,
-            answers=answers,
-            decision=decision if isinstance(decision, str) else None,
+            provider,
+            interaction,
+            answers,
+            given_decision,
+            _held_answer_text(interaction, answer_text, given_decision, dismissed),
+            closed,
+            attempted=not restarting,
         )
-    if not result.accepted:
-        raise HTTPException(status_code=422, detail=result.reason)
     if answer_text:
         _note_boss_turn(request, session.key, {}, answer_text)
     remaining = None
     if interaction.dismissible:
         # The questions not answered here stay in the box (#3451).
-        closed = set(answers) | ({dismissed} if dismissed else set())
         left = tuple(q for q in interaction.questions if q.id not in closed)
         if left:
             remaining = replace(
                 interaction, id=open_questions_id(q.id for q in left), questions=left
             )
-    return session, remaining
+    return session, remaining, held
 
 
 @router.post("/sessions/new", response_class=HTMLResponse)
@@ -2050,8 +2211,14 @@ async def continue_session(request: Request, session_key: str) -> Response:
     ):
         raise HTTPException(status_code=415, detail="form content type required")
     form = await request.form()
+    # The cold-chat bar (#4169) watches its start in the composer's own slot.
+    result_id = _START_RESULT_IDS.get(
+        str(form.get("result_id") or ""), "continue-session-result"
+    )
+    if result_id not in ("continue-session-result", "inject-result"):
+        result_id = "continue-session-result"
     return await _continue_chat(
-        request, source_account, source_session, source_provider, form
+        request, source_account, source_session, source_provider, form, refusal_id=result_id
     )
 
 
@@ -2124,11 +2291,12 @@ async def _continue_chat(
     if refusal:
         return reject(refusal, status_code=409)
     saved_defaults = saved_new_session_defaults(request, account, provider)
-    model = model or saved_defaults.model or ""
-    effort = effort or saved_defaults.effort
-    transcript_url = str(
-        request.url_for("session_transcript", session_key=source_session.key)
-    )
+    # A Work's chat keeps the model and effort its New work press picked (#4181).
+    from ..work_start import chosen_options, session_start_choice
+
+    picked = chosen_options(session_start_choice(request.app, source_session.key), provider)
+    model = model or picked["model"] or saved_defaults.model or ""
+    effort = effort or picked["effort"] or saved_defaults.effort
     relocation = (
         ""
         if cwd == source_session.cwd
@@ -2187,7 +2355,30 @@ async def _continue_chat(
             f"{handoff.strip()}{relocation}"
         )
     else:
-        message = transcript_continuation(transcript_url) + relocation
+        # What the person asked the new chat, when the chat page's cold-chat bar
+        # started it (#4169): it goes first, and the note to read the old chat after.
+        raw_first = form.get("message")
+        first = raw_first.strip() if isinstance(raw_first, str) else ""
+        # A temporary secret is entered only in an existing chat's box: as the first
+        # message of a new chat it would reach the agent in plain text.
+        try:
+            _reject_reserved_secret_command(first, SavedUploads())
+        except HTTPException as exc:
+            return reject(str(exc.detail))
+        undeliverable = provider.user_message_refusal(first) if first else None
+        if undeliverable is not None:
+            return reject(undeliverable)
+        message = await continuation_note(
+            get_state(request),
+            get_accounts(request),
+            source_session,
+            provider=provider,
+            config=get_config(request).inject,
+            before=f"{first}\n\n" if first else "",
+            after=relocation,
+        )
+        if first and get_config(request).inject.too_long(message):
+            return reject("The message is too long. Shorten it and try again.")
     client_action_id = bind_action(request, provider=account.provider_id)
     session_token = handoff_token if machine_callback else uuid.uuid4().hex
     if machine_callback:
@@ -2276,10 +2467,16 @@ async def _continue_chat(
         f"[Continue in new chat]({destination_url}). Do no more work in this "
         "chat. Reply with the same link so it remains visible here, then stop."
     )
+    # Only a chat with a turn running hears about the move: it has to stop, and it is awake
+    # anyway. An idle one is left asleep, because any message would pay for its whole
+    # context again (#4169); the chat page already shows the new part after it. A steer
+    # refused because the turn just ended leaves an idle chat, so it is not sent again.
     injector = get_injector(request)
     departure = None
-    source_cwd_exists = recorded_continue_cwd_exists(source_session.cwd)
-    if source_cwd_exists and Capability.STEER in source_session.capabilities:
+    if (
+        recorded_continue_cwd_exists(source_session.cwd)
+        and Capability.STEER in source_session.capabilities
+    ):
         try:
             departure = (
                 await injector.deliver_now(
@@ -2296,30 +2493,6 @@ async def _continue_chat(
                 session_token,
                 source_session.key,
             )
-    elif source_cwd_exists:
-        departure = await injector.start(
-            source_account,
-            source_session,
-            source_provider,
-            departure_message,
-            allow_over_budget=True,
-        )
-    if (
-        source_cwd_exists
-        and departure is not None
-        and not departure.accepted
-        and Capability.STEER in source_session.capabilities
-    ):
-        # The active turn may have ended between session discovery and steering.
-        # A definite refusal means no write occurred, so queueing the same message
-        # as a new turn is safe; an exception above stays uncertain and is never retried.
-        departure = await injector.start(
-            source_account,
-            source_session,
-            source_provider,
-            departure_message,
-            allow_over_budget=True,
-        )
     if departure is not None and not departure.accepted:
         log.warning(
             "continued chat %s started but source %s could not record the link: %s",
@@ -2327,9 +2500,7 @@ async def _continue_chat(
             source_session.key,
             departure.reason,
         )
-    return await _render_start_accepted(
-        request, session_token, result_id="continue-session-result"
-    )
+    return await _render_start_accepted(request, session_token, result_id=refusal_id)
 
 
 def _render_account_defaults(

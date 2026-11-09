@@ -409,18 +409,26 @@ async def test_reads_reuse_one_connection_per_thread(tmp_path, monkeypatch):
 async def test_resolving_never_touches_sqlite_on_the_event_loop(tmp_path):
     """#3739: the shared file is in rollback-journal mode, so a claim can wait out another
     process's write and each store syncs to disk. On the loop, a map's 25 re-reads stalled
-    every page for up to 2.8 s; each statement now runs in a worker thread."""
+    every page for up to 2.8 s; each statement now runs in a worker thread.
+
+    Off the loop a statement waits out a slow disk instead of losing the write: one
+    commit took 14 s (#4144), and a store that gave up at two seconds left the next
+    read saying "not cached" (#4206). A read on the loop still gives up at two."""
     import threading
 
     cache = GitHubMetadataCache(tmp_path / "github.sqlite3")
     loop_thread = threading.get_ident()
-    seen = []
+    seen, waits = [], set()
     for name in ("_claim", "_store", "_back_off"):
         real = getattr(cache, name)
 
         def spy(*args, _real=real, _name=name, **kwargs):
             seen.append((_name, threading.get_ident() != loop_thread))
-            return _real(*args, **kwargs)
+            try:
+                return _real(*args, **kwargs)
+            finally:
+                handle = cache._connect(cache.THREAD_WAIT_S)
+                waits.add(handle.execute("PRAGMA busy_timeout").fetchone()[0])
 
         setattr(cache, name, spy)
 
@@ -438,6 +446,10 @@ async def test_resolving_never_touches_sqlite_on_the_event_loop(tmp_path):
         ("_claim", True),
         ("_store", True),
     ]
+    assert waits == {int(GitHubMetadataCache.THREAD_WAIT_S * 1000)}
+    cache.peek("issue:v1:o/r#1")
+    on_loop = cache._connect().execute("PRAGMA busy_timeout").fetchone()[0]
+    assert on_loop == int(GitHubMetadataCache.LOOP_WAIT_S * 1000)
 
 
 async def test_a_claim_that_timed_out_still_keeps_the_fetched_answer(tmp_path):
@@ -452,7 +464,7 @@ async def test_a_claim_that_timed_out_still_keeps_the_fetched_answer(tmp_path):
         blocker = sqlite3.connect(cache.path, timeout=0)
         blocker.execute("BEGIN IMMEDIATE")
         try:
-            cache._connect().execute("PRAGMA busy_timeout = 0")
+            cache._connect(cache.THREAD_WAIT_S).execute("PRAGMA busy_timeout = 0")
             return real_claim(key, **kwargs)
         finally:
             blocker.rollback()
@@ -550,7 +562,8 @@ async def test_writers_in_one_process_queue_instead_of_timing_out(tmp_path):
     real_claim, tokens = cache._claim, []
 
     def impatient_claim(key, **kwargs):
-        cache._connect().execute("PRAGMA busy_timeout = 0")  # SQLite alone would fail at once
+        # SQLite alone would fail at once.
+        cache._connect(cache.THREAD_WAIT_S).execute("PRAGMA busy_timeout = 0")
         result = real_claim(key, **kwargs)
         tokens.append(result[0])
         return result

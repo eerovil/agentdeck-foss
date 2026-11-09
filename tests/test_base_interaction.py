@@ -71,6 +71,41 @@ def test_pending_interaction_gate_skips_the_provider_read_without_interact():
     assert provider.reads == []  # the gate short-circuits before the read
 
 
+class _RestartingProvider(_StubProvider):
+    """A chat whose runtime is away: the live read has nothing, the kept copy does (#4106)."""
+
+    def __init__(self, *, unreachable: bool) -> None:
+        super().__init__(None)
+        self.unreachable = unreachable
+
+    def runtime_unreachable(self, account, session):
+        return self.unreachable
+
+    def _last_seen_interaction(self, account, session_id):
+        return _INTERACTION
+
+
+def test_a_restarting_runtime_keeps_the_box_from_the_last_read():
+    provider = _RestartingProvider(unreachable=True)
+    # With INTERACT, too: the session may not have been projected yet.
+    for interact in (False, True):
+        assert provider.pending_interaction(_ACCOUNT, _session(interact=interact)) is _INTERACTION
+
+
+def test_a_chat_refused_for_another_reason_shows_no_kept_box():
+    provider = _RestartingProvider(unreachable=False)
+    assert provider.pending_interaction(_ACCOUNT, _session(interact=False)) is None
+
+
+async def test_a_held_answer_is_delivered_past_the_capability_gate():
+    provider = _StubProvider(None)
+    result = await provider.answer_live_interaction(
+        _ACCOUNT, _session(interact=False), _INTERACTION, answers={"q": ["a"]}, decision=None
+    )
+    assert result.accepted
+    assert provider.answered == [("int-1", {"q": ["a"]})]
+
+
 def test_pending_interaction_reads_when_interact_is_granted():
     provider = _StubProvider(_INTERACTION)
     assert provider.pending_interaction(_ACCOUNT, _session(interact=True)) is _INTERACTION

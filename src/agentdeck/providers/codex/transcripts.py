@@ -756,8 +756,8 @@ def _objects(blob: bytes, *, skip_first_partial: bool, require_final_newline: bo
 
 def _latest_task_state(
     path: Path, *, chunk_size: int = 64 * 1024
-) -> tuple[str | None, datetime | None, datetime | None]:
-    """Return the latest task status and its start/end by scanning lines backwards.
+) -> tuple[str | None, datetime | None, datetime | None, dict | None]:
+    """Return the latest task status, its start/end and its error, scanning lines backwards.
 
     Task boundaries may sit outside the bounded metadata head/tail on large,
     multi-turn rollouts. Reverse scanning stops at the latest turn's start and
@@ -765,6 +765,7 @@ def _latest_task_state(
     """
     latest_status = None
     latest_finished_at = None
+    latest_error = None
     try:
         with path.open("rb") as handle:
             handle.seek(0, 2)
@@ -799,8 +800,10 @@ def _latest_task_state(
                         }[boundary]
                         if boundary != "task_started":
                             latest_finished_at = timestamp
+                        if boundary == "task_complete" and isinstance(payload.get("error"), dict):
+                            latest_error = payload["error"]
                     if boundary == "task_started":
-                        return latest_status, timestamp, latest_finished_at
+                        return latest_status, timestamp, latest_finished_at, latest_error
             if remainder:
                 try:
                     obj = json.loads(remainder)
@@ -810,10 +813,11 @@ def _latest_task_state(
                     payload = obj.get("payload")
                     if isinstance(payload, dict) and payload.get("type") == "task_started":
                         latest_status = latest_status or "working"
-                        return latest_status, _parse_ts(obj.get("timestamp")), latest_finished_at
+                        started_at = _parse_ts(obj.get("timestamp"))
+                        return latest_status, started_at, latest_finished_at, latest_error
     except OSError:
         pass
-    return latest_status, None, latest_finished_at
+    return latest_status, None, latest_finished_at, latest_error
 
 
 def _may_carry_message(raw: bytes) -> bool:
@@ -853,6 +857,35 @@ def _newest_messages(path: Path) -> NewestMessages:
         prefilter=_may_carry_message,
         message_timestamp=lambda obj: _parse_ts(obj.get("timestamp")),
     )
+
+
+ASYNC_QUESTION_TOOL = "request_user_input_async"
+
+
+def _async_question_text(payload: dict) -> str | None:
+    """The first question a ``request_user_input_async`` call asks, ending in ``?``.
+
+    Codex 0.166 returns ``{"accepted": true}`` at once and expects the answer later as
+    an ordinary message, so no question box stays open (#4177).
+    """
+    if payload.get("name") != ASYNC_QUESTION_TOOL:
+        return None
+    try:
+        arguments = json.loads(payload.get("arguments") or "")
+        title = arguments["questions"][0]["title"]
+    except (ValueError, TypeError, KeyError, IndexError):
+        return None
+    if not isinstance(title, str) or not title.strip():
+        return None
+    title = " ".join(title.split())
+    return title if title.endswith("?") else f"{title}?"
+
+
+def _accepted(output: object) -> bool:
+    try:
+        return isinstance(output, str) and json.loads(output).get("accepted") is True
+    except (ValueError, AttributeError):
+        return False
 
 
 def _real_user_message(obj: dict) -> str | None:
@@ -956,6 +989,10 @@ def transcript_meta(
     last_agent_message = None
     tokens = None
     context_tokens = None
+    # An accepted ``request_user_input_async`` call no message has followed: (call id,
+    # its question), so the Work waits for the answer in the chat (#4177).
+    asked: tuple[str, str] | None = None
+    attempted: dict[object, str] = {}  # calls whose output has not come yet
 
     def scan(objects: list[dict]) -> None:
         nonlocal session_id, parent_session_id, cwd, kind, model, started_at
@@ -965,7 +1002,7 @@ def transcript_meta(
         nonlocal task_status
         nonlocal last_prompt, last_text, last_role, last_message_at
         nonlocal tokens, context_tokens
-        nonlocal last_agent_message
+        nonlocal last_agent_message, asked
         for obj in objects:
             payload = obj.get("payload")
             if not isinstance(payload, dict):
@@ -1045,6 +1082,8 @@ def transcript_meta(
                 native_role = payload.get("role")
                 text = _text_content(payload.get("content"))
                 if native_role == "user" and text and not _is_noise_user(text):
+                    asked = None
+                    attempted.clear()
                     last_prompt = text
                     last_role = "user"
                     last_message_at = _parse_ts(obj.get("timestamp"))
@@ -1054,6 +1093,19 @@ def transcript_meta(
                         last_text = text
                         last_role = "agent"
                         last_message_at = _parse_ts(obj.get("timestamp"))
+            elif outer_type == "response_item" and payload.get("type") == "function_call":
+                question = _async_question_text(payload)
+                if question is not None:
+                    attempted[payload.get("call_id")] = question
+            elif (
+                outer_type == "response_item"
+                and payload.get("type") == "function_call_output"
+                and payload.get("call_id") in attempted
+            ):
+                # Only the tool's acceptance asks; a refused call leaves the earlier one.
+                question = attempted.pop(payload.get("call_id"))
+                if _accepted(payload.get("output")):
+                    asked = (payload.get("call_id"), question)
             elif outer_type == "event_msg" and payload.get("type") == "task_complete":
                 msg = payload.get("last_agent_message")
                 if isinstance(msg, str) and msg.strip():
@@ -1089,7 +1141,17 @@ def transcript_meta(
         role=last_role,
         message_at=last_message_at,
     )
-    exact_task_status, exact_task_started_at, exact_task_finished_at = _latest_task_state(path)
+    if asked is not None:
+        # No message followed the question (one would have cleared it), so it is the
+        # last thing said: after the turn's closing words, or alone in a turn that
+        # wrote none, where the newest message is still the person's prompt.
+        if last_role == "agent":
+            last_text = f"{last_text or ''}\n\n{asked[1]}".strip()
+        else:
+            last_text, last_role = asked[1], "agent"
+    exact_task_status, exact_task_started_at, exact_task_finished_at, turn_error = (
+        _latest_task_state(path)
+    )
     if exact_task_status is not None:
         task_status = exact_task_status
         task_active = exact_task_status == "working"
@@ -1121,6 +1183,7 @@ def transcript_meta(
         agent_role=agent_role,
         task_finished_at=task_finished_at,
         task_status=task_status,
+        turn_error=turn_error,
     )
 
 
@@ -1183,6 +1246,42 @@ def _assistant_message(obj: dict) -> bool:
         and payload.get("type") == "message"
         and payload.get("role") == "assistant"
     )
+
+
+def newest_fork_seq(path: Path) -> int | None:
+    """The line of the newest reply ``fork_turn`` can cut after, or None (#4199): the last
+    assistant message of the newest completed turn, even while a later turn runs."""
+    try:
+        lines = path.read_bytes().splitlines()
+    except OSError:
+        return None
+    confirmed: int | None = None
+    last: int | None = None
+    turn: str | None = None
+    for seq, raw in enumerate(lines, 1):
+        try:
+            obj = json.loads(raw)
+        except ValueError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        if _assistant_message(obj):
+            last = seq
+            continue
+        payload = obj.get("payload")
+        if (
+            obj.get("type") == "event_msg"
+            and isinstance(payload, dict)
+            and payload.get("type") == "task_complete"
+        ):
+            confirmed = last or confirmed
+            last = None
+            continue
+        next_turn = _turn_id(obj)
+        if next_turn is not None and next_turn != turn:
+            turn = next_turn
+            last = None
+    return confirmed
 
 
 def fork_turn(path: Path, seq: int) -> str | None:

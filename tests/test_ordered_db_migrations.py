@@ -5,8 +5,10 @@ from threading import Barrier
 
 import pytest
 
+from agentdeck import db as db_module
 from agentdeck.db import Db, _declared_columns, open_db
 from agentdeck.db_migrations import MIGRATIONS, applied_versions, apply_ordered_migrations
+from agentdeck.sqlite_open import OPEN_LOCK_WAIT_S
 
 
 def _legacy_database(path):
@@ -93,7 +95,7 @@ def test_ordered_migrations_tolerate_two_processes_opening_together(tmp_path):
     expected = tuple(m.version for m in MIGRATIONS)
 
     def migrate() -> tuple[int, ...]:
-        connection = sqlite3.connect(path, timeout=5)
+        connection = sqlite3.connect(path, timeout=OPEN_LOCK_WAIT_S)
         try:
             barrier.wait()
             with connection:
@@ -107,6 +109,23 @@ def test_ordered_migrations_tolerate_two_processes_opening_together(tmp_path):
         results = tuple(future.result() for future in futures)
 
     assert results == (expected, expected)
+
+
+def test_opening_waits_out_another_openers_upgrade_but_running_does_not(tmp_path, monkeypatch):
+    """The other opener's upgrade outlasted SQLite's default 5 s on a busy disk (#4144)."""
+    waits = []
+
+    def record_the_wait(connection):
+        waits.append(connection.execute("PRAGMA busy_timeout").fetchone()[0])
+        apply_ordered_migrations(connection)
+
+    monkeypatch.setattr(db_module, "apply_ordered_migrations", record_the_wait)
+    db = Db(tmp_path / "wait.db")
+    try:
+        assert waits == [OPEN_LOCK_WAIT_S * 1000]
+        assert db._conn.execute("PRAGMA busy_timeout").fetchone()[0] == 5000
+    finally:
+        db.close()
 
 
 def test_the_oldest_database_on_the_host_gains_the_columns_once_inferred(tmp_path):

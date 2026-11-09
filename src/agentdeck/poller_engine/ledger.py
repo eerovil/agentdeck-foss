@@ -57,6 +57,9 @@ _CONTROLS_KEY = "controls"
 _CURSOR_KEY = "control_since"
 _PROPOSAL_INBOX_KEY = "proposal_inbox"
 _RECOVERABLE = frozenset({"queued", "processing"})
+# Commands nothing will touch again. ``recover`` skips them, and no wake has added or read one
+# since the card era ended (#3741), yet they made up 99% of both durable files (#4147).
+_SETTLED = frozenset({"done", "cancelled", "rejected", "adopted"})
 _RELEASE_IN_FLIGHT = frozenset(
     {"awaiting_merge", "awaiting_deploy", "done_pending", "blocked_pending", "fix", "merged"}
 )
@@ -74,6 +77,25 @@ def snapshot(state: dict) -> dict:
         _PROPOSAL_INBOX_KEY: state.get(_PROPOSAL_INBOX_KEY) or [],
         "issue_context": context,
     }
+
+
+def prune(state: dict) -> dict:
+    """Take the settled commands out of ``state`` and return them, keyed by comment id.
+
+    Anything else stays, an unknown status included: a command that may still need rescuing
+    must not be dropped because this list has not heard of its status.
+    """
+    commands = state.get(_CONTROLS_KEY)
+    if not isinstance(commands, dict):
+        return {}
+    settled = {
+        cid: control
+        for cid, control in commands.items()
+        if isinstance(control, dict) and control.get("status") in _SETTLED
+    }
+    for cid in settled:
+        del commands[cid]
+    return settled
 
 
 def merge(state: dict, ledger: dict) -> dict:

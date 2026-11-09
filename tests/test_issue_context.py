@@ -830,6 +830,14 @@ async def test_reading_a_parents_sub_issues_relinks_a_child_that_lost_its_parent
     assert resolver.held_sub_issues("eerovil/agentdeck", 9) == (tuple(listed), False)
     assert resolver.held_blocked_by("eerovil/agentdeck", 9) == (None, False)
 
+    # #4101: an empty body is held too, not read again; only no row at all is nothing held.
+    assert resolver.held_issue_body("eerovil/agentdeck", 9) == (None, False)
+    body = "issue-body:v1:eerovil/agentdeck#9"
+    cache.offer(body, GitHubMetadata({"body": ""}, terminal=True))
+    assert resolver.held_issue_body("eerovil/agentdeck", 9) == ("", True)
+    cache.expire(body)
+    assert resolver.held_issue_body("eerovil/agentdeck", 9) == ("", False)
+
 
 async def test_refreshed_pull_rows_wake_the_work_routers_backstop(tmp_path, monkeypatch):
     """#3903 review: a refresh that rewrote rows tells ``on_pull_rows``; one that read none

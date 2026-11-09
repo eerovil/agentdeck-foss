@@ -26,6 +26,7 @@ from .chat_identity import (
     published_chat_reference,
     working_leg,
 )
+from .chat_use import ChatUse
 from .context_policy import ContextAction
 from .events import EventBus
 from .host_stats import HostStats
@@ -275,6 +276,8 @@ class AppState:
         # chats an announcement names, ``_sessions_epoch`` for one that names none.
         self._sessions_epoch: int = 0
         self._session_revisions: dict[str, int] = {}
+        # Each chat's use of the weekly limit in the last day (#4163), by session key.
+        self.chat_use: dict[str, ChatUse] = {}
         # Each chat's ``visible_sessions`` row and what it was built from (#2865).
         self._visible_cache: dict[tuple[str, ...], tuple] = {}
         # Each chat's display copy and what it was built from (#2865).
@@ -1474,6 +1477,68 @@ class AppState:
         if self.db is not None and pull:
             self.db.drop_review_events(pull)
             self.bus.publish(REVIEWS_TOPIC)
+
+    def claim_shipped(
+        self, pull: str, head: str, findings: str, url: str, work: str = "", base: str = ""
+    ) -> bool:
+        """Record ``pull`` shipping at ``head`` with its findings left (#4212); ``False`` when
+        that head was recorded already or nothing could be stored."""
+        if self.db is None or not pull or len(head or "") != 40:
+            return False
+        at = datetime.now(UTC).timestamp()
+        return self.db.claim_shipped(pull, head, findings, url, at, work, base)
+
+    def note_follow_up(self, pull: str, head: str, follow_up: str) -> bool:
+        return self.db is not None and self.db.note_follow_up(pull, head, follow_up)
+
+    def note_shipped(self, pull: str, head: str) -> bool:
+        """Mark ``pull`` at ``head`` shipped once its review counted as passed (#4212 review);
+        the Work page redraws its Shipped line from it."""
+        if self.db is None or not self.db.note_shipped(pull, head, datetime.now(UTC).timestamp()):
+            return False
+        self.bus.publish(REVIEWS_TOPIC)
+        return True
+
+    def note_shipped_merge(self, pull: str, merged: str) -> bool:
+        """Name the merge commit of a pull request shipped with findings left (#4212 review)."""
+        return self.db is not None and self.db.note_shipped_merge(pull, merged)
+
+    def shipped(self, pull: str, head: str) -> review_history.ShippedFollowUp | None:
+        return self.db.shipped(pull, head) if self.db is not None and pull else None
+
+    def ship_unfinished(self, pull: str, head: str) -> bool:
+        """Whether the Ship now press that passed ``pull`` at ``head`` has not finished
+        (#4212 review): no record of it, or one not marked shipped. Marked last, after its
+        follow-up and any Merge press were recorded, so the release merges such a pass only
+        then, and the Work page offers Ship now again until it is."""
+        record = self.shipped(pull.lower(), head.lower())
+        return record is None or not record.follow_up or not record.shipped
+
+    def shipped_for(self, follow_up: str) -> list[review_history.ShippedFollowUp]:
+        """The heads shipped with findings that the issue ``follow_up`` fixes (#4212)."""
+        return self.db.shipped_for(follow_up) if self.db is not None else []
+
+    def shipped_by_work(self, work: str) -> list[review_history.ShippedFollowUp]:
+        """The heads the Work of issue ``work`` shipped with findings left (#4212)."""
+        return self.db.shipped_by_work(work) if self.db is not None else []
+
+    def shipped_chain(self, follow_up: str) -> list[review_history.ShippedFollowUp]:
+        """Every shipped head the issue ``follow_up`` fixes, its own and, when a follow-up was
+        itself shipped with findings, those its Work followed up in turn, newest first
+        (#4212 D11). Each issue is read once, so a loop in the records ends."""
+        found: list[review_history.ShippedFollowUp] = []
+        seen: set[str] = set()
+        todo = [follow_up.lower()] if follow_up else []
+        while todo:
+            issue = todo.pop(0)
+            if issue in seen:
+                continue
+            seen.add(issue)
+            for record in self.shipped_for(issue):
+                found.append(record)
+                if record.work:
+                    todo.append(record.work)
+        return sorted(found, key=lambda record: record.at, reverse=True)
 
     def review_events(self, pull: str) -> list[review_history.ReviewEvent]:
         """``pull``'s review history, every head, in arrival order (#3956)."""
@@ -3276,10 +3341,21 @@ class AppState:
         # one chat's change no longer re-copies every chat on the deck.
         display_cache = self._display_cache
         display_by_key: dict[str, Session] = {}
-        for session in visible:
-            changes = self._effective_activity_changes(
-                session, working_keys, effective_progress
+        listed = {session.key for session in visible}
+        # A chat outside the list still shows its dot on its own page (#4168): a finished
+        # Work's idle chat is exactly such a chat.
+        unlisted = [
+            self.sessions[key]
+            for key in self.chat_use.keys() - listed
+            if key in self.sessions
+        ]
+        for session in (*visible, *unlisted):
+            changes = (
+                self._effective_activity_changes(session, working_keys, effective_progress)
+                if session.key in listed
+                else {}
             )
+            changes["chat_use"] = self.chat_use.get(session.key)
             revision = self.session_revision(session.key)
             entry = display_cache.get(session.key)
             if (
@@ -3340,6 +3416,14 @@ class AppState:
         return presentation
 
     # --- usage --------------------------------------------------------
+
+    def set_chat_use(self, readings: dict[str, ChatUse]) -> None:
+        """Store each chat's use, announcing only the chats whose dot or tooltip moved."""
+        old = self.chat_use
+        changed = {key for key in old.keys() | readings.keys() if old.get(key) != readings.get(key)}
+        self.chat_use = readings
+        if changed:
+            self.sessions_changed(changed)
 
     def set_mac_waiting(self, count: int) -> None:
         """Store the Mac's waiting count, pushing the icon only when it changes (#2864)."""

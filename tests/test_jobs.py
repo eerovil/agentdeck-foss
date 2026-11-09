@@ -11,12 +11,14 @@ import threading
 import time
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import conftest as harness
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+from agentdeck import job_scratch
 from agentdeck import jobs as jobs_module
 from agentdeck.config import AppConfig, HistoryConfig, JobsConfig
 from agentdeck.host_slots import (
@@ -41,6 +43,7 @@ from agentdeck.host_slots import (
     slot_paths,
     try_take_slot,
 )
+from agentdeck.job_scratch import JOB_SCRATCH_ENV
 from agentdeck.jobs import (
     CANCELLED,
     DESKTOP,
@@ -1558,7 +1561,7 @@ async def test_a_follow_up_of_a_queue_placed_verification_can_leave_this_host(
     await queue.stop()
 
     assert (rerun.state, rerun.lane, rerun.lane_defaulted) == (DONE, KUBE, True)
-    assert Path(rerun.log_path).read_text().strip() == "ran on kube: -q tests/test_a.py::t"
+    assert Path(rerun.log_path).read_text().strip() == "ran on kube: -rA -q tests/test_a.py::t"
 
 
 async def test_a_rerun_or_base_check_starts_ahead_of_a_suite_queued_before_it(tmp_path):
@@ -2671,3 +2674,43 @@ async def test_a_job_tells_its_suite_where_to_record_test_timings(tmp_path):
     assert Path(final.log_path).read_text().strip() == str(
         Path(final.log_path).with_name(f"{final.id}.tests.jsonl")
     )
+
+
+async def test_a_local_job_waits_for_the_scratch_folder_or_moves_to_a_pod(tmp_path, monkeypatch):
+    """Short of the other disk, a run never falls back to the deck's own one (#4143)."""
+    root = tmp_path / "ssd"
+    monkeypatch.setenv("TMPDIR", "/var/tmp")
+    monkeypatch.setenv(JOB_SCRATCH_ENV, str(root))
+    monkeypatch.setattr(job_scratch, "_disk_of", lambda path: path)
+    # A test pod's /tmp is 2 GB, under the real limit, so the folder would stay short.
+    monkeypatch.setattr(job_scratch, "JOB_SCRATCH_MIN_FREE_BYTES", 0)
+    monkeypatch.setenv(jobs_module.LOCAL_FIRST_MIN_CORES_ENV, "10")
+    monkeypatch.setattr(jobs_module, "usable_cores", lambda: 12)
+    worktree = _fake_worktree(tmp_path)
+    _profile_runner(worktree, "true\n")
+    queue = _queue(tmp_path)
+    await queue.start()
+
+    held = queue.submit(command=["bash", "-c", "echo $TMPDIR"], cwd=str(worktree))
+    await _wait_for(lambda: queue.scratch_waiting == 1, what="the folder check")
+    assert queue.get(held.id).state == QUEUED and not root.exists(), "never made here"
+
+    moved = queue.submit(
+        command=["uv", "run", "pytest"], cwd=str(worktree), lane_defaulted=True
+    )
+    assert (await _settle(queue, moved.id)).lane != LOCAL
+
+    root.mkdir()
+    final = await _settle(queue, held.id)
+    assert Path(final.log_path).read_text().strip() == str(root)
+    await _wait_for(lambda: queue.scratch_waiting == 0, what="nothing left waiting")
+    await queue.stop()
+
+
+def test_a_job_on_a_remote_lane_keeps_its_temp_folder(tmp_path, monkeypatch):
+    monkeypatch.setenv("TMPDIR", "/var/tmp")
+    monkeypatch.setenv(JOB_SCRATCH_ENV, "/ssd")
+    job = SimpleNamespace(id="j", lane="kube", log_path=tmp_path / "j.log", quarantined=())
+
+    assert jobs_module._child_env(job)["TMPDIR"] == "/var/tmp"
+    assert JOB_SCRATCH_ENV not in jobs_module._child_env(job)

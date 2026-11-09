@@ -17,6 +17,7 @@ from urllib.parse import parse_qsl, urlparse
 
 import pytest
 
+from agentdeck.chat_use import ChatUse
 from agentdeck.models import Session, SessionStatus
 from agentdeck.web.render import SESSION_HISTORY_PAGE_SIZE, ChatListQuery, _chat_matches
 
@@ -135,6 +136,21 @@ def test_matching_follows_the_rules_the_browser_used_to_apply():
 
 
 # ---- the page --------------------------------------------------------------------------
+
+
+async def test_a_chat_card_shows_its_cost_dot_beside_the_context_badge(tmp_path):
+    from test_web import _app_with_state, _client
+
+    app = _app_with_state(tmp_path)
+    state = app.state.app_state
+    key = next(k for k in state.sessions if k.endswith(SID1))
+    use = ChatUse("middling", 120_000, 0.3)
+    state.set_chat_use({key: use})
+    async with _client(app) as client:
+        page = await client.get("/chats")
+
+    assert page.text.count('data-chat-use="middling"') == 1
+    assert f'title="{use.title}"' in page.text
 
 
 async def test_chats_renders_its_cards_at_load_with_no_list_stream(tmp_path):

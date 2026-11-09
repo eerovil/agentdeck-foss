@@ -27,6 +27,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any
 
+from .work_derived import is_mac_pause_link
 from .work_overview import (
     HANDOFF_STATES,
     RECENT_WORK,
@@ -78,6 +79,9 @@ _WAITS = frozenset({WAITING_JOB})
 # group.
 LIVE_CHECKING = "live_checking"
 _LIVE = frozenset({LIVE_CHECKING})
+# Live, and only a person can see whether it works (#4210): its own front-page group, outside
+# Needs you, whose rows carry Works, close.
+AWAITING_TRY = "awaiting_try"
 # An open issue no agent works on (#3558): a person starts one or handles it themselves.
 NOT_STARTED = "not_started"
 # The readings that say only that nothing is going (#2590): a Work Working over one has
@@ -264,6 +268,7 @@ _DERIVED_TONES = {
     "reviving": ACTIVE,  # the runtime revives a turn a restart cut off by itself (#3008)
     "cut_off": ATTENTION,  # its revival window passed: a person starts it again
     "login_expired": ATTENTION,  # its account's sign-in expired: a person signs in (#3354)
+    "retry_cancelled": ATTENTION,  # a person cancelled its retry: a person starts it (#4074)
     "closed": ATTENTION,  # a person finishes it (D14); "finished" is done
     "finished": DONE,
     "review": ACTIVE,
@@ -284,6 +289,7 @@ _DERIVED_TONES = {
     "review_escalated": ATTENTION,  # the reviewer asks the owner (#3216)
     "spec_wait": ATTENTION,  # a person approves the posted spec (#3247)
     "asked_in_chat": ATTENTION,  # the agent's reply asks the person something (#3887)
+    "try_wait": ACTIVE,  # a person tries it when they can; it is not in Needs you (#4210)
 }
 _DERIVED_WAITS = frozenset(
     {"review", "review_queued", "waiting", "queued", "scheduled", "parked", "reviving"}
@@ -296,6 +302,7 @@ _DERIVED_HEADLINES = {
     "reviving": "Waiting",
     "cut_off": "Needs you",
     "login_expired": "Needs you",
+    "retry_cancelled": "Needs you",
     "closed": "Issue closed",
     "finished": "Finished",
     "review": "In review",
@@ -316,6 +323,7 @@ _DERIVED_HEADLINES = {
     "review_escalated": "Needs you",
     "spec_wait": "Needs you",
     "asked_in_chat": "Needs you",
+    "try_wait": "Waiting for a try",
 }
 
 
@@ -331,7 +339,11 @@ def derived_story(card: WorkCard) -> WorkStatus:
     summary = derived.summary
     you = {
         "question": (
-            "Approve or deny the command on the Mac's page"
+            (
+                "Run the expired command or let the chat ask again, on the Mac's page"
+                if is_mac_pause_link(derived.approval_href)
+                else "Approve or deny the command on the Mac's page"
+            )
             if derived.approval_href
             else "Answer the question in the chat"
         ),
@@ -341,6 +353,7 @@ def derived_story(card: WorkCard) -> WorkStatus:
         "login_expired": (
             "Sign the account in again from the usage panel, then send the chat a message"
         ),
+        "retry_cancelled": "Send the chat a message to start it again, or continue in a new chat",
         "closed": "Finish the Work, or send a follow-up",
         "review_stuck": (
             "Open the review chat and read why the reviewer stopped"
@@ -355,10 +368,14 @@ def derived_story(card: WorkCard) -> WorkStatus:
         "pr_held": "Lift the hold, merge it by hand, or finish the Work",
         "pr_stuck": "Open the pull request and see why nothing moved it",
         "live_failed": "Read what failed live, then reopen the issue or finish the Work",
-        "not_live": "Deploy what is not running yet, then tell the agent to check it again",
+        "not_live": (
+            "Deploy what is not running yet and tell the agent to check it again,"
+            " or finish the Work"
+        ),
         "review_escalated": "Read the reviewer's question and answer it in the chat",
         "spec_wait": "Read the spec, then approve it or say what to change",
         "asked_in_chat": "Answer the question in the chat",
+        "try_wait": "Try it in the app, then press Works, close or Doesn't work",
     }.get(derived.kind, NOTHING_NEEDED)
     return WorkStatus(
         tone=ACTIVE if live else _DERIVED_TONES.get(derived.kind, IDLE),
@@ -369,7 +386,13 @@ def derived_story(card: WorkCard) -> WorkStatus:
         you=you,
         milestones=(),
         kind=(
-            LIVE_CHECKING if live else WAITING_JOB if derived.kind in _DERIVED_WAITS else ""
+            LIVE_CHECKING
+            if live
+            else AWAITING_TRY
+            if derived.kind == "try_wait"
+            else WAITING_JOB
+            if derived.kind in _DERIVED_WAITS
+            else ""
         ),
         # A Mac command waiting on the boss's tap opens its approval page (#3106).
         where=(
@@ -689,6 +712,11 @@ class FrontRow:
     held: frozenset[str] = frozenset()
 
     @property
+    def starred(self) -> bool:
+        """The row's Work is starred, or one folded into it: a star folded away still counts."""
+        return any(getattr(row.card, "starred", False) for row in (self, *self.children))
+
+    @property
     def revision(self) -> str:
         stopped = self.stopped_at.isoformat() if self.stopped_at is not None else ""
         base = f"{self.card.revision}:{stopped}:{int(self.unseen)}"
@@ -729,6 +757,23 @@ class FrontRow:
         from .work_actions import ARCHIVE_BUTTON
 
         return ARCHIVE_BUTTON
+
+    @property
+    def finish_unproven(self) -> bool:
+        """A closed issue whose live check is ``not_live`` with no wait left (#4126).
+
+        Nothing moves it on but a person, and a phone opens the row's chat rather than the
+        Work page, so its row carries Finish as an Issue closed row does. Read from ``actor``:
+        a folded row shows its leading child, whose Work the button acts on.
+        """
+        from .work_attention import FINISH
+
+        derived = self.actor.derived
+        return (
+            derived is not None
+            and derived.kind == "not_live"
+            and FINISH in getattr(self.attention, "actions", ())
+        )
 
     @property
     def finish(self) -> Any:
@@ -810,6 +855,18 @@ class FrontRow:
         """Listed under Waiting: an automatic wait such as a job (#2573)."""
         return self.section == IN_PROGRESS and self.status.kind in _WAITS
 
+    @property
+    def trying(self) -> bool:
+        """Listed under Waiting for a try: only a person can see it works (#4210)."""
+        return self.section == IN_PROGRESS and self.status.kind == AWAITING_TRY
+
+    @property
+    def tried(self) -> tuple:
+        """A Waiting for a try row's two controls (#4210): Works, close and Doesn't work."""
+        from .work_actions import tried_buttons
+
+        return tried_buttons(self.actor)
+
 
 @dataclass(frozen=True)
 class FrontGroup:
@@ -866,8 +923,8 @@ def _needs_you(card: WorkCard, story: WorkStatus) -> tuple[str, str, int]:
 # A derived status that waits on a person (#2944): its rank among Needs you, as ``_needs_you``
 # ranks the rest. A question first, then a stopped or stuck chat, then a Work to finish.
 _DERIVED_RANKS = {
-    "question": 0, "died": 0, "cut_off": 0, "login_expired": 0, "stalled": 0,
-    "unfinished": 1, "review_stuck": 1,
+    "question": 0, "died": 0, "cut_off": 0, "login_expired": 0, "retry_cancelled": 0,
+    "stalled": 0, "unfinished": 1, "review_stuck": 1,
     "ready": 1, "closed": 3, "pr_stuck": 1, "pr_held": 2, "live_failed": 2,
     "not_live": 2, "review_escalated": 0, "spec_wait": 0,
     "asked_in_chat": 0,
@@ -967,6 +1024,43 @@ class FrontSections:
     paused: tuple[FrontRow, ...] = ()
     # Current Works merged and checked live now (#3578), kept out of ``active`` and ``waiting``.
     live: tuple[FrontRow, ...] = ()
+    # Starred Works with nothing current and nothing finished (#4121): quiet, but still listed.
+    idle: tuple[FrontRow, ...] = ()
+    # Current Works only a person can check live (#4210), kept out of Needs you and Working.
+    trying: tuple[FrontRow, ...] = ()
+
+    @property
+    def rows(self) -> tuple[FrontRow, ...]:
+        """Every row the sections hold, each once; Recently stopped only repeats Needs you."""
+        return (
+            *self.needs_you, *self.hidden, *self.active, *self.waiting, *self.live, *self.trying,
+            *self.idle, *self.finished, *self.paused,
+        )
+
+    @property
+    def starred(self) -> tuple[FrontRow, ...]:
+        """The page's Starred group (#4121): every listed starred Work, most needing you first.
+
+        Only a display: each row stays in its own section, so the counts line, the top bar's
+        list and everything else that asks what a Work is doing read it the same. A row the
+        person hid stays hidden, star or not."""
+        return tuple(
+            row
+            for section in (
+                self.needs_you, self.active, self.waiting, self.live, self.trying, self.idle,
+                self.finished, self.paused,
+            )
+            for row in section
+            if row.starred
+        )
+
+    @property
+    def starred_new(self) -> int:
+        return sum(1 for row in self.starred if row.unseen)
+
+    def others(self, rows: Sequence[FrontRow]) -> tuple[FrontRow, ...]:
+        """``rows`` as a group lists them: the starred ones are in Starred alone (#4121)."""
+        return tuple(row for row in rows if not row.starred)
 
     @property
     def new(self) -> int:
@@ -998,10 +1092,13 @@ class FrontSections:
     @property
     def groups(self) -> tuple[FrontGroup, ...]:
         """Needs you by category, in the front page's order; each keeps Needs you's order."""
+        return self._grouped(self.needs_you)
+
+    def _grouped(self, rows: Sequence[FrontRow]) -> tuple[FrontGroup, ...]:
         from .work_attention import FRONT_ORDER, GLYPHS, LABELS, NOTES
 
         by: dict[str, list[FrontRow]] = {}
-        for row in self.needs_you:
+        for row in rows:
             category = row.attention.category if row.attention is not None else ""
             by.setdefault(category, []).append(row)
         known = [category for category in FRONT_ORDER if category in by]
@@ -1014,11 +1111,12 @@ class FrontSections:
         )
 
     def groups_in(self, place: str) -> tuple[FrontGroup, ...]:
-        """The groups listed at one place in the front page's flow (``FRONT_PLACES``)."""
+        """The groups listed at one place in the front page's flow (``FRONT_PLACES``), without
+        the starred rows Starred lists instead (#4121)."""
         from .work_attention import FRONT_PLACES
 
         return tuple(
-            group for group in self.groups
+            group for group in self._grouped(self.others(self.needs_you))
             if FRONT_PLACES.get(group.category, "cleanup") == place
         )
 
@@ -1093,8 +1191,11 @@ def front_sections(
     The Work id breaks every tie, so a refresh with nothing new renders the same order.
     A Work in ``hidden`` leaves Needs you for the Hidden list; every other section is
     unaffected by it (#2238). A paused Work is on the Paused list only (#2548).
-    A starred Work goes first in Needs you (so in its category) and in Active (#3116).
-    Recently stopped is the ``MAX_STOPPED`` shown Needs you rows with the newest
+    A starred Work is never cut (#4121): the page lists it in Starred alone
+    (``FrontSections.starred``), so it takes no place from the bounds above. A finished one
+    stays however long ago it finished, or with no known finish time, and an open one that
+    went quiet is listed in ``idle`` rather than counted.
+    Recently stopped is the ``MAX_STOPPED`` shown unstarred Needs you rows with the newest
     ``stopped_at`` (#2283); a row with none yet, or whose issue closed (#3388), is not
     listed there.
     """
@@ -1110,15 +1211,16 @@ def front_sections(
     for row in rows:
         section = row.section
         ended = row.finished_order
-        if section == FINISHED and ended is None:
-            unknown += 1
-            continue
-        if section == FINISHED and now is not None and now - ended > RECENT_WORK:
-            section = QUIET
+        if section == FINISHED and not row.starred:
+            if ended is None:
+                unknown += 1
+                continue
+            if now is not None and now - ended > RECENT_WORK:
+                section = QUIET
         by[section].append(row)
     def order(row: FrontRow) -> tuple[bool, float, str]:
         # A starred Work first in its section (#3116), then the most recent activity.
-        return not getattr(row.card, "starred", False), -stamp(row), row.card.work_id
+        return not row.starred, -stamp(row), row.card.work_id
 
     ranked = sorted(by[NEEDS_YOU], key=order)
     needs = [row for row in ranked if row.card.work_id not in hidden]
@@ -1126,15 +1228,26 @@ def front_sections(
     active = sorted(by[IN_PROGRESS], key=order)
     live = [row for row in active if row.live]
     active = [row for row in active if not row.live]
+    trying = [row for row in active if row.trying]
+    active = [row for row in active if not row.trying]
     waiting = [row for row in active if row.waits]
     active = [row for row in active if not row.waits]
-    finished = sorted(
-        by[FINISHED],
-        key=lambda row: (-row.finished_order.timestamp(), row.card.work_id),
-    )
+    # Starred leads both lists, so each bound below counts only the rows its group lists.
+    active_limit = max_active + sum(1 for row in active if row.starred)
+    def finished_rank(row: FrontRow) -> tuple[bool, float, str]:
+        # Only a starred row can have no finish time here: it goes after those that have one.
+        ended = row.finished_order
+        return not row.starred, -ended.timestamp() if ended else 0.0, row.card.work_id
+
+    finished = sorted(by[FINISHED], key=finished_rank)
     # Archive on a finished row is the same deck-only hide (#2254): it leaves the list too.
     put_away += tuple(row for row in finished if row.card.work_id in hidden)
     finished = [row for row in finished if row.card.work_id not in hidden]
+    finished_limit = MAX_FINISHED + sum(1 for row in finished if row.starred)
+    idle = sorted(
+        (row for row in by[QUIET] if row.starred and row.card.work_id not in hidden),
+        key=order,
+    )
     from .work_attention import ISSUE_CLOSED, UNSTARTED
 
     # A closed issue only waits for Finish: it is not a stop worth a shortcut (#3388). Nor is
@@ -1143,27 +1256,30 @@ def front_sections(
         (
             row for row in needs
             if row.stopped_at is not None
+            and not row.starred
             and getattr(row.attention, "category", "") not in {ISSUE_CLOSED, UNSTARTED}
         ),
         key=lambda row: (-row.stopped_at.timestamp(), row.card.work_id),
     )[:MAX_STOPPED]
     paused = sorted(by[PAUSED], key=lambda row: (-stamp(row), row.card.work_id))
     shown = (
-        *needs, *put_away, *active[:max_active], *waiting, *live, *finished[:MAX_FINISHED],
-        *paused,
+        *needs, *put_away, *active[:active_limit], *waiting, *live, *trying, *idle,
+        *finished[:finished_limit], *paused,
     )
     repositories = {row.card.source_label.rpartition("#")[0].casefold() for row in shown}
     return FrontSections(
         needs_you=tuple(needs),
-        active=tuple(active[:max_active]),
-        finished=tuple(finished[:MAX_FINISHED]),
-        active_more=max(0, len(active) - max_active),
-        finished_more=max(0, len(finished) - MAX_FINISHED) + unknown,
-        quiet=len(by[QUIET]),
+        active=tuple(active[:active_limit]),
+        finished=tuple(finished[:finished_limit]),
+        active_more=max(0, len(active) - active_limit),
+        finished_more=max(0, len(finished) - finished_limit) + unknown,
+        quiet=len(by[QUIET]) - len(idle),
         one_repository=len(repositories) <= 1,
         hidden=put_away,
         waiting=tuple(waiting),
         live=tuple(live),
+        trying=tuple(trying),
+        idle=tuple(idle),
         stopped=tuple(stopped),
         paused=tuple(paused),
     )

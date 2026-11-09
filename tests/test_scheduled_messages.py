@@ -1,11 +1,25 @@
 import asyncio
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 from agentdeck.db import Db
 from agentdeck.inject import InjectionStatus, QueuedMessage
-from agentdeck.models import Capability, InjectResult
-from agentdeck.scheduled_messages import ScheduledMessage, ScheduledMessageService
+from agentdeck.models import (
+    Capability,
+    InjectResult,
+    InteractionQuestion,
+    PendingInteraction,
+)
+from agentdeck.scheduled_messages import (
+    HOLD_EXPIRED_REASON,
+    QUESTION_GONE_MID_SEND_REASON,
+    QUESTION_GONE_REASON,
+    RUNTIME_HOLD,
+    HeldAnswer,
+    ScheduledMessage,
+    ScheduledMessageService,
+)
 
 
 async def test_dispatching_message_retries_with_stable_id_after_restart(tmp_path):
@@ -158,6 +172,375 @@ async def test_a_held_message_waits_for_the_runtime_then_goes_once_with_its_file
     await _sweep(service, now)
     assert injector.calls == [("Remove the worker limits", [image], [note], "held-1")]
     assert store.load_visible_scheduled_messages("chat-1") == ()
+
+
+def _asked(interaction_id="tok-1", *, question_ids=("q1",), dismissible=False):
+    return PendingInteraction(
+        id=interaction_id,
+        kind="question",
+        thread_id="sid",
+        turn_id=None,
+        title="Pick",
+        questions=tuple(
+            InteractionQuestion(id=item, header="", prompt=f"{item}?") for item in question_ids
+        ),
+        dismissible=dismissible,
+    )
+
+
+class _Box:
+    """A chat's question box as the delivery reads it (#4106)."""
+
+    def __init__(self, live, *, up=False, result=None):
+        self.live = live
+        self.up = up
+        self.result = result or InjectResult(True)
+        self.answered = []
+
+    def runtime_unreachable(self, _account, _session):
+        return not self.up
+
+    def interactions_unknown(self, _account):
+        return False
+
+    def live_interaction(self, _account, _session):
+        return self.live
+
+    async def answer_live_interaction(self, _account, _session, live, *, answers, decision):
+        self.answered.append((live.id, answers, decision))
+        return self.result
+
+
+def _answer_row(now, asked=None, *, answers=None, decision=None, created_at=None):
+    asked = asked or _asked()
+    return ScheduledMessage(
+        id="answer-1",
+        chat_id="chat-1",
+        text="q1?: yes",
+        due_at=now,
+        created_at=created_at or now,
+        hold_reason=RUNTIME_HOLD,
+        interaction_answer=HeldAnswer(
+            "codex:test:sid",
+            asked.id,
+            asked.kind,
+            asked.fingerprint(),
+            {"q1": ["yes"]} if answers is None else answers,
+            decision,
+        ),
+    )
+
+
+def _answer_service(tmp_path, box, injector=None):
+    store = Db(tmp_path / "answers.db")
+    # A chat whose answer waits cannot take a new turn: only the answer's resolver finds it.
+    target = SimpleNamespace(
+        account=object(),
+        session=SimpleNamespace(key="codex:test:sid", capabilities=frozenset()),
+        provider=box,
+    )
+    service = ScheduledMessageService(
+        store,
+        injector or _HeldInjector(),
+        lambda _chat_id: None,
+        resolve_answer_target=lambda _chat_id: target,
+    )
+    return store, service
+
+
+def _row(store, message_id="answer-1"):
+    return store.load_scheduled_message(message_id)
+
+
+async def test_a_held_answer_goes_to_the_box_once_the_runtime_is_back(tmp_path):
+    now = datetime.now(UTC)
+    box = _Box(_asked())
+    injector = _HeldInjector()
+    store, service = _answer_service(tmp_path, box, injector)
+    service.schedule(_answer_row(now))
+
+    await _sweep(service, now)
+    assert box.answered == []
+    assert _row(store).state == "scheduled"
+
+    box.up = True
+    await _sweep(service, now)
+
+    assert box.answered == [("tok-1", {"q1": ["yes"]}, None)]
+    assert _row(store).state == "delivered"
+    assert injector.calls == []  # never an ordinary chat message
+    store.close()
+
+
+async def test_a_web_process_that_has_not_reached_the_runtime_keeps_an_answer_waiting(tmp_path):
+    now = datetime.now(UTC)
+    box = _Box(None, up=True)
+    box.interactions_unknown = lambda _account: True
+    store, service = _answer_service(tmp_path, box)
+    service.schedule(_answer_row(now))
+
+    await _sweep(service, now)
+
+    assert service._question_deadlines == {}  # the wait for the question has not begun
+    assert _row(store).state == "scheduled"
+    store.close()
+
+
+async def test_a_prompt_replayed_after_the_return_is_answered_under_its_new_id(tmp_path):
+    now = datetime.now(UTC)
+    box = _Box(None, up=True)
+    store, service = _answer_service(tmp_path, box)
+    service.schedule(_answer_row(now))
+
+    await _sweep(service, now)
+    assert _row(store).state == "scheduled"
+    assert service.next_due(now) == service._question_deadlines["answer-1"]
+
+    box.live = _asked("tok-2")
+    await _sweep(service, now)
+
+    assert [answer[0] for answer in box.answered] == ["tok-2"]
+    assert _row(store).state == "delivered"
+    assert service._question_deadlines == {}
+    store.close()
+
+
+async def test_a_question_that_never_returns_is_reported_after_a_minute(tmp_path):
+    now = datetime.now(UTC)
+    box = _Box(None, up=True)
+    store, service = _answer_service(tmp_path, box)
+    service.schedule(_answer_row(now))
+
+    await _sweep(service, now)
+    service._question_deadlines["answer-1"] = now - timedelta(seconds=1)
+    await _sweep(service, now)
+
+    row = _row(store)
+    assert (row.state, row.reason) == ("failed", QUESTION_GONE_REASON)
+    assert box.answered == []
+    store.close()
+
+
+async def test_a_different_question_in_the_box_does_not_take_the_answer(tmp_path):
+    now = datetime.now(UTC)
+    box = _Box(_asked("tok-2", question_ids=("other",)), up=True)
+    store, service = _answer_service(tmp_path, box)
+    service.schedule(_answer_row(now))
+
+    await _sweep(service, now)
+    service._question_deadlines["answer-1"] = now - timedelta(seconds=1)
+    await _sweep(service, now)
+
+    assert box.answered == []
+    assert _row(store).state == "failed"
+    store.close()
+
+
+async def test_a_held_decision_stays_with_the_leg_that_asked(tmp_path):
+    # The chat moved to leg B, which asks the very same thing: A's "accept" is not B's.
+    now = datetime.now(UTC)
+    legs = {
+        "leg-a": _Box(None, up=True),
+        "leg-b": _Box(_asked(), up=True),
+    }
+    store = Db(tmp_path / "answers.db")
+    service = ScheduledMessageService(
+        store,
+        _HeldInjector(),
+        lambda _chat_id: None,
+        resolve_answer_target=lambda key: SimpleNamespace(
+            account=object(),
+            session=SimpleNamespace(key=key, capabilities=frozenset()),
+            provider=legs[key],
+        ),
+    )
+    row = _answer_row(now)
+    pinned = replace(row.interaction_answer, session_key="leg-a")
+    service.schedule(replace(row, interaction_answer=pinned))
+
+    await _sweep(service, now)
+    assert legs["leg-b"].answered == []
+    assert _row(store).state == "scheduled"
+
+    legs["leg-a"].live = _asked()
+    await _sweep(service, now)
+    assert len(legs["leg-a"].answered) == 1
+    assert legs["leg-b"].answered == []
+    store.close()
+
+
+async def test_the_runtime_leaving_again_restarts_the_wait_for_the_question(tmp_path):
+    now = datetime.now(UTC)
+    box = _Box(None, up=True)
+    store, service = _answer_service(tmp_path, box)
+    service.schedule(_answer_row(now))
+    await _sweep(service, now)
+    assert "answer-1" in service._question_deadlines
+
+    box.up = False
+    await _sweep(service, now)
+
+    assert service._question_deadlines == {}
+    store.close()
+
+
+async def test_a_held_answer_is_given_up_after_thirty_minutes(tmp_path):
+    now = datetime.now(UTC)
+    box = _Box(_asked())
+    store, service = _answer_service(tmp_path, box)
+    service.schedule(_answer_row(now, created_at=now - timedelta(minutes=31)))
+
+    await _sweep(service, now)
+
+    row = _row(store)
+    assert (row.state, row.reason) == ("failed", HOLD_EXPIRED_REASON)
+    assert box.answered == []
+    store.close()
+
+
+async def test_a_cancelled_answer_is_not_delivered(tmp_path):
+    now = datetime.now(UTC)
+    box = _Box(_asked())
+    store, service = _answer_service(tmp_path, box)
+    service.schedule(_answer_row(now))
+
+    assert service.cancel("answer-1", "chat-1") is True
+    box.up = True
+    await _sweep(service, now)
+
+    assert box.answered == []
+    store.close()
+
+
+async def test_a_refused_answer_shows_the_runtimes_reason(tmp_path):
+    now = datetime.now(UTC)
+    box = _Box(_asked(), up=True, result=InjectResult(False, "interaction_not_pending"))
+    store, service = _answer_service(tmp_path, box)
+    service.schedule(_answer_row(now))
+
+    await _sweep(service, now)
+
+    row = _row(store)
+    assert (row.state, row.reason) == ("failed", "interaction_not_pending")
+    store.close()
+
+
+async def test_an_answer_left_mid_send_is_retried_only_while_its_question_is_open(tmp_path):
+    now = datetime.now(UTC)
+    box = _Box(_asked(), up=True)
+    store, service = _answer_service(tmp_path, box)
+    service.schedule(_answer_row(now))
+    store.claim_scheduled_message("answer-1")
+
+    await _sweep(service, now)
+    assert len(box.answered) == 1
+    assert _row(store).state == "delivered"
+    store.close()
+
+
+async def test_an_answer_left_mid_send_with_its_question_gone_says_it_cannot_tell(tmp_path):
+    now = datetime.now(UTC)
+    box = _Box(None, up=True)
+    store, service = _answer_service(tmp_path, box)
+    service.schedule(_answer_row(now))
+    store.claim_scheduled_message("answer-1")
+
+    await _sweep(service, now)
+    service._question_deadlines["answer-1"] = now - timedelta(seconds=1)
+    await _sweep(service, now)
+
+    row = _row(store)
+    assert (row.state, row.reason) == ("failed", QUESTION_GONE_MID_SEND_REASON)
+    assert box.answered == []
+    store.close()
+
+
+async def test_an_answer_whose_first_send_lost_its_reply_never_claims_it_was_not_sent(tmp_path):
+    # The runtime took the answer and the reply was lost: the question closes, which is
+    # the answer working, and the row must not tell the person to give it again.
+    now = datetime.now(UTC)
+    box = _Box(None, up=True)
+    store, service = _answer_service(tmp_path, box)
+    row = _answer_row(now)
+    tried = replace(row.interaction_answer, attempted=True)
+    service.schedule(replace(row, interaction_answer=tried))
+
+    await _sweep(service, now)
+    service._question_deadlines["answer-1"] = now - timedelta(seconds=1)
+    await _sweep(service, now)
+
+    settled = _row(store)
+    assert settled.interaction_answer.attempted
+    assert (settled.state, settled.reason) == ("failed", QUESTION_GONE_MID_SEND_REASON)
+    assert settled.may_have_reached_the_agent
+    assert box.answered == []
+    store.close()
+
+
+async def test_a_tried_answer_out_of_time_says_it_may_have_been_sent(tmp_path):
+    from agentdeck.scheduled_messages import HOLD_EXPIRED_MID_SEND_REASON
+
+    now = datetime.now(UTC)
+    box = _Box(_asked(), up=False)
+    store, service = _answer_service(tmp_path, box)
+    row = _answer_row(now, created_at=now - timedelta(minutes=31))
+    tried = replace(row.interaction_answer, attempted=True)
+    service.schedule(replace(row, interaction_answer=tried))
+
+    await _sweep(service, now)
+
+    settled = _row(store)
+    assert (settled.state, settled.reason) == ("failed", HOLD_EXPIRED_MID_SEND_REASON)
+    assert settled.may_have_reached_the_agent
+    store.close()
+
+
+async def test_the_runtime_leaving_mid_delivery_leaves_the_row_for_the_question_to_settle(
+    tmp_path,
+):
+    now = datetime.now(UTC)
+    lost = InjectResult(False, "runtime unavailable", runtime_unreachable=True)
+    box = _Box(_asked(), up=True, result=lost)
+    store, service = _answer_service(tmp_path, box)
+    service.schedule(_answer_row(now))
+
+    await _sweep(service, now)
+    assert _row(store).state == "dispatching"
+
+    box.result = InjectResult(True)
+    await _sweep(service, now)
+    assert _row(store).state == "delivered"
+    store.close()
+
+
+async def test_an_open_question_answer_goes_on_when_one_of_its_questions_closed(tmp_path):
+    now = datetime.now(UTC)
+    answered = _asked("questions-old", question_ids=("q1", "q2"), dismissible=True)
+    live = _asked("questions-new", question_ids=("q2", "q3"), dismissible=True)
+    box = _Box(live, up=True)
+    store, service = _answer_service(tmp_path, box)
+    service.schedule(
+        _answer_row(now, answered, answers={"q1": ["yes"], "q2": ["no"]})
+    )
+
+    await _sweep(service, now)
+
+    assert box.answered == [("questions-new", {"q2": ["no"]}, None)]
+    store.close()
+
+
+async def test_a_held_dismissal_needs_its_own_question_open(tmp_path):
+    now = datetime.now(UTC)
+    answered = _asked("questions-old", question_ids=("q1", "q2"), dismissible=True)
+    live = _asked("questions-new", question_ids=("q2",), dismissible=True)
+    box = _Box(live, up=True)
+    store, service = _answer_service(tmp_path, box)
+    service.schedule(_answer_row(now, answered, answers={}, decision="dismiss:q1"))
+
+    await _sweep(service, now)
+
+    assert box.answered == []
+    store.close()
 
 
 async def test_a_held_message_is_reported_unsent_after_thirty_minutes(tmp_path):

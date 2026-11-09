@@ -622,6 +622,8 @@ def test_the_workspace_is_served_only_inside_the_work_page(tmp_path):
         "/api/works/{work_id:path}/star",
         # An agent's message to the chat running another Work (#3908); no workspace.
         "/api/works/{work_id:path}/message",
+        # A chat starts an issue with its project's own label (#4141); no workspace.
+        "/api/works/{work_id:path}/start",
         "/api/works/{work_id:path}/map-layout",
         "/api/works/{work_id:path}/question",
         # Rename (#2328) stores this deck's own name for the Work; no workspace.
@@ -629,6 +631,8 @@ def test_the_workspace_is_served_only_inside_the_work_page(tmp_path):
         # New chat (#2388) reads the workspace only to pick the new chat's folder; it serves
         # no workspace.
         "/works/{work_id:path}/new-chat",
+        # Side chat (#4199) starts a copy of the working chat; it serves no workspace.
+        "/works/{work_id:path}/side-chat",
         # New work (#2415) files a new issue; there is no Work, so no workspace, yet.
         "/works/new",
         "/works/new/guess-project",

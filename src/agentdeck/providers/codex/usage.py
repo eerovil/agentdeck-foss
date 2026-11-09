@@ -11,8 +11,9 @@ import asyncio
 import json
 import logging
 import os
+import re
 from collections.abc import Awaitable, Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from ...models import Account, UsageSnapshot
@@ -26,6 +27,36 @@ log = logging.getLogger(__name__)
 FIVE_HOUR_MINS = 5 * 60
 SEVEN_DAY_MINS = 7 * 24 * 60
 REQUEST_TIMEOUT_S = 30.0
+
+#: Where a refusal says when the limit resets, in this host's local time: `12:05 PM` on the
+#: day of the refusal, `Sep 11th, 2026 7:48 AM` on any other day.
+_RESET_AT = re.compile(
+    r"try again at (?:(?P<day>[A-Z][a-z]{2} \d{1,2})(?:st|nd|rd|th), (?P<year>\d{4}) )?"
+    r"(?P<time>\d{1,2}:\d{2} [AP]M)"
+)
+#: The refusal drops the seconds, and a retry sent inside that minute is refused again.
+_RESET_MARGIN = timedelta(minutes=1)
+
+
+def limit_reset_at(refusal: str, refused_at: datetime) -> datetime | None:
+    """When a usage-limit refusal says the account can run again, or None (#4118).
+
+    The rollout's own rate-limit figures are no substitute: the refused turn's record has
+    none, and a chat refused on its first turn never wrote any.
+    """
+    found = _RESET_AT.search(refusal)
+    if found is None:
+        return None
+    try:
+        clock = datetime.strptime(found["time"], "%I:%M %p").time()
+        day = (
+            datetime.strptime(f"{found['day']} {found['year']}", "%b %d %Y").date()
+            if found["day"]
+            else refused_at.astimezone().date()
+        )
+    except ValueError:
+        return None
+    return datetime.combine(day, clock).astimezone(UTC) + _RESET_MARGIN
 
 
 def _number(value: object) -> float | None:

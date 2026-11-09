@@ -64,16 +64,31 @@ from .work_hidden import UNHIDE
 APPROVE_MERGE = "approve_merge"
 WITHDRAW_MERGE = "withdraw_merge"
 APPROVAL_ACTIONS = frozenset({APPROVE_MERGE, WITHDRAW_MERGE})
+# Ship now, fix later (#4212): merge a pull request its review sent back with findings, and
+# file those findings as a follow-up Work.
+SHIP_NOW = "ship_now"
+# Works, close on a Work waiting for a person to try it live (#4210): closes its issue, records
+# the live check as verified and finishes the Work, in one press with no confirm. Offered from
+# the Work's own state (``derived.kind == "try_wait"``), not from Needs you.
+TRIED_OK = "tried_ok"
+# Doesn't work: only a link to the Work's message box; what the person types reaches the agent.
+TRIED_BAD = "tried_bad"
+#: The comment the issue gets when Works, close closes it.
+TRIED_COMMENT = "Tried live by a person and it works; closed from AgentDeck's Works, close."
 WRITES = frozenset(
     {
-        AGENT_REVIEW, APPROVE_MERGE, CHATGPT_REVIEW, CLOSE, MERGE, PAUSE, RESUME, START,
-        WITHDRAW_MERGE,
+        AGENT_REVIEW, APPROVE_MERGE, CHATGPT_REVIEW, CLOSE, MERGE, PAUSE, RESUME, SHIP_NOW,
+        START, TRIED_OK, WITHDRAW_MERGE,
     }
 )
 # A side chat started from the Work's page (#2388). Its press is reserved in the same store,
 # so a replay of its action id answers with that press, but it has its own route, not
 # ``/action``, and is never one of the Work's offered actions.
 NEW_CHAT = "new_chat"
+# The side chat of a working Work (#4199): a copy of its working chat to ask questions in.
+# Reserved in the same store, so a replay answers with that press, and the Work's newest done
+# one is the side chat a later press carries on. Its own route, never an offered action.
+SIDE_CHAT = "side_chat"
 # A new Work filed from the deck (#2415): reserved in the same store under the press's id, so a
 # replay answers with what that press did. Its ``work_id`` is ``new-work:<owner/repo>``, since
 # the Work it starts has no issue number until the press makes one.
@@ -86,6 +101,7 @@ LABELS = {
     MERGE: "Merge",
     APPROVE_MERGE: "Merge when ready",
     WITHDRAW_MERGE: "Withdraw",
+    SHIP_NOW: "Ship now",
     # The Poller's board commands, retired with its cards (#3025): only old presses name them.
     "resolve": "Resolve",
     "retry": "Retry",
@@ -99,10 +115,13 @@ LABELS = {
     PAUSE: "Pause",
     RESUME: "Resume",
     START: "Start agent",
+    TRIED_OK: "Works, close",
+    TRIED_BAD: "Doesn't work",
     HIDE: "Hide",
     UNHIDE: "Bring back",
     FINISH: "Finish",
     NEW_CHAT: "New chat",
+    SIDE_CHAT: "Side chat",
     NEW_WORK: "New work",
     TAKE_OVER: "Take over",
     **LINKS,
@@ -115,6 +134,11 @@ CONFIRMS = {
     APPROVE_MERGE: (
         "Approve merging this Work at its current diff? The deck merges once its review passes"
         " and its tests are green. Any change to the diff clears this."
+    ),
+    SHIP_NOW: (
+        "Ship this Work as it is? The deck merges it once its tests are green, with no new"
+        " review, and files the review's findings as a follow-up Work whose review also reads"
+        " this change again."
     ),
 }
 
@@ -151,6 +175,8 @@ class Step:
     # A ``chatgpt_review``'s open pull requests as ``owner/repo#n``, so the chat lists each
     # one even where GitHub links none of them to the issue (#2637).
     pulls: tuple[str, ...] = ()
+    # A ``close``'s comment on the issue, posted with the close (#4210); "" for none.
+    comment: str = ""
 
     @property
     def issue(self) -> str:
@@ -164,17 +190,39 @@ def plan(
     *,
     deck_release: bool = False,
     approval: str = "",
+    shippable: Sequence[str] = (),
+    confirmed: str = "",
 ) -> Step:
     """The write ``action`` makes for this Work now, or ``Refused`` saying why it may not.
 
     ``deck_release`` is the deck's own release taking this Work (#2895): only then is Merge a
     ``deck_merge`` step. ``approval`` is the release's ``approval`` for it (#3320).
+    ``shippable`` are the open pull requests Ship now, fix later may ship (#4212), and
+    ``confirmed`` the ``pull@head`` its confirm showed the findings of: only those ship.
     """
     if action not in WRITES:
         raise Refused("That is not a Work action.", 422)
     label = LABELS[action]
     if action in {PAUSE, RESUME}:
         return _plan_pause(action, card)
+    if action == SHIP_NOW:
+        why = ship_now_refusal(card, deck_release, shippable)
+        if why:
+            raise Refused(f"{label} is not offered for this Work now: {why} Nothing was sent.")
+        ref = WorkRef.from_work_id(card.work_id)
+        if ref is None:
+            raise Refused("This Work has no GitHub issue to act on.", 422)
+        # Each pull request ships only at the head whose findings the confirm showed (#4212
+        # review): one that came to stand at findings since, or moved, is asked about again.
+        current = ship_targets(card, shippable)
+        shown = set(confirmed.casefold().split())
+        unshown = [target.rpartition("@")[0] for target in current if target not in shown]
+        if unshown:
+            raise Refused(
+                f"{label} was not sent: the findings of {', '.join(unshown)} changed since the"
+                " page showed them. Read them on the page now and press again."
+            )
+        return Step("deck_ship_now", ref.repository, ref.number, pulls=current)
     if action in {APPROVE_MERGE, WITHDRAW_MERGE}:
         why = approval_refusal(action, card, attention, approval)
         if why:
@@ -186,6 +234,13 @@ def plan(
             # ``fresh``: refused by the release while a press already stands (#3320 review).
             return Step("deck_merge", ref.repository, ref.number, "fresh")
         return Step("deck_withdraw", ref.repository, ref.number)
+    if action == TRIED_OK:
+        if not tried_offered(card):
+            raise Refused(f"{label} is not offered for this Work now; nothing was sent.")
+        ref = WorkRef.from_work_id(card.work_id)
+        if ref is None:
+            raise Refused("This Work has no GitHub issue to act on.", 422)
+        return Step("close", ref.repository, ref.number, "completed", comment=TRIED_COMMENT)
     if attention is None or action not in attention.actions:
         raise Refused(f"{label} is not offered for this Work now; nothing was sent.")
     ref = WorkRef.from_work_id(card.work_id)
@@ -244,6 +299,62 @@ def merge_approval_control(
         if not approval_refusal(action, card, attention, approval):
             return ActionButton(action, LABELS[action], confirm=CONFIRMS.get(action, ""))
     return None
+
+
+def ship_now_refusal(card: Any, deck_release: bool, shippable: Sequence[str]) -> str:
+    """Why Ship now, fix later is not offered now, or "" when it is (#4212).
+
+    Only on a Work the deck releases, and only while one of its open pull requests stands at
+    findings or an escalation of its review with no newer review running (``shippable``, read
+    from the review history by ``review_history.shippable``).
+    """
+    if not deck_release:
+        return "the deck does not release this Work."
+    if getattr(card, "paused", False):
+        return "it is paused."
+    if not shippable:
+        return "no open pull request stands at review findings."
+    return ""
+
+
+def ship_targets(card: Any, shippable: Sequence[str]) -> tuple[str, ...]:
+    """``pull@head`` of each open pull request in ``shippable``, at the head the card read."""
+    found = []
+    for output in getattr(card, "outputs", ()):
+        pull = f"{output.repository}#{output.number}".lower()
+        if pull in shippable and output.head:
+            found.append(f"{pull}@{output.head.lower()}")
+    return tuple(found)
+
+
+def ship_now_control(
+    card: Any,
+    deck_release: bool,
+    shippable: Sequence[str],
+    findings: Sequence[tuple[str, str]] = (),
+) -> ActionButton | None:
+    """The Work page's Ship now, beside its findings (#4212); its confirm names every pull
+    request it ships with the first line of its findings (``findings``, ``(pull, line)``), so
+    the owner sees all that ships unfixed (D10), and the press posts the heads it showed."""
+    if ship_now_refusal(card, deck_release, shippable):
+        return None
+    lines = dict(findings)
+    shown = [
+        f"{pull}: {lines.get(pull) or 'its findings kept no words; read them on its pull request'}"
+        for pull in shippable
+    ]
+    confirm = CONFIRMS[SHIP_NOW]
+    if len(shown) == 1:
+        confirm += f"\n\nThe findings start: {shown[0]}"
+    else:
+        confirm += f"\n\nIt ships {len(shown)} pull requests with their findings:\n"
+        confirm += "\n".join(f"- {line}" for line in shown)
+    return ActionButton(
+        SHIP_NOW,
+        LABELS[SHIP_NOW],
+        confirm=confirm,
+        confirmed=" ".join(ship_targets(card, shippable)),
+    )
 
 
 def pause_refusal(card: Any) -> str:
@@ -426,6 +537,31 @@ def finish_control(card: Any, attention: OperatorAttention | None) -> ActionButt
     if attention is not None and FINISH in attention.actions:
         return None
     return finish_button(card)
+
+
+def tried_offered(card: Any) -> bool:
+    """Whether the Work waits for a person to try it live now (#4210).
+
+    A paused Work shows Paused and offers only Resume, so it is not offered then.
+    """
+    if getattr(card, "paused", False):
+        return False
+    return getattr(getattr(card, "derived", None), "kind", "") == "try_wait"
+
+
+def tried_buttons(card: Any, *, page: bool = False) -> tuple[ActionButton, ...]:
+    """Works, close and Doesn't work, while the Work waits for a try (#4210); else none.
+
+    Works, close asks nothing first, as the owner chose: a wrong close is undone by reopening
+    the issue. Doesn't work opens the message box, whose message wakes the agent.
+    """
+    if not tried_offered(card):
+        return ()
+    href = "#work-message" if page else f"{card.href}#work-message"
+    return (
+        ActionButton(TRIED_OK, LABELS[TRIED_OK]),
+        ActionButton(TRIED_BAD, LABELS[TRIED_BAD], href),
+    )
 
 
 def pause_control(card: Any) -> ActionButton | None:

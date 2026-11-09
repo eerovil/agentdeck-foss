@@ -10,6 +10,7 @@ from agentdeck.db import Db
 from agentdeck.review_history import (
     ACCEPTED,
     ASKED,
+    CHANGES,
     CHAT,
     CHECKLIST,
     CHECKLIST_DONE,
@@ -21,9 +22,12 @@ from agentdeck.review_history import (
     HeadReview,
     ReviewEvent,
     answered,
+    at_head,
     checklist_waits,
     head_review,
     last_digest,
+    newest_verdict,
+    passed,
     same_change,
 )
 from agentdeck.work_release import note_escalation
@@ -53,6 +57,14 @@ def test_every_order_of_six_events_gives_one_answer_and_the_newest_verdict_decid
         events = [_event(kind, at, seq) for seq, (kind, at) in enumerate(arrived)]
         answer = head_review(events)
         assert answer == head_review(sorted(events, key=lambda event: event.at))
+        # An escalation after the owner's acceptance with no ask between is that round's
+        # late copy, and counts for nothing, unless the acceptance came with an ask still
+        # unanswered: then it is that review's result (#4069).
+        between = order[order.index(ACCEPTED) + 1 : order.index(ESCALATED)]
+        before = order[: order.index(ACCEPTED)]
+        out = ASKED in before and PASS not in before[before.index(ASKED) :]
+        if order.index(ESCALATED) > order.index(ACCEPTED) and ASKED not in between and not out:
+            order = tuple(kind for kind in order if kind != ESCALATED)
         newest = [kind for kind in order if kind in VERDICTS][-1]
         assert answer.verdict == (PASS if newest == ACCEPTED else newest)
         assert answer.accepted == (newest == ACCEPTED)
@@ -131,6 +143,19 @@ def test_the_router_reads_its_checklist_digest_carry_and_answer_from_the_history
     assert same_change(events, other, old[:12]) and same_change(events, new, new)
     assert not same_change(events, old, new) and not same_change(events, other, "1" * 6)
     assert answered(events, new[:7]) and not answered([at(old, ASKED, 1)], old)
+    # The chat board's copy of an escalation the owner already accepted on its comment, dated
+    # later, keeps the pass; a new ask opens a round whose escalation counts (#4069).
+    round_ = [at(new, ASKED, 1), at(new, ESCALATED, 2), at(new, ACCEPTED, 3), at(old, ASKED, 4)]
+    copied = [*round_, at(new, ESCALATED, 5), at(old, FINDINGS, 6)]
+    assert head_review(at_head(copied, new)).passed and passed(newest_verdict(at_head(copied, new)))
+    assert newest_verdict(copied).kind == FINDINGS, "another head's findings still count"
+    again = [*copied, at(new, ASKED, 7), at(new, ESCALATED, 8)]
+    assert head_review(at_head(again, new)).verdict == ESCALATED
+    # Accepted while a newer review was out: what that review finds still stands.
+    newer = [at(new, ASKED, 1), at(new, ESCALATED, 2), at(new, ASKED, 3), at(new, ACCEPTED, 4)]
+    assert head_review(newer).passed
+    assert head_review([*newer, at(new, FINDINGS, 5)]).verdict == CHANGES
+    assert head_review([*newer, at(new, ESCALATED, 5)]).verdict == ESCALATED
 
 
 def test_the_table_keeps_each_event_once_and_forgets_a_closed_pull_request(tmp_path):
@@ -148,8 +173,75 @@ def test_the_table_keeps_each_event_once_and_forgets_a_closed_pull_request(tmp_p
     ]
     # The pass is older by its own time; the chat after it, with no ask, reviews nothing here.
     assert head_review(rows).verdict == PASS and head_review(rows).review_since is None
+    # A head shipped with its findings left (#4212) is recorded once, outlives the history
+    # its merge drops, and is found from its follow-up issue.
+    assert db.claim_shipped(
+        PR, HEAD, "1. off by one", "https://c/1", 4.0, "EerOvil/AgentDeck#7", "B" * 40
+    )
+    assert not db.claim_shipped(PR.upper(), HEAD, "again", "", 5.0)
+    assert db.shipped_for("") == [] and db.shipped_for("eerovil/agentdeck#41") == []
+    assert db.note_follow_up(PR, HEAD, "EerOvil/AgentDeck#41")
+    # Unfinished (its pass not recorded): it did not ship, so neither the page nor the
+    # follow-up's review reads it (#4212 review); the press's own resume still does.
+    assert db.shipped_for("eerovil/agentdeck#41") == [] == db.shipped_by_work("eerovil/agentdeck#7")
+    assert db.shipped(PR, HEAD).follow_up == "eerovil/agentdeck#41"
+    # One rule the release holds a Ship now pass by and the page offers Ship now again by.
+    from types import SimpleNamespace
+
+    from agentdeck.state import AppState
+
+    unfinished = AppState.ship_unfinished
+    owner = SimpleNamespace(shipped=lambda pull, head: db.shipped(pull, head))
+    assert unfinished(owner, PR.upper(), HEAD) and unfinished(owner, PR, "d" * 40)
+    assert db.note_shipped(PR.upper(), HEAD, 4.5)
+    assert not unfinished(owner, PR, HEAD.upper())
+    db.note_shipped(PR, HEAD, 9.0)  # marked once: a later press keeps its time
+    assert db.shipped(PR, HEAD).shipped == 4.5
     db.drop_review_events(PR)
     assert db.review_events(PR) == [] and len(db.review_events("eerovil/agentdeck#10")) == 1
+    [shipped] = db.shipped_for("eerovil/agentdeck#41")
+    assert (shipped.pull, shipped.head, shipped.findings, shipped.url) == (
+        PR,
+        HEAD,
+        "1. off by one",
+        "https://c/1",
+    )
+    assert db.shipped(PR, HEAD.upper()) == shipped and db.shipped(PR, "d" * 40) is None
+    # Its base is kept from the press and its merge commit once the merge is heard (D7).
+    assert shipped.base == "b" * 40 and shipped.merged == ""
+    # Named by the pull request: the base merged in after the press is a new head (D7 review).
+    assert db.note_shipped_merge(PR.upper(), "C" * 40)
+    shipped = db.shipped(PR, HEAD)
+    assert shipped.merged == "c" * 40
+    # A pull request merges once: a later merge event does not rename it.
+    db.note_shipped_merge(PR, "e" * 40)
+    assert db.shipped(PR, HEAD).merged == "c" * 40
+    # The confirm quotes the first line that says something (D10).
+    from agentdeck.review_history import first_finding
+
+    comment = "/claude\nReview findings for PR a/b#9 at abc\n\n1. `x.py:3` is off" + "x" * 200
+    first = first_finding(comment)
+    assert first.startswith("1. `x.py:3` is off") and len(first) == 160
+    assert first_finding("") == "" == first_finding("<!-- marker -->\n")
+    # The original Work's page reads it by its own issue (D12).
+    assert db.shipped_by_work("eerovil/agentdeck#7") == [shipped] and db.shipped_by_work("") == []
+    # D11: the follow-up #41's own pull request shipped with findings again, to #42. #42's
+    # review reads the whole chain, newest first; #51 points back at #41, and the walk still
+    # reads each issue once and ends.
+    later = "eerovil/agentdeck#50"
+    assert db.claim_shipped(later, "e" * 40, "2. still off", "", 6.0, "eerovil/agentdeck#41")
+    db.note_follow_up(later, "e" * 40, "eerovil/agentdeck#42")
+    db.note_shipped(later, "e" * 40, 6.5)
+    assert db.claim_shipped("eerovil/agentdeck#51", "f" * 40, "", "", 7.0, "eerovil/agentdeck#42")
+    db.note_follow_up("eerovil/agentdeck#51", "f" * 40, "eerovil/agentdeck#41")
+    db.note_shipped("eerovil/agentdeck#51", "f" * 40, 7.5)
+    reader = SimpleNamespace(shipped_for=db.shipped_for)
+    chain = AppState.shipped_chain(reader, "EerOvil/AgentDeck#42")
+    assert [(item.pull, item.work) for item in chain] == [
+        ("eerovil/agentdeck#51", "eerovil/agentdeck#42"),
+        (later, "eerovil/agentdeck#41"),
+        (PR, "eerovil/agentdeck#7"),
+    ]
 
 
 def test_an_escalation_is_written_at_the_head_its_chat_reviewed_for_each_named_pull():

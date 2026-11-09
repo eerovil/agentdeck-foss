@@ -19,10 +19,11 @@ from ...models import (
     SNAPSHOT_CONTEXT_MANAGEMENT_V1,
     SNAPSHOT_FORK_V1,
     SNAPSHOT_RELOCATE_V1,
+    SNAPSHOT_ROLE_V1,
     WORKER_SNAPSHOT_CAPABILITIES,
     Account,
 )
-from ..delivery import DeliverResult, DeliveryCorrelation, DeliveryReceipts
+from ..delivery import DeliverResult, DeliveryCorrelation, DeliveryReceipts, ReceiptSweep
 from ..instructions import (
     SessionRole,
     agentdeck_session_instructions,
@@ -110,6 +111,7 @@ class CodexWorkerHost:
         self.account = account
         self.client = client
         self._state_path = Path(state_dir) / f"{account.label}.json"
+        self._receipt_sweep = ReceiptSweep()
         self._bind_session_token = bind_session_token or (lambda _token, _key: None)
         self._artifact_root = artifact_root or state_dir / "command-artifacts"
         self._records: dict[str, CodexWorkerRecord] = {}
@@ -164,9 +166,11 @@ class CodexWorkerHost:
 
     def _save_state(self) -> None:
         self._state_path.parent.mkdir(parents=True, exist_ok=True)
+        self._receipt_sweep.run(record.receipts for record in self._records.values())
         payload = {"workers": [vars(record) for record in self._records.values()]}
         temporary = self._state_path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(payload, indent=1))
+        # Compact: this whole file is rewritten on every state change (#4143).
+        temporary.write_text(json.dumps(payload, separators=(",", ":")))
         temporary.replace(self._state_path)
         self.on_state_change()
 
@@ -917,6 +921,8 @@ class CodexWorkerHost:
                 # Advertised here because this is the list the deck reads; the fork
                 # itself is the app-server's `thread/fork` behind `/start` (#2485).
                 SNAPSHOT_FORK_V1,
+                # `/start` takes a role and `CodexRuntime` saves it (#4092).
+                SNAPSHOT_ROLE_V1,
                 # The app-server resumes a thread whose directory is gone in its
                 # repository when it starts the next turn (#2524).
                 SNAPSHOT_RELOCATE_V1,

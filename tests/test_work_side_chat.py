@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import subprocess
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
@@ -447,6 +448,7 @@ async def test_new_chat_on_a_phone_adds_no_height_keeps_its_text_and_starts_once
     checkout = _repo(tmp_path / "checkout")
     starts: list = []
     app = _app(tmp_path, monkeypatch, cwd=checkout, starts=starts)
+    _side_chattable(monkeypatch)
     async with _live_server(app) as base, async_playwright() as playwright:
         browser = await playwright.chromium.launch()
         page = await browser.new_page(
@@ -455,23 +457,33 @@ async def test_new_chat_on_a_phone_adds_no_height_keeps_its_text_and_starts_once
         await page.goto(base + work_href(WORK.work_id))
         opener = page.locator("[data-work-new-chat-open]")
         await opener.wait_for()
-        # Shut, the control costs the page no height at all, on a phone or a narrow one: the
-        # same page with the control taken out entirely is exactly as tall.
-        for width in (390, 320):
+        await page.locator("[data-work-side-chat]").wait_for()
+        # Shut, New chat and Side chat add no row, on a phone or a narrow one (at 351 px New
+        # chat wrapped under the text box and pushed Side chat onto a row of its own, #4199):
+        # New chat stays on Send's row, and Side chat ends within the "Goes to" line. Under
+        # 340 px New chat joins Side chat there.
+        for width in (390, 351, 320):
             await page.set_viewport_size({"width": width, "height": 844})
-            heights = await page.evaluate(
+            box = await page.evaluate(
                 """() => {
                     const form = document.querySelector('#work-message');
-                    const button = form.querySelector('[data-work-new-chat-open]');
-                    const withIt = form.getBoundingClientRect().height;
-                    const mark = button.nextSibling;
-                    button.remove();
-                    const without = form.getBoundingClientRect().height;
-                    form.insertBefore(button, mark);
-                    return [withIt, without];
+                    const rect = (sel) => form.querySelector(sel).getBoundingClientRect();
+                    const send = rect('.wd-message-send'), open = rect('[data-work-new-chat-open]');
+                    const side = rect('[data-work-side-chat]'), to = rect('.wd-message-to');
+                    const within = (r) => r.top >= to.top - 1 && r.bottom <= to.bottom + 1;
+                    return {
+                        newChatOnSendRow: Math.abs(open.top - send.top) < 1,
+                        newChatWithinGoesTo: within(open),
+                        sideWithinGoesTo: within(side),
+                    };
                 }"""
             )
-            assert heights[0] == heights[1], (width, heights)
+            narrow = width < 340
+            assert box == {
+                "newChatOnSendRow": not narrow,
+                "newChatWithinGoesTo": narrow,
+                "sideWithinGoesTo": True,
+            }, (width, box)
         await page.set_viewport_size({"width": 390, "height": 844})
         assert await page.locator("#work-new-chat").is_hidden()
 
@@ -582,16 +594,20 @@ async def test_with_no_chat_to_message_new_chat_still_adds_no_height(tmp_path, m
         )
         await page.goto(base + work_href(WORK.work_id))
         await page.locator("#work-message [data-wd-no-target]").wait_for()
-        heights = await page.evaluate(
+        # New chat and Side chat share the "no chat" line and never take a row of their own;
+        # beside both at 320 px that line's text may wrap once (#4199).
+        within = await page.evaluate(
             """() => {
                 const form = document.querySelector('#work-message');
-                const button = form.querySelector('[data-work-new-chat-open]');
-                const withIt = form.getBoundingClientRect().height;
-                button.remove();
-                return [withIt, form.getBoundingClientRect().height];
+                const to = form.querySelector('.wd-message-to').getBoundingClientRect();
+                return [...form.querySelectorAll(
+                    '[data-work-new-chat-open], [data-work-side-chat]')].map((button) => {
+                    const r = button.getBoundingClientRect();
+                    return r.top >= to.top - 1 && r.bottom <= to.bottom + 1;
+                });
             }"""
         )
-        assert heights[0] == heights[1], heights
+        assert within == [True, True], within
         await browser.close()
 
 
@@ -612,7 +628,8 @@ async def test_an_account_whose_runtime_is_restarting_stays_offered_and_refuses_
     starts: list = []
     app = _app(tmp_path, monkeypatch, cwd=checkout, starts=starts)
     provider = PROVIDERS["claude_code"]
-    monkeypatch.setitem(provider._workers, ACCOUNT, SimpleNamespace(unreachable=True))
+    worker = SimpleNamespace(unreachable=True, available=False)
+    monkeypatch.setitem(provider._workers, ACCOUNT, worker)
     monkeypatch.setattr(provider, "can_start_session", lambda account: False)
 
     html = TestClient(app).get(work_href(WORK.work_id)).text
@@ -638,7 +655,8 @@ def test_the_front_page_form_keeps_an_account_whose_runtime_is_restarting(tmp_pa
     checkout = _repo(tmp_path / "checkout")
     app = _app(tmp_path, monkeypatch)
     provider = PROVIDERS["claude_code"]
-    monkeypatch.setitem(provider._workers, ACCOUNT, SimpleNamespace(unreachable=True))
+    worker = SimpleNamespace(unreachable=True, available=False)
+    monkeypatch.setitem(provider._workers, ACCOUNT, worker)
     monkeypatch.setattr(provider, "can_start_session", lambda account: False)
     client = TestClient(app)
 
@@ -652,3 +670,238 @@ def test_the_front_page_form_keeps_an_account_whose_runtime_is_restarting(tmp_pa
     )
     assert response.status_code == 422
     assert "try again in a minute" in response.text
+
+
+# --- the side chat of a working Work (#4199) -------------------------------------------------
+
+
+def test_the_working_chat_is_a_working_one_first_and_never_a_reviewer():
+    from agentdeck.work_side_chat import side_chat_fresh, working_chat
+
+    def chat(key, minutes, *, working=False, reviewer=False):
+        return SimpleNamespace(
+            session_key=key,
+            working=working,
+            reviewer=reviewer,
+            last_activity=NOW - timedelta(minutes=minutes),
+        )
+
+    idle_new, busy_old = chat("idle", 1), chat("busy", 30, working=True)
+    assert working_chat([idle_new, busy_old]) is busy_old
+    assert working_chat([idle_new, chat("old", 9)]) is idle_new
+    assert working_chat([chat("review", 0, working=True, reviewer=True), busy_old]) is busy_old
+    assert working_chat([]) is None
+    assert side_chat_fresh(NOW - timedelta(minutes=54), now=NOW)
+    assert not side_chat_fresh(NOW - timedelta(minutes=56), now=NOW)
+    assert not side_chat_fresh(None)
+
+
+def _side_chattable(monkeypatch, *, refusal=None, seq=9):
+    from agentdeck.providers import PROVIDERS
+
+    claude = PROVIDERS["claude_code"]
+    cuts: list = []
+    monkeypatch.setattr(claude, "fork_refusal", lambda account, session: refusal)
+
+    def newest_fork(account, session):
+        if seq is None:
+            return None
+        cuts.append((session.key, seq))
+        return seq, "uuid-9"
+
+    monkeypatch.setattr(claude, "newest_fork", newest_fork)
+    monkeypatch.setattr(claude, "fork_settings", lambda account, session: ("claude-x", "high"))
+    return cuts
+
+
+async def _side(app, action_id: str):
+    from httpx import ASGITransport, AsyncClient
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            work_href(WORK.work_id) + "/side-chat", data={"client_action_id": action_id}
+        )
+        await _settle(app)
+        return response
+
+
+def _page(app) -> str:
+    from fastapi.testclient import TestClient
+
+    return TestClient(app).get(work_href(WORK.work_id)).text
+
+
+@pytest.mark.asyncio
+async def test_side_chat_copies_the_working_chat_and_is_carried_on_while_fresh(
+    tmp_path, monkeypatch
+):
+    from agentdeck.models import ForkFrom
+    from agentdeck.work_message import send
+
+    checkout = _repo(tmp_path / "checkout")
+    starts: list = []
+    app = _app(tmp_path, monkeypatch, cwd=checkout, starts=starts)
+    forks: list = []
+    from agentdeck.providers import PROVIDERS
+
+    async def start_session(account, cwd, message, *, timeout_s, session_token=None, **kw):
+        starts.append((str(cwd), message, session_token))
+        forks.append(kw.get("fork_from"))
+        return InjectResult(True, session_id=f"side{len(starts)}")
+
+    monkeypatch.setattr(PROVIDERS["claude_code"], "start_session", start_session)
+    cuts = _side_chattable(monkeypatch)
+    state = app.state.app_state
+    worker = f"{ACCOUNT}:worker"
+
+    page = await asyncio.to_thread(_page, app)
+    button = page.split("data-work-side-chat", 1)[1].split("</button>", 1)[0]
+    assert "/side-chat" in button and ">Side chat" in button and "aria-disabled" not in button
+
+    first = await _side(app, "side-ask-0001")
+    assert first.status_code == 202, first.text
+    assert 'id="work-side-chat-result"' in first.text
+    assert (await _side(app, "side-ask-0001")).status_code == 202  # the same press
+    assert len(starts) == 1 and cuts == [(worker, 9)]
+    cwd, message, token = starts[0]
+    assert cwd == str(checkout) and token == "side-ask-0001"
+    assert forks == [ForkFrom("worker", "uuid-9")]
+    assert message.startswith(
+        "You are a side chat of the agent working on eerovil/agentdeck#2388. "
+    )
+    assert f"/sessions/{worker}/transcript.json" in message
+    assert "/api/works/eerovil/agentdeck/2388/message" in message
+    assert "only when — the owner asks" in message
+
+    # A second press before the scan names the chat waits on the same start.
+    assert (await _side(app, "side-ask-0002")).status_code == 202
+    assert len(starts) == 1
+
+    # Once it exists, a press opens it, and the page links to it.
+    side = _scanned(app, "side1", cwd=checkout)
+    state.bind_session_token("side-ask-0001", side)
+    opened = await _side(app, "side-ask-0003")
+    assert opened.status_code == 200
+    assert opened.headers["HX-Redirect"] == state.chat_path_for_session(side)
+    page = await asyncio.to_thread(_page, app)
+    assert f'href="{state.chat_path_for_session(side)}" data-work-side-chat>Side chat ↗' in page
+    # The page that started it, pressed again, opens it too.
+    replayed = await _side(app, "side-ask-0001")
+    assert replayed.headers["HX-Redirect"] == state.chat_path_for_session(side)
+    # Many other presses on the Work since do not hide it.
+    for n in range(25):
+        app.state.control_db.reserve_work_action(f"star-press-{n:04d}", WORK.work_id, "star")
+    assert (await _side(app, "side-ask-0006")).headers["HX-Redirect"] == (
+        state.chat_path_for_session(side)
+    )
+    assert len(starts) == 1
+
+    # A restarted web process finds the same side chat from what it stored.
+    restarted = _app(tmp_path, monkeypatch, cwd=checkout, starts=starts)
+    _scanned(restarted, "side1", cwd=checkout)
+    again = await _side(restarted, "side-ask-0005")
+    assert again.headers["HX-Redirect"] == state.chat_path_for_session(side)
+    assert len(starts) == 1
+
+    # It is never a member of the Work, so the Work's messages keep going to its agent, and
+    # the side chat can pass the owner's words on.
+    assert state.chat_identity_key(side) not in state.work_projection().get(WORK).chat_ids
+
+    class Messages:
+        rows: dict = {}
+
+        def exists(self, key):
+            return key in self.rows
+
+        def schedule(self, message):
+            self.rows[message.id] = message
+            return message
+
+    sent = send(state, Messages(), WORK, side, "The owner says: stop after the tests")
+    assert sent.chat_id == state.chat_identity_key(worker)
+
+    # Past its freshness the next press copies the working chat again.
+    stale = state.sessions[side]
+    state.update_session(replace(stale, last_activity=NOW - timedelta(minutes=56)))
+    assert (await _side(app, "side-ask-0004")).status_code == 202
+    assert len(starts) == 2
+    await app.state.injector.stop()
+
+
+@pytest.mark.asyncio
+async def test_two_presses_at_once_start_one_side_chat(tmp_path, monkeypatch):
+    starts: list = []
+    app = _app(tmp_path, monkeypatch, cwd=_repo(tmp_path / "checkout"), starts=starts)
+    _side_chattable(monkeypatch)
+    first, second = await asyncio.gather(_side(app, "side-ask-0101"), _side(app, "side-ask-0102"))
+    assert (first.status_code, second.status_code) == (202, 202)
+    assert len(starts) == 1
+    await app.state.injector.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_side_chat_whose_worker_died_can_be_pressed_again_at_once(tmp_path, monkeypatch):
+    """The start was accepted, then its worker exited: the next press starts a new one
+    rather than showing that dead start for two minutes. The page's button keeps its action
+    id, so a second tap on the same button is that next press, with no reload (#4199)."""
+    from agentdeck.providers import PROVIDERS
+
+    starts: list = []
+    app = _app(tmp_path, monkeypatch, cwd=_repo(tmp_path / "checkout"), starts=starts)
+    hold = asyncio.Event()
+    hold.set()
+
+    async def start_session(account, cwd, message, *, timeout_s, session_token=None, **kw):
+        starts.append(session_token)
+        await hold.wait()
+        return InjectResult(False, reason="Claude worker exited before session initialization.")
+
+    monkeypatch.setattr(PROVIDERS["claude_code"], "start_session", start_session)
+    _side_chattable(monkeypatch)
+    assert (await _side(app, "side-ask-0201")).status_code == 202
+    assert starts == ["side-ask-0201"]
+    press = app.state.control_db.work_action("side-ask-0201")
+    assert press.result == "Started a side chat"
+    # The same button tapped again: a new start under a new id.
+    assert (await _side(app, "side-ask-0201")).status_code == 202
+    assert len(starts) == 2 and starts[1] != "side-ask-0201"
+    # Another page's button works the same way.
+    assert (await _side(app, "side-ask-0202")).status_code == 202
+    assert len(starts) == 3 and starts[2] == "side-ask-0202"
+
+    # A start still under way: the same button tapped again answers with it, starting nothing.
+    from httpx import ASGITransport, AsyncClient
+
+    hold.clear()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        path = work_href(WORK.work_id) + "/side-chat"
+        for _ in range(2):
+            tap = await client.post(path, data={"client_action_id": "side-ask-0203"})
+            assert tap.status_code == 202
+            for _ in range(50):
+                await asyncio.sleep(0)
+    assert starts[3:] == ["side-ask-0203"]
+    hold.set()
+    await _settle(app)
+    await app.state.injector.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_side_chat_that_cannot_start_says_why_and_starts_nothing(tmp_path, monkeypatch):
+    starts: list = []
+    app = _app(tmp_path, monkeypatch, cwd=_repo(tmp_path / "checkout"), starts=starts)
+    _side_chattable(monkeypatch, refusal="Claude workers are not running on this deck right now.")
+    page = await asyncio.to_thread(_page, app)
+    button = page.split("data-work-side-chat", 1)[1].split("</button>", 1)[0]
+    reason = "Claude workers are not running on this deck right now."
+    assert f'aria-disabled="true" title="{reason}"' in button
+    refused = await _side(app, "side-ask-0010")
+    assert refused.status_code == 409 and "Claude workers are not running" in refused.text
+
+    _side_chattable(monkeypatch, seq=None)
+    unfinished = await _side(app, "side-ask-0011")
+    assert unfinished.status_code == 409 and "no finished reply yet" in unfinished.text
+    assert (await _side(app, "short")).status_code == 422
+    assert starts == []
+    # Nothing was reserved, so the same press may go again.
+    assert app.state.control_db.work_action("side-ask-0011") is None

@@ -1,14 +1,15 @@
-"""Start a new Work from the deck: file its issue at once, attachments included (#2415).
+"""Start a new Work from the deck: file its issue at once (#2415).
 
 A person types a rough idea — on the front page, or from a chat they are watching — and the
 deck files it as an issue in a Poller-managed repository, labelled so the Poller picks it up.
 There is no drafting agent and no approval step: when the card is spec-only, the worker the
 Poller starts writes the spec and asks its questions on the card.
 
-GitHub has no API for attaching a file to an issue, so attachments are committed to the
-project's evidence repository (the manifest's ``holds_artifacts`` repository, #1791) through
-the contents API, one after another, before the issue exists. The issue then embeds or links
-each file pinned to the commit its upload made, and tells the worker how to read it back.
+Attachments never reach GitHub (#4135). They are saved on this deck's disk before the issue
+exists, under ``FILES_ROOT``, and the issue carries only each file's name, deck link and path.
+The issue is what every start of a Work reads, so an early start, a usual start and a Poller
+worker all find the files with no code of their own. Files older than ``FILES_TTL_S`` are
+swept away, so an old issue's path can be gone.
 
 The issue is created with one REST request (#3590), not ``gh issue create``, which first looks
 the repository and its labels up. ``file`` hands the body to ``on_body`` just before that
@@ -23,27 +24,27 @@ check rather than made again.
 from __future__ import annotations
 
 import asyncio
-import base64
 import json
+import os
 import re
-import shlex
 import shutil
+import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from pathlib import Path
 from urllib.parse import quote
 
 from starlette.datastructures import FormData, UploadFile
 
 from . import gh_cli
-from .images import sniff_suffix
+from .public_origin import public_url
 from .web.uploads import _safe_file_name
 
-UPLOAD_TIMEOUT_S = 60.0
 CREATE_TIMEOUT_S = 30.0
 
-# A filing with attachments holds one of `gh_cli`'s four spawn threads for up to a minute per
-# file. One at a time, so a burst of them cannot starve every other GitHub read on the deck.
-_ATTACHMENT_FILING = asyncio.Lock()
+# Where attachments are kept, one folder per press: a Work outlives the turn-long upload spool.
+FILES_ROOT = Path.home() / ".local/share/agentdeck/new-work-files"
+FILES_TTL_S = 90 * 24 * 60 * 60
 
 # GitHub answers these before anything is created: a label or repository it does not know, a
 # permission it refuses, or a request it rejects outright. Anything else from a non-zero exit
@@ -67,7 +68,6 @@ class Target:
     project: str
     ownership_label: str
     spec_only_label: str = ""
-    evidence_repository: str = ""
     # The repository the form lands on when only the project is known (#3882).
     project_default: bool = False
 
@@ -77,18 +77,13 @@ class Attachment:
     name: str
     data: bytes
 
-    @property
-    def is_image(self) -> bool:
-        return sniff_suffix(self.data) is not None
-
 
 @dataclass(frozen=True)
-class Uploaded:
+class Kept:
+    """An attachment saved on this deck, by its absolute path."""
+
     name: str
     path: str
-    commit: str
-    blob: str
-    is_image: bool
 
 
 @dataclass(frozen=True)
@@ -109,7 +104,6 @@ def targets(board) -> tuple[Target, ...]:
         )
         if not labels:
             continue
-        evidence = scope.artifact_repositories[0] if scope.artifact_repositories else ""
         home = _project_home(scope)
         for repository in scope.issue_repositories:
             found.setdefault(
@@ -120,7 +114,6 @@ def targets(board) -> tuple[Target, ...]:
                     # The first label is the canonical one for creating an issue.
                     ownership_label=labels[0],
                     spec_only_label=scope.spec_only_label,
-                    evidence_repository=evidence,
                     project_default=repository.lower() == home,
                 ),
             )
@@ -210,53 +203,49 @@ def _gh() -> str:
     return shutil.which("gh") or "gh"
 
 
-def _encoded(path: str) -> str:
-    return quote(path, safe="/")
-
-
-def _link(evidence: str, commit: str, path: str) -> str:
-    return f"https://github.com/{evidence}/blob/{commit}/{_encoded(path)}?raw=1"
-
-
-class _UploadFailed(Exception):
+class _NotKept(Exception):
     pass
 
 
-async def _upload(target: Target, folder: str, attachment: Attachment) -> Uploaded:
-    path = f"{target.repository.split('/', 1)[-1]}/new-work/{folder}/{attachment.name}"
-    payload = json.dumps(
-        {
-            "message": f"New work attachment for {target.repository}: {attachment.name}",
-            "content": base64.b64encode(attachment.data).decode("ascii"),
-        }
-    ).encode("utf-8")
-    argv = [
-        _gh(),
-        "api",
-        "-X",
-        "PUT",
-        f"repos/{target.evidence_repository}/contents/{_encoded(path)}",
-        "--input",
-        "-",
-    ]
+def _folder(target: Target, press: str) -> Path:
+    return FILES_ROOT / target.repository / press
+
+
+def _keep(target: Target, press: str, attachments: tuple[Attachment, ...]) -> tuple[Kept, ...]:
+    """Save a press's files, or none of them: a Work missing a file it was given is worse."""
+    folder = _folder(target, press)
+    kept: list[Kept] = []
+    attachment = attachments[0]
     try:
-        code, stdout, stderr = await gh_cli.run_once(
-            argv, timeout=UPLOAD_TIMEOUT_S, stdin=payload, repo=target.evidence_repository
-        )
-    except gh_cli.GitHubRefusal as exc:
-        raise _UploadFailed(str(exc)) from exc
-    except (OSError, TimeoutError) as exc:
-        raise _UploadFailed(f"the upload did not finish ({exc or 'timed out'})") from exc
-    if code != 0:
-        message = stderr.decode("utf-8", "replace").strip() or f"gh exited {code}"
-        raise _UploadFailed(message.splitlines()[-1])
+        FILES_ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(FILES_ROOT, 0o700)
+        folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+        for attachment in attachments:
+            path = folder / attachment.name
+            flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW
+            with os.fdopen(os.open(path, flags, 0o600), "wb") as handle:
+                handle.write(attachment.data)
+            kept.append(Kept(attachment.name, str(path)))
+    except OSError as exc:
+        shutil.rmtree(folder, ignore_errors=True)
+        raise _NotKept(f"{attachment.name} could not be kept: {exc.strerror or exc}") from exc
+    return tuple(kept)
+
+
+def sweep_old_files(now: float | None = None) -> None:
+    """Remove the press folders older than ``FILES_TTL_S``."""
+    cutoff = (time.time() if now is None else now) - FILES_TTL_S
     try:
-        answer = json.loads(stdout or b"{}")
-        commit = str(answer["commit"]["sha"])
-        blob = str(answer["content"]["sha"])
-    except (ValueError, KeyError, TypeError) as exc:
-        raise _UploadFailed("GitHub's answer named no commit") from exc
-    return Uploaded(attachment.name, path, commit, blob, attachment.is_image)
+        presses = tuple(FILES_ROOT.glob("*/*/*"))
+    except OSError:
+        return
+    for press in presses:
+        try:
+            if press.is_symlink() or not press.is_dir() or press.stat().st_mtime >= cutoff:
+                continue
+            shutil.rmtree(press)
+        except OSError:
+            continue
 
 
 # GitHub refuses an issue body over 65,536 characters; the rest is left for what
@@ -271,31 +260,21 @@ def max_text_chars(configured: int | None) -> int:
     return min(configured, GITHUB_TEXT_MAX_CHARS)
 
 
-def compose_body(
-    text: str, *, evidence: str = "", uploaded: Iterable[Uploaded] = (), chat_url: str = ""
-) -> str:
+def compose_body(text: str, *, kept: Iterable[Kept] = (), chat_url: str = "") -> str:
     parts = [text.strip()]
     if chat_url:
         parts.append(f"Started from [this chat]({chat_url})")
-    uploaded = tuple(uploaded)
-    if uploaded:
-        shown = [
-            f"![{item.name}]({_link(evidence, item.commit, item.path)})"
-            if item.is_image
-            else f"- [{item.name}]({_link(evidence, item.commit, item.path)})"
-            for item in uploaded
-        ]
-        # Through a worker's `gh`, only text survives: the blob API's base64 JSON does.
-        fetch = [
-            f"- `gh api repos/{evidence}/git/blobs/{item.blob} --jq .content "
-            f"| base64 -d > {shlex.quote(item.name)}`"
-            for item in uploaded
-        ]
+    kept = tuple(kept)
+    if kept:
+        lines = []
+        for item in kept:
+            # No picture: GitHub cannot fetch from the deck's private address.
+            link = public_url(quote(item.path, safe="/"))
+            lines.append(f"- [{item.name}]({link}) `{item.path}`" if link else f"- `{item.path}`")
         parts.append(
             "### Attachments\n\n"
-            + "\n".join(shown)
-            + f"\n\nThe files are in `{evidence}`. To read one:\n\n"
-            + "\n".join(fetch)
+            "Kept on the deck, not on GitHub. Read them from these paths on the deck's host:\n\n"
+            + "\n".join(lines)
         )
     return "\n\n".join(parts) + "\n"
 
@@ -356,30 +335,24 @@ async def file(
     on_body: Callable[[str], object] | None = None,
     assignee: str = "",
 ) -> Outcome:
-    """Upload the attachments, then create the issue. Called once per reserved press.
+    """Keep the attachments, then create the issue. Called once per reserved press.
 
     ``on_body`` gets the issue's body just before the create is sent, nothing on a failed
-    upload: the caller starts the Work's agent then rather than after GitHub answers.
+    save: the caller starts the Work's agent then rather than after GitHub answers.
     ``assignee`` is filed as the issue's assignee (``work_claims.own_assignee``).
     """
     attachments = tuple(attachments)
-    if not attachments:
-        body = compose_body(text, chat_url=chat_url)
-        if on_body is not None:
-            on_body(body)
-        return await _create(target, title, body, spec_only, assignee)
-    async with _ATTACHMENT_FILING:
-        uploaded: list[Uploaded] = []
-        for attachment in attachments:
-            try:
-                uploaded.append(await _upload(target, folder, attachment))
-            except _UploadFailed as exc:
-                # A stray file in the evidence repository is harmless; an issue missing a
-                # file the person attached is not. Stop before the issue exists.
-                return Outcome("failed", f"{attachment.name} could not be uploaded: {exc}")
-        body = compose_body(
-            text, evidence=target.evidence_repository, uploaded=uploaded, chat_url=chat_url
-        )
-        if on_body is not None:
-            on_body(body)
-        return await _create(target, title, body, spec_only, assignee)
+    kept: tuple[Kept, ...] = ()
+    if attachments:
+        try:
+            kept = await asyncio.to_thread(_keep, target, folder, attachments)
+        except _NotKept as exc:
+            return Outcome("failed", str(exc))
+    body = compose_body(text, kept=kept, chat_url=chat_url)
+    if on_body is not None:
+        on_body(body)
+    outcome = await _create(target, title, body, spec_only, assignee)
+    if kept and outcome.state == "failed":
+        # Nothing was filed. An uncertain create keeps its files: the issue may exist.
+        await asyncio.to_thread(shutil.rmtree, _folder(target, folder), True)
+    return outcome

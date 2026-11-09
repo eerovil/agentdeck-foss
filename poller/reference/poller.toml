@@ -166,7 +166,17 @@ auto_deploys = true
 #   proof. Refused on a repository that deploys (`auto_deploys`), and on one holding no code.
 #
 # Each source feeds the same tests bit, and none merges anything; `capabilities.auto_release`
-# stays the only way to do that.
+# merges for the whole project. A project that keeps it off can still let one code repository
+# merge on its own with `auto_release = true` in its `[[repos]]` entry (#4172): the deck merges a
+# reviewed, tested pull request there with nobody pressing Merge, while the others wait. A
+# `/reviewed pass` from a GitHub login needs Release for a pull request in that repository; a Work
+# with a pull request in another repository too waits for a person's Merge for all of them.
+#
+#   [[repos]]
+#   id = "some-robot"
+#   holds_code = true
+#   verification = "agentdeck_job"
+#   auto_release = true
 #
 #   [[repos]]
 #   id = "some-service"

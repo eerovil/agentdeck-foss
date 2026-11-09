@@ -38,9 +38,9 @@ from .models import (
     UsageSnapshot,
 )
 from .questions import OpenQuestion
-from .review_history import ReviewEvent
-from .scheduled_messages import HeldAttachment, ScheduledMessage
-from .sqlite_open import create_schema, use_wal
+from .review_history import ReviewEvent, ShippedFollowUp
+from .scheduled_messages import HeldAnswer, HeldAttachment, ScheduledMessage
+from .sqlite_open import OPEN_LOCK_WAIT_S, create_schema, use_wal
 from .work import WorkRef
 
 if TYPE_CHECKING:
@@ -83,7 +83,7 @@ def _parse_dt(value: object) -> datetime | None:
 
 _SCHEDULED_COLUMNS = (
     "id, chat_id, message, due_at, created_at, effort, state, reason,"
-    " hold_reason, attachments"
+    " hold_reason, attachments, interaction_answer"
 )
 
 
@@ -148,6 +148,32 @@ class PendingSideChat(NamedTuple):
     work_id: str
     pull_requests: tuple[str, ...]
     created_at: datetime
+
+
+# Each Work's own agent chat (#3597): the chat its start token names, else, for a start that
+# took a chat begun before its issue (#3590), the first side chat bound after the start.
+_OWN_CHAT_CTE = (
+    "WITH own AS ("
+    " SELECT a.work_id, COALESCE(t.session_key, ("
+    "  SELECT b.session_key FROM session_work_bindings b"
+    "  WHERE b.work_id = a.work_id AND b.evidence = 'side_chat'"
+    "  AND b.bound_at >= a.reserved_at ORDER BY b.bound_at LIMIT 1"
+    " )) AS session_key"
+    " FROM work_actions a LEFT JOIN session_tokens t ON t.token = a.action_id"
+    " WHERE a.action_id LIKE 'work-start-%')"
+)
+
+
+class StartChoice(NamedTuple):
+    """The account, model and effort a New work press picked for its Work (#4181).
+
+    Empty means the deck's own choice: the account usage balances, the account's default
+    model and effort. A picked account is kept: the usage move never moves its chat.
+    """
+
+    account_key: str = ""
+    model: str = ""
+    effort: str = ""
 
 
 class DeliveryRoute(NamedTuple):
@@ -399,6 +425,20 @@ CREATE TABLE IF NOT EXISTS session_permission_prompts (
     previous_policy_json TEXT NOT NULL,
     enabled_at TEXT NOT NULL
 );
+-- A Codex chat switched to "Bypass permissions" (#4092), with the approval and
+-- sandbox settings switching it off puts back. Absence is the default: the sandbox
+-- and its reviewer stay on.
+CREATE TABLE IF NOT EXISTS session_bypass_permissions (
+    session_key TEXT PRIMARY KEY,
+    previous_settings_json TEXT NOT NULL,
+    enabled_at TEXT NOT NULL
+);
+-- The role a Codex chat was started with (#4092): its thread keeps the guide, but
+-- nothing Codex stores says which one, and the chat's next leg must keep it.
+CREATE TABLE IF NOT EXISTS session_roles (
+    session_key TEXT PRIMARY KEY,
+    role TEXT NOT NULL
+);
 -- A handoff callback is an agent-authored write that may outlive the web
 -- request which asked for it. Reserve its pre-minted destination token before
 -- provider I/O so replay can return the same waiting-chat URL, never spawn a
@@ -466,6 +506,15 @@ CREATE TABLE IF NOT EXISTS work_side_chats (
     action_id TEXT PRIMARY KEY,
     work_id TEXT NOT NULL,
     pull_requests TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL
+);
+-- What a New work press picked for its Work's agent (#4181): written once the issue has its
+-- number, read by every start of that Work (the usual start, a usage move, Continue).
+CREATE TABLE IF NOT EXISTS work_start_choices (
+    work_id TEXT PRIMARY KEY,
+    account_key TEXT NOT NULL DEFAULT '',
+    model TEXT NOT NULL DEFAULT '',
+    effort TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS work_backfills (
@@ -783,7 +832,9 @@ CREATE TABLE IF NOT EXISTS scheduled_messages (
     -- Set on a message held while its runtime restarts (#2847); NULL for wake-on.
     hold_reason TEXT,
     -- JSON list of {"path", "kind"} uploads a held message keeps until delivery.
-    attachments TEXT
+    attachments TEXT,
+    -- JSON of a question box's answer held for the runtime (#4106); NULL otherwise.
+    interaction_answer TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_scheduled_messages_due
     ON scheduled_messages(state, due_at);
@@ -908,6 +959,46 @@ CREATE TABLE IF NOT EXISTS review_events (
 );
 CREATE INDEX IF NOT EXISTS idx_review_events_pull ON review_events(pull, head);
 
+-- A pull request shipped with its review findings left to a follow-up Work (#4212): which
+-- head shipped, and the follow-up issue that fixes them. Kept after the pull request merges,
+-- unlike review_events: the follow-up's review reads the shipped change again from it.
+-- ``follow_up`` is "" until its issue exists, so a press that could not file one says so.
+-- ``work`` is the shipped Work's issue, which links a follow-up shipped again to its own.
+-- ``base`` is the base branch's commit when it shipped (``base...head`` is its change) and
+-- ``merged`` its merge commit, written when the merge is heard. ``shipped`` is when its review
+-- counted as passed; 0 while a press is unfinished (its follow-up not filed, or its acceptance
+-- refused), which the Work page and the follow-up's review leave out: it did not ship.
+CREATE TABLE IF NOT EXISTS shipped_follow_ups (
+    pull TEXT NOT NULL,
+    head TEXT NOT NULL,
+    follow_up TEXT NOT NULL DEFAULT '',
+    findings TEXT NOT NULL DEFAULT '',
+    url TEXT NOT NULL DEFAULT '',
+    at REAL NOT NULL,
+    work TEXT NOT NULL DEFAULT '',
+    base TEXT NOT NULL DEFAULT '',
+    merged TEXT NOT NULL DEFAULT '',
+    shipped REAL NOT NULL DEFAULT 0,
+    PRIMARY KEY (pull, head)
+);
+CREATE INDEX IF NOT EXISTS idx_shipped_follow_ups_follow_up ON shipped_follow_ups(follow_up);
+CREATE INDEX IF NOT EXISTS idx_shipped_follow_ups_work ON shipped_follow_ups(work);
+
+-- What the GitHub check last said about each pull request head (#4152): its check run's id, its
+-- state and a hash of what was sent, so only a real change writes to GitHub. Head ``comment`` is
+-- the pull request's one findings comment, and the empty pull the publisher's place in
+-- review_events (``run_id``).
+CREATE TABLE IF NOT EXISTS review_checks (
+    pull TEXT NOT NULL,
+    head TEXT NOT NULL,
+    run_id INTEGER NOT NULL DEFAULT 0,
+    state TEXT NOT NULL DEFAULT '',
+    fingerprint TEXT NOT NULL DEFAULT '',
+    at REAL NOT NULL DEFAULT 0,
+    PRIMARY KEY (pull, head)
+);
+CREATE INDEX IF NOT EXISTS idx_review_checks_state ON review_checks(state);
+
 -- A note a chat shows but its agent never sees (#3227): a comment the deck's own GitHub
 -- account posted on the chat's issue or one of its pull requests, from the webhook log.
 -- ``chat_id`` is the chat that owned the item when the comment arrived. ``body_html`` is
@@ -1031,6 +1122,10 @@ class ChatSnapshot:
         return ChatIdentity(chat_id, self.legs_by_chat[chat_id])
 
 
+# SQLite's default wait for the write lock once a ``Db`` is open.
+_RUNNING_LOCK_WAIT_MS = 5000
+
+
 class Db:
     def __init__(
         self,
@@ -1043,7 +1138,9 @@ class Db:
         self.context_retention_days = context_retention_days
         path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
-        self._conn = sqlite3.connect(str(path), check_same_thread=False)
+        self._conn = sqlite3.connect(
+            str(path), timeout=OPEN_LOCK_WAIT_S, check_same_thread=False
+        )
         use_wal(self._conn)
         # Read-mostly mirror of chat_legs/chat_aliases; see the chat identity
         # section for why it exists and how it stays fresh (#1291).
@@ -1054,6 +1151,9 @@ class Db:
         self._known_work_ids: set[str] = set()
         self._init_schema()
         self._known_work_ids = set(self.load_works())
+        # Only a process starting up may wait that long: after this, a write waits
+        # with ``self._lock`` held, and every other caller queues behind it.
+        self._conn.execute(f"PRAGMA busy_timeout = {_RUNNING_LOCK_WAIT_MS}")
 
     def _init_schema(self) -> None:
         with self._conn:
@@ -1067,7 +1167,6 @@ class Db:
             self._backfill_chat_identities()
         self._prune_usage_history()
         self.prune_context_deliveries(self.context_retention_days)
-        self._prune_work_status_log()
 
     # --- context delivery ledger (#1471) -------------------------------
 
@@ -2420,6 +2519,66 @@ class Db:
             (session_key,),
         )
 
+    # --- per-session permission bypass (#4092) --------------------------
+
+    def bypass_permissions_on(self, session_key: str) -> bool:
+        return bool(
+            self._query(
+                "SELECT 1 FROM session_bypass_permissions WHERE session_key = ?",
+                (session_key,),
+            )
+        )
+
+    def bypass_permissions_previous(self, session_key: str) -> dict[str, object] | None:
+        rows = self._query(
+            "SELECT previous_settings_json FROM session_bypass_permissions"
+            " WHERE session_key = ?",
+            (session_key,),
+        )
+        if not rows:
+            return None
+        settings = json.loads(str(rows[0][0]))
+        return settings if isinstance(settings, dict) else None
+
+    def set_bypass_permissions(
+        self,
+        session_key: str,
+        enabled: bool,
+        previous_settings: dict[str, object] | None = None,
+    ) -> bool:
+        if enabled:
+            if previous_settings is None:
+                raise ValueError("the settings to restore are required when bypassing")
+            return self._write(
+                "INSERT INTO session_bypass_permissions"
+                "(session_key, previous_settings_json, enabled_at) VALUES (?, ?, ?)"
+                " ON CONFLICT(session_key) DO NOTHING",
+                (
+                    session_key,
+                    json.dumps(previous_settings, separators=(",", ":"), sort_keys=True),
+                    datetime.now(UTC).isoformat(),
+                ),
+            )
+        return self._write(
+            "DELETE FROM session_bypass_permissions WHERE session_key = ?",
+            (session_key,),
+        )
+
+    # --- the role a Codex chat started with (#4092) ---------------------
+
+    def session_role(self, session_key: str) -> str | None:
+        rows = self._query(
+            "SELECT role FROM session_roles WHERE session_key = ?", (session_key,)
+        )
+        return str(rows[0][0]) if rows else None
+
+    def set_session_role(self, session_key: str, role: str) -> bool:
+        return self._write(
+            "INSERT INTO session_roles(session_key, role) VALUES (?, ?)"
+            " ON CONFLICT(session_key) DO UPDATE SET role = excluded.role",
+            (session_key, role),
+        )
+
     # --- session pull requests ----------------------------------------
     # Registered by the session's own agent through the local API; the only
     # source of a chat's PRs.
@@ -2907,6 +3066,7 @@ class Db:
             reason=str(row[7]) if row[7] is not None else None,
             hold_reason=str(row[8]) if row[8] is not None else None,
             attachments=_held_attachments(row[9]),
+            interaction_answer=HeldAnswer.from_json(row[10]),
         )
 
     def record_scheduled_message(
@@ -2926,8 +3086,8 @@ class Db:
                 self._conn.execute(
                     "INSERT OR IGNORE INTO scheduled_messages"
                     " (id, chat_id, message, effort, due_at, created_at, state,"
-                    " reason, updated_at, hold_reason, attachments)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    " reason, updated_at, hold_reason, attachments, interaction_answer)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         message.id,
                         message.chat_id,
@@ -2940,6 +3100,9 @@ class Db:
                         now,
                         message.hold_reason,
                         attachments,
+                        message.interaction_answer.to_json()
+                        if message.interaction_answer is not None
+                        else None,
                     ),
                 )
                 row = self._conn.execute(
@@ -3033,6 +3196,20 @@ class Db:
         """Ids that still own a future delivery, in one pass-wide read."""
         rows = self._query(
             "SELECT id FROM scheduled_messages WHERE state IN ('scheduled', 'dispatching')"
+        )
+        return frozenset(str(row[0]) for row in rows)
+
+    def cancelled_scheduled_message_ids(self, hold_prefix: str) -> frozenset[str]:
+        """Rows cancelled before any send, whose hold reason starts with ``hold_prefix``.
+
+        ``cancel_scheduled_message`` also moves a failed row to cancelled when a person removes
+        it from the chat. A failure always records a ``reason`` and a cancel leaves it, so a
+        reason on a cancelled row marks one that failed first (#4074).
+        """
+        rows = self._query(
+            "SELECT id FROM scheduled_messages WHERE state = 'cancelled'"
+            " AND reason IS NULL AND hold_reason LIKE ?",
+            (f"{hold_prefix}%",),
         )
         return frozenset(str(row[0]) for row in rows)
 
@@ -3422,6 +3599,36 @@ class Db:
             pending.append(PendingSideChat(str(action_id), str(work_id), refs, created))
         return pending
 
+    def record_work_start_choice(self, work_id: str, choice: StartChoice) -> bool:
+        """Save what a New work press picked for ``work_id``; False if it was not saved."""
+        try:
+            with self._lock, self._conn:
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO work_start_choices"
+                    " (work_id, account_key, model, effort, created_at) VALUES (?, ?, ?, ?, ?)",
+                    (
+                        work_id,
+                        choice.account_key,
+                        choice.model,
+                        choice.effort,
+                        datetime.now(UTC).isoformat(),
+                    ),
+                )
+            return True
+        except sqlite3.Error as exc:
+            self._log_failure("write", exc)
+            return False
+
+    def work_start_choice(self, work_id: str) -> StartChoice | None:
+        """What a New work press picked for ``work_id``, or None for the deck's own choice."""
+        rows = self._query(
+            "SELECT account_key, model, effort FROM work_start_choices WHERE work_id = ?",
+            (work_id,),
+        )
+        if not rows:
+            return None
+        return StartChoice(*(str(value or "") for value in rows[0]))
+
     def delete_work_side_chat(self, action_id: str) -> None:
         self._write("DELETE FROM work_side_chats WHERE action_id = ?", (action_id,))
 
@@ -3515,6 +3722,21 @@ class Db:
             log.debug("work action read failed: %s", exc)
             return ()
         return tuple(self._work_action_press(row) for row in rows)
+
+    def newest_work_action(self, work_id: str, action: str, outcome: str) -> WorkActionPress | None:
+        """The Work's newest press of this kind with this outcome, however many other presses
+        came after it (a Work's side chat, #4199)."""
+        try:
+            with self._lock:
+                row = self._conn.execute(
+                    f"SELECT {self._WORK_ACTION_COLUMNS} FROM work_actions WHERE work_id = ?"
+                    " AND action = ? AND outcome = ? ORDER BY reserved_at DESC, rowid DESC LIMIT 1",
+                    (work_id, action, outcome),
+                ).fetchone()
+        except sqlite3.Error as exc:
+            log.debug("work action read failed: %s", exc)
+            return None
+        return self._work_action_press(row) if row is not None else None
 
     def load_issue_posts(self, work_id: str, limit: int = 1) -> tuple[WorkActionPress, ...]:
         """The newest chat messages posted to this Work's issue (#2416), newest first."""
@@ -3758,12 +3980,22 @@ class Db:
         " prev_kind, prev_tone, facts_mark, why, degraded, pid, revision"
     )
 
-    def _prune_work_status_log(self) -> None:
-        """Drop status-log rows past ``work_status_log.RETENTION``, once at open."""
+    def prune_work_status_log(self, limit: int) -> int:
+        """Delete up to ``limit`` oldest rows past ``RETENTION``; returns how many went (#4114).
+
+        One batch, so ``work_status_log.prune_forever`` lets other writers in between: a
+        day of the October burst in one delete took 5.8 s, past SQLite's 5 s wait for them.
+        Raises ``sqlite3.Error``, so a failure does not read as nothing left to delete.
+        """
         from .work_status_log import RETENTION
 
         cutoff = (datetime.now(UTC) - RETENTION).isoformat()
-        self._write("DELETE FROM work_status_log WHERE at < ?", (cutoff,))
+        with self._lock, self._conn:
+            return self._conn.execute(
+                "DELETE FROM work_status_log WHERE id IN"
+                " (SELECT id FROM work_status_log WHERE at < ? ORDER BY at LIMIT ?)",
+                (cutoff, limit),
+            ).rowcount
 
     def append_work_status_log(self, points: Iterable[WorkStatusPoint]) -> None:
         """Append status changes; a failed write is logged and the pass goes on."""
@@ -3833,12 +4065,26 @@ class Db:
         return [p for p in map(_status_point, reversed(rows)) if p is not None]
 
     def latest_work_status_points(self) -> dict[str, WorkStatusPoint]:
-        """Each Work's newest status-log row: where the next pass compares from."""
+        """Each Work's newest status-log row: where the next pass compares from.
+
+        Seeks each Work in ``idx_work_status_log_work`` rather than grouping: ``MAX(id)``
+        per Work reads the whole index, 7-9 s from a cold disk under ``_lock``, and the
+        web's event loop froze behind it after every deploy (#4114). The index orders a
+        Work's rows by ``at``, then ``id``, so "newest" here means just that.
+        """
         try:
             with self._lock:
                 rows = self._conn.execute(
-                    f"SELECT {self._STATUS_LOG_FIELDS} FROM work_status_log WHERE id IN"
-                    " (SELECT MAX(id) FROM work_status_log GROUP BY work_id)"
+                    "WITH RECURSIVE w(work_id) AS ("
+                    " SELECT MIN(work_id) FROM work_status_log"
+                    " UNION ALL"
+                    " SELECT (SELECT MIN(work_id) FROM work_status_log"
+                    " WHERE work_id > w.work_id)"
+                    " FROM w WHERE w.work_id IS NOT NULL)"
+                    f" SELECT {self._STATUS_LOG_FIELDS} FROM work_status_log WHERE id IN"
+                    " (SELECT (SELECT l.id FROM work_status_log l WHERE l.work_id = w.work_id"
+                    " ORDER BY l.at DESC, l.id DESC LIMIT 1)"
+                    " FROM w WHERE w.work_id IS NOT NULL)"
                 ).fetchall()
         except sqlite3.Error as exc:
             log.debug("work status log read failed: %s", exc)
@@ -3979,15 +4225,7 @@ class Db:
         try:
             with self._lock:
                 rows = self._conn.execute(
-                    "WITH own AS ("
-                    " SELECT a.work_id, COALESCE(t.session_key, ("
-                    "  SELECT b.session_key FROM session_work_bindings b"
-                    "  WHERE b.work_id = a.work_id AND b.evidence = 'side_chat'"
-                    "  AND b.bound_at >= a.reserved_at ORDER BY b.bound_at LIMIT 1"
-                    " )) AS session_key"
-                    " FROM work_actions a LEFT JOIN session_tokens t ON t.token = a.action_id"
-                    " WHERE a.action_id LIKE 'work-start-%')"
-                    " SELECT own.work_id, g.title, own.session_key FROM own"
+                    _OWN_CHAT_CTE + " SELECT own.work_id, g.title, own.session_key FROM own"
                     " LEFT JOIN chat_legs mine ON mine.session_key = own.session_key"
                     " LEFT JOIN chat_legs leg ON leg.chat_id = mine.chat_id"
                     " JOIN generated_titles g"
@@ -3998,6 +4236,20 @@ class Db:
             log.debug("work start chat title read failed: %s", exc)
             return {}
         return {str(work_id): (str(title), str(key)) for work_id, title, key in rows}
+
+    def work_agent_chat(self, work_id: str) -> str | None:
+        """The session key the Work's own agent chat started under, as ``work_start_chats``
+        reads it, or None (#4181): a helper or reviewer chat joined to the Work is not it."""
+        try:
+            with self._lock:
+                row = self._conn.execute(
+                    _OWN_CHAT_CTE + " SELECT session_key FROM own WHERE work_id = ?",
+                    (work_id,),
+                ).fetchone()
+        except sqlite3.Error as exc:
+            log.debug("work agent chat read failed: %s", exc)
+            return None
+        return str(row[0]) if row is not None and row[0] else None
 
     def set_work_agent_title(self, work_id: str, title: str, session_key: str) -> bool:
         """Set the name a worker gave its Work; an empty one clears it. Never touches the
@@ -4498,6 +4750,64 @@ class Db:
             self._log_failure("write", exc)
             return False
 
+    def review_event_pulls_after(self, seq: int) -> tuple[list[str], int]:
+        """The pull requests with a review event after ``seq``, and the newest ``seq`` read."""
+        rows = self._query(
+            "SELECT pull, MAX(seq) FROM review_events WHERE seq > ? GROUP BY pull", (seq,)
+        )
+        return [pull for pull, _newest in rows], max((row[1] for row in rows), default=seq)
+
+    def newest_review_event_seq(self) -> int:
+        rows = self._query("SELECT MAX(seq) FROM review_events")
+        return int(rows[0][0] or 0) if rows else 0
+
+    def review_checks(self, pull: str) -> dict[str, dict]:
+        """What the GitHub check said about ``pull``, by head (#4152)."""
+        rows = self._query(
+            "SELECT head, run_id, state, fingerprint, at FROM review_checks WHERE pull = ?",
+            (pull.lower(),),
+        )
+        return {
+            head: {"run_id": run_id, "state": state, "fingerprint": fingerprint, "at": at}
+            for head, run_id, state, fingerprint, at in rows
+        }
+
+    def put_review_check(
+        self, pull: str, head: str, run_id: int, state: str, fingerprint: str, at: float
+    ) -> None:
+        self._write(
+            "INSERT OR REPLACE INTO review_checks(pull, head, run_id, state, fingerprint, at)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (pull.lower(), head.lower(), run_id, state, fingerprint, float(at)),
+        )
+
+    def drop_review_check(self, pull: str, head: str) -> None:
+        self._write(
+            "DELETE FROM review_checks WHERE pull = ? AND head = ?", (pull.lower(), head.lower())
+        )
+
+    def drop_review_checks(self, pull: str) -> None:
+        self._write("DELETE FROM review_checks WHERE pull = ?", (pull.lower(),))
+
+    def review_check_pulls(self, states: Iterable[str]) -> list[str]:
+        """The pull requests with a head whose check is in one of ``states``."""
+        states = list(states)
+        marks = ", ".join("?" for _ in states)
+        rows = self._query(
+            f"SELECT DISTINCT pull FROM review_checks WHERE state IN ({marks})", tuple(states)
+        )
+        return [pull for (pull,) in rows]
+
+    def review_check_pull_of(self, repository: str, head: str, run_id: int) -> str:
+        """The pull request of ``repository`` whose check at ``head`` is the run ``run_id``, or
+        "". Two pull requests can share a head, so the run says which, and only its newest run
+        is stored: an older one finds nothing."""
+        rows = self._query(
+            "SELECT pull FROM review_checks WHERE head = ? AND run_id = ?", (head.lower(), run_id)
+        )
+        prefix = repository.lower() + "#"
+        return next((pull for (pull,) in rows if pull.startswith(prefix)), "")
+
     def has_review_event(self, key: str) -> bool:
         """Whether an event under ``key`` is stored; ``False`` when unreadable too."""
         return bool(self._query("SELECT 1 FROM review_events WHERE key = ?", (key,)))
@@ -4549,6 +4859,104 @@ class Db:
     def drop_review_events(self, pull: str) -> None:
         """Forget ``owner/repo#n``'s review history: it merged or closed."""
         self._write("DELETE FROM review_events WHERE pull = ?", (pull.lower(),))
+
+    # --- pull requests shipped with findings left to a follow-up (#4212) ---
+
+    def claim_shipped(
+        self,
+        pull: str,
+        head: str,
+        findings: str,
+        url: str,
+        at: float,
+        work: str = "",
+        base: str = "",
+    ) -> bool:
+        """Record that ``pull`` ships at ``head`` with its findings left; ``False`` when that
+        head was already recorded (or the write failed), so one press files one follow-up."""
+        try:
+            with self._lock, self._conn:
+                cursor = self._conn.execute(
+                    "INSERT OR IGNORE INTO shipped_follow_ups"
+                    "(pull, head, findings, url, at, work, base) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        pull.lower(),
+                        head.lower(),
+                        findings,
+                        url,
+                        float(at),
+                        work.lower(),
+                        base.lower(),
+                    ),
+                )
+            return cursor.rowcount > 0
+        except sqlite3.Error as exc:
+            self._log_failure("write", exc)
+            return False
+
+    def note_follow_up(self, pull: str, head: str, follow_up: str) -> bool:
+        """Name the follow-up issue (``owner/repo#n``) of a shipped head."""
+        return self._write(
+            "UPDATE shipped_follow_ups SET follow_up = ? WHERE pull = ? AND head = ?",
+            (follow_up.lower(), pull.lower(), head.lower()),
+        )
+
+    def note_shipped(self, pull: str, head: str, at: float) -> bool:
+        """Mark ``pull`` at ``head`` shipped: its review counted as passed at ``at``."""
+        return self._write(
+            "UPDATE shipped_follow_ups SET shipped = ? WHERE pull = ? AND head = ? AND shipped = 0",
+            (float(at), pull.lower(), head.lower()),
+        )
+
+    def note_shipped_merge(self, pull: str, merged: str) -> bool:
+        """Name the merge commit of ``pull``, once its merge is heard, on each head it
+        shipped with no merge named yet: the base merged in after a press is a new head of
+        the same change (#4212 review), and a pull request merges once."""
+        return self._write(
+            "UPDATE shipped_follow_ups SET merged = ? WHERE pull = ? AND merged = ''",
+            (merged.lower(), pull.lower()),
+        )
+
+    def shipped(self, pull: str, head: str) -> ShippedFollowUp | None:
+        """The record of ``pull`` shipped at ``head``, or ``None``."""
+        rows = self._shipped_rows(" WHERE pull = ? AND head = ?", (pull.lower(), head.lower()))
+        return rows[0] if rows else None
+
+    def shipped_for(self, follow_up: str) -> list[ShippedFollowUp]:
+        """The shipped heads whose findings the issue ``owner/repo#n`` follows up; a press
+        left unfinished did not ship and is not one."""
+        if not follow_up:
+            return []
+        return self._shipped_rows(" WHERE follow_up = ? AND shipped > 0", (follow_up.lower(),))
+
+    def shipped_by_work(self, work: str) -> list[ShippedFollowUp]:
+        """The heads the Work of issue ``owner/repo#n`` shipped with findings left; a press
+        left unfinished did not ship and is not one."""
+        if not work:
+            return []
+        return self._shipped_rows(" WHERE work = ? AND shipped > 0", (work.lower(),))
+
+    def _shipped_rows(self, where: str, params: tuple) -> list[ShippedFollowUp]:
+        rows = self._query(
+            "SELECT pull, head, follow_up, findings, url, at, work, base, merged, shipped"
+            " FROM shipped_follow_ups" + where + " ORDER BY at",
+            params,
+        )
+        return [
+            ShippedFollowUp(
+                pull=pull,
+                head=head,
+                follow_up=follow_up,
+                findings=findings,
+                url=url,
+                at=float(at),
+                work=work,
+                base=base,
+                merged=merged,
+                shipped=float(shipped),
+            )
+            for pull, head, follow_up, findings, url, at, work, base, merged, shipped in rows
+        ]
 
     # --- notes a chat shows and its agent never sees (#3227) ---
 

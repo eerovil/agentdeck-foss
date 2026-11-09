@@ -3,5 +3,7 @@
   <span class="dot {{ s.status }}{% if s.thinking %} thinking{% elif s.turn_failed %} failed{% endif %}"></span>
   <span class="session-title">{{ s.display_title }}</span>
   <span class="status-tag {{ s.display_state }}"{% if background_only %} data-background{% endif %}>{{ s.display_state }}</span>
+  {#- Tapping shows the numbers, because a phone has no tooltip (#4168): the panel is in session.html. #}
+  {% if s.chat_use %}<button type="button" class="use-info-open" popovertarget="session-use-info" title="What this chat's next message costs" aria-label="Next message cost: {{ s.chat_use.level }}" data-chat-use="{{ s.chat_use.level }}"><span class="use-dot use-{{ s.chat_use.level }}"></span></button>{% endif %}
   {% if s.subagent_count %}<span class="subagent-badge">{{ s.subagent_count }} sub-agent{{ '' if s.subagent_count == 1 else 's' }}</span>{% endif %}
 </div>

@@ -36,6 +36,7 @@ from .work_router import (
     REVIEW_POLICY_PATH,
     AgainBusy,
     AgainRefused,
+    ShipPorts,
     SwitchedRepositories,
     WorkRouterService,
     base_only_between,
@@ -54,6 +55,7 @@ from .work_signals import (
     read_map,
     read_map_body,
     read_parent,
+    start_unless_blocked,
     write_map_body,
 )
 from .work_start import start_action_id
@@ -139,6 +141,16 @@ def services_enabled(config) -> bool:
     return config.github_webhook.enabled if chosen is None else bool(chosen)
 
 
+def check_on(config) -> bool:
+    """Whether pull requests get the GitHub check (#4152): switched on, with the services
+    running, and in an edition with a reviewer."""
+    return (
+        config.review_check.enabled
+        and services_enabled(config)
+        and review_refs.reviewer_available()
+    )
+
+
 @dataclass
 class WorkServices:
     """The three moved services and what answers a call to them (``call``)."""
@@ -155,13 +167,19 @@ class WorkServices:
     #: Run before each router call: the services process reads the registrations again, so a
     #: pull request a chat registered a moment ago is known to the call it caused (#4016).
     before_router_call: Callable[[], object] | None = None
+    #: The GitHub check's publisher (#4152), ``None`` when it is off.
+    check: Any = None
 
     def start(self) -> None:
         self.router.start()
         self.backstop.start()
         self.release.start(self.state.bus, scanned=self.hooks.scanned)
+        if self.check is not None:
+            self.check.start()
 
     async def stop(self) -> None:
+        if self.check is not None:
+            await self.check.stop()
         await self.backstop.stop()
         await self.router.stop()
         await self.release.stop()
@@ -226,7 +244,9 @@ CALLS: dict[str, tuple[str, ...]] = {
         "note_registered",
         "ask_again",
         "accept",
+        "ship_now",
         "pre_review_done",
+        "check_request",
     ),
     "services": (
         "hold_filing",
@@ -489,6 +509,7 @@ def build(
         work_release.ReleaseStore(config.github_webhook.store_path / work_release.STORE_FILENAME),
         work_release.Ports(
             press_is_review=reviewer == agent_review.OFF,
+            ship_unfinished=state.ship_unfinished,
             switched=switched_repositories,
             paused=release_paused,
             starred=work_starred,
@@ -576,7 +597,7 @@ def build(
 
     services: WorkServices
 
-    async def start_work(repository: str, number: int, *, on_refused=None, **kwargs) -> str:
+    async def ask_runtime(repository: str, number: int, *, on_refused=None, **kwargs) -> str:
         # A start the runtime refuses later is reported back by the web (``start_refused``).
         work_id = WorkRef(repository.lower(), number).work_id
         if on_refused is not None:
@@ -584,6 +605,62 @@ def build(
         return await hooks.start_work(
             repository, number, on_refused=on_refused is not None, **kwargs
         )
+
+    async def start_work(repository: str, number: int, **kwargs) -> str:
+        # Held while a blocker is open or unread (#4216), on every router start and retry.
+        return await start_unless_blocked(ask_runtime, repository, number, **kwargs)
+
+    check = None
+    if check_on(config) and db is not None:
+        try:
+            from .review_check import ReviewCheckPublisher
+        except ImportError:  # the public copy has no reviewer and leaves the file out
+            ReviewCheckPublisher = None
+        if ReviewCheckPublisher is not None:
+            check = ReviewCheckPublisher(
+                state=state,
+                db=db,
+                owned=lambda repository, number: (
+                    work_owner_of_pull(state, repository, number) is not None
+                ),
+            )
+
+    async def ship_open_head(repository: str, number: int) -> tuple[str, bool, str]:
+        from .review_refs import pull_facts
+
+        facts = await pull_facts(repository, number) or {}
+        if str(facts.get("state") or "").upper() != "OPEN":
+            return "", False, ""
+        return (
+            str(facts.get("headRefOid") or ""),
+            bool(facts.get("isDraft")),
+            str(facts.get("baseRefOid") or ""),
+        )
+
+    async def ship_mark_ready(repository: str, number: int) -> bool:
+        from .work_claims import run_gh_write
+
+        argv = ["gh", "pr", "ready", str(number), "--repo", repository]
+        outcome, _why = await run_gh_write(argv, repository, "Mark ready")
+        return outcome == "done"
+
+    async def ship_file_issue(repository: str, title: str, body: str):
+        from .work_claims import own_assignee
+
+        assignee = own_assignee(repository, deck_claims)
+        return await file_shipped_issue(config.poller.root, repository, title, body, assignee)
+
+    ship = ShipPorts(
+        open_head=ship_open_head,
+        mark_ready=ship_mark_ready,
+        file_issue=ship_file_issue,
+        find_filed=find_shipped_issue,
+        claim=state.claim_shipped,
+        note_follow_up=state.note_follow_up,
+        note_merged=state.note_shipped_merge,
+        note_shipped=state.note_shipped,
+        shipped=state.shipped,
+    )
 
     router = WorkRouterService(
         config.github_webhook.path,
@@ -604,6 +681,8 @@ def build(
         ),
         refusal=work_event_refusal,
         ready_head=ready_pull_head,
+        # Review fixes that grew the diff over 15% add a design check to the checklist (#4220).
+        diff_sizes=review_refs.diff_sizes,
         enabled=enabled,
         watcher=watcher,
         # The ownership label on an issue no chat owns starts its Work's agent (step 5b).
@@ -645,7 +724,7 @@ def build(
         # A wayfinder map's chat wakes when its last ticket closes (#3627).
         read_issue=read_map,
         read_parent=read_parent,
-        # ... and a ticket starts once its last blocker closes (#3764).
+        # ... and an issue starts once its last blocker closes (#3764, #4216).
         read_dependencies=read_dependencies,
         start_ticket=start_unblocked_ticket,
         hold_labels=lambda repository: work_hold_labels(config.poller.root).get(
@@ -661,6 +740,10 @@ def build(
         # Each head's review history is the router's own record too (#3955).
         review_event=state.record_review_event,
         reviews=state.review_events,
+        check=check,
+        forget_reviews=state.forget_review_events,
+        # Ship now, fix later (#4212).
+        ship=ship,
     )
 
     def work_start_spent(work_id: str) -> bool:
@@ -681,17 +764,70 @@ def build(
         owned=lambda repository, number: work_owner_of_issue(state, repository, number) is not None,
         paused=release_paused,
         spent=work_start_spent,
-        start_work=lambda repository, number, **kwargs: hooks.start_work(
-            repository, number, wait=True, **kwargs
+        # Held while a blocker is open or unread (#4216), the same check as the router's.
+        start_work=lambda repository, number, **kwargs: start_unless_blocked(
+            hooks.start_work, repository, number, wait=True, **kwargs
         ),
         mine=deck_claims,
         enabled=enabled,
     )
     services = WorkServices(
-        router=router, release=release, backstop=backstop, hooks=hooks, state=state
+        router=router, release=release, backstop=backstop, hooks=hooks, state=state, check=check
     )
     router.filing_holds = services._filing_now
     return services
+
+
+async def file_shipped_issue(root: str, repository: str, title: str, body: str, assignee: str = ""):
+    """File a shipped head's follow-up issue as a New work is, with the repository's
+    canonical ownership label (the first its manifest names), so its Work starts.
+
+    Read in the manifest's order (#4223): ``work_start_labels`` keeps the labels as an
+    unordered set, which names no first one."""
+    from . import new_work
+    from .poller_ops import issue_label_targets
+
+    wanted = repository.lower()
+    labels = next(
+        (
+            target.ownership_labels
+            for target in issue_label_targets(root)
+            if target.repository.lower() == wanted
+        ),
+        (),
+    )
+    if not labels:
+        return new_work.Outcome("failed", f"{repository} has no ownership label to start it")
+    target = new_work.Target(repository, project="", ownership_label=labels[0])
+    return await new_work._create(target, title, body, False, assignee)
+
+
+async def find_shipped_issue(repository: str, marker: str, since: float) -> int | None:
+    """The issue of ``repository`` whose body carries ``marker``, among every issue updated
+    since ``since`` (#4212 review): ``None`` only once all of them were read.
+
+    Listed, not searched (a search index lags a filing by minutes), and every page, not the
+    newest few: an issue filed after ``since`` was updated after it too, and an hour's slack
+    covers a clock off from GitHub's. An unread page raises, so only a whole read proves
+    none was filed."""
+    import json
+    from datetime import UTC, datetime
+
+    from . import gh_cli
+
+    after = datetime.fromtimestamp(max(0.0, since - 3600), UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    argv = ["gh", "api", "--paginate"]
+    argv += [f"repos/{repository}/issues?state=all&since={after}&per_page=100"]
+    argv += ["--jq", ".[] | {number, body}"]
+    code, stdout = await gh_cli.run(argv, timeout=60)
+    if code != 0:
+        raise RuntimeError(f"listing {repository}'s issues exited {code}")
+    for line in (stdout or b"").decode().splitlines():
+        if line.strip():
+            item = json.loads(line)
+            if marker in str(item.get("body") or ""):
+                return int(item["number"])
+    return None
 
 
 def wake_registry_for(config) -> WakeOnRegistry:

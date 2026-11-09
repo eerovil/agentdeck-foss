@@ -93,6 +93,14 @@ class GitHubMetadataCache:
     NEGATIVE_TTL_S = 6 * 3600.0
     FAILURE_BACKOFF_S = 60.0
     LEASE_S = 15.0
+    # How long a read or write may wait out another writer. Two seconds where it can
+    # run on the event loop, where a longer wait stalls every page. A resolve's own
+    # claims, stores and row reads run only in worker threads (#3739), so they wait as
+    # long as opening a shared file does: on this host's busy disk one commit's syncs
+    # took 14 s (#4144), and a two-second wait lost the write, which the next read then
+    # showed as "not cached" (#4206).
+    LOOP_WAIT_S = 2.0
+    THREAD_WAIT_S = 30.0
 
     def __init__(self, path: Path | None = None) -> None:
         self.path = path or Path(
@@ -107,7 +115,7 @@ class GitHubMetadataCache:
             self._write_lock = _WRITE_LOCKS.setdefault(self.path.resolve(), threading.Lock())
         self._prepare()
 
-    def _connect(self) -> sqlite3.Connection:
+    def _connect(self, wait_s: float | None = None) -> sqlite3.Connection:
         """This thread's connection to the shared cache file.
 
         Opening SQLite is cheap but not free, and this cache is read on the hot
@@ -122,16 +130,19 @@ class GitHubMetadataCache:
         ``with connection:`` transaction, which commits as before and does not
         close the handle.
         """
-        existing = getattr(self._connections, "handle", None)
-        if existing is not None:
-            return existing
-        connection = sqlite3.connect(self.path, timeout=2.0)
-        connection.execute("PRAGMA busy_timeout = 2000")
-        self._connections.handle = connection
+        wait_ms = int((self.LOOP_WAIT_S if wait_s is None else wait_s) * 1000)
+        connection = getattr(self._connections, "handle", None)
+        if connection is None:
+            connection = sqlite3.connect(self.path, timeout=wait_ms / 1000)
+            self._connections.handle = connection
+            self._connections.wait_ms = None
+        if self._connections.wait_ms != wait_ms:
+            connection.execute(f"PRAGMA busy_timeout = {wait_ms}")
+            self._connections.wait_ms = wait_ms
         return connection
 
     @contextmanager
-    def _writing(self) -> Iterator[None]:
+    def _writing(self, wait_s: float | None = None) -> Iterator[None]:
         """Queue this process's writers to the file before SQLite sees them (#3914).
 
         Since #3739 a resolve's claims and stores run on several worker threads at once,
@@ -140,12 +151,18 @@ class GitHubMetadataCache:
         lost. Waiting here is bounded by the same timeout; past it the write goes on to
         SQLite, which still decides, so a caller never waits longer than twice that.
         """
-        acquired = self._write_lock.acquire(timeout=2.0)
+        acquired = self._write_lock.acquire(timeout=self.LOOP_WAIT_S if wait_s is None else wait_s)
         try:
             yield
         finally:
             if acquired:
                 self._write_lock.release()
+
+    @contextmanager
+    def _thread_writer(self) -> Iterator[sqlite3.Connection]:
+        """A write made only from a worker thread, with ``THREAD_WAIT_S`` to wait."""
+        with self._writing(self.THREAD_WAIT_S), self._connect(self.THREAD_WAIT_S) as connection:
+            yield connection
 
     def _discard_connection(self) -> None:
         """Throw this thread's handle away after a SQLite error.
@@ -433,7 +450,7 @@ class GitHubMetadataCache:
         ignore_backoff: bool = False,
     ) -> tuple[str | None, GitHubLookup]:
         try:
-            with self._writing(), self._connect() as connection:
+            with self._thread_writer() as connection:
                 connection.execute("BEGIN IMMEDIATE")
                 row = connection.execute(
                     """
@@ -487,7 +504,7 @@ class GitHubMetadataCache:
     ) -> bool:
         try:
             payload = json.dumps(metadata.value, separators=(",", ":"), sort_keys=True)
-            with self._writing(), self._connect() as connection:
+            with self._thread_writer() as connection:
                 cursor = connection.execute(
                     """
                     UPDATE github_metadata_v1 SET
@@ -507,7 +524,7 @@ class GitHubMetadataCache:
         """``key``'s row as ``(payload, fetched_at)``, None when there is no row, or
         ``_UNREAD`` when the file could not be read."""
         try:
-            with self._connect() as connection:
+            with self._connect(self.THREAD_WAIT_S) as connection:
                 row = connection.execute(
                     "SELECT payload, fetched_at FROM github_metadata_v1 WHERE key = ?", (key,)
                 ).fetchone()
@@ -534,7 +551,7 @@ class GitHubMetadataCache:
         """
         try:
             payload = json.dumps(metadata.value, separators=(",", ":"), sort_keys=True)
-            with self._writing(), self._connect() as connection:
+            with self._thread_writer() as connection:
                 if seen is None:
                     cursor = connection.execute(
                         """
@@ -565,7 +582,7 @@ class GitHubMetadataCache:
     def _fetched_at(self, key: str) -> float:
         """When ``key``'s stored value was fetched, or 0 when it has none or is unreadable."""
         try:
-            with self._connect() as connection:
+            with self._connect(self.THREAD_WAIT_S) as connection:
                 row = connection.execute(
                     "SELECT fetched_at FROM github_metadata_v1 WHERE key = ?", (key,)
                 ).fetchone()
@@ -577,7 +594,7 @@ class GitHubMetadataCache:
 
     def _back_off(self, key: str, now: float, token: str) -> None:
         try:
-            with self._writing(), self._connect() as connection:
+            with self._thread_writer() as connection:
                 connection.execute(
                     """
                     UPDATE github_metadata_v1

@@ -257,6 +257,11 @@ def check_isolation(
         "github_webhook.enabled": (staging_config.github_webhook.enabled, False),
         "chat_board.enabled": (staging_config.chat_board.enabled, False),
         "poller.issue_refresh_interval_s": (staging_config.poller.issue_refresh_interval_s, 0),
+        # Its stub refuses the writes, but a review chat it opened would be production's.
+        "review_check.enabled with the Work services enabled": (
+            staging_config.review_check.enabled and services_enabled(staging_config),
+            False,
+        ),
     }
     for name, (value, wanted) in settings.items():
         if value != wanted:

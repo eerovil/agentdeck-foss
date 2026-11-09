@@ -7,6 +7,7 @@ import logging
 import shutil
 import time
 import uuid
+from collections import defaultdict
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
@@ -209,6 +210,8 @@ class JobSubmitRequest(BaseModel):
     workspaces: list[str] = Field(default_factory=list, max_length=16)
     # How long it may run (#3038): None lets the queue learn it from the project, 0 is no limit.
     max_minutes: int | None = Field(default=None, ge=0)
+    # Whether the chat wants a progress message every few minutes (#4080).
+    progress: bool = False
 
 
 class WorkWorkspaceReleaseRequest(BaseModel):
@@ -260,6 +263,7 @@ class StartRequest(ActionRequest):
     # Direct runtime callers are machine dispatchers unless an AgentDeck
     # primary-chat provider explicitly says otherwise.
     delegated: bool = True
+    role: SessionRole | None = None
     # Deck-minted self-identification token for the thread being started.
     session_token: str | None = None
     # Start the thread as a copy of this one through turn ``fork_turn_id`` (#2485).
@@ -570,7 +574,15 @@ class CodexRuntime:
         self._backend_scope = str(runtime_socket_path().resolve())
         self._persistent_backend = config.keyed_workers.persistent_backend
         self._budget_db = budget_db
+        self._start_bypassed = {
+            account.label
+            for account in config.accounts
+            if account.provider == "codex" and account.start_bypassed
+        }
         self.clients: dict[str, CodexAppServer] = {}
+        # One thread's two permission switches take turns: each reads the other's saved
+        # state, then waits on Codex, and must not change it in between (#4092).
+        self._permission_locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
         self._unload_task: asyncio.Task | None = None
         self._cleanup_tasks: set[asyncio.Task] = set()
         self._worker_change: Callable[[str, str], None] = lambda _label, _thread: None
@@ -628,6 +640,11 @@ class CodexRuntime:
                     ),
                     permission_prompts_allowed=lambda thread_id, account=account: (
                         self._budget_db.permission_prompts_allowed(
+                            f"{account.key}:{thread_id}"
+                        )
+                    ),
+                    bypass_permissions_on=lambda thread_id, account=account: (
+                        self._budget_db.bypass_permissions_on(
                             f"{account.key}:{thread_id}"
                         )
                     ),
@@ -711,30 +728,96 @@ class CodexRuntime:
         account = self.accounts[label]
         session_key = f"{account.key}:{thread_id}"
         client = self.client(label)
-        was_enabled = self._budget_db.permission_prompts_allowed(session_key)
-        previous_policy = self._budget_db.permission_prompts_previous_policy(session_key)
-        if enabled:
-            previous_policy = await client.current_approval_policy(thread_id)
-            if previous_policy is None:
-                return InjectResult(False, "Codex approval policy is not available yet")
-        result = await client.set_permission_prompts(
-            thread_id, enabled, previous_policy=previous_policy
-        )
-        if result.accepted:
-            persisted = self._budget_db.set_permission_prompts(
-                session_key, enabled, previous_policy
+        async with self._permission_locks[session_key]:
+            if self._budget_db.bypass_permissions_on(session_key):
+                # Bypass holds the approval policy at "never"; this switch would move it.
+                return InjectResult(False, "switch off Bypass permissions first")
+            was_enabled = self._budget_db.permission_prompts_allowed(session_key)
+            previous_policy = self._budget_db.permission_prompts_previous_policy(session_key)
+            if enabled:
+                previous_policy = await client.current_approval_policy(thread_id)
+                if previous_policy is None:
+                    return InjectResult(False, "Codex approval policy is not available yet")
+            result = await client.set_permission_prompts(
+                thread_id, enabled, previous_policy=previous_policy
             )
-            if not persisted:
-                restored = await client.set_permission_prompts(
-                    thread_id,
-                    was_enabled,
-                    previous_policy=previous_policy,
+            if result.accepted:
+                persisted = self._budget_db.set_permission_prompts(
+                    session_key, enabled, previous_policy
                 )
-                reason = "could not save permission prompt setting"
+                if not persisted:
+                    restored = await client.set_permission_prompts(
+                        thread_id,
+                        was_enabled,
+                        previous_policy=previous_policy,
+                    )
+                    reason = "could not save permission prompt setting"
+                    if not restored.accepted:
+                        reason += "; could not restore the prior runtime setting"
+                    return InjectResult(False, reason)
+            return result
+
+    async def set_bypass_permissions(
+        self, label: str, thread_id: str, enabled: bool
+    ) -> InjectResult:
+        """Switch one thread's "Bypass permissions" on or off (#4092)."""
+        session_key = f"{self.accounts[label].key}:{thread_id}"
+        client = self.client(label)
+        async with self._permission_locks[session_key]:
+            was_enabled = self._budget_db.bypass_permissions_on(session_key)
+            if enabled == was_enabled:
+                return InjectResult(True)
+            previous = (
+                await client.current_permission_settings(thread_id)
+                if enabled
+                else self._budget_db.bypass_permissions_previous(session_key)
+            )
+            if previous is None:
+                return InjectResult(False, "Codex permission settings are not available yet")
+            result = await client.set_bypass_permissions(
+                thread_id, enabled, previous_settings=previous
+            )
+            if result.accepted and not self._budget_db.set_bypass_permissions(
+                session_key, enabled, previous
+            ):
+                restored = await client.set_bypass_permissions(
+                    thread_id, was_enabled, previous_settings=previous
+                )
+                reason = "could not save the bypass setting"
                 if not restored.accepted:
                     reason += "; could not restore the prior runtime setting"
                 return InjectResult(False, reason)
-        return result
+            return result
+
+    async def prepare_new_thread(
+        self,
+        label: str,
+        thread_id: str,
+        *,
+        role: SessionRole | None,
+        bypass: bool,
+    ) -> InjectResult:
+        """What a new thread needs in place before its first message is sent (#4092)."""
+        if role and not self._budget_db.set_session_role(
+            f"{self.accounts[label].key}:{thread_id}", role
+        ):
+            return InjectResult(False, "could not save the chat's role")
+        if bypass:
+            return await self.set_bypass_permissions(label, thread_id, True)
+        return InjectResult(True)
+
+    def starts_bypassed(self, label: str, body: StartRequest) -> bool:
+        """Whether a new chat starts with the switch on, as Claude's do (#2319).
+
+        A delegated worker and a chat that names its own sandbox keep that limit; a
+        side chat is a copy of a chat whose switch it does not share.
+        """
+        return (
+            label in self._start_bypassed
+            and not body.delegated
+            and body.sandbox is None
+            and body.fork_thread_id is None
+        )
 
     async def nudge_session(
         self, label: str, thread_id: str, delivery_id: str, message: str = NUDGE_MESSAGE
@@ -810,6 +893,11 @@ class CodexRuntime:
                 f"{account.key}:{thread_id}"
             ),
             "permission_prompts_available": True,
+            "bypass_permissions": self._budget_db.bypass_permissions_on(
+                f"{account.key}:{thread_id}"
+            ),
+            "bypass_permissions_available": True,
+            "role": self._budget_db.session_role(f"{account.key}:{thread_id}"),
         }
 
 
@@ -1199,7 +1287,11 @@ class RestartNudges:
             previous = {}
         now = time.time()
         try:
-            survivors = find_survivors(
+            # On a thread: the background lookup reads each recent chat's whole
+            # transcript, and some are 80 MB. On the event loop that held the runtime
+            # back from serving for 40 s after every restart (#4100).
+            survivors = await asyncio.to_thread(
+                find_survivors,
                 snapshots,
                 now=now,
                 ttl_s=self.registry.ttl_s,
@@ -2078,6 +2170,7 @@ def create_runtime_app(config: AppConfig) -> FastAPI:
                 run_id=body.run_id,
                 workspaces=body.workspaces,
                 max_minutes=body.max_minutes,
+                progress=body.progress,
             )
         except JobError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from None
@@ -2113,6 +2206,8 @@ def create_runtime_app(config: AppConfig) -> FastAPI:
             ),
             # How many local jobs wait for memory while slots are free (#3614).
             "memory_waiting": queue.memory_waiting,
+            # And how many wait for their temp folder's disk (#4143).
+            "scratch_waiting": queue.scratch_waiting,
         }
 
     @app.get("/job-evidence")
@@ -2190,6 +2285,15 @@ def create_runtime_app(config: AppConfig) -> FastAPI:
             "released": [item.as_json() for item in outcomes],
             "unclaimed": unclaimed,
         }
+
+    @app.post(work_claims.RELEASE_IDLE_PATH)
+    async def release_idle_work_workspace(body: WorkWorkspaceReleaseRequest) -> dict[str, Any]:
+        """The Work's issue closed long ago: release its claims if none is in use (#4148)."""
+        service = _require_work_workspaces()
+        outcomes, kept = await asyncio.to_thread(
+            service.release_idle, body.work_id, execution_active=_execution_active()
+        )
+        return {"released": [item.as_json() for item in outcomes], "kept": kept}
 
     @app.get(work_claims.CLAIMS_PATH)
     async def work_workspace_claims(work_id: str = "") -> dict[str, Any]:
@@ -2717,11 +2821,18 @@ def create_runtime_app(config: AppConfig) -> FastAPI:
                     effort=body.effort,
                     approval_policy=body.approval_policy,
                     delegated=body.delegated,
+                    role=body.role,
                     session_token=body.session_token,
                     fork_from=(
                         ForkFrom(body.fork_thread_id, body.fork_turn_id)
                         if body.fork_thread_id and body.fork_turn_id
                         else None
+                    ),
+                    before_first_turn=lambda thread_id: runtime.prepare_new_thread(
+                        label,
+                        thread_id,
+                        role=body.role,
+                        bypass=runtime.starts_bypassed(label, body),
                     ),
                 ),
             )
@@ -2775,6 +2886,14 @@ def create_runtime_app(config: AppConfig) -> FastAPI:
     ) -> dict[str, Any]:
         return _result(
             await runtime.set_permission_prompts(label, body.thread_id, body.enabled)
+        )
+
+    @app.post("/accounts/{label}/bypass-permissions")
+    async def bypass_permissions(
+        label: str, body: PermissionPromptsRequest
+    ) -> dict[str, Any]:
+        return _result(
+            await runtime.set_bypass_permissions(label, body.thread_id, body.enabled)
         )
 
     @app.post("/accounts/{label}/steer")

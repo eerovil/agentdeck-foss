@@ -7,12 +7,25 @@ a Work's section, Needs you category, status kind or tone changes, so a wrong or
 
 from __future__ import annotations
 
+import asyncio
+import sqlite3
 from datetime import UTC, datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
 
-from agentdeck.work_status_log import GONE, HIDDEN, StatusPoint, changes, flaps, point
+from agentdeck.work_status_log import (
+    GONE,
+    HIDDEN,
+    PRUNE_BATCH,
+    PRUNE_BATCH_WAIT_S,
+    PRUNE_IDLE_WAIT_S,
+    StatusPoint,
+    changes,
+    flaps,
+    point,
+    prune_forever,
+)
 
 NOW = datetime(2026, 10, 9, 12, 0, tzinfo=UTC)
 A = "github_issue:eerovil/agentdeck#1"
@@ -215,11 +228,106 @@ def test_rows_are_durable_newest_per_work_is_readable_and_old_ones_are_pruned(tm
     other = StatusPoint(B, now, "finished")
     db.append_work_status_log([old, first, second, other])
 
-    reopened = Db(path)  # opening drops rows past the 30 days
+    reopened = Db(path)
+    assert reopened.work_status_log(work_id=A) == [old, first, second], "opening deletes nothing"
+    assert reopened.prune_work_status_log(100) == 1
     assert reopened.work_status_log(work_id=A) == [first, second]
     assert reopened.work_status_log(since=now - timedelta(seconds=90)) == [second, other]
     assert reopened.work_status_log(limit=1) == [other]
     assert reopened.latest_work_status_points() == {A: second, B: other}
+
+
+def test_prune_takes_a_limited_batch_of_the_oldest_rows_past_the_limit(tmp_path, monkeypatch):
+    from agentdeck import db as db_module
+    from agentdeck.db import Db
+
+    path = tmp_path / "control.sqlite3"
+    db = Db(path)
+    now = datetime(2026, 11, 5, 12, tzinfo=UTC)
+
+    class Frozen(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now
+
+    monkeypatch.setattr(db_module, "datetime", Frozen)
+    cutoff = now - timedelta(days=30)
+    oldest = StatusPoint(A, cutoff - timedelta(days=2), "active")
+    older = StatusPoint(B, cutoff - timedelta(days=1), "active")
+    at_cutoff = StatusPoint(A, cutoff, "finished")
+    db.append_work_status_log([older, oldest, at_cutoff])
+
+    assert db.prune_work_status_log(1) == 1
+    assert db.work_status_log() == [older, at_cutoff], "the oldest by time, not by id"
+    assert db.prune_work_status_log(5) == 1
+    assert Db(path).prune_work_status_log(5) == 0, "an overlapping worker finds nothing left"
+    assert db.work_status_log() == [at_cutoff], "a row exactly at the limit stays"
+
+
+def test_newest_per_work_is_by_time_then_id_and_seeks_rather_than_scans(tmp_path):
+    from agentdeck.db import Db
+
+    db = Db(tmp_path / "control.sqlite3")
+    assert db.latest_work_status_points() == {}
+
+    now = datetime.now(UTC)
+    late = StatusPoint(A, now, "active")
+    written_after = StatusPoint(A, now - timedelta(seconds=5), "finished")
+    tied_first = StatusPoint(B, now, "active")
+    tied_second = StatusPoint(B, now, "finished")
+    only = StatusPoint("github_issue:o/r#3", now, "needs_you")
+    db.append_work_status_log([late, written_after, tied_first, tied_second, only])
+
+    assert db.latest_work_status_points() == {
+        A: late,
+        B: tied_second,
+        only.work_id: only,
+    }
+
+    # #4114: a scan of this table under ``Db._lock`` froze the web after every deploy.
+    statements: list[str] = []
+    db._conn.set_trace_callback(statements.append)
+    db.latest_work_status_points()
+    db._conn.set_trace_callback(None)
+    (statement,) = statements
+    plan = [row[3] for row in db._conn.execute(f"EXPLAIN QUERY PLAN {statement}")]
+    assert not [step for step in plan if step.startswith("SCAN work_status_log")], plan
+
+
+@pytest.mark.parametrize(
+    ("deleted", "wait"),
+    [
+        (PRUNE_BATCH, PRUNE_BATCH_WAIT_S),
+        (PRUNE_BATCH - 1, PRUNE_IDLE_WAIT_S),
+        (None, PRUNE_IDLE_WAIT_S),
+    ],
+)
+async def test_prune_forever_goes_on_soon_only_after_a_full_batch(deleted, wait, caplog):
+    class Stop(Exception):
+        pass
+
+    class Log:
+        limits: list[int] = []
+
+        def prune_work_status_log(self, limit: int) -> int:
+            self.limits.append(limit)
+            if deleted is None:
+                raise sqlite3.OperationalError("database is locked")
+            return deleted
+
+    waits: list[float] = []
+
+    async def stop_after_two(seconds: float) -> None:
+        waits.append(seconds)
+        if len(waits) == 2:
+            raise Stop
+
+    with pytest.raises(Stop):
+        await prune_forever(Log(), stop_after_two)
+
+    assert waits == [wait, wait]
+    assert Log.limits == [PRUNE_BATCH, PRUNE_BATCH]
+    assert ("database is locked" in caplog.text) == (deleted is None)
 
 
 @pytest.mark.asyncio
@@ -328,6 +436,36 @@ async def test_an_unreadable_issue_cache_fails_the_pass_instead_of_reopening_wor
         await app.state.work_overview.refresh()
     assert app.state.work_overview.overview is kept
     assert app.state.control_db.work_status_log(work_id=WORK.work_id) == before
+
+
+async def test_prune_forever_stops_on_cancel_and_the_web_lifespan_runs_it(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from agentdeck import work_status_log
+
+    class Log:
+        def prune_work_status_log(self, limit: int) -> int:
+            return 0
+
+    task = asyncio.create_task(prune_forever(Log()))
+    await asyncio.sleep(0.01)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    seen: list[str] = []
+
+    async def recorded(db) -> None:
+        seen.append("started")
+        try:
+            await asyncio.Event().wait()
+        finally:
+            seen.append("stopped")
+
+    monkeypatch.setattr(work_status_log, "prune_forever", recorded)
+    with TestClient(_deck(tmp_path, monkeypatch)):
+        assert seen == ["started"]
+    assert seen == ["started", "stopped"]
 
 
 def test_the_routes_read_the_log_and_its_flaps(tmp_path, monkeypatch):

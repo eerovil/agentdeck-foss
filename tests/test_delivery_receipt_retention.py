@@ -46,6 +46,28 @@ def _stage_historically(store, delivery_id, **fields):
     store[delivery_id].update(delivery_stage="prepared_before_write", **fields)
 
 
+def test_sweep_expires_a_quiet_store_keeps_its_fences_and_waits_an_hour(clock):
+    """A chat that went quiet gets no delivery to clean it, so the sweep must (#4143)."""
+    quiet, busy = {}, {}
+    _settle(DeliveryReceipts(quiet), "old")
+    DeliveryReceipts(quiet).prepare("unfinished", "fingerprint", session_id=None)
+    clock[0] += delivery.DELIVERY_RETRY_HORIZON_S + 1
+    _settle(DeliveryReceipts(quiet), "recent")
+    sweep = delivery.ReceiptSweep()
+    quiet["old-too"] = {**quiet["recent"], "at": 0.0}
+
+    sweep.run([DeliveryReceipts(quiet), DeliveryReceipts(busy)])
+    assert set(quiet) == {"unfinished", "recent"}
+
+    quiet["old-too"] = {**quiet["recent"], "at": 0.0}
+    clock[0] += delivery.RECEIPT_SWEEP_INTERVAL_S - 1
+    sweep.run([DeliveryReceipts(quiet)])
+    assert "old-too" in quiet  # Not yet: every save must not walk every record.
+    clock[0] += 1
+    sweep.run([DeliveryReceipts(quiet)])
+    assert "old-too" not in quiet
+
+
 @pytest.mark.parametrize("kind", ["age", "count"])
 @pytest.mark.parametrize("stage", ["legacy", "prepared", "writing", "identified"])
 def test_unfinished_receipt_survives_cleanup_and_json_reload(clock, monkeypatch, kind, stage):

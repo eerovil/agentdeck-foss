@@ -18,7 +18,7 @@ from agentdeck.models import (
     SessionStatus,
     UsageSnapshot,
 )
-from agentdeck.scheduled_messages import RUNTIME_HOLD, ScheduledMessage
+from agentdeck.scheduled_messages import RUNTIME_HOLD, HeldAnswer, ScheduledMessage
 from agentdeck.state import AppState
 
 
@@ -1311,6 +1311,9 @@ def test_scheduled_message_survives_reopen_and_retries_a_dispatching_row(tmp_pat
         created_at=created_at,
         # Only a send held for a restarting runtime is drawn in its chat (#2847).
         hold_reason=RUNTIME_HOLD,
+        interaction_answer=HeldAnswer(
+            "codex:test:sid", "tok-1", "question", "print", {"q": ["yes"]}, "accept"
+        ),
     )
     db = Db(path)
     try:

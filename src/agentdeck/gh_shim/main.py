@@ -39,6 +39,8 @@ from .classify import (
     classify,
     credential_identity,
     is_terminal,
+    label_values,
+    misplaced_start_label,
     ownership_label_to_add,
     repo_identity,
     target_owner,
@@ -325,6 +327,34 @@ def _ownership_label(
         return None
 
 
+def _warn_misplaced_label(argv: list[str], remote: str | None) -> None:
+    """Say so when a label just written starts no Work in this repository (#4141).
+
+    Every project has its own start label, and the wrong one looks like it worked: the
+    issue carries a label and nothing ever happens. Read only for a call that names a
+    label, and like the ownership label above, a failure here costs nothing but the note.
+    """
+    if not label_values(argv):
+        return
+    try:
+        from .. import github_accounts, poller_ops
+
+        repository = target_repo(argv, remote=remote)
+        found = misplaced_start_label(
+            argv, repository, poller_ops.issue_label_targets(github_accounts.poller_root())
+        )
+    except Exception:  # noqa: BLE001 — a warning, never a reason to fail the write
+        return
+    if found is not None:
+        wrong, right = found
+        _note(
+            f"warning: '{wrong}' does not start a Work in {repository}, so no agent will "
+            f"pick this issue up. Its start label is '{right}'. Start it with POST "
+            f"$AGENTDECK_URL/api/works/<owner>/<repo>/<issue number>/start, which picks the "
+            "label itself"
+        )
+
+
 def _issue_create(
     argv: list[str],
     environment: dict[str, str],
@@ -353,6 +383,8 @@ def _issue_create(
     sys.stdout.write(stdout)
     if code == 0:
         _tell_deck_filed(stdout, environment)
+        if label is None:
+            _warn_misplaced_label(argv, remote)
     return code
 
 
@@ -707,6 +739,8 @@ def main(argv: list[str] | None = None) -> int:
             code = _issue_create(arguments, environment, cache, remote)
         else:
             code = _passthrough(arguments, environment, cache, kind="write")
+            if (decision.group, decision.verb) == ("issue", "edit") and code == 0:
+                _warn_misplaced_label(arguments, remote)
         if decision.invalidates and code == 0:
             cache.invalidate(decision.invalidates)
         if (decision.group, decision.verb) == ("pr", "ready") and code == 0:

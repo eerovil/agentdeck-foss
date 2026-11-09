@@ -102,6 +102,9 @@ def test_only_a_works_own_agent_chat_names_it(tmp_path):
     assert titles(db) == {usual: "renamed"}
     # The key the chat started under, so the front page can ask which Works it is in.
     assert db.work_start_chats() == {usual: ("renamed", "k:own")}
+    # The same chat, untitled too, is what a New work pick follows (#4181); a helper is not.
+    assert (db.work_agent_chat(usual), db.work_agent_chat(early)) == ("k:own", "k:early")
+    assert db.work_agent_chat("github_issue:eerovil/agentdeck#1") is None
 
 
 def test_a_chat_in_several_works_names_none_of_them():

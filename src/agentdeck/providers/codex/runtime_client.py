@@ -115,11 +115,34 @@ class CodexRuntimeClient(RuntimeSocketClient):
     def interaction(self, thread_id: str) -> PendingInteraction | None:
         return _interaction(self._state.get(thread_id, {}).get("interaction"))
 
+    def forget_interaction(self, thread_id: str) -> None:
+        """Take an answer held for the runtime out of the copy kept here (#4106).
+
+        The snapshot bytes go too, so the runtime's next read replaces this copy even
+        if it says exactly what the last one said.
+        """
+        thread = self._state.get(thread_id)
+        if thread is None:
+            return
+        thread["interaction"] = None
+        self._snapshot = None
+        self._on_change(thread_id)
+
     def permission_prompts_allowed(self, thread_id: str) -> bool:
         return bool(self._state.get(thread_id, {}).get("permission_prompts"))
 
     def permission_prompts_available(self, thread_id: str) -> bool:
         return bool(self._state.get(thread_id, {}).get("permission_prompts_available"))
+
+    def bypass_permissions_on(self, thread_id: str) -> bool:
+        return bool(self._state.get(thread_id, {}).get("bypass_permissions"))
+
+    def bypass_permissions_available(self, thread_id: str) -> bool:
+        return bool(self._state.get(thread_id, {}).get("bypass_permissions_available"))
+
+    def role(self, thread_id: str) -> str | None:
+        value = self._state.get(thread_id, {}).get("role")
+        return value if isinstance(value, str) else None
 
     async def start_thread(
         self,
@@ -132,6 +155,7 @@ class CodexRuntimeClient(RuntimeSocketClient):
         effort: str | None = None,
         approval_policy: str | None = None,
         delegated: bool = False,
+        role: str | None = None,
         session_token: str | None = None,
         fork_from: ForkFrom | None = None,
     ) -> InjectResult:
@@ -144,6 +168,7 @@ class CodexRuntimeClient(RuntimeSocketClient):
             "effort": effort,
             "approval_policy": approval_policy,
             "delegated": delegated,
+            "role": role,
             "session_token": session_token,
         }
         if fork_from is not None:
@@ -178,6 +203,11 @@ class CodexRuntimeClient(RuntimeSocketClient):
     ) -> InjectResult:
         return await self._post(
             "permission-prompts", {"thread_id": thread_id, "enabled": enabled}
+        )
+
+    async def set_bypass_permissions(self, thread_id: str, enabled: bool) -> InjectResult:
+        return await self._post(
+            "bypass-permissions", {"thread_id": thread_id, "enabled": enabled}
         )
 
     async def steer(

@@ -161,12 +161,20 @@ async def test_a_running_job_s_chat_hears_how_it_goes(tmp_path):
     await queue.start()
     script = "echo 'collected 3 items'; sleep 0.2"
     job = queue.submit(
-        command=["sh", "-c", script], cwd=str(tmp_path), session_key="claude_code:a:b"
+        command=["sh", "-c", script],
+        cwd=str(tmp_path),
+        session_key="claude_code:a:b",
+        progress=True,
     )
-    # Beside it, a job with no chat to tell runs through several intervals of its own.
-    quiet = queue.submit(command=["sleep", "0.2"], cwd=str(tmp_path))
+    # Beside it, a job with no chat to tell and one that did not ask each run through
+    # several intervals of their own.
+    quiet = queue.submit(command=["sleep", "0.2"], cwd=str(tmp_path), progress=True)
+    unasked = queue.submit(
+        command=["sleep", "0.2"], cwd=str(tmp_path), session_key="claude_code:a:b"
+    )
     final = await _settle(queue, job.id)
     await _settle(queue, quiet.id)
+    await _settle(queue, unasked.id)
     await queue.stop()
 
     assert final.state == DONE
@@ -191,7 +199,9 @@ async def test_progress_messages_stop_when_the_job_ends(tmp_path):
     queue._notify_progress = notify_progress
     queue._progress_interval_s = 0.05
     await queue.start()
-    job = queue.submit(command=["true"], cwd=str(tmp_path), session_key="claude_code:a:b")
+    job = queue.submit(
+        command=["true"], cwd=str(tmp_path), session_key="claude_code:a:b", progress=True
+    )
     await _settle(queue, job.id)
     await asyncio.sleep(0.15)
     await queue.stop()

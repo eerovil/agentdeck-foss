@@ -1,17 +1,22 @@
-"""Starting a new Work from the deck (#2415): its issue is filed at once, attachments included.
+"""Starting a new Work from the deck (#2415): its issue is filed at once.
 
-The route reserves the press's client action id before anything reaches GitHub, uploads any
-attachments to the project's evidence repository one after another, then creates the issue
-with the canonical ownership label (and the spec-only label when asked) as the repository
-owner's non-human authority. A failed upload files nothing; a create that ended without proof
-either way is never made again.
+The route reserves the press's client action id before anything reaches GitHub, saves any
+attachments on the deck (never on GitHub, #4135), then creates the issue with the canonical
+ownership label (and the spec-only label when asked) as the repository owner's non-human
+authority. A failed save files nothing; a create that ended without proof either way is never
+made again.
 """
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import dataclasses
+import errno
 import json
+import os
+import stat
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -56,7 +61,7 @@ BOARD = BoardView(scopes=(AGENTDECK, TRAILHEAD, MINECRAFT))
 
 # --- which repositories, and what filing there needs ---------------------------------------------
 
-def test_targets_are_every_issue_repository_with_its_own_projects_labels_and_evidence():
+def test_targets_are_every_issue_repository_with_its_own_projects_labels():
     found = {target.repository: target for target in new_work.targets(BOARD)}
 
     assert sorted(found) == sorted(
@@ -75,11 +80,7 @@ def test_targets_are_every_issue_repository_with_its_own_projects_labels_and_evi
     ]
     deck = found["eerovil/agentdeck"]
     # The first ownership label is the canonical one for creating an issue.
-    assert (deck.ownership_label, deck.spec_only_label, deck.evidence_repository) == (
-        "agent", "spec-only", "eerovil/agent-evidence"
-    )
-    assert found["Northwind/store"].evidence_repository == "Northwind/issues"
-    assert found["eerovil/game-mod"].evidence_repository == ""
+    assert (deck.ownership_label, deck.spec_only_label) == ("agent", "spec-only")
     assert found["eerovil/game-mod"].spec_only_label == ""
 
 
@@ -111,30 +112,33 @@ def test_attachment_names_are_made_unique_within_one_filing():
     ]
 
 
-def test_the_body_embeds_images_links_files_and_says_how_to_read_them():
-    uploaded = (
-        new_work.Uploaded("a b.png", "agentdeck/new-work/x/a b.png", "c0ffee", "b10b", True),
-        new_work.Uploaded("log.txt", "agentdeck/new-work/x/log.txt", "c0ffee2", "b10b2", False),
+def test_the_body_names_each_file_and_says_where_to_read_it(monkeypatch):
+    monkeypatch.setenv("AGENTDECK_PUBLIC_URL", "https://deck.example")
+    kept = (
+        new_work.Kept("a b.png", "/deck/files/x/a b.png"),
+        new_work.Kept("log.txt", "/deck/files/x/log.txt"),
     )
 
     body = new_work.compose_body(
         "Chart labels overlap\n\nOn the phone.",
-        evidence="eerovil/agent-evidence",
-        uploaded=uploaded,
+        kept=kept,
         chat_url="https://deck.example/chats/abc",
     )
 
     assert body.startswith("Chart labels overlap\n\nOn the phone.")
     assert "Started from [this chat](https://deck.example/chats/abc)" in body
-    assert (
-        "![a b.png](https://github.com/eerovil/agent-evidence/blob/c0ffee/"
-        "agentdeck/new-work/x/a%20b.png?raw=1)"
-    ) in body
-    assert "- [log.txt](https://github.com/eerovil/agent-evidence/blob/c0ffee2/" in body
-    assert (
-        "`gh api repos/eerovil/agent-evidence/git/blobs/b10b --jq .content "
-        "| base64 -d > 'a b.png'`"
-    ) in body
+    assert "Kept on the deck, not on GitHub." in body
+    link = "https://deck.example/deck/files/x/a%20b.png"
+    assert f"- [a b.png]({link}) `/deck/files/x/a b.png`" in body
+    assert "- [log.txt](https://deck.example/deck/files/x/log.txt) `/deck/files/x/log.txt`" in body
+    # GitHub cannot fetch from the deck's private address: no picture to show broken.
+    assert "![" not in body
+
+
+def test_a_body_with_no_public_address_still_gives_the_path():
+    body = new_work.compose_body("Text", kept=(new_work.Kept("a.png", "/deck/a.png"),))
+
+    assert "- `/deck/a.png`" in body and "](" not in body
 
 
 def test_a_body_without_a_chat_or_files_is_just_the_text():
@@ -162,14 +166,7 @@ class _Gh:
             url = "https://github.com/eerovil/agentdeck/issues/77"
             answer = (0, json.dumps({"number": 77, "html_url": url}).encode(), b"")
         else:
-            index = len(self.calls)
-            answer = (
-                0,
-                json.dumps(
-                    {"commit": {"sha": f"commit{index}"}, "content": {"sha": f"blob{index}"}}
-                ).encode(),
-                b"",
-            )
+            raise AssertionError(f"unexpected gh call: {argv}")
         if isinstance(answer, BaseException):
             raise answer
         return answer
@@ -181,6 +178,7 @@ def _app(tmp_path, monkeypatch, *, gh: _Gh | None = None, board=BOARD):
     app = _app_with_state(tmp_path)
     monkeypatch.setattr(app.state.issues, "read_board", lambda: board)
     monkeypatch.setattr(new_work.shutil, "which", lambda name: "/usr/bin/gh")
+    monkeypatch.setattr(new_work, "FILES_ROOT", tmp_path / "new-work-files")
     gh = gh or _Gh()
     monkeypatch.setattr(gh_cli, "run_once", gh)
     return app, gh
@@ -203,10 +201,6 @@ def _file(client, *, message="Chart labels overlap on phone\n\nUnder 400px.",
 
 def _creates(gh):
     return [call for call in gh.calls if call[0][1:4] == ["api", "-X", "POST"]]
-
-
-def _uploads(gh):
-    return [call for call in gh.calls if call[0][1:4] == ["api", "-X", "PUT"]]
 
 
 def _labels(call):
@@ -278,8 +272,6 @@ def test_a_filing_assigns_this_decks_person_where_another_deck_takes_unassigned(
 
 async def _post_and_settle(app, **fields):
     """File through the app's own loop, then let the early start settle (#3590)."""
-    import asyncio
-
     import httpx
 
     from agentdeck.web import routes_works
@@ -303,8 +295,6 @@ async def test_the_agent_starts_before_github_answers_and_the_receipt_links_its_
     tmp_path, monkeypatch
 ):
     """#3590: the start runs while the issue is created, then is bound to the new Work."""
-    import asyncio
-
     from agentdeck import work_start
 
     app, gh = _app(tmp_path, monkeypatch)
@@ -314,8 +304,9 @@ async def test_the_agent_starts_before_github_answers_and_the_receipt_links_its_
     early = object()
     calls: list = []
 
-    async def start_before_issue(app_, repository, *, request, press):
+    async def start_before_issue(app_, repository, *, request, press, choice):
         # GitHub has not answered yet: the create waits on this very start.
+        assert choice is None  # nothing picked: the deck chooses, as before #4181
         calls.append(("start", repository, request, press, len(_creates(gh))))
         gh.gate.set()
         return early
@@ -376,12 +367,131 @@ async def test_with_no_early_start_the_work_starts_once_the_issue_exists(tmp_pat
     assert filed == [("eerovil/agentdeck", 77, ["agent", "spec-only"])]
 
 
+def _startable(app, monkeypatch):
+    """The deck may start chats, its Claude account and a Codex one may start one now, and
+    its Work router starts Works in eerovil/agentdeck only: elsewhere a Poller worker does."""
+    from agentdeck.models import Account
+    from agentdeck.providers import PROVIDERS
+
+    object.__setattr__(app.state.config.inject, "enabled", True)
+    monkeypatch.setattr(PROVIDERS["claude_code"], "can_start_session", lambda account: True)
+    monkeypatch.setattr(PROVIDERS["codex"], "can_start_session", lambda account: True)
+    if not any(account.provider_id == "codex" for account in app.state.accounts):
+        app.state.accounts = [
+            *app.state.accounts, Account("codex:cx", "codex", "cx", app.state.accounts[0].root)
+        ]
+    router = _router()
+    router.starts_on = lambda repository, labels: (
+        "agent" if repository.lower() == "eerovil/agentdeck" and "agent" in labels else ""
+    )
+    app.state.work_router = router
+
+
+async def test_a_picked_account_and_model_start_the_agent_and_stay_with_the_work(
+    tmp_path, monkeypatch
+):
+    """#4181: Edit advanced's pick reaches the early start and is saved under the Work."""
+    from agentdeck import work_start
+    from agentdeck.db import StartChoice
+    from agentdeck.providers import PROVIDERS
+
+    app, _gh = _app(tmp_path, monkeypatch)
+    _startable(app, monkeypatch)
+    app.state.work_router = _router()
+    picks: list = []
+
+    async def start_before_issue(app_, repository, *, request, press, choice):
+        picks.append(choice)
+        return None
+
+    monkeypatch.setattr(work_start, "start_before_issue", start_before_issue)
+
+    response, replay = await _post_and_settle(
+        app, account_key="claude_code:test", model="opus", effort="high"
+    )
+
+    assert response.status_code == 200, response.text
+    picked = StartChoice("claude_code:test", "opus", "high")
+    assert picks == [picked]
+    # A resend of the same press is a replay, even once the picked account cannot start:
+    # it answers what was filed and starts nothing more.
+    assert "Already filed" in replay.text
+    monkeypatch.setattr(PROVIDERS["claude_code"], "can_start_session", lambda account: False)
+    _response, late = await _post_and_settle(
+        app, account_key="claude_code:test", model="opus", effort="high"
+    )
+    assert late.status_code == 200 and "Already filed" in late.text
+    assert picks == [picked]
+    work_id = "github_issue:eerovil/agentdeck#77"
+    assert app.state.control_db.work_start_choice(work_id) == picked
+    # Nothing picked saves nothing: the Work's starts choose for themselves.
+    assert app.state.control_db.work_start_choice("github_issue:eerovil/agentdeck#78") is None
+
+
+async def test_a_codex_account_its_project_names_may_be_picked(tmp_path, monkeypatch):
+    """#4181: a Codex account, with Codex's own model and effort, is a pick too."""
+    from agentdeck import work_start
+    from agentdeck.db import StartChoice
+
+    app, _gh = _app(tmp_path, monkeypatch)
+    _startable(app, monkeypatch)
+    app.state.work_router = _router()
+    picks: list = []
+
+    async def start_before_issue(app_, repository, *, request, press, choice):
+        picks.append(choice)
+        return None
+
+    monkeypatch.setattr(work_start, "start_before_issue", start_before_issue)
+
+    response, _replay = await _post_and_settle(
+        app, account_key="codex:cx", model="gpt-6-sol", effort="ultra"
+    )
+
+    assert response.status_code == 200, response.text
+    assert picks == [StartChoice("codex:cx", "gpt-6-sol", "ultra")]
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "why", "repository"),
+    [
+        ("account_key", "claude_code:nobody", "may not start a Work in eerovil/agentdeck now",
+         "eerovil/agentdeck"),
+        ("model", "gpt-9", "the model “gpt-9” is not offered", "eerovil/agentdeck"),
+        ("effort", "ludicrous", "the effort “ludicrous” is not offered", "eerovil/agentdeck"),
+        # A model or effort is the picked account's provider's own: none of Claude's on Codex.
+        ({"account_key": "codex:cx", "model": "opus"}, None, "the model “opus” is not offered",
+         "eerovil/agentdeck"),
+        ({"account_key": "claude_code:test", "effort": "ultra"}, None,
+         "the effort “ultra” is not offered", "eerovil/agentdeck"),
+        # A Poller worker starts this Work and never reads a pick: refused, not dropped.
+        ("model", "opus", "is started by its Poller", "Northwind/store"),
+    ],
+)
+def test_a_pick_the_work_cannot_run_on_files_nothing(
+    tmp_path, monkeypatch, field, value, why, repository
+):
+    app, gh = _app(tmp_path, monkeypatch)
+    _startable(app, monkeypatch)
+    client = _client(app)
+    data = {
+        "message": "Chart labels overlap",
+        "repository": repository,
+        "client_action_id": "press-0001",
+        **(field if isinstance(field, dict) else {field: value}),
+    }
+
+    response = client.post("/works/new", data=data)
+
+    assert response.status_code == 422 and why in response.text
+    assert gh.calls == []
+    assert app.state.control_db.work_action("press-0001") is None
+
+
 async def test_the_work_chat_link_opens_the_chat_once_it_exists_else_the_work_page(
     tmp_path, monkeypatch
 ):
     """#3590: the receipt's link is drawn before the chat exists; it waits a little for it."""
-    import asyncio
-
     import httpx
 
     from agentdeck.web import routes_works
@@ -769,9 +879,7 @@ def test_a_chat_filing_without_a_public_address_leaves_the_link_out(tmp_path, mo
 
 # --- attachments ----------------------------------------------------------------------------------
 
-def test_attachments_upload_one_after_another_before_the_issue_and_are_pinned(
-    tmp_path, monkeypatch
-):
+def test_attachments_stay_on_the_deck_and_the_issue_only_names_them(tmp_path, monkeypatch):
     app, gh = _app(tmp_path, monkeypatch)
     files = [
         ("images", ("image.png", PNG, "image/png")),
@@ -782,44 +890,62 @@ def test_attachments_upload_one_after_another_before_the_issue_and_are_pinned(
     response = _file(_client(app), files=files)
 
     assert response.status_code == 200
-    kinds = [call[0][3] for call in gh.calls]
-    assert kinds == ["PUT", "PUT", "PUT", "POST"]
-    paths = [call[0][4] for call in _uploads(gh)]
-    assert paths == [
-        "repos/eerovil/agent-evidence/contents/agentdeck/new-work/press-0001/image.png",
-        "repos/eerovil/agent-evidence/contents/agentdeck/new-work/press-0001/image-2.png",
-        "repos/eerovil/agent-evidence/contents/agentdeck/new-work/press-0001/notes%3F.txt",
-    ]
-    for argv, stdin, repo in _uploads(gh):
-        # The file travels as JSON on stdin, never on the command line.
-        assert argv[:4] == ["/usr/bin/gh", "api", "-X", "PUT"] and argv[-2:] == ["--input", "-"]
-        assert repo == "eerovil/agent-evidence"
-        payload = json.loads(stdin)
-        assert base64.b64decode(payload["content"]) in (PNG, b"hello")
-        assert all(len(part) < 1000 for part in argv)
-    ((_argv, body, _repo),) = _creates(gh)
-    body = json.loads(body)["body"]
-    assert "![image.png](https://github.com/eerovil/agent-evidence/blob/commit1/" in body
-    assert "![image-2.png](https://github.com/eerovil/agent-evidence/blob/commit2/" in body
-    assert "- [notes?.txt](https://github.com/eerovil/agent-evidence/blob/commit3/" in body
-    assert "git/blobs/blob3 --jq .content" in body
+    # One write to GitHub, the issue: no file travels there.
+    ((_argv, stdin, _repo),) = gh.calls
+    assert _creates(gh) == gh.calls
+    body = json.loads(stdin)["body"]
+    folder = new_work.FILES_ROOT / "eerovil/agentdeck/press-0001"
+    assert (folder / "image.png").read_bytes() == PNG
+    assert (folder / "image-2.png").read_bytes() == PNG
+    assert (folder / "notes?.txt").read_bytes() == b"hello"
+    assert stat.S_IMODE(new_work.FILES_ROOT.stat().st_mode) == 0o700
+    assert stat.S_IMODE(folder.stat().st_mode) == 0o700
+    assert stat.S_IMODE((folder / "image.png").stat().st_mode) == 0o600
+    for name in ("image.png", "image-2.png", "notes?.txt"):
+        assert f"`{folder / name}`" in body
+    assert "github.com" not in body and base64.b64encode(PNG).decode() not in body
 
 
-def test_trailhead_attachments_go_to_outdoors_own_evidence_repository(tmp_path, monkeypatch):
+def test_each_press_has_its_own_folder_and_a_replay_saves_nothing_more(tmp_path, monkeypatch):
     app, gh = _app(tmp_path, monkeypatch)
+    client = _client(app)
+    shot = [("images", ("shot.png", PNG, "image/png"))]
 
-    _file(
-        _client(app),
-        repository="Northwind/store",
-        files=[("images", ("shot.png", PNG, "image/png"))],
+    _file(client, action_id="press-0001", files=shot)
+    _file(client, action_id="press-0002", files=[("images", ("shot.png", b"other", "text/plain"))])
+    replay = _file(client, action_id="press-0001", files=[("images", ("x.png", PNG, "image/png"))])
+
+    assert "Already filed" in replay.text and len(_creates(gh)) == 2
+    root = new_work.FILES_ROOT / "eerovil/agentdeck"
+    assert (root / "press-0001/shot.png").read_bytes() == PNG
+    assert (root / "press-0002/shot.png").read_bytes() == b"other"
+    assert not (root / "press-0001/x.png").exists()
+
+
+def test_the_early_agent_gets_the_same_paths_the_issue_has(tmp_path, monkeypatch):
+    app, gh = _app(tmp_path, monkeypatch)
+    target = new_work.Target("eerovil/agentdeck", "agentdeck", "agent")
+    told: list[str] = []
+
+    outcome = asyncio.run(
+        new_work.file(
+            target,
+            title="T",
+            text="T",
+            spec_only=False,
+            folder="press-0001",
+            attachments=[new_work.Attachment("a.png", PNG)],
+            on_body=told.append,
+        )
     )
 
-    ((argv, _stdin, repo),) = _uploads(gh)
-    assert argv[4].startswith("repos/Northwind/issues/contents/store/new-work/")
-    assert repo == "Northwind/issues"
+    assert outcome.state == "done"
+    assert str(new_work.FILES_ROOT / "eerovil/agentdeck/press-0001/a.png") in told[0]
+    ((_argv, stdin, _repo),) = gh.calls
+    assert json.loads(stdin)["body"] == told[0]
 
 
-def test_files_for_a_project_with_no_evidence_repository_are_refused(tmp_path, monkeypatch):
+def test_a_project_with_no_evidence_repository_takes_files(tmp_path, monkeypatch):
     app, gh = _app(tmp_path, monkeypatch)
 
     response = _file(
@@ -828,20 +954,71 @@ def test_files_for_a_project_with_no_evidence_repository_are_refused(tmp_path, m
         files=[("images", ("shot.png", PNG, "image/png"))],
     )
 
-    assert response.status_code == 422 and "no evidence repository" in response.text
+    assert response.status_code == 200
+    assert (new_work.FILES_ROOT / "eerovil/game-mod/press-0001/shot.png").is_file()
+
+
+def test_a_failed_save_files_nothing_and_says_which_file(tmp_path, monkeypatch):
+    app, gh = _app(tmp_path, monkeypatch)
+    files = [
+        ("images", ("first.png", PNG, "image/png")),
+        ("images", ("shot.png", PNG, "image/png")),
+    ]
+    real_open = os.open
+
+    def full_disk(path, *args, **kwargs):
+        if str(path).endswith("shot.png"):
+            raise OSError(errno.ENOSPC, "No space left on device")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(new_work.os, "open", full_disk)
+
+    response = _file(_client(app), files=files)
+
+    assert response.status_code == 409
+    assert "shot.png could not be kept: No space left on device" in response.text
     assert gh.calls == []
+    assert not (new_work.FILES_ROOT / "eerovil/agentdeck/press-0001").exists()
+    (press,) = app.state.control_db.load_work_actions("new-work:eerovil/agentdeck")
+    assert press.state == "failed"
 
 
-def test_a_failed_upload_files_nothing_and_says_which_file(tmp_path, monkeypatch):
-    app, gh = _app(tmp_path, monkeypatch, gh=_Gh((1, b"", b"HTTP 422: Invalid request\n")))
+def test_a_filing_github_refused_removes_its_files(tmp_path, monkeypatch):
+    app, _gh = _app(tmp_path, monkeypatch, gh=_Gh((1, b"", b"HTTP 422: Invalid request\n")))
 
     response = _file(_client(app), files=[("images", ("shot.png", PNG, "image/png"))])
 
     assert response.status_code == 409
-    assert "shot.png could not be uploaded" in response.text
-    assert _creates(gh) == []
-    (press,) = app.state.control_db.load_work_actions("new-work:eerovil/agentdeck")
-    assert press.state == "failed"
+    assert not (new_work.FILES_ROOT / "eerovil/agentdeck/press-0001").exists()
+
+
+def test_an_uncertain_filing_keeps_its_files(tmp_path, monkeypatch):
+    app, _gh = _app(tmp_path, monkeypatch, gh=_Gh(TimeoutError()))
+
+    response = _file(_client(app), files=[("images", ("shot.png", PNG, "image/png"))])
+
+    assert response.status_code == 202
+    assert (new_work.FILES_ROOT / "eerovil/agentdeck/press-0001/shot.png").is_file()
+
+
+def test_the_sweep_removes_only_old_press_folders(tmp_path, monkeypatch):
+    root = tmp_path / "files"
+    monkeypatch.setattr(new_work, "FILES_ROOT", root)
+    old, fresh = root / "o/r/old-press", root / "o/r/new-press"
+    for folder in (old, fresh):
+        folder.mkdir(parents=True)
+        (folder / "a.png").write_bytes(PNG)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (root / "o/r/link").symlink_to(outside)
+    now = time.time()
+    os.utime(old, (now - new_work.FILES_TTL_S - 60,) * 2)
+    os.utime(outside, (now - new_work.FILES_TTL_S - 60,) * 2)
+
+    new_work.sweep_old_files(now)
+
+    assert not old.exists() and (fresh / "a.png").exists()
+    assert outside.is_dir() and (root / "o/r/link").is_symlink()
 
 
 def test_too_many_files_are_refused_before_any_upload(tmp_path, monkeypatch):
@@ -864,7 +1041,34 @@ def test_the_front_page_offers_a_closed_new_work_form(tmp_path, monkeypatch):
     assert '<details class="new-chat new-work" id="new-work">' in page.text
     assert 'data-agentdeck-action="new_work"' in page.text
     assert 'value="eerovil/agentdeck"' in page.text
-    assert 'data-evidence="Northwind/issues"' in page.text
+    assert "the issue lists only their links and paths. Don't attach secrets." in page.text
+    # #4181: no Work here is started by the deck, so there is nothing to pick.
+    assert "new-work-advanced" not in page.text
+    # Account, model and effort, collapsed; only accounts its Work may run on, and only for
+    # a repository whose Work the deck starts (not Northwind/store, a Poller's).
+    _startable(app, monkeypatch)
+    page = _client(app).get("/")
+    assert (
+        '<details class="advanced-settings new-work-advanced" data-new-work-advanced'
+        ' data-repositories="eerovil/agentdeck" data-auto-provider="claude_code">' in page.text
+    )
+    assert '<option value="">Auto (most usage left)</option>' in page.text
+    assert (
+        '<option value="claude_code:test" data-provider="claude_code"'
+        ' data-repositories="eerovil/agentdeck">' in page.text
+    )
+    assert (
+        '<option value="codex:cx" data-provider="codex" data-repositories="eerovil/agentdeck">'
+        in page.text
+    )
+    # Each provider's models and efforts; the script keeps the chosen account's, and Auto
+    # is Claude, so Codex's start hidden.
+    assert '<option value="opus" data-provider="claude_code">Opus</option>' in page.text
+    assert '<option value="high" data-provider="claude_code">High</option>' in page.text
+    assert (
+        '<option value="gpt-6-sol" data-provider="codex" hidden disabled>GPT-6 Sol</option>'
+        in page.text
+    )
     # It guesses its project from what is typed (#3367); a chat's own form does not.
     assert "data-guess-project" in page.text
     assert "data-guess-project" not in _client(app).get("/sessions/claude_code:test:sid1").text
@@ -913,7 +1117,7 @@ def test_no_form_without_a_poller_repository(tmp_path, monkeypatch):
 async def test_the_front_page_form_files_keeps_words_on_failure_and_follows_the_project(
     tmp_path, monkeypatch
 ):
-    """Closed by default, attachments follow the chosen project, and only "Filed" clears it."""
+    """Closed by default, attaching works on every project, and only "Filed" clears it."""
     import os
 
     from conftest import async_playwright
@@ -942,7 +1146,7 @@ async def test_the_front_page_form_files_keeps_words_on_failure_and_follows_the_
         form = box.locator("form")
         message = form.locator('textarea[name="message"]')
         repository = form.locator('select[name="repository"]')
-        attach = form.locator("[data-new-work-attach]")
+        attach = form.locator(".new-work-attach")
         assert await repository.input_value() == "eerovil/agentdeck"
         await repository.select_option("eerovil/agentdeck")
         assert await attach.is_visible()
@@ -950,10 +1154,10 @@ async def test_the_front_page_form_files_keeps_words_on_failure_and_follows_the_
             {"name": "shot.png", "mimeType": "image/png", "buffer": PNG}
         )
         await form.locator(".paste-preview").wait_for()
-        # A project with nowhere to keep files hides Attach and drops the picked file.
+        # Files stay on the deck, so every project takes them and a picked file stays.
         await repository.select_option("eerovil/game-mod")
-        assert await attach.is_hidden()
-        assert await form.locator(".paste-preview").count() == 0
+        assert await attach.is_visible()
+        assert await form.locator(".paste-preview").count() == 1
         assert await form.locator("[data-new-work-spec-only]").is_hidden()
         await repository.select_option("eerovil/agentdeck")
         await message.fill("Usage chart labels overlap on phone")
@@ -1066,7 +1270,7 @@ async def test_the_front_page_form_files_keeps_words_on_failure_and_follows_the_
         assert await select.input_value() == "Northwind/store"
         await page.locator('[data-project-tab="minecraft"]').click()
         assert await select.input_value() == "eerovil/game-mod"
-        assert await page.locator("details#new-work [data-new-work-attach]").is_hidden()
+        assert await page.locator("details#new-work .new-work-attach").is_visible()
 
         # A project that sorts first starts on its docker only as the browser's automatic
         # first option, which is no one's choice: its tab and its name still land on the
@@ -1100,6 +1304,66 @@ async def test_the_front_page_form_files_keeps_words_on_failure_and_follows_the_
         await fresh.locator('[data-project-tab="trailhead"]').click()
         await fresh.locator("details#new-work summary").click()
         assert await select.input_value() == "Northwind/issues"
+        await browser.close()
+
+
+@pytest.mark.browser
+@pytest.mark.asyncio
+async def test_edit_advanced_hides_and_clears_its_picks_for_a_poller_repository(
+    tmp_path, monkeypatch
+):
+    """#4181 review: in a form listing a deck-started and a Poller-started repository,
+    moving to the Poller's hides the whole box and sends none of its picks."""
+    from conftest import async_playwright
+    from test_web import _live_server
+
+    app, _gh = _app(tmp_path, monkeypatch)
+    _startable(app, monkeypatch)
+    async with _live_server(app) as base, async_playwright() as playwright:
+        browser = await playwright.chromium.launch()
+        page = await browser.new_page(viewport={"width": 390, "height": 844},
+                                      service_workers="block")
+        await page.goto(base + "/")
+        await page.locator("details#new-work > summary").click()
+        form = page.locator("details#new-work form")
+        box = form.locator("[data-new-work-advanced]")
+        await form.locator('select[name="repository"]').select_option("eerovil/agentdeck")
+        assert await box.is_visible()
+        await box.locator("summary").click()
+        await form.locator('select[name="account_key"]').select_option("claude_code:test")
+        await form.locator('select[name="model"]').select_option("opus")
+        await form.locator('select[name="effort"]').select_option("high")
+        summary = form.locator("[data-new-work-advanced-summary]")
+        assert await summary.text_content() == "test · Opus · High effort"
+        # A Codex account offers Codex's models only; Claude's pick goes back to Default,
+        # and an effort both offer stays.
+        models = form.locator('select[name="model"]')
+        await form.locator('select[name="account_key"]').select_option("codex:cx")
+        offered = await models.evaluate("s => Array.from(s.options).map(o => o.value)")
+        assert "opus" not in offered and "gpt-6-sol" in offered
+        assert await summary.text_content() == "cx · default model · High effort"
+        await models.select_option("gpt-6-sol")
+        await form.locator('select[name="effort"]').select_option("ultra")
+        # Back on Auto (a Claude account), Codex's picks are gone again.
+        await form.locator('select[name="account_key"]').select_option("")
+        offered = await models.evaluate("s => Array.from(s.options).map(o => o.value)")
+        assert "opus" in offered and "gpt-6-sol" not in offered
+        assert await summary.text_content() == "Auto account · default model"
+        await form.locator('select[name="account_key"]').select_option("claude_code:test")
+        await models.select_option("opus")
+        await form.locator('select[name="effort"]').select_option("high")
+
+        await form.locator('select[name="repository"]').select_option("Northwind/store")
+        assert not await box.is_visible()
+        sent = await form.evaluate(
+            "f => ['account_key', 'model', 'effort'].filter(n => new FormData(f).get(n))"
+        )
+        assert sent == []
+
+        # Back on a deck-started repository the box returns with nothing picked.
+        await form.locator('select[name="repository"]').select_option("eerovil/agentdeck")
+        assert await box.is_visible()
+        assert await summary.text_content() == "Auto account · default model"
         await browser.close()
 
 

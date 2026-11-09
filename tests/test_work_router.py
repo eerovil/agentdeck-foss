@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
@@ -32,9 +33,11 @@ from agentdeck.work_router import (
     AgainRefused,
     SwitchedRepositories,
     WorkRouterService,
+    _grown,
     classify,
     owner_of_issue,
     owner_of_pull,
+    pulls_by_work,
     pulls_lookup,
     work_pulls,
 )
@@ -83,6 +86,7 @@ def comment(
             "id": kw.pop("comment_id", 100),
             "author_association": kw.pop("comment_association", "OWNER"),
             **({"created_at": kw.pop("created_at")} if "created_at" in kw else {}),
+            **({"performed_via_github_app": {"slug": kw.pop("via")}} if "via" in kw else {}),
         },
         **kw,
     )
@@ -121,6 +125,11 @@ class Harness:
         self.fail_review = False
         self.refuse = None
         self.heads: dict[tuple[str, int], str] = {}
+        # Changed lines of the pull request's diff at each head (#4220); a head left out is
+        # unread. ``size_read`` replaces the read when set (it may raise).
+        self.sizes: dict[str, int] = {}
+        self.size_read = None
+        self.size_reads: list[tuple[str, ...]] = []
         self.now = 1000.0
         self.store_refuses = False
         self.stored: set[str] = set()
@@ -140,6 +149,12 @@ class Harness:
 
         async def ready_head(repository: str, number: int) -> str:
             return self.heads.get((repository, number), "")
+
+        async def diff_sizes(repository: str, number: int, heads: tuple[str, ...]):
+            self.size_reads.append(heads)
+            if self.size_read is not None:
+                self.size_read()
+            return {head: self.sizes[head] for head in heads if head in self.sizes}
 
         def schedule(message):
             if any(item.id == message.id for item in self.scheduled):
@@ -168,6 +183,7 @@ class Harness:
             on_verdict=lambda chat, pulls: self.verdicts.append((chat, pulls)),
             review_event=self.note,
             reviews=self.reviews_of,
+            diff_sizes=diff_sizes,
         )
         self.acknowledged: list[tuple[str, int]] = []
 
@@ -801,12 +817,20 @@ async def test_a_maps_last_ticket_closing_wakes_the_maps_chat(
     assert "Reach the destination" in message.text
 
 
-def _dep(number, state="open", labels=("wayfinder:research",), repository="eerovil/agentdeck"):
-    return {"repository": repository, "number": number, "state": state, "labels": list(labels)}
+def _dep(
+    number, state="open", labels=("wayfinder:research",), repository="eerovil/agentdeck",
+    assignee="",
+):
+    return {
+        "repository": repository, "number": number, "state": state, "labels": list(labels),
+        "assignee": assignee,
+    }
 
 
 def _unblock_harness(harness, blocking, blockers, *, fail=None):
-    """The router with the dependency reads and the Start write faked (#3764)."""
+    """The router with the dependency reads, the Start write and the Work start faked
+    (#3764, #4216): ``started`` holds ``("label", n)`` for the Start write, ``("work", n)``
+    for a labelled issue's Work started."""
     asked, started = [], []
 
     async def read_dependencies(repository, number, kind):
@@ -816,13 +840,19 @@ def _unblock_harness(harness, blocking, blockers, *, fail=None):
         return blocking.get(number, []) if kind == "blocking" else blockers.get(number, [])
 
     async def start_ticket(repository, number):
-        started.append((repository, number))
+        started.append(("label", number))
         return "done", f"Started {repository}#{number}"
+
+    async def start_work(repository, number, **kwargs):
+        started.append(("work", number))
+        return "started"
 
     harness.service._read_dependencies = read_dependencies
     harness.service._start_ticket = start_ticket
+    harness.service._start_work = start_work
     harness.service._start_labels = lambda repository: ("agent",)
     harness.service._hold_labels = lambda repository: ("Paused",)
+    harness.service._mine = lambda repository, assignee: assignee != "coworker"
     return asked, started
 
 
@@ -831,30 +861,36 @@ def _unblock_harness(harness, blocking, blockers, *, fail=None):
     [
         # #3705 on map #3697: both blockers closed, the second by the deck's own login.
         (_dep(30), [_dep(21, "closed"), _dep(22, "closed")], ["wayfinder:research"], None,
-         True, "eerovil/agentdeck#30 has no open blocker: done"),
+         "label", "eerovil/agentdeck#30 has no open blocker: done"),
         (_dep(30), [_dep(21, "closed"), _dep(22)], ["wayfinder:research"], None,
-         False, "eerovil/agentdeck#30 waits on #22"),
-        (_dep(30, labels=["wayfinder:task", "Agent"]), [], ["wayfinder:research"], None,
-         False, "already has its start label"),
+         None, "eerovil/agentdeck#30 waits on #22"),
+        # #4216: a store repository's issue #1134, a map's build issue labelled only with the
+        # start label, closed as the last blocker of #1149, another build issue: no wayfinder
+        # label on either, and it starts all the same.
+        (_dep(30, labels=["Agent"]), [_dep(22, "closed")], ["agent"], None,
+         "work", "eerovil/agentdeck#30 has no open blocker: starting its Work"),
+        (_dep(30, labels=["bug"]), [], ["agent"], None,
+         "label", "eerovil/agentdeck#30 has no open blocker: done"),
         (_dep(30, labels=["wayfinder:task", "paused"]), [], ["wayfinder:research"], None,
-         False, "it is paused"),
-        (_dep(30, "closed"), [], ["wayfinder:research"], None, False, "it is closed"),
-        (_dep(30, labels=["bug"]), [], ["wayfinder:research"], None,
-         False, "not a wayfinder ticket"),
+         None, "it is paused"),
+        (_dep(30, "closed"), [], ["wayfinder:research"], None, None, "it is closed"),
         (_dep(30, labels=["wayfinder:map"]), [], ["wayfinder:research"], None,
-         False, "not a wayfinder ticket"),
-        # An ordinary issue's close reads nothing at all.
-        (_dep(30), [], ["agent"], None, False, None),
-        (_dep(30), [], ["wayfinder:research"], "blocking", False, "blocks unread"),
-        (_dep(30), [], ["wayfinder:research"], "blocked_by", False, "blockers of"),
+         None, "it is a wayfinder map"),
+        # #4216 review: assigned to another deck's person, labelled or not, it is theirs.
+        (_dep(30, assignee="coworker"), [], ["agent"], None, None, "another deck works it"),
+        (_dep(30, labels=["agent"], assignee="coworker"), [], ["agent"], None,
+         None, "another deck works it"),
+        (_dep(30), [], ["wayfinder:research"], "blocking", None, "blocks unread"),
+        (_dep(30), [], ["wayfinder:research"], "blocked_by", None, "blockers of"),
     ],
 )
-async def test_a_tickets_last_blocker_closing_starts_it(
+async def test_an_issues_last_blocker_closing_starts_it(
     root, harness, caplog, blocked, blockers, closed_labels, fail, started, why
 ):
-    """#3764: a wayfinder ticket waits for every blocker, then gets the Start button's write,
-    whoever closed the last one; a labelled, paused, closed or non-ticket one is left alone,
-    and a failed read starts nothing and stops nothing else."""
+    """#3764, #4216: an issue waits for every blocker, then starts, whoever closed the last
+    one: an unlabelled one gets the Start button's write, a labelled one, whose label's start
+    waited, starts its Work. A paused, closed or map one is left alone, and a failed read
+    starts nothing and stops nothing else."""
     caplog.set_level("INFO", logger="agentdeck.work_router")
     asked, starts = _unblock_harness(harness, {22: [blocked]}, {30: blockers}, fail=fail)
     deliver(
@@ -862,21 +898,30 @@ async def test_a_tickets_last_blocker_closing_starts_it(
         event="issues",
         delivery="d1",
         action="closed",
-        sender={"login": "eerovil-agent", "type": "User"},
+        sender={"login": "agentdeck-eerovil[bot]", "type": "Bot"},
         issue={"number": 22, "state": "closed", "labels": [{"name": n} for n in closed_labels]},
     )
     await harness.drain()
-    assert starts == ([("eerovil/agentdeck", 30)] if started else [])
-    if why is None:
-        assert asked == []
-        return
+    assert starts == ([(started, 30)] if started else [])
     logged = [r.getMessage() for r in caplog.records if r.name == "agentdeck.work_router"]
     assert any(why in line for line in logged), logged
-    # A replay of the delivery reads the ticket again, now labelled, and starts nothing more.
+    # A replay of the delivery reads the issue again, now labelled and owned by its Work's
+    # chat, and starts nothing more.
     if started:
         blocked["labels"].append("agent")
+        harness.issues[("eerovil/agentdeck", 30)] = ("chat-t", "eerovil/agentdeck#30")
         await harness.service.apply(read(root))
         assert len(starts) == 1
+        logged = [r.getMessage() for r in caplog.records if r.name == "agentdeck.work_router"]
+        assert any("already has its start label and a chat" in line for line in logged)
+
+
+async def test_a_pull_requests_close_reads_no_blockers(root, harness):
+    asked, starts = _unblock_harness(harness, {22: [_dep(30)]}, {30: []})
+    deliver(root, event="issues", delivery="d1", action="closed", sender=PERSON,
+            issue={"number": 22, "state": "closed", "pull_request": {"url": "x"}})
+    await harness.drain()
+    assert asked == [] and starts == []
 
 
 async def test_a_blocker_removed_by_hand_starts_a_ticket_left_with_none(root, harness):
@@ -896,7 +941,7 @@ async def test_a_blocker_removed_by_hand_starts_a_ticket_left_with_none(root, ha
         )
     await harness.drain()
     assert asked == [("blocked_by", 30), ("blocked_by", 31)]
-    assert starts == [("eerovil/agentdeck", 30)]
+    assert starts == [("label", 30)]
 
 
 async def test_a_handed_over_maps_last_ticket_wakes_no_chat_here(root, harness):
@@ -1209,6 +1254,23 @@ def test_a_pull_request_whose_chat_joined_two_works_is_not_placed():
         )
 
 
+def test_a_registration_naming_a_work_outweighs_a_newer_chat_naming_none():
+    """#4125: chats from a branch's first life, more recently active, do not take the pull
+    request from the chat that registered it for the Work it was revived under."""
+    old = SimpleNamespace(repository="eerovil/agentdeck", number=7)
+    revived = SimpleNamespace(repository="eerovil/agentdeck", number=8)
+    named = PullRequestRef("eerovil/other", 9, "github_issue:eerovil/agentdeck#8")
+    state = FakeState(
+        pulls={"chat-old": (PullRequestRef("eerovil/other", 9),), "chat-new": (named,)},
+        joined={"chat-old": (old,), "chat-new": (revived, old)},
+        activity={"chat-old": 0, "chat-new": 60},
+    )
+    assert owner_of_pull(state, "eerovil/other", 9) == ("chat-new", "eerovil/agentdeck#8")
+    # A Work its chat has left names nothing: the newest chat decides, as before.
+    state._joined["chat-new"] = (old,)
+    assert owner_of_pull(state, "eerovil/other", 9) == ("chat-old", "eerovil/agentdeck#7")
+
+
 def test_work_pulls_places_every_pull_with_one_projection():
     """#2954: one projection for the whole deck, and the same set ``owner_of_pull`` gives."""
     seven = SimpleNamespace(repository="eerovil/agentdeck", number=7)
@@ -1250,6 +1312,10 @@ def test_work_pulls_places_every_pull_with_one_projection():
         "eerovil/other#9",
     )
     assert work_pulls(state, "github_issue:eerovil/agentdeck#8") == ("eerovil/agentdeck#10",)
+    # #4125: a Work page places only what it shows, by the same rule.
+    assert pulls_by_work(state, only={("eerovil/other", 9)}) == {
+        "eerovil/agentdeck#7": ("eerovil/other#9",)
+    }
     # #3993: one walk answers every Work, the same as asking each.
     builds.clear()
     lookup = pulls_lookup(state)
@@ -1280,7 +1346,7 @@ async def test_an_ask_again_that_cannot_start_now_keeps_its_place_and_note(root,
     retry carries the agent's note into the new chat. Only a started ask counts against the
     cap (#3955); one still pending turns the next ask away as busy."""
     from agentdeck.chat_review import ReviewBusy
-    from agentdeck.work_router import AgainBusy
+    from agentdeck.work_router import AgainBusy, AgainRefused
 
     pull = "eerovil/agentdeck#9"
     harness.asked(pull, OLD)
@@ -1325,6 +1391,21 @@ async def test_an_ask_again_that_cannot_start_now_keeps_its_place_and_note(root,
     assert len(calls) == 1, "no review of a head that passed since the ask"
     assert not harness.service.pending.entries
     assert harness.agains(pull, OLD) == 1
+
+    # #4089: an ask for want of a verdict has no reason left once one stands. Made after it, it
+    # is refused; kept pending while it landed, it drops. Its row would void metso#77's pass.
+    with pytest.raises(AgainRefused, match="has its verdict"):
+        await harness.service.ask_again("eerovil/agentdeck", 9, "no verdict", no_verdict=True)
+    harness.asked(pull, NEW)
+    harness.heads[("eerovil/agentdeck", 9)] = NEW
+    calls.clear()
+    await harness.service.ask_again("eerovil/agentdeck", 9, "no verdict", no_verdict=True)
+    assert len(calls) == 1 and harness.service.pending.entries
+    harness.answered(pull, NEW, review_history.PASS)
+    harness.now += 3600
+    await harness.service.retry_pending()
+    assert len(calls) == 1 and not harness.service.pending.entries
+    assert harness.kinds(pull, NEW) == [review_history.ASKED, review_history.PASS]
 
 
 async def test_a_refused_review_leaves_the_head_for_the_next_event(root, harness):
@@ -1439,9 +1520,151 @@ async def test_registering_a_ready_pull_request_starts_its_review(root, harness)
     assert len(harness.reviews) == 1, "registration and event share one start per head"
 
 
+#: The escalation on eerovil/agentdeck#4064 (issuecomment-6624116226), its heads replaced:
+#: it retells the round at the older head before asking about the live one (#4069).
+LOOP_ESCALATION = (
+    "Review loop escalated to the operator\n"
+    "\n"
+    "The earlier review of PR #9 at `{old}` "
+    "(https://github.com/eerovil/agentdeck/issues/4064#issuecomment-6623823598) found that"
+    " `reviewer_down` falsely called a Work's reviewer down when a reviewer was still "
+    "active. The subsequent fix added `src/agentdeck/review_fallback.py:1421-1422`:\n"
+    "\n"
+    "```python\n"
+    '    if any(row.group == "working" for row in chats.rows.values()):\n'
+    '        return ""\n'
+    "```\n"
+    "\n"
+    "At `{new}`, the opposite failure remains: the predicate ranges over **every** review "
+    "chat, not the Work whose wait expired, and `chat_board.py:180-188` defines `working` "
+    "from the `in-progress` label alone. For example, a Claude fallback can still be "
+    "working on an *unrelated* claimed chat while its account has reached its usage limit;"
+    " a second Work's chat is untouched, ChatGPT's latest start has failed and no eligible"
+    " account can start its reviewer, yet the global guard suppresses the outage signal. "
+    "An abandoned `in-progress` claim silent past the worker protocol's 30-minute recovery"
+    " limit also suppresses it indefinitely. The Work is sent to check/retry instead of "
+    "being told why no new review can start, recreating the review-wait loop this issue "
+    "set out to stop.\n"
+    "\n"
+    "This is another case of the earlier slow-versus-down classification problem, not a "
+    "request for another unbounded patch round. Please choose one:\n"
+    "\n"
+    "1. **Accept the limit** and document that another claimed (or abandoned) chat can "
+    "mask a down reviewer on this Work.\n"
+    "2. **Ask for a different approach** based on the actual Work/review chat and its live"
+    " reviewer, rather than a board-wide label.\n"
+    "3. **Allow one more narrow fix** to scope the check to the waiting review and "
+    "disregard claims silent past the worker's 30-minute threshold, with regression tests "
+    "for unrelated and abandoned claims.\n"
+    "\n"
+    "<!-- chatgpt-review -->"
+)
+
+
 OLD = "c" * 40
 MID = "b" * 40
 NEW = "a" * 40
+
+
+async def test_review_fixes_that_grew_the_diff_add_a_design_check(root, harness):
+    """#4220: a round whose diff grew over 15% (and 100 lines) of the previous round's gets a
+    checklist point asking whether the design still holds; smaller growth or an unread size
+    gets the plain checklist. The previous round is the newest head asked about, whoever
+    asked, and both sizes are read from GitHub when the checklist goes out."""
+    harness.service.pre_review_on = True
+    pull, key = "eerovil/agentdeck#9", ("eerovil/agentdeck", 9)
+
+    async def round_at(head: str, size, delivery: str) -> str:
+        harness.heads[key] = head
+        if size is not None:
+            harness.sizes[head] = size
+        pull_event(root, delivery, sha=head)
+        await harness.drain()
+        checklist = harness.scheduled[-1]
+        assert checklist.id == f"work-event:pre-review:{pull}@{head}"
+        assert (await harness.service.pre_review_done("eerovil/agentdeck", 9))["outcome"]
+        return checklist.text
+
+    assert "6. " not in await round_at(OLD, 1000, "d1")
+    assert harness.size_reads == [], "no earlier round: nothing is read"
+    assert "6. " not in await round_at(MID, 1100, "d2"), "10% is not over"
+    grown = await round_at(NEW, 1300, "d3")
+    assert "grew from 1100 to 1300 changed lines (+18%)" in grown
+    assert "still the right design" in grown and grown.index("6. ") < grown.index("Fix and push")
+    assert harness.size_reads[-1] == (MID, NEW)
+    # A failed read, or a head GitHub would not size, sends the plain checklist.
+    harness.size_read = lambda: (_ for _ in ()).throw(RuntimeError("gh is down"))
+    assert "6. " not in await round_at(SHA, 9000, "d4")
+    harness.size_read = None
+    assert "6. " not in await round_at("d" * 40, None, "d5")
+    # No writer stores a size: the rows say only what was asked.
+    assert all("size" not in event.data for event in harness.history)
+    # A restart keeps the rounds: they live in the review history, not in the router.
+    first = harness.service
+    harness.service = WorkRouterService(
+        root,
+        switched=first._switched,
+        owner_of_issue=first._chat_of_issue,
+        owner_of_pull=first._chat_of_pull,
+        schedule=first._schedule,
+        start_review=first._start_review,
+        own_logins=OWN,
+        ready_head=first._ready_head,
+        exists=first._exists,
+        clock=first._clock,
+        pre_review=True,
+        review_event=harness.note,
+        reviews=harness.reviews_of,
+        diff_sizes=first._diff_sizes,
+    )
+    harness.sizes["d" * 40] = 1300
+    assert "grew from 1300 to 1600" in await round_at("e" * 40, 1600, "d6")
+    # #4220 review: the head moves on between the checklist and pre-review-done, so the
+    # review asks about another head. That head is the next round's baseline, not the
+    # checklist's; a checklist still waiting is no round either.
+    harness.heads[key], harness.sizes["a1" * 20] = "a1" * 20, 1900
+    pull_event(root, "d6a", sha="a1" * 20)
+    await harness.drain()
+    assert "grew from 1600 to 1900" in harness.scheduled[-1].text
+    harness.heads[key], harness.sizes["a5" * 20] = "a5" * 20, 1950
+    pull_event(root, "d6c", sha="a5" * 20)
+    await harness.drain()
+    assert "grew from 1600 to 1950" in harness.scheduled[-1].text
+    harness.heads[key], harness.sizes["a2" * 20] = "a2" * 20, 1650
+    assert (await harness.service.pre_review_done("eerovil/agentdeck", 9))["head"] == "a2" * 20
+    assert "grew from 1650 to 1900" in await round_at("a3" * 20, 1900, "d6b")
+    # #4220 review: a person's press on the Review form writes an ``asked`` row with no data;
+    # it is a round like any other.
+    harness.note(pull, "9a" * 20, review_history.ASKED, "press", data={})
+    harness.sizes["9a" * 20] = 1500
+    assert "grew from 1500 to 1800" in await round_at("a4" * 20, 1800, "d6e")
+    # Two at once: another head's checklist goes out while this one's sizes are read. The
+    # read gave the router away, so this head is covered by that checklist, not sent another.
+    sent = len(harness.scheduled)
+    harness.heads[key], harness.sizes["f" * 40] = "f" * 40, 2500
+    harness.size_read = lambda: harness.note(pull, "9" * 40, review_history.CHECKLIST, "other")
+    pull_event(root, "d7", action="synchronize", sha="f" * 40)
+    await harness.drain()
+    assert len(harness.scheduled) == sent
+    assert harness.history[-1].data == {"covered": True}
+
+
+@pytest.mark.parametrize(
+    ("before", "after", "point"),
+    [
+        (1000, 1150, False),  # exactly 15% is not over it
+        (1000, 1151, True),
+        (300, 390, False),  # 30%, but under 100 lines
+        (500, 600, True),
+        (0, 800, False),  # nothing to take a percent of
+        (1000, 400, False),  # it shrank
+        (None, 1500, False),  # unread
+        (1000, None, False),
+        (True, 1500, False),
+    ],
+)
+def test_growth_needs_both_the_percent_and_the_floor(before, after, point):
+    assert bool(_grown(before, after)) is point
 
 
 async def test_a_ready_head_waits_on_the_agents_pre_review(root, harness):
@@ -1561,6 +1784,14 @@ async def test_a_ready_head_waits_on_the_agents_pre_review(root, harness):
     assert f"asked:eerovil/agentdeck#9@{NEW}+" in keys
     again = [data for head, kind, data in noted if (head, kind) == (SHA, "asked")]
     assert again[-1]["note"] == "walkthrough posted" and again[-1]["again"]
+    # #4208: a review of the ready head already starting from another call (a ready event a
+    # moment earlier) answers "pending", not "not reviewed", and starts no second one.
+    harness.heads[("eerovil/agentdeck", 9)] = MID
+    harness.service._in_flight.add(f"eerovil/agentdeck#9@{MID}")
+    reviewed = len(harness.reviews)
+    answer = await done("eerovil/agentdeck", 9)
+    assert (answer["outcome"], answer["head"]) == ("pending", MID)
+    assert len(harness.reviews) == reviewed
 
 
 async def test_a_ready_head_nobody_started_is_caught_by_the_backstop(root, harness):
@@ -1913,6 +2144,24 @@ async def test_fixing_a_no_code_review_starts_no_new_review(root, harness, monke
         assert await between("eerovil/agentdeck", 9, OLD, NEW, before) is proven, changed
 
 
+async def test_a_push_to_any_branch_reaches_the_release_by_its_branch(root, harness):
+    """#4217 review: a push no Work owns (another Work's merge, a hand push) still tells the
+    release which branch moved; a deleted branch and a tag are no move."""
+    moved = []
+
+    class Release:
+        def on_base_moved(self, repository, branch):
+            moved.append((repository, branch))
+            return []
+
+    harness.service._release = Release()
+    deliver(root, event="push", delivery="p1", ref="refs/heads/master", sender=PERSON)
+    deliver(root, event="push", delivery="p2", ref="refs/heads/gone", deleted=True)
+    deliver(root, event="push", delivery="p3", ref="refs/tags/v1", sender=PERSON)
+    await harness.drain()
+    assert moved == [("eerovil/agentdeck", "master")]
+
+
 async def test_an_owner_accepting_findings_passes_the_reviewed_head_with_no_review(root, harness):
     """#3828: escalation, the owner accepts as is, and the head counts as reviewed with no
     second review round; never a head the reviewer was not sent, nor a draft."""
@@ -1990,6 +2239,608 @@ async def test_an_owner_accepting_findings_passes_the_reviewed_head_with_no_revi
     assert len(harness.asks) == 2 and not harness.service.pending.entries
     with pytest.raises(AgainRefused, match="no Work's chat registered"):
         await harness.service.accept("eerovil/agentdeck", 10, "accept as is")
+
+
+async def test_ship_now_passes_the_reviewed_head_and_files_its_findings_once(root, harness):
+    """#4212: Ship now, fix later at a head whose review came back with findings. A draft the
+    agent made of it is readied, the review counts as a pass, the findings go to one follow-up
+    issue and the agent hears it; never a head the reviewer did not answer, a moved head, or
+    a head shipped once already."""
+    from agentdeck.new_work import Outcome
+    from agentdeck.work_router import SHIP_NOTE, AgainRefused, ShipPorts
+
+    pull = "eerovil/agentdeck#9"
+    accepted, readied, filed, merges = [], [], [], []
+    open_heads = {("eerovil/agentdeck", 9): (OLD, True, "b" * 40)}
+    records: dict[tuple[str, str], review_history.ShippedFollowUp] = {}
+
+    class Release:
+        ports = SimpleNamespace(pulls=lambda work: [pull])
+
+        async def on_pull_event(self, *args):
+            return None
+
+        def no_code_head(self, work, ref):
+            return None
+
+        async def owner_accepted(self, work, ref, head, note):
+            accepted.append((work, ref, head, note))
+            harness.now += 1
+            data = {"note": note}
+            harness.note(ref, head, review_history.ACCEPTED, f"accepted:{head}", data=data)
+            return f"review pass recorded for {ref} at {head[:12]}"
+
+        def approval(self, work):
+            return "offered"
+
+        async def request_merge(self, work):
+            merges.append(work)
+            return "waits for its tests"
+
+        async def evaluate(self, work):
+            return "waits for its tests"
+
+    async def open_head(repository, number):
+        return open_heads.get((repository, number), ("", False, ""))
+
+    async def mark_ready(repository, number):
+        readied.append(number)
+        harness.heads[(repository, number)] = open_heads[(repository, number)][0]
+        return True
+
+    async def file_issue(repository, title, body):
+        filed.append((repository, title, body))
+        return Outcome("done", "Filed", f"https://github.com/{repository}/issues/{40 + len(filed)}")
+
+    def claim(ref, head, text, url, work, base):
+        if (ref, head) in records:
+            return False
+        records[(ref, head)] = review_history.ShippedFollowUp(
+            ref, head, "", text, url, work=work, base=base
+        )
+        return True
+
+    async def find_filed(repository, marker, since):
+        return next((40 + place for place, item in enumerate(filed, 1) if marker in item[2]), None)
+
+    def note_merged(ref, merged):
+        for key, record in records.items():
+            if key[0] == ref and not record.merged:
+                records[key] = replace(record, merged=merged)
+        return True
+
+    def note_follow_up(ref, head, follow_up):
+        records[(ref, head)] = replace(records[(ref, head)], follow_up=follow_up)
+        return True
+
+    def note_shipped(ref, head):
+        records[(ref, head)] = replace(records[(ref, head)], shipped=1.0)
+        return True
+
+    harness.service._release = Release()
+    harness.service._ship = ShipPorts(
+        open_head=open_head,
+        mark_ready=mark_ready,
+        file_issue=file_issue,
+        find_filed=find_filed,
+        claim=claim,
+        note_follow_up=note_follow_up,
+        note_merged=note_merged,
+        note_shipped=note_shipped,
+        shipped=lambda ref, head: records.get((ref, head)),
+    )
+    # Asked for, not answered: the reviewer has not finished this diff.
+    harness.asked(pull, OLD)
+    with pytest.raises(AgainRefused, match="nothing to ship past"):
+        await harness.service.ship_now("eerovil/agentdeck", 9)
+    harness.note(
+        pull, OLD, review_history.FINDINGS, "findings:1", data={"text": "1. <b> `a.py:3` is off"}
+    )
+    # A newer review of the same head is out again: it may pass, so nothing ships yet.
+    harness.now += 10
+    harness.asked(pull, OLD, again="later")
+    with pytest.raises(AgainRefused, match="nothing to ship past"):
+        await harness.service.ship_now("eerovil/agentdeck", 9)
+    harness.now += 10
+    harness.note(pull, OLD, review_history.ESCALATED, "escalated:1", data={"url": "https://c/1"})
+    answer = await harness.service.ship_now("EerOvil/AgentDeck", 9)
+    assert readied == [9]
+    assert accepted == [("github_issue:eerovil/agentdeck#7", pull, OLD, SHIP_NOTE)]
+    assert answer["follow_up"] == "eerovil/agentdeck#41" and merges == [
+        "github_issue:eerovil/agentdeck#7"
+    ]
+    [(repository, title, body)] = filed
+    assert repository == "eerovil/agentdeck"
+    assert title == f"Fix the review findings shipped in {pull}"
+    assert "> 1. &lt;b> `a.py:3` is off" in body and "https://c/1" in body
+    assert f"<!-- agentdeck-shipped: {pull}@{OLD} -->" in body
+    assert records[(pull, OLD)].follow_up == "eerovil/agentdeck#41"
+    assert records[(pull, OLD)].shipped  # only a finished press says Shipped (review)
+    # D11: the shipping Work's own issue is kept, so a follow-up shipped again chains to it.
+    assert records[(pull, OLD)].work == "eerovil/agentdeck#7"
+    # D7: its base is kept, so the follow-up's review reads exactly ``base...head``.
+    assert records[(pull, OLD)].base == "b" * 40
+    [told] = [item for item in harness.scheduled if "ship-now" in item.id]
+    assert told.chat_id == "chat-a" and "eerovil/agentdeck#41" in told.text
+    assert "push nothing more" in told.text
+    # A second press of the same head files nothing again.
+    with pytest.raises(AgainRefused, match="already shipped: its follow-up is"):
+        await harness.service.ship_now("eerovil/agentdeck", 9)
+    assert len(filed) == 1 and len(accepted) == 1
+    # A draft whose branch moved while it was readied is not shipped.
+    # Its merge names the merge commit, at the head the merge queue made by merging the base
+    # in after the press too; another pull request's merge writes nothing.
+    merged_pull(harness.root, "m1", sha="f" * 40, merge_sha="c" * 40)
+    merged_pull(harness.root, "m2", number=10, sha=NEW, merge_sha="d" * 40)
+    await harness.drain()
+    assert records[(pull, OLD)].merged == "c" * 40 and len(records) == 1
+    open_heads[("eerovil/agentdeck", 9)] = (NEW, True, "b" * 40)
+    harness.answered(pull, NEW, review_history.FINDINGS)
+    harness.service._ship = replace(
+        harness.service._ship, mark_ready=lambda repository, number: _true_moved(harness)
+    )
+    with pytest.raises(AgainRefused, match="moved past .* a fix is already in review"):
+        await harness.service.ship_now("eerovil/agentdeck", 9)
+    assert len(accepted) == 1
+    with pytest.raises(AgainRefused, match="no Work's chat registered"):
+        await harness.service.ship_now("eerovil/agentdeck", 10)
+
+
+async def test_ship_now_cut_off_anywhere_is_finished_by_the_next_press(root, harness):
+    """#4212 review: the review counts as passed only once the follow-up is filed and recorded,
+    so a failed filing, a lost record or a refused acceptance leaves nothing to merge, and the
+    next press (after a restart too: every step is in the table) finishes the same head
+    without filing a second issue. Two presses at once ship it once."""
+    import asyncio
+
+    from agentdeck.new_work import Outcome
+    from agentdeck.work_router import AgainBusy, AgainRefused, ShipPorts
+
+    pull = "eerovil/agentdeck#9"
+    accepted, filed, listed = [], [], []
+    records: dict[tuple[str, str], review_history.ShippedFollowUp] = {}
+    fail = {"file": "raise", "note": False, "accept": "refused: tests are red"}
+    gate = asyncio.Event()
+    gate.set()
+
+    class Release:
+        ports = SimpleNamespace(pulls=lambda work: [pull])
+
+        async def on_pull_event(self, *args):
+            return None
+
+        def no_code_head(self, work, ref):
+            return None
+
+        async def owner_accepted(self, work, ref, head, note):
+            await gate.wait()
+            if fail["accept"]:
+                return fail["accept"]
+            accepted.append(head)
+            return f"review pass recorded for {ref} at {head[:12]}"
+
+        def approval(self, work):
+            return ""
+
+        async def evaluate(self, work):
+            raise RuntimeError("the release looks again at its next event")
+
+    async def open_head(repository, number):
+        return OLD, False, "b" * 40
+
+    async def file_issue(repository, title, body):
+        filed.append(body)
+        if fail["file"] == "raise":
+            raise TimeoutError("gh timed out after creating it")
+        return Outcome("done", "Filed", f"https://github.com/{repository}/issues/{60 + len(filed)}")
+
+    async def find_filed(repository, marker, since):
+        listed.append((marker, since))
+        if fail.get("find"):
+            raise RuntimeError(fail["find"])
+        return next((60 + n for n, body in enumerate(filed, 1) if marker in body), None)
+
+    def claim(ref, head, text, url, work, base):
+        if (ref, head) in records:
+            return False
+        records[(ref, head)] = review_history.ShippedFollowUp(
+            ref, head, "", text, url, at=500.0, work=work
+        )
+        return True
+
+    def note_shipped(ref, head):
+        records[(ref, head)] = replace(records[(ref, head)], shipped=1.0)
+        return True
+
+    def note_follow_up(ref, head, follow_up):
+        if not fail["note"]:
+            return False
+        records[(ref, head)] = replace(records[(ref, head)], follow_up=follow_up)
+        return True
+
+    harness.service._release = Release()
+    harness.service._ship = ShipPorts(
+        open_head=open_head,
+        mark_ready=lambda repository, number: None,
+        file_issue=file_issue,
+        find_filed=find_filed,
+        claim=claim,
+        note_follow_up=note_follow_up,
+        note_merged=lambda ref, merged: False,
+        note_shipped=note_shipped,
+        shipped=lambda ref, head: records.get((ref, head)),
+    )
+    harness.note(pull, OLD, review_history.FINDINGS, "findings:1", data={"text": "1. off"})
+    # A lookup that could not be read files nothing: unread is not "none filed".
+    fail["find"] = "gh api exited 1"
+    with pytest.raises(AgainRefused, match="already filed could not be read: gh api exited 1"):
+        await harness.service.ship_now("eerovil/agentdeck", 9)
+    assert filed == [] and accepted == [] and listed[-1][1] == 500.0
+    fail["find"] = ""
+    # The filing raised after GitHub made the issue: it is found, but its record failed.
+    with pytest.raises(AgainRefused, match="not shipped: .*61 was filed but could not be recorded"):
+        await harness.service.ship_now("eerovil/agentdeck", 9)
+    assert accepted == [] and len(filed) == 1 and records[(pull, OLD)].follow_up == ""
+    assert not [item for item in harness.scheduled if "ship-now" in item.id]
+    # The next press finds that issue rather than filing a second; the acceptance is refused.
+    fail["note"] = True
+    with pytest.raises(AgainRefused, match="tests are red; its follow-up eerovil/agentdeck#61"):
+        await harness.service.ship_now("eerovil/agentdeck", 9)
+    assert len(filed) == 1 and records[(pull, OLD)].follow_up == "eerovil/agentdeck#61"
+    # Unfinished: its follow-up is filed but nothing shipped, so the page says no Shipped.
+    assert accepted == [] and not records[(pull, OLD)].shipped
+    # A press made from a confirm that showed another head's findings ships nothing.
+    with pytest.raises(AgainRefused, match="moved past dddddddddddd, whose findings"):
+        await harness.service.ship_now("eerovil/agentdeck", 9, head="d" * 40)
+    # Two presses at once: the second waits for the first, which ships it once.
+    fail["accept"] = ""
+    gate.clear()
+    first = asyncio.ensure_future(harness.service.ship_now("eerovil/agentdeck", 9))
+    await asyncio.sleep(0)
+    with pytest.raises(AgainBusy, match="still running"):
+        await harness.service.ship_now("eerovil/agentdeck", 9)
+    gate.set()
+    answer = await first
+    assert answer["follow_up"] == "eerovil/agentdeck#61" and accepted == [OLD]
+    assert len(filed) == 1 and records[(pull, OLD)].shipped
+    # A filing that failed and made nothing refuses, with nothing recorded passed.
+    records.clear()
+    harness.note(pull, NEW, review_history.FINDINGS, "findings:2", data={"text": "2. off"})
+    harness.service._ship = replace(
+        harness.service._ship,
+        open_head=lambda repository, number: _head(NEW),
+        file_issue=lambda repository, title, body: _outcome("failed", "no label"),
+    )
+    with pytest.raises(AgainRefused, match=r"follow-up issue could not be filed \(no label\)"):
+        await harness.service.ship_now("eerovil/agentdeck", 9)
+    assert accepted == [OLD] and records[(pull, NEW)].follow_up == ""
+
+
+async def test_a_press_refused_after_its_pass_is_finished_by_the_next_press(root, harness):
+    """#4212 review: once a press recorded the pass, a refused Merge press or a failed mark
+    leaves the head unfinished, so its merge holds (``ship_unfinished``) and the next press
+    finishes it, at the head a base update carried the pass to too, with no second
+    acceptance, follow-up or Merge press. Only a finished press tells the agent."""
+    from agentdeck.new_work import Outcome
+    from agentdeck.work_release import PressRefused
+    from agentdeck.work_router import SHIP_NOTE, AgainRefused, ShipPorts
+
+    pull = "eerovil/agentdeck#9"
+    accepted, filed, merges, looked = [], [], [], []
+    records: dict[tuple[str, str], review_history.ShippedFollowUp] = {}
+    live = {"head": OLD, "merge": "refuse", "mark": "fail", "approval": "offered"}
+
+    class Release:
+        ports = SimpleNamespace(pulls=lambda work: [pull])
+
+        async def on_pull_event(self, *args):
+            return None
+
+        def no_code_head(self, work, ref):
+            return None
+
+        async def owner_accepted(self, work, ref, head, note):
+            accepted.append(head)
+            data = {"note": note}
+            harness.note(ref, head, review_history.ACCEPTED, f"accepted:{head}", data=data)
+            return f"review pass recorded for {ref} at {head[:12]}"
+
+        def approval(self, work):
+            return live["approval"]
+
+        async def request_merge(self, work):
+            if live["merge"] == "refuse":
+                raise PressRefused(f"{pull} could not be read, so no Merge was recorded")
+            merges.append(work)
+            live["approval"] = "approved"
+            return "waits for its tests"
+
+        async def evaluate(self, work):
+            looked.append(work)
+            return "waits for its tests"
+
+    async def open_head(repository, number):
+        return live["head"], False, "b" * 40
+
+    async def file_issue(repository, title, body):
+        filed.append(body)
+        return Outcome("done", "Filed", f"https://github.com/{repository}/issues/{70 + len(filed)}")
+
+    async def find_filed(repository, marker, since):
+        return next((70 + n for n, body in enumerate(filed, 1) if marker in body), None)
+
+    def claim(ref, head, text, url, work, base):
+        if (ref, head) in records:
+            return False
+        records[(ref, head)] = review_history.ShippedFollowUp(ref, head, "", text, url, work=work)
+        return True
+
+    def note_follow_up(ref, head, follow_up):
+        records[(ref, head)] = replace(records[(ref, head)], follow_up=follow_up)
+        return True
+
+    def note_shipped(ref, head):
+        if live["mark"] == "fail":
+            return False
+        if live["mark"] == "raise":
+            raise OSError("database is locked")
+        records[(ref, head)] = replace(records[(ref, head)], shipped=1.0)
+        return True
+
+    harness.service._release = Release()
+    harness.service._ship = ShipPorts(
+        open_head=open_head,
+        mark_ready=lambda repository, number: None,
+        file_issue=file_issue,
+        find_filed=find_filed,
+        claim=claim,
+        note_follow_up=note_follow_up,
+        note_merged=lambda ref, merged: False,
+        note_shipped=note_shipped,
+        shipped=lambda ref, head: records.get((ref, head)),
+    )
+    harness.note(pull, OLD, review_history.FINDINGS, "findings:1", data={"text": "1. off"})
+    told = lambda: [item for item in harness.scheduled if "ship-now" in item.id]  # noqa: E731
+    # The pass is recorded, but the Merge press this project waits for is refused.
+    with pytest.raises(AgainRefused, match=r"Merge was not recorded \(.*could not be read"):
+        await harness.service.ship_now("eerovil/agentdeck", 9)
+    assert accepted == [OLD] and len(filed) == 1 and not records[(pull, OLD)].shipped
+    assert told() == [] and looked == []
+    # The next press records the Merge press, but the head could not be marked shipped.
+    live["merge"] = ""
+    with pytest.raises(AgainRefused, match="could not be marked shipped, so it does not merge"):
+        await harness.service.ship_now("eerovil/agentdeck", 9)
+    assert accepted == [OLD] and len(filed) == 1 and len(merges) == 1
+    live["mark"] = "raise"
+    with pytest.raises(AgainRefused, match="press Ship now again to finish it"):
+        await harness.service.ship_now("eerovil/agentdeck", 9)
+    # Base updates carried the pass to a new head: the press still finishes the head it
+    # passed, with no second acceptance, issue or Merge press, and the release looks again.
+    live["head"], live["mark"] = NEW, ""
+    # Two base updates carry it OLD -> MID -> NEW; each row names only the head before.
+    for before, after in ((OLD, MID), (MID, NEW)):
+        carried = {"note": SHIP_NOTE, "carried_from": before}
+        harness.note(pull, after, review_history.PASS, f"carried:{pull}@{after}", data=carried)
+    answer = await harness.service.ship_now("eerovil/agentdeck", 9, head=NEW)
+    assert answer["head"] == OLD and answer["follow_up"] == "eerovil/agentdeck#71"
+    assert "finished" in answer["outcome"]
+    assert accepted == [OLD] and len(filed) == 1 and len(merges) == 1 and looked
+    assert records[(pull, OLD)].shipped and len(told()) == 1 and list(records) == [(pull, OLD)]
+    with pytest.raises(AgainRefused, match="already shipped: its follow-up is .*#71"):
+        await harness.service.ship_now("eerovil/agentdeck", 9)
+
+
+async def test_a_shipped_heads_issue_is_looked_for_in_every_issue_since_it_shipped(monkeypatch):
+    """#4212 review: the lookup that decides whether to file reads every page of the issues
+    updated since the head was recorded, so one filed long before the newest few is found,
+    and a read that failed raises rather than answer "none"."""
+    from agentdeck import gh_cli
+    from agentdeck.work_services import find_shipped_issue
+
+    calls = []
+    lines = [json.dumps({"number": 500 - n, "body": "other"}) for n in range(180)]
+    lines.append(json.dumps({"number": 7, "body": "x <!-- agentdeck-shipped: a#1@h -->"}))
+    answer = {"code": 0}
+
+    async def run(argv, *, timeout, repo=None, owner=None):
+        calls.append(argv)
+        return answer["code"], "\n".join(lines).encode()
+
+    monkeypatch.setattr(gh_cli, "run", run)
+    assert await find_shipped_issue("a/b", "<!-- agentdeck-shipped: a#1@h -->", 7200.0) == 7
+    assert "--paginate" in calls[0]
+    assert "repos/a/b/issues?state=all&since=1970-01-01T01:00:00Z&per_page=100" in calls[0]
+    assert await find_shipped_issue("a/b", "<!-- agentdeck-shipped: a#2@h -->", 0.0) is None
+    answer["code"] = 1
+    with pytest.raises(RuntimeError, match="exited 1"):
+        await find_shipped_issue("a/b", "<!-- agentdeck-shipped: a#1@h -->", 0.0)
+
+
+async def test_a_shipped_heads_follow_up_is_filed_with_the_manifests_first_label(
+    tmp_path, monkeypatch
+):
+    """#4223: Ship now files its follow-up with the repository's canonical ownership label,
+    the first its manifest names. It once indexed the unordered label set and crashed, so
+    every press said the issue "was not filed"."""
+    from agentdeck import new_work
+    from agentdeck.work_services import file_shipped_issue
+
+    instance = tmp_path / "instances" / "robot"
+    instance.mkdir(parents=True)
+    (instance / "poller.toml").write_text(
+        '[board]\norg = "Acme"\nownership_label = ["agent", "claude"]\n\n'
+        '[[repos]]\nid = "robot"\nholds_issues = true\n',
+        encoding="utf-8",
+    )
+    made = []
+
+    async def create(target, title, body, spec_only, assignee=""):
+        made.append((target.repository, target.ownership_label, title, spec_only, assignee))
+        return new_work.Outcome("done", "filed", "https://github.com/Acme/robot/issues/40")
+
+    monkeypatch.setattr(new_work, "_create", create)
+    outcome = await file_shipped_issue(str(tmp_path), "acme/robot", "Fix", "body", "me")
+    assert outcome.state == "done"
+    assert made == [("acme/robot", "agent", "Fix", False, "me")]
+    missing = await file_shipped_issue(str(tmp_path), "acme/other", "Fix", "body")
+    assert missing.state == "failed" and "no ownership label" in missing.text
+    assert len(made) == 1
+
+
+async def _head(head: str):
+    return head, False, ""
+
+
+async def _outcome(state: str, text: str):
+    from agentdeck.new_work import Outcome
+
+    return Outcome(state, text)
+
+
+async def _true_moved(harness) -> bool:
+    harness.heads[("eerovil/agentdeck", 9)] = "e" * 40
+    return True
+
+
+async def test_an_escalation_retelling_older_heads_is_accepted_once_its_chat_line_lands(
+    root, harness
+):
+    """#4069: an escalation names every head its loop reviewed, so its comment marks none,
+    even when the older head was answered before it (#3828). The owner's acceptance is
+    refused with a time wait, not a new review, and passes once the review chat's closing
+    line writes the escalation at the head it reviewed."""
+    from agentdeck.work_router import AgainRefused
+
+    pull = "eerovil/agentdeck#9"
+    accepted = []
+
+    class Release:
+        ports = SimpleNamespace(pulls=lambda work: [pull])
+
+        async def on_pull_event(self, *args):
+            return None
+
+        def no_code_head(self, work, ref):
+            return None
+
+        async def owner_accepted(self, work, ref, head, note):
+            accepted.append(head)
+            return f"review pass recorded for {ref} at {head[:12]}"
+
+    harness.service._release = Release()
+    harness.now = datetime(2026, 11, 4, 8, tzinfo=UTC).timestamp()
+    harness.asked(pull, OLD)
+    harness.answered(pull, OLD, review_history.FINDINGS)
+    harness.heads[("eerovil/agentdeck", 9)] = NEW
+    harness.now += 60
+    harness.asked(pull, NEW)
+    body = LOOP_ESCALATION.format(old=OLD[:8], new=NEW[:8])
+    comment(root, "e1", body=body, created_at="2026-11-04T08:19:31Z")
+    await harness.drain()
+    assert harness.kinds(pull, NEW) == [review_history.ASKED]
+    with pytest.raises(AgainRefused, match="time wait") as refused:
+        await harness.service.accept("eerovil/agentdeck", 9, "accept the limit")
+    assert "new review" in str(refused.value) and accepted == []
+    # The chat board writes it from "Reviewed eerovil/agentdeck#9 at <NEW>: escalated".
+    harness.now += 180
+    harness.note(pull, NEW, review_history.ESCALATED, "escalated:chat", data={"chat": "c#1"})
+    answer = await harness.service.accept("eerovil/agentdeck", 9, "accept the limit")
+    assert answer["head"] == NEW and accepted == [NEW]
+
+
+async def test_a_heading_naming_the_commit_decides_which_head_a_comment_marks(root, harness):
+    """#4069: the same escalation with the commit in its first line marks the live head at
+    once and the first acceptance passes; a heading for an older head marks nothing, whatever
+    its body names (#3828); and a heading marks only the pull requests it names."""
+    from agentdeck.work_router import AgainRefused
+
+    pull = "eerovil/agentdeck#9"
+    accepted = []
+    listed = [pull]
+
+    class Release:
+        ports = SimpleNamespace(pulls=lambda work: listed)
+
+        async def on_pull_event(self, *args):
+            return None
+
+        def no_code_head(self, work, ref):
+            return None
+
+        async def owner_accepted(self, work, ref, head, note):
+            accepted.append(head)
+            return f"review pass recorded for {ref} at {head[:12]}"
+
+    def headed(line):
+        return line + LOOP_ESCALATION.format(old=OLD[:8], new=NEW[:8]).partition("\n")[2]
+
+    escalated = "Review loop escalated to the operator for PR "
+    harness.service._release = Release()
+    harness.now = datetime(2026, 11, 4, 8, tzinfo=UTC).timestamp()
+    harness.asked(pull, OLD)
+    harness.answered(pull, OLD, review_history.FINDINGS)
+    harness.heads[("eerovil/agentdeck", 9)] = NEW
+    harness.now += 60
+    harness.asked(pull, NEW)
+    reviewer = {"login": "review-bot[bot]", "type": "Bot"}
+    findings = f"/claude\nReview findings for PR #9 at {OLD}\n\n1. {NEW[:8]} was pushed since."
+    comment(root, "h", sender=reviewer, body=findings, created_at="2026-11-04T08:19:30Z")
+    late = [
+        headed(f"{escalated}#9 at `{OLD[:8]}`"),
+        headed(f"{escalated}#9 at {'1' * 12}"),  # no head sent for review
+        headed(f"{escalated}#10 at {NEW[:8]}"),  # another pull request's heading
+        headed(f"{escalated}other/repo#9 at {NEW[:8]}"),
+    ]
+    for index, body in enumerate(late):
+        comment(root, f"h{index}", body=body, created_at="2026-11-04T08:19:31Z")
+    await harness.drain()
+    assert harness.kinds(pull, NEW) == [review_history.ASKED]
+    with pytest.raises(AgainRefused, match="time wait"):
+        await harness.service.accept("eerovil/agentdeck", 9, "accept the limit")
+    # Upper case and the full reference read as the real thing does.
+    body = headed(f"{escalated}EerOvil/AgentDeck#9 at `{NEW[:8].upper()}`")
+    comment(root, "h9", body=body, created_at="2026-11-04T08:19:32Z")
+    await harness.drain()
+    assert harness.kinds(pull, NEW) == [review_history.ASKED, review_history.ESCALATED]
+    answer = await harness.service.accept("eerovil/agentdeck", 9, "accept the limit")
+    assert answer["head"] == NEW and accepted == [NEW]
+    # Findings are read by the same rule.
+    findings = f"/claude\nReview findings for PR #9 at {NEW}\n\n1. As at {OLD[:8]}."
+    comment(root, "h10", sender=reviewer, body=findings, created_at="2026-11-04T08:19:33Z")
+    await harness.drain()
+    assert harness.kinds(pull, NEW)[-1] == review_history.FINDINGS
+    # Two pull requests in the Work: a heading for #10 that quotes #9's live commit leaves #9
+    # alone, and one review's heading naming both marks both.
+    other = "eerovil/agentdeck#10"
+    harness.pulls[("eerovil/agentdeck", 10)] = ("chat-a", "eerovil/agentdeck#7")
+    harness.heads[("eerovil/agentdeck", 10)] = MID
+    harness.asked(other, MID)
+    rows = harness.kinds(pull, NEW)
+    body = f"{escalated}#10 at {MID[:8]}\n\nAs on PR #9 at `{NEW[:8]}`: X?"
+    comment(root, "h11", body=body, created_at="2026-11-04T08:19:34Z")
+    await harness.drain()
+    assert harness.kinds(pull, NEW) == rows
+    assert harness.kinds(other, MID) == [review_history.ASKED, review_history.ESCALATED]
+    body = f"/claude\nReview findings for #9 at {NEW} and #10 at {MID}:\n\n1. X"
+    comment(root, "h12", sender=reviewer, body=body, created_at="2026-11-04T08:19:35Z")
+    await harness.drain()
+    assert harness.kinds(pull, NEW)[-1] == harness.kinds(other, MID)[-1] == review_history.FINDINGS
+    # The Work's pull request in another repository (store#3943 under issues#1162, #4208): a
+    # bare #3943 on the Work's issue is that repository's and marks nothing, whatever commit
+    # it names; written out in full it marks the pull request.
+    store = "other/store#3943"
+    listed[:] = [pull, other, store]
+    harness.pulls[("other/store", 3943)] = ("chat-a", "eerovil/agentdeck#7")
+    harness.heads[("other/store", 3943)] = OLD
+    harness.asked(store, OLD)
+    body = f"/claude\nReview findings for PR #3943 at {OLD}:\n\n1. X"
+    comment(root, "h13", sender=reviewer, body=body, created_at="2026-11-04T08:19:36Z")
+    await harness.drain()
+    assert harness.kinds(store, OLD) == [review_history.ASKED]
+    body = body.replace("PR #3943", "PR Other/Store#3943")
+    comment(root, "h14", sender=reviewer, body=body, created_at="2026-11-04T08:19:37Z")
+    await harness.drain()
+    assert harness.kinds(store, OLD) == [review_history.ASKED, review_history.FINDINGS]
 
 
 async def test_a_reviewed_head_is_reviewed_again_on_request_at_most_twice(root, harness):
@@ -2149,14 +3000,19 @@ async def test_note_registered_runs_the_check_in_the_background(root, harness):
     assert harness.reviews == [("eerovil/agentdeck#9", "eerovil/agentdeck#7")]
 
 
-def merged_pull(root, delivery: str, *, merged=True, number=9, action="closed"):
+def merged_pull(root, delivery: str, *, merged=True, number=9, action="closed", **kw):
+    pull = {"number": number, "state": "closed", "merged": merged}
+    if "sha" in kw:
+        pull["head"] = {"sha": kw.pop("sha")}
+    if "merge_sha" in kw:
+        pull["merge_commit_sha"] = kw.pop("merge_sha")
     deliver(
         root,
         event="pull_request",
         delivery=delivery,
         action=action,
         sender=PERSON,
-        pull_request={"number": number, "state": "closed", "merged": merged},
+        pull_request=pull,
     )
 
 
@@ -2430,3 +3286,30 @@ async def test_a_pending_review_already_in_flight_is_pushed_back(root, harness):
     assert harness.service.pending.wait(harness.now) > 0, "no spin on an in-flight start"
 
 
+
+
+async def test_diff_sizes_read_each_head_against_the_base_branch(monkeypatch):
+    """#4220: a head's size is its compare against the pull request's base branch; a head
+    GitHub cannot list whole (300 files) or a failed read is left out."""
+    from agentdeck import review_refs
+
+    reads: list[list[str]] = []
+
+    async def run(argv, timeout=None, **kw):
+        reads.append(argv)
+        if argv[1:3] == ["pr", "view"]:
+            return 0, b'{"baseRefName": "master"}'
+        path = argv[2]
+        if path.endswith("...aaa"):
+            return 0, b'{"files": 3, "lines": 1200}'
+        if path.endswith("...bbb"):
+            return 0, b'{"files": 300, "lines": 9000}'
+        if path.endswith("...ccc"):
+            return 0, b'{"files": 0, "lines": null}'
+        return 1, b""
+
+    monkeypatch.setattr(review_refs.gh_cli, "run", run)
+    sizes = await review_refs.diff_sizes("o/r", 9, ("aaa", "bbb", "ccc", "ddd", "aaa"))
+    assert sizes == {"aaa": 1200, "ccc": 0}
+    assert reads[1][:3] == ["gh", "api", "repos/o/r/compare/master...aaa"]
+    assert len(reads) == 5, "each head is read once"

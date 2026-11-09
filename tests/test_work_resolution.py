@@ -169,9 +169,148 @@ def test_a_cross_site_rename_is_refused(tmp_path, monkeypatch, headers):
     from fastapi.testclient import TestClient
 
     app = _deck(tmp_path, monkeypatch)
-    response = TestClient(app).post(work_href(WORK_ID) + "/title", data={"title": "x"},
-                                    headers=headers)
+    response = TestClient(app).post(
+        work_href(WORK_ID) + "/title", data={"title": "x"}, headers=headers
+    )
     assert response.status_code == 403 and app.state.control_db.work_titles() == {}
+
+
+LONG_ISSUE = "## Why\r\n\r\n" + "A long line about the work. " * 12 + "\r\n\r\nThe last line."
+
+
+def test_the_work_page_shows_the_issues_text_and_folds_a_long_one(tmp_path, monkeypatch):
+    """#4101: above the Summary, a long text's first lines show shut, a short one whole, and
+    nothing shows for no text. Each is escaped: the browser's markdown pass reads it as text."""
+    from fastapi.testclient import TestClient
+
+    app = _deck(tmp_path, monkeypatch)
+    client = TestClient(app)
+    held = {"body": LONG_ISSUE}
+    app.state.issues.held_issue_body = lambda *ref: (held["body"], True)
+
+    page = client.get(work_href(WORK_ID)).text
+    assert 'data-work-issue="long"' in page
+    assert f'data-keep-open="work-issue:{WORK_ID}"' in page
+    assert page.count('class="wd-issue-text') == 2  # the preview, and the whole text
+    assert "\r" not in page[page.index("wd-issue-preview") : page.index("The last line.")]
+    assert page.index('id="work-sec-result"') < page.index('id="work-sec-issue"')
+    assert page.index('id="work-sec-issue"') < page.index('id="work-sec-resolution"')
+
+    held["body"] = "Run <script>alert(1)</script>\n<!-- agentdeck-marker\nid=1 -->\n"
+    page = client.get(work_href(WORK_ID)).text
+    assert 'data-work-issue="short"' in page and "wd-fold wd-issue" not in page
+    assert "Run &lt;script&gt;alert(1)&lt;/script&gt;</div>" in page
+    assert "agentdeck-marker" not in page
+
+    for nothing in ("", "  \n", "<!-- only a marker -->", None):
+        held["body"] = nothing
+        assert "data-work-issue" not in client.get(work_href(WORK_ID)).text, nothing
+
+
+def test_a_pull_requests_own_text_starts_open_only_while_it_waits():
+    """#4137: an open pull request, a draft too, shows its description; a merged or closed one
+    folds it behind its title; no description leaves a plain title and no row leaves nothing.
+    The key's end moves with the state, so a shut description does not outlive the merge."""
+    from pathlib import Path
+
+    from jinja2 import Environment, FileSystemLoader
+    from test_work_ui import WORK
+
+    import agentdeck.web
+    from agentdeck.work_facts import OutputFact, Registration, work_facts
+
+    templates = Path(agentdeck.web.__file__).parent / "templates"
+    macros = Environment(loader=FileSystemLoader(templates), autoescape=True).get_template(
+        "partials/work_macros.html"
+    )
+
+    def about(**row):
+        url = "https://github.com/eerovil/agentdeck/pull/9"
+        (output,) = work_facts(
+            WORK, rows={url: row}, registered=[Registration(url, True, True)]
+        ).outputs
+        return str(macros.module.output_about(output, WORK_ID))
+
+    text = {"title": "Fix <b>it</b>", "body": "Why\r\n<!-- marker -->\n<script>x</script>"}
+    waiting = about(state="OPEN", **text)
+    assert 'data-wd-output-about="waiting"' in waiting and "data-open-by-default open>" in waiting
+    assert f'"work-pull:{WORK_ID}:https://github.com/eerovil/agentdeck/pull/9:waiting"' in waiting
+    assert "<summary>Fix &lt;b&gt;it&lt;/b&gt;</summary>" in waiting
+    assert "Why\n\n&lt;script&gt;" in waiting and "marker" not in waiting and "\r" not in waiting
+    assert "data-open-by-default" in about(state="OPEN", isDraft=True, **text)
+    shut = about(state="MERGED", **text)
+    assert 'data-wd-output-about="done"' in shut and " open" not in shut.split(">")[0]
+    assert "data-open-by-default" not in shut
+    for empty in ("", None, "<!-- only a marker -->"):
+        plain = about(state="OPEN", title="Fix", body=empty)
+        assert "data-wd-output-title" in plain and "<details" not in plain
+    assert "data-wd-output-title" in about(state="MERGED", title="Old, read before #4137")
+    bare = OutputFact("https://github.com/eerovil/agentdeck/pull/9", "eerovil/agentdeck", 9, "")
+    assert str(macros.module.output_about(bare, WORK_ID)).strip() == ""
+    closed = dataclasses.replace(bare, state="closed", title="Dropped", body="Why")
+    assert 'data-wd-output-about="done"' in macros.module.output_about(closed, WORK_ID)
+
+
+@pytest.mark.asyncio
+async def test_an_edited_issue_reaches_the_work_page_behind_the_page(tmp_path, monkeypatch):
+    """#4101: a webhook marks the held text out of date, so the page draws it and reads it
+    again behind itself; the changed answer moves the page's key, and only its section."""
+    from test_work_ui import WORK
+
+    from agentdeck import wayfinder_map
+    from agentdeck.web.work_view import load_work_detail, render_changed_sections
+
+    app = _deck(tmp_path, monkeypatch)
+    held = {"body": ("Old text.", False)}
+
+    async def read(*ref):
+        held["body"] = ("New text.", True)
+        return "New text."
+
+    app.state.issues.held_issue_body = lambda *ref: held["body"]
+    app.state.issues.issue_body = read
+    generation = wayfinder_map.generation()
+
+    drawn = await load_work_detail(app, WORK, workspace=False)
+    assert drawn.issue_text == "Old text."
+    refresh = app.state.work_tree_refreshes.get(WORK_ID)  # gone once it finished
+    if refresh is not None:
+        await refresh
+    assert wayfinder_map.generation() == generation + 1
+
+    moved = await load_work_detail(app, WORK, workspace=False)
+    assert moved.issue_text == "New text."
+    templates = app.state.templates
+    before = render_changed_sections(templates, drawn, previous={})
+    after = render_changed_sections(templates, moved, previous=before)
+    assert "New text." in after["issue"][1]
+    assert after["resolution"] is before["resolution"]
+
+
+@pytest.mark.parametrize(
+    ("text", "short"),
+    [
+        ("one\ntwo\nthree", True),
+        ("one\ntwo\nthree\nfour", False),
+        ("x" * 60, True),
+        ("x" * 61, False),
+        ("x" * 40 + "\nthree", True),
+        ("x" * 41 + "\nfour", False),
+        ("\N{SMILING FACE WITH SUNGLASSES}" * 30, True),
+        ("\N{SMILING FACE WITH SUNGLASSES}" * 31, False),
+        ("# A heading", False),
+        ("```\ncode\n```", False),
+        ("- one\n- two", False),
+        ("1. one", False),
+        ("> quoted", False),
+        ("a | b\n---|---", False),
+        ("-5 degrees, #4101 and 3.5", True),
+    ],
+)
+def test_a_short_issue_is_what_the_preview_would_hold(text, short):
+    from agentdeck.web.work_view import WorkDetail
+
+    assert WorkDetail(None, None, (), (), issue_text=text).issue_short is short
 
 
 def test_the_work_page_shows_the_resolution_only_once_one_is_written(tmp_path, monkeypatch):
@@ -227,8 +366,9 @@ def test_the_work_diagram_opens_the_live_page_then_the_merged_copy(tmp_path, mon
     worktree = tmp_path / "wt" / "docs" / "diagrams"
     worktree.mkdir(parents=True)
     (worktree / "merge-queue.md").write_text("Intro\n# Merge queue\n```mermaid\n```\n")
-    deck = SimpleNamespace(state=SimpleNamespace(app_state=SimpleNamespace(
-        chat_identity_key=lambda key: key)))
+    deck = SimpleNamespace(
+        state=SimpleNamespace(app_state=SimpleNamespace(chat_identity_key=lambda key: key))
+    )
     ours, theirs = WorkRef("eerovil/agentdeck", 1), WorkRef("acme/shop", 2)
     chats = [chat("old", 1), chat("new", 2), chat("none", 3)]
     assert work_view.work_diagram(deck, ours, chats) is None
@@ -240,7 +380,8 @@ def test_the_work_diagram_opens_the_live_page_then_the_merged_copy(tmp_path, mon
     (worktree / "merge-queue.md").unlink()
     monkeypatch.setattr(live_prototype, "DECK_CHECKOUT", tmp_path / "deck")
     assert work_view.work_diagram(deck, theirs, chats) == work_view.WorkDiagram(
-        "merge-queue", "https://github.com/acme/shop/blob/HEAD/docs/diagrams/merge-queue.md",
+        "merge-queue",
+        "https://github.com/acme/shop/blob/HEAD/docs/diagrams/merge-queue.md",
         external=True,
     )
     merged = tmp_path / "deck" / "docs" / "diagrams"
@@ -270,15 +411,17 @@ def test_the_work_page_breaks_a_part_into_paragraphs_and_bullets(tmp_path, monke
     from fastapi.testclient import TestClient
 
     app = _deck(tmp_path, monkeypatch)
-    app.state.control_db.set_work_resolution(_resolution(
-        solution="Store-box shelves hold whole boxes.\n\n"
-        "- Scanning a box shelves it\n- <b>Bold</b>",
-    ))
+    app.state.control_db.set_work_resolution(
+        _resolution(
+            solution="Store-box shelves hold whole boxes.\n\n"
+            "- Scanning a box shelves it\n- <b>Bold</b>",
+        )
+    )
 
     page = TestClient(app).get(work_href(WORK_ID)).text
 
-    solution = page[page.index('data-wd-resolution="solution"'):]
-    solution = solution[:solution.index("</div>")]
+    solution = page[page.index('data-wd-resolution="solution"') :]
+    solution = solution[: solution.index("</div>")]
     assert "<p>Store-box shelves hold whole boxes.</p>" in solution
     assert "<ul><li>Scanning a box shelves it</li><li>&lt;b&gt;Bold&lt;/b&gt;</li></ul>" in solution
     assert "<details" not in solution
@@ -384,6 +527,12 @@ async def test_the_worker_records_its_live_check_apart_from_the_resolution(tmp_p
         put = await client.put(url, json={"result": "not_live", "note": "VPS connector"})
     assert put.status_code == 200, "#3220: merged but not running yet"
     assert app.state.control_db.work_live_check(WORK_ID).line == "not live yet: VPS connector"
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as client:
+        bare = await client.put(url, json={"result": "needs_person"})
+        put = await client.put(url, json={"result": "needs_person", "note": "open the cart"})
+    assert bare.status_code == 422 and "needs a note" in bare.json()["detail"], "#4210"
+    assert put.status_code == 200
+    assert app.state.control_db.work_live_check(WORK_ID).line == "open the cart"
 
 
 @pytest.mark.asyncio
@@ -510,6 +659,81 @@ async def test_a_chat_that_only_mentions_an_issue_cannot_write_its_resolution(tm
 
 @pytest.mark.browser
 @pytest.mark.asyncio
+async def test_an_edited_issue_swaps_in_formatted_and_stays_open_on_a_phone(tmp_path, monkeypatch):
+    """#4101: a live swap brings the new text in formatted, a section a person opened stays
+    open, and nothing is wider than a phone."""
+    from conftest import async_playwright
+    from test_web import _live_server
+    from test_work_actions import _no_overflow
+
+    from agentdeck import wayfinder_map
+    from agentdeck.web.work_view import WORKS_TOPIC
+
+    app = _deck(tmp_path, monkeypatch)
+    held = {"body": "[a link](https://example.com/a)\n\n" + LONG_ISSUE}
+    app.state.issues.held_issue_body = lambda *ref: (held["body"], True)
+    await app.state.work_overview.refresh()
+    async with _live_server(app) as base, async_playwright() as playwright:
+        browser = await playwright.chromium.launch()
+        page = await browser.new_page(
+            viewport={"width": 390, "height": 844}, service_workers="block"
+        )
+        await page.add_init_script(
+            "document.addEventListener('htmx:sseOpen', () => { window.__sseOpen = true; }, true)"
+        )
+        await page.goto(base + work_href(WORK_ID))
+        await page.wait_for_function("() => window.__sseOpen === true")
+        issue = page.locator("#work-issue")
+        link = issue.locator(".wd-issue-preview a")
+        await link.wait_for()
+        await link.evaluate("n => n.focus()")
+        assert await page.evaluate("document.activeElement.tagName") != "A"
+        await issue.locator(".wd-issue-preview").click(force=True)  # the summary takes the tap
+        whole = issue.locator(".wd-issue-text:not(.wd-issue-preview)")
+        await whole.locator(".md-h").wait_for()
+        await _no_overflow(page, 390)
+
+        held["body"] = LONG_ISSUE.replace("## Why", "## Edited on GitHub")
+        wayfinder_map.bump_generation()
+        app.state.app_state.bus.publish(WORKS_TOPIC)
+
+        await whole.locator(".md-h", has_text="Edited on GitHub").wait_for()
+        assert await page.locator("#work-issue").get_attribute("open") is not None
+        await _no_overflow(page, 390)
+
+        # A link is a link only to a safe place; the longest text called short takes three
+        # lines on the narrowest phone, and one character more folds.
+        held["body"] = "[bad](javascript:alert(1)) [good](https://example.com/a)"
+        wayfinder_map.bump_generation()
+        app.state.app_state.bus.publish(WORKS_TOPIC)
+        short = page.locator('[data-work-issue="short"] .wd-issue-text[data-md]')
+        await short.locator('a[href="https://example.com/a"]').wait_for()
+        assert await short.locator("a").count() == 1
+        assert "[bad](javascript:alert(1))" in await short.inner_text()
+
+        await page.set_viewport_size({"width": 320, "height": 640})
+        for text, kind in (
+            ("W" * 60, "short"),
+            ("W" * 61, "long"),
+            ("# Title\n```\ncode\n```", "long"),
+        ):
+            held["body"] = text
+            wayfinder_map.bump_generation()
+            app.state.app_state.bus.publish(WORKS_TOPIC)
+            box = page.locator(f'[data-work-issue="{kind}"] .wd-issue-text[data-md]').first
+            await box.wait_for(state="attached")  # the section stays open, so its preview hides
+            if kind == "short":
+                rows = await box.evaluate(
+                    "n => n.getBoundingClientRect().height"
+                    " / parseFloat(getComputedStyle(n).lineHeight)"
+                )
+                assert rows <= 3.1
+        await _no_overflow(page, 320)
+        await browser.close()
+
+
+@pytest.mark.browser
+@pytest.mark.asyncio
 async def test_rename_a_work_on_a_phone_and_back(tmp_path, monkeypatch):
     from conftest import async_playwright
     from test_web import _live_server
@@ -517,11 +741,13 @@ async def test_rename_a_work_on_a_phone_and_back(tmp_path, monkeypatch):
 
     app = _deck(tmp_path, monkeypatch)
     app.state.control_db.set_work_resolution(_resolution())
+    app.state.issues.held_issue_body = lambda *ref: (LONG_ISSUE, True)
     await app.state.work_overview.refresh()
     async with _live_server(app) as base, async_playwright() as playwright:
         browser = await playwright.chromium.launch()
-        page = await browser.new_page(viewport={"width": 320, "height": 640},
-                                      service_workers="block")
+        page = await browser.new_page(
+            viewport={"width": 320, "height": 640}, service_workers="block"
+        )
         await page.add_init_script(
             "document.addEventListener('htmx:sseOpen', () => { window.__sseOpen = true; }, true)"
         )
@@ -534,6 +760,18 @@ async def test_rename_a_work_on_a_phone_and_back(tmp_path, monkeypatch):
         assert await form.is_hidden()
         await page.locator("#work-sec-resolution [data-work-resolution]").wait_for()
         await _no_overflow(page, 320)
+
+        # The issue's text (#4101): formatted, three lines shut, the rest a tap away.
+        issue = page.locator("#work-issue")
+        preview = issue.locator(".wd-issue-preview")
+        await issue.locator(".wd-issue-preview[data-md] .md-h").wait_for()
+        shut = await preview.bounding_box()
+        assert 0 < shut["height"] < 80 and not await issue.get_attribute("open")
+        await issue.locator("summary").click()
+        await issue.locator(".wd-issue-text:not(.wd-issue-preview)").wait_for()
+        assert await preview.is_hidden()
+        await _no_overflow(page, 320)
+        await issue.locator("summary").click()
 
         await page.locator("[data-work-rename-open]").click()
         box = form.locator('input[name="title"]')

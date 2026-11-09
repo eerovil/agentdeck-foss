@@ -36,6 +36,10 @@ Rules the tests pin:
 * **Release is Work-terminal only.** A Run ending releases nothing. The request is
   persisted before any deletion, a live worker in the tree defers it, and a dirty or
   unreadable tree keeps it pending with ``last_error`` for a person to see.
+* **A closed issue is not a Finish, but it ends the wait for one (#4148).** Agents close
+  their own issues, and only a person's Finish released a claim, so 109 worktrees stayed
+  held. ``release_idle`` gives a Work's claims back only when every one is idle (no
+  changed files, no process inside): unlike a Finish it asks nothing of a tree in use.
 * **Verification evidence is not a workspace.** Releasing a claim never touches the
   Run evidence ledger (#2148); a removed worktree's A1/B4 evidence stays readable.
 
@@ -68,6 +72,7 @@ log = logging.getLogger(__name__)
 # never imports the app; a test pins the two together.
 ENSURE_PATH = "/work-workspaces/ensure"
 RELEASE_PATH = "/work-workspaces/release"
+RELEASE_IDLE_PATH = "/work-workspaces/release-idle"
 CLAIMS_PATH = "/work-workspaces/claims"
 
 #: The folder-name prefix of a worktree made ahead of a deck-started Work (#3590): the agent
@@ -517,6 +522,19 @@ class GitHost:
         status = self._git("-C", path, "status", "--porcelain", timeout=15)
         return status is None or status.returncode != 0 or bool(status.stdout.strip())
 
+    def running_in(self, path: str) -> bool:
+        """Whether a process has ``path`` or a folder inside it as its directory."""
+        path = os.path.realpath(path)  # /proc answers real paths; /home is a link on this host
+        for pid in os.listdir("/proc"):
+            if pid.isdigit():
+                try:
+                    cwd = os.readlink(f"/proc/{pid}/cwd")
+                except OSError:
+                    continue
+                if cwd == path or cwd.startswith(f"{path}/"):
+                    return True
+        return False
+
     def branch_here(self, path: str, branch: str) -> str:
         """Start ``branch`` at the worktree's own commit, no fetch (#3590); "" or why not."""
         done = self._git("-C", path, "switch", "--quiet", "-c", branch, timeout=15)
@@ -945,6 +963,43 @@ class WorkWorkspaceService:
             # Persisted first: a crash from here on still leaves the Work release-eligible.
             claims = self.store.request_release(work_id)
             return [self._release_one(claim, execution_active) for claim in claims], unclaimed
+
+    def release_idle(
+        self,
+        work_id: str,
+        *,
+        execution_active: Callable[[str], bool | None] | None = None,
+    ) -> tuple[list[ReleaseOutcome], str]:
+        """Release this Work's claims if every one is idle (#4148).
+
+        Answers (per-claim outcomes, why nothing was asked). A Work with one tree in use
+        keeps them all and records nothing: this is housekeeping, so a tree in use must not
+        show as a problem on the Work the way a Finish's pending release does.
+        """
+        with self._lock:
+            for claim in self.store.active(work_id):
+                why = self._in_use(claim, execution_active or self.execution_active)
+                if why:
+                    return [], f"{claim.path}: {why}"
+            claims = self.store.request_release(work_id)
+            return [self._release_one(claim, execution_active) for claim in claims], ""
+
+    def _in_use(self, claim: WorkspaceClaim, active: Callable[[str], bool | None]) -> str:
+        """Why ``claim``'s worktree is not idle, or "" when it is."""
+        if not claim.confirmed:
+            return "its worktree is not settled"
+        if active(claim.path) is not False:
+            return "a Run may be working in it"
+        if not self.host.inspect(claim.path).exists:
+            return ""
+        if self.host.changed(claim.path):
+            return "it has uncommitted changes"
+        if self.host.running_in(claim.path):
+            return "a process is running in it"
+        # A branch outlives its worktree; commits on a detached HEAD would not.
+        if not self.host.current_branch(claim.path):
+            return self.host.unsaved(claim.path)
+        return ""
 
     def release_pending(
         self, *, execution_active: Callable[[str], bool | None] | None = None

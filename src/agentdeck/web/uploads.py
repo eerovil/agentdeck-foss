@@ -88,9 +88,12 @@ def sweep_abandoned_uploads(now: float | None = None) -> None:
 
 async def sweep_abandoned_uploads_periodically() -> None:
     """Apply the hard upload TTL even when no later upload or restart occurs."""
+    from ..new_work import sweep_old_files  # new_work imports this module
+
     while True:
         await asyncio.sleep(GENERIC_UPLOAD_SWEEP_INTERVAL_S)
         await asyncio.to_thread(sweep_abandoned_uploads)
+        await asyncio.to_thread(sweep_old_files)
 
 
 def _same_file_digest(path: Path, digest: str) -> bool:

@@ -1,9 +1,9 @@
 """Run /dream on an account's leftover weekly usage before its week resets (#3336).
 
 Whatever an account has not used by its weekly reset is lost, so the owner asked for that
-leftover to go to /dream. Every ``CHECK_INTERVAL_S`` the web process reads each Claude and
-Codex account's shared usage reading — the same file ``dream.py`` reads — and starts at most
-one dream chat, the way the New chat box starts one:
+leftover to go to /dream. Every ``CHECK_INTERVAL_S`` the web process reads each Claude
+account's shared usage reading — the same file ``dream.py`` reads — and starts at most one
+dream chat, the way the New chat box starts one (Codex accounts do not dream, #4100):
 
 * **early**: the week resets within ``EARLY_WITHIN_H`` hours and at least
   ``EARLY_MIN_LEFT_PCT`` of it is unused: ``/dream <label> 5``;
@@ -44,7 +44,7 @@ FIVE_HOUR_STOP_PCT = 75
 # dream.py's own USAGE_MAX_AGE_S and LOCK_STALE_S.
 READING_MAX_AGE_S = 1800.0
 LOCK_STALE_S = 6 * 3600
-DREAM_PROVIDERS = ("claude_code", "codex")
+DREAM_PROVIDERS = ("claude_code",)
 
 
 @dataclass(frozen=True)
@@ -138,8 +138,8 @@ def candidates(
             skipped.append(f"{key}: the usage reading is stale")
             continue
         five_hour = snapshot.five_hour_pct
-        # An account may have no 5-hour window at all, Codex's (#2560) and Claude's (#3947)
-        # alike; then its week decides alone, as in dream.py.
+        # An account may have no 5-hour window at all (#3947); then its week decides alone,
+        # as in dream.py.
         if _number(five_hour) and five_hour >= FIVE_HOUR_STOP_PCT:
             skipped.append(f"{key}: the 5-hour meter is at {five_hour:.0f}%")
             continue

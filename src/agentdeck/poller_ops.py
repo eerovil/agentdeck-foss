@@ -427,6 +427,9 @@ class _ManifestFacts:
     # The engine merges a passed review itself (``auto_release``, #2101). Without it a pass
     # waits for a person's ``/merge``, never for the deck (#2399).
     releases_itself: bool = False
+    # The repositories that merge on their own in a project that does not (``[[repos]]
+    # auto_release = true``, #4172), as the manifest names them.
+    releasing_repos: tuple[str, ...] = ()
     # The repositories whose GitHub checks are the verification (``verification =
     # "github_checks"``, #2364), as the manifest names them.
     ci_repos: tuple[str, ...] = ()
@@ -545,6 +548,11 @@ def _manifest(path: Path) -> _ManifestFacts:
             str(entry.get("id")).strip()
             for entry in (repos if isinstance(repos, list) else [])
             if isinstance(entry, dict) and entry.get("auto_deploys") is True and entry.get("id")
+        ),
+        releasing_repos=tuple(
+            str(entry.get("id")).strip()
+            for entry in (repos if isinstance(repos, list) else [])
+            if isinstance(entry, dict) and entry.get("auto_release") is True and entry.get("id")
         ),
         borrowed=tuple(
             (str(entry.get("id")).strip(), entry["workspace"].strip())
@@ -793,8 +801,9 @@ def release_policies(root: str | Path) -> dict[str, object]:
     """Each project repository's merge policy, by lowercased ``owner/repo`` (#2895).
 
     What the deck's own release (``work_release``) reads in place of the engine's loaded
-    manifest: ``auto_release``, the merge method, and which of the project's repositories
-    are proven by their review alone or by their GitHub checks. Manifest-only, as
+    manifest: ``auto_release`` (the project's, and each repository's own, #4172), the merge
+    method, and which of the project's repositories are proven by their review alone or by
+    their GitHub checks. Manifest-only, as
     ``work_repositories`` is; a repository two projects declare takes the
     first one's policy.
     """
@@ -827,6 +836,9 @@ def release_policies(root: str | Path) -> dict[str, object]:
             staging=facts.staging,
             staging_repos=frozenset(
                 _qualified(facts.org, repo).lower() for repo in facts.staging_repos
+            ),
+            auto_release_repos=frozenset(
+                _qualified(facts.org, repo).lower() for repo in facts.releasing_repos
             ),
         )
         for repo in facts.repos:

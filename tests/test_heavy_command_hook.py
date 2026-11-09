@@ -32,7 +32,7 @@ hook = _module()
 
 @pytest.fixture
 def runtime_socket(tmp_path):
-    path = tmp_path / "codex-runtime.sock"
+    path = tmp_path / "rt.sock"  # Short: 107 characters, and a job's TMPDIR is long (#4143).
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     listener.bind(str(path))
     listener.listen()

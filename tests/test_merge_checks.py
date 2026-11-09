@@ -203,7 +203,7 @@ def test_an_armed_work_whose_checks_all_reported_stays_in_progress(tmp_path):
 def test_the_pull_request_row_carries_auto_merge_from_both_writers():
     from agentdeck.git_context import _PR_FIELDS
 
-    assert "autoMergeRequest" in _PR_FIELDS.split(",")
+    assert {"autoMergeRequest", "body"} <= set(_PR_FIELDS.split(","))
     pull = {
         "number": 3369, "title": "t", "html_url": PR, "state": "open",
         "updated_at": "2026-09-26T19:19:34Z", "head": {"ref": "b", "sha": HEAD},
@@ -314,3 +314,92 @@ def test_a_merge_candidate_is_watched_for_its_merge_answer(tmp_path):
 
     ready = replace(plain, derived=DerivedStatus(READY, "Ready for merge"))
     assert merge_watch_pulls([ready]) == ((f"{ORG}/agentdeck", 7),)
+
+
+# --- a conflict found after Ready for merge (#4217) -------------------------------------------
+
+
+def _release(awaiting: dict[str, dict]):
+    """The release as the Work page reads it: each Work's ``awaiting_merge`` and its looks."""
+    looked: list[str] = []
+
+    async def evaluate(work_id):
+        looked.append(work_id)
+        return ""
+
+    store = SimpleNamespace(get=lambda work_id: {"awaiting_merge": awaiting.get(work_id, {})})
+    return SimpleNamespace(store=store, evaluate=evaluate), looked
+
+
+@pytest.mark.asyncio
+async def test_a_ready_work_that_starts_conflicting_is_not_ready_and_its_release_looks(tmp_path):
+    """#4217: robot#30 conflicted after something else landed on its base; the Work page kept
+    it Ready for merge and nothing told its agent."""
+    from agentdeck.web.work_view import WorkOverview, WorkOverviewService, _ready_for_merge
+
+    clean = _work(tmp_path, row=_row(), checks=_checked(mergeable="MERGEABLE"))
+    dirty = _work(
+        tmp_path, row=_row(), checks=_checked(mergeable="CONFLICTING", merge_state="DIRTY")
+    )
+    older = _work(  # a conflict read about an older head says nothing about this one
+        tmp_path, row=_row(), checks=_checked(head="f" * 40, mergeable="CONFLICTING")
+    )
+    release, looked = _release({WORK.work_id: {f"{ORG}/agentdeck#7": HEAD}})
+    app = SimpleNamespace(state=SimpleNamespace(work_release=release))
+
+    assert _ready_for_merge(app, WORK.work_id, clean.outputs) is clean.outputs[0]
+    assert _ready_for_merge(app, WORK.work_id, older.outputs) is older.outputs[0]
+    assert _ready_for_merge(app, WORK.work_id, dirty.outputs) is None
+
+    service = WorkOverviewService(app)
+    service.overview = WorkOverview(cards=(clean,))
+    assert await service.release_conflicts() == 0
+    service.overview = WorkOverview(cards=(dirty,))
+    works = release.evaluate
+
+    async def restarting(work_id):
+        raise OSError("the merge service is restarting")
+
+    release.evaluate = restarting
+    assert await service.release_conflicts() == 0, "a failed ask is asked again"
+    release.evaluate = works
+    assert await service.release_conflicts() == 1
+    assert await service.release_conflicts() == 0, "once per Work and heads"
+    assert looked == [WORK.work_id]
+    # Not held Ready by the release: nothing to pass on.
+    release.store.get = lambda work_id: {}
+    service = WorkOverviewService(app)
+    service.overview = WorkOverview(cards=(dirty,))
+    assert await service.release_conflicts() == 0
+
+
+@pytest.mark.asyncio
+async def test_merge_answers_are_read_oldest_first_past_the_limit(tmp_path, monkeypatch):
+    """#4217: with more candidates than ``limit``, the same first few took every place, fresh
+    or not, and a pull request past them never had its conflict read."""
+    from agentdeck import issue_context
+    from agentdeck.github_cache import GitHubMetadata, GitHubMetadataCache
+
+    cache = GitHubMetadataCache(tmp_path / "c.sqlite3")
+    refs = [(f"{ORG}/store", n) for n in (1, 2, 3)]
+
+    async def fetch():
+        return GitHubMetadata({"head": HEAD}, terminal=False)
+
+    for ref in refs[:2]:
+        await cache.resolve(merge_checks.cache_key(*ref), fetch)
+    asked: list = []
+
+    class Resolver:
+        def __init__(self, **kwargs):
+            pass
+
+        async def refresh_merge_checks(self, wanted, *, limit):
+            asked.extend(list(wanted)[:limit])
+            return 0
+
+    monkeypatch.setattr(issue_context, "GitContextResolver", Resolver)
+    context = issue_context.IssueResolver.__new__(issue_context.IssueResolver)
+    context._metadata = cache
+    await context.refresh_merge_checks(refs, limit=1)
+    assert asked == [refs[2]], "the one never read goes first"

@@ -1308,6 +1308,18 @@ def _parse_repos(raw: object, report: Report) -> tuple[Repo, ...]:
                 "a pull request",
             )
             checks_required = False
+        # Read by the deck's release alone (#4172): this repository merges on a passed review
+        # and green tests while the project's other ones wait for a person's Merge. The engine
+        # keeps no field for it, so an activated instance's digest does not move; it only
+        # refuses a value the deck could misread, or one on a repository with no pull requests.
+        releases = entry.get(AUTO_RELEASE, False)
+        if not isinstance(releases, bool) or (releases and not flags["holds_code"]):
+            report.add(
+                f"{location}.{AUTO_RELEASE}",
+                "must be true or false, and true only on a repository that holds code",
+                "set it only where this repository's reviewed, tested pull requests should "
+                "merge with nobody pressing Merge",
+            )
         repo = Repo(
             id=repo_id,
             workspace=workspace.strip(),

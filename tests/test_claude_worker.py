@@ -16,8 +16,10 @@ from worker_harness import FakeProcess, FakeStdin, FakeStdout  # noqa: F401
 from worker_harness import claude_host as _host
 from worker_harness import settle as _settle
 
+from agentdeck import job_scratch
 from agentdeck.classifier_grants import consume_grant, write_grant
 from agentdeck.command_artifacts import load_context
+from agentdeck.job_scratch import JOB_SCRATCH_ENV
 from agentdeck.models import (
     SNAPSHOT_ACTIVITY_CLOCK,
     SNAPSHOT_CAPABILITIES_KEY,
@@ -32,6 +34,7 @@ from agentdeck.providers.claude_code.worker import (
     ClaudeWorkerHost,
     WorkerRecord,
 )
+from agentdeck.providers.delivery import ReceiptSweep
 from agentdeck.providers.instructions import (
     AGENTDECK_SESSION_INSTRUCTIONS,
     agentdeck_session_instructions,
@@ -457,8 +460,7 @@ async def test_tokenless_spawn_mints_a_session_token_and_keeps_it_across_revival
     token = host._records["issue-1"].session_token
     assert token
     assert bound == [(token, "claude_code:test:sid-auto-1")]
-    prompt = spawned[0]["args"][spawned[0]["args"].index("--append-system-prompt") + 1]
-    assert token in prompt
+    assert spawned[0]["kwargs"]["env"]["AGENTDECK_SESSION_TOKEN"] == token
 
     proc = spawned[0]["process"]
     proc.stdout.emit({"type": "system", "subtype": "init", "session_id": "sid-abc"})
@@ -475,12 +477,7 @@ async def test_tokenless_spawn_mints_a_session_token_and_keeps_it_across_revival
     revived = await revived_host.deliver("issue-1", "follow-up", delegated=False)
     assert revived.accepted and revived.action == "revived"
     assert revived_host._records["issue-1"].session_token == token
-    assert (
-        token
-        in revived_spawned[0]["args"][
-            revived_spawned[0]["args"].index("--append-system-prompt") + 1
-        ]
-    )
+    assert revived_spawned[0]["kwargs"]["env"]["AGENTDECK_SESSION_TOKEN"] == token
     await revived_host.stop()
 
 
@@ -490,10 +487,7 @@ async def test_caller_supplied_session_token_is_never_replaced_by_a_minted_one(t
         "issue-1", "start", cwd=str(tmp_path), delegated=False, session_token="token-1"
     )
     assert host._records["issue-1"].session_token == "token-1"
-    assert (
-        "token-1"
-        in spawned[0]["args"][spawned[0]["args"].index("--append-system-prompt") + 1]
-    )
+    assert spawned[0]["kwargs"]["env"]["AGENTDECK_SESSION_TOKEN"] == "token-1"
     await host.stop()
 
 
@@ -710,10 +704,14 @@ async def test_a_deleted_directory_with_no_repository_above_it_stays_put(
     await host.stop()
 
 
-async def test_spawn_injects_agentdeck_url_but_not_session_key_when_fresh(tmp_path):
+async def test_spawn_injects_agentdeck_url_but_not_session_key_when_fresh(tmp_path, monkeypatch):
+    monkeypatch.setenv(JOB_SCRATCH_ENV, str(tmp_path))
+    monkeypatch.setattr(job_scratch, "scratch_problem", lambda _home: None)
     host, spawned = _host(tmp_path, base_url="http://127.0.0.1:8756")
     await host.deliver("issue-1", "work it", cwd=str(tmp_path), delegated=False)
     env = spawned[0]["kwargs"]["env"]
+    # A chat's direct test runs stay off the deck's disk too (#4143).
+    assert env["TMPDIR"] == str(tmp_path) and JOB_SCRATCH_ENV not in env
     # A fresh worker's session id is unknown at spawn, so only the base is set.
     assert env["AGENTDECK_URL"] == "http://127.0.0.1:8756"
     assert "AGENTDECK_SESSION_KEY" not in env
@@ -2130,8 +2128,7 @@ async def test_legacy_tokenless_record_is_repaired_before_revival(tmp_path):
     token = host._records["issue-9"].session_token
     assert token
     assert bound == [(token, "claude_code:test:sid-auto-1")]
-    prompt = spawned[0]["args"][spawned[0]["args"].index("--append-system-prompt") + 1]
-    assert token in prompt
+    assert spawned[0]["kwargs"]["env"]["AGENTDECK_SESSION_TOKEN"] == token
     await host.stop()
 
 
@@ -2273,6 +2270,23 @@ async def test_delivery_receipts_are_time_bounded_not_fifo_64(tmp_path):
     )
     assert replay.accepted and replay.action == "spawned"
     assert len(proc.stdin.lines) == writes
+
+
+async def test_saving_state_drops_expired_receipts_of_a_quiet_chat(tmp_path):
+    """Every state change rewrites every chat's receipts, so a quiet one's old ones go
+    too, and the file on disk is compact (#4143)."""
+    host, _ = _host(tmp_path)
+    await host.deliver("quiet", "m", cwd=str(tmp_path), delivery_id="d0", delegated=False)
+    host._records["quiet"].deliveries["d0"]["at"] = 0.0
+    host._receipt_sweep = ReceiptSweep()
+
+    await host.deliver("other", "m", cwd=str(tmp_path), delivery_id="d1", delegated=False)
+
+    text = host._state_path.read_text()
+    saved = {w["key"]: w["deliveries"] for w in json.loads(text)["workers"]}
+    assert saved["quiet"] == {} and "d1" in saved["other"]
+    assert "\n" not in text
+    await host.stop()
 
 
 async def test_clean_write_failure_keeps_delivery_retryable(tmp_path):
@@ -2516,6 +2530,7 @@ async def test_a_chat_outside_auto_mode_gets_the_block_hooks_but_no_skip_list(tm
     settings = _settings(spawned[0]["args"])
     assert settings["permissions"]["allow"] == []
     assert set(settings["hooks"]) == {"PermissionDenied", "PreToolUse"}
+    assert settings["skillListingMaxDescChars"] == 200  # every chat loads the list (#4080)
     await host.stop()
 
 
@@ -4237,7 +4252,7 @@ async def test_a_spare_cli_takes_a_new_chats_first_message_without_a_spawn(tmp_p
     assert host.snapshot()["workers"] == {}
     assert host.snapshot()["live_count"] == 0
     assert "--append-system-prompt" in spawned[0]["args"]
-    assert "tok-1" in spawned[0]["args"][spawned[0]["args"].index("--append-system-prompt") + 1]
+    assert spawned[0]["kwargs"]["env"]["AGENTDECK_SESSION_TOKEN"] == "tok-1"
 
     caplog.set_level("INFO", logger="agentdeck.providers.claude_code.worker")
     started = await host.deliver(

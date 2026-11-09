@@ -41,6 +41,7 @@ from ...command_artifacts import (
     ensure_claude_settings,
 )
 from ...images import UnsupportedImage, read_supported_image
+from ...job_scratch import point_chat_temp_files
 from ...models import (
     OPEN_QUESTIONS_PREFIX,
     RUNTIME_BOOTED_AT,
@@ -62,6 +63,7 @@ from ..delivery import (
     DeliverResult,
     DeliveryCorrelation,
     DeliveryReceipts,
+    ReceiptSweep,
 )
 from ..instructions import (
     SessionRole,
@@ -836,6 +838,7 @@ class ClaudeWorkerHost:
         self._bind_session_token = bind_session_token or (lambda _token, _key: None)
         self._process_factory = process_factory or asyncio.create_subprocess_exec
         self._state_path = state_dir / f"{account.label}.json"
+        self._receipt_sweep = ReceiptSweep()
         self._artifact_root = artifact_root or state_dir / "command-artifacts"
         allow_rules = permission_rules.allow_rules(classifier_skip_rules or ())
         # Keyed by whether the chat runs in auto: only an auto chat gets the skip list.
@@ -1264,9 +1267,11 @@ class ClaudeWorkerHost:
 
     def _save_state(self) -> None:
         self._state_path.parent.mkdir(parents=True, exist_ok=True)
+        self._receipt_sweep.run(rec.receipts for rec in self._records.values())
         payload = {"workers": [vars(rec) for rec in self._records.values()]}
         tmp = self._state_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(payload, indent=1))
+        # Compact: this whole file is rewritten on every state change (#4143).
+        tmp.write_text(json.dumps(payload, separators=(",", ":")))
         tmp.replace(self._state_path)
         self.on_state_change(None)
 
@@ -3622,6 +3627,7 @@ class ClaudeWorkerHost:
         # GitHub, so a worker cannot spend the reserve the poller holds for its
         # own wakes (#814). Writes still reach the real binary untouched.
         env["PATH"] = gh_shim.worker_path(env)
+        point_chat_temp_files(env)
         # Every GitHub push and fetch goes through AgentDeck's credential helper,
         # which answers per repository owner with a non-human authority and
         # refuses everything else; no inherited token survives (#2289).

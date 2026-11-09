@@ -150,7 +150,11 @@ class RuntimeSocketClient:
             await self._http.aclose()
             raise
         except httpx.HTTPError as exc:
-            return InjectResult(False, f"{self._runtime_label} unavailable: {exc}")
+            return InjectResult(
+                False,
+                f"{self._runtime_label} unavailable: {exc}",
+                runtime_unreachable=isinstance(exc, _CONNECTION_LOST),
+            )
 
     async def _post_when_listening(self, path: str, payload: dict) -> httpx.Response:
         loop = asyncio.get_running_loop()

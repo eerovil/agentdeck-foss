@@ -112,7 +112,7 @@ class StagingDeployService:
                 async for batch in self._tailer.watch(stop_event=self._stop, watcher=self._watcher):
                     if self.apply_batch(batch) and self.on_change is not None:
                         self.on_change()
-                    self._tailer.commit()
+                    await self._tailer.commit_off_loop()
                 return  # the stop event ended the watch
             except asyncio.CancelledError:
                 raise

@@ -12,6 +12,7 @@ import asyncio
 import json
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 
@@ -235,6 +236,31 @@ async def test_a_closed_work_waits_in_needs_you_until_a_person_finishes_it(tmp_p
     child["parent"] = None  # under no map, the same closed issue waits for its own Finish
     await app.state.work_overview.refresh()
     assert _ids(app.state.work_overview.overview.front.needs_you) == [OTHER.work_id]
+
+
+@pytest.mark.asyncio
+async def test_a_closed_work_left_unproven_is_finished_from_its_row(tmp_path, monkeypatch):
+    """A not_live check with no wait left has only a person's Finish to move it on (#4126)."""
+    from test_work_ui import WORK
+
+    app, _record = _deck(
+        tmp_path, monkeypatch, closed_at=NOW - timedelta(minutes=5), cutoff=NOW - timedelta(days=1)
+    )
+    client = _client(app)
+    app.state.work_router = SimpleNamespace(switched=lambda repository: True)  # deck-run
+    note = "no new case came up since the deploy"
+    app.state.control_db.set_work_live_check(WORK.work_id, "not_live", note, "s")
+    await app.state.work_overview.refresh()
+
+    (row,) = app.state.work_overview.overview.front.needs_you
+    assert row.attention.category == "needs_answer" and FINISH in row.attention.actions
+    front = client.get("/", params={"chats": "0"}).text
+    assert f"not live yet: {note}" in front and 'value="finish"' in front
+    assert "or finish the Work" in row.status.you
+
+    assert _visibility(client, "finish").status_code == 200
+    after = app.state.work_overview.overview
+    assert _ids(after.front.needs_you) == [] and _ids(after.front.finished) == [WORK.work_id]
 
 
 @pytest.mark.asyncio

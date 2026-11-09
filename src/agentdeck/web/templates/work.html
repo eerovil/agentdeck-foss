@@ -38,6 +38,20 @@
     {#- New chat (#2388): beside Send, so shut it adds no height. #}
     <button type="button" class="wd-new-chat-open" data-work-new-chat-open aria-controls="work-new-chat" aria-expanded="false">New chat</button>
     {%- endif %}
+    {%- if side_chat %}
+    {#- Side chat (#4199): a copy of the working chat to ask questions in while it works. On the
+        "Goes to" line under the text box (app.css), so it adds no height. While the Work's side chat is fresh it is a link to it. #}
+    {%- if side_chat.href %}
+    <a class="wd-new-chat-open wd-side-chat" href="{{ side_chat.href }}" data-work-side-chat>Side chat ↗</a>
+    {%- else %}
+    <button type="button" class="wd-new-chat-open wd-side-chat" data-work-side-chat
+            hx-post="{{ side_chat.url }}" hx-vals='{"client_action_id": "{{ side_chat.action_id }}"}'
+            hx-target="#work-side-chat-slot" hx-swap="innerHTML" hx-disabled-elt="this"
+            {#- Refused, it stays tappable: a press answers the reason in the slot below, which a
+                phone shows and a hover title would not. #}
+            {%- if side_chat.refusal %} aria-disabled="true" title="{{ side_chat.refusal }}"{% endif %}>Side chat</button>
+    {%- endif %}
+    {%- endif %}
     <div class="wd-message-result" id="work-message-result" aria-live="polite"></div>
   </form>
   {%- if new_chat %}
@@ -66,6 +80,9 @@
     </div>
   </form>
   <div class="wd-new-chat-slot" id="work-new-chat-slot" aria-live="polite"></div>
+  {%- endif %}
+  {%- if side_chat %}
+  <div class="wd-new-chat-slot" id="work-side-chat-slot" aria-live="polite"></div>
   {%- endif %}
   {%- else %}
   <div class="work-sec" id="work-sec-{{ name }}" sse-swap="work-{{ name }}" hx-swap="innerHTML" data-hold-in-use>{{ html | safe }}</div>

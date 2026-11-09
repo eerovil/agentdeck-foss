@@ -2,6 +2,7 @@ from typing import get_args
 
 import pytest
 
+from agentdeck.command_artifacts import SESSION_TOKEN_ENV
 from agentdeck.providers.instructions import (
     LOOK_CHECK_LINE,
     SESSION_GUIDE_OPEN,
@@ -371,7 +372,8 @@ def test_guide_tells_a_session_how_to_register_related_work_and_title():
     assert "creates" not in flat_guide.split("Register only additional issues")[1][:80]
     # The shim labels an agent-filed issue itself; a chat that hid its stderr told
     # the owner #2801 had no label when it did (#2802).
-    assert "adds that project's ownership label (`agent`) by itself" in flat_guide
+    assert "adds that project's ownership label by itself" in flat_guide
+    assert "$AGENTDECK_URL/api/works/<owner>/<repo>/<issue number>/start" in flat_guide
     assert "check the issue's labels before you report" in flat_guide
     # Another Work's agent never reads its issue's later edits or comments (#3908).
     assert "$AGENTDECK_URL/api/works/<owner>/<repo>/<issue number>/message" in flat_guide
@@ -401,9 +403,25 @@ def test_guide_tells_a_session_how_to_register_related_work_and_title():
     assert "update it when the chat's objective genuinely changes" in guide
 
 
+def test_a_claude_guide_names_the_token_variable_so_chats_share_their_cached_guide():
+    guides = {
+        token: agentdeck_session_instructions(
+            provider="claude_code", role="work", session_token=token, origin=""
+        )
+        for token in ("tok-123", "tok-456")
+    }
+    assert guides["tok-123"] == guides["tok-456"]
+    assert "tok-123" not in guides["tok-123"]
+    assert (
+        "`~/agentdeck/.venv/bin/agentdeck session-key $AGENTDECK_SESSION_TOKEN` as a command"
+        in guides["tok-123"]
+    )
+    assert SESSION_TOKEN_ENV == "AGENTDECK_SESSION_TOKEN"  # what the worker sets, and the text
+
+
 def test_session_token_is_the_identity_a_codex_or_fresh_worker_chat_has():
     tokened = agentdeck_session_instructions(
-        provider="claude_code", role="primary", session_token="tok-123"
+        provider="codex", role="primary", session_token="tok-123"
     )
 
     # A command, not a curl: Codex's approval gate refused sending the token to a URL (#3350).
@@ -506,6 +524,12 @@ def test_work_session_guide_says_what_the_deck_reads_and_names_no_poller():
         # Marking ready sends the pre-review checklist first (#3880).
         assert "short pre-review checklist" in flat and "`pre-review-done`" in flat
         assert "Do not ask a person whether to close it" in flat
+        # ... but a step left for a person keeps it open, as a question (#4151).
+        assert "left for a person" in flat and "your reply's last paragraph" in flat
+        # ... trying the change is not such a step: it is `needs_person` (#4210).
+        assert "trying the change is not such a step" in flat
+        assert "record `needs_person` with what to try" in flat
+        assert "Unit tests and a deploy alone prove no fix" in flat
         # The reviewer's walkthrough line (#3338), in the very form the poller brief asks for.
         assert f"opening with the line {USE_CASE_WALKTHROUGH_LINE}" in flat
         assert USE_CASE_WALKTHROUGH_NOT_APPLICABLE in flat

@@ -223,14 +223,14 @@ def target_owner(argv: list[str], *, remote: str | None = None) -> str:
 def label_values(argv: list[str]) -> list[str]:
     """Every label an invocation names, case-folded and stripped, empties dropped.
 
-    ``--label X``, ``--label=X``, ``-l X`` and ``-lX``, repeated or comma-separated, as
-    ``gh`` itself accepts them. ``_split_flags`` keeps ``-lX`` whole as a flag name, so
-    that spelling is read off the name.
+    ``--label X``, ``--label=X``, ``-l X``, ``-lX`` and ``gh issue edit``'s ``--add-label``,
+    repeated or comma-separated, as ``gh`` itself accepts them. ``_split_flags`` keeps
+    ``-lX`` whole as a flag name, so that spelling is read off the name.
     """
     _positionals, flags = _split_flags(argv)
     values: list[str] = []
     for name, value in flags:
-        if name in ("--label", "-l"):
+        if name in ("--label", "-l", "--add-label"):
             raw = value
         elif name.startswith("-l") and not name.startswith("--"):
             raw = name[2:]
@@ -250,22 +250,54 @@ def ownership_label_to_add(
     ownership labels (aliases included). A repository two
     manifests declare honours either's labels and gains the first one's canonical label.
     """
+    matches = _label_targets(repository, targets)
+    if not matches:
+        return None
+    owned = _labels_of(matches)
+    for value in label_values(argv):
+        if value in owned:
+            return None
+    return matches[0].ownership_labels[0]
+
+
+def misplaced_start_label(
+    argv: list[str], repository: str, targets: object
+) -> tuple[str, str] | None:
+    """``(label named, the label that starts a Work here)`` when the wrong one is used (#4141).
+
+    The label an invocation names starts a Work in some other repository but not in this
+    managed one, so the issue would wait in silence. ``None`` when it also names one that
+    works here, when the repository is not managed, or for any label that starts nothing
+    anywhere, which is just a label.
+    """
+    matches = _label_targets(repository, targets)
+    if not matches:
+        return None
+    named = label_values(argv)
+    if _labels_of(matches).intersection(named):
+        return None
+    elsewhere = _labels_of(
+        target for target in (targets or ()) if getattr(target, "ownership_labels", ())
+    )
+    wrong = next((value for value in named if value in elsewhere), None)
+    return (wrong, matches[0].ownership_labels[0]) if wrong else None
+
+
+def _label_targets(repository: str, targets: object) -> list:
+    """The ``targets`` that declare ``repository`` and have ownership labels."""
     wanted = github_authority.repository_of(repository)
     if not wanted:
-        return None
-    matches = [
+        return []
+    return [
         target
         for target in (targets or ())
         if github_authority.repository_of(getattr(target, "repository", "")) == wanted
         and getattr(target, "ownership_labels", ())
     ]
-    if not matches:
-        return None
-    owned = {label.strip().casefold() for target in matches for label in target.ownership_labels}
-    for value in label_values(argv):
-        if value in owned:
-            return None
-    return matches[0].ownership_labels[0]
+
+
+def _labels_of(targets) -> set[str]:
+    return {label.strip().casefold() for target in targets for label in target.ownership_labels}
 
 
 def credential_identity(environment: dict[str, str] | None = None) -> str:

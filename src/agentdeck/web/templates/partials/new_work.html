@@ -27,19 +27,58 @@
     <select id="{{ nw_id }}-repository" name="repository" data-new-work-repository>
       {% for target in new_work.targets %}
       <option value="{{ target.repository }}" data-project="{{ target.project }}"
-              data-evidence="{{ target.evidence_repository }}"
               data-spec-only="{{ '1' if target.spec_only_label else '' }}"
               {% if target.project_default %}data-project-default{% endif %}
               {% if target.repository == new_work.default %}selected{% endif %}>{{ target.repository }}</option>
       {% endfor %}
     </select>
+    {# Which account, model and effort the Work's agent runs on (#4181). Collapsed, as New
+       chat's is: almost every Work wants the deck's own choice, and the phone needs the room.
+       `new_work.js` shows only the accounts the chosen repository's Work may run on, and
+       the models and efforts of the chosen account's provider (Auto is Claude), and hides
+       the whole box, clearing its picks, for a repository whose Work a Poller starts. #}
+    {% if new_work.accounts %}
+    <details class="advanced-settings new-work-advanced" data-new-work-advanced data-repositories="{{ new_work.advanced_repositories | join(' ') }}" data-auto-provider="{{ new_work.auto_provider }}">
+      <summary>
+        <span>Edit advanced</span>
+        <span class="advanced-summary" data-new-work-advanced-summary>Auto account · default model</span>
+      </summary>
+      <div class="model-field">
+        <label for="{{ nw_id }}-account">Account</label>
+        <select id="{{ nw_id }}-account" name="account_key" data-new-work-account>
+          <option value="">Auto (most usage left)</option>
+          {% for account in new_work.accounts %}
+          <option value="{{ account.key }}" data-provider="{{ account.provider_id }}" data-repositories="{{ account.repositories | join(' ') }}">{{ account.label }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="model-field">
+        <label for="{{ nw_id }}-model">Model</label>
+        <select id="{{ nw_id }}-model" name="model" data-new-work-model>
+          <option value="">Default</option>
+          {% for model in new_work.models %}
+          <option value="{{ model.value }}" data-provider="{{ model.provider_id }}"{% if model.provider_id != new_work.auto_provider %} hidden disabled{% endif %}>{{ model.label }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="model-field">
+        <label for="{{ nw_id }}-effort">Effort</label>
+        <select id="{{ nw_id }}-effort" name="effort" data-new-work-effort>
+          <option value="">Default</option>
+          {% for effort in new_work.efforts %}
+          <option value="{{ effort.value }}" data-provider="{{ effort.provider_id }}"{% if effort.provider_id != new_work.auto_provider %} hidden disabled{% endif %}>{{ effort.label }}</option>
+          {% endfor %}
+        </select>
+      </div>
+    </details>
+    {% endif %}
     <label class="new-work-check" data-new-work-spec-only>
       <input type="checkbox" name="spec_only" value="1" checked> Spec only — write a spec first
     </label>
-    <div class="new-work-attach" data-new-work-attach>
+    <div class="new-work-attach">
       <label class="image-picker" for="{{ nw_id }}-images">＋ Attach file <span class="paste-hint">or paste screenshot</span></label>
       <input id="{{ nw_id }}-images" class="image-input" type="file" name="images" multiple>
-      <p class="new-work-note">Files are committed to <span data-new-work-evidence></span> — don't attach secrets. At most {{ new_work.max_files }}.</p>
+      <p class="new-work-note">Files stay on this deck; the issue lists only their links and paths. Don't attach secrets. At most {{ new_work.max_files }}.</p>
     </div>
     <div class="composer-actions">
       <span>Filed as an issue the Poller picks up</span>

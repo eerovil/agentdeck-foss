@@ -1,14 +1,16 @@
 """Durable deferred delivery through the ordinary session injection path.
 
-Two things ride it: wake-on messages (``wake_on.py``) and a person's message sent
-while the chat's runtime was restarting, held until it is back (#2847). The
-person-facing "send later" button that first used it was removed in #2847.
+Three things ride it: wake-on messages (``wake_on.py``), a person's message sent
+while the chat's runtime was restarting, held until it is back (#2847), and an answer
+to a question box given meanwhile (#4106). The person-facing "send later" button that
+first used it was removed in #2847.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -17,7 +19,7 @@ from pathlib import Path
 
 from .attachments import cleanup_uploaded_files
 from .inject import InjectionService
-from .models import Account, Capability, Session
+from .models import OPEN_QUESTIONS_PREFIX, Account, Capability, PendingInteraction, Session
 from .providers.base import SessionProvider
 
 log = logging.getLogger(__name__)
@@ -39,6 +41,15 @@ ATTACHMENTS_LOST_MID_SEND_REASON = (
 HOLD_EXPIRED_MID_SEND_REASON = (
     "the runtime did not come back in 30 minutes; it may have been sent before the restart"
 )
+#: How long a held answer waits, once the runtime is back, for its question to show:
+#: a restarted app-server replays an unanswered prompt a moment after it starts (#4106).
+QUESTION_RETURN_WAIT = timedelta(seconds=60)
+QUESTION_GONE_REASON = "the question had closed by the time the runtime came back"
+#: The same, for a row a web restart left mid-handoff: a closed question may be the very
+#: answer that went out, so the deck cannot say it was not sent.
+QUESTION_GONE_MID_SEND_REASON = (
+    "the question has closed; the deck cannot tell whether this answer reached the agent"
+)
 
 
 @dataclass(frozen=True)
@@ -47,6 +58,80 @@ class HeldAttachment:
 
     path: Path
     kind: str  # "image" or "file", the two ways ``InjectionService.start`` takes one
+
+
+@dataclass(frozen=True)
+class HeldAnswer:
+    """A question box's answer given while its runtime was restarting (#4106).
+
+    It goes back to the box, never into the chat as an ordinary message, and only while
+    the same question is still open: it would be read out of context anywhere else.
+    """
+
+    # The leg that asked: the chat may move to another leg meanwhile, and a decision given
+    # to one must never go to another, however alike their prompts read.
+    session_key: str
+    interaction_id: str
+    kind: str
+    fingerprint: str
+    answers: dict[str, list[str]]
+    decision: str | None = None
+    # The first try lost its connection, perhaps after the runtime took the answer, so a
+    # question that then closes may be this very answer.
+    attempted: bool = False
+
+    def to_json(self) -> str:
+        return json.dumps(
+            {
+                "session_key": self.session_key,
+                "interaction_id": self.interaction_id,
+                "kind": self.kind,
+                "fingerprint": self.fingerprint,
+                "answers": self.answers,
+                "decision": self.decision,
+                "attempted": self.attempted,
+            }
+        )
+
+    @classmethod
+    def from_json(cls, raw: object) -> HeldAnswer | None:
+        if not isinstance(raw, str):
+            return None
+        try:
+            data = json.loads(raw)
+            return cls(
+                str(data["session_key"]),
+                str(data["interaction_id"]),
+                str(data["kind"]),
+                str(data["fingerprint"]),
+                {str(key): list(values) for key, values in data["answers"].items()},
+                data["decision"] if isinstance(data.get("decision"), str) else None,
+                data.get("attempted") is True,
+            )
+        except (ValueError, KeyError, TypeError, AttributeError):
+            return None
+
+    @property
+    def closes(self) -> frozenset[str]:
+        """The questions this answer settles, a dismissed one included."""
+        decision = self.decision or ""
+        if decision.startswith("dismiss:"):
+            return frozenset(self.answers) | {decision.removeprefix("dismiss:")}
+        return frozenset(self.answers)
+
+    def still_open_in(self, live: PendingInteraction | None) -> bool:
+        """Whether what is asked now is what this answers, whatever id it goes by now."""
+        if live is None:
+            return False
+        if self.interaction_id.startswith(OPEN_QUESTIONS_PREFIX) and live.dismissible:
+            # Open questions come and go one by one: any left of these is still open.
+            return any(question.id in self.closes for question in live.questions)
+        return live.kind == self.kind and live.fingerprint() == self.fingerprint
+
+    def answers_for(self, live: PendingInteraction) -> dict[str, list[str]]:
+        """The answers to questions still open in ``live``."""
+        open_ids = {question.id for question in live.questions}
+        return {key: values for key, values in self.answers.items() if key in open_ids}
 
 
 @dataclass(frozen=True)
@@ -61,6 +146,7 @@ class ScheduledMessage:
     reason: str | None = None
     hold_reason: str | None = None
     attachments: tuple[HeldAttachment, ...] = ()
+    interaction_answer: HeldAnswer | None = None
 
     @property
     def held_for_runtime(self) -> bool:
@@ -92,6 +178,22 @@ class ScheduledMessage:
     def hold_expired(self, now: datetime) -> bool:
         return self.held_for_runtime and now - self.created_at >= HOLD_LIMIT
 
+    @property
+    def may_have_reached_the_agent(self) -> bool:
+        """An answer given up on that the agent may have got anyway (#4106): the person
+        must look at the chat before answering again, not just send it once more."""
+        return self.interaction_answer is not None and self.reason in (
+            QUESTION_GONE_MID_SEND_REASON,
+            HOLD_EXPIRED_MID_SEND_REASON,
+        )
+
+    @property
+    def send_was_tried(self) -> bool:
+        """Whether this row may already have gone out, so giving up cannot say it did not."""
+        return self.state != "scheduled" or (
+            self.interaction_answer is not None and self.interaction_answer.attempted
+        )
+
 
 @dataclass(frozen=True)
 class ScheduledTarget:
@@ -108,7 +210,15 @@ def _must_wait(
     Any row waits while the chat is the deck's own and its runtime cannot be reached
     (#2847). A held row also waits through the moment after the runtime returns and
     before the chat's controls are projected again; its 30-minute limit bounds that.
+
+    A held answer goes to the question box, not into a new turn, so INJECT says nothing
+    about it: it waits exactly while the box cannot be read (#4106). That includes a web
+    process that has not reached the runtime since it started.
     """
+    if message.interaction_answer is not None:
+        return target.provider.runtime_unreachable(
+            target.account, target.session
+        ) or target.provider.interactions_unknown(target.account)
     if Capability.INJECT in target.session.capabilities or injector.can_queue(
         target.session.key
     ):
@@ -133,6 +243,7 @@ class ScheduledMessageService:
         injector: InjectionService,
         resolve_target: Callable[[str], ScheduledTarget | None],
         *,
+        resolve_answer_target: Callable[[str], ScheduledTarget | None] | None = None,
         on_change: Callable[[str], None] | None = None,
         on_delivering: Callable[[str], None] | None = None,
         on_delivered: Callable[[str, str], None] | None = None,
@@ -142,6 +253,8 @@ class ScheduledMessageService:
         self._store = store
         self._injector = injector
         self._resolve_target = resolve_target
+        # A held answer's chat need not be able to take a new turn (#4106).
+        self._resolve_answer_target = resolve_answer_target or resolve_target
         self._on_change = on_change or (lambda _chat_id: None)
         self._on_delivering = on_delivering or (lambda _session_key: None)
         # A held send is a person's message, so a parked card's answer is relayed from
@@ -167,6 +280,9 @@ class ScheduledMessageService:
         self._blocked: set[str] = set()
         # When the earliest held row still due runs out its 30 minutes.
         self._hold_deadline: datetime | None = None
+        # When each held answer stops waiting for its question to show, once the runtime
+        # is back. In memory: a web restart only gives the question another minute.
+        self._question_deadlines: dict[str, datetime] = {}
 
     def start(self) -> None:
         if self._task is not None:
@@ -211,6 +327,10 @@ class ScheduledMessageService:
         """Deferred turns that still own a future delivery."""
         return self._store.pending_scheduled_message_ids()
 
+    def cancelled_retry_ids(self) -> frozenset[str]:
+        """Quota retries a person cancelled before any send (#4074)."""
+        return self._store.cancelled_scheduled_message_ids(QUOTA_RETRY_PREFIX)
+
     def handoffs(self, now: datetime, since: datetime) -> dict[str, datetime]:
         """Chats a message was handed to at or after ``since`` (#3084)."""
         return self._store.scheduled_message_handoffs(now, since)
@@ -237,6 +357,14 @@ class ScheduledMessageService:
         cleanup_uploaded_files([item.path for item in message.attachments])
         self._on_change(message.chat_id)
 
+    def _give_up(self, message: ScheduledMessage, reason: str, tried_reason: str) -> None:
+        """Report a row out of time, saying it may have gone out if a send was tried."""
+        wording = tried_reason if message.send_was_tried else reason
+        if message.state == "scheduled":
+            self._fail_waiting(message, wording)
+        else:
+            self._fail_mid_send(message, wording)
+
     async def dispatch_due(
         self, now: datetime | None = None, *, skip_waiting: bool = False
     ) -> None:
@@ -254,6 +382,10 @@ class ScheduledMessageService:
                 expires = message.created_at + HOLD_LIMIT
                 hold_deadline = expires if hold_deadline is None else min(hold_deadline, expires)
         self._hold_deadline = hold_deadline
+        due = {message.id for messages in grouped.values() for message in messages}
+        self._question_deadlines = {
+            key: moment for key, moment in self._question_deadlines.items() if key in due
+        }
         for chat_id, messages in grouped.items():
             if skip_waiting and chat_id in self._blocked:
                 continue
@@ -304,17 +436,19 @@ class ScheduledMessageService:
         for message in messages:
             if not message.hold_expired(now):
                 live.append(message)
-            elif message.state == "scheduled":
-                self._fail_waiting(message, HOLD_EXPIRED_REASON)
             else:
-                self._fail_mid_send(message, HOLD_EXPIRED_MID_SEND_REASON)
+                self._give_up(message, HOLD_EXPIRED_REASON, HOLD_EXPIRED_MID_SEND_REASON)
         for message in live:
             waiting = message.state == "scheduled"
             # A ``dispatching`` row is one a web restart left mid-handoff. It is
             # retried under the same id, so the runtime's fence replays a write
             # that already happened; it still waits for the runtime and still
             # checks its files, exactly like a fresh row (#2847 review).
-            target = self._resolve_target(chat_id)
+            target = (
+                self._resolve_target(chat_id)
+                if message.interaction_answer is None
+                else self._resolve_answer_target(message.interaction_answer.session_key)
+            )
             if target is None:
                 # Discovery may still be warming after a web restart. Leave the
                 # row scheduled and retry on the next chat change (#2865).
@@ -338,6 +472,11 @@ class ScheduledMessageService:
             if _must_wait(message, target, self._injector):
                 # The chat is the deck's own and its runtime is restarting: wait for
                 # its chat to change instead of failing the send (#2847, #2865).
+                self._question_deadlines.pop(message.id, None)
+                return False
+            if message.interaction_answer is not None:
+                if await self._deliver_answer(message, target, message.interaction_answer):
+                    continue
                 return False
             if any(not item.path.is_file() for item in message.attachments):
                 # A reboot can empty the temporary folder; a message read without the
@@ -403,14 +542,59 @@ class ScheduledMessageService:
             self._on_change(chat_id)
         return True
 
+    async def _deliver_answer(
+        self, message: ScheduledMessage, target: ScheduledTarget, answer: HeldAnswer
+    ) -> bool:
+        """Give a held answer to its question box; False while it must wait (#4106).
+
+        The fence is the question itself: an answer the agent received closes it, so a
+        row left mid-handoff is sent again only while the question is still open.
+        """
+        live = target.provider.live_interaction(target.account, target.session)
+        if not answer.still_open_in(live):
+            now = datetime.now(UTC)
+            deadline = self._question_deadlines.setdefault(
+                message.id, now + QUESTION_RETURN_WAIT
+            )
+            if now < deadline:
+                return False
+            del self._question_deadlines[message.id]
+            self._give_up(message, QUESTION_GONE_REASON, QUESTION_GONE_MID_SEND_REASON)
+            return True
+        self._question_deadlines.pop(message.id, None)
+        if not self._store.claim_scheduled_message(message.id):
+            return True
+        self._on_change(message.chat_id)
+        result = await target.provider.answer_live_interaction(
+            target.account,
+            target.session,
+            live,
+            answers=answer.answers_for(live),
+            decision=answer.decision,
+        )
+        if result.runtime_unreachable:
+            # It went away again, perhaps after taking the answer: the row stays
+            # mid-handoff, and the question being open or not settles it on its return.
+            return False
+        if result.accepted:
+            self._store.settle_scheduled_message(message.id, "delivered")
+        else:
+            self._store.settle_scheduled_message(
+                message.id, "failed", result.reason or "delivery refused"
+            )
+        self._on_change(message.chat_id)
+        return True
+
     def next_due(self, now: datetime) -> datetime | None:
-        """When the next row falls due, or a held row runs out its 30 minutes (#2865).
+        """When the next row falls due, or a held row runs out of time (#2865).
 
         A row scheduled for later is due at its own ``due_at``; a held row waiting on its
-        runtime is given up at ``created_at + HOLD_LIMIT``. None when neither is pending.
-        A store without the lookup (a test fake) has no future rows to offer.
+        runtime is given up at ``created_at + HOLD_LIMIT``, and a held answer whose runtime
+        is back but whose question has not shown at its own deadline. None when none is
+        pending. A store without the lookup (a test fake) has no future rows to offer.
         """
         moments = [] if self._hold_deadline is None else [self._hold_deadline]
+        moments.extend(self._question_deadlines.values())
         later = getattr(self._store, "next_scheduled_message_due", None)
         if later is not None:
             upcoming = later(now)

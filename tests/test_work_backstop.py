@@ -152,6 +152,27 @@ def test_an_issue_another_deck_works_is_not_started():
     assert harness.reread_calls == [(REPO, 2), (REPO, 3)]
 
 
+def test_an_issue_a_blocker_holds_is_not_counted_as_started(caplog):
+    """#4216: ``start_work`` is ``start_unless_blocked``, which answers without starting while
+    a blocker is open or unread; the backstop logs that and tries again next pass."""
+    caplog.set_level("INFO", logger="agentdeck.work_backstop")
+    harness = Harness([_issue(n, "agent") for n in (1, 2, 3)])
+    held = {1: "waits on a blocker", 3: "blockers unread"}
+
+    async def start(repository, number, labels=()):
+        harness.starts.append((repository, number))
+        return held.get(number, "started")
+
+    harness.backstop._start_work = start
+    assert harness.sweep() == ["github_issue:eerovil/agentdeck#2"]
+    assert "github_issue:eerovil/agentdeck#1 not started: waits on a blocker" in caplog.text
+    assert "#1 was labelled with no chat" not in caplog.text
+    held.clear()
+    assert {"github_issue:eerovil/agentdeck#1", "github_issue:eerovil/agentdeck#3"} <= set(
+        harness.sweep()
+    )
+
+
 def test_only_an_issue_updated_in_the_last_day_is_started():
     harness = Harness(
         [

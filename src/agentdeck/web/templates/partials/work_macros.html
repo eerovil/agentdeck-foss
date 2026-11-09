@@ -2,10 +2,19 @@
     deck's rows and page (#3855), which read the same `diffstat` and `targets`. #}
 {%- macro size(card, lead=true) -%}
 {#- The Work's pull requests' size, and their target only when it is not master (#2236).
-    Source files only: tests, docs and non-code files are left out (#2331). -#}
+    Source files only: tests, docs and non-code files are left out (#2331). Whether those
+    changes are merged leads it (#4134), in a span of its own: it shows with no size too. Only
+    open pull requests count, so a merged Work shows the word alone (#4195). -#}
 {%- set stat = card.diffstat -%}
-{%- if stat %}{% if lead %} · {% endif %}<span class="fr-size" data-work-diffstat>{% if stat.files %}+{{ stat.additions }}/&minus;{{ stat.deletions }} · {{ stat.files }} {{ "file" if stat.files == 1 else "files" }}{% if stat.new_files %} ({{ stat.new_files }} new){% endif %}{% else %}no source change{% endif %}</span>{% endif -%}
+{%- set word = card.merge_word -%}
+{%- if word %}{% if lead %} · {% endif %}<span class="fr-merge fr-merge-{{ word }}" data-work-merge="{{ word }}">{{ word }}</span>{% endif -%}
+{%- if stat %}{% if word %} {% elif lead %} · {% endif %}<span class="fr-size" data-work-diffstat>{% if stat.files %}+{{ stat.additions }}/&minus;{{ stat.deletions }} · {{ stat.files }} {{ "file" if stat.files == 1 else "files" }}{% if stat.new_files %} ({{ stat.new_files }} new){% endif %}{% else %}no source change{% endif %}</span>{% endif -%}
 {%- if card.targets %} · <span class="fr-target" data-work-target>into {{ card.targets | join(", ") }}</span>{% endif -%}
+{%- endmacro -%}
+{%- macro use_dot(use) -%}
+{#- What a chat's next message will cost, by its context size (#4168). A round dot, away from
+    a row's title, so it does not read as the diff square. -#}
+{%- if use %}<span class="use-dot use-{{ use.level }}" role="img" title="{{ use.title }}" aria-label="{{ use.title }}" data-chat-use="{{ use.level }}"></span>{% endif -%}
 {%- endmacro -%}
 {%- macro diff_icon(card) -%}
 {#- GitHub's diff square (#3617): [+] when most changed lines are in new files, [•] otherwise,
@@ -14,4 +23,18 @@
 {%- set stat = card.diffstat -%}
 {%- if stat and stat.split %}<span class="fr-diff fr-diff-{{ stat.grade }}" role="img" title="{{ stat.split_label }}" aria-label="{{ stat.split_label }}" data-work-diff="{{ stat.grade }} {{ 'new' if stat.mostly_new else 'edited' }}"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="1.75" y="1.75" width="12.5" height="12.5" rx="2" fill="none" stroke="currentColor" stroke-width="1.5"/>
 {%- if stat.mostly_new %}<path d="M8 4.5v7M4.5 8h7" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>{% else %}<circle cx="8" cy="8" r="2.4" fill="currentColor"/>{% endif %}</svg></span>{% endif -%}
+{%- endmacro -%}
+{#- What one pull request of a Work does, in its own words (#4137): its title, with its
+    description below it. A pull request still open waits on the reader, so its description
+    starts open; one merged or closed folds behind its title. The key's end changes with that,
+    so a choice made while it was open does not outlive the merge (work_list.js). -#}
+{%- macro output_about(output, work_id) -%}
+{%- if output.title and output.body %}
+<details class="wd-output-about" data-wd-output-about="{{ "waiting" if output.is_open else "done" }}" data-keep-open="work-pull:{{ work_id }}:{{ output.url }}:{{ "waiting" if output.is_open else "done" }}"{% if output.is_open %} data-open-by-default open{% endif %}>
+  <summary>{{ output.title }}</summary>
+  <div class="wd-issue-text">{{ output.body }}</div>
+</details>
+{%- elif output.title %}
+<div class="wd-output-title" data-wd-output-title>{{ output.title }}</div>
+{%- endif %}
 {%- endmacro -%}

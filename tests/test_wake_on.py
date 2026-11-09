@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -39,7 +40,7 @@ from agentdeck.wake_on import (
     seen_result,
     timeout_message,
 )
-from agentdeck.webhook_tailer import WebhookTailer
+from agentdeck.webhook_tailer import Delivery, WebhookTailer
 from agentdeck.work_router import AgainBusy, AgainRefused
 
 REPO = Repository(owner="eerovil", name="agentdeck")
@@ -184,6 +185,12 @@ def test_a_review_wait_ends_quietly_on_the_verdict_and_wakes_only_on_its_timeout
     # A verdict on one pull request leaves the wait on another (#3183 review); none is the Work.
     assert service.registry.answer_reviews("claude_code:alt:one", ["Eerovil/AgentDeck#12"]) == 1
     assert service.registry.answer_reviews("claude_code:alt:one", ["eerovil/agentdeck#99"]) == 0
+    # #4089: a verdict naming no pull request cannot say whose it is, so of several waits it
+    # ends none; metso#77's wait went with store#3849's findings.
+    third = register(service, review="eerovil/agentdeck#14", timeout_minutes=30)
+    assert service.registry.answer_reviews("claude_code:alt:one", None) == 0
+    assert service.registry.answer_reviews("claude_code:alt:one", ["eerovil/agentdeck#14"]) == 1
+    assert third.id not in {item.id for item in service.registry.all()}
     assert service.registry.answer_reviews("claude_code:alt:one", None) == 1
     assert second.id not in {item.id for item in service.registry.all()}
     assert scheduled[1:] == []
@@ -469,6 +476,40 @@ def test_a_commit_wait_on_a_replaced_head_is_dropped_without_a_wake(root, schedu
     assert [message.id for message in scheduled] == [f"wake-on:{pull.id}"]
     assert {item.id for item in service.registry.all()} == {unrelated.id, bystander.id}
     assert f"@{new} named like 'test': pull request eerovil/agentdeck#76: it merged" in caplog.text
+
+
+def test_the_decks_review_check_is_no_ci_result_for_a_commit_wait(root, service, scheduled):
+    """A wait on CI must not end on the deck's own review check (#4152)."""
+    register(service, commit=f"eerovil/agentdeck@{SHA}")
+    deliver(
+        root,
+        event="check_run",
+        delivery="d1",
+        action="completed",
+        check_run={"head_sha": SHA, "name": "AgentDeck review", "conclusion": "failure"},
+    )
+    deliver(
+        root,
+        event="check_suite",
+        delivery="d2",
+        action="completed",
+        check_suite={
+            "head_sha": SHA,
+            "conclusion": "failure",
+            "app": {"slug": "agentdeck-eerovil"},
+        },
+    )
+    drain(service)
+    assert scheduled == []
+    deliver(
+        root,
+        event="check_run",
+        delivery="d3",
+        action="completed",
+        check_run={"head_sha": SHA, "name": "tests", "conclusion": "success"},
+    )
+    drain(service)
+    assert len(scheduled) == 1
 
 
 def test_a_commit_wait_wakes_on_a_completed_check_run(root, service, scheduled):
@@ -833,10 +874,211 @@ def test_a_wait_that_times_out_still_wakes_the_chat_once(root, service, schedule
     clock.now += 5 * 60
     service.expire_due()
     service.expire_due()
+    assert scheduled == []  # one more round first (#4080)
+    clock.now += 5 * 60
+    service.expire_due()
+    service.expire_due()
     assert [message.id for message in scheduled] == [f"wake-on:{request.id}"]
-    assert "nothing arrived for pull request eerovil/agentdeck#12 within 5 minutes" in (
+    assert "nothing arrived for pull request eerovil/agentdeck#12 within 10 minutes" in (
         scheduled[0].text
     )
+
+
+def test_registering_again_gives_a_spent_round_back(root, service, scheduled, clock):
+    body = {"pull_request": "eerovil/agentdeck#12", "timeout_minutes": 5}
+    register(service, **body)
+    clock.now += 5 * 60
+    service.expire_due()
+    register(service, **body)
+    clock.now += 5 * 60
+    service.expire_due()
+    assert scheduled == []
+    clock.now += 5 * 60
+    service.expire_due()
+    assert len(scheduled) == 1
+
+
+def test_the_extra_round_survives_a_restart_and_a_delivery_still_ends_it(
+    root, service, scheduled, clock
+):
+    request = register(service, pull_request="eerovil/agentdeck#12", timeout_minutes=5)
+    clock.now = request.deadline
+    service.expire_due()
+    restarted = WakeOnService(
+        root,
+        schedule=lambda message: scheduled.append(message) or message,
+        message_exists=lambda _id: False,
+        clock=clock,
+    )
+    (held,) = restarted.registry.all()
+    assert (held.deadline, held.extra_s) == (request.deadline + 5 * 60, 0.0)
+    restarted.apply(
+        [
+            Delivery(
+                stream="eerovil/agentdeck",
+                delivery_id="d1",
+                event="pull_request",
+                received_at=datetime.fromtimestamp(clock.now + 1, UTC).isoformat(),
+                headers={},
+                raw_body=json.dumps(
+                    {"action": "closed", "number": 12, "pull_request": {"merged": True}}
+                ).encode(),
+                offset=0,
+            )
+        ]
+    )
+    assert len(scheduled) == 1 and "merged" in scheduled[0].text
+    assert restarted.registry.all() == ()
+
+
+def test_a_renewal_or_a_stopped_review_beats_the_extra_round(root, service, scheduled, clock):
+    body = {"pull_request": "eerovil/agentdeck#12", "timeout_minutes": 5}
+    request = register(service, **body)
+    clock.now += 5 * 60
+    renewed = register(service, **body)  # lands between the deadline pass's read and its write
+    service.registry.extend(request.id, clock.now)
+    assert service.registry.all() == (renewed,)
+    # A merge wait a stopped review brought forward says so at once.
+    service.registry.update(
+        replace(renewed, stopped="no verdict", cut_from=renewed.deadline, deadline=clock.now)
+    )
+    service.expire_due()
+    assert len(scheduled) == 1 and "nothing arrived" not in scheduled[0].text
+
+
+def test_a_wait_stored_before_the_extra_round_times_out_at_once(root, service, scheduled, clock):
+    request = register(service, pull_request="eerovil/agentdeck#12", timeout_minutes=5)
+    service.registry.update(replace(request, extra_s=0.0))
+    clock.now += 5 * 60
+    service.expire_due()
+    assert len(scheduled) == 1
+
+
+def test_a_timeout_sends_a_result_the_deck_already_holds(root, service, scheduled, clock):
+    finished = {"sha": SHA, "context": "ci", "state": "success"}
+    deliver(root, event="status", delivery="d1", updated_at="2026-11-04T10:00:00Z", **finished)
+    deliver(
+        root,
+        event="deployment_status",
+        delivery="d2",
+        action="created",
+        deployment_status={
+            "state": "success",
+            "environment": "production",
+            "updated_at": "2026-11-04T10:00:00Z",
+        },
+        deployment={"sha": SHA},
+    )
+    # Both are older than the waits, so only the read at the timeout can find them.
+    clock.now = datetime.now(UTC).timestamp() + 5
+    register(service, commit=f"eerovil/agentdeck@{SHA}", timeout_minutes=5)
+    register(service, deployment=f"eerovil/agentdeck@{SHA}", timeout_minutes=5)
+    drain(service)
+    assert scheduled == []
+    clock.now += 5 * 60
+    service.expire_due()
+    assert service.registry.all() == ()
+    assert "commit status ci" in scheduled[0].text
+    assert "deployment to production" in scheduled[1].text
+
+
+def deploy_state(root, delivery, state, at, *, sha=SHA, environment="production"):
+    deliver(
+        root,
+        event="deployment_status",
+        delivery=delivery,
+        action="created",
+        deployment_status={"state": state, "environment": environment, "updated_at": at},
+        deployment={"sha": sha},
+    )
+
+
+@pytest.mark.parametrize(
+    ("states", "told"),
+    [
+        (["failure"], "finished: failure"),
+        (["success", "failure"], "finished: failure"),
+        (["failure", "success"], "finished: success"),
+        (["success", "in_progress"], None),
+    ],
+)
+def test_a_timeout_tells_the_newest_state_of_a_deploy(
+    root, service, scheduled, clock, states, told
+):
+    # Stored in reverse, so the source's own time decides and not the arrival.
+    for n, state in reversed(list(enumerate(states))):
+        deploy_state(root, f"d{n}", state, f"2026-11-04T10:0{n}:00Z")
+    clock.now = datetime.now(UTC).timestamp() + 5
+    register(service, deployment=f"eerovil/agentdeck@{SHA}", timeout_minutes=5)
+    drain(service)
+    clock.now += 5 * 60
+    service.expire_due()
+    if told:
+        assert len(scheduled) == 1 and told in scheduled[0].text
+    else:
+        assert scheduled == [] and len(service.registry.all()) == 1
+
+
+def test_a_timeout_finds_a_named_status_deploy_and_only_for_a_named_wait(
+    root, service, scheduled, clock
+):
+    finished = {"sha": SHA, "context": "Vercel", "state": "failure"}
+    deliver(root, event="status", delivery="d1", updated_at="2026-11-04T10:00:00Z", **finished)
+    clock.now = datetime.now(UTC).timestamp() + 5
+    register(service, deployment=f"eerovil/agentdeck@{SHA}", name="vercel", timeout_minutes=5)
+    unnamed = register(service, deployment=f"eerovil/agentdeck@{SHA}", timeout_minutes=5)
+    drain(service)
+    clock.now += 5 * 60
+    service.expire_due()
+    assert len(scheduled) == 1 and "commit status Vercel" in scheduled[0].text
+    assert [held.id for held in service.registry.all()] == [unnamed.id]
+
+
+def test_a_timeout_reads_a_named_deploy_across_both_kinds_of_report(
+    root, service, scheduled, clock
+):
+    finished = {"sha": SHA, "context": "Vercel", "state": "success"}
+    deliver(root, event="status", delivery="d1", updated_at="2026-11-04T10:00:00Z", **finished)
+    deploy_state(root, "d2", "in_progress", "2026-11-04T10:01:00Z", environment="Vercel – Preview")
+    clock.now = datetime.now(UTC).timestamp() + 5
+    register(service, deployment=f"eerovil/agentdeck@{SHA}", name="vercel", timeout_minutes=5)
+    drain(service)
+    clock.now += 5 * 60
+    service.expire_due()
+    assert scheduled == [] and len(service.registry.all()) == 1
+
+
+def test_a_timeout_on_a_wait_with_no_commit_counts_only_later_deploys(
+    root, service, scheduled, clock
+):
+    now = datetime.now(UTC)
+    deploy_state(root, "d1", "success", (now - timedelta(hours=1)).isoformat())
+    clock.now = now.timestamp() + 5
+    first = register(service, deployment="eerovil/agentdeck", timeout_minutes=5)
+    drain(service)
+    clock.now += 5 * 60
+    service.expire_due()
+    assert scheduled == [] and service.registry.all()[0].id == first.id
+    # Not drained: the tailer is behind, so only the read at the timeout finds it.
+    later = (now + timedelta(minutes=1)).isoformat()
+    deploy_state(root, "d2", "failure", later, sha="b" * 40)
+    clock.now += 5 * 60
+    service.expire_due()
+    assert len(scheduled) == 1 and "finished: failure" in scheduled[0].text
+    assert service.registry.all() == ()
+
+
+def test_an_unreadable_stream_does_not_stop_a_timeout(root, service, scheduled, clock, monkeypatch):
+    def broken(_request):
+        raise OSError("gone")
+
+    monkeypatch.setattr(service, "seen_result", broken)
+    register(service, commit=f"eerovil/agentdeck@{SHA}", timeout_minutes=5)
+    clock.now += 5 * 60
+    service.expire_due()
+    clock.now += 5 * 60
+    service.expire_due()
+    assert len(scheduled) == 1 and "within 10 minutes" in scheduled[0].text
 
 
 def test_the_next_deadline_is_the_earliest_timeout_or_retry(root, service, clock):
@@ -868,7 +1110,7 @@ async def test_a_timeout_fires_at_its_deadline_and_a_registration_replans(root):
     try:
         await asyncio.sleep(0.1)  # asleep with nothing registered
         fields = parse_request(pull_request="eerovil/agentdeck#12")
-        fields["timeout_s"] = 0.3
+        fields["timeout_s"] = 0.1  # twice over: a merge wait gets one more round (#4080)
         request = service.register("claude_code:alt:one", "chat-1", **fields)
         await asyncio.wait_for(fired.wait(), timeout=5)
     finally:
@@ -925,7 +1167,9 @@ def test_a_message_already_saved_under_the_id_ends_the_wait(root, clock):
 
     service = WakeOnService(root, schedule=schedule, message_exists=lambda _id: True, clock=clock)
     register(service, pull_request="eerovil/agentdeck#12", timeout_minutes=1)
-    clock.now += 120
+    clock.now += 60
+    service.expire_due()
+    clock.now += 60
     service.expire_due()
     service.expire_due()
     assert len(request_ids) == 1

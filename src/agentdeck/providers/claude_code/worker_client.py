@@ -16,7 +16,13 @@ from datetime import UTC, datetime
 import httpx
 
 from ... import runtime_feed
-from ...models import SNAPSHOT_CAPABILITIES_KEY, Account, ForkFrom, InjectResult
+from ...models import (
+    SNAPSHOT_CAPABILITIES_KEY,
+    Account,
+    ForkFrom,
+    InjectResult,
+    open_questions_id,
+)
 from ..instructions import SessionRole
 from ..runtime_socket_client import RuntimeSocketClient
 
@@ -415,6 +421,26 @@ class ClaudeWorkerClient(RuntimeSocketClient):
             return pending
         return entry.get("open_questions") or pending
 
+    def forget_interaction(self, session_id: str, question_ids: Iterable[str]) -> None:
+        """Take an answer held for the runtime out of the copy kept here (#4106).
+
+        The other open questions stay, under the id the runtime would give them. The
+        snapshot bytes go too, so the runtime's next read replaces this copy even if it
+        says exactly what the last one said.
+        """
+        entry = self._owned.get(session_id)
+        if not entry:
+            return
+        pending = entry.get("pending_interaction")
+        blocked = isinstance(pending, dict) and pending.get("kind") != "question"
+        entry["pending_interaction"] = None
+        if not blocked:
+            entry["open_questions"] = _without_questions(
+                entry.get("open_questions"), set(question_ids)
+            )
+        self._snapshot = None
+        self._on_change()
+
     async def prepare_spare(
         self,
         shape: str,
@@ -597,6 +623,24 @@ class ClaudeWorkerClient(RuntimeSocketClient):
                 await asyncio.sleep(min(TURN_POLL_S, remaining))
             else:
                 await changes.wait(TURN_POLL_S, timeout=remaining)
+
+
+def _without_questions(box: object, closed: set[str]) -> dict | None:
+    """A chat's open-questions box without ``closed``, or None when none are left."""
+    if not isinstance(box, dict):
+        return None
+    left = [
+        question
+        for question in box.get("questions") or []
+        if isinstance(question, dict) and question.get("id") not in closed
+    ]
+    if not left:
+        return None
+    return {
+        **box,
+        "id": open_questions_id(str(question.get("id")) for question in left),
+        "questions": left,
+    }
 
 
 def _stamp(value: object) -> float:

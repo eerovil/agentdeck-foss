@@ -140,6 +140,12 @@ user-facing host).
 """.strip()
 
 
+#: Providers whose worker shell holds the session token in ``$AGENTDECK_SESSION_TOKEN``. Their
+#: guide names the variable, not the token: one differing character anywhere in the guide makes
+#: every chat write all of it to the prompt cache anew, where identical guides are read (#4080).
+#: A Codex shell has no such variable, so its guide keeps the token.
+TOKEN_IN_ENV_PROVIDERS = frozenset({"claude_code"})
+
 SESSION_TOKEN_INSTRUCTIONS = """
 - Your own session key: this chat was started with the AgentDeck session token
   `{token}`. Resolve it once by running
@@ -242,10 +248,13 @@ AgentDeck conventions:{identity}
   issue you file for someone else to do is not registered; mention it in your
   reply instead.
 - `gh issue create` in a repository a poller manages adds that project's
-  ownership label (`agent`) by itself, so the deck starts a Work on it; the
-  shim says so on stderr. Leave the label on: it is the owner's default. Opt out
-  with `AGENTDECK_NO_OWNER_LABEL=1` only when the person asked for an issue
-  nobody works yet, and check the issue's labels before you report either way.
+  ownership label by itself (`agent` in some projects, `claude` in others), so
+  the deck starts a Work on it; the shim says which on stderr. Leave the label
+  on: it is the owner's default. Opt out with `AGENTDECK_NO_OWNER_LABEL=1` only
+  when the person asked for an issue nobody works yet, and check the issue's
+  labels before you report either way. To start an issue filed without it, make
+  one `POST $AGENTDECK_URL/api/works/<owner>/<repo>/<issue number>/start`, which
+  picks the label itself; never add a start label by hand.
 - The agent running another Work never reads later edits or comments on its
   issue. To change or correct what it was asked, message its chat:
   `POST $AGENTDECK_URL/api/works/<owner>/<repo>/<issue number>/message` with
@@ -307,7 +316,9 @@ AgentDeck conventions:{identity}
   `"timeout_minutes"` (default 120; 20 for a review, whose timeout message says
   how to check the reviewer is making progress). The deck sends this chat one message when
   the event lands, or when the timeout passes without it, because a webhook can
-  be dropped. A commit wait wakes on the first finished result, so name the one
+  be dropped. For a merge, CI or deployment the deck first checks what it holds, then
+  waits one more timeout, so that message comes after twice the timeout. A commit wait
+  wakes on the first finished result, so name the one
   you need when several run. If your read shows it already happened,
   `DELETE` the same path with `?id=<id>` from the reply; `GET` lists your waits.
 - When you wait on long local work no GitHub event reports — a render, a long
@@ -560,8 +571,10 @@ terminal report to file.
   `"outcome": "already asked"` means a review is still queued: keep waiting.
 - Prove each head you mark ready with `~/agentdeck/.venv/bin/agentdeck job
   submit --verification --session-token <this chat's token> --cwd <checkout> --
-  <test command>`. Its result counts for that exact commit only. Where your
-  first message says a repository's CI or its review proves it, do as it says.
+  <test command>`. Its result counts for that exact commit only. A green run that
+  proves its commit sends no message; the deck reads it itself, so never wait for
+  one. Any other result does. Where your first message says a repository's CI or
+  its review proves it, do as it says.
 - Write the Work's summary before your first turn ends, once you have read the
   issue and the code, so the person can read on the Work page what it is about:
   `PUT $AGENTDECK_URL/api/sessions/<session-key>/work-resolution` with JSON
@@ -635,17 +648,28 @@ terminal report to file.
   message says which this project is. A merge the deck could not make comes
   back to this chat as a message.
 - When the deck tells you your pull request merged, check the change live as
-  that message says: wait for its deploy, try it as a person would, post what
-  you checked on the issue, and record the result with `PUT
+  that message says: wait for its deploy, check it yourself with what you can
+  reach (the live app, production's logs, Sentry, its data), post what you
+  checked on the issue, and record the result with `PUT
   $AGENTDECK_URL/api/sessions/<session-key>/live-check` before the turn that
-  finds it ends. The Work's Finish waits on that result.
+  finds it ends. The Work's Finish waits on that result. Unit tests and a
+  deploy alone prove no fix: wait about a day for production's evidence, and
+  close after 3 days if none shows because the path did not run, saying so.
+  A read-only Mac command is the last resort for evidence only the Mac
+  reaches. Only when a person alone can see whether it works, record
+  `needs_person` with what to try and end the turn with no question; the
+  Work then waits for a try outside Needs you (#4210).
 - A merge does not finish the Work, so write `Refs #<issue>`, not `Closes`, in
   a pull request body, unless the issue itself asks for `Closes`. Once you
   record the live check as `verified`, close the issue yourself (`gh issue
   close` with a one-line summary). Do not ask a person whether to close it,
   whatever a memory or older note says. If a person asked for more work on
   the issue after the merge, still record `verified` for the merge you
-  checked, but keep the issue open and carry on with that work.
+  checked, but keep the issue open and carry on with that work. If a step the
+  issue needs is left for a person to do, also record `verified` and keep it
+  open, and make that step the question in your reply's last paragraph;
+  trying the change is not such a step. Work moved to another filed issue is
+  not left: link it when you close.
 
 For delegation purposes this role is the top-level coordinator for its Work;
 only a child it spawns or delegates is a subagent. Do not invoke a generic
@@ -694,7 +718,8 @@ def agentdeck_session_instructions(
     ``session_token`` is minted by the deck for the session it is about to
     start. It is the only self-identification a Codex thread or a first-turn
     Claude worker has: neither knows its own session key, and the instructions
-    are composed before the provider assigns an id.
+    are composed before the provider assigns an id. A provider in
+    ``TOKEN_IN_ENV_PROVIDERS`` is told the shell variable holding it instead.
 
     ``origin`` is this deck's public address for the file links the guide asks
     for (#1838). Left as None it is resolved at call time rather than at import,
@@ -706,12 +731,12 @@ def agentdeck_session_instructions(
         "delegated": DELEGATED_SESSION_ROLE_INSTRUCTIONS,
         "work": WORK_SESSION_ROLE_INSTRUCTIONS,
     }[stored_session_role(role) or "primary"]
-    identity = (
-        "\n" + SESSION_TOKEN_INSTRUCTIONS.format(token=session_token) if session_token else ""
-    )
+    token_in_env = provider in TOKEN_IN_ENV_PROVIDERS
+    named_token = "$AGENTDECK_SESSION_TOKEN" if token_in_env else session_token
+    identity = "\n" + SESSION_TOKEN_INSTRUCTIONS.format(token=named_token) if session_token else ""
     resolved_origin = public_origin() if origin is None else origin
     guide = f"{_conventions(identity, provider, resolved_origin)}\n\n{role_instructions}"
-    return guide + mac_runner_instructions(session_token)
+    return guide + mac_runner_instructions(session_token, token_in_env=token_in_env)
 
 
 # Backward-compatible primary-role constant for callers that do not yet pass

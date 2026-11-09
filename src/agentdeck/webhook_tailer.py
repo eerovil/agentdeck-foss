@@ -91,6 +91,7 @@ import json
 import logging
 import os
 import tempfile
+import time
 from collections import OrderedDict
 from collections.abc import AsyncIterator, Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
@@ -111,6 +112,9 @@ log = logging.getLogger(__name__)
 DEDUPE_WINDOW = 4096
 # How often a consumer waiting for another process's lock on its name looks again (#4002).
 LOCK_POLL_S = 1.0
+# A state write this slow is logged. It costs a consumer a pause, not the loop (#4130), so it
+# would otherwise go unseen, and whether the disk really takes this long is still unproven.
+SLOW_WRITE_S = 1.0
 
 # Bytes of the stream head hashed into the rotation fingerprint. One record is far larger
 # than this, so the window always lands inside the first delivery — enough to tell one
@@ -562,9 +566,37 @@ class WebhookTailer:
         replay. Advancing memory first would drop a batch precisely when the durable
         record of it failed — the one moment the guarantee exists for.
         """
+        candidate = self._candidate()
+        if candidate is not None:
+            self._write_state(*candidate)
+            self._publish(*candidate)
+
+    async def commit_off_loop(self) -> None:
+        """`commit()` with the file write in a worker thread, for a consumer on the event loop.
+
+        Each write ends in an `fsync`, and every consumer in a process wakes on the same
+        append, so on the loop their writes ran one after another with nothing else served:
+        4.9 s on 2026-11-05, with the stack in this file (#4130).
+
+        Only the task that reads this tailer may call it: a read during the write would have
+        its pending state cleared by the publish after it. A cancelled commit leaves the write
+        finishing in its thread and memory unpublished, which at worst replays the batch.
+        """
+        candidate = self._candidate()
+        if candidate is None:
+            return
+        started = time.monotonic()
+        await asyncio.to_thread(self._write_state, *candidate)
+        took = time.monotonic() - started
+        if took >= SLOW_WRITE_S:
+            log.warning("webhook tailer %s: its state took %.1f s to write", self.consumer, took)
+        self._publish(*candidate)
+
+    def _candidate(self) -> tuple[dict[str, _StreamState], OrderedDict[str, None]] | None:
+        """The state a commit would write, or None with nothing to commit."""
         self._load()
         if not self._pending and not self._pending_seen:
-            return
+            return None
         streams = {**self._streams, **self._pending}
         seen = OrderedDict(self._seen)
         for delivery_id in self._pending_seen:
@@ -572,9 +604,9 @@ class WebhookTailer:
             seen[delivery_id] = None
         while len(seen) > self.dedupe_window:
             seen.popitem(last=False)
+        return streams, seen
 
-        self._write_state(streams, seen)
-
+    def _publish(self, streams: dict[str, _StreamState], seen: OrderedDict[str, None]) -> None:
         self._streams = streams
         self._seen = seen
         self._pending = {}

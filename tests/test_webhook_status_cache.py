@@ -31,11 +31,13 @@ def pull_body(
     updated_at: str = "2026-09-07T10:00:00Z",
     title: str = "Ship the thing",
     head_sha: str = "a" * 40,
+    **pull: object,
 ) -> bytes:
     return json.dumps(
         {
             "action": action,
             "pull_request": {
+                **pull,
                 "number": number,
                 "title": title,
                 "html_url": f"https://github.com/eerovil/agentdeck/pull/{number}",
@@ -717,6 +719,27 @@ def test_a_title_change_wakes_the_reader(root, signalling, looks):
     batch(root, signalling)
 
     assert looks == [1]
+
+
+def test_the_row_keeps_the_description_and_an_edit_of_it_wakes_nothing(
+    root, signalling, looks, cache
+):
+    """#4137: the Work page reads the description from the row, on its own cadence. GitHub sends
+    null for an empty one, which clears it; a payload with no key says nothing about it."""
+    key = "pr-ref:v1:eerovil/agentdeck:7"
+
+    def write(n, **pull):
+        deliver(root, pull_body(updated_at=f"2026-09-07T10:0{n}:00Z", **pull),
+                event="pull_request", delivery=f"d-{n}")
+        batch(root, signalling)
+        return cache.peek(key).value["body"]
+
+    assert write(1, body="What it does") == "What it does"
+    looks.clear()
+    assert write(2, action="edited", body="What it does now") == "What it does now"
+    assert looks == []
+    assert write(3, action="synchronize") == "What it does now"
+    assert write(4, action="edited", body=None) == ""
 
 
 def test_a_push_to_the_branch_wakes_the_reader(root, signalling, looks):

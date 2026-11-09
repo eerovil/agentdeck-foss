@@ -13,8 +13,9 @@ found (``OutputFact.found_by``).
 
 Each output also carries its size and target branch from the same cached row (#2236):
 ``gh pr view`` stores the per-file ``files`` list beside the changed-file count, so
-``diffstat`` sums a Work's outputs without a GitHub call; while any of them is open, only the
-open ones count, so a merged one stops inflating what is left to review (#4010). The size
+``diffstat`` sums a Work's outputs without a GitHub call; only the open ones count, so a merged
+one never inflates what is left to review (#4010), and a Work with none open has no size
+(#4195). The size
 counts source files only (#2331): tests, docs and non-code files
 (``worktree_diff.classify_path``) are left out, the way the chat's diff pane groups them away.
 The same list's ``changeType`` splits that size into lines in new files and lines in edited
@@ -27,6 +28,7 @@ checks' names (#2275), from the row ``merge_checks`` caches for armed pull reque
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -72,6 +74,16 @@ def pull_state(record: Mapping[str, Any] | None) -> str:
     return state if state in {"open", CLOSED} else ""
 
 
+_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+
+
+def page_text(body: object) -> str:
+    """An issue's or pull request's body as the Work page shows it (#4101, #4137): without its
+    HTML comments, hidden markers the page's markdown pass would print, and without GitHub's
+    line ends."""
+    return _HTML_COMMENT_RE.sub("", str(body or "").replace("\r\n", "\n")).strip()
+
+
 @dataclass(frozen=True)
 class OutputFact:
     """One pull request the Work produced, with its current head and state.
@@ -112,6 +124,10 @@ class OutputFact:
     # When its head commit was made, from the ``merge_checks`` row for exactly that head
     # (#3199); None when the deck holds no such row.
     head_at: datetime | None = None
+    # Its own title and description as the Work page shows them (#4137), from the cached row;
+    # "" when the row has none. They are read by nothing that decides a Work's status.
+    title: str = ""
+    body: str = ""
 
     @property
     def conflicting(self) -> bool:
@@ -190,14 +206,12 @@ class DiffStat:
 
 
 def _counted(outputs: Sequence[OutputFact]) -> list[OutputFact]:
-    """The outputs a Work's size is about: the open ones while any is open, else every one
-    except those closed without merging (#4010).
+    """The outputs a Work's size is about: the open ones only (#4010, #4195).
 
-    A merged pull request is history once a new one is open: counting it would grade what is
-    already in rather than what is left to review."""
-    counted = [output for output in outputs if output.state != CLOSED]
-    pending = [output for output in counted if output.is_open]
-    return pending or counted
+    A merged pull request is history: counting it would grade what is already in rather than
+    what is left to review, so a Work whose changes are all merged has no size. A state not
+    resolved yet is not open (#3187), so it is not counted either."""
+    return [output for output in outputs if output.is_open]
 
 
 def diffstat(outputs: Sequence[OutputFact]) -> DiffStat | None:
@@ -219,6 +233,19 @@ def diffstat(outputs: Sequence[OutputFact]) -> DiffStat | None:
         # The size is known but not its split: a partial split would be a wrong one.
         sizes = [size[:3] for size in sizes]
     return DiffStat(*(sum(column) for column in zip(*sizes, strict=True)))
+
+
+def merge_word(outputs: Sequence[OutputFact]) -> str:
+    """``unmerged``, ``merged`` or "" for what a Work's row says about its changes (#4134).
+
+    One open pull request is enough for ``unmerged``, whatever merged before it. ``merged``
+    needs every one to be known as merged, so an unresolved state says nothing rather than
+    a guess. A pull request closed without merging counts for neither, as in ``_counted``.
+    """
+    counted = [output for output in outputs if output.state != CLOSED]
+    if any(output.is_open for output in counted):
+        return "unmerged"
+    return MERGED if counted and all(output.state == MERGED for output in counted) else ""
 
 
 DEFAULT_TARGET = "master"
@@ -295,10 +322,12 @@ def new_source_size(row: Mapping[str, Any]) -> tuple[int, int] | None:
 @dataclass(frozen=True)
 class Registration:
     """A pull request one of the Work's chats registered, and whether that chat is in this
-    Work alone: a chat working on several Works cannot say which of them it was for."""
+    Work alone: a chat working on several Works cannot say which of them it was for, unless
+    its registration ``named`` this one (#4125)."""
 
     url: str
     exclusive: bool
+    named: bool = False
 
 
 @dataclass(frozen=True)
@@ -375,8 +404,24 @@ def _issue_key(ref: WorkRef) -> str:
     return f"{ref.repository}#{ref.number}".lower()
 
 
-def _registered_output(ref: WorkRef, item: Registration, row: Mapping[str, Any] | None) -> bool:
+def _home(url: str, homes: Mapping[str, str]) -> str:
+    """The Work the release places this pull request in, as ``_issue_key``; "" for none."""
+    where = pull_identity(url)
+    return homes.get(f"{where[0]}#{where[1]}".lower(), "") if where is not None else ""
+
+
+def _registered_output(
+    ref: WorkRef, item: Registration, row: Mapping[str, Any] | None, home: str = ""
+) -> bool:
     """Whether a pull request one of the Work's chats registered is one of its outputs.
+
+    The release placing it here (``home``, from ``work_router.pulls_by_work``) settles it,
+    whatever the branch says: a branch from August revived under a new issue named neither
+    Work's number and repository, so the release waited for a Merge the page had no pull
+    request to offer (#4125). An open one placed in another Work is that Work's alone, even
+    when two chats each named their own: the page and the release must agree. Unplaced or
+    merged, a registration naming this Work counts; a merged one waits for nothing, so the
+    rules below keep it where it was.
 
     Only a merged or an open one: a pull request closed without merging is not an output, and
     one the deck never resolved has no state or branch to judge. One still open after its
@@ -390,6 +435,12 @@ def _registered_output(ref: WorkRef, item: Registration, row: Mapping[str, Any] 
     where = pull_identity(item.url)
     if where is None or pull_state(row) not in {"open", MERGED}:
         return False
+    if home == _issue_key(ref):
+        return True
+    if home and pull_state(row) == "open":
+        return False
+    if item.named:
+        return True
     number = issue_number_from_branch(str((row or {}).get("headRefName") or ""))
     if number is None:
         return item.exclusive
@@ -401,6 +452,7 @@ def _discover(
     open_pulls: Sequence[Mapping[str, Any]],
     registered: Sequence[Registration],
     rows: Mapping[str, Mapping[str, Any]],
+    homes: Mapping[str, str],
 ) -> list[tuple[str, str]]:
     """``(url, found_by)`` for every output, by the one precedence every surface shares.
 
@@ -408,7 +460,8 @@ def _discover(
     chats' registrations add theirs. Both speak together (#2286): the open list is re-read
     on its own clock, so a pull request opened a minute ago is only a registration yet, and
     a Work with pull requests in two repositories would otherwise lose the ones the list
-    does not join to its issue.
+    does not join to its issue. A branch number says nothing about a pull request the release
+    places in another Work (#4125); GitHub's own closing link still does.
     """
     if ref is None:
         return []
@@ -421,11 +474,11 @@ def _discover(
         closes = {str(item).lower() for item in pull.get("closes") or ()}
         if key in closes:
             found.append((url, FOUND_BY_CLOSING))
-        elif not closes:
+        elif not closes and _home(url, homes) in ("", key):
             # GitHub named the issues it closes, and this is not one: its branch says nothing.
             found.append((url, FOUND_BY_BRANCH))
     for item in registered:
-        if _registered_output(ref, item, rows.get(item.url.lower())):
+        if _registered_output(ref, item, rows.get(item.url.lower()), _home(item.url, homes)):
             found.append((item.url, FOUND_BY_CHAT))
     return found
 
@@ -449,20 +502,23 @@ def work_facts(
     open_pulls: Sequence[Mapping[str, Any]] = (),
     registered: Sequence[Registration] = (),
     checks: Mapping[str, Mapping[str, Any]] | None = None,
+    homes: Mapping[str, str] | None = None,
 ) -> WorkFacts:
     """One Work's facts. Pure: every input is a local read the caller made once per pass.
 
     ``rows`` is the cached row of each pull request by lowercased URL; ``open_pulls`` the
     cached open pull requests joined to this issue (``IssueBacklog.pulls_for_work``);
     ``registered`` the pull requests the Work's chats registered; and ``checks`` the cached
-    ``merge_checks`` row of each armed or mergeable-candidate pull request, by lowercased URL.
+    ``merge_checks`` row of each armed or mergeable-candidate pull request, by lowercased URL;
+    ``homes`` the Work the release places each pull request in, both as lowercased
+    ``owner/repo#n``.
     """
     rows = rows or {}
     checks = checks or {}
     finished_at = work_finished_at(record)
     seen: set[str] = set()
     outputs = []
-    discovered = _discover(ref, open_pulls, registered, rows)
+    discovered = _discover(ref, open_pulls, registered, rows, homes or {})
     for url, found_by in discovered:
         if url.lower() in seen:
             continue
@@ -504,6 +560,8 @@ def work_facts(
                     if state not in _SETTLED
                     else None
                 ),
+                title=str(row.get("title") or ""),
+                body=page_text(row.get("body")),
             )
         )
     return WorkFacts(

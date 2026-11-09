@@ -1065,7 +1065,7 @@ async def test_a_full_claude_scan_parses_no_transcript_on_the_event_loop(
 
         return wrapper
 
-    for name in ("transcript_meta", "last_event", "last_context_tokens", "task_ledger"):
+    for name in ("transcript_meta", "last_event", "last_context_reading", "task_ledger"):
         monkeypatch.setattr(transcripts, name, watched(name, getattr(transcripts, name)))
     monkeypatch.setattr(
         provider_mod,
@@ -1133,7 +1133,7 @@ async def test_a_replacement_worker_reuses_the_full_claude_scan_parse(
     for name in (
         "transcript_meta",
         "last_event",
-        "last_context_tokens",
+        "last_context_reading",
         "task_ledger",
     ):
         monkeypatch.setattr(
@@ -1150,7 +1150,7 @@ async def test_a_replacement_worker_reuses_the_full_claude_scan_parse(
     assert set(calls) == {
         "transcript_meta",
         "last_event",
-        "last_context_tokens",
+        "last_context_reading",
         "task_ledger",
         "_subagent_task",
     }
@@ -1376,7 +1376,7 @@ def test_transcript_meta_keeps_the_latest_claude_model(tmp_path):
     assert transcripts.transcript_meta(p).model == "claude-sonnet-5"
 
 
-def test_last_context_tokens_uses_latest_usage_block(tmp_path):
+def test_last_context_reading_uses_latest_usage_block(tmp_path):
     # context = input + cache_read + cache_creation of the *most recent* usage
     # block — not summed over the transcript. A later, bigger turn wins, and a
     # trailing tool-result line (no usage) doesn't reset it.
@@ -1396,25 +1396,101 @@ def test_last_context_tokens_uses_latest_usage_block(tmp_path):
     }
     p = tmp_path / "t.jsonl"
     _write(p, [ASSISTANT, bigger, TOOL_RESULT])
-    assert transcripts.last_context_tokens(p) == 41200  # 1000 + 40000 + 200
+    assert transcripts.last_context_reading(p).tokens == 41200  # 1000 + 40000 + 200
 
 
-def test_last_context_tokens_none_without_usage(tmp_path):
+def test_last_context_reading_says_when_the_cache_counts_as_gone(tmp_path):
+    """#4169: the last call's time plus 90 % of the lifetime its block wrote, as the CLI
+    writes it; a block that only read the cache keeps the lifetime an earlier one named."""
+
+    def call(at, five_minutes, one_hour):
+        usage = {
+            "input_tokens": 1,
+            "cache_read_input_tokens": 100,
+            "cache_creation_input_tokens": five_minutes + one_hour,
+            "cache_creation": {
+                "ephemeral_5m_input_tokens": five_minutes,
+                "ephemeral_1h_input_tokens": one_hour,
+            },
+        }
+        return {"type": "assistant", "timestamp": at, "message": {"model": "m", "usage": usage}}
+
+    p = tmp_path / "t.jsonl"
+    _write(p, [call("2026-11-07T08:00:00.000Z", 0, 6110)])
+    assert transcripts.last_context_reading(p).cache_expires_at == datetime(
+        2026, 11, 7, 8, 54, tzinfo=UTC
+    )
+    _write(p, [call("2026-11-07T08:00:00.000Z", 0, 6110), call("2026-11-07T09:00:00Z", 0, 0)])
+    assert transcripts.last_context_reading(p).cache_expires_at == datetime(
+        2026, 11, 7, 9, 54, tzinfo=UTC
+    )
+    _write(p, [call("2026-11-07T08:00:00Z", 500, 0)])
+    assert transcripts.last_context_reading(p).cache_expires_at == datetime(
+        2026, 11, 7, 8, 4, 30, tzinfo=UTC
+    )
+    # A block that wrote both lifetimes counts as gone when its 5-minute part goes.
+    _write(p, [call("2026-11-07T08:00:00Z", 500, 6110)])
+    assert transcripts.last_context_reading(p).cache_expires_at == datetime(
+        2026, 11, 7, 8, 4, 30, tzinfo=UTC
+    )
+    # The call that wrote the cache lies beyond the usual tail, behind cache reads: the
+    # wider tail still finds its lifetime.
+    big = {"type": "user", "message": {"role": "user", "content": "x" * 70_000}}
+    _write(p, [call("2026-11-07T08:00:00Z", 0, 6110), big, call("2026-11-07T09:00:00Z", 0, 0)])
+    assert transcripts.last_context_reading(p) == (
+        101,
+        False,
+        datetime(2026, 11, 7, 9, 54, tzinfo=UTC),
+    )
+    # No lifetime named, or no time: unknown, and the chat page never asks.
+    _write(p, [call("2026-11-07T08:00:00Z", 0, 0)])
+    assert transcripts.last_context_reading(p).cache_expires_at is None
+    _write(p, [ASSISTANT])
+    assert transcripts.last_context_reading(p).cache_expires_at is None
+
+
+def test_last_context_reading_none_without_usage(tmp_path):
     p = tmp_path / "t.jsonl"
     _write(p, [USER, TOOL_RESULT])
-    assert transcripts.last_context_tokens(p) is None
-    assert transcripts.last_context_tokens(tmp_path / "missing.jsonl") is None
+    assert transcripts.last_context_reading(p) == (None, False, None)
+    assert transcripts.last_context_reading(tmp_path / "missing.jsonl") == (None, False, None)
 
 
-def test_last_context_tokens_reset_by_compaction(tmp_path):
+def test_last_context_reading_reset_by_compaction(tmp_path):
     # After /compact the last usage block predates the compaction and no longer
     # reflects the (now much smaller) context — report unknown, not the old size.
     p = tmp_path / "t.jsonl"
     _write(p, [ASSISTANT, COMPACT_SUMMARY, COMPACT_CMD, COMPACT_STDOUT])
-    assert transcripts.last_context_tokens(p) is None
+    assert transcripts.last_context_reading(p) == (None, True, None)
 
 
-def test_last_context_tokens_after_post_compact_turn(tmp_path):
+def test_last_context_reading_finds_a_compact_behind_its_attachments(tmp_path):
+    """#4168, as a real `/compact` wrote it: the files the CLI re-attaches come after the
+    summary, so the usual tail reaches neither it nor any usage block."""
+    attachment = {"type": "attachment", "attachment": {"content": "x" * 44_000}}
+    p = tmp_path / "t.jsonl"
+    _write(p, [ASSISTANT, COMPACT_SUMMARY, COMPACT_CMD, COMPACT_STDOUT, attachment, attachment])
+    assert transcripts.last_context_reading(p) == (None, True, None)
+
+
+def test_last_context_reading_finds_a_size_behind_a_large_tool_result(tmp_path):
+    """#4168: otherwise the dot and the badge blink out while a big result is the last row."""
+    result = {"type": "user", "message": {"role": "user", "content": "x" * 70_000}}
+    p = tmp_path / "t.jsonl"
+    _write(p, [ASSISTANT, result])
+    assert transcripts.last_context_reading(p).tokens == 108
+
+
+def test_last_context_reading_skips_a_synthetic_row(tmp_path):
+    """#4168: the CLI's own error row counts no tokens, which is not an empty context."""
+    usage = {"input_tokens": 0, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}
+    error = {"type": "assistant", "message": {"model": "<synthetic>", "usage": usage}}
+    p = tmp_path / "t.jsonl"
+    _write(p, [ASSISTANT, error])
+    assert transcripts.last_context_reading(p).tokens == 108
+
+
+def test_last_context_reading_after_post_compact_turn(tmp_path):
     # A real turn after the compaction produces a fresh usage block → shown again.
     post = {
         "type": "assistant",
@@ -1424,7 +1500,7 @@ def test_last_context_tokens_after_post_compact_turn(tmp_path):
     }
     p = tmp_path / "t.jsonl"
     _write(p, [ASSISTANT, COMPACT_SUMMARY, post])
-    assert transcripts.last_context_tokens(p) == 300
+    assert transcripts.last_context_reading(p) == (300, False, None)
 
 
 def test_last_event_idle_after_compact(tmp_path):

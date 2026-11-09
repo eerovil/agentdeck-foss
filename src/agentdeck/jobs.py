@@ -78,8 +78,10 @@ from .host_slots import (
 from .host_slots import desktop_slot_paths as default_desktop_slot_paths
 from .host_slots import kube_slot_paths as default_kube_slot_paths
 from .host_slots import mac_slot_paths as default_mac_slot_paths
+from .job_scratch import JOB_SCRATCH_ENV, scratch_problem, scratch_root
 from .poller_engine import baseline, flaky
-from .poller_engine.baseline import extract_failures
+from .poller_engine.baseline import extract_failures, extract_passed
+from .poller_engine.verification import proves_commit
 from .poller_engine.workspace import (
     WorkspaceSnapshot,
     collect_workspace_snapshot,
@@ -347,6 +349,8 @@ DEFAULT_LOCAL_FIRST_MIN_CORES = 10
 # ``background.slice`` (CPU weight 30 against 100 for apps and 500 for the session), so
 # the kernel serves the deck, the chats and the desktop first however many jobs run.
 JOBS_SLICE = "background-agentdeck.slice"
+# Has no effect while the disks run the kyber scheduler with io.cost off, as they do here:
+# nothing reads the weight. What keeps a job off the deck's disk is JOB_SCRATCH_ENV (#4143).
 JOBS_SLICE_IO_WEIGHT = 20
 # The slice's memory: slowed past total minus 12 GB, killed past total minus 8 GB, so a
 # runaway suite fails instead of pushing the deck into swap (#1546 lost the host to one).
@@ -472,7 +476,7 @@ NOTIFY_GIVE_UP_S = 3600.0
 NOTIFY_HOST_BUSY_GIVE_UP_S = 24 * 3600.0
 # Environment the child must not inherit: it would make a test suite act as the
 # chat that submitted it, and several tests assert these are absent from a spawn.
-_STRIPPED_ENV = ("AGENTDECK_SESSION_KEY", "AGENTDECK_URL")
+_STRIPPED_ENV = ("AGENTDECK_SESSION_KEY", "AGENTDECK_URL", JOB_SCRATCH_ENV)
 
 
 class JobError(ValueError):
@@ -556,6 +560,9 @@ class Job:
     # The test ids a rerun or merge-base follow-up ran: the queue chose them, so it records
     # them rather than anyone inferring them from the command later.
     follow_tests: tuple[str, ...] = ()
+    # The tests a rerun's summary lists as passed (it runs with ``-rA``, #4197): exit 0 alone
+    # also covers a test that was skipped or never collected, which proves nothing.
+    passed: tuple[str, ...] = ()
     # Which of a failed verification's failing tests already exist on its merge base (#2552).
     # A test the branch added is its own, so the poller never forgives it; None means nobody
     # could tell, which forgives nothing either.
@@ -564,6 +571,8 @@ class Job:
     # queue learn one from the project's past runs, 0 means no limit. The limit actually
     # applied, and why, is fixed when the job starts.
     max_minutes: int | None = None
+    # Whether the chat asked for a progress message every few minutes (``--progress``, #4080).
+    progress: bool = False
     time_limit_s: float | None = None
     time_limit_basis: str = ""
     # The quarantined tests this verification left out (#3055), fixed when it starts.
@@ -656,6 +665,8 @@ class Job:
                 # Absent before #3116: such a job simply never counts as starred.
                 owner_work_id=str(raw.get("owner_work_id", "")),
                 follow_tests=tuple(str(item) for item in raw.get("follow_tests") or ()),
+                # Absent before #4197: such a rerun proves no test passed.
+                passed=tuple(str(item) for item in raw.get("passed") or ()),
                 base_present=(
                     tuple(str(item) for item in raw["base_present"])
                     if isinstance(raw.get("base_present"), list)
@@ -663,6 +674,7 @@ class Job:
                 ),
                 # Absent before #3038: the queue learns a limit, as for any job that named none.
                 max_minutes=_optional_int(raw.get("max_minutes")),
+                progress=raw.get("progress") is True,
                 time_limit_s=_optional_float(raw.get("time_limit_s")),
                 time_limit_basis=str(raw.get("time_limit_basis", "")),
                 # Absent before #3055: nothing was left out.
@@ -765,6 +777,8 @@ class JobQueue:
         # the job panel says.
         self._memory = memory_gate or MemoryGate()
         self.memory_waiting = 0
+        self.scratch_waiting = 0
+        self._scratch_said: str | None = None
         # Sets up the slice local jobs run in (``configure_jobs_slice``); the runtime passes
         # it, so a test's queue never changes the host's systemd settings.
         self._configure_slice = configure_slice
@@ -1059,6 +1073,7 @@ class JobQueue:
         follow_kind: str = "",
         follow_tests: Iterable[str] = (),
         max_minutes: int | None = None,
+        progress: bool = False,
     ) -> Job:
         argv = [str(part) for part in command]
         if not argv:
@@ -1136,6 +1151,7 @@ class JobQueue:
             follow_kind=follow_kind,
             follow_tests=tuple(str(test) for test in follow_tests),
             max_minutes=max_minutes,
+            progress=progress,
             note=note,
         )
         self._jobs[job_id] = job
@@ -1229,11 +1245,18 @@ class JobQueue:
         A job whose own lane is full may start on one of its spill lanes instead,
         tried in order (``_spill_order``); it is asked again every sweep, so it
         takes whichever frees up first.
+
+        This host counts as full while the jobs' temp folder cannot be used: falling back
+        to the runtime's TMPDIR would put the run on the deck's own disk (#4143). A job
+        that can spill goes to a pod, and the rest wait.
         """
         waiting = self.waiting()
         full: set[str] = set()
         short = False
         skipped = self._skipped_lanes()
+        no_scratch = bool(waiting) and self._scratch_is_short()
+        if no_scratch:
+            full.add(LOCAL)
         for job in waiting:
             if job.id in self._running:
                 continue
@@ -1278,14 +1301,22 @@ class JobQueue:
                 task=asyncio.create_task(self._run(job, fd), name=f"job-{job.id}"),
                 slot_inode=slot_inode,
             )
-        held = (
-            sum(1 for job in self.waiting() if job.lane == LOCAL and job.id not in self._running)
-            if short
-            else 0
+        here = sum(
+            1 for job in self.waiting() if job.lane == LOCAL and job.id not in self._running
         )
-        if held != self.memory_waiting:
-            self.memory_waiting = held
+        held, no_room = (here if short else 0), (here if no_scratch else 0)
+        if (held, no_room) != (self.memory_waiting, self.scratch_waiting):
+            self.memory_waiting, self.scratch_waiting = held, no_room
             self.on_change()  # the panel says why, and it reads the queue only on a change
+
+    def _scratch_is_short(self) -> bool:
+        """Whether local jobs must wait for their temp folder; says why once in the log."""
+        problem = scratch_problem(self._dir)
+        if problem != self._scratch_said:
+            self._scratch_said = problem
+            if problem:
+                log.warning("jobs: local jobs wait, because %s", problem)
+        return problem is not None
 
     def _unreachable_lanes(self) -> frozenset[str]:
         """The remote lanes found unreachable less than ``UNREACHABLE_SKIP_S`` ago (#3584)."""
@@ -1572,6 +1603,7 @@ class JobQueue:
         deadline = None if job.time_limit_s is None else begun + job.time_limit_s
         nudging = (
             self._notify_progress is not None
+            and job.progress
             and bool(job.session_key)
             and self._progress_interval_s > 0
         )
@@ -1636,6 +1668,11 @@ class JobQueue:
         classification = _result_class(job, state=state, exit_code=exit_code)
         output_bytes, output_sha256, excerpt = _log_identity(job.log_path)
         failures, failures_complete = _read_failures(job, succeeded=state == DONE)
+        passed = (
+            extract_passed(read_tail(job.log_path, limit=FAILURE_SUMMARY_CHARS))
+            if job.follow_kind == flaky.RERUN
+            else ()
+        )
         result_id = hashlib.sha256(
             json.dumps(
                 {
@@ -1663,6 +1700,7 @@ class JobQueue:
             diagnostic_excerpt=excerpt,
             failures=failures,
             failures_complete=failures_complete,
+            passed=passed,
         )
         # A verification result is evidence only once its evidence is durable (#2148): the
         # queue forgets this row a day from now, and a result that was announced and credited
@@ -1812,7 +1850,20 @@ class JobQueue:
             await asyncio.to_thread(_remove_pinned_checkout, pinned)
 
     def _say_not_followed(self, finished: Job) -> None:
-        """Say why a verification's failures got no same-commit rerun, when the tree is why."""
+        """Say why a verification's failures got no same-commit rerun, when the tree or the
+        command is why."""
+        if flaky.not_pytest(finished.to_dict()):
+            said = (
+                "Its command is not a plain pytest call, so the queue does not rerun its "
+                "failing tests alone: they would run outside whatever the command sets up. "
+                "Fix them, or rerun the whole command."
+            )
+            current = self._jobs[finished.id]
+            self._jobs[finished.id] = replace(
+                current, note="\n\n".join(part for part in (current.note, said) if part)
+            )
+            self._save()
+            return
         reason = flaky.unfollowable_tree(finished.to_dict())
         if reason is None:
             return
@@ -1851,6 +1902,7 @@ class JobQueue:
                 # The submitter's limit, or none: the one retry must not be judged by a
                 # learned limit the first run was never under (#3038).
                 max_minutes=verification.max_minutes,
+                progress=verification.progress,
             )
             said = (
                 f"It ended with no test result, so the queue resubmitted it once as job "
@@ -1891,7 +1943,8 @@ class JobQueue:
                     if job.follows == verification.id and job.follow_kind == flaky.RERUN
                 )
                 where = f"the same commit {head[:12]} (attempt {attempt} of {flaky.MAX_RERUNS})"
-            command = [*prefix, "-q", *plan.tests]
+            # ``-rA`` lists each passed test, the only proof one ran rather than skipped (#4197).
+            command = [*prefix, "-rA", "-q", *plan.tests]
             follow = self.submit(
                 command=command,
                 cwd=cwd,
@@ -1944,6 +1997,13 @@ class JobQueue:
             or current.notified
             or job.id in self._announcing
         ):
+            return
+        if _result_speaks_for_itself(current):
+            # Done with it as a delivery would be, so the row prunes and nothing waits on it.
+            self._jobs[job.id] = replace(current, notified=True)
+            self._save()
+            self._notify_after.pop(job.id, None)
+            log.info("jobs: job %s proved its commit; %s is not woken", job.id, job.session_key)
             return
         self._announcing.add(job.id)
         try:
@@ -2110,13 +2170,7 @@ def _keyed_records(raw: object) -> dict[str, dict[str, Any]] | None:
 
 
 def _runs_pytest(job: Job) -> bool:
-    parts = list(job.command)
-    if parts[:2] == ["uv", "run"]:
-        parts = parts[2:]
-    head = parts[0] if parts else ""
-    if head == "pytest" or head.endswith("/pytest"):
-        return True
-    return len(parts) >= 3 and parts[1:3] == ["-m", "pytest"]
+    return flaky.runs_pytest(job.command)
 
 
 _WORK_ISSUE = re.compile(r"github_issue:([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#(\d+)")
@@ -2159,6 +2213,22 @@ def _leaves_out_quarantined(job: Job) -> bool:
 def _is_verification(job: Job) -> bool:
     """Whether this job's result may become release evidence (#2154)."""
     return job.purpose == VERIFICATION
+
+
+def _result_speaks_for_itself(job: Job) -> bool:
+    """Whether the chat need not be woken for this result (#4080).
+
+    A green verification of a Work proves its commit, and the deck reads that from the job
+    itself: the merge waits on the evidence, not on the chat, so the wake-up had nothing to say.
+
+    Everything else still wakes the chat. A run that passed on a tree that moved or was unclean
+    proves nothing, and only the chat can run it again. A poller Run's job is left out because
+    the poller holds its card until the job's message is delivered and then expects the
+    worker's report (``awaited_run_job``).
+    """
+    if not _is_verification(job) or not job.work_id or job.run_id:
+        return False
+    return proves_commit(job.to_dict())
 
 
 def _result_class(job: Job, *, state: str, exit_code: int | None) -> str:
@@ -2320,9 +2390,14 @@ def _read_failures(job: Job, *, succeeded: bool = False) -> tuple[tuple[str, ...
         for timing in read_timings(timings_path_for_log(job.log_path))
         if timing.outcome in {"failed", "error"}
     ]
-    return extract_failures(
-        read_tail(job.log_path, limit=FAILURE_SUMMARY_CHARS), succeeded=succeeded, known=known
-    )
+    text = read_tail(job.log_path, limit=FAILURE_SUMMARY_CHARS)
+    failures, complete = extract_failures(text, succeeded=succeeded, known=known)
+    if complete and text.startswith("…") and not flaky.runs_pytest(job.command):
+        # A script may run pytest several times, and an earlier run's summary can lie before
+        # the cut even when only one remains after it (#4197). One pytest prints one summary,
+        # so only its header inside the tail proves the list whole.
+        complete = False
+    return failures, complete
 
 
 def _failures_present_on_base(job: Job) -> tuple[str, ...] | None:
@@ -2777,6 +2852,9 @@ def _child_env(job: Job) -> dict[str, str]:
     # Where a pytest run records when each test started and stopped, read back
     # by `agentdeck job tests` (#2297). Anything that is not this suite ignores it.
     env[TIMINGS_ENV] = str(timings_path_for_log(job.log_path))
+    # The queue started this job only with the folder usable (``_scratch_is_short``).
+    if scratch_root() and job.lane not in REMOTE_LANES:
+        env["TMPDIR"] = scratch_root()
     if job.quarantined:
         env[QUARANTINE_ENV] = json.dumps(list(job.quarantined))
         if job.lane in REMOTE_LANES:

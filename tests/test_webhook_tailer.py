@@ -16,6 +16,7 @@ import asyncio
 import base64
 import contextlib
 import json
+import threading
 from pathlib import Path
 
 import pytest
@@ -410,6 +411,86 @@ def test_a_commit_can_be_retried_after_the_state_write_fails(root, log, monkeypa
     assert len(replacements) == 2
     assert tailer.read() == []
     assert tailer_for(root).read() == []
+
+
+async def test_a_commit_off_the_loop_writes_in_a_thread_and_commits_like_commit(
+    root, log, monkeypatch
+):
+    """#4130: an `fsync` in this write was on the loop's stack in a 5 s freeze."""
+    deliver(log, AGENTDECK, delivery="d-1")
+    tailer = tailer_for(root, "off-loop")
+    assert len(tailer.read()) == 1
+    writes: list[int] = []
+    write = tailer._write_state
+
+    def recorded(*args) -> None:
+        writes.append(threading.get_ident())
+        write(*args)
+
+    monkeypatch.setattr(tailer, "_write_state", recorded)
+    await tailer.commit_off_loop()
+    await tailer.commit_off_loop()  # nothing new: no second write
+
+    assert len(writes) == 1 and writes[0] != threading.get_ident()
+    assert tailer_for(root, "off-loop").read() == []
+    assert tailer.read() == []
+
+
+async def test_a_failed_commit_off_the_loop_can_be_retried(root, log, monkeypatch):
+    deliver(log, AGENTDECK, delivery="d-1")
+    tailer = tailer_for(root, "off-loop")
+    tailer.read()
+    write = tailer._write_state
+
+    def broken(*_args) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(tailer, "_write_state", broken)
+    with pytest.raises(OSError, match="disk full"):
+        await tailer.commit_off_loop()
+    assert ids(tailer_for(root, "off-loop").read()) == ["d-1"]
+
+    monkeypatch.setattr(tailer, "_write_state", write)
+    await tailer.commit_off_loop()
+    assert tailer_for(root, "off-loop").read() == []
+
+
+async def test_a_commit_cancelled_by_a_stop_loses_nothing_across_a_restart(root, log, monkeypatch):
+    """A stop can land during the write, which then finishes in its thread."""
+    deliver(log, AGENTDECK, delivery="d-1")
+    tailer = tailer_for(root, "off-loop")
+    tailer.read()
+    writing, finish, finished = threading.Event(), threading.Event(), threading.Event()
+    write = tailer._write_state
+
+    def held(*args) -> None:
+        writing.set()
+        assert finish.wait(10)
+        write(*args)
+        finished.set()
+
+    monkeypatch.setattr(tailer, "_write_state", held)
+    commit = asyncio.create_task(tailer.commit_off_loop())
+    await asyncio.to_thread(writing.wait, 10)
+    commit.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await commit
+    finish.set()
+    await asyncio.to_thread(finished.wait, 10)
+
+    deliver(log, AGENTDECK, delivery="d-2")
+    assert ids(tailer_for(root, "off-loop").read()) == ["d-2"], "the write landed: d-1 is done"
+
+
+async def test_a_slow_state_write_is_logged(root, log, monkeypatch, caplog):
+    monkeypatch.setattr(webhook_tailer, "SLOW_WRITE_S", 0.0)
+    deliver(log, AGENTDECK, delivery="d-1")
+    tailer = tailer_for(root, "off-loop")
+    tailer.read()
+
+    await tailer.commit_off_loop()
+
+    assert "off-loop: its state took" in caplog.text
 
 
 def test_two_processes_committing_one_consumer_do_not_collide(root, log, monkeypatch):

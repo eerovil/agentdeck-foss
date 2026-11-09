@@ -26,6 +26,7 @@ from urllib.parse import quote
 
 from .agent_review import is_reviewer_prompt
 from .chat_cwd import cannot_resume
+from .chat_use import ChatUse
 from .issue_context import identity
 from .models import BACKGROUND_TASK_ACTIVITY, IssueRef
 from .poller_engine.schedules import LABEL as SCHEDULE_LABEL
@@ -38,6 +39,7 @@ from .work_facts import (
     WorkFacts,
     _stamp,
     diffstat,
+    merge_word,
     target_branches,
 )
 from .work_hidden import issue_comments
@@ -335,6 +337,9 @@ class WorkChat:
     last_text: str = ""  # the chat's most recent response text, "" unknown (#2254)
     # Working only on a turn a background notification opened, not a message (#2760).
     background: bool = False
+    use: ChatUse | None = None  # the cost dot's reading (#4163, #4168)
+    reviewer: bool = False  # a deck-started reviewer's chat (#3101)
+    delegated: bool = False  # started by another chat of the deck
 
 
 @dataclass(frozen=True)
@@ -500,6 +505,8 @@ class WorkCard:
     # front-page row goes straight to it, and Back returns to the front page (#2512).
     chat_href: str = ""
     chat_key: str = ""  # that chat's session key: a phone push skips a muted one (#3348)
+    # The most expensive of its chats (#4163): a sum would hide which one to look at.
+    use: ChatUse | None = None
     # A person paused the Work (#2548): its issue carries its instance's ``paused_label``,
     # which is the label Pause adds and Resume removes; "" when that instance names none.
     paused: bool = False
@@ -508,7 +515,7 @@ class WorkCard:
     # (#2559): it sends nothing to its chats.
     label_paused: bool = False
     deck_paused: bool = False
-    # A person starred the Work (#3116): first in its front-page section, with a star mark.
+    # A person starred the Work (#3116): in the front page's Starred group, with a star mark.
     starred: bool = False
     # No agent works on it (#3558): an open issue without its repository's ownership label.
     # The label the Start agent action adds; "" for every Work an agent has or had.
@@ -539,6 +546,11 @@ class WorkCard:
     def diffstat(self) -> DiffStat | None:
         """The size of the Work's pull requests, or None while any is unknown (#2236)."""
         return diffstat(self.outputs)
+
+    @property
+    def merge_word(self) -> str:
+        """``unmerged``, ``merged`` or "": what its row says about its changes (#4134)."""
+        return merge_word(self.outputs)
 
     @property
     def targets(self) -> tuple[str, ...]:
@@ -634,6 +646,7 @@ def build_work_card(
         project=project,
         chatgpt_reviewed=chat_reviewed(facts.outputs, chat_reviews or {}),
         working_chats=tuple((chat.title, chat.href) for chat in chats if chat.working),
+        use=newest_chat_use(chats),
         woke_itself=any(chat.working for chat in chats)
         and all(chat.background for chat in chats if chat.working),
         paused=label_paused or deck_paused,
@@ -871,6 +884,10 @@ class OtherDeckWork:
         return diffstat(self.outputs)
 
     @property
+    def merge_word(self) -> str:
+        return merge_word(self.outputs)
+
+    @property
     def targets(self) -> tuple[str, ...]:
         return target_branches(self.outputs)
 
@@ -1071,6 +1088,7 @@ def front_page_works(
 
     A Work in ``awaiting`` — its issue closed, and no person has finished it (#2510) — is
     built however long ago it closed or last moved: it waits in Needs you until someone does.
+    So is a starred Work, finished or not: it stays in Starred until its star goes (#4121).
     """
     finished_at = finished_at or {}
     awaiting = frozenset(awaiting)
@@ -1271,6 +1289,21 @@ def other_activity(
     return tuple(ordered[:limit]), max(0, len(ordered) - limit)
 
 
+def newest_chat_use(chats: Sequence[WorkChat]) -> ChatUse | None:
+    """The reading of the chat the Work's next message goes to (#4168). It is the chat doing
+    the Work: a reviewer's chat is never it, and a helper another chat started only when the
+    Work has no chat of its own. Newest by activity, not by ``work_chats``' order, which puts
+    a working chat first however old. The newest chat having no reading leaves the Work
+    without one, rather than an older chat's.
+    """
+    workers = [chat for chat in chats if not chat.reviewer]
+    own = [chat for chat in workers if not chat.delegated] or workers
+    if not own:
+        return None
+    floor = datetime.min.replace(tzinfo=UTC)
+    return max(own, key=lambda chat: chat.last_activity or floor).use
+
+
 def work_chats(
     state: Any,
     work: Work | None,
@@ -1318,6 +1351,13 @@ def work_chats(
                 pull_requests=tuple(pulls.values()),
                 legs=tuple(legs),
                 last_text=str(getattr(session, "last_text", "") or "") if session else "",
+                use=getattr(state, "chat_use", {}).get(key),
+                reviewer=is_reviewer_prompt(getattr(session, "initial_prompt", None)),
+                delegated=any(
+                    getattr(leg, "parent_session_key", None)
+                    or getattr(leg, "is_delegated", False)
+                    for leg in map(state.sessions.get, legs)
+                ),
             )
         )
     floor = datetime.min.replace(tzinfo=UTC)

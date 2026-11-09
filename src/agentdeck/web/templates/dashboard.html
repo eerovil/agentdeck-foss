@@ -9,10 +9,10 @@
 
 {% block content %}
 {% include "partials/session_sidebar_head.html" %}
-{# One line of counts, then the Works by how much they need the owner (#3818, replacing #3578's
-   order of a Work's life): Needs answer, Ready for merge, Needs review and Release blocked,
+{# One line of counts, then every starred Work (#4121), then the rest by how much they need the
+   owner (#3818, replacing #3578's order of a Work's life): Needs answer, Ready for merge, Needs review and Release blocked,
    Needs retry and Work error, Working now, the quick tidy-ups (Issue closed, Not started),
-   Waiting, Live checking, Recently finished, Paused, then Recently stopped. A Work is in exactly one of them, picked from the
+   Waiting, Live checking, Waiting for a try (#4210), Recently finished, Paused, then Recently stopped. A Work is in exactly one of them, picked from the
    same status the Work page shows (`work_story.front_row`); Recently stopped is a shortcut to
    where each landed. Each part draws its own header, so an empty one takes no height, and the
    page's order is the DOM's, so keyboard and screen-reader order match it. #}
@@ -22,6 +22,12 @@
   </p>
 </div>
 <nav class="front-tabs" id="front-tabs" aria-label="Show only a project" hidden></nav>
+{# Every starred Work, above everything and in no other group (#4121). #}
+<section class="front-sec front-starred" id="front-starred" aria-label="Starred">
+  <div class="front-rows" id="works-starred" sse-swap="works-starred" hx-swap="keyed-works">
+    {%- set part = "starred" %}{% include "partials/work_front.html" %}
+  </div>
+</section>
 <section class="front-sec front-needs" id="front-needs" aria-label="Needs answer">
   <div class="front-rows" id="works-needs" sse-swap="works-needs" hx-swap="keyed-works">
     {%- set part = "needs" %}{% include "partials/work_front.html" %}
@@ -40,7 +46,7 @@
   </div>
 </section>
 {%- for part, label in (("cleanup", "Clean-up"), ("waiting", "Waiting"), ("live", "Live checking"),
-                        ("finished", "Recently finished"), ("paused", "Paused")) %}
+                        ("try", "Waiting for a try"), ("finished", "Recently finished"), ("paused", "Paused")) %}
 <section class="front-sec front-{{ part }}" id="front-{{ part }}" aria-label="{{ label }}">
   <div class="front-rows" id="works-{{ part }}" sse-swap="works-{{ part }}" hx-swap="keyed-works">
     {%- include "partials/work_front.html" %}

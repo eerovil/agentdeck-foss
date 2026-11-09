@@ -12,8 +12,14 @@ set -u
 instances="${AGENTDECK_POLLER_INSTANCES:-$HOME/.local/share/agentdeck/poller/instances}"
 python="${AGENTDECK_PYTHON:-$HOME/agentdeck/.venv/bin/python}"
 engine="${AGENTDECK_POLLER_ENGINE:-$HOME/agentdeck/scripts/poller_engine.py}"
+janitor="${AGENTDECK_HOST_JANITOR:-$HOME/agentdeck/scripts/host-janitor.py}"
 
 status=0
+# Claimed worktrees are the deck's to give back, so closed Works' go through it (#4148).
+if ! "$python" "$janitor" --closed-works; then
+    echo "releasing closed Works' worktrees failed" >&2
+    status=1
+fi
 for dir in "$instances"/*/; do
     dir="${dir%/}"
     [[ -f "$dir/poller.toml" && -f "$dir/overlay.toml" ]] || continue

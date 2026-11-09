@@ -29,7 +29,7 @@ def note_handover(control_db, _session_key: str, action_id: str) -> None:
     return None
 
 
-def session_instructions(session_token: str | None) -> str:
+def session_instructions(session_token: str | None, *, token_in_env: bool = False) -> str:
     return ""
 
 

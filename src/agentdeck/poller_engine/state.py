@@ -59,6 +59,8 @@ class EnginePaths:
     lock: Path
     controls: Path
     controls_backup: Path
+    controls_archive: Path
+    controls_archive_backup: Path
     ownership: Path
     dispatch_ack_dir: Path
     dispatch_defer_dir: Path
@@ -74,6 +76,10 @@ class EnginePaths:
             lock=state.with_name(state.name + ".lock"),
             controls=directory / "controls.json",
             controls_backup=directory / "controls.json.bak",
+            # Settled commands, moved here once so they stop being rewritten every wake
+            # (#4147). Only a person rolling back to card-era software would ever read it.
+            controls_archive=directory / "controls-archive.json",
+            controls_archive_backup=directory / "controls-archive.json.bak",
             ownership=directory / "ownership.json",
             dispatch_ack_dir=directory / "dispatch-acks",
             dispatch_defer_dir=directory / "dispatch-deferrals",
@@ -108,7 +114,8 @@ def write_json_atomic(path: Path, value: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     with open(tmp, "w") as handle:
-        json.dump(value, handle, indent=2)
+        # No indent: it was a tenth of every file, and a person reading one has `jq` (#4147).
+        json.dump(value, handle, separators=(",", ":"))
         handle.flush()
         if durable:
             os.fsync(handle.fileno())
@@ -304,11 +311,32 @@ class StateStore:
 
         The command ledger is published first: a crash between the two writes can at
         worst replay an idempotent state transition, never forget an accepted command.
+
+        Settled commands reach their archive before either publish, so they exist somewhere
+        at every moment. A load from a backup that still holds them just settles them again.
         """
+        self._archive_settled(payload)
         save_json_with_backup(
             self._paths.controls, self._paths.controls_backup, ledger.snapshot(payload)
         )
         save_json_with_backup(self._paths.state, self._paths.backup, _wrap(payload))
+
+    def _archive_settled(self, payload: dict) -> None:
+        """Move settled commands from ``payload`` to the archive, adding to what it holds.
+
+        An archive that exists but cannot be read may still be repaired by hand, and writing
+        would replace it, so the commands stay in the state instead. Stopping the wake would
+        cost far more: the files staying large is the whole price of waiting.
+        """
+        settled = ledger.prune(payload)
+        if not settled:
+            return
+        archive, backup = self._paths.controls_archive, self._paths.controls_archive_backup
+        stored = load_json_with_backup(archive, backup, {})
+        if stored.source is None and (archive.exists() or backup.exists()):
+            payload["controls"].update(settled)
+            return
+        save_json_with_backup(archive, backup, {**stored.value, **settled})
 
     @contextmanager
     def transaction(self) -> Iterator[dict]:

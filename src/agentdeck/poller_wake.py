@@ -270,7 +270,8 @@ class PollerWakeService:
         while True:
             try:
                 if first:
-                    self.seek_to_end()
+                    # A worker thread, for its commit's fsync: this task owns the tailer.
+                    await asyncio.to_thread(self.seek_to_end)
                     first = False
                 async for batch in self._tailer.watch(
                     stop_event=self._stop,
@@ -279,7 +280,7 @@ class PollerWakeService:
                     keepalive_s=KEEPALIVE_S,
                 ):
                     await self.apply(batch)
-                    self._tailer.commit()
+                    await self._tailer.commit_off_loop()
                 return  # the stop event ended the watch
             except asyncio.CancelledError:
                 raise

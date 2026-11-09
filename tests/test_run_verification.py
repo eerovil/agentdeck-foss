@@ -110,6 +110,7 @@ class _Args:
         self.workspace = []
         self.work = ""
         self.max_minutes = None
+        self.progress = False
         self.__dict__.update(values)
 
 
@@ -491,6 +492,95 @@ async def test_a_tree_edited_while_the_suite_ran_credits_nothing(tmp_path):
     assert row["tested_workspace"]["clean"] is True
     assert row["verified_workspace"]["snapshot_id"] != row["tested_workspace"]["snapshot_id"]
     assert credited_head(row, run_id="gen-1") == ""
+
+
+_EDIT = "import pathlib; pathlib.Path('a.txt').write_text('two\\n')"
+
+
+@pytest.mark.parametrize(
+    ("code", "fields", "woken"),
+    [
+        ("print('ok')", {"purpose": VERIFICATION, "work_id": WORK}, False),
+        (_EDIT, {"purpose": VERIFICATION, "work_id": WORK}, True),
+        ("raise SystemExit(1)", {"purpose": VERIFICATION, "work_id": WORK}, True),
+        # The poller holds its card until this message is delivered (``awaited_run_job``).
+        ("print('ok')", {"purpose": VERIFICATION, "work_id": WORK, "run_id": "gen-1"}, True),
+        ("print('ok')", {"work_id": WORK}, True),
+    ],
+    ids=["proved", "tree-moved", "failed", "poller-run", "ordinary"],
+)
+async def test_only_a_green_run_that_proves_its_commit_wakes_nobody(tmp_path, code, fields, woken):
+    from test_jobs import _queue as queue_for
+    from test_jobs import _settle, _wait_for
+
+    told: list[str] = []
+
+    async def notify(job, message):
+        told.append(message)
+        return True
+
+    repo = _git_repo(tmp_path / "repo")
+    queue = queue_for(tmp_path, notify=notify)
+    await queue.start()
+    try:
+        job = queue.submit(
+            command=[sys.executable, "-c", code],
+            cwd=str(repo),
+            session_key="claude_code:main:sid",
+            **fields,
+        )
+        await _settle(queue, job.id)
+        await _wait_for(lambda: queue.get(job.id).notified, what="the queue to be done with it")
+    finally:
+        await queue.stop()
+
+    assert bool(told) is woken
+
+
+async def test_a_green_run_finished_before_a_restart_stays_silent_after_it(tmp_path):
+    from test_jobs import _queue as queue_for
+    from test_jobs import _settle, _wait_for
+
+    told: list[str] = []
+
+    async def notify(job, message):
+        told.append(message)
+        return True
+
+    before = queue_for(tmp_path)  # nothing to tell it with, so the row is still owed
+    await before.start()
+    job = before.submit(
+        command=[sys.executable, "-c", "print('ok')"],
+        cwd=str(_git_repo(tmp_path / "repo")),
+        session_key="claude_code:main:sid",
+        purpose=VERIFICATION,
+        work_id=WORK,
+        progress=True,
+    )
+    await _settle(before, job.id)
+    await before.stop()
+
+    after = queue_for(tmp_path, notify=notify)
+    await after.start()
+    try:
+        await _wait_for(lambda: after.get(job.id).notified, what="the queue to be done with it")
+        assert after.get(job.id).progress is True, "the choice survives the reload"
+    finally:
+        await after.stop()
+
+    assert told == []
+
+
+def test_the_submitter_is_told_a_green_run_sends_no_message():
+    work = {"purpose": VERIFICATION, "work_id": WORK}
+
+    assert "sends no message" in cli._job_announcement(work, progress=False)
+    assert "sends no message" not in cli._job_announcement(
+        {**work, "run_id": "gen-1"}, progress=False
+    )
+    assert "sends no message" not in cli._job_announcement({"work_id": WORK}, progress=False)
+    assert "every five minutes" not in cli._job_announcement({}, progress=False)
+    assert "every five minutes" in cli._job_announcement({}, progress=True)
 
 
 async def test_an_ordinary_job_pays_for_no_second_reading(tmp_path):

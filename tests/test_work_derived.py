@@ -35,6 +35,7 @@ from agentdeck.work_derived import (
     PR_STUCK,
     QUESTION,
     READY,
+    RETRY_CANCELLED,
     REVIEW,
     REVIEW_ESCALATED,
     REVIEW_QUEUED,
@@ -240,7 +241,7 @@ def card(**fields):
          "Issue closed", "finish it? · checked live: it shows"),
         ({"closed": True, "live_result": "failed", "live_line": "live check failed: 500"},
          "Needs you", "live check failed: 500"),
-        # #3220: part of the merge runs nowhere yet, so it is not a Finish.
+        # #3220: part of the merge runs nowhere yet, so it does not read as done.
         ({"closed": True, "live_result": "not_live", "live_line": "not live yet: VPS connector"},
          "Needs you", "not live yet: VPS connector"),
         # #3297: with a wake-on of its own on the deploy, nobody is asked anything.
@@ -287,8 +288,9 @@ def test_the_work_page_reads_the_derived_line(fields, headline, summary):
          ["Merge", "Open", "Hide"]),
         ({"closed": True, "live_result": "failed", "live_line": "live check failed: 500"},
          "needs_you", "needs_answer", ["Open", "Finish", "Hide"]),
+        # #4126: nothing else moves it on, so a person may finish it unproven.
         ({"closed": True, "live_result": "not_live", "live_line": "not live yet: VPS connector"},
-         "needs_you", "needs_answer", ["Open", "Hide"]),
+         "needs_you", "needs_answer", ["Open", "Finish", "Hide"]),
         ({"closed": True, "live_result": "not_live", "live_line": "not live yet: build 7",
           "waits": (("o/docker@548fcac1", None),)}, "active", None, []),
         # A real question still needs an answer, wait or not (#3297).
@@ -376,10 +378,12 @@ def test_a_turn_an_expired_sign_in_failed_asks_for_a_sign_in_and_is_not_a_bug():
     assert derived_for(app, snapshot, WORK, card()).kind == DIED
 
 
-def test_a_turn_the_usage_limit_stopped_waits_on_the_decks_own_retry():
+def test_a_turn_the_usage_limit_stopped_waits_on_the_decks_own_retry(tmp_path):
     """#3305: a chat hit its account's session limit and the deck had already scheduled its
     retry for the reset, yet the Work read "the agent stopped unexpectedly" and filed a bug."""
-    from agentdeck.quota_retry import message_id_for
+    from agentdeck.db import Db
+    from agentdeck.quota_retry import message_for, message_id_for
+    from agentdeck.scheduled_messages import ScheduledMessageService
     from agentdeck.web.work_view import derived_for
 
     reset = NOW + timedelta(hours=1)
@@ -395,13 +399,49 @@ def test_a_turn_the_usage_limit_stopped_waits_on_the_decks_own_retry():
             control_db=None,
         )
     )
-    session = _session(turn_failed=True, automatic_retry_at=reset, key="chat-a")
+    session = _session(turn_failed=True, automatic_retry_at=reset, key="chat-a", chat_id="chat-a")
     retry = message_id_for(session)
     pending = SimpleNamespace(state=_state(session), pending_message_ids=frozenset({retry}))
     assert derived_for(app, pending, WORK, card()).kind == WAITING
     # A cancelled or failed retry leaves the schedule: then it is a death again (#2928).
     gone = SimpleNamespace(state=_state(session), pending_message_ids=frozenset())
     assert derived_for(app, gone, WORK, card()).kind == DIED
+    # #4074: a person cancelled it, as the owner did on a chat stopped by the alt account's
+    # limit: the deck knows why, so it stays theirs and is not filed as a bug.
+    cancelled = SimpleNamespace(
+        state=_state(session),
+        pending_message_ids=frozenset(),
+        cancelled_retry_ids=frozenset({retry}),
+    )
+    chosen = derived_for(app, cancelled, WORK, card())
+    assert chosen.kind == RETRY_CANCELLED
+    assert chosen.line.startswith("Needs you — its automatic retry was cancelled")
+    row = front_row(card(derived=chosen), current=True)
+    assert (row.section, row.attention.category, row.attention.bug) == (
+        "needs_you", "needs_retry", "",
+    )
+    assert "start it again" in work_status(card(derived=chosen)).you
+    # An older limit's cancelled retry says nothing about this stop.
+    older = SimpleNamespace(
+        state=_state(session),
+        pending_message_ids=frozenset(),
+        cancelled_retry_ids=frozenset({"quota-retry:older"}),
+    )
+    assert derived_for(app, older, WORK, card()).kind == DIED
+    # A retry that failed to send, then removed from the chat with the same button, stays a
+    # death: the send failed, nobody chose to stop it.
+    store = Db(tmp_path / "deck.db")
+    scheduled = ScheduledMessageService(store, None, lambda _chat: None)
+    message = message_for(session)
+    assert scheduled.schedule(message) is not None and store.claim_scheduled_message(retry)
+    store.settle_scheduled_message(retry, "failed", "refused")
+    assert scheduled.cancel(retry, message.chat_id)
+    removed = SimpleNamespace(
+        state=_state(session),
+        pending_message_ids=scheduled.pending_ids(),
+        cancelled_retry_ids=scheduled.cancelled_retry_ids(),
+    )
+    assert derived_for(app, removed, WORK, card()).kind == DIED
 
 
 def test_a_turn_a_restart_cut_off_waits_on_its_revival_and_is_never_a_bug():
@@ -496,6 +536,15 @@ def test_a_reply_ending_on_a_question_waits_for_the_answer_and_is_never_asked():
     assert status(last_text="Deploying.", ended_at=AT, merged=True, waits=deploy).live_checking
     verified = status(last_text="Checked live.", closed=True, live_result="verified")
     assert verified.kind == CLOSED
+    # #4151: verified with a step left for a person: the issue stays open and the reply asks
+    # about it, so the Work reads Needs you, not Finish. With nothing left it closes as above.
+    left = status(
+        last_text="Checked live.\n\nHave you run the balance?", ended_at=AT, asks=True,
+        merged=True, live_result="verified",
+    )
+    assert (left.kind, left.summary) == (
+        ASKED_IN_CHAT, 'answer in the chat: "Have you run the balance?"'
+    )
 
 
 def test_a_question_opens_the_chat_that_asked_it():
@@ -674,6 +723,13 @@ def test_a_chat_waiting_on_the_macs_approval_needs_you_not_a_next_step(monkeypat
     row = front_row(card(derived=asked), current=True)
     assert row.section == "needs_you"
     assert ("Open", "HTTPS://Mac.Example:8443/#run-7") in [(b.label, b.href) for b in row.buttons]
+    # #4132: an expired command's card is the same Open with its own words.
+    paused = found("It expired. https://mac.example:8443/#paused-run-7 There you can run it.")
+    assert (paused.kind, paused.line) == (
+        QUESTION,
+        "Needs you — decide on the expired Mac command",
+    )
+    assert paused.approval_href == "https://mac.example:8443/#paused-run-7"
     # A link anywhere else is never the Work's Open; the mark alone is still a question.
     for text in ("See https://mac.example:84430/#x. Shall I go on?", "https://evil.example/#x"):
         other = found(text)
@@ -806,6 +862,25 @@ def test_a_pending_live_check_with_no_wait_still_says_so():
     assert (asking.kind, asking.line, asking.live_checking) == (
         ENDED, "Live checking — asking the agent for its next step", True
     )
+
+
+def test_a_check_only_a_person_can_make_waits_for_a_try_outside_needs_you():
+    """#4210: ``needs_person`` rests as Waiting for a try; a question still wins, and a closed
+    issue, an open pull request or a newer ask is not waiting for a try."""
+    tried = dict(live_result="needs_person", live_line="open the cart on a phone")
+    waiting = status(**tried, ended_at=AT, last_text="Recorded needs_person.")
+    assert (waiting.kind, waiting.line) == (
+        "try_wait", "Waiting for a try — open the cart on a phone"
+    )
+    story = derived_story(card(derived=waiting))
+    assert (story.kind, story.tone, story.headline) == (
+        "awaiting_try", "active", "Waiting for a try"
+    )
+    assert "Works, close" in story.you
+    assert status(**tried, question="Which cart?").kind != "try_wait"
+    assert status(**tried, closed=True).kind != "try_wait"
+    assert status(**tried, pr_open=True).kind != "try_wait"
+    assert status(**tried, live_pending=True).kind != "try_wait"
 
 
 def test_a_live_check_is_pending_from_the_ask_until_a_result_recorded_after_it():
@@ -1197,6 +1272,12 @@ def test_a_wait_on_its_own_pull_request_does_not_hide_ready_for_merge():
     assert found.line.startswith(
         "Waiting on its pull request — not reviewed at its head, until "
     )
+    # #4124: a pass the deck keeps until it can read the diff says so, not "not reviewed".
+    held = {"why": "x", "words": "review passed; waiting to read its diff", "since": fresh}
+    found = _derived_with_reviews({}, waits=own, ended=fresh, entry={"hold": held})
+    assert found.line.startswith(
+        "Waiting on its pull request — review passed; waiting to read its diff, until "
+    )
     # #3097: abacus#2084's pass was lost, and its Work read Waiting for a day.
     stuck = _derived_with_reviews({}, waits=own)
     assert stuck.kind == "pr_stuck" and stuck.line.endswith(f"nothing since {deck_clock(AT)}")
@@ -1221,6 +1302,23 @@ def test_a_wait_on_its_own_pull_request_does_not_hide_ready_for_merge():
     moved = [_event("changes", "b" * 40, after, told=True)]
     found = _derived_with_reviews({}, waits=own, entry=tests, history=moved)
     assert "asked for changes" not in found.line
+    # #4089: of several pull requests the line names each one and what it lacks.
+    from agentdeck.review_history import HeadReview
+    from agentdeck.web.work_view import _pr_hold
+
+    several = {"words": "Merge pressed; not reviewed at its head", "since": since}
+    several |= {
+        "why": "o/metso#77 has no review pass",
+        "pulls": [{"pull": "o/store#3", "lacks": "checks are pending"}],
+    }
+    state = SimpleNamespace(
+        work_release=SimpleNamespace(store=SimpleNamespace(get=lambda _w: {"hold": several}))
+    )
+    found = HeadReview()
+    held = _pr_hold(SimpleNamespace(state=state), WORK, ((None, found), (None, found)))
+    assert held.words == (
+        "Merge pressed; metso#77: not reviewed at its head; store#3: checks are pending"
+    )
     # #3097: store#3553 was reviewed and green, and held by the spec-only label.
     held = {"hold": {"why": "y", "words": "held: spec-only label", "person": True, "since": since}}
     found = _derived_with_reviews({}, waits=own, entry=held)

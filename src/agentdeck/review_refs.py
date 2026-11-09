@@ -191,14 +191,21 @@ async def target_digest(repository: str, number: int, head: str) -> tuple[str, s
         code, stdout, stderr = await gh_cli.run_once(
             ["gh", "pr", "diff", str(number), "--repo", repository], timeout=_TIMEOUT_S
         )
-    except (OSError, TimeoutError):
+    except (OSError, TimeoutError) as exc:
         # A digest the chat lacks costs one verdict; a review refused over it costs the review.
-        code, stdout, stderr = 1, b"", b""
+        code, stdout, stderr = 1, b"", str(exc).encode()
     if code != 0:
         if review_diff_too_large((stderr or b"").decode("utf-8", "replace")):
             log.info("chat review: %s#%s diff too large; digest pinned to head", repository, number)
             return head_digest(repository, number, head), ""
-        log.info("chat review: %s#%s diff unreadable; no review digest", repository, number)
+        # Why is the only trace of a read nobody can repeat (#4124).
+        why = (stderr or b"").decode("utf-8", "replace").strip()[:500]
+        log.warning(
+            "chat review: %s#%s diff unreadable; no review digest: %s",
+            repository,
+            number,
+            why or f"gh exited {code}",
+        )
         return "", DIGEST_UNREADABLE
     try:
         text = (stdout or b"").decode("utf-8")
@@ -259,7 +266,8 @@ async def _read_json(argv: list[str], what: str, *, owner: str | None = None) ->
 
 
 async def pull_facts(repository: str, number: int) -> dict | None:
-    """A pull request's state, draft flag, head and the issues it closes; None if it is none."""
+    """A pull request's state, draft flag, head and base commits and the issues it closes;
+    None if it is none."""
     return await _read_json(
         [
             "gh",
@@ -269,10 +277,43 @@ async def pull_facts(repository: str, number: int) -> dict | None:
             "--repo",
             repository,
             "--json",
-            "number,state,isDraft,headRefOid,closingIssuesReferences",
+            "number,state,isDraft,isCrossRepository,headRefOid,baseRefOid,closingIssuesReferences",
         ],
         f"{repository}#{number}",
     )
+
+
+# GitHub's compare lists at most this many files, so a diff this wide has no full count.
+_COMPARE_FILES = 300
+
+
+async def diff_sizes(repository: str, number: int, heads: tuple[str, ...]) -> dict[str, int]:
+    """Changed lines (added plus removed) of a pull request's diff at each of ``heads``, against
+    its base branch as GitHub shows it (#4220). A head left out was unread or too wide."""
+    facts = await _read_json(
+        ["gh", "pr", "view", str(number), "--repo", repository, "--json", "baseRefName"],
+        f"{repository}#{number}",
+    )
+    base = (facts or {}).get("baseRefName")
+    if not isinstance(base, str) or not base:
+        return {}
+    sizes: dict[str, int] = {}
+    for head in dict.fromkeys(heads):
+        compare = await _read_json(
+            [
+                "gh",
+                "api",
+                f"repos/{repository}/compare/{base}...{head}",
+                "--jq",
+                "{files: (.files | length), lines: ([.files[] | .additions + .deletions] | add)}",
+            ],
+            f"{repository}@{head}",
+        )
+        files, lines = (compare or {}).get("files"), (compare or {}).get("lines")
+        if not isinstance(files, int) or files >= _COMPARE_FILES:
+            continue
+        sizes[head] = lines if isinstance(lines, int) else 0
+    return sizes
 
 
 # Long enough for a real sentence, short enough that the board's rows stay one line on a

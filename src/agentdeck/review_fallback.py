@@ -75,6 +75,14 @@ def starred_check(state, is_starred):
     return lambda repository, number: False
 
 
+def person_check(state):
+    return lambda repository, number: False
+
+
+def tell_takeover(state, messages, chat_repository):
+    return lambda row, why, reviewer, now: None
+
+
 def start_failed_on(row, start) -> str:
     return ""
 

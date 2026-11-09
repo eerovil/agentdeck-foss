@@ -96,6 +96,11 @@ def _proven_head(job: dict, jobs: Iterable[object]) -> str:
     return tested.head
 
 
+def proves_commit(job: dict) -> bool:
+    """Whether this job passed on its own, on a clean tree that held still (#4080)."""
+    return _passed(job) and bool(_proven_head(job, ()))
+
+
 def _passed(job: dict) -> bool:
     return str(job.get("state") or "") == _DONE and str(job.get("result_class") or "") == _SUCCESS
 

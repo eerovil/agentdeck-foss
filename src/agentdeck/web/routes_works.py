@@ -18,6 +18,7 @@ import math
 import re
 import shutil
 import time
+import uuid
 from collections import OrderedDict
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
@@ -38,7 +39,7 @@ from ..state import REVIEWS_TOPIC
 from ..work import WorkRef
 from ..work_actions import STAR, UNSTAR, WorkActionPress, finish_question
 from ..work_attention import FINISH, HIDE
-from ..work_claims import own_assignee, run_gh_write, start_issue, take_over
+from ..work_claims import assignee_of, own_assignee, run_gh_write, start_issue, take_over
 from ..work_hidden import UNHIDE
 from ..work_overview import (
     WorkCandidate,
@@ -52,7 +53,7 @@ from ..work_overview import (
     work_title,
 )
 from ..work_resolution import MAX_TITLE, normalize_title
-from ..work_start import release_work_worktrees, start_action_id
+from ..work_start import release_closed_work_worktrees, release_work_worktrees, start_action_id
 from ..work_status_log import flaps
 from ..work_story import DONE, waiting_attention
 from ..work_workspace import parse_work_id
@@ -679,6 +680,7 @@ async def work_page(request: Request, work_id: str) -> HTMLResponse:
             "issue_post_target": ref,
             "rename_url": work_href(ref.work_id) + "/title",
             "new_chat": _new_chat_form(request, ref, detail),
+            "side_chat": _side_chat_button(request, ref, detail),
             "title_max": MAX_TITLE,
             # Only a Work with a checkout on this host offers its diff (#2379).
             "diff_url": _diff_url(ref) if work_checkouts(detail.workspace) else "",
@@ -1271,6 +1273,11 @@ async def deck_request_api(request: Request) -> JSONResponse:
     if not _ACTION_ID_RE.match(action_id):
         raise HTTPException(status_code=400, detail="the request carried no usable id")
     repository, number = target.group("repo"), int(target.group("n"))
+    # Before the release, which takes any switched repository: this one is no Work's (#4152).
+    router = getattr(request.app.state, "work_router", None)
+    checked = await router.check_request(repository, number, command, action_id) if router else None
+    if checked is not None:
+        return JSONResponse(checked)
     released = await _deck_released_verdict(request, repository, number, command, action_id)
     if released is not None:
         return JSONResponse({"outcome": "done", "detail": released})
@@ -1340,7 +1347,7 @@ async def _agent_review(request: Request, step: work_actions.Step, label: str) -
     there by head and diff like any other. A chat someone already holds is left to them.
     """
     from .. import chat_board, chat_review
-    from .routes_chat_board import note_review_head, releases_of
+    from .routes_chat_board import earlier_of, note_review_head, releases_of, shipped_of
 
     service = getattr(request.app.state, "review_fallback", None)
     if service is None:
@@ -1352,6 +1359,8 @@ async def _agent_review(request: Request, step: work_actions.Step, label: str) -
             start=False,
             pulls=step.pulls,
             releases=releases_of(request.app),
+            earlier=earlier_of(request.app),
+            shipped=shipped_of(request.app),
         )
     except chat_review.ReviewError as exc:
         return "failed", str(exc)
@@ -1394,7 +1403,13 @@ async def _write(
     or ``uncertain`` (no proof either way, so the reservation stays unsettled)."""
     if step.kind == "chatgpt_review":
         from .. import chat_review
-        from .routes_chat_board import chat_board_of, note_review_head, releases_of
+        from .routes_chat_board import (
+            chat_board_of,
+            earlier_of,
+            note_review_head,
+            releases_of,
+            shipped_of,
+        )
 
         try:
             outcome = await chat_review.open_review(
@@ -1404,6 +1419,8 @@ async def _write(
                 pulls=step.pulls,
                 board=chat_board_of(request.app),
                 releases=releases_of(request.app),
+                earlier=earlier_of(request.app),
+                shipped=shipped_of(request.app),
             )
         except chat_review.ReviewError as exc:
             # ``open_review`` finds the open chat before it writes one, so a refusal here is
@@ -1435,6 +1452,36 @@ async def _write(
             logger.exception("work action Merge for %s failed", step.issue)
             return "uncertain", f"{label} did not finish ({exc}); it may have merged"
         return "done", f"{label} asked for {step.issue}: {answer}"
+    if step.kind == "deck_ship_now":
+        # Ship now, fix later (#4212): the router checks each pull request's head against its
+        # review, records the pass, files the follow-up and tells the agent.
+        router_service = getattr(request.app.state, "work_router", None)
+        if router_service is None or not getattr(router_service, "enabled", True):
+            return "failed", "this deck does not route Work events; nothing was sent."
+        from ..services_link import ServicesUnavailable
+        from ..work_router import AgainRefused
+
+        done: list[str] = []
+        for target in step.pulls:
+            pull, _, head = target.partition("@")
+            repository, _, number = pull.rpartition("#")
+            try:
+                shipped = await router_service.ship_now(repository, int(number), head=head)
+            except (AgainRefused, ServicesUnavailable) as refused:
+                if not done:
+                    return "failed", str(refused)
+                done.append(f"{pull} not shipped: {refused}")
+                continue
+            except Exception as exc:  # noqa: BLE001 - its pass or issue may have been written
+                logger.exception("work action Ship now for %s failed", pull)
+                return "uncertain", f"{label} did not finish for {pull} ({exc}); it may have run"
+            follow_up = shipped.get("follow_up") or ""
+            done.append(
+                f"{pull} ships once its tests are green; follow-up {follow_up}"
+                if follow_up
+                else f"{pull} ships once its tests are green; {shipped.get('outcome', '')}"
+            )
+        return "done", "; ".join(done) or "nothing to ship"
     if step.kind == "deck_withdraw":
         # A Merge press taken back (#3320): the release's own record, under the Work's lock.
         release = getattr(request.app.state, "work_release", None)
@@ -1470,8 +1517,9 @@ async def _write(
     # Only the close and the labels reach here. None carries anyone's authority, so each goes
     # out as the repository owner's non-human authority, like every other deck write.
     if step.kind == "add_label":
-        # The same write a wayfinder ticket gets when its last blocker closes (#3764).
-        return await start_issue(
+        # The same write an issue gets when its last blocker closes (#3764).
+        waits = await _waits_on(request, step.repository, step.number)
+        outcome, text = await start_issue(
             gh,
             step.repository,
             step.number,
@@ -1480,6 +1528,7 @@ async def _write(
             label=label,
             timeout=_GH_TIMEOUT_S,
         )
+        return outcome, _waiting_text(text, waits) if outcome == "done" else text
     if step.kind == "remove_label":
         argv = [
             gh, "issue", "edit", str(step.number), "--repo", step.repository,
@@ -1497,6 +1546,8 @@ async def _write(
             "--reason",
             step.body,
         ]
+        if step.comment:
+            argv += ["--comment", step.comment]
         done = f"Closed {step.issue}"
     outcome, text = await _run_gh(argv, step.repository, label)
     return (outcome, done) if outcome == "done" else (outcome, text)
@@ -1662,6 +1713,8 @@ async def work_action(request: Request, work_id: str) -> HTMLResponse:
             detail.attention,
             deck_release=bool(release is not None and release.handles(detail.card.work_id)),
             approval=detail.approval,
+            shippable=detail.shippable,
+            confirmed=str(form.get("confirmed") or ""),
         )
     except work_actions.Refused as refused:
         return _message_receipt(
@@ -1710,11 +1763,17 @@ async def work_action(request: Request, work_id: str) -> HTMLResponse:
         return _message_receipt(
             request, text=f"{label} was not sent: {receipt}", state="refused", status_code=409
         )
-    if action == work_actions.CLOSE:
+    if action == work_actions.TRIED_OK:
+        # A person tried it live (#4210): the check the Work waited for, recorded as the
+        # agent's would be, so its line and Finish read verified.
+        db.set_work_live_check(ref.work_id, "verified", "tried live by a person", "")
+    if action in {work_actions.CLOSE, work_actions.TRIED_OK}:
         # Closing it here is the person's sign-off too, so it needs no Finish after (#2510).
         if db.finish_work(ref.work_id, datetime.now(UTC)):
             _release_worktrees(request, ref.work_id)
-    if action in {work_actions.PAUSE, work_actions.RESUME, work_actions.START}:
+    if action in {
+        work_actions.PAUSE, work_actions.RESUME, work_actions.START, work_actions.TRIED_OK
+    }:
         if action == work_actions.RESUME:
             # One Resume ends every pause the Work had, the label's and this deck's (#2559).
             db.resume_work(ref.work_id)
@@ -1775,12 +1834,116 @@ def new_work_form(
     current = new_work.target_for(options, repository)
     return {
         "targets": options,
+        **_new_work_start_options(request, options),
         "default": current.repository if current else new_work.default_repository(options, issues),
         "session_key": session_key,
         "max_files": get_config(request).inject.max_images,
         # The front page's form guesses its project from what is typed (#3367).
         "guess_project": not session_key and guess.guessing_enabled(request.app),
     }
+
+
+def _new_work_start_options(request: Request, targets) -> dict:
+    """What the form's Edit advanced offers for the Work's agent (#4181): each account any
+    target's Work may start on, with the repositories it serves and its provider, and each
+    offered provider's models and efforts. Auto is the deck's own choice, a Claude account
+    (``work_start.work_accounts``); a pick may also name a Codex account the project names.
+
+    Only a repository whose Work the deck starts itself is offered: there the pick is read
+    by every start, while a Poller worker never reads it."""
+    from ..providers import PROVIDERS
+    from ..work_start import AUTO_PROVIDERS, PICK_PROVIDERS, work_accounts
+
+    accounts: dict[str, dict] = {}
+    repositories: list[str] = []
+    for target in targets:
+        if not _deck_starts(request, target):
+            continue
+        for account in (
+            work_accounts(request.app, target.repository, providers=PICK_PROVIDERS) or ()
+        ):
+            entry = accounts.setdefault(
+                account.key,
+                {
+                    "key": account.key,
+                    "label": account.label,
+                    "provider_id": account.provider_id,
+                    "repositories": [],
+                },
+            )
+            entry["repositories"].append(target.repository.lower())
+            if target.repository.lower() not in repositories:
+                repositories.append(target.repository.lower())
+    offered = list(AUTO_PROVIDERS) + sorted(
+        {entry["provider_id"] for entry in accounts.values()} - set(AUTO_PROVIDERS)
+    )
+    return {
+        "accounts": list(accounts.values()),
+        "advanced_repositories": repositories,
+        "auto_provider": AUTO_PROVIDERS[0],
+        "models": [
+            {"provider_id": provider_id, "value": choice.value, "label": choice.label}
+            for provider_id in offered
+            for choice in PROVIDERS[provider_id].selectable_models
+        ],
+        "efforts": [
+            {"provider_id": provider_id, "value": choice.value, "label": choice.label}
+            for provider_id in offered
+            for choice in PROVIDERS[provider_id].selectable_efforts
+        ],
+    }
+
+
+def _deck_starts(request: Request, target, labels: list[str] | None = None) -> bool:
+    """Whether the Work router, not a Poller worker, starts a Work filed to ``target``."""
+    from .. import new_work
+
+    router_service = getattr(request.app.state, "work_router", None)
+    if router_service is None:
+        return False
+    if labels is None:
+        labels = new_work.labels_for(target, False)
+    return bool(router_service.starts_on(target.repository, labels))
+
+
+def _new_work_choice(request: Request, target, labels: list[str], form) -> tuple[Any, str]:
+    """The press's own pick of account, model and effort (#4181), or why it is refused.
+
+    ``(None, "")`` when nothing was picked: the deck chooses, as before. A pick for a
+    repository whose Work a Poller worker starts is refused, since nothing there reads it.
+    """
+    repository = target.repository
+    from ..db import StartChoice
+    from ..providers import PROVIDERS
+    from ..work_start import AUTO_PROVIDERS, PICK_PROVIDERS, work_accounts
+
+    def field(name: str) -> str:
+        raw = form.get(name)
+        return raw.strip() if isinstance(raw, str) else ""
+
+    account_key, model, effort = field("account_key"), field("model"), field("effort")
+    provider = PROVIDERS[AUTO_PROVIDERS[0]]
+    if account_key:
+        picked = {
+            account.key: account
+            for account in work_accounts(request.app, repository, providers=PICK_PROVIDERS) or ()
+        }.get(account_key)
+        if picked is None:
+            return None, f"the account {account_key} may not start a Work in {repository} now."
+        # The model and effort are the picked account's provider's own.
+        provider = PROVIDERS[picked.provider_id]
+    if model and not provider.is_valid_model(model):
+        return None, f"the model “{model}” is not offered."
+    if effort and not provider.is_valid_effort(effort):
+        return None, f"the effort “{effort}” is not offered."
+    if not (account_key or model or effort):
+        return None, ""
+    if not _deck_starts(request, target, labels):
+        return None, (
+            f"a Work in {repository} is started by its Poller, which picks its own account"
+            " and model."
+        )
+    return StartChoice(account_key, model, effort), ""
 
 
 def _new_work_chat_url(request: Request, session_key: str) -> str:
@@ -1888,9 +2051,13 @@ def _settle_later(
     outcome: Any,
     labels: list[str],
     guard: contextlib.AbstractContextManager,
+    choice: Any = None,
 ) -> None:
     """Hold the router no longer than the create (D19), then settle an early start off the
     request, so its receipt is not held up.
+
+    The press's pick of account and model (#4181) is saved under the Work first, still under
+    the hold, so any start of it the router makes from then on reads the same pick.
 
     The new Work's start is reserved for this press first, still under the hold: from then
     on the per-Work reservation, not the repository-wide hold, keeps a second agent away.
@@ -1899,6 +2066,10 @@ def _settle_later(
     filed_at = time.monotonic()
     number = outcome.url.rsplit("/", 1)[-1] if outcome.state == "done" else ""
     try:
+        if choice is not None and number.isdigit():
+            work_id = WorkRef(target.repository, int(number)).work_id
+            if not app.state.control_db.record_work_start_choice(work_id, choice):
+                logger.warning("new work: the pick for %s was not saved", work_id)
         if early_task is not None and number.isdigit():
             from .. import work_actions as actions
 
@@ -1973,8 +2144,8 @@ async def file_new_work(request: Request) -> HTMLResponse:
 
     The press is reserved under its client action id before anything reaches GitHub, as a
     Work action is: a replay answers with what that press did, and a filing that ended
-    without proof either way is never made again by the deck. Attachments are uploaded to
-    the project's evidence repository first, so a failed upload files nothing.
+    without proof either way is never made again by the deck. Attachments are saved on this
+    deck first, never on GitHub (#4135), so a failed save files nothing.
     """
     from .. import new_work
     from ..review_refs import first_line_title
@@ -2026,17 +2197,18 @@ async def file_new_work(request: Request) -> HTMLResponse:
         )
     except new_work.Refused as exc:
         return refuse(f"{exc}.")
-    if attachments and not target.evidence_repository:
-        return refuse(f"{target.project} has no evidence repository to hold files.")
     work_id = f"new-work:{target.repository}"
     spec_only = form.get("spec_only") == "1"
     labels = new_work.labels_for(target, spec_only)
+    choice, unpicked = _new_work_choice(request, target, labels, form)
     db = get_control_db(request)
     earlier = db.work_action(action_id)
     if earlier is not None:
         if earlier.work_id != work_id or earlier.action != work_actions.NEW_WORK:
             return refuse("that action ID was already used for something else.", 409)
         return _new_work_replay(request, earlier, labels)
+    if unpicked:
+        return refuse(unpicked)
     reserved = db.reserve_work_action(action_id, work_id, work_actions.NEW_WORK)
     if reserved is None:
         return refuse("the deck could not record this press.", 409)
@@ -2060,7 +2232,7 @@ async def file_new_work(request: Request) -> HTMLResponse:
 
         early_task = asyncio.create_task(
             work_start.start_before_issue(
-                request.app, target.repository, request=body, press=action_id
+                request.app, target.repository, request=body, press=action_id, choice=choice
             )
         )
 
@@ -2081,9 +2253,9 @@ async def file_new_work(request: Request) -> HTMLResponse:
     except BaseException:
         # Cut short (a deploy, a crash in the filing): an early agent only waits.
         cut = new_work.Outcome("uncertain", "the filing was cut short")
-        _settle_later(request.app, target, early_task, cut, labels, guard)
+        _settle_later(request.app, target, early_task, cut, labels, guard, choice)
         raise
-    _settle_later(request.app, target, early_task, outcome, labels, guard)
+    _settle_later(request.app, target, early_task, outcome, labels, guard, choice)
     issues_url = f"https://github.com/{target.repository}/issues"
     if outcome.state == "uncertain":
         # Left unsettled, as a Work action's uncertain write is: the table holds only
@@ -2378,6 +2550,230 @@ async def work_new_chat(request: Request, work_id: str) -> HTMLResponse:
     )
 
 
+# The slot a Side chat press's start is watched in (#4199); ``routes_actions._START_RESULT_IDS``
+# knows it.
+SIDE_CHAT_RESULT_ID = "work-side-chat-result"
+# A Side chat press whose chat has not been scanned yet is answered with that press's start
+# for this long, unless its start already failed; after it a press makes a new one.
+_SIDE_CHAT_PENDING = timedelta(minutes=2)
+# Each Work's Side chat presses run one at a time in this web process (#4199).
+_SIDE_CHAT_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+def _live_side_chat(request: Request, ref: WorkRef) -> tuple[str, str]:
+    """The Work's side chat to carry on (#4199): ``(session key, "")`` when its newest one is
+    still fresh, ``("", action id)`` while that one's start is not scanned yet, else
+    ``("", "")``.
+
+    Read from the Work's own presses: a side chat is never a member of the Work, so the
+    Work's messages, comments and status never go to it.
+    """
+    from ..work_side_chat import side_chat_fresh
+
+    press = get_control_db(request).newest_work_action(ref.work_id, work_actions.SIDE_CHAT, "done")
+    if press is None:
+        return "", ""
+    state = get_state(request)
+    key = state.session_key_for_token(press.action_id)
+    session = state.sessions.get(key) if key else None
+    if session is None:
+        from .deps import get_injector
+
+        start = get_injector(request).started_chat(press.action_id)
+        if start is not None and (
+            start.status.state == "failed"
+            or (start.status.state == "complete" and not start.status.session_key)
+        ):
+            return "", ""  # its worker died or named no chat: a press starts a new one
+        try:
+            reserved = datetime.fromisoformat(press.reserved_at)
+        except ValueError:
+            return "", ""
+        if reserved.tzinfo is None:
+            reserved = reserved.replace(tzinfo=UTC)
+        pending = datetime.now(UTC) - reserved < _SIDE_CHAT_PENDING
+        return "", press.action_id if pending else ""
+    return (session.key, "") if side_chat_fresh(session.last_activity) else ("", "")
+
+
+def _side_chat_button(request: Request, ref: WorkRef, detail) -> dict | None:
+    """What the Side chat control shows (#4199), or None when the Work has no chat to copy.
+
+    Read once with the page, never on the stream, like New chat beside it.
+    """
+    from ..work_side_chat import working_chat
+    from .deps import resolve_session
+
+    chat = working_chat(detail.chats)
+    if chat is None:
+        return None
+    live, _pending = _live_side_chat(request, ref)
+    refusal = ""
+    if not live:
+        try:
+            account, session, provider = resolve_session(request, chat.session_key)
+        except HTTPException:
+            return None
+        refusal = provider.fork_refusal(account, session) or ""
+    return {
+        "url": work_href(ref.work_id) + "/side-chat",
+        "href": get_state(request).chat_path_for_session(live) if live else "",
+        "refusal": refusal,
+        # Minted with the page: a second press of the same page is the same press.
+        "action_id": uuid.uuid4().hex,
+    }
+
+
+@router.post("/works/{work_id:path}/side-chat", response_class=HTMLResponse)
+async def work_side_chat(request: Request, work_id: str) -> HTMLResponse:
+    """Open the Work's side chat (#4199): a copy of its working chat to ask questions in.
+
+    The Work keeps one while it is fresh (``work_side_chat.SIDE_CHAT_FRESH``): a press then
+    opens that one. Otherwise the working chat is cut at its newest finished reply and a new
+    chat starts from there on the same account, folder, model and effort, as a chat page's
+    side chat does (#2485), with a first message that says what it is for. The press's action
+    id is reserved first and is also the new chat's session token, so a replay of the same id
+    answers with that start and never spawns another.
+    """
+    from . import routes_actions
+
+    routes_actions._require_same_origin(request)
+    ref, _ = _resolve(work_id)
+    if ref is None:
+        raise HTTPException(status_code=404, detail="not a Work id")
+    form = await request.form()
+    action_id = str(form.get("client_action_id") or "")
+    if not _ACTION_ID_RE.fullmatch(action_id):
+        return _message_receipt(
+            request,
+            text="No side chat was opened: the press carried no usable action ID.",
+            state="refused",
+            status_code=422,
+        )
+
+    # One press per Work at a time: the check for a live or starting side chat and the start
+    # it leads to are several awaits apart, so two presses at once would each start one.
+    async with _SIDE_CHAT_LOCKS.setdefault(ref.work_id, asyncio.Lock()):
+        return await _open_side_chat(request, ref, action_id)
+
+
+async def _open_side_chat(request: Request, ref: WorkRef, action_id: str) -> Any:
+    """The body of a Side chat press, run under the Work's lock."""
+    from ..work_side_chat import side_chat_message, working_chat
+    from . import routes_actions
+    from .deps import get_injector, resolve_session
+
+    def accepted(token: str) -> Any:
+        return routes_actions._render_start_accepted(request, token, result_id=SIDE_CHAT_RESULT_ID)
+
+    def opened(session_key: str) -> HTMLResponse:
+        response = HTMLResponse("", status_code=200)
+        response.headers["HX-Redirect"] = get_state(request).chat_path_for_session(session_key)
+        return response
+
+    db = get_control_db(request)
+    earlier = db.work_action(action_id)
+    if earlier is not None:
+        if earlier.work_id != ref.work_id or earlier.action != work_actions.SIDE_CHAT:
+            return _message_receipt(
+                request,
+                text="That action ID was already used for something else; no side chat opened.",
+                state="refused",
+                status_code=409,
+            )
+        # The same page pressed again; its button keeps the id. Below, it opens the side chat
+        # that press started once it is up, or answers with its start while under way. A
+        # press that left no side chat (refused, or its worker died) is spent, so the tap is
+        # a new press under an id minted here, and never needs a reload.
+        action_id = uuid.uuid4().hex
+    live, pending = _live_side_chat(request, ref)
+    if live:
+        return opened(live)
+    if pending:
+        return await accepted(pending)
+    detail = await load_work_detail(request.app, ref)
+    if detail is None:
+        raise HTTPException(status_code=404, detail="nothing on this deck names this Work")
+    chat = working_chat(detail.chats)
+    if chat is None:
+        return _message_receipt(
+            request,
+            text="This Work has no chat to copy, so no side chat was opened.",
+            state="refused",
+            status_code=409,
+        )
+    account, session, provider = resolve_session(request, chat.session_key)
+    refusal = provider.fork_refusal(account, session)
+    if refusal is not None:
+        return _message_receipt(request, text=refusal, state="refused", status_code=409)
+    fork = await asyncio.to_thread(provider.newest_fork, account, session)
+    if fork is None:
+        return _message_receipt(
+            request,
+            text="Its chat has no finished reply yet, so no side chat was opened.",
+            state="refused",
+            status_code=409,
+        )
+    seq, cut = fork
+    issue = IssueRef.parse(detail.card.source_label) or IssueRef(ref.repository, ref.number)
+    message = side_chat_message(issue, session.key)
+    model, effort = provider.fork_settings(account, session)
+    reserved = db.reserve_work_action(action_id, ref.work_id, work_actions.SIDE_CHAT)
+    if not reserved:
+        pressed = db.work_action(action_id) if reserved is False else None
+        if pressed is not None and pressed.action == work_actions.SIDE_CHAT:
+            return await accepted(action_id)
+        return _message_receipt(
+            request,
+            text="The deck could not record this press, so no side chat was opened.",
+            state="refused",
+            status_code=409,
+        )
+    state = get_state(request)
+    owner = state.reserve_chat_fork(action_id, session.key, seq, action_id)
+    if owner is None:
+        db.settle_work_action(action_id, "failed", "the deck could not record its source")
+        return _message_receipt(
+            request,
+            text="The side chat could not be recorded, so it was not opened.",
+            state="refused",
+            status_code=409,
+        )
+    try:
+        result = await get_injector(request).start_new(
+            account,
+            provider,
+            session.cwd,
+            message,
+            model=model,
+            effort=effort,
+            client_action_id=action_id,
+            session_token=action_id,
+            allow_over_budget=True,
+            origin="fork",
+            source_session_key=session.key,
+            fork_from=routes_actions.ForkFrom(session.session_id, cut),
+        )
+    except Exception as exc:  # noqa: BLE001 - the spawn may have begun; never repeat it
+        logger.exception("side chat of %s did not report its start", ref.work_id)
+        return _message_receipt(
+            request,
+            text=f"The start did not answer ({exc}); it may have begun, so it was not repeated.",
+            state="uncertain",
+            status_code=202,
+        )
+    if not result.accepted:
+        reason = result.reason or "the start was refused"
+        state.release_chat_fork(action_id)
+        db.settle_work_action(action_id, "failed", reason)
+        return _message_receipt(
+            request, text=f"Not opened: {reason}", state="refused", status_code=409
+        )
+    db.settle_work_action(action_id, "done", "Started a side chat")
+    logger.info("side chat of %s started from %s line %s", ref.work_id, session.key, seq)
+    return await accepted(action_id)
+
+
 @router.post("/works/seen", response_class=HTMLResponse)
 async def works_seen(request: Request) -> HTMLResponse:
     """Mark Works read from the top bar's list without opening them (#3246).
@@ -2559,6 +2955,120 @@ async def put_work_star(request: Request, work_id: str) -> JSONResponse:
 async def delete_work_star(request: Request, work_id: str) -> JSONResponse:
     """Unstar a Work (#3116); unstarring an unstarred Work changes nothing."""
     return await _star_json(request, work_id, False)
+
+
+async def _waits_on(request: Request, repository: str, number: int) -> list[str]:
+    """What an issue's start waits for, read live (#4216): its open blockers, or, when they
+    could not be read, that read, which the deck tries again before the agent starts."""
+    read = getattr(request.app.state, "open_blockers", None)
+    if read is None:
+        return []
+    try:
+        still = await read(repository, number)
+    except Exception:  # noqa: BLE001 - unread: the router and backstop read it again
+        logger.warning("blockers of %s#%s unread", repository, number, exc_info=True)
+        still = None
+    return UNREAD_BLOCKERS if still is None else list(still)
+
+
+# The wait a start answers with when the issue's blockers could not be read (#4216).
+UNREAD_BLOCKERS = ["a read of its blockers"]
+
+
+def _waiting_text(text: str, waits: list[str]) -> str:
+    """A start's answer, saying when an open blocker holds the agent back (#4216)."""
+    if not waits:
+        return text
+    if text.startswith("Started "):
+        text = "Labelled " + text[len("Started ") :]
+    if waits == UNREAD_BLOCKERS:
+        when = "once its blockers can be read and none is open"
+    else:
+        when = f"once {', '.join(waits)} {'closes' if len(waits) == 1 else 'close'}"
+    return text.replace("so an agent starts on it", f"so an agent starts on it {when}")
+
+
+async def _start_refusal(request: Request, ref: WorkRef, claims) -> tuple[int, str] | None:
+    """Why this issue must not be started here, as ``(status, reason)``, read from GitHub."""
+    issue = f"{ref.repository}#{ref.number}"
+    key = (ref.repository, ref.number)
+    issues = request.app.state.issues
+    try:
+        # A failed read returns 0 rather than raising, and the row left in the cache may
+        # be stale: an issue closed or taken since must not look open and free.
+        read = await issues.refresh_issue_records([key], limit=1)
+        record = issues.cached_issues([key]).get(key) if read else None
+    except Exception:  # noqa: BLE001 - unread is refused below, and asking again is safe
+        logger.warning("issue %s could not be read before its start", issue, exc_info=True)
+        record = None
+    if not record:
+        return 503, f"{issue} could not be read, so nothing changed; try again"
+    if str(record.get("state") or "").lower() != "open" or record.get("is_pr"):
+        return 409, f"{issue} is not an open issue, so nothing changed"
+    assignee = assignee_of(record)
+    if assignee and claims is not None and not claims(ref.repository, assignee):
+        return 409, (
+            f"{issue} is assigned to {assignee}, so another deck works it and nothing changed; "
+            "Take over on its Work page moves it here"
+        )
+    return None
+
+
+@router.post("/api/work-worktrees/release-closed")
+async def post_release_closed_worktrees(request: Request) -> JSONResponse:
+    """Host-janitor's daily ask: give back closed Works' idle worktrees (#4148)."""
+    return JSONResponse(await release_closed_work_worktrees(request.app))
+
+
+@router.post("/api/works/{work_id:path}/start")
+async def post_work_start(request: Request, work_id: str) -> JSONResponse:
+    """Start an agent on an issue for a chat that wants that done (#4141).
+
+    The same write as the Start button and a ticket whose last blocker closed: each project
+    has its own start label, and in a repository another deck also serves the issue must be
+    assigned first, so a chat that labels by hand can get either wrong and nothing says so.
+    An issue with an open blocker is labelled too, and its agent waits for the last blocker
+    to close (#4216): the answer's ``waits_on`` names them and ``started`` is false; when its
+    blockers could not be read it waits too, with ``blockers_read`` false. Starting a
+    started issue changes nothing. An issue that would not start here is refused, not labelled:
+    a closed one, and one whose first assignee is another deck's, since adding this deck's
+    person after them would claim a start that never comes (#3731); Take over moves those.
+    """
+    ref, _ = _resolve(work_id)
+    if ref is None:
+        raise HTTPException(status_code=404, detail="not a Work id")
+    read_board = getattr(getattr(request.app.state, "issues", None), "read_board", None)
+    board = read_board() if read_board is not None else None
+    labels = board.ownership_labels(ref.repository) if board is not None else ()
+    if not labels:
+        raise HTTPException(
+            status_code=409,
+            detail=f"no poller on this deck manages {ref.repository}, so nothing starts there",
+        )
+    gh = shutil.which("gh")
+    if gh is None:
+        raise HTTPException(status_code=503, detail="gh is not available on this host")
+    claims = getattr(request.app.state, "deck_claims", None)
+    refusal = await _start_refusal(request, ref, claims)
+    if refusal is not None:
+        raise HTTPException(status_code=refusal[0], detail=refusal[1])
+    waits = await _waits_on(request, ref.repository, ref.number)
+    outcome, text = await start_issue(
+        gh, ref.repository, ref.number, labels[0], claims, timeout=_GH_TIMEOUT_S
+    )
+    if outcome != "done":
+        # "uncertain" may have landed: repeating this call is safe, as above.
+        raise HTTPException(status_code=409 if outcome == "failed" else 502, detail=text)
+    return JSONResponse(
+        {
+            "work_id": ref.work_id,
+            "started": not waits,
+            "waits_on": [] if waits == UNREAD_BLOCKERS else waits,
+            "blockers_read": waits != UNREAD_BLOCKERS,
+            "label": labels[0],
+            "detail": _waiting_text(text, waits),
+        }
+    )
 
 
 class AgentMessageRequest(BaseModel):

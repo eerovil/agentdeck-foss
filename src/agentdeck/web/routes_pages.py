@@ -4,14 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from dataclasses import asdict
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.encoders import jsonable_encoder
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 
-from .. import github_suspension, issue_post, live_prototype, meta_chat, voice_helper
+from .. import chat_read, github_suspension, issue_post, live_prototype, meta_chat, voice_helper
 from ..chat_transcript import chat_event_id, load_chat_transcript
 from ..composer_phrases import composer_phrases
 from ..composer_suggestions import composer_suggestions
@@ -48,6 +49,9 @@ from .routes_works import new_work_form
 from .side_chat import side_chat_context
 
 router = APIRouter()
+
+#: A turn or a range of turns: 7, 3-7 or 5-. Nine digits so ``int`` cannot refuse it.
+_TURNS_RE = re.compile(r"(?P<first>\d{1,9})(?:(?P<open>-)(?P<last>\d{0,9}))?")
 logger = logging.getLogger(__name__)
 
 
@@ -618,6 +622,137 @@ async def session_transcript(request: Request, session_key: str) -> JSONResponse
 
 
 @router.get(
+    "/api/sessions/{session_key}/history",
+    response_class=PlainTextResponse,
+    dependencies=[Depends(require_access)],
+)
+async def session_history(
+    request: Request,
+    session_key: str,
+    outline: bool = False,
+    turns: str = "",
+    last: int | None = None,
+    search: str = "",
+    role: str = "",
+    tools: str = chat_read.TOOLS_NONE,
+    after: str = "",
+    event: str = "",
+    offset: int = 0,
+    page_chars: int = chat_read.PAGE_CHARS,
+) -> PlainTextResponse:
+    """A chat read in parts, as plain text, without waking it (#4169).
+
+    ``transcript.json`` hands over everything; an agent picking up from an old chat wants
+    a small part, and pays for every character it reads. ``agentdeck chat-read`` calls this.
+    """
+    _account, session, _provider = resolve_session(request, session_key)
+    match = _TURNS_RE.fullmatch(turns)
+    roles = tuple(item for item in role.split(",") if item) or chat_read.DEFAULT_ROLES
+    # Name each wrong option the way `agentdeck chat-read` spells it, with what it
+    # takes, so an agent reading in parts can fix its call (#4179).
+    problems = []
+    if turns and match is None:
+        problems.append(f"--turns {turns[:40]!r}: give a turn or range, such as 7, 3-7 or 5-")
+    if last is not None and last < 1:
+        problems.append(f"--last {last}: give 1 or more")
+    if not set(roles) <= set(chat_read.ROLES):
+        problems.append(
+            f"--role {role[:40]!r}: give one or more of {','.join(chat_read.ROLES)},"
+            " separated by commas"
+        )
+    if tools not in chat_read.TOOL_LEVELS:
+        problems.append(f"--tools {tools[:40]!r}: give one of {', '.join(chat_read.TOOL_LEVELS)}")
+    if offset < 0:
+        problems.append(f"--offset {offset}: give 0 or more")
+    if not chat_read.MIN_PAGE_CHARS <= page_chars <= chat_read.MAX_PAGE_CHARS:
+        problems.append(
+            f"--page-chars {page_chars}: give {chat_read.MIN_PAGE_CHARS:,}"
+            f" to {chat_read.MAX_PAGE_CHARS:,}"
+        )
+    if problems:
+        raise HTTPException(status_code=422, detail="bad filter: " + "; ".join(problems))
+    state = get_state(request)
+    lines = await chat_read.load_lines(
+        session.key,
+        leg_keys=state.chat_session_keys(session.key),
+        sessions=state.sessions,
+        accounts_by_key={account.key: account for account in get_accounts(request)},
+        providers=PROVIDERS,
+    )
+    if lines is None:
+        raise HTTPException(status_code=404, detail="transcript unavailable")
+    if event:
+        text = chat_read.one_event(lines, session.key, event, offset, page_chars)
+        if text is None:
+            raise HTTPException(status_code=404, detail="no such event in this chat")
+        return PlainTextResponse(text)
+    first = int(match["first"]) if match else None
+    final = int(match["last"]) if match and match["last"] else first
+    query = chat_read.Query(
+        first_turn=first,
+        last_turn=None if match and match["open"] and not match["last"] else final,
+        last=last,
+        search=search,
+        roles=roles,
+        tools=tools,
+        after=after,
+        page_chars=page_chars,
+    )
+    reader = chat_read.outline if outline else chat_read.read
+    return PlainTextResponse(reader(lines, session.key, query))
+
+
+def _cold_chat(
+    request: Request, account, session, provider, *, interaction_open: bool | None = None
+):
+    """Whether this chat page asks before a message wakes the chat (#4169)."""
+    from datetime import UTC, datetime
+
+    from ..cold_chat import cold_chat
+    from ..models import Capability
+    from .render import pending_injection_messages
+
+    injector = request.app.state.injector
+    can_continue = (
+        request.app.state.config.inject.enabled
+        and Capability.TRANSCRIPT in session.capabilities
+        and session.cwd is not None
+        and PROVIDERS[account.provider_id].offers_new_session(account)
+    )
+    if interaction_open is None:
+        interaction_open = (
+            can_continue and provider.pending_interaction(account, session) is not None
+        )
+    return cold_chat(
+        get_state(request).session_presentation().display(session),
+        now=datetime.now(UTC),
+        # A message already waiting wakes it whatever the answer.
+        busy=injector.session_busy(session.key)
+        or bool(pending_injection_messages(injector.status(session.key))),
+        question_open=bool(session.question) or interaction_open,
+        can_continue=can_continue,
+    )
+
+
+@router.get(
+    "/sessions/{session_key}/cold-chat",
+    response_class=JSONResponse,
+    dependencies=[Depends(require_access)],
+)
+async def session_cold_chat(request: Request, session_key: str) -> JSONResponse:
+    """Ask again, for a chat page a person comes back to (#4169).
+
+    Read once when the tab shows again with an empty message box, never on a timer.
+    """
+    account, session, provider = resolve_session(request, session_key)
+    session = get_state(request).sessions.get(session.key) or session
+    found = _cold_chat(request, account, session, provider)
+    return JSONResponse(
+        {"ask": found is not None} | ({"cost": found.cost, "stamp": found.stamp} if found else {})
+    )
+
+
+@router.get(
     "/sessions/starting/{token}",
     dependencies=[Depends(require_access)],
 )
@@ -857,6 +992,9 @@ async def _render_session_detail(
                 )
             ),
             "inject_max_chars": request.app.state.config.inject.max_message_chars,
+            "cold_chat": _cold_chat(
+                request, account, session, provider, interaction_open=interaction is not None
+            ),
             "issue_post_target": issue_post_target,
             "issue_post_notice": issue_post.notice(
                 getattr(request.app.state, "control_db", None), issue_post_target
@@ -884,6 +1022,9 @@ async def _render_session_detail(
                 Capability.BYPASS_PERMISSIONS in session.capabilities
             ),
             "bypass_permissions_enabled": provider.bypass_permissions_on(account, session),
+            "bypass_permissions_next_turn": provider.permission_prompts_next_turn(
+                account, session
+            ),
             "bypass_permissions_error": None,
             **mac_runner_session_context(request, session.key),
             **side_chat_context(request, session.key),

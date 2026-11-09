@@ -27,6 +27,7 @@ const ASSETS = [
   '/static/htmx.min.js',
   '/static/error_reporting.js',
   '/static/sse.js',
+  '/static/cold_chat.js',
   '/static/work_list.js',
   '/static/front_filters.js',
   '/static/work_stop_sound.js',

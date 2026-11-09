@@ -10,6 +10,10 @@ locked" rather than waiting out the connection's busy timeout:
 - a deferred ``BEGIN`` that reads the schema and then writes cannot be upgraded to a
   writer once another connection has committed, so the schema is created under
   ``BEGIN IMMEDIATE``, which takes the write lock first and does wait for it.
+
+An opener that does wait must wait long enough. The other opener's upgrade is a few
+disk syncs, and on a busy disk those took 14 s where SQLite's default gives up at 5
+(#4144), so opening a file gets ``OPEN_LOCK_WAIT_S``.
 """
 
 from __future__ import annotations
@@ -17,11 +21,11 @@ from __future__ import annotations
 import sqlite3
 import time
 
-_WAL_RETRY_S = 5.0
+OPEN_LOCK_WAIT_S = 30.0
 
 
 def use_wal(conn: sqlite3.Connection) -> None:
-    deadline = time.monotonic() + _WAL_RETRY_S
+    deadline = time.monotonic() + OPEN_LOCK_WAIT_S
     while True:
         try:
             conn.execute("PRAGMA journal_mode=WAL")

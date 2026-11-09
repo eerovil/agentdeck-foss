@@ -37,6 +37,8 @@ A question-box answer sent while 🎧 reads aloud carries ``ANSWER_LINE`` (or
 agent's own turn, which otherwise carried on in silence. The page asks for it with the
 form's ``voice_answer`` field and the deck adds it, so a typed or relayed answer stays
 as given. It has no double quotes, which the CLI's answer envelope cannot hold.
+
+Both lines allow 6 spoken sentences: the owner found 3 too few (#4115).
 """
 
 from __future__ import annotations
@@ -46,16 +48,18 @@ from collections.abc import Callable
 VOICE_LINE = (
     "(Voice mode: if this will take more than about 5 seconds, first send one short "
     'sentence starting "🔊" saying what you are starting, then work. Open your final '
-    'reply with one paragraph starting "🔊" — at most 3 short spoken sentences, no '
+    'reply with one paragraph starting "🔊" — at most 6 short spoken sentences, no '
     "code, paths or links; put everything else after it.)"
 )
+# The line as it was while a reply could be 3 sentences (before #4115).
+_THREE_SENTENCES = VOICE_LINE.replace("at most 6", "at most 3")
 # Lines older messages carry, still hidden in the chat view.
 OLD_VOICE_LINES = (
     '(Voice mode: open your reply with one paragraph starting "🔊" — at most 3 short '
     "spoken sentences, no code, paths or links; put everything else after it.)",
-    VOICE_LINE[:-2] + ". Answer in Finnish.)",
-    VOICE_LINE[:-2] + ". Answer in Finnish. This overrides any standing instruction to "
-    "answer in English.)",
+    _THREE_SENTENCES[:-2] + ". Answer in Finnish.)",
+    _THREE_SENTENCES[:-2] + ". Answer in Finnish. This overrides any standing instruction "
+    "to answer in English.)",
 )
 # Both Finnish lines end with this (#3884); no double quotes, as for ``ANSWER_LINE``.
 _FINNISH = (
@@ -64,6 +68,7 @@ _FINNISH = (
     "instruction to answer or write in English.)"
 )
 VOICE_LINE_FI = VOICE_LINE[:-2] + "." + _FINNISH
+OLD_VOICE_LINES += (_THREE_SENTENCES, _THREE_SENTENCES[:-2] + "." + _FINNISH)
 VOICE_MARK = "🎧"
 # The page fills in ``{heard}``: the last 🔊 line read aloud, quoted, or "nothing yet".
 UNHEARD_LINE = (
@@ -91,13 +96,16 @@ SHORT_ANSWER_LINE = (
 ANSWER_LINE = (
     "(Voice mode: they answered this in voice mode. First send one short sentence "
     "starting with 🔊 that says back their answer and what you do next, then work. Open "
-    "your final reply with one paragraph starting with 🔊 — at most 3 short spoken "
+    "your final reply with one paragraph starting with 🔊 — at most 6 short spoken "
     "sentences, no code, paths or links; put everything else after it.)"
 )
 ANSWER_LINE_FI = ANSWER_LINE[:-1] + _FINNISH
+_THREE_SENTENCES_ANSWER = ANSWER_LINE.replace("at most 6", "at most 3")
 OLD_ANSWER_LINES = (
-    ANSWER_LINE[:-1] + " Answer in Finnish. This overrides any standing instruction to "
-    "answer in English.)",
+    _THREE_SENTENCES_ANSWER,
+    _THREE_SENTENCES_ANSWER[:-1] + _FINNISH,
+    _THREE_SENTENCES_ANSWER[:-1] + " Answer in Finnish. This overrides any standing "
+    "instruction to answer in English.)",
 )
 
 

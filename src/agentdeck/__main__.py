@@ -14,7 +14,7 @@ import sys
 import time
 from pathlib import Path
 from typing import NamedTuple
-from urllib.parse import urljoin
+from urllib.parse import quote, urljoin
 
 import httpx
 import uvicorn
@@ -63,6 +63,8 @@ def main() -> None:
         raise SystemExit(_job(sys.argv[2:]))
     if len(sys.argv) > 1 and sys.argv[1] == "session-key":
         raise SystemExit(_session_key(sys.argv[2:]))
+    if len(sys.argv) > 1 and sys.argv[1] == "chat-read":
+        raise SystemExit(_chat_read(sys.argv[2:]))
     if len(sys.argv) > 1 and sys.argv[1] == "artifact":
         raise SystemExit(_artifact(sys.argv[2:]))
     if len(sys.argv) > 1 and sys.argv[1] == "delegate":
@@ -743,6 +745,11 @@ def _job(argv: list[str]) -> int:
         ),
     )
     submit.add_argument(
+        "--progress",
+        action="store_true",
+        help="also send this chat a progress message every five minutes while the job runs",
+    )
+    submit.add_argument(
         "--max-minutes",
         type=int,
         default=None,
@@ -855,6 +862,7 @@ def _job_submit(parser: argparse.ArgumentParser, socket_path: Path, args) -> int
             run_id=run_id,
             workspaces=[os.path.abspath(path) for path in args.workspace],
             max_minutes=args.max_minutes,
+            progress=args.progress,
         )
 
     try:
@@ -911,11 +919,7 @@ def _job_submit(parser: argparse.ArgumentParser, socket_path: Path, args) -> int
         if hint:
             print(hint)
         if session_key:
-            print(
-                "You can do other work, or end your turn. AgentDeck will send this chat "
-                "a message when the job finishes, and one with its progress every five "
-                "minutes while it runs."
-            )
+            print(_job_announcement(job, progress=args.progress))
         else:
             # Nothing will announce it, so say so rather than let the caller wait
             # for a message that is never coming — and do not send them into the
@@ -933,6 +937,21 @@ def _job_submit(parser: argparse.ArgumentParser, socket_path: Path, args) -> int
     if notice:
         print(notice)
     return _job_wait(socket_path, job)
+
+
+def _job_announcement(job: dict, *, progress: bool) -> str:
+    """What the submitting chat should expect to hear about this job."""
+    said = (
+        "You can do other work, or end your turn. AgentDeck will send this chat a message "
+        "when the job finishes"
+    )
+    said += ", and one with its progress every five minutes while it runs." if progress else "."
+    if job.get("purpose") == "verification" and job.get("work_id") and not job.get("run_id"):
+        said += (
+            " A green run that proves its commit sends no message, because the deck reads the "
+            "result itself: do not wait for it, and mark your pull request ready now."
+        )
+    return said
 
 
 def _resolve_session_token(token: str) -> dict:
@@ -970,6 +989,69 @@ def _session_key(argv: list[str]) -> int:
         print(f"agentdeck session-key: {exc}", file=sys.stderr)
         return 1
     print(payload["session_key"])
+    return 0
+
+
+def _chat_read(argv: list[str]) -> int:
+    """Print part of a chat without waking it (#4169).
+
+    Any agent can run this, on either provider: it only asks the deck's local API.
+    """
+    parser = argparse.ArgumentParser(
+        prog="agentdeck chat-read",
+        description="Read a chat in parts, a page at a time, without waking it.",
+    )
+    parser.add_argument("session_key", help="the chat to read, as its session key")
+    parser.add_argument("--outline", action="store_true", help="one line per turn")
+    parser.add_argument("--turns", default="", help="a turn or range: 7, 3-7 or 5-")
+    parser.add_argument("--last", type=int, help="only the last N turns")
+    parser.add_argument("--search", default="", help="only events holding this text")
+    parser.add_argument("--role", default="", help="user,assistant,system")
+    parser.add_argument(
+        "--tools", default="none", choices=("none", "calls", "all"), help="default: none"
+    )
+    parser.add_argument("--after", default="", help="start after this event id")
+    parser.add_argument("--event", default="", help="read this one event whole")
+    parser.add_argument("--offset", type=int, default=0, help="where in --event to start")
+    parser.add_argument("--page-chars", type=int, help="size of a page, in characters")
+    args = parser.parse_args(argv)
+    base = os.environ.get("AGENTDECK_URL", "").strip() or _local_deck_url()
+    if not base:
+        print("agentdeck chat-read: AGENTDECK_URL is not set", file=sys.stderr)
+        return 1
+    params = {
+        name: value
+        for name, value in {
+            "outline": "true" if args.outline else None,
+            "turns": args.turns,
+            "last": args.last,
+            "search": args.search,
+            "role": args.role,
+            "tools": args.tools,
+            "after": args.after,
+            "event": args.event,
+            "offset": args.offset or None,
+            "page_chars": args.page_chars,
+        }.items()
+        if value not in (None, "")
+    }
+    path = f"api/sessions/{quote(args.session_key, safe=':')}/history"
+    try:
+        response = httpx.get(urljoin(base + "/", path), params=params, timeout=30.0)
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        # The deck's refusal names what was wrong (#4179); show its words, not its JSON.
+        try:
+            detail = exc.response.json().get("detail")
+        except (ValueError, AttributeError):
+            detail = None
+        reason = detail if isinstance(detail, str) else exc.response.text
+        print(f"agentdeck chat-read: {exc.response.status_code}: {reason}", file=sys.stderr)
+        return 1
+    except httpx.HTTPError as exc:
+        print(f"agentdeck chat-read: {exc}", file=sys.stderr)
+        return 1
+    print(response.text, end="")
     return 0
 
 

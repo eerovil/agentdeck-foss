@@ -145,6 +145,96 @@ async def test_a_new_stop_chimes_once_and_only_when_it_may(tmp_path, monkeypatch
 
 @pytest.mark.browser
 @pytest.mark.asyncio
+async def test_a_starred_works_stop_chimes_from_the_starred_list(tmp_path, monkeypatch):
+    """#4121: Starred is the only list a starred Work is in, so its stops chime from there."""
+    from conftest import async_playwright
+    from test_web import _live_server
+    from test_work_stops import _deck, _pretend_it_left
+    from test_work_ui import WORK
+
+    app = _deck(tmp_path, monkeypatch)
+    app.state.control_db.star_work(WORK.work_id)
+    service = app.state.work_overview
+    await service.refresh()
+    row = f'#works-starred [data-work-id="{WORK.work_id}"]'
+
+    async with _live_server(app) as base, async_playwright() as playwright:
+        browser = await playwright.chromium.launch()
+        context = await browser.new_context(service_workers="block")
+        await context.add_init_script(AUDIO_STUB)
+        page = await _open(context, base)
+        await page.wait_for_selector(row, state="attached")
+        assert await page.locator(f'#works-stopped [data-work-id="{WORK.work_id}"]').count() == 0
+        await _use(page)
+        old = await page.get_attribute(row, "data-work-stopped")
+        _pretend_it_left(app, WORK.work_id)
+        await service.refresh()
+        await page.wait_for_function(
+            """([sel, old]) => {
+                const el = document.querySelector(sel);
+                return !!el && el.hasAttribute('data-work-unseen')
+                    && el.getAttribute('data-work-stopped') !== old;
+            }""",
+            arg=[row, old],
+        )
+        assert await _chimes(page) == 1
+        await browser.close()
+
+
+@pytest.mark.browser
+@pytest.mark.asyncio
+async def test_a_star_on_a_stop_past_recently_stoppeds_cap_is_no_new_stop(tmp_path, monkeypatch):
+    """#4121: a star moves an unseen row into Starred with the stop it already had, even one
+    Recently stopped had no room for; only the Work's next stop chimes."""
+    from conftest import async_playwright
+    from test_web import _live_server
+    from test_work_stops import _deck, _pretend_it_left
+    from test_work_ui import WORK
+
+    from agentdeck import work_story
+
+    monkeypatch.setattr(work_story, "MAX_STOPPED", 0)
+    app = _deck(tmp_path, monkeypatch)
+    service = app.state.work_overview
+    await service.refresh()
+    needs = f'article[data-work-id="{WORK.work_id}"]'  # in the Needs you group it stopped for
+    row = f'#works-starred [data-work-id="{WORK.work_id}"]'
+    newer = """([sel, old]) => {
+        const el = document.querySelector(sel);
+        return !!el && el.hasAttribute('data-work-unseen')
+            && el.getAttribute('data-work-stopped') !== old;
+    }"""
+
+    async with _live_server(app) as base, async_playwright() as playwright:
+        browser = await playwright.chromium.launch()
+        context = await browser.new_context(service_workers="block")
+        await context.add_init_script(AUDIO_STUB)
+        page = await _open(context, base)
+        await page.wait_for_selector(needs, state="attached")
+        await _use(page)
+
+        # A stop that came after the page loaded, so only the push put it in Needs answer.
+        old = await page.get_attribute(needs, "data-work-stopped")
+        _pretend_it_left(app, WORK.work_id)
+        await service.refresh()
+        await page.wait_for_function(newer, arg=[needs, old])
+        stop = await page.get_attribute(needs, "data-work-stopped")
+
+        app.state.control_db.star_work(WORK.work_id)
+        await service.refresh()
+        await page.wait_for_selector(row, state="attached")
+        assert await page.get_attribute(row, "data-work-stopped") == stop
+        assert await _chimes(page) == 0
+
+        _pretend_it_left(app, WORK.work_id)
+        await service.refresh()
+        await page.wait_for_function(newer, arg=[row, stop])
+        assert await _chimes(page) == 1
+        await browser.close()
+
+
+@pytest.mark.browser
+@pytest.mark.asyncio
 async def test_the_settings_switch_is_kept_per_device_and_previews_the_chime(tmp_path, monkeypatch):
     from conftest import async_playwright
     from test_web import _live_server

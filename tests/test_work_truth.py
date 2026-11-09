@@ -163,6 +163,15 @@ def test_a_closed_issue_whose_close_time_is_unknown_is_finished_never_quiet():
     sections = front_sections(rows, now=NOW)
     assert sections.finished == () and sections.finished_more == 1 and sections.quiet == 1
 
+    # A star lists it all the same (#4121), behind a starred row whose finish time is known.
+    from dataclasses import replace
+
+    starred = front_row(replace(closed, starred=True), current=False)
+    dated = _done(3, closed=NOW - timedelta(days=30), moved=None)
+    dated = replace(dated, card=replace(dated.card, starred=True))
+    sections = front_sections([starred, dated], now=NOW)
+    assert sections.starred == (dated, starred) and sections.finished_more == 0
+
 
 def _done(number: int, *, closed: datetime, moved: datetime | None):
     from dataclasses import replace
@@ -470,6 +479,113 @@ def test_a_merged_pull_request_in_another_repository_finishes_its_issue_on_both_
     front, page = _both_pages(app, ref)
     _agree(front, page)
     assert front.outputs == ()
+
+
+def test_a_revived_branch_counts_for_the_work_it_was_registered_for(tmp_path):
+    """shop#1695 (#4125): branch ``agent/issue-69`` from August, revived under issues#1043 by
+    a chat in both Works. The release waited for a Merge while neither page listed it."""
+    from test_work_ui import _add
+
+    from agentdeck.models import PullRequestRef
+    from agentdeck.web.work_view import _ready_for_merge
+    from agentdeck.work_router import work_pulls
+
+    revived, old = WorkRef(f"{ORG}/issues", 1043), WorkRef(f"{ORG}/issues", 69)
+    url = f"https://github.com/{ORG}/shop/pull/1695"
+    row = {"state": "OPEN", "headRefOid": HEAD, "headRefName": "agent/issue-69", "url": url}
+    app = _trailhead_app(tmp_path, rows={url.lower(): row})
+    chat = _add(app, "claude_code:test:worker", revived, old)
+    state = app.state.app_state
+
+    # Named by neither the registration nor the branch: no Work holds it, on either side.
+    state.set_pull_requests(chat, (PullRequestRef(f"{ORG}/shop", 1695),))
+    assert _both_pages(app, revived)[0].outputs == ()
+    assert work_pulls(state, revived.work_id) == ()
+
+    state.set_pull_requests(chat, (PullRequestRef(f"{ORG}/shop", 1695, revived.work_id),))
+    front, page = _both_pages(app, revived)
+    _agree(front, page)
+    assert [item.label for item in front.outputs] == [f"{ORG}/shop#1695"]
+    assert work_pulls(state, revived.work_id) == (f"{ORG}/shop#1695".lower(),)
+    # What the release told the chat is what the page now offers a Merge for.
+    awaiting = {"awaiting_merge": {f"{ORG}/shop#1695".lower(): HEAD}}
+    app.state.work_release = SimpleNamespace(store=SimpleNamespace(get=lambda _: awaiting))
+    assert _ready_for_merge(app, revived.work_id, front.outputs) == front.outputs[0]
+
+    front, page = _both_pages(app, old)
+    _agree(front, page)
+    assert front.outputs == () and work_pulls(state, old.work_id) == ()
+
+
+def test_the_work_page_lists_what_the_release_holds_whatever_the_branch_says(tmp_path):
+    """#4125: the same revival by a chat in the new Work alone, and in one repository, where
+    the old issue's branch number would otherwise claim it for the old Work as well."""
+    from test_work_ui import _add
+
+    from agentdeck.models import PullRequestRef
+    from agentdeck.work_router import work_pulls
+
+    revived, old = WorkRef("eerovil/agentdeck", 1043), WorkRef("eerovil/agentdeck", 69)
+    url = _registered(1695)
+    row = {"state": "OPEN", "headRefOid": HEAD, "headRefName": "agent/issue-69", "url": url}
+    backlog = SimpleNamespace(
+        pulls_for_work=lambda: {"eerovil/agentdeck#69": ({"url": url, "closes": ()},)},
+        issue=lambda *_: None,
+    )
+    app = _trailhead_app(tmp_path, rows={url.lower(): row}, backlog=backlog)
+    chat = _add(app, "claude_code:test:worker", revived)
+    _add(app, "claude_code:test:old", old)
+    state = app.state.app_state
+    state.set_pull_requests(chat, (PullRequestRef("eerovil/agentdeck", 1695),))
+
+    front, page = _both_pages(app, revived)
+    _agree(front, page)
+    assert [item.url for item in front.outputs] == [url]
+    assert work_pulls(state, revived.work_id) == ("eerovil/agentdeck#1695",)
+    assert _both_pages(app, old)[0].outputs == ()
+
+    # Once no chat holds it, its branch speaks for the old issue again.
+    state.set_pull_requests(chat, ())
+    assert [item.url for item in _both_pages(app, old)[0].outputs] == [url]
+
+
+def test_two_chats_naming_their_own_work_list_it_where_the_release_holds_it(tmp_path):
+    """robot#2 on staging (#4125): issues#1048 and issues#1080 each registered it. The release
+    holds it for the newest chat's Work, and the page agrees while it is open; a merged one
+    waits for nothing, so each Work that named it keeps it."""
+    from test_work_ui import _add
+
+    from agentdeck.models import PullRequestRef
+    from agentdeck.work_router import work_pulls
+
+    first, second = WorkRef(f"{ORG}/issues", 1080), WorkRef(f"{ORG}/issues", 1048)
+    url = f"https://github.com/{ORG}/robot/pull/2"
+    row = {"state": "OPEN", "headRefOid": HEAD, "headRefName": "agent/issue-1080", "url": url}
+    rows = {url.lower(): row}
+    app = _trailhead_app(tmp_path, rows=rows)
+    state = app.state.app_state
+    for key, ref, age in (("a", first, 60), ("b", second, 0)):
+        chat = _add(
+            app, f"claude_code:test:{key}", ref,
+            last_activity=datetime.now(UTC) - timedelta(minutes=age),
+        )
+        state.set_pull_requests(chat, (PullRequestRef(f"{ORG}/robot", 2, ref.work_id),))
+
+    assert work_pulls(state, second.work_id) == (f"{ORG}/robot#2".lower(),)
+    assert work_pulls(state, first.work_id) == ()
+    assert [item.url for item in _both_pages(app, second)[0].outputs] == [url]
+    assert _both_pages(app, first)[0].outputs == ()
+    rows[url.lower()] = dict(row, state="MERGED", mergedAt="2026-11-05T12:00:00Z")
+    for ref in (first, second):
+        assert [item.url for item in _both_pages(app, ref)[0].outputs] == [url]
+    rows[url.lower()] = row
+
+    # Unnamed, an open one follows the release and a merged one stays by its branch.
+    state.set_pull_requests("claude_code:test:a", ())
+    state.session_pull_requests["claude_code:test:a"] = (PullRequestRef(f"{ORG}/robot", 2),)
+    assert _both_pages(app, first)[0].outputs == ()
+    rows[url.lower()] = dict(row, state="MERGED", mergedAt="2026-11-05T12:00:00Z")
+    assert [item.url for item in _both_pages(app, first)[0].outputs] == [url]
 
 
 # agentdeck#2272 on 2026-09-27, as its worker chat registered them: #2284 said only "Part of

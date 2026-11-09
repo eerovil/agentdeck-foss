@@ -13,7 +13,9 @@ Work's own facts. Nothing here is stored and nothing here asks the agent to call
 3. the turn died and the runtime's revival did not bring it back:
    **Needs you — the agent stopped unexpectedly · 13:02**; one whose last line is the CLI's
    expired sign-in reads **Needs you — the alt account's sign-in expired · 13:02**, a
-   person's to sign in again and never a bug (#3354). A turn a runtime restart or crash
+   person's to sign in again and never a bug (#3354); one whose retry at the reset a person
+   cancelled reads **Needs you — its automatic retry was cancelled · 13:02**, known and chosen,
+   so never a bug either (#4074). A turn a runtime restart or crash
    cut off is not that (#3008). While the runtime still owes it a revival (its boot's scan
    has not run, or a full account turned the revival away and it keeps trying) it reads
    **Waiting on the runtime to revive the agent · cut off 13:02**, never asked for a next
@@ -23,7 +25,9 @@ Work's own facts. Nothing here is stored and nothing here asks the agent to call
    again, and not reported as a bug. Past those, a turn that ended with the chat marked
    waiting for a person (``PUT …/attention``, as the Mac runner's wrapper does) reads as a
    question, never as an ending (#3106): **Needs you — approve the Mac command** when its
-   last message links the Mac's approval page, which the Work's Open then opens, else
+   last message links the Mac's approval page, which the Work's Open then opens
+   (**Needs you — decide on the expired Mac command** when that link is a paused chat's
+   card, #4132), else
    **Needs you —** the question in its last message;
 4. the issue closed: **Issue closed — finish it?** (#2944, #2956), with what the agent's live
    check of the merged change found (**finish it? · checked live: the card shows the line**,
@@ -32,8 +36,9 @@ Work's own facts. Nothing here is stored and nothing here asks the agent to call
    deck's ask for a next step read **Live checking — …** too (#3578), and an ending nobody answered
    **Needs you — no live check recorded · …**; a failed check is **Needs you — live check
    failed: …**, and one with part of the merge not running yet **Needs you — not live yet: …**
-   (#3220), offering no Finish. Only once no registered pull request is open: with one still
-   open the rules below read it as usual and the line ends **· issue closed** (#3187), since
+   (#3220), which a person may still Finish unproven (#4126). Only once no registered pull
+   request is open: with one still open the rules below read it as usual and the line ends
+   **· issue closed** (#3187), since
    another chat may close the issue while this Work's pull request still waits for its review
    or Merge;
 5. a registered pull request is ready and a review chat about its head is still open:
@@ -126,11 +131,15 @@ FINISHED = "finished"
 REVIVING = "reviving"  # a restart cut the turn off; the runtime's revival answers it (#3008)
 CUT_OFF = "cut_off"  # the process died mid-turn and no revival is coming
 LOGIN_EXPIRED = "login_expired"  # the turn failed because its account's sign-in expired
+RETRY_CANCELLED = "retry_cancelled"  # a person cancelled the retry of a limit-stopped turn
 SCHEDULED = "scheduled"  # a schedule definition, open on purpose: no next step (#2998)
 PR_HELD = "pr_held"  # its own pull request is held by something only a person lifts (#3097)
 PR_STUCK = "pr_stuck"  # its own pull request's hold has not moved for ``PR_STALE`` (#3097)
 LIVE_FAILED = "live_failed"  # the agent's live check of its merged change failed (#3141)
 NOT_LIVE = "not_live"  # merged, but part of it is not running yet (#3220)
+#: Live, and only a person can see whether it works (#4210): it waits for a try, outside
+#: Needs you, and a person's Works, close finishes it.
+TRY_WAIT = "try_wait"
 REVIEW_ESCALATED = "review_escalated"  # the reviewer handed the review to the owner (#3216)
 SPEC_WAIT = "spec_wait"  # a spec-only Work's spec is posted; a person approves it (#3247)
 PARKED = "parked"  # a person asked the agent to leave it until they write (#3560)
@@ -206,6 +215,9 @@ class DerivedInputs:
     #: The account a died turn failed to sign in to ("alt"), else "" (#3354): the CLI answered
     #: "Failed to authenticate: OAuth session expired", which a person's sign-in fixes.
     login_expired: str = ""
+    #: A person cancelled that retry (#4074): the deck knows why the turn stopped, and nothing
+    #: will start it again. A retry that failed to send stays a death, which is a bug.
+    retry_cancelled: bool = False
     #: The turn's process died mid-turn with nothing running since (#3008), when the turn
     #: was last fed, and whether the runtime still owes it a revival.
     cut_off: bool = False
@@ -336,6 +348,11 @@ class DerivedStatus:
     #: the Work has a status and a front-page group of its own. ``kind`` stays the rule that
     #: matched, so the nudge and the bug report read the same Work as before.
     live_checking: bool = False
+
+
+def is_mac_pause_link(href: str) -> bool:
+    """Whether a Mac link goes to a paused chat's card rather than a waiting command (#4132)."""
+    return "#paused-" in href
 
 
 def clock(value: datetime | None) -> str:
@@ -532,6 +549,13 @@ def _first_rule(
             LOGIN_EXPIRED, f"Needs you — {summary}", at=inputs.died_at, summary=summary,
             chat_href=href,
         )
+    if inputs.died and inputs.retry_cancelled:
+        when = clock(inputs.died_at)
+        summary = "its automatic retry was cancelled" + (f" · {when}" if when else "")
+        return DerivedStatus(
+            RETRY_CANCELLED, f"Needs you — {summary}", at=inputs.died_at, summary=summary,
+            chat_href=href,
+        )
     if inputs.died:
         when = clock(inputs.died_at)
         summary = "the agent stopped unexpectedly" + (f" · {when}" if when else "")
@@ -539,7 +563,11 @@ def _first_rule(
             DIED, f"Needs you — {summary}", at=inputs.died_at, summary=summary, chat_href=href
         )
     if inputs.approval_href:
-        summary = "approve the Mac command"
+        summary = (
+            "decide on the expired Mac command"
+            if is_mac_pause_link(inputs.approval_href)
+            else "approve the Mac command"
+        )
         return DerivedStatus(
             QUESTION, f"Needs you — {summary}", summary=summary, chat_href=href,
             approval_href=inputs.approval_href,
@@ -577,13 +605,26 @@ def _first_rule(
         )
     if closed and inputs.live_result == "not_live":
         # Part of the merge runs nowhere yet and nothing will wake the agent (#3220): someone
-        # deploys it by hand. Not a Finish until a later check says so.
+        # deploys it by hand, so it asks a person rather than reading as done. A person may
+        # still Finish it unproven (#4126).
         summary = inputs.live_line
         return DerivedStatus(NOT_LIVE, f"Needs you — {summary}", summary=summary, chat_href=href)
     if closed and not inputs.live_pending:
         summary = "finish it?" + (f" · {inputs.live_line}" if inputs.live_line else "")
         return DerivedStatus(
             CLOSED, f"Issue closed — {summary}", summary=summary, chat_href=href
+        )
+    if (
+        inputs.live_result == "needs_person"
+        and not inputs.closed
+        and not inputs.pr_open
+        and not inputs.live_pending
+    ):
+        # Only a person can see it works (#4210): the agent asked no question and ended its
+        # turn, so this is not an ending to ask about, nor a question for Needs you.
+        summary = inputs.live_line
+        return DerivedStatus(
+            TRY_WAIT, f"Waiting for a try — {summary}", summary=summary, chat_href=href
         )
     if inputs.escalated_pr is not None:
         # Neither findings nor a pass: the reviewer asks the owner and reviews nothing more by

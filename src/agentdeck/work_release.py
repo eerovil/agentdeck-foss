@@ -13,22 +13,28 @@ a moment every condition holds at the exact head, as a merge pinned to that head
 GitHub refuses it if the head moved in between. Nothing is left armed that a later push, turn,
 pause or label could make stale, so there is nothing to watch or call off.
 
+A press and its conditions are per Work, not per pull request: nothing merges, or joins a merge
+queue, until every open pull request of the Work passes them, so a reviewed, green pull request
+waits for its siblings and the hold names each one that lacks something (#4089).
+
 The conditions, read on every wake (``_hold_reason``, in this order): no Poller card holds the
 Work; it is not paused, on the deck or by its label; its issue carries no spec-only label; no
-chat of it is mid-turn; no pull request is a draft; each open one has a review pass at its head
-and green tests there (a verification job of the Work, green GitHub checks for a
-``github_checks`` repository, or the review alone for a ``review_only`` one), and outside a
-``review_only`` repository none of its GitHub checks still running (#3132). Then, per pull
-request: it is up to date with its base (read as the Poller's ``classify_pr``, with
-``behind_by``), does not conflict and has no red checks. ``auto_release`` merges at once; any
-other project waits for the Work page's Merge press. ``review_only`` repositories (the
-review chats') merge first.
+chat of it is mid-turn; no pull request is a draft or conflicts with its base (#4217); each
+open one has a review pass at its head and green tests there (a verification job of the
+Work, green GitHub checks for a ``github_checks`` repository, or the review alone for a
+``review_only`` one), and outside a ``review_only`` repository none of its GitHub checks
+still running (#3132). Then, per pull request: it is up to date with its base (read as the
+Poller's ``classify_pr``, with ``behind_by``), does not conflict and has no red checks.
+``auto_release`` merges at once; any other project waits for the Work page's Merge press.
+``review_only`` repositories (the review chats') merge first.
 
 A verdict is a ``/reviewed pass <head> <digest>`` from a login holding the tier the Poller
 asks of one (``authorization.required_tier``): Release where ``auto_release`` lets a pass merge,
 Work where a person's Merge press still follows it (#2375, #3157), or from the deck's own
 reviewer through ``/api/deck-request``; it counts only at the pull request's current head and
-diff (``review_refs.target_digest``). ``changes-needed`` clears the pass. ``no-code`` (#3322)
+diff (``review_refs.target_digest``). A pass whose pull request or diff could not be read is no
+refusal: it is held and read again (``held_passes``, #4124), and a pass refused for good is told
+to the Work's chat. ``changes-needed`` clears the pass. ``no-code`` (#3322)
 holds as ``changes-needed`` does, about findings that need no code change; once the router sees
 them fixed (``no_code_fixed``) that review counts as a pass, with no new one. A recorded verdict,
 either way, is one message to the Work's chat naming the pull request, the head and the review
@@ -60,8 +66,9 @@ import json
 import logging
 import re
 import time
+from collections import Counter
 from collections.abc import Awaitable, Callable, Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from urllib.parse import quote
 
@@ -78,6 +85,15 @@ MAX_FINDINGS = 8000
 MERGED = "merged"
 ALREADY_MERGED = "already-merged"
 FAILED = "failed"
+
+#: The pull request a hold's reason opens with, when it opens with one.
+_HOLD_PULL_RE = re.compile(r"[\w.-]+/[\w.-]+#\d+")
+#: A cleared press is the one hold only a person ends, and the agent is the one they ask.
+PRESS_CLEARED_TEXT = (
+    "AgentDeck: {ref} {why} at {head}, so the person's Merge press no longer stands: it was for"
+    " the diffs they saw. Nothing of this Work merges until they press Merge again. Tell them,"
+    " and do not say the merge is armed."
+)
 
 #: ``WorkReleaseService.approval``: a Merge press may be made, or one stands (#3320).
 MERGE_OFFERED = "offered"
@@ -110,6 +126,13 @@ UNCLEAN_TEXT = (
 )
 #: A verdict the review history would not store (#3956 review): nothing merges on it.
 UNRECORDED = "could not be recorded, so nothing merges on it until a newer verdict is"
+#: A pass that came while its pull request or diff could not be read (#4124): no refusal, as
+#: nothing says it is wrong, so it waits under this entry key and is read again.
+HELD_PASSES = "held_passes"
+PASS_HELD = "is held until its diff can be read"
+#: Ends the answer about a pass refused and told to the Work's chat, so the comment itself,
+#: which reads as a pass, is not forwarded beside it (#4124).
+REFUSAL_TOLD = "the Work's chat was told"
 #: What the answers of a failed read say: a pull request, its diff (``DIGEST_UNREADABLE``) or
 #: its comparison with its base.
 _UNREADABLE_WORDS = (" could not be read", " could not be compared with its base")
@@ -140,6 +163,16 @@ QUEUE_LOOK_S = 120.0
 #: pending (#3911): GitHub sends a suite's ``completed`` before its rollup shows the last run done
 #: (19 s late once), and no later delivery moves the Work.
 CHECKS_SETTLE_S = 60.0
+#: How long after something landed on a base the deck reads a Work's merge answers again
+#: (#4217): GitHub works out ``mergeable`` lazily after the base moves, so a read made at once
+#: still says ``UNKNOWN`` or the answer from before.
+MERGEABLE_SETTLE_S = 60.0
+#: The one message to a Work's agent when a pull request conflicts with its base (#4217), once
+#: per head, whether the deck found it before offering Merge or while merging.
+CONFLICT_TEXT = (
+    "AgentDeck: {ref} conflicts with its base at {head}, so it cannot merge. Merge the base"
+    " in, resolve the conflict, verify, push, and mark it ready again."
+)
 
 #: The one message to a Work's agent once its pull requests wait only for a person's Merge
 #: (#3199): that person reads the Work's summary first, so its evidence must be the final one.
@@ -156,18 +189,32 @@ READY_TEXT = (
 #: The one message to a Work's agent once its last open pull request merged (#3141): check the
 #: change live, then record the result, which the Work's status line and its Finish read.
 LIVE_CHECK_TEXT = (
-    "AgentDeck: {refs} merged. Check that it works live now. {deploy} Then try the change in"
-    " the live app the way a person would use it, post what you checked on the issue (with a"
-    " screenshot if it shows in the UI), and record the result with `PUT"
-    " $AGENTDECK_URL/api/sessions/<your session key>/live-check` and"
-    ' `{{"result": "verified" | "failed" | "nothing_to_check" | "not_live", "note": "<one'
-    ' line>"}}`. Record `verified` only once every one of them runs live; if any is merged but'
-    " not running yet, record `not_live` and name it, which keeps the Work open (#3220)."
-    " Once you record `verified`, close the issue yourself with a one-line summary; do not"
-    " ask anyone whether to close it (#3437). If a person asked for more work on the issue"
-    " after the merge, record `verified` all the same, keep the issue open and carry on with"
-    " that work (#3905). If it failed, reopen the issue, say there what failed, and fix it in"
-    " a new pull request."
+    "AgentDeck: {refs} merged. Check that it works live now. {deploy} Then check the change"
+    " yourself with what you can reach: try it in the live app the way a person would use it,"
+    " or read production's logs, Sentry, its data or its API. Unit tests and a deploy alone do"
+    " not prove a fix: for a backend or Sentry fix, register a time wait (about a day) and look"
+    " in production for the evidence, such as the error not coming back or a log showing the"
+    " fixed path ran. If none shows in 3 days because the path simply did not run, record"
+    " `verified`, say no evidence showed, and close (#4210). When only the owner's Mac reaches"
+    " the evidence, propose a read-only Mac command (reading a log or the database) as the last"
+    " resort, once Sentry, the log service and your data tools are not enough. Post what you"
+    " checked on the issue (with a screenshot if it shows in the UI), and record the result"
+    " with `PUT $AGENTDECK_URL/api/sessions/<your session key>/live-check` and"
+    ' `{{"result": "verified" | "failed" | "nothing_to_check" | "not_live" | "needs_person",'
+    ' "note": "<one line>"}}`. Record `verified` only once every one of them runs live; if any'
+    " is merged but not running yet, record `not_live` and name it, which keeps the Work open"
+    " (#3220). Once you record `verified`, close the issue yourself with a one-line summary;"
+    " do not ask anyone whether to close it (#3437). Only when a person alone can see whether"
+    " it works (a page behind a production login, a pick that changes real data), record"
+    " `needs_person` with a note saying what to try, and end your turn with no question: the"
+    " Work then waits for a try outside Needs you, and the person's Works, close finishes it"
+    " (#4210). If a person asked for more work on the issue after the merge, record `verified`"
+    " all the same, keep the issue open and carry on with that work (#3905). If a step the"
+    " issue needs is left for a person to do (switch on a key, type a password), also record"
+    " `verified` and keep the issue open, and make that step the question in your reply's last"
+    " paragraph, which shows the Work as Needs you (#4151); trying it is not such a step. Work"
+    " moved to another filed issue is not left: link it when you close. If it failed, reopen"
+    " the issue, say there what failed, and fix it in a new pull request."
 )
 #: This deck's own repository, whose merges its deploy timer ships (``work_bugs.HOME``). Spelled
 #: here rather than imported: ``work_bugs`` reaches most of the deck, and this module is loaded
@@ -211,6 +258,12 @@ class Pull:
     #: Commits the base has that the head lacks (the Poller's ``behind_by``, #2101); ``None``
     #: when the comparison could not be read, which is never "up to date".
     behind_by: int | None = 0
+    base: str = ""  # the branch it merges into, as GitHub names it
+
+    @property
+    def conflicting(self) -> bool:
+        """GitHub says this head conflicts with its base: nothing can merge it as it is."""
+        return self.mergeable == "CONFLICTING" or self.merge_state == "DIRTY"
 
     @property
     def behind(self) -> bool:
@@ -252,6 +305,27 @@ class Policy:
     #: repositories, lowercased ``owner/repo``, that deploy into them.
     staging: object | None = None
     staging_repos: frozenset[str] = frozenset()
+    #: The repositories that merge on their own (``[[repos]] auto_release = true``, #4172),
+    #: lowercased ``owner/repo``, in a project whose own ``auto_release`` is off: a pass there
+    #: merges with nobody pressing Merge, while the project's other repositories still wait.
+    auto_release_repos: frozenset[str] = frozenset()
+
+    def merges_itself(self, pulls: Iterable[str]) -> bool:
+        """Do these pull requests (``owner/repo#n``) merge with nobody pressing Merge (#4172)?
+
+        Yes on a project that merges on its own; otherwise only when there is at least one and
+        every one is in a repository that does. A press is per Work, so one pull request that
+        needs it holds the Work's others too.
+        """
+        if self.auto_release:
+            return True
+        repositories = {str(pull).partition("#")[0].lower() for pull in pulls}
+        return bool(repositories) and repositories <= self.auto_release_repos
+
+    def for_pulls(self, pulls: Iterable[str]) -> Policy:
+        """This policy with ``auto_release`` as it holds for these pull requests (#4172)."""
+        merges = self.merges_itself(pulls)
+        return self if merges == self.auto_release else replace(self, auto_release=merges)
 
 
 def deploy_sentence(policy: Policy, refs: Iterable[str]) -> str:
@@ -280,7 +354,16 @@ def deploy_sentence(policy: Policy, refs: Iterable[str]) -> str:
 
 def checks_state(rollup: object) -> str:
     """``green``, ``red``, ``pending`` or ``none`` for a ``statusCheckRollup``."""
-    if not isinstance(rollup, list) or not rollup:
+    if not isinstance(rollup, list):
+        return "none"
+    # The deck's own review check is no CI: read as CI it would wait on itself, and tell an
+    # agent its tests failed when a review only asked for changes (#4152).
+    rollup = [
+        item
+        for item in rollup
+        if not (isinstance(item, dict) and review_history.deck_check(item.get("name")))
+    ]
+    if not rollup:
         return "none"
     states = []
     for item in rollup:
@@ -315,6 +398,8 @@ def verifies(rows: Iterable[object], work_id: str) -> bool:
 
 #: How ``on_verdict`` answers a pass it recorded, and findings about a commit the branch left.
 PASS_RECORDED = "review pass recorded for"
+#: Why a Ship now pass holds the merge (#4212 review).
+SHIP_UNFINISHED = "is not finished; press Ship now again"
 FINDINGS_DROPPED = "findings dropped"
 #: What the agent does once the owner settled every finding at a head with no code change
 #: (#3828): the review counts as a pass there, with no new review. Asking for a fresh review
@@ -339,10 +424,22 @@ OWNER_CALL_TEST = (
     " with a cheap fix: those are ordinary findings the agent settles, fixing them or giving"
     " its reason in the pull request body"
 )
+#: How a reviewer marks a problem that came back after a fix (#4208): the patches so far and the
+#: one rule that replaces them. On store#3943 the agent was asked twice whether to accept such a
+#: problem, recommended one more narrow fix both times, and the next round found the next hole;
+#: the owner always wants a real problem fixed, so the agent builds the rule without asking.
+DESIGN_FINDING_MARK = "Design finding:"
+DESIGN_FINDING_ASK = (
+    f'A finding whose line starts "{DESIGN_FINDING_MARK}" is a problem that came back after'
+    " an earlier fix: build the one rule it names, replacing the patches it lists, rather than"
+    " patching the new case. Do not ask the owner whether to fix it; they want every real"
+    " problem fixed."
+)
 #: Under every reviewer's findings the Work's agent hears (#3314): a finding only the owner can
 #: settle, sent as one to fix, held a Work in review for two days until it repeated.
 OWNER_CALL_ASK = (
-    "A finding is the owner's call only when "
+    DESIGN_FINDING_ASK
+    + " A finding is the owner's call only when "
     + OWNER_CALL_TEST
     + ". For such a finding, do not work around it: ask the owner in your question box"
     " now, with the options. Once they answer, post their decision on the issue. " + ACCEPTED_ASK
@@ -374,8 +471,8 @@ NO_CODE_TEXT = (
     " pull request body, staging evidence) or in doc files (" + DOC_FILES_TEXT + ") and push."
     " If you pushed nothing, turn the pull request to draft and mark it ready again. No new"
     " review runs: that review then counts as a pass. A push that changes any other file is"
-    " reviewed again as usual. A finding marked \"" + EDGE_CASE_MARK + "\" is a rare edge"
-    " case (#3574): fix it, or accept it as a known limit by naming it under \"Known limits\""
+    ' reviewed again as usual. A finding marked "' + EDGE_CASE_MARK + '" is a rare edge'
+    ' case (#3574): fix it, or accept it as a known limit by naming it under "Known limits"'
     " in the pull request body, which needs no new review either. The owner's standing rule"
     " is to accept rare edge cases; ask them in your question box only when you doubt it."
 )
@@ -398,21 +495,50 @@ def _hold_unrecorded(entry: dict, pull: str, head: str, now: float) -> None:
         held[pull] = {"head": head, "at": now}
 
 
+def _older_than_held(entry: dict, pull: str, at: float | None) -> bool:
+    """Is a verdict dated ``at`` older than the pass ``entry`` holds for ``pull`` (#4124)?"""
+    held_at = ((entry.get(HELD_PASSES) or {}).get(pull) or {}).get("at")
+    return at is not None and held_at is not None and at < held_at
+
+
 def verdict_settled(answer: str) -> bool:
     """Whether ``on_verdict``'s answer leaves nothing for the comment itself to tell the chat
-    (#3192): a pass the release already told it about, or findings about a commit it left."""
-    return answer.startswith(PASS_RECORDED) or answer.endswith(FINDINGS_DROPPED)
+    (#3192): a pass the release already told it about, one it told it is held or refused
+    (#4124), or findings about a commit it left."""
+    return answer.startswith(PASS_RECORDED) or answer.endswith(
+        (FINDINGS_DROPPED, PASS_HELD, REFUSAL_TOLD)
+    )
 
 
 #: The heading a reviewer's findings open with, naming the pull request and the commit read:
 #: ``Review findings for PR #12 at abc1234`` (ChatGPT) or ``Review of owner/repo#12 at abc1234``
 #: (the deck's reviewer, #3004).
+_HEAD_TARGET = (
+    r"`?(?:PR\s+)?`?(?P<repository>[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)?)?#(?P<number>\d+)`?"
+    r"\s+at\s+`?(?P<head>[0-9a-fA-F]{7,40})\b"
+)
 _FINDINGS_HEAD_RE = re.compile(
-    r"\A\s*(?:/claude\s+)?Review\s+(?:findings\s+for\s+|of\s+)?(?:PR\s+)?"
-    r"(?P<repository>[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)?)?#(?P<number>\d+)"
-    r"\s+at\s+`?(?P<head>[0-9a-fA-F]{7,40})\b",
+    r"\A\s*(?:/claude\s+)?Review\s+(?:findings\s+for\s+|of\s+)?" + _HEAD_TARGET, re.IGNORECASE
+)
+#: The first line of a reviewer's escalation (#4069):
+#: ``Review loop escalated to the operator for PR owner/repo#12 at abc1234``.
+_ESCALATION_HEAD_RE = re.compile(
+    r"\A\s*(?:/claude\s+)?Review(?:\s+loop)?\s+(?:was\s+)?escalated\b[^\n#]*?\s" + _HEAD_TARGET,
     re.IGNORECASE,
 )
+
+
+#: A further pull request on the same line.
+_MORE_TARGETS_RE = re.compile(r"(?<![\w/#.-])" + _HEAD_TARGET, re.IGNORECASE)
+
+
+def _head_target(found: re.Match | None, repository: str) -> tuple[str, str] | None:
+    if found is None:
+        return None
+    named = (found.group("repository") or repository).lower()
+    if "/" not in named:
+        named = f"{repository.lower().partition('/')[0]}/{named}"
+    return f"{named}#{found.group('number')}", found.group("head").lower()
 
 
 def findings_target(text: str, repository: str) -> tuple[str, str] | None:
@@ -421,13 +547,25 @@ def findings_target(text: str, repository: str) -> tuple[str, str] | None:
     ``#12`` alone is in ``repository``, the repository the findings were posted in, and
     ``repo#12`` is in that repository's owner.
     """
-    found = _FINDINGS_HEAD_RE.match(text or "")
+    return _head_target(_FINDINGS_HEAD_RE.match(text or ""), repository)
+
+
+def heading_targets(text: str, repository: str) -> dict[str, str]:
+    """``{"owner/repo#12": head}``, what the first line of a findings or escalation comment
+    says it is about (#4069), or ``{}`` with no such heading. One review covers all a Work's
+    pull requests, so the line may go on: ``… #12 at abc1234 and other/repo#3 at def5678``.
+    Whatever older heads the body retells, only these count.
+    """
+    text = text or ""
+    found = _ESCALATION_HEAD_RE.match(text) or _FINDINGS_HEAD_RE.match(text)
     if found is None:
-        return None
-    named = (found.group("repository") or repository).lower()
-    if "/" not in named:
-        named = f"{repository.lower().partition('/')[0]}/{named}"
-    return f"{named}#{found.group('number')}", found.group("head").lower()
+        return {}
+    rest = text[found.end() :].partition("\n")[0]
+    return dict(
+        target
+        for each in (found, *_MORE_TARGETS_RE.finditer(rest))
+        if (target := _head_target(each, repository))
+    )
 
 
 def same_commit(full: str, given: str) -> bool:
@@ -543,6 +681,25 @@ def merge_outcome(code: int, blob: str) -> str:
     return FAILED
 
 
+def offered_pulls(policy: Policy, pulls: Iterable[tuple[str, str, bool]]) -> list[str]:
+    """The pull requests a Work offers to merge, from ``(ref, state, draft)`` (#4172 review).
+
+    Open ones, and a draft only in a ``review_only`` repository, where it holds the Work so
+    the reviewer's repository merges first (D8). A state the deck never read counts as open,
+    so an unknown pull request holds rather than lets the rest merge by themselves. The
+    release's own look and the Work page's Merge read this one rule.
+    """
+    offered = set()
+    for ref, state, draft in pulls:
+        ref = str(ref).lower()
+        if (state or "OPEN").upper() != "OPEN":
+            continue
+        if draft and ref.partition("#")[0] not in policy.review_only:
+            continue
+        offered.add(ref)
+    return sorted(offered)
+
+
 class ReleaseStore:
     """Each Work's release facts, in one small JSON file keyed by work id.
 
@@ -556,9 +713,10 @@ class ReleaseStore:
     of line), ``told`` (message keys already sent to the Work's chat), the
     ``waiting_tests``/``waiting_turn`` marks that let a finished job or an idle chat look again,
     ``queued`` (the pulls held only by their place in a merge queue, looked at again once one is
-    first, #3034), and ``retry`` (first failure ``since``, last wait ``delay``), set while the
-    last look stopped on a failed read (#3023). Review passes and findings are not here: each
-    pull request head's review history holds them (``review_history``, #3956).
+    first, #3034), ``retry`` (first failure ``since``, last wait ``delay``), set while the
+    last look stopped on a failed read (#3023), and ``held_passes`` (pull -> a pass that came
+    while its diff could not be read and its back-off, #4124). Recorded passes and findings are
+    not here: each pull request head's review history holds them (``review_history``, #3956).
 
     Beside the Works, ``queues``: the merge queue (#3022), per repository (lowercased
     ``owner/repo``) a list of ``{"pull", "work", "at", "rounds"}``, first in line first.
@@ -706,6 +864,10 @@ class Ports:
     #: True in an edition with no reviewer (the public copy, #3623): a person's Merge press
     #: is then also the review pass for each pull request at the head it was pressed for.
     press_is_review: bool = False
+    #: Is the Ship now press that passed ``pull`` at ``head`` not finished (#4212 review)? Its
+    #: pass then holds the merge until a press finishes it: the follow-up recorded, the head
+    #: marked shipped and, where the Work waits for one, its Merge press recorded.
+    ship_unfinished: Callable[[str, str], bool] = lambda pull, head: False
     #: The files of ``pull``'s diff now, or ``None`` when unread (#3322): kept with a
     #: ``no-code`` verdict, so a fix that reverts one of them is not taken for a base merge.
     pull_files: Callable[[str], Awaitable[set[str] | None]] | None = None
@@ -780,11 +942,7 @@ class WorkReleaseService:
     def handles(self, work_id: str) -> bool:
         """Does the deck release this Work?"""
         repository = _repository_of(work_id)
-        return (
-            self._enabled
-            and bool(repository)
-            and self.ports.switched(repository)
-        )
+        return self._enabled and bool(repository) and self.ports.switched(repository)
 
     # --- lifecycle: the watch on jobs and chats ---
 
@@ -855,7 +1013,10 @@ class WorkReleaseService:
             # A skipped Work awaits nothing else: without this the whole run of them is one
             # block of the event loop, seconds long on a deck with many Works (#3975).
             await asyncio.sleep(0)
-            if not self.handles(work_id) or not self._has_pass(work_id, pulls):
+            if not self.handles(work_id):
+                continue
+            # A held pass too: the restart lost the timer that would read it again (#4124).
+            if not self._holds_pass(work_id) and not self._has_pass(work_id, pulls):
                 continue
             try:
                 answer = await self.evaluate(work_id)
@@ -863,6 +1024,8 @@ class WorkReleaseService:
                 raise
             except Exception:
                 log.warning("work-release: evaluating %s at start failed", work_id, exc_info=True)
+                # The restart lost its timer, and nothing else may come by.
+                await self._retry_raised_look(work_id, pulls)
                 continue
             # Every answer, so a reviewed Work that did not turn Ready for merge can be read
             # off the journal: a label, an unreadable pull request or none known yet (#3080).
@@ -872,7 +1035,8 @@ class WorkReleaseService:
         """Look again after the back-off: the look stopped on a failed read (#3023).
 
         A timed look (``_look_later``), not a stored due time: a restart loses the timer, and
-        the start's look at every reviewed Work, the only Works marked, sets it again."""
+        the start's look at every reviewed Work or one holding a pass, the only Works marked,
+        sets it again."""
         now = self.ports.clock()
         mark = entry.get("retry") if isinstance(entry.get("retry"), dict) else {}
         since = float(mark.get("since", now))
@@ -890,6 +1054,16 @@ class WorkReleaseService:
         entry["retry"] = {"since": since, "delay": delay}
         log.info("work-release: %s: %s; looking again in %.0fs", work_id, reason, delay)
         self._look_later(work_id, delay)
+
+    async def _retry_raised_look(
+        self, work_id: str, pulls: Callable[[str], Iterable[str]] | None = None
+    ) -> None:
+        """A look that raised is a failed read too: looked at again after the back-off."""
+        async with self._lock(work_id):
+            entry = self.store.get(work_id)
+            if self._holds_pass(work_id) or self._has_pass(work_id, pulls):
+                self._mark_retry(work_id, entry, "the look raised")
+                self.store.put(work_id, entry)
 
     # --- entry points ---
 
@@ -917,7 +1091,28 @@ class WorkReleaseService:
             self.store.put(work_id, entry)
         return "told the Work's chat" if told else "not told (no chat, or already told)"
 
-    async def _tell_untrusted_reviewer(self, work_id: str, by: str, head: str, tier: str) -> None:
+    async def _answers_deck_ask(self, work_id: str, by: str, chosen: list[str], head: str) -> bool:
+        """Does the reviewer's verdict answer a review the deck itself asked for at ``head``?
+
+        Where Release is needed only because the pull request's repository merges on its own
+        (#4172), the deck's ``[reviewers]`` account counts at Work tier for the one pull
+        request and commit the deck sent it to review (owner's choice on #4187): the ChatGPT
+        review chats post as that bot, and without this a clean review there never counted.
+        It is no grant of Release, so its ``/reviewed`` about any other head or repository is
+        refused as before; the pass is still checked against the head and digest.
+        """
+        from .poller_engine.authorization import Tier, reviewer_logins
+
+        if len(chosen) != 1 or by.casefold() not in reviewer_logins():
+            return False
+        events = review_history.at_head(self._history(chosen[0]), head)
+        if not any(event.kind == review_history.ASKED for event in events):
+            return False
+        return await self._holds(work_id, by, Tier.WORK)
+
+    async def _tell_untrusted_reviewer(
+        self, work_id: str, by: str, head: str, tier: str, *, repository_only: bool = False
+    ) -> None:
         """Tell the Work's chat once per head that the reviewer's own verdict was refused (#3901).
 
         Only the ``[reviewers]`` account, so anyone else's ``/reviewed`` stays unheard. Without
@@ -933,12 +1128,23 @@ class WorkReleaseService:
                 work_id,
                 entry,
                 f"verdict:untrusted:{by.casefold()}:{head[:12]}",
-                f"AgentDeck: {by}'s review verdict at {head[:12]} was not recorded, because on"
-                f" this project a verdict needs the {tier} tier and {by} does not hold it."
-                " Another review will end the same way. Ask the owner to add it to `allow` under"
-                " `[authorization.release]` in the project's poller file and run `agentdeck-project"
-                " update`, then ask for the review again. A Merge press does not stand in for"
-                " the missing pass.",
+                (
+                    f"AgentDeck: {by}'s review verdict at {head[:12]} was not recorded, because"
+                    f" its pull request is in a repository that merges on its own"
+                    f" (`auto_release` on its `[[repos]]` entry), where a verdict needs the"
+                    f" {tier} tier, and {by} does not hold it. There its verdict counts only"
+                    " when it answers a review the deck asked for at that exact commit. Do not"
+                    " ask for it to be given Release: that would let it merge the project's"
+                    " other repositories too. Ask the deck for a review of the current head"
+                    " (`review-request`) instead."
+                    if repository_only
+                    else f"AgentDeck: {by}'s review verdict at {head[:12]} was not recorded,"
+                    f" because on this project a verdict needs the {tier} tier and {by} does"
+                    " not hold it. Another review will end the same way. Ask the owner to add"
+                    " it to `allow` under `[authorization.release]` in the project's poller"
+                    " file and run `agentdeck-project update`, then ask for the review again. A"
+                    " Merge press does not stand in for the missing pass."
+                ),
             )
             if told:
                 self.store.put(work_id, entry)
@@ -965,12 +1171,6 @@ class WorkReleaseService:
         """
         if not self.handles(work_id):
             return "not released by the deck"
-        if by is not None:
-            tier = self._verdict_tier(work_id)
-            if not await self._holds(work_id, by, tier):
-                name = tier.value.capitalize()
-                await self._tell_untrusted_reviewer(work_id, by, head, name)
-                return f"{by} may not send a review verdict here (it holds no {name} tier)"
         pulls = sorted(set(self.ports.pulls(work_id)))
         targets = tuple(targets)
         named = [_match(pull, target) for target in targets for pull in pulls]
@@ -979,6 +1179,23 @@ class WorkReleaseService:
             # A verdict naming a pull request this Work does not count is not about its only
             # one: beside another verdict in one comment, it names another repository (#3161).
             chosen = pulls if len(pulls) == 1 else []
+        if by is not None:
+            # The tier of the pull request it is about (#4172), every one of the Work's when it
+            # names none this Work counts.
+            tier = self._verdict_tier(work_id, chosen)
+            if not await self._holds(work_id, by, tier):
+                name = tier.value.capitalize()
+                # Release only because of a repository's own switch (#4172): granting it
+                # project-wide would let this login merge every other repository too.
+                alone = not self.ports.policy(_repository_of(work_id)).auto_release
+                repository_only = alone and name == "Release"
+                if not (
+                    repository_only and await self._answers_deck_ask(work_id, by, chosen, head)
+                ):
+                    await self._tell_untrusted_reviewer(
+                        work_id, by, head, name, repository_only=repository_only
+                    )
+                    return f"{by} may not send a review verdict here (it holds no {name} tier)"
         if len(chosen) != 1:
             return _unplaced(pulls, chosen)
         pull = chosen[0]
@@ -991,21 +1208,35 @@ class WorkReleaseService:
             # A no-code verdict that does not match the diff now holds as changes-needed: its
             # fix is reviewed again (#3322).
             held = await self._no_code_hold(pull, head, digest) if verdict == NO_CODE else None
+            merged = bool(standing) and await self._merged(pull)
             async with self._lock(work_id):
                 entry = self.store.get(work_id)
-                entry.pop("asked", None)
+                # A late comment older than the newest verdict is not the newer word, since
+                # history dates each by its own time: only its row is kept.
+                late = self._outdated(entry, pull, head, at)
+                if not late:
+                    entry.pop("asked", None)
+                    self._drop_held(entry, pull)  # not read again
+                    # Out of line with all its pull requests, not only this one: the Work
+                    # merges nothing without this pass, so another of them first in line would
+                    # hold the line until the Work's next event (#3033).
+                    self._leave(work_id)
                 # Read by the Work's line until a push or a pass answers them (#3097).
-                told = bool(self.ports.chat(work_id))
-                # Out of line with all its pull requests, not only this one: the Work merges
-                # nothing without this pass, so another of them first in line would hold the
-                # line until the Work's next event (#3033).
-                self._leave(work_id)
+                told = bool(self.ports.chat(work_id)) and not late
                 word = NO_CODE if held else "changes-needed"
                 message_key = _round_key(
                     entry, f"verdict:{word}:{pull}@{head[:12]}", self.review_chat(pull, head)
                 )
                 reviewer = self._reviewer(pull, head, by)
-                if held:
+                if merged:
+                    # The owner merged it by hand while the review ran (#4189): it cannot
+                    # be fixed before merging any more, only after.
+                    text = (
+                        f"AgentDeck: the review of {pull} at {head[:12]} ({reviewer}) asks for"
+                        f" changes, but {pull} had already merged before it finished. Fix the"
+                        " findings in a follow-up pull request."
+                    )
+                elif held:
                     text = NO_CODE_TEXT.format(pull=pull, head=head[:12], reviewer=reviewer)
                 else:
                     text = (
@@ -1013,7 +1244,8 @@ class WorkReleaseService:
                         " changes, so it will not merge. Fix the findings, push, and mark it"
                         " ready again."
                     )
-                self._tell(work_id, entry, message_key, text)
+                if not late:
+                    self._tell(work_id, entry, message_key, text)
                 self.store.put(work_id, entry)
                 kind = review_history.NO_CODE if held else review_history.CHANGES
                 data = {"by": by or "", "chat": self.review_chat(pull, head) or ""}
@@ -1026,7 +1258,10 @@ class WorkReleaseService:
                     self.store.put(work_id, entry)
                 # Ended only for a verdict taken and told (#3183 review): a refused one leaves
                 # the wait to its timeout, so the agent still looks.
-                self._review_answered(work_id, entry, message_key, [pull])
+                if not late:
+                    self._review_answered(work_id, entry, message_key, [pull])
+            if late:
+                return f"{pull}'s verdict is older than its newest; {FINDINGS_DROPPED}"
             await self._wake_next(work_id)  # the next in line, once this lock is let go
             if verdict == NO_CODE and not held:
                 return (
@@ -1034,17 +1269,85 @@ class WorkReleaseService:
                     f" at {head[:12]}, so a fix is reviewed again"
                 )
             return f"{NO_CODE} fixes needed on {pull}" if held else f"changes needed on {pull}"
+        return await self._take_pass(work_id, pull, head, digest, by=by, source=source, at=at)
+
+    async def _take_pass(
+        self,
+        work_id: str,
+        pull: str,
+        head: str,
+        digest: str,
+        *,
+        by: str | None,
+        source: str,
+        at: float | None,
+    ) -> str:
+        """Record a pass at ``pull``'s current head and diff; answer what became of it.
+
+        A read that failed says nothing about the pass, so it is held and read again (#4124).
+        Anything that does say no is told to the Work's chat, which otherwise reads the pass
+        comment and waits for a merge that will not come.
+        """
+        args = (work_id, pull, head, digest, by, source, at)
         async with self._lock(work_id):
+            # A pass delivered late neither replaces a newer one held here nor is announced
+            # over newer findings, which history keeps first whatever becomes of it.
+            entry = self.store.get(work_id)
+            if self._outdated(entry, pull, head, at):
+                # A hold no newer than this pass was overtaken too: a read would only find so.
+                if not _older_than_held(entry, pull, at) and self._drop_held(entry, pull):
+                    self.store.put(work_id, entry)
+                return f"{pull}'s pass is older than its newest verdict; {FINDINGS_DROPPED}"
             facts = await self.ports.read_pull(pull)
-            if facts is None or facts.state != "OPEN":
-                return f"{pull} is not open at {head[:12]}"
+            if facts is None:
+                return self._hold_pass(*args)
+            if facts.state == "MERGED":  # needs no pass any more
+                entry = self.store.get(work_id)
+                changed = self._drop_held(entry, pull)
+                told = ""
+                # Told only for the diff that merged: a wrong digest passed nothing (#4189).
+                if same_commit(facts.head, head):
+                    current = await self.ports.digest(pull, facts.head)
+                    if current and current == digest.lower():
+                        told = self._tell_late_pass(work_id, entry, pull, facts.head, head, by)
+                if changed or told:
+                    self.store.put(work_id, entry)
+                if told:
+                    self._review_answered(work_id, entry, told, [pull])
+                return f"{pull} is not open at {head[:12]}" + ("; told as merged" if told else "")
+            if facts.state != "OPEN":
+                return self._refuse_pass(
+                    work_id,
+                    pull,
+                    head,
+                    f"{pull} is not open at {head[:12]}",
+                    "the pull request was closed without merging. Reopen it and ask for the"
+                    " review again (`review-request`) if it should still merge",
+                )
             current = await self.ports.digest(pull, facts.head)
             if not same_commit(facts.head, head) and not self._same_change(pull, facts.head, head):
                 # A pass about a head the branch left counts only where the router proved the
                 # new head a base merge away and reviewed nothing new for it (#3314).
-                return f"{pull} is not open at {head[:12]}"
-            if not current or current != digest.lower():
-                return f"the digest does not match {pull}'s diff at {facts.head[:12]}"
+                return self._refuse_pass(
+                    work_id,
+                    pull,
+                    head,
+                    f"{pull} is not open at {head[:12]}",
+                    f"the branch has moved on to {facts.head[:12]}, and only a review of that"
+                    " head counts",
+                    ends_wait=False,
+                )
+            if not current:
+                return self._hold_pass(*args)
+            if current != digest.lower():
+                return self._refuse_pass(
+                    work_id,
+                    pull,
+                    head,
+                    f"the digest does not match {pull}'s diff at {facts.head[:12]}",
+                    f"the digest it states does not match the diff at {facts.head[:12]}. Ask for"
+                    " the review again (`review-request`)",
+                )
             passed = {"head": facts.head, "digest": current, "at": self.ports.clock()}
             chat = self.review_chat(pull, facts.head) or self.review_chat(pull, head)
             if chat:
@@ -1053,12 +1356,138 @@ class WorkReleaseService:
                 passed["by"] = by
             key = f"{source}:{pull}" if source else f"verdict:pass:{pull}@{facts.head}@{chat or ''}"
             if not self._note(pull, facts.head, review_history.PASS, key, passed, head, at=at):
-                return f"{pull}'s pass at {facts.head[:12]} {UNRECORDED}"
+                return self._refuse_pass(
+                    work_id,
+                    pull,
+                    head,
+                    f"{pull}'s pass at {facts.head[:12]} {UNRECORDED}",
+                    "the deck could not write it to the review history. Ask for the review again"
+                    " (`review-request`)",
+                )
+            entry = self.store.get(work_id)
+            if self._drop_held(entry, pull):
+                self.store.put(work_id, entry)
         lead = (
             f"AgentDeck: the review of {pull} at {facts.head[:12]}"
             f" ({self._reviewer(pull, facts.head, by)}) passed clean."
         )
         return await self._announce_pass(work_id, pull, facts.head, lead)
+
+    def _hold_pass(
+        self,
+        work_id: str,
+        pull: str,
+        head: str,
+        digest: str,
+        by: str | None,
+        source: str,
+        at: float | None,
+    ) -> str:
+        """Keep a pass nothing could be read about, to read again after the back-off (#4124).
+
+        Under the Work's lock. Kept in the entry, so a restart loses only the timer, and the
+        start's look sets it again. A day of failed reads ends in a refusal, told to the chat.
+        """
+        now = self.ports.clock()
+        entry = self.store.get(work_id)
+        before = (entry.get(HELD_PASSES) or {}).get(pull) or {}
+        if before.get("head") != head or before.get("digest") != digest:
+            before = {}
+        since = float(before.get("since", now))
+        if now - since > RETRY_MAX_AGE_S:
+            return self._refuse_pass(
+                work_id,
+                pull,
+                head,
+                f"{pull}'s diff at {head[:12]} could not be read for a day",
+                "the deck could not read the pull request's diff for a day. Ask for the review"
+                " again (`review-request`)",
+            )
+        backoff = Backoff(first=RETRY_FIRST_S, cap=RETRY_MAX_S)
+        backoff.next_s = float(before.get("delay", 0.0))
+        delay = backoff.failed()
+        entry.setdefault(HELD_PASSES, {})[pull] = {
+            "head": head,
+            "digest": digest,
+            "by": by,
+            "source": source,
+            # A verdict with no time of its own is dated now, not when a read finally works.
+            "at": now if at is None else at,
+            "since": since,
+            "delay": delay,
+        }
+        self._tell(
+            work_id,
+            entry,
+            f"verdict:held:{pull}@{head[:12]}",
+            f"AgentDeck: the review of {pull} at {head[:12]}"
+            f" ({self._reviewer(pull, head, by)}) sent a pass, but the deck could not read the"
+            " diff to check it, so it is not recorded yet. The deck keeps the pass and reads the"
+            " diff again by itself, and you will hear what became of it. Nothing merges until"
+            " then, and nothing is needed from you or the owner.",
+        )
+        self.store.put(work_id, entry)
+        log.info("work-release: %s's pass at %s held; reading in %.0fs", pull, head[:12], delay)
+        self._look_later(work_id, delay)
+        return f"{pull}'s pass at {head[:12]} {PASS_HELD}"
+
+    def _refuse_pass(
+        self, work_id: str, pull: str, head: str, answer: str, why: str, *, ends_wait: bool = True
+    ) -> str:
+        """Tell the Work's chat a pass was not recorded, and why; ``answer`` for the log (#4124).
+
+        Under the Work's lock. This message is what the chat's wait on the review waited for,
+        unless the branch left the head: its wait is then on the new head's review.
+        """
+        entry = self.store.get(work_id)
+        self._drop_held(entry, pull)
+        key = _round_key(entry, f"verdict:refused:{pull}@{head[:12]}", self.review_chat(pull, head))
+        self._tell(
+            work_id,
+            entry,
+            key,
+            f"AgentDeck: the review pass of {pull} at {head[:12]} was not recorded, so nothing"
+            f" merges on it: {why}.",
+        )
+        self.store.put(work_id, entry)
+        if ends_wait:
+            self._review_answered(work_id, entry, key, [pull])
+        told = key in (entry.get("told") or [])
+        return f"{answer}; {REFUSAL_TOLD}" if told else answer
+
+    @staticmethod
+    def _drop_held(entry: dict, pull: str) -> bool:
+        """Forget ``pull``'s held pass; whether there was one."""
+        held = entry.get(HELD_PASSES)
+        if not isinstance(held, dict) or held.pop(pull, None) is None:
+            return False
+        if not held:
+            entry.pop(HELD_PASSES)
+        return True
+
+    def _holds_pass(self, work_id: str) -> bool:
+        """Does this Work keep a pass waiting for a read (#4124)?"""
+        return bool((self.store.works.get(work_id) or {}).get(HELD_PASSES))
+
+    async def _read_held(self, work_id: str) -> None:
+        """Try each pass this Work holds again (#4124). Outside the Work's lock, which taking
+        one needs. The tier was checked when it came, so a login's lookup failing now loses
+        nothing; each is looked up again, as a pass recorded here looks at the Work and may
+        take the next one too."""
+        for pull in sorted((self.store.works.get(work_id) or {}).get(HELD_PASSES) or ()):
+            held = ((self.store.works.get(work_id) or {}).get(HELD_PASSES) or {}).get(pull)
+            if not isinstance(held, dict):
+                continue
+            answer = await self._take_pass(
+                work_id,
+                pull,
+                str(held.get("head") or ""),
+                str(held.get("digest") or ""),
+                by=held.get("by"),
+                source=str(held.get("source") or ""),
+                at=held.get("at"),
+            )
+            log.info("work-release: held pass of %s: %s", pull, answer)
 
     async def _announce_pass(self, work_id: str, pull: str, head: str, lead: str) -> str:
         """Evaluate a pass just recorded at ``head`` and tell the Work's chat, once per head."""
@@ -1072,7 +1501,7 @@ class WorkReleaseService:
             untested = entry.pop("untested", None) == key
             text = (
                 f"{lead} The deck records the pass; it is not posted on GitHub."
-                f" Release: {answer or 'nothing holds it'}."
+                f" Release: {_held_now(entry, answer) or 'nothing holds it'}."
             )
             # Only a pass message this verdict sends carries the call to verify: a repeat pass
             # at a head already told about sends nothing, so the call goes on its own.
@@ -1118,6 +1547,19 @@ class WorkReleaseService:
             held["files"] = sorted(files)
         return held
 
+    def _outdated(self, entry: dict, pull: str, head: str, at: float | None) -> bool:
+        """Is a verdict dated ``at`` about ``head`` older than the newest word there: a verdict
+        held or recorded, findings, or a review asked for since (#4124)? The one rule for a
+        late verdict: it moves nothing, and a held pass it describes ends at its next read."""
+        if at is None:
+            return False
+        if _older_than_held(entry, pull, at):
+            return True
+        events = review_history.at_head(self._history(pull), head)
+        newest = review_history.newest_verdict(events)
+        times = [event.at for event in events if event.kind == review_history.ASKED]
+        return at < max(times + ([newest.at] if newest else []), default=at)
+
     def _history(self, pull: str) -> list[review_history.ReviewEvent]:
         """``pull``'s review history at every head; none when unreadable, which passes nothing."""
         try:
@@ -1143,8 +1585,20 @@ class WorkReleaseService:
         ``None`` once a review of that head was asked for again after it: its pass then waits
         for that review's own verdict (#3956 review). A review chat opened since is not an
         ask: one that lists an already passed pull request beside others posts no verdict on
-        it (#3341)."""
-        return review_history.standing_verdict(review_history.at_head(self._history(pull), head))
+        it (#3341). A Ship now pass counts only once its press finished (#4212 review)."""
+        history = self._history(pull)
+        verdict = review_history.standing_verdict(review_history.at_head(history, head))
+        shipped = review_history.ship_pass_head(history, head)
+        if shipped and self._ship_unfinished(pull, shipped):
+            return None
+        return verdict
+
+    def _ship_unfinished(self, pull: str, head: str) -> bool:
+        try:
+            return bool(self.ports.ship_unfinished(pull, head))
+        except Exception:  # noqa: BLE001 - unread is not finished: the merge holds
+            log.warning("work-release: Ship now of %s unreadable", pull, exc_info=True)
+            return True
 
     def review_chat(self, pull: str, head: str) -> str | None:
         """The newest review chat (``owner/repo#n``) opened about ``pull`` at ``head``, or
@@ -1153,9 +1607,7 @@ class WorkReleaseService:
         newest = max(chats, key=lambda event: (event.at, event.seq), default=None)
         return str(newest.data.get("chat") or "") or None if newest is not None else None
 
-    def _has_pass(
-        self, work_id: str, pulls: Callable[[str], Iterable[str]] | None = None
-    ) -> bool:
+    def _has_pass(self, work_id: str, pulls: Callable[[str], Iterable[str]] | None = None) -> bool:
         """Whether the newest verdict on any pull request of the Work, at any head, is a pass.
 
         ``pulls`` is a lookup a caller asking about many Works took once (``pulls_lookup``)."""
@@ -1249,6 +1701,39 @@ class WorkReleaseService:
             " review counts as a pass here."
         )
         return await self._announce_pass(work_id, pull, facts.head, lead)
+
+    def _tell_late_pass(
+        self, work_id: str, entry: dict, pull: str, merged_head: str, head: str, by: str | None
+    ) -> str:
+        """Tell the Work's chat a pass came after ``pull`` merged; the message key, or "".
+
+        The owner may merge by hand while a review still runs (#4189): its pass then counts for
+        nothing, but the agent waiting on it must still hear that the review found nothing to
+        follow up. Only for the head that merged, and only when the newest verdict told there is
+        not a pass already: a second copy of the pass the deck merged on says nothing new.
+        """
+        if not same_commit(merged_head, head):
+            return ""
+        # The told keys, not the history: a merge forgets the pull request's history
+        # (``forget_reviews``), so a replay of the pass the deck merged on would read as new.
+        # The newest verdict told at this head decides, so a pass after findings is told.
+        mark = f":{pull}@{head[:12]}"
+        told = [k for k in entry.get("told") or [] if k.startswith("verdict:") and mark in k]
+        if told and told[-1].startswith(("verdict:pass:", "verdict:late-pass:")):
+            return ""
+        key = _round_key(
+            entry, f"verdict:late-pass:{pull}@{head[:12]}", self.review_chat(pull, head)
+        )
+        text = (
+            f"AgentDeck: the review of {pull} at {head[:12]} ({self._reviewer(pull, head, by)})"
+            f" passed after {pull} had already merged, so nothing needs a follow-up."
+        )
+        return key if self._tell(work_id, entry, key, text) else ""
+
+    async def _merged(self, pull: str) -> bool:
+        """Whether ``pull`` reads as merged; unreadable is not merged."""
+        facts = await self.ports.read_pull(pull)
+        return facts is not None and facts.state == "MERGED"
 
     async def _standing_head(self, pull: str, head: str) -> str | None:
         """The full head that findings about ``pull`` at ``head`` stand at ("" when unread), or
@@ -1344,16 +1829,24 @@ class WorkReleaseService:
             # Kept, so the Work's line says they never reached its agent (#3097).
             async with self._lock(work_id):
                 entry = self.store.get(work_id)
-                self._note_findings(entry, key, False)
+                self._note_findings(entry, key, False, text)
                 self.store.put(work_id, entry)
             return False
         body = text.strip()
         if len(body) > MAX_FINDINGS:
             body = body[:MAX_FINDINGS].rstrip() + " …"
+        # Findings on a pull request merged by hand while its review ran can only be fixed
+        # after it, in a follow-up pull request (#4189).
+        found = self._findings_heads.get(key)
+        ask = "Fix the findings, push, and mark the pull request ready again."
+        if found is not None and await self._merged(found[0]):
+            ask = (
+                f"{found[0]} had already merged before the review finished: fix the findings"
+                " in a follow-up pull request."
+            )
         message = (
             f"AgentDeck: the deck's reviewer asks for changes on {_ref_of(work_id)}:\n\n{body}\n\n"
-            f"{url}\n\nFix the findings, push, and mark the pull request ready again."
-            f" {OWNER_CALL_ASK}"
+            f"{url}\n\n{ask} {OWNER_CALL_ASK}"
         )
         if self.ports.refusal(chat, message) is not None:
             message = (
@@ -1365,14 +1858,14 @@ class WorkReleaseService:
             entry = self.store.get(work_id)
             self._tell(work_id, entry, f"findings:{key}", message)
             told = f"findings:{key}" in (entry.get("told") or [])
-            self._note_findings(entry, key, told)
+            self._note_findings(entry, key, told, text)
             self.store.put(work_id, entry)
             # The deck's reviewer reviews the Work's one chat, which covers all its pull
             # requests; told first, so a refused message keeps the wait (#3183 review).
             self._review_answered(work_id, entry, f"findings:{key}", None)
         return told
 
-    def _note_findings(self, entry: dict, key: str, told: bool) -> None:
+    def _note_findings(self, entry: dict, key: str, told: bool, text: str = "") -> None:
         """The ``findings`` event of request ``key`` at the head ``stale_findings`` found
         (#3957): keyed by whether they were told, so a resend that reaches the agent is newer.
         Findings whose text names no head have none, and write nothing; ones not written hold
@@ -1381,7 +1874,7 @@ class WorkReleaseService:
         if found is not None:
             pull, head, about = found
             told_key = f"findings:{key}:{'told' if told else 'untold'}"
-            data = {"told": told}
+            data = {"told": told, "text": review_history.clip_findings(text)}
             self._note(pull, head, review_history.FINDINGS, told_key, data, about, hold=entry)
             if told:
                 del self._findings_heads[key]
@@ -1468,19 +1961,56 @@ class WorkReleaseService:
         answer = await self.evaluate(work_id)
         return f"Merge approval withdrawn; {answer}" if answer else "Merge approval withdrawn"
 
-    def approval(self, work_id: str) -> str:
+    def approval(self, work_id: str, pulls: Iterable[tuple[str, str, bool]] | None = None) -> str:
         """What the Work page offers for an early Merge (#3320): "" for nothing (not released
-        here, or a project that merges on its own), ``offered`` when no press stands, and
-        ``approved`` while one does."""
+        here, or a Work that merges on its own), ``offered`` when no press stands, and
+        ``approved`` while one does.
+
+        ``pulls`` are the Work's pull requests as the page shows them, ``(ref, state,
+        draft)``: the web cannot ask the services process for them (#4172 review), and the
+        page and the release judge them by one rule (``offered_pulls``). Without them only a
+        project that merges on its own offers nothing.
+        """
         if not self.handles(work_id):
             return ""
         try:
-            if self.ports.policy(_repository_of(work_id)).auto_release:
+            policy = self.ports.policy(_repository_of(work_id))
+            if policy.auto_release:
+                return ""
+            if pulls is not None and policy.merges_itself(offered_pulls(policy, pulls)):
                 return ""
             entry = self.store.works.get(work_id) or {}
         except Exception:  # noqa: BLE001 -- unreadable: nothing offered
             return ""
         return MERGE_APPROVED if entry.get("asked") else MERGE_OFFERED
+
+    def approval_reason(self, work_id: str, pulls: Iterable[tuple[str, str, bool]] = ()) -> str:
+        """Why this Work waits for a person's Merge though one of its repositories merges on
+        its own (#4172), else "": its pull requests elsewhere hold them all. ``pulls`` as for
+        ``approval``."""
+        if not self.handles(work_id):
+            return ""
+        try:
+            policy = self.ports.policy(_repository_of(work_id))
+            if policy.auto_release or not policy.auto_release_repos:
+                return ""
+            offered = offered_pulls(policy, pulls)
+            repositories = sorted({pull.partition("#")[0] for pull in offered})
+        except Exception:  # noqa: BLE001 -- unreadable: no line
+            return ""
+        owner = _repository_of(work_id).partition("/")[0].lower() + "/"
+
+        def name(repo: str) -> str:  # the project's own repositories by their short name
+            return repo.removeprefix(owner)
+
+        own = [name(repo) for repo in repositories if repo in policy.auto_release_repos]
+        held = [name(repo) for repo in repositories if repo not in policy.auto_release_repos]
+        if not own or not held:
+            return ""
+        return (
+            f"{', '.join(own)} merges on its own, but this Work also has a pull request in"
+            f" {', '.join(held)}, so all of them wait for your Merge."
+        )
 
     def approval_waits(self, work_id: str) -> str:
         """The Work page's line while a press stands and something still holds it (#3869).
@@ -1496,7 +2026,7 @@ class WorkReleaseService:
         hold = entry.get("hold")
         if not entry.get("asked") or not isinstance(hold, dict):
             return ""
-        words = str(hold.get("words") or "").removeprefix("Merge pressed; ")
+        words = hold_line(hold)
         if not words:
             return ""
         return f"Merge armed: it merges with no second press once nothing holds it. Now: {words}."
@@ -1513,7 +2043,7 @@ class WorkReleaseService:
             what = f"{cleared['pull']} changed at {str(cleared.get('head') or '')[:12]}"
         else:
             what = f"{cleared['pull']} joined the Work"
-        return f"Merge approval cleared: {what}."
+        return f"Merge approval cleared: {what}. Press Merge again to merge it."
 
     async def _check_press(self, work_id: str, entry: dict, facts: dict[str, Pull]) -> None:
         """Clear a person's Merge press once a diff it was for changed (#3320).
@@ -1548,6 +2078,13 @@ class WorkReleaseService:
         entry.pop("asked", None)
         entry.pop("press_waits", None)
         entry["asked_cleared"] = {"pull": ref, "head": head, "why": why, "at": self.ports.clock()}
+        # Its agent would otherwise go on saying the merge is armed (#4089).
+        self._tell(
+            work_id,
+            entry,
+            f"press-cleared:{ref}@{head[:12]}",
+            PRESS_CLEARED_TEXT.format(ref=ref, head=head[:12], why=why),
+        )
 
     async def on_pull_event(self, work_id: str, pull: str, action: str, merged: bool) -> None:
         """A ``pull_request`` delivery on a pull request this Work registered."""
@@ -1575,6 +2112,40 @@ class WorkReleaseService:
                 entry["merged_now"] = True
                 self.store.put(work_id, entry)
         await self.evaluate(work_id)
+        if action == "closed" and merged and self.handles(work_id):
+            # Its base moved, so a sibling pull request may conflict now, and GitHub says so
+            # only a while after (#4217): one more look then.
+            self._look_soon(work_id, MERGEABLE_SETTLE_S)
+
+    def on_base_moved(self, repository: str, branch: str) -> list[str]:
+        """A push to ``branch`` in ``repository``: look again at each Work waiting on a Merge
+        whose pull request there merges into it (#4217).
+
+        Whatever moved the branch (another Work's merge, a hand push, a pull request no Work
+        registered), a pull request waiting on a person's Merge may conflict now, and nothing
+        on that pull request says so: the Work page would read Ready for merge while nobody
+        has a dashboard open. GitHub works ``mergeable`` out lazily, so the look is one timed
+        look after ``MERGEABLE_SETTLE_S``, at most one held per Work however many pushes land,
+        and no read happens here. A pull request whose base was never read is looked at too.
+        Returns the Works it will look at.
+        """
+        repository = repository.lower()
+        looked = []
+        for work_id in sorted(self.store.works):
+            entry = self.store.get(work_id)
+            awaiting = entry.get("awaiting_merge")
+            if not isinstance(awaiting, dict) or not self.handles(work_id):
+                continue
+            bases = entry.get("awaiting_bases")
+            bases = bases if isinstance(bases, dict) else {}
+            if any(
+                str(ref).partition("#")[0].lower() == repository
+                and str(bases.get(ref) or branch) == branch
+                for ref in awaiting
+            ):
+                self._look_soon(work_id, MERGEABLE_SETTLE_S)
+                looked.append(work_id)
+        return looked
 
     async def on_label(self, work_id: str, label: str, added: bool) -> None:
         """A label went on or off the Work's issue: the conditions are read again."""
@@ -1694,12 +2265,13 @@ class WorkReleaseService:
         if not self.handles(work_id):
             await self._not_handled(work_id)
             return "not released by the deck"
+        await self._read_held(work_id)
         async with self._lock(work_id):
             self._looked[work_id] = self.ports.clock()
             entry = self.store.get(work_id)
             answer = await self._evaluate(work_id, entry, tell_untested)
             log.info("work-release: %s: %s", work_id, answer or "nothing holds it")
-            _note_hold(entry, answer, self.ports.clock())
+            _note_hold(entry, answer, self.ports.clock(), entry.pop("pull_waits", None))
             if _failed_read(answer) and self._has_pass(work_id):
                 # Without a pass nothing merges or reads Ready, and a verdict looks again.
                 self._mark_retry(work_id, entry, answer)
@@ -1741,7 +2313,8 @@ class WorkReleaseService:
 
         In order: it is paused, on the deck or by its
         label; it carries the spec-only label; one of its chats is mid-turn; a pull request is
-        a draft; one has no review pass at its head; one has no green tests at its head. Only
+        a draft; one conflicts with its base (#4217); one has no review pass at its head; one
+        has no green tests at its head. Only
         the reason that stops it now leaves its wake mark (``waiting_turn``, ``waiting_tests``).
         """
         entry.pop("waiting_turn", None)
@@ -1763,6 +2336,15 @@ class WorkReleaseService:
             return "the Work's agent is still working"
         if any(facts[ref].draft for ref in open_pulls):
             return "a pull request in the reviewer's repository is still a draft"
+        conflicts = [facts[ref] for ref in open_pulls if facts[ref].conflicting]
+        if conflicts:
+            # Never offered for Merge, nor kept in line, while GitHub says it cannot merge
+            # (#4217): its agent is told now, not when a person presses Merge. Before the
+            # review and the tests, as a pull request that conflicts may run no CI at all.
+            for pull in conflicts:
+                self._tell_conflict(work_id, entry, pull)
+            first = conflicts[0]
+            return f"{first.ref} conflicts with its base at {first.head[:12]}"
         green: set[str] | None = None
         for ref in open_pulls:
             pull = facts[ref]
@@ -1811,6 +2393,11 @@ class WorkReleaseService:
                     self._note(ref, pull.head, review_history.PASS, key, newest.data, newest.head)
                     here = review_history.at_head(self._history(ref), pull.head)
             if not review_history.passed(self._verdict_at(ref, pull.head)):
+                held_pass = (entry.get(HELD_PASSES) or {}).get(ref) or {}
+                if same_commit(pull.head, str(held_pass.get("head") or "")):
+                    return f"{ref}'s review pass at {pull.head[:12]} {PASS_HELD}"
+                if review_history.ship_pass_head(self._history(ref), pull.head):
+                    return f"{ref}'s Ship now at {pull.head[:12]} {SHIP_UNFINISHED}"
                 return f"{ref} has no review pass at {pull.head[:12]}"
             if pull.repository in policy.review_only:
                 continue
@@ -1881,6 +2468,54 @@ class WorkReleaseService:
                 return f"{ref}'s checks are {pull.checks} at {pull.head[:12]}"
         return ""
 
+    async def _pull_waits(
+        self, work_id: str, policy: Policy, facts: dict[str, Pull], open_pulls: list[str]
+    ) -> list[dict[str, str]]:
+        """What each open pull request lacks now, as ``{"pull": ref, "lacks": "not reviewed"}``
+        (#4089); ``hold_line`` words it.
+
+        ``_hold_reason`` stops at the first thing it meets, and an agent's turn comes first of
+        all, so on its own the hold named one pull request or none, and changed as chats moved.
+        This only reads: it tells nobody and marks no wake. A failed read of the tests leaves
+        them out, as nothing is known about them.
+        """
+        said: list[dict[str, str]] = []
+        green: set[str] | None = None
+        unread = False
+        for ref in open_pulls:
+            pull = facts[ref]
+            missing = ""
+            if pull.draft:
+                missing = "still a draft"
+            elif pull.conflicting:
+                missing = "conflicts with its base"
+            elif not review_history.passed(self._verdict_at(ref, pull.head)):
+                missing = "not reviewed"
+            elif pull.repository in policy.review_only:
+                pass
+            elif pull.checks == "red":
+                missing = "checks are red"
+            elif pull.repository in policy.github_checks:
+                missing = "" if pull.checks == "green" else f"checks are {pull.checks}"
+            else:
+                if green is None and not unread:
+                    try:
+                        green = {sha.lower() for sha in await self.ports.green_heads(work_id)}
+                    except Exception:  # noqa: BLE001 - this line only: the hold itself stands
+                        log.warning("work-release: %s tests unread", work_id, exc_info=True)
+                        unread = True
+                if green is None:
+                    continue
+                if not any(same_commit(sha, pull.head) for sha in green):
+                    missing = "tests are not green"
+                elif pull.checks == "pending" or (
+                    pull.repository in policy.checks_required and pull.checks != "green"
+                ):
+                    missing = f"checks are {pull.checks}"
+            if missing:
+                said.append({"pull": ref, "lacks": missing})
+        return said
+
     async def _tested(self, work_id: str, head: str) -> bool:
         """Is a verification of this Work running, or did one fail at ``head`` (#2999)?
 
@@ -1932,10 +2567,17 @@ class WorkReleaseService:
                 # rather than turning into an ending nobody asked about (#2960 review).
                 return f"{ref} could not be read"
             facts[ref] = read
+        # Whether a pass merges by itself is decided by the repositories of the pull requests
+        # offered (#4172), the same ones as ``open_pulls`` below, so a draft next step elsewhere
+        # holds nothing and every reader below sees the Work's own answer.
+        policy = policy.for_pulls(
+            offered_pulls(policy, ((ref, facts[ref].state, facts[ref].draft) for ref in refs))
+        )
         if not policy.auto_release:
             await self._check_press(work_id, entry, facts)
         # Set again below only while a person's Merge is all that is missing (#2960).
         awaiting = entry.pop("awaiting_merge", None)
+        bases = entry.pop("awaiting_bases", None)
         # A draft is not yet offered (D8): left out of what merges, so a Work whose next step is
         # open as a draft still merges its ready one. A draft in a review-only repository stays
         # in, as a hold, so the reviewer's repository still merges first.
@@ -1999,12 +2641,21 @@ class WorkReleaseService:
             and awaiting is not None
         ):
             entry["awaiting_merge"] = awaiting  # a failed read is no answer either
+            if bases is not None:
+                entry["awaiting_bases"] = bases
         if reason:
+            entry["pull_waits"] = await self._pull_waits(work_id, policy, facts, open_pulls)
             return await self._queue_hold(work_id, entry, policy, facts, reason)
+        if any(facts[ref].mergeable == "UNKNOWN" for ref in open_pulls):
+            # GitHub is still working its answer out, so whether this merges is not known
+            # yet: one more look once it has (#4217).
+            self._look_soon(work_id, MERGEABLE_SETTLE_S)
         if not policy.auto_release and not _press_stands(entry, digests):
             # The Work page reads this as Ready for merge (#2960). Not in line until pressed.
             self._leave(work_id)
             entry["awaiting_merge"] = {ref: facts[ref].head for ref in open_pulls}
+            # Which branch each merges into, so a push there looks again (#4217).
+            entry["awaiting_bases"] = {ref: facts[ref].base for ref in open_pulls}
             heads = [f"{ref}@{facts[ref].head[:12]}" for ref in open_pulls]
             self._tell(
                 work_id, entry, f"ready:{','.join(heads)}", READY_TEXT.format(refs=", ".join(heads))
@@ -2056,16 +2707,8 @@ class WorkReleaseService:
     ) -> tuple[bool, str]:
         """Merge one pull request now if it is mergeable; ``(merged, what happened)``."""
         ref, key = pull.ref, f"{pull.ref}@{pull.head[:12]}"
-        if pull.mergeable == "CONFLICTING" or pull.merge_state == "DIRTY":
-            self._tell(
-                work_id,
-                entry,
-                f"conflict:{key}",
-                f"AgentDeck: {ref} conflicts with its base at {pull.head[:12]}, so it cannot"
-                " merge. Merge the base in, resolve the conflict, verify, push, and mark it"
-                " ready again.",
-            )
-            self._leave(work_id, refs=[ref])
+        if pull.conflicting:
+            self._tell_conflict(work_id, entry, pull)
             return False, f"{ref} conflicts"
         if pull.checks == "red":
             self._tell_red(work_id, entry, pull)
@@ -2204,6 +2847,12 @@ class WorkReleaseService:
         )
         return False, f"{ref} is behind its base; the deck's update never landed"
 
+    def _look_soon(self, work_id: str, delay: float) -> None:
+        """``_look_later``, unless a timed look at this Work is already held (#4217): that look
+        reads the merge answers too, and a shorter one must not replace a longer one."""
+        if work_id not in self._timers:
+            self._look_later(work_id, delay)
+
     def _look_later(self, work_id: str, delay: float) -> None:
         """Evaluate this Work again after ``delay`` seconds, once (#3033 review).
 
@@ -2224,12 +2873,7 @@ class WorkReleaseService:
                 raise
             except Exception:
                 log.warning("work-release: a timed look at %s failed", work_id, exc_info=True)
-                # A look that raised is a failed read too: looked at again after the back-off.
-                async with self._lock(work_id):
-                    entry = self.store.get(work_id)
-                    if self._has_pass(work_id):
-                        self._mark_retry(work_id, entry, "the look raised")
-                        self.store.put(work_id, entry)
+                await self._retry_raised_look(work_id)
 
         delay = max(1.0, float(delay))
         if self.ports.later is not None:
@@ -2443,7 +3087,7 @@ class WorkReleaseService:
     def _lock(self, work_id: str) -> asyncio.Lock:
         return self.ports.locks.setdefault(work_id, asyncio.Lock())
 
-    def _verdict_tier(self, work_id: str):
+    def _verdict_tier(self, work_id: str, pulls: Iterable[str] = ()):
         """The tier a ``/reviewed`` needs on this Work's project, as the Poller decides it.
 
         Release only where a pass can merge with nobody in the loop (``auto_release``); where a
@@ -2454,7 +3098,11 @@ class WorkReleaseService:
         from .poller_engine.intake import CommandKind
 
         policy = self.ports.policy(_repository_of(work_id))
-        tier = required_tier(CommandKind.REVIEWED.value, reviewed_merges=policy.auto_release)
+        # Per pull request (#4172): a pass on one in a repository that merges on its own needs
+        # Release there alone. With none named, every pull request of the Work, strictest first.
+        named = tuple(pulls) or tuple(self.ports.pulls(work_id))
+        merges = policy.auto_release or any(policy.merges_itself([pull]) for pull in named)
+        tier = required_tier(CommandKind.REVIEWED.value, reviewed_merges=merges)
         return tier or Tier.RELEASE
 
     async def _holds(self, work_id: str, login: str, tier) -> bool:
@@ -2496,6 +3144,16 @@ class WorkReleaseService:
             )
         return verdict is Verdict.AUTHORIZED
 
+    def _tell_conflict(self, work_id: str, entry: dict, pull: Pull) -> None:
+        """Tell the agent once per head that ``pull`` conflicts, and take it out of line."""
+        self._tell(
+            work_id,
+            entry,
+            f"conflict:{pull.ref}@{pull.head[:12]}",
+            CONFLICT_TEXT.format(ref=pull.ref, head=pull.head[:12]),
+        )
+        self._leave(work_id, refs=[pull.ref])
+
     def _tell_red(self, work_id: str, entry: dict, pull: Pull) -> None:
         """Tell the Work's agent once per head that its pull request's checks failed."""
         self._tell(
@@ -2534,11 +3192,15 @@ class WorkReleaseService:
         refs = sorted(set(merged))
         if not refs:
             return
-        text = LIVE_CHECK_TEXT.format(
-            refs=", ".join(refs), deploy=deploy_sentence(policy, refs)
-        )
-        if self._tell(work_id, entry, f"live-check:{','.join(refs)}", text):
+        if self._tell(
+            work_id, entry, f"live-check:{','.join(refs)}", _live_check_text(policy, refs)
+        ):
             entry["live_check_asked"] = {"at": self.ports.clock(), "pulls": refs}
+
+
+def _live_check_text(policy: Policy, refs: list[str]) -> str:
+    """``LIVE_CHECK_TEXT`` for these merged pull requests."""
+    return LIVE_CHECK_TEXT.format(refs=", ".join(refs), deploy=deploy_sentence(policy, refs))
 
 
 def _asked_pulls(entry: dict) -> dict[str, dict] | None:
@@ -2574,12 +3236,15 @@ def _press_stands(entry: dict, digests: dict[str, str]) -> bool:
     )
 
 
-def _note_hold(entry: dict, answer: str, now: float) -> None:
+def _note_hold(
+    entry: dict, answer: str, now: float, pulls: list[dict[str, str]] | None = None
+) -> None:
     """Keep what holds the Work now in plain words, and since when it has (#3097).
 
     The Work's line reads it when the agent's only wait is its own pull request merging, which
     says nothing about what that pull request waits for. ``since`` stays while the answer does,
-    so a hold nothing moves for hours reads as stuck.
+    so a hold nothing moves for hours reads as stuck. ``pulls`` is what each open pull request
+    lacks (``_pull_waits``), read back by ``hold_line``.
     """
     pressed = entry.pop("press_waits", None)
     if answer == NO_PULLS_KNOWN or _failed_read(answer):
@@ -2593,6 +3258,42 @@ def _note_hold(entry: dict, answer: str, now: float) -> None:
     old = entry.get("hold")
     since = old.get("since") if isinstance(old, dict) and old.get("why") == answer else None
     entry["hold"] = {"why": answer, "words": words, "person": person, "since": since or now}
+    if pulls:
+        entry["hold"]["pulls"] = pulls
+
+
+def _short(ref: str) -> str:
+    """``owner/metso#77`` as a person says it: ``metso#77``."""
+    return ref.rpartition("/")[2]
+
+
+def hold_line(hold: dict) -> str:
+    """A kept hold as one line naming each pull request it is about (#4089): what stops the
+    Work first, then what the others lack, as ``its agent is still working; metso#77: not
+    reviewed``. Two of one short name read in full. A hold from before ``pulls`` was kept has
+    only its own words."""
+    words = str(hold.get("words") or "").removeprefix("Merge pressed; ")
+    found = _HOLD_PULL_RE.match(str(hold.get("why") or ""))
+    first = found.group(0).lower() if found else ""
+    waits = [(str(w["pull"]).lower(), str(w["lacks"])) for w in hold.get("pulls") or ()]
+    shorts = Counter(_short(ref) for ref in {first, *(ref for ref, _ in waits)} - {""})
+
+    def name(ref: str) -> str:
+        return _short(ref) if shorts[_short(ref)] == 1 else ref
+
+    if words and first and first not in words.lower():
+        words = f"{name(first)}: {words}"
+    others = [f"{name(ref)}: {lacks}" for ref, lacks in waits if ref != first]
+    return "; ".join(part for part in (words, *others) if part)
+
+
+def _held_now(entry: dict, answer: str) -> str:
+    """``answer`` as the Work's chat reads it: the line naming every pull request while the
+    look left that answer's hold, else the answer."""
+    hold = entry.get("hold")
+    if answer and isinstance(hold, dict) and hold.get("why") == answer:
+        return hold_line(hold) or answer
+    return answer
 
 
 def hold_words(answer: str, *, needs_verify: bool = False) -> tuple[str, bool]:
@@ -2608,12 +3309,16 @@ def hold_words(answer: str, *, needs_verify: bool = False) -> tuple[str, bool]:
         return "still a draft", False
     if " has no review pass at " in answer:
         return "not reviewed at its head", False
+    if PASS_HELD in answer:
+        return "review passed; waiting to read its diff", False
     if TREE_MOVED in answer:  # a place in the merge queue may follow it
         return "tests passed but the tree changed during the run, so they don't count", False
     if TREE_UNCLEAN in answer:
         return "tests passed but the checkout had uncommitted or untracked files", False
     if " has no green verification at " in answer:
         return ("no test run started" if needs_verify else "its tests are not green"), False
+    if " conflicts with its base" in answer:
+        return "conflicts with its base; its agent merges the base in", False
     if "'s checks are " in answer:
         return "its checks are " + answer.split("'s checks are ", 1)[1].split(" at ")[0], False
     return answer, False
@@ -2668,6 +3373,7 @@ async def read_pull(ref: str) -> Pull | None:
     return Pull(
         behind_by=await _behind_by(repository, base, head) if base and head else None,
         ref=ref.lower(),
+        base=base,
         state=str(raw.get("state") or "").upper(),
         draft=bool(raw.get("isDraft")),
         head=str(raw.get("headRefOid") or "").lower(),

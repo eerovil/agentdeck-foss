@@ -23,6 +23,8 @@ RuntimeDirectoryMode=0700
 # Keep the control surface usable while deck-owned workers and their test suites
 # put the host under CPU, disk, or memory pressure. The worker runtime remains at
 # systemd's default weights, so these values favor only the small web process.
+# IOWeight does nothing while the disks run kyber with io.cost off (#4143); it would
+# take effect if an owner turned io.cost on.
 CPUWeight=1000
 IOWeight=1000
 MemoryLow=2G

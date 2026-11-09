@@ -6,6 +6,9 @@ turn and the reset is far off, the chat continues on the next listed account wit
 the way the chat page's Continue in new chat does. The new leg joins the same chat, so
 the Work, its pull requests and its wake-ons follow it, and the reset retry is cancelled
 on its own once the chat's working leg has moved.
+
+A Work whose account was picked by hand in New work (#4181) is never moved: it waits for
+that account's reset. A model and effort picked there go with the chat to its new leg.
 """
 
 from __future__ import annotations
@@ -19,15 +22,14 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
 
 from .models import Account, Session
 from .quota_retry import message_id_for
 
 log = logging.getLogger(__name__)
 
-#: A reset nearer than this is waited for: the new chat reads the whole transcript again,
-#: which costs more than a short wait.
+#: A reset nearer than this is waited for: the new chat starts cold and reads the old one
+#: again, which costs more than a short wait.
 MIN_WAIT = timedelta(minutes=30)
 #: How long a move that proved it started nothing waits before it is tried again.
 RETRY_AFTER = timedelta(minutes=1)
@@ -38,12 +40,15 @@ STARTED, RETRY, SPENT = "started", "retry", "spent"
 
 @dataclass(frozen=True)
 class Move:
-    """One chat the limit stopped, and the account it continues on."""
+    """One chat the limit stopped, the account it continues on, and why, in one line."""
 
     session: Session
     account: Account
     token: str
     message: str
+    # Picked in New work (#4181); None is the new account's saved default.
+    model: str | None = None
+    effort: str | None = None
 
 
 def move_token(session: Session) -> str | None:
@@ -84,16 +89,13 @@ def pick_account(
     return others[chosen]
 
 
-def first_message(transcript: str, source: str, reset: datetime, target: Account) -> str:
-    """The new leg's first message: why it moved, then the transcript continuation."""
-    from .web.chat_successor import transcript_continuation
-
+def move_reason(source: str, reset: datetime, target: Account) -> str:
+    """Why the chat moved: the line that opens the new leg's first message."""
     label = source.partition(":")[2] or source
     clock = reset.astimezone().strftime("%H:%M")
     return (
         f"The previous account ({label}) reached its usage limit until {clock}. "
-        f"AgentDeck moved this Work's chat to {target.key}.\n\n"
-        f"{transcript_continuation(transcript)}"
+        f"AgentDeck moved this Work's chat to {target.key}."
     )
 
 
@@ -109,8 +111,8 @@ class UsageMoveService:
         usage_cache: Callable[[], Path | None],
         db: Any,
         start: Callable[[Move], Awaitable[str]],
-        transcript_url: Callable[[str], str],
         *,
+        start_choice: Callable[[Session], Any] = lambda session: None,
         bus=None,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
@@ -121,7 +123,7 @@ class UsageMoveService:
         self._usage_cache = usage_cache
         self._db = db
         self._start = start
-        self._transcript_url = transcript_url
+        self._start_choice = start_choice
         self._bus = bus
         self._clock = clock
         # When the last pass decided: a retry due by then has had its chance.
@@ -146,6 +148,15 @@ class UsageMoveService:
         repository = self._work_repository(session)
         if repository is None:
             return None
+        choice = self._start_choice(session)
+        if choice is not None and choice.account_key:
+            self._skipped.add(token)
+            log.info(
+                "usage move: %s waits for its reset at %s: its account was picked in New work",
+                session.key,
+                reset.isoformat(),
+            )
+            return None
         candidates = self._accounts_for(repository)
         if not candidates:
             return None
@@ -161,10 +172,14 @@ class UsageMoveService:
                 reset.isoformat(),
             )
             return None
-        message = first_message(
-            self._transcript_url(session.key), session.account_key, reset, account
+        return Move(
+            session,
+            account,
+            token,
+            move_reason(session.account_key, reset, account),
+            model=(choice.model or None) if choice is not None else None,
+            effort=(choice.effort or None) if choice is not None else None,
         )
-        return Move(session, account, token, message)
 
     async def reconcile(self, *, now: datetime | None = None) -> int:
         """Move every newly stopped Work chat that can move; return how many started."""
@@ -257,11 +272,6 @@ class UsageMoveService:
                 sessions.close()
 
 
-def transcript_url(base_url: str, session_key: str) -> str:
-    """The loopback transcript a moved chat reads, as the Continue button links it."""
-    return f"{base_url.rstrip('/')}/sessions/{quote(session_key, safe=':')}/transcript.json"
-
-
 async def start_moved_leg(app: Any, move: Move) -> str:
     """Start ``move``'s new leg as the next leg of the same chat.
 
@@ -269,7 +279,7 @@ async def start_moved_leg(app: Any, move: Move) -> str:
     nothing started and both fences are free again, ``SPENT`` when the outcome is unknown.
     """
     from .providers import PROVIDERS
-    from .web.chat_successor import reserve_successor
+    from .web.chat_successor import continuation_note, reserve_successor
 
     state = app.state.app_state
     injector = app.state.injector
@@ -294,14 +304,27 @@ async def start_moved_leg(app: Any, move: Move) -> str:
         state.release_chat_successor(move.token)
         log.warning("usage move: %s could not record its start; not starting", session.key)
         return RETRY
-    # The account's saved new-chat defaults, as a Continue with nothing picked uses.
+    # What New work picked (#4181), else the account's saved new-chat defaults, as a
+    # Continue with nothing picked uses.
     stored = db.load_account_new_chat_defaults(account.key)
-    model, effort = stored.get("model"), stored.get("effort")
+    model = move.model or stored.get("model")
+    effort = move.effort or stored.get("effort")
+    # The limit stopped this chat in the middle of a task, so the note says to read how it
+    # ended in full.
+    message = await continuation_note(
+        state,
+        app.state.accounts,
+        session,
+        provider=provider,
+        config=injector.config,
+        before=f"{move.message}\n\n",
+        mid_task=True,
+    )
     result = await injector.start_new(
         account,
         provider,
         Path(session.cwd),
-        move.message,
+        message,
         model=model if model and provider.is_valid_model(model) else None,
         effort=effort if effort and provider.is_valid_effort(effort) else None,
         session_token=move.token,

@@ -32,6 +32,7 @@ from . import (
     work_endings,
     work_release,
     work_services,
+    work_status_log,
 )
 from .action_context import client_action_context
 from .assistant import AssistantService
@@ -44,7 +45,7 @@ from .chat_jump import ChatJumps
 from .chat_notes import TOPIC as CHAT_NOTES_TOPIC
 from .chat_notes import ChatNotesService
 from .collector import Collector
-from .config import AppConfig, owned_session_base_url
+from .config import AppConfig
 from .db import open_db
 from .deployment import deployment_status, skills_sha
 from .github_webhook_log import WebhookLog
@@ -56,7 +57,7 @@ from .issue_refresh import IssueRefreshService
 from .live_window import LiveWindow
 from .poller_wake import KEEPALIVE_S as WEBHOOK_KEEPALIVE_S
 from .poller_wake import PollerWakeService
-from .providers import PROVIDERS, delivery_target_for
+from .providers import PROVIDERS, chat_target_for, delivery_target_for
 from .providers.codex.runtime_client import runtime_socket_path
 from .providers.usage import read_shared_cache, shared_cache_dir, warm_usage_state
 from .public_origin import record_public_origin
@@ -64,15 +65,16 @@ from .push import PushService
 from .quota_retry import QuotaRetryService
 from .review_fallback import ReviewFallbackService
 from .review_fallback import deck_hooks as review_fallback_hooks
+from .review_fallback import person_check as review_fallback_person
 from .review_fallback import reviewer_down as review_reviewer_down
 from .review_fallback import starred_check as review_fallback_starred
+from .review_fallback import tell_takeover as review_fallback_tell_takeover
 from .run_execution import MAX_CONTINUATIONS
 from .scheduled_messages import ScheduledMessageService
 from .shared_file import add_drained_hook
 from .staging_deploys import StagingDeployService
 from .state import AppState
 from .usage_move import UsageMoveService, start_moved_leg
-from .usage_move import transcript_url as usage_move_transcript_url
 from .view_commands import ViewCommands
 from .voice_mode import deck_line
 from .wake_on import WakeOnService
@@ -120,7 +122,8 @@ from .work_message import on_delivered as work_message_delivered
 from .work_router import configured_own_logins
 from .work_router import owner_of_issue as work_owner_of_issue
 from .work_router import owner_of_pull as work_owner_of_pull
-from .work_start import work_accounts
+from .work_signals import open_blockers
+from .work_start import session_start_choice, work_accounts
 from .worktree_diff import WorktreeDiffReader
 
 log = logging.getLogger(__name__)
@@ -285,10 +288,16 @@ def create_app(config: AppConfig) -> FastAPI:
             else None
         )
 
+    def resolve_answer_target(session_key: str):
+        # The leg that asked, never the chat's current one: an answer belongs to it alone.
+        session = state.sessions.get(session_key)
+        return chat_target_for(session, collector.accounts) if session is not None else None
+
     scheduled_messages = ScheduledMessageService(
         db,
         injector,
         resolve_scheduled_target,
+        resolve_answer_target=resolve_answer_target,
         on_change=lambda chat_id: state.sessions_changed((chat_id,)),
         # Another Work's agent's message (#3908) leaves the owner's open question standing.
         on_delivered=work_message_delivered(state, assistant),
@@ -335,7 +344,7 @@ def create_app(config: AppConfig) -> FastAPI:
         lambda: shared_cache_dir(config.usage.shared_cache_dir),
         db,
         lambda move: start_moved_leg(app, move),
-        lambda key: usage_move_transcript_url(owned_session_base_url(config), key),
+        start_choice=lambda session: session_start_choice(app, session.key),
         bus=state.bus,
     )
     # The deck's own issue reader (#821): one shared, rate-limited GitHub read
@@ -543,6 +552,12 @@ def create_app(config: AppConfig) -> FastAPI:
         ),
         # A starred Work's review chat is taken first (#3116).
         starred=review_fallback_starred(state, work_starred),
+        # A pull request no Work owns goes after the Works', for an hour at most (#4152).
+        person=review_fallback_person(state),
+        # A chat ChatGPT left is taken over in the open: its Work's chat hears it (#4189).
+        taken_over=review_fallback_tell_takeover(
+            state, scheduled_messages, config.chat_board.repository
+        ),
     )
 
     # Leftover weekly usage goes to /dream before the week resets (#3336).
@@ -598,6 +613,9 @@ def create_app(config: AppConfig) -> FastAPI:
         )
         upload_sweeper = asyncio.create_task(
             sweep_abandoned_uploads_periodically(), name="upload-ttl-sweeper"
+        )
+        status_log_pruner = asyncio.create_task(
+            work_status_log.prune_forever(db), name="work-status-log-pruner"
         )
         # Proxy channel to the long-lived runtime service (deck-owned Claude
         # workers). Lazy per-request use; unreachable → the route returns 503.
@@ -662,6 +680,9 @@ def create_app(config: AppConfig) -> FastAPI:
             upload_sweeper.cancel()
             with suppress(asyncio.CancelledError):
                 await upload_sweeper
+            status_log_pruner.cancel()
+            with suppress(asyncio.CancelledError):
+                await status_log_pruner
             relation_follower.cancel()
             with suppress(asyncio.CancelledError):
                 await relation_follower
@@ -725,6 +746,8 @@ def create_app(config: AppConfig) -> FastAPI:
     app.state.work_router = work_router
     # The Work list leaves out an unlabelled issue another deck would work (#3731).
     app.state.deck_claims = deck_claims
+    # The Start button says when an open blocker holds the agent back (#4216).
+    app.state.open_blockers = open_blockers
     app.state.work_release = work_release_service
     app.state.services_later = services_later
     app.state.session_copy = session_copy_feed

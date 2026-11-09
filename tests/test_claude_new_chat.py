@@ -725,6 +725,67 @@ def test_owned_worker_liveness_can_clear_a_stale_message_timestamp(
     assert session.last_message_at is None
 
 
+async def test_a_scan_carries_a_compact_to_the_chat_and_the_next_reply_ends_it(tmp_path):
+    """#4168: a compact writes no usage row, so until the next reply the size is unknown and
+    the chat says it was compacted; a rescan must drop the old size, then the flag."""
+    account = Account("claude_code:main", "claude_code", "main", tmp_path)
+    transcript_dir = tmp_path / "projects" / "project"
+    transcript_dir.mkdir(parents=True)
+    path = transcript_dir / "sid-1.jsonl"
+    base = {"sessionId": "sid-1", "cwd": str(tmp_path)}
+
+    def reply(tokens, hour):
+        return {
+            **base,
+            "type": "assistant",
+            "timestamp": f"2026-11-07T{hour:02d}:00:00.000Z",
+            "message": {
+                "role": "assistant",
+                "model": "claude-opus-5-5",
+                "content": [{"type": "text", "text": "Done."}],
+                "usage": {
+                    "input_tokens": tokens,
+                    "output_tokens": 5,
+                    "cache_creation": {"ephemeral_1h_input_tokens": 9},
+                },
+            },
+        }
+
+    def gone(hour):  # when its cache counts as gone (#4169)
+        return datetime(2026, 11, 7, hour, 54, tzinfo=UTC)
+
+    def add(*rows):
+        with path.open("a") as file:
+            file.writelines(json.dumps(row) + "\n" for row in rows)
+        # Every write in the same timestamp tick, as a coarse filesystem clock gives
+        # appends close together: only the size tells them apart (#4175).
+        os.utime(path, ns=(1_000_000_000, 1_000_000_000))
+
+    provider = ClaudeCodeProvider()
+    add(reply(170_000, 8))
+    (session,) = await provider.scan_sessions(account)
+    assert (session.context_tokens, session.context_compacted) == (170_000, False)
+    assert session.cache_expires_at == gone(8)
+
+    add(
+        {**base, "type": "system", "subtype": "compact_boundary"},
+        {
+            **base,
+            "type": "user",
+            "isCompactSummary": True,
+            "message": {"role": "user", "content": "Summary of the chat."},
+        },
+    )
+    (session,) = await provider.scan_sessions(account)
+    assert (session.context_tokens, session.context_compacted) == (None, True)
+    assert session.cache_expires_at is None
+
+    add(reply(61_000, 9))
+    (session,) = await provider.scan_sessions(account)
+    assert (session.context_tokens, session.context_compacted) == (61_000, False)
+    assert session.cache_expires_at == gone(9)
+
+
 async def test_an_unrouted_question_stops_an_owned_worker_reading_as_working(tmp_path):
     """Issue #1878: without a permission prompt tool the ask never reaches the
     runtime as a control request, so the turn stays open and only the transcript
@@ -1199,7 +1260,10 @@ async def test_control_actions_suppressed_when_runtime_unreachable():
     assert Capability.INTERACT not in session.capabilities
     assert Capability.TRANSCRIPT in session.capabilities  # still readable
     assert session.show_when_idle is True  # visible, just uncontrollable
-    assert provider.pending_interaction(_account(), session) is None
+    # The question is still open, so its box stays, but only an answer held for the
+    # runtime's return can use it (#4106).
+    assert provider.pending_interaction(_account(), session).id == "permission-1"
+    assert provider.live_interaction(_account(), session) is None
 
     fake.available = True  # reconnect re-grants control
     provider.sweep_liveness(_account(), [session], AppState())

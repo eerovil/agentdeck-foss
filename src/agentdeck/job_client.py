@@ -73,6 +73,7 @@ def submit_job(
     run_id: str = "",
     workspaces: list[str] | None = None,
     max_minutes: int | None = None,
+    progress: bool = False,
 ) -> dict[str, Any]:
     return _call(
         socket_path,
@@ -98,6 +99,7 @@ def submit_job(
             **({"work_id": work_id} if work_id and not (purpose or run_id) else {}),
             **({"workspaces": workspaces} if workspaces else {}),
             **({"max_minutes": max_minutes} if max_minutes is not None else {}),
+            **({"progress": True} if progress else {}),
         },
     )
 

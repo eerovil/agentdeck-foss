@@ -31,6 +31,7 @@ from agentdeck.providers.codex.runtime_client import CodexRuntimeClient
 from agentdeck.restart_nudge import RestartNudgeRegistry
 from agentdeck.runtime import (
     CodexRuntime,
+    StartRequest,
     create_runtime_app,
 )
 
@@ -306,6 +307,33 @@ async def test_provider_neutral_worker_route_dispatches_to_codex(tmp_path):
     host.deliver.assert_awaited_once()
     assert host.deliver.await_args.kwargs["context_maintenance"] is True
     assert host.deliver.await_args.kwargs["expected_session_id"] == "thread-1"
+
+
+async def test_new_thread_route_passes_the_session_role_to_codex(tmp_path):
+    app = create_runtime_app(
+        AppConfig(
+            accounts=[
+                AccountConfig(provider="codex", label="codex", config_dir=str(tmp_path))
+            ]
+        )
+    )
+    client = MagicMock()
+    client.start_thread = AsyncMock(return_value=InjectResult(True, session_id="thread-1"))
+    app.state.runtime.clients["codex"] = client
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://runtime"
+    ) as http_client:
+        response = await http_client.post(
+            "/accounts/codex/start",
+            json={
+                "cwd": str(tmp_path),
+                "message": "Work on the issue",
+                "delegated": False,
+                "role": "work",
+            },
+        )
+    assert response.status_code == 200
+    assert client.start_thread.await_args.kwargs["role"] == "work"
 
 
 def test_no_session_addressed_idle_route_is_left(tmp_path):
@@ -644,6 +672,187 @@ async def test_runtime_persists_permission_prompt_override(tmp_path):
     )
 
 
+def _bypass_app(tmp_path, *, start_bypassed=False):
+    app = create_runtime_app(
+        AppConfig(
+            history=HistoryConfig(db_path=str(tmp_path / "control.db")),
+            accounts=[
+                AccountConfig(
+                    provider="codex",
+                    label="local",
+                    config_dir=str(tmp_path),
+                    start_bypassed=start_bypassed,
+                )
+            ],
+        )
+    )
+    previous = {"approvalPolicy": "on-request", "sandboxPolicy": {"type": "readOnly"}}
+    runtime_client = MagicMock()
+    runtime_client.current_permission_settings = AsyncMock(return_value=previous)
+    runtime_client.set_bypass_permissions = AsyncMock(return_value=InjectResult(True))
+    runtime_client.set_permission_prompts = AsyncMock(return_value=InjectResult(True))
+    app.state.runtime.clients["local"] = runtime_client
+    return app, runtime_client, previous
+
+
+async def test_runtime_remembers_bypass_and_what_to_put_back(tmp_path):
+    app, runtime_client, previous = _bypass_app(tmp_path)
+    db = app.state.runtime._budget_db
+    key = "codex:local:thread-1"
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://runtime"
+    ) as client:
+        async def switch(path, enabled):
+            response = await client.post(
+                f"/accounts/local/{path}", json={"thread_id": "thread-1", "enabled": enabled}
+            )
+            return response.json()
+
+        assert (await switch("bypass-permissions", True))["accepted"] is True
+        assert db.bypass_permissions_on(key)
+        assert db.bypass_permissions_previous(key) == previous
+        # Ticking it again must not save the bypass as the thing to put back.
+        assert (await switch("bypass-permissions", True))["accepted"] is True
+        # The other switch would move the approval policy out from under the bypass.
+        refused = await switch("permission-prompts", True)
+        assert refused["accepted"] is False
+        assert "Bypass permissions" in refused["reason"]
+        runtime_client.set_permission_prompts.assert_not_awaited()
+        assert (await switch("bypass-permissions", False))["accepted"] is True
+
+    assert runtime_client.set_bypass_permissions.await_args_list == [
+        call("thread-1", True, previous_settings=previous),
+        call("thread-1", False, previous_settings=previous),
+    ]
+    assert not db.bypass_permissions_on(key)
+
+    # Two ticks at once: the later one must not save the bypass as what to put back.
+    reads = iter([previous, {"approvalPolicy": "never", "sandboxPolicy": {"type": "x"}}])
+
+    async def read_settings(_thread_id):
+        settings = next(reads)
+        await asyncio.sleep(0)
+        return settings
+
+    runtime_client.current_permission_settings = read_settings
+    runtime = app.state.runtime
+    both = await asyncio.gather(
+        runtime.set_bypass_permissions("local", "thread-1", True),
+        runtime.set_bypass_permissions("local", "thread-1", True),
+    )
+    assert [result.accepted for result in both] == [True, True]
+    assert db.bypass_permissions_previous(key) == previous
+
+
+@pytest.mark.parametrize("bypass_first", [False, True])
+async def test_a_thread_s_two_permission_switches_take_turns(tmp_path, bypass_first):
+    app, runtime_client, _previous = _bypass_app(tmp_path)
+    runtime = app.state.runtime
+    sent = []
+
+    async def read_policy(_thread_id):
+        await asyncio.sleep(0)
+        return "never"
+
+    async def record(name):
+        await asyncio.sleep(0)
+        sent.append(name)
+        return InjectResult(True)
+
+    runtime_client.current_approval_policy = read_policy
+    runtime_client.set_permission_prompts = lambda *_a, **_k: record("prompts")
+    runtime_client.set_bypass_permissions = lambda *_a, **_k: record("bypass")
+    prompts = runtime.set_permission_prompts("local", "thread-1", True)
+    bypass = runtime.set_bypass_permissions("local", "thread-1", True)
+
+    results = await asyncio.gather(*((bypass, prompts) if bypass_first else (prompts, bypass)))
+
+    # Whichever came first, Codex ends on the bypass the deck has saved.
+    assert sent == (["bypass"] if bypass_first else ["prompts", "bypass"])
+    assert [result.accepted for result in results] == [True, not bypass_first]
+    assert runtime._budget_db.bypass_permissions_on("codex:local:thread-1")
+
+
+async def test_runtime_undoes_bypass_it_could_not_save(tmp_path, monkeypatch):
+    app, runtime_client, previous = _bypass_app(tmp_path)
+    monkeypatch.setattr(
+        app.state.runtime._budget_db, "set_bypass_permissions", lambda *_a: False
+    )
+
+    result = await app.state.runtime.set_bypass_permissions("local", "thread-1", True)
+
+    assert not result.accepted
+    assert runtime_client.set_bypass_permissions.await_args_list == [
+        call("thread-1", True, previous_settings=previous),
+        call("thread-1", False, previous_settings=previous),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("start_bypassed", "request_body", "expected"),
+    [
+        (True, {"delegated": False}, True),
+        (False, {"delegated": False}, False),
+        (True, {"delegated": True}, False),
+        (True, {"delegated": False, "sandbox": "read-only"}, False),
+        (True, {"delegated": False, "fork_thread_id": "a", "fork_turn_id": "b"}, False),
+    ],
+)
+async def test_a_new_thread_keeps_its_role_and_starts_bypassed_only_when_set(
+    tmp_path, start_bypassed, request_body, expected
+):
+    app, runtime_client, _previous = _bypass_app(tmp_path, start_bypassed=start_bypassed)
+
+    async def start_thread(*_args, before_first_turn, **_kwargs):
+        return await before_first_turn("thread-1")
+
+    runtime_client.start_thread = start_thread
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://runtime"
+    ) as client:
+        response = await client.post(
+            "/accounts/local/start",
+            json={"cwd": str(tmp_path), "message": "go", "role": "work", **request_body},
+        )
+
+    assert response.json()["accepted"] is True
+    db = app.state.runtime._budget_db
+    assert db.session_role("codex:local:thread-1") == "work"
+    assert db.bypass_permissions_on("codex:local:thread-1") is expected
+
+
+@pytest.mark.parametrize(
+    ("claude_flag", "codex_flag"), [(True, False), (False, True)]
+)
+def test_start_bypassed_reads_only_the_codex_account_of_a_shared_label(
+    tmp_path, claude_flag, codex_flag
+):
+    # Labels are unique per provider, so a Claude account can be called the same.
+    app = create_runtime_app(
+        AppConfig(
+            history=HistoryConfig(db_path=str(tmp_path / "control.db")),
+            accounts=[
+                AccountConfig(
+                    provider="claude_code",
+                    label="local",
+                    config_dir=str(tmp_path),
+                    start_bypassed=claude_flag,
+                ),
+                AccountConfig(
+                    provider="codex",
+                    label="local",
+                    config_dir=str(tmp_path),
+                    start_bypassed=codex_flag,
+                ),
+            ],
+        )
+    )
+    body = StartRequest(cwd=str(tmp_path), message="go", delegated=False)
+
+    assert app.state.runtime.starts_bypassed("local", body) is codex_flag
+
+
 async def test_runtime_reverts_permission_override_when_persistence_fails(
     tmp_path, monkeypatch
 ):
@@ -761,6 +970,9 @@ def test_runtime_snapshot_serializes_owned_turn_and_interaction(tmp_path):
         "interaction": asdict(FakeClient().interaction("thread-1")),
         "permission_prompts": False,
         "permission_prompts_available": True,
+        "bypass_permissions": False,
+        "bypass_permissions_available": True,
+        "role": None,
     }
 
 

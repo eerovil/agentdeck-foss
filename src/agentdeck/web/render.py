@@ -19,6 +19,7 @@ from ..agent_review import is_reviewer_prompt
 from ..attachments import display_message
 from ..chat_board import ChatBoardService
 from ..chat_transcript import chat_event_id
+from ..chat_use import size_level
 from ..deployment import is_deploy_checkout
 from ..git_context import GitContext, PullRequestContext
 from ..head_review import reviewable_commit
@@ -182,25 +183,14 @@ def ktok(value) -> str:
     return f"{k:.1f}k" if k < 10 else f"{k:.0f}k"
 
 
-# Context-size colour thresholds, referenced to the 1M-token (beta) window most
-# sessions run on: amber past the halfway mark, red in the near-full zone where
-# auto-compaction bites.
-CTX_WARN_TOKENS = 500_000
-CTX_CRIT_TOKENS = 800_000
-
-
 def ctx_level(value) -> str:
     """Traffic-light class for a context size: '' (green) / 'warn' / 'crit' —
-    same modifier vocabulary as the usage bars."""
+    same modifier vocabulary as the usage bars, and the cost dot's limits (#4168)."""
     try:
         n = int(value)
     except (TypeError, ValueError):
         return ""
-    if n >= CTX_CRIT_TOKENS:
-        return "crit"
-    if n >= CTX_WARN_TOKENS:
-        return "warn"
-    return ""
+    return {"cheap": "", "middling": "warn", "expensive": "crit"}[size_level(n)]
 
 
 def _aware(value: datetime) -> datetime:
@@ -1205,6 +1195,7 @@ SESSION_FRAGMENTS = (
             # A rename changes nothing else about the chat, so without this the
             # header would keep the old name until some unrelated flip (#1569).
             view.effective.display_title,
+            view.effective.chat_use.level if view.effective.chat_use else None,
         ),
         context=lambda view: {
             "s": replace(view.effective, thinking=view.busy),
@@ -1258,6 +1249,14 @@ SESSION_FRAGMENTS = (
             "pull_request_fold": fold_pull_requests(view.pull_requests)[1],
             "head_review": view.head_review,
         },
+    ),
+    # The numbers behind the header's dot (#4168). A fragment of its own, inside a panel the
+    # stream never replaces, so a reading landing does not shut the panel on its reader.
+    LiveFragment(
+        name="use-info",
+        template="partials/session_use_info.html",
+        signature=lambda view: (view.effective.chat_use,),
+        context=lambda view: {"use": view.effective.chat_use},
     ),
     LiveFragment(
         name="interaction",

@@ -18,6 +18,8 @@ from agentdeck.providers.codex import (
     WRITABLE_ROOTS_CONFIG_OVERRIDE,
 )
 from agentdeck.providers.codex.appserver import (
+    STDOUT_LINE_LIMIT,
+    THREAD_LIST_PAGE_SIZE,
     AppServerError,
     CodexAppServer,
     _PendingRequest,
@@ -253,6 +255,7 @@ bearer_token_env_var = "ABACUS_MCP_TOKEN"
         "AGENTDECK_URL": "http://127.0.0.1:8420",
         "PATH": "/opt/codex/bin:/usr/bin",
         "PYTHONPATH": "/opt/agentdeck/heavy-shim/python",
+        "TMPDIR": "/mnt/other-disk/tmp",
         "GIT_CONFIG_COUNT": "1",
         "GIT_CONFIG_KEY_0": "credential.https://github.com.helper",
         "GIT_CONFIG_VALUE_0": "!gh auth git-credential",
@@ -278,6 +281,7 @@ bearer_token_env_var = "ABACUS_MCP_TOKEN"
     assert "--setenv=CODEX_HOME=" + str(tmp_path) in command
     assert "--setenv=AGENTDECK_GH_CONSUMER=codex:test" in command
     assert "--setenv=PYTHONPATH=/opt/agentdeck/heavy-shim/python" in command
+    assert "--setenv=TMPDIR=/mnt/other-disk/tmp" in command
     assert "--setenv=GIT_CONFIG_VALUE_0=!gh auth git-credential" in command
     assert "--setenv=ABACUS_MCP_TOKEN" in command
     assert not any("token-must-not-reach-command-line" in arg for arg in command)
@@ -371,6 +375,62 @@ async def test_active_persistent_backend_detects_stale_worker_interception(
         == socket
     )
     assert server._backend_env_stale is True
+
+
+@pytest.mark.parametrize(
+    ("shown", "stale"),
+    [
+        (b"PATH=/usr/bin\n", True),
+        (b"PATH=/usr/bin TMPDIR=/var/tmp\n", True),
+        (b"PATH=/usr/bin TMPDIR=/mnt/other-disk/tmp\n", False),
+    ],
+)
+async def test_a_running_backend_with_another_temp_folder_is_replaced_when_idle(
+    tmp_path, monkeypatch, shown, stale
+):
+    """It outlives a deploy, so only this check moves its temp files (#4143)."""
+    socket = tmp_path / "control.sock"
+    socket.touch()
+    server = CodexAppServer(Account("codex:test", "codex", "test", tmp_path))
+    monkeypatch.setattr(server, "_backend_identity", lambda: ("backend.service", socket))
+
+    class Process:
+        returncode = 0
+
+        async def wait(self):
+            return self.returncode
+
+        async def communicate(self):
+            return shown, b""
+
+    monkeypatch.setattr(
+        asyncio, "create_subprocess_exec", AsyncMock(return_value=Process())
+    )
+    monkeypatch.setattr(
+        server, "_persistent_backend_nofile_stale", AsyncMock(return_value=False)
+    )
+    monkeypatch.setattr(
+        server, "_persistent_backend_args_stale", AsyncMock(return_value=False)
+    )
+
+    await server._ensure_persistent_backend(
+        {"PATH": "/usr/bin", "TMPDIR": "/mnt/other-disk/tmp"}
+    )
+    assert server._backend_env_stale is stale
+
+
+async def test_the_idle_refresh_does_not_compare_this_process_temp_folder(
+    tmp_path, monkeypatch
+):
+    """The runtime's TMPDIR differs from a chat's: comparing it would never settle."""
+    server = CodexAppServer(Account("codex:test", "codex", "test", tmp_path))
+    run = AsyncMock()
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", run)
+
+    assert not await server._persistent_backend_env_stale(
+        {"TMPDIR": "/var/tmp"}, "backend.service"
+    )
+    run.assert_not_called()
 
 
 async def test_stale_persistent_backend_refreshes_only_after_threads_are_idle(
@@ -848,7 +908,12 @@ async def test_recover_owned_includes_vscode_persisted_agentdeck_threads(tmp_pat
 
     assert server._request.await_args_list == [
         call(
-            "thread/list", {"sourceKinds": ["appServer", "vscode"], "limit": 200}
+            "thread/list",
+            {
+                "sourceKinds": ["appServer", "vscode"],
+                "limit": THREAD_LIST_PAGE_SIZE,
+                "useStateDbOnly": True,
+            },
         ),
         call(
             "thread/resume",
@@ -1069,6 +1134,94 @@ async def test_permission_prompt_override_updates_thread_and_replays_on_resume(t
         },
     )
     assert server.approval_policy("thread-1") == "never"
+
+
+async def test_bypass_lifts_the_sandbox_replays_on_resume_and_puts_it_back(tmp_path):
+    bypassed = {"thread-1"}
+    sandbox = {"type": "workspaceWrite", "writableRoots": ["/home/me"]}
+    server = CodexAppServer(
+        Account("codex:test", "codex", "test", tmp_path),
+        persistent_backend=False,
+        bypass_permissions_on=lambda thread_id: thread_id in bypassed,
+    )
+    server.start = AsyncMock()
+    server._owned.add("thread-1")
+    server._request = AsyncMock(
+        return_value={"approvalPolicy": "on-request", "sandbox": sandbox}
+    )
+
+    # A reload after the runtime restarts asks for the bypass again.
+    assert (await server.set_bypass_permissions("thread-1", True, previous_settings={})).accepted
+    assert server._request.await_args_list == [
+        call(
+            "thread/resume",
+            {
+                "threadId": "thread-1",
+                "approvalsReviewer": "auto_review",
+                "approvalPolicy": "never",
+                "sandbox": "danger-full-access",
+            },
+        ),
+        call(
+            "thread/settings/update",
+            {
+                "threadId": "thread-1",
+                "approvalPolicy": "never",
+                "sandboxPolicy": {"type": "dangerFullAccess"},
+            },
+        ),
+    ]
+
+    server._request.reset_mock()
+    previous = {"approvalPolicy": "on-request", "sandboxPolicy": sandbox}
+    assert (
+        await server.set_bypass_permissions("thread-1", False, previous_settings=previous)
+    ).accepted
+    server._request.assert_awaited_once_with(
+        "thread/settings/update", {"threadId": "thread-1", **previous}
+    )
+    assert await server.current_permission_settings("thread-1") == previous
+
+    # Nothing known to put back: the sandbox stays as it is, not half restored.
+    server._request.reset_mock()
+    assert not (await server.set_bypass_permissions("thread-1", False)).accepted
+    server._request.assert_not_awaited()
+
+
+async def test_permission_settings_are_unknown_until_codex_has_said_both(tmp_path):
+    server = _server(tmp_path)
+    server.start = AsyncMock()
+    assert await server.current_permission_settings("thread-1") is None
+    server._owned.add("thread-1")
+    server._request = AsyncMock(return_value={"approvalPolicy": "never"})
+    assert await server.current_permission_settings("thread-1") is None
+
+
+async def test_a_new_thread_is_prepared_before_its_first_message(tmp_path):
+    server = _server(tmp_path)
+    order: list[str] = []
+    server.create_thread = AsyncMock(return_value=InjectResult(True, session_id="thread-1"))
+
+    async def first_turn(*_args, **_kwargs):
+        order.append("turn")
+        return InjectResult(True)
+
+    async def prepare(thread_id):
+        order.append(f"prepare {thread_id}")
+        return InjectResult(True)
+
+    server.start_turn = first_turn
+    result = await server.start_thread(tmp_path, "hello", before_first_turn=prepare)
+    assert result.accepted and result.session_id == "thread-1"
+    assert order == ["prepare thread-1", "turn"]
+
+    async def refuse(_thread_id):
+        return InjectResult(False, "could not save the chat's role")
+
+    order.clear()
+    result = await server.start_thread(tmp_path, "hello", before_first_turn=refuse)
+    assert result.reason == "could not save the chat's role"
+    assert order == []
 
 
 async def test_permission_prompt_override_loads_idle_policy_before_enabling(tmp_path):
@@ -1946,3 +2099,16 @@ async def test_persistent_backend_below_the_file_limit_is_stale(tmp_path, monkey
     Process.started = b""
     assert await server._ensure_persistent_backend({}) == socket
     assert server._backend_env_stale is False
+
+
+async def test_a_thread_list_page_of_large_first_messages_fits_on_one_line():
+    """Chats opened with 400 KB prompts made a 38 MB reply that stopped the runtime."""
+    preview = "x" * 425_000
+    reply = json.dumps(
+        {"id": 1, "result": {"data": [{"preview": preview}] * THREAD_LIST_PAGE_SIZE}}
+    ).encode()
+    reader = asyncio.StreamReader(limit=STDOUT_LINE_LIMIT)
+    reader.feed_data(reply + b"\n")
+
+    assert await reader.readline() == reply + b"\n"
+    assert len(reply) * 8 < STDOUT_LINE_LIMIT

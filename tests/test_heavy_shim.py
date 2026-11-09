@@ -310,7 +310,7 @@ def worker(tmp_path, monkeypatch):
         marker = real / program
         marker.write_text(f'#!/bin/sh\necho "real {program} ran: $*"\n')
         marker.chmod(0o755)
-    socket_path = tmp_path / "codex-runtime.sock"
+    socket_path = tmp_path / "rt.sock"  # Short: 107 characters, and a job's TMPDIR is long (#4143).
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     listener.bind(str(socket_path))
     listener.listen()
@@ -430,7 +430,7 @@ def python_guard(tmp_path, monkeypatch):
     monkeypatch.setenv(install.SHIM_DIR_ENV, str(tmp_path / "shim"))
     guard = install.ensure_python_guard()
     assert guard is not None
-    socket_path = tmp_path / "codex-runtime.sock"
+    socket_path = tmp_path / "rt.sock"  # Short: 107 characters, and a job's TMPDIR is long (#4143).
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     listener.bind(str(socket_path))
     listener.listen()

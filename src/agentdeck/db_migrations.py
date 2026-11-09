@@ -291,6 +291,11 @@ MIGRATIONS = (
         (("work_metadata", "background_summary", "TEXT"),),
     ),
     Migration(19, "drop chat_review_heads", (), _drop_chat_review_heads),
+    Migration(
+        20,
+        "a question box's answer held while the runtime restarts",
+        (("scheduled_messages", "interaction_answer", "TEXT"),),
+    ),
 )
 
 

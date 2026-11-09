@@ -15,6 +15,7 @@ import pytest
 from test_work_ui import OTHER, WORK, _add, _app, _board, _overview
 
 from agentdeck import work_counter
+from agentdeck.chat_use import ChatUse
 from agentdeck.models import Session, SessionStatus
 from agentdeck.state import AppState, chat_topic
 
@@ -53,6 +54,20 @@ async def test_one_chat_change_rebuilds_that_chat_once_and_wakes_no_other_page()
     assert mine.get_nowait() is not None
     assert others.get_nowait() is None
     assert presentation.display(state.sessions[changed]).title == "Renamed"
+
+
+async def test_a_chat_cost_reading_reaches_only_that_chats_display_copy():
+    state = AppState()
+    keys = [f"codex:test:chat{index}" for index in range(3)]
+    for key in keys:
+        state.update_session(_chat(key, title=key))
+    state.session_presentation()
+    with work_counter.counting() as spent:
+        state.set_chat_use({keys[1]: ChatUse("expensive", 170_000, 0.8)})
+        presentation = state.session_presentation()
+    assert spent[work_counter.CHAT_DISPLAY] == 1
+    shown = {session.key: session.chat_use for session in presentation.visible}
+    assert shown[keys[1]] == ChatUse("expensive", 170_000, 0.8) and shown[keys[0]] is None
 
 
 async def test_a_child_change_also_wakes_the_parent_it_shows_on():
@@ -98,6 +113,36 @@ async def test_one_chat_change_builds_only_its_own_works_cards(tmp_path, monkeyp
     assert next(card for card in overview.cards if card.work_id == OTHER.work_id) is next(
         card for card in first.cards if card.work_id == OTHER.work_id
     )
+
+
+async def test_a_cost_dot_rebuilds_only_when_what_it_shows_moves(tmp_path, monkeypatch):
+    import agentdeck.web.work_view as work_view
+
+    monkeypatch.setattr(work_view, "FULL_CHECK_S", 1e9)
+    app = _app(tmp_path, board=_board())
+    mine = _add(app, "claude_code:test:mine", WORK)
+    _add(app, "claude_code:test:theirs", OTHER)
+    await _overview(app)
+    state = app.state.app_state
+    middling = {mine: ChatUse("middling", 120_000, 0.3)}
+
+    state.set_chat_use(middling)
+    with work_counter.counting() as spent:
+        overview = await _overview(app)
+    assert 1 <= spent[work_counter.WORK_CARD] <= 2
+    card = next(card for card in overview.cards if card.work_id == WORK.work_id)
+    assert card.use == ChatUse("middling", 120_000, 0.3)
+
+    # A pass that finds what the page already shows announces nothing.
+    state.set_chat_use(dict(middling))
+    with work_counter.counting() as idle:
+        await _overview(app)
+    assert idle[work_counter.WORK_CARD] == 0 and idle[work_counter.WORK_CARD_CHECK] == 0
+
+    # The chat's size is no longer known: the dot goes, on its own row.
+    state.set_chat_use({})
+    overview = await _overview(app)
+    assert next(c for c in overview.cards if c.work_id == WORK.work_id).use is None
 
 
 async def test_two_tabs_on_one_chat_share_one_read_and_one_render(tmp_path, monkeypatch):

@@ -26,11 +26,14 @@ deliveries are the deck's own echo):
 * **A wayfinder map's last ticket closed** (#3627): a sub-issue's close, under any login, whose
   parent, read once from GitHub, is an open ``wayfinder:map`` with every sub-issue done. The
   map's own chat is told to reach the destination, so nobody has to wake it.
-* **A wayfinder ticket's last blocker closed** (#3764): a ticket's close, under any login, or
-  a person removing a blocker. Nothing is sent: every open ticket it blocked that is left with
-  no open blocker, read live, gets the Start button's own write (assigned where another deck
-  takes unassigned issues, then the start label), so its Work starts without waiting for the
-  closing chat to remember to start it.
+* **An issue's last blocker closed** (#3764, #4216): an issue's close, under any login, or a
+  person removing a blocker. Nothing is sent: every open issue it blocked that is left with no
+  open blocker, read live, starts — one with no start label gets the Start button's own write
+  (assigned where another deck takes unassigned issues, then the start label), one already
+  labelled, which waited, starts its Work — so nobody has to remember to start it. Any issue,
+  not only a wayfinder ticket: a map's build issues are filed blocked and unlabelled too. A
+  labelled issue with an open blocker waits for it rather than starting (owner's choice):
+  every Work start, its retries included, goes through ``work_signals.start_unless_blocked``.
 * **A wayfinder record** (#3695): a ticket's ``**Answer:**`` comment, or an ``**Ideas
   sorted:**`` or ``**Destination redrawn:**`` comment on the map, posted or edited by the deck
   or a person on the repository. Nothing is sent: the deck rebuilds the map's four lists from
@@ -131,7 +134,7 @@ import logging
 import re
 import secrets
 import time
-from collections.abc import Awaitable, Callable, Coroutine, Iterable, Iterator
+from collections.abc import Awaitable, Callable, Collection, Coroutine, Iterable, Iterator
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -146,7 +149,15 @@ from .wake_on import STOP_SETTLE_S
 from .watch_retry import Backoff
 from .webhook_tailer import Delivery, WebhookTailer, WebhookWatcher
 from .work_claims import assignee_of
-from .work_release import ACCEPTED_ASK, OWNER_CALL_ASK
+from .work_release import (
+    ACCEPTED_ASK,
+    NO_CODE,
+    OWNER_CALL_ASK,
+    _match_in,
+    heading_targets,
+    same_commit,
+)
+from .work_signals import BLOCKED
 from .work_signals import MARKER as START_MARKER
 
 log = logging.getLogger(__name__)
@@ -174,13 +185,25 @@ PRE_REVIEW_TEXT = """AgentDeck: before {pull} at {short} goes to review, check t
 4. The tests cover the other cases too: events in another order or shape, two at once, a\
  restart, and for a page a live update and a 390px phone.
 5. The Work summary is current, and the body says `Refs #<issue>` (`Closes` only if the\
- issue asks).
+ issue asks).{grown}
 
 Fix and push what is missing, keeping it ready, then call `POST\
  $AGENTDECK_URL/api/sessions/<session-key>/pre-review-done` with\
  `{{"pull_request": "{pull}"}}`: the review of its head then starts, and this chat waits on\
  it. The review waits until you call it, and reads the head current then, even after more\
  pushes or a draft and ready again.{policy}"""
+#: The checklist's extra point when review fixes grew the diff past ``GROWTH_PERCENT`` of the
+#: previous round's (#4220, owner's choice: an agent note, not a question or a reviewer brief).
+GROWN_TEXT = """
+6. Since the previous review round this pull request grew from {before} to {after} changed\
+ lines (+{percent}%). Before fixing more, post a short note on the issue: is this still the\
+ right design, and which remaining findings could be left to a follow-up issue instead?"""
+#: Growth over this percent of the previous round's changed lines (added plus removed, the
+#: whole diff) adds ``GROWN_TEXT`` (#4220, owner's choice: 15%, against the previous round).
+GROWTH_PERCENT = 15
+#: Growth under this many lines never does, so a small pull request is left alone (#4220,
+#: assumed: drop it if small pull requests turn out to grow off course too).
+GROWTH_FLOOR = 100
 #: A pending action's back-off (``watch_retry.Backoff``): its first wait and its ceiling.
 RETRY_FIRST_S = 60.0
 RETRY_MAX_S = 30 * 60.0
@@ -221,6 +244,9 @@ CLOSE_QUOTE = 300
 #: ``pull_request`` actions after which the pull request may sit ready at a new head.
 _READY_ACTIONS = frozenset({"ready_for_review", "synchronize", "opened", "reopened"})
 _VERDICT_RE = re.compile(r"^\s*/(?:reviewed|claude)\b", re.IGNORECASE)
+#: The GitHub App ChatGPT's own connector posts through, under the login of whoever's ChatGPT
+#: it is rather than the reviewer's (#4152): a comment's ``performed_via_github_app``.
+REVIEWER_CONNECTOR = "chatgpt-codex-connector"
 #: A sub-issue's ``parent_issue_url`` (#3627).
 _API_ISSUE_RE = re.compile(r"^https://api\.github\.com/repos/([^/\s]+)/([^/\s]+)/issues/(\d+)$")
 #: The label of a wayfinder map, whose chat wakes when its last ticket closes (#3627).
@@ -243,7 +269,8 @@ _SHA_RE = re.compile(r"(?<![0-9A-Za-z])[0-9a-fA-F]{7,40}(?![0-9A-Za-z])")
 _RELEASE_VERDICT_RE = re.compile(r"^\s*/reviewed\b", re.IGNORECASE)
 _DECK_REVIEW_RE = re.compile(r"^\s*/(?:claude\s+Review\b|reviewed\b)", re.IGNORECASE)
 #: A reviewer handing the review to the owner instead of passing it or sending it back (#3216),
-#: as its first line: "Review loop escalated to the operator". ChatGPT posts it through its own
+#: as its first line: "Review loop escalated to the operator", since #4069 going on to name the
+#: pull request and commit it is for. ChatGPT posts it through its own
 #: GitHub connector, so under the owner's login rather than the reviewer's.
 _ESCALATED_RE = re.compile(
     r"^\s*(?:/claude\s+)?review(?:\s+loop)?\s+(?:was\s+)?escalated\b", re.IGNORECASE
@@ -280,8 +307,8 @@ class Event:
     #: CLOSE only: closed under one of the deck's own logins, which every chat writes as.
     by_deck: bool = False
     #: MESSAGE only: the reviewer's findings, which end the chat's review waits. A ``/reviewed``
-    #: verdict is not one: the release ends them once it has taken the verdict (#3183 review),
-    #: so a stale head or a wrong digest leaves the wait to its timeout.
+    #: verdict is not one: the release ends them once it has taken the verdict (#3183 review)
+    #: or told the chat it refused it (#4124), so a stale head leaves the wait to its timeout.
     verdict: bool = False
     #: REVIEW only: marked ready from draft, so an already-reviewed head is asked again (#3183).
     explicit: bool = False
@@ -302,10 +329,13 @@ def _label_name(label: object) -> str:
     return _text(label.get("name") if isinstance(label, dict) else label).strip()
 
 
-def _is_ticket(labels: object) -> bool:
-    """A wayfinder ticket and not a map: the labels of a webhook issue or a dependency row."""
-    names = [_label_name(label) for label in labels] if isinstance(labels, list) else []
-    return wayfinder_map.is_ticket(names) and not wayfinder_map.is_map(names)
+def _open_blockers(rows: Iterable[dict]) -> list[str]:
+    """The dependency rows that are not closed, as ``#n``, for the log."""
+    return [
+        f"#{row.get('number')}"
+        for row in rows
+        if isinstance(row, dict) and _text(row.get("state")).lower() != "closed"
+    ]
 
 
 def _login(payload: dict, key: str = "sender") -> tuple[str, str]:
@@ -992,8 +1022,21 @@ class WorkRouterService:
         ready_pulls: Callable[[], Iterable[tuple[str, int, str]]] | None = None,
         review_event: review_history.Note = review_history.no_note,
         reviews: Callable[[str], Iterable[review_history.ReviewEvent]] = lambda pull: (),
+        check: object | None = None,
+        forget_reviews: Callable[[str], object] = lambda pull: None,
+        diff_sizes: Callable[[str, int, tuple[str, ...]], Awaitable[dict[str, int]]]
+        | None = None,
+        ship: ShipPorts | None = None,
     ) -> None:
         self._enabled = bool(enabled)
+        # Ship now, fix later (#4212): ``None`` refuses every press.
+        self._ship = ship
+        # ``pull@head`` of each Ship now still running, so a second press waits for the first.
+        self._shipping: set[str] = set()
+        # The GitHub check (#4152): ``review_check.ReviewCheckPublisher``, ``None`` when off.
+        # With it every eligible pull request is reviewed, a Work's or not.
+        self._check = check
+        self._forget_reviews = forget_reviews
         self._tailer = WebhookTailer(streams_root, consumer=CONSUMER)
         self._watcher = watcher
         self._switched = switched
@@ -1022,8 +1065,9 @@ class WorkRouterService:
         self._latest_comment = latest_comment
         self._read_issue = read_issue
         self._read_parent = read_parent
-        # A wayfinder ticket whose last blocker closed is started (#3764): the tickets an
-        # issue blocks or waits on, read live, and the Start button's own write.
+        # An issue whose last blocker closed is started (#3764, #4216): the issues an issue
+        # blocks or waits on, read live, and the Start button's own write. A labelled issue
+        # with an open blocker waits for it.
         self._read_dependencies = read_dependencies
         self._start_ticket = start_ticket
         self._hold_labels = hold_labels
@@ -1068,6 +1112,10 @@ class WorkRouterService:
         # Each head's review history (#3957): appended to, and read for every review record
         # the router keeps (#3955), ``reviews(owner/repo#n)`` giving every head's events.
         self._note = review_event
+        # ``{head: added plus removed lines}`` of a pull request's diff at each given head, read
+        # from GitHub when a checklist is sent: growth past the previous round's adds a design
+        # check (#4220). Nothing writes a size, so every way a review starts counts alike.
+        self._diff_sizes = diff_sizes
         self._reviews = reviews
         #: ``owner/repo#n`` -> ``(cached head, since when it sat unstarted)``, ``None`` once
         #: the backstop read it live: its grace, and no second read of the same row.
@@ -1154,7 +1202,7 @@ class WorkRouterService:
             try:
                 async for batch in self._tailer.watch(stop_event=self._stop, watcher=self._watcher):
                     await self.apply(batch)
-                    self._tailer.commit()
+                    await self._tailer.commit_off_loop()
                 return
             except asyncio.CancelledError:
                 raise
@@ -1423,7 +1471,7 @@ class WorkRouterService:
         number = entry.get("number")
         head = str(entry.get("head") or "").lower()
         again = str(entry.get("again") or "")
-        owner = self._owner_of_pull(repository, number) if isinstance(number, int) else None
+        owner = self._review_owner(repository, number) if isinstance(number, int) else None
         if owner is None or not head:
             self.pending.discard(key)
             return
@@ -1506,6 +1554,13 @@ class WorkRouterService:
                     log.warning(
                         "work-router: release of %s failed", delivery.delivery_id, exc_info=True
                     )
+            if self._check is not None:
+                try:
+                    settled = await self._observe_check(delivery) or settled
+                except Exception:  # noqa: BLE001 - a check hiccup must not stop routing
+                    log.warning(
+                        "work-router: check of %s failed", delivery.delivery_id, exc_info=True
+                    )
             if self._start_work is not None:
                 await self._maybe_start(delivery)
             await self._maybe_reassigned(delivery)
@@ -1534,6 +1589,8 @@ class WorkRouterService:
                 event.repository, event.number
             )
             if owner is None:
+                if self._check is not None and event.kind == REVIEW:
+                    await self._check_review(delivery, event)
                 continue
             if event.kind == CLOSE:
                 self._hold_close(delivery, owner, event)
@@ -1588,6 +1645,278 @@ class WorkRouterService:
             else:
                 await self._review(owner, event)
 
+    def _review_owner(self, repository: str, number: int) -> Owner | None:
+        """Who a review of this pull request belongs to: its Work, else, once the check took
+        it in (``_observe_check``), nobody's, as a chat-less owner named after itself."""
+        owner = self._owner_of_pull(repository, number)
+        if owner is not None or self._check is None:
+            return owner
+        return self._no_work(repository, number)
+
+    def _no_work(self, repository: str, number: int) -> Owner | None:
+        pull = f"{repository}#{number}".lower()
+        seen = any(event.kind == review_history.SEEN for event in self._history(pull))
+        return ("", pull) if seen else None
+
+    async def _observe_check(self, delivery: Delivery) -> bool:
+        """What the GitHub check takes from a delivery (#4152). ``True`` when it was a reviewer's
+        answer on a pull request no Work owns, which has no chat to go on to."""
+        payload = delivery.payload
+        repository = delivery.stream.lower()
+        action = _text(payload.get("action"))
+        if delivery.event == "pull_request":
+            self._check_pull_event(repository, payload, action)
+        elif delivery.event == "check_run" and review_history.deck_check_delivery(
+            "check_run", payload
+        ):
+            await self._check_pressed(delivery, repository, action)
+        elif delivery.event == "issue_comment" and action == "created":
+            return await self._check_comment(delivery, repository)
+        return False
+
+    def _check_pull_event(self, repository: str, payload: dict, action: str) -> None:
+        pull = payload.get("pull_request")
+        number = pull.get("number") if isinstance(pull, dict) else None
+        if not isinstance(number, int):
+            return
+        ref = f"{repository}#{number}"
+        owned = self._owner_of_pull(repository, number) is not None
+        if action == "closed":
+            self._check.wake(ref)
+            if not owned and self._no_work(repository, number) is not None:
+                # Nothing else ends a history no Work owns. Reopened, it starts again.
+                self._forget_reviews(ref)
+            return
+        if action not in _READY_ACTIONS or pull.get("draft") or pull.get("state") != "open":
+            return
+        head = pull.get("head")
+        sha = _text(head.get("sha")).lower() if isinstance(head, dict) else ""
+        if not sha or self._check.from_fork(pull):
+            return
+        if owned or self._check.eligible(pull, self.own_logins()):
+            self._note_seen(ref, sha)
+
+    def _note_seen(self, pull: str, head: str) -> None:
+        """A ready head, so its check says it waits even while its ask does."""
+        self._note(pull, head, review_history.SEEN, f"seen:{pull}@{head}")
+        self._check.wake()
+
+    async def _check_pressed(self, delivery: Delivery, repository: str, action: str) -> None:
+        """A person's Re-run or Handled on the check."""
+        payload = delivery.payload
+        run = payload.get("check_run")
+        run = run if isinstance(run, dict) else {}
+        head = _text(run.get("head_sha")).lower()
+        run_id = run.get("id")
+        # The run's own record says whose it is. The webhook's list names every pull request at
+        # the commit, and a replaced run's press would answer a result nobody sees any more.
+        pull = self._check.pull_of(repository, head, run_id) if isinstance(run_id, int) else ""
+        found = pull.rpartition("#")[2]
+        if not found.isdigit():
+            log.info("work-router: %s on %s's unknown run %s dropped", action, repository, run_id)
+            return
+        number = int(found)
+        live = await self._live_ready_head(repository, number)
+        if not live or live != head:
+            # A press on a check the branch has left says nothing about the live head.
+            log.info("work-router: %s on %s's old check dropped", action, pull)
+            return
+        login, _kind = _login(payload)
+        if action == "rerequested":
+            # Without the second sentence an unchanged answer is not repeated, as the reviewer's
+            # rules ask, and the check waits on this review for hours (#4152).
+            note = (
+                f"{login or 'A person'} pressed Re-run on the check on GitHub. Post your findings "
+                "or verdict again, in full, even if they are the same as the last review's: the "
+                "check shows only what this review posts."
+            )
+            try:
+                await self.ask_again(repository, number, note)
+            except AgainBusy:
+                pass  # the review the press asks for is already on its way
+            except AgainRefused as refused:
+                log.info("work-router: Re-run of %s: %s", pull, refused)
+                key = f"rerun-refused:{pull}@{head}:{delivery.delivery_id}"
+                self._note(pull, head, review_history.RERUN_REFUSED, key)
+                self._check.wake(pull)
+        elif action == "requested_action" and self._is_handled_press(payload):
+            if self._owner_of_pull(repository, number) is None:
+                key = f"handled:{pull}@{head}:{delivery.delivery_id}"
+                self._note(pull, head, review_history.HANDLED, key, data={"by": login})
+                self._check.wake(pull)
+
+    @staticmethod
+    def _is_handled_press(payload: dict) -> bool:
+        asked = payload.get("requested_action")
+        return isinstance(asked, dict) and asked.get("identifier") == "handled"
+
+    async def _check_comment(self, delivery: Delivery, repository: str) -> bool:
+        """A reviewer's answer posted on a pull request no Work owns: a verdict, findings or an
+        escalation. From anyone else it is a comment like any other (``_from_reviewer``)."""
+        from .poller_engine.intake import CommandKind, parse_verdicts
+
+        payload = delivery.payload
+        issue, comment = payload.get("issue"), payload.get("comment")
+        if not isinstance(issue, dict) or not isinstance(comment, dict):
+            return False
+        number = issue.get("number")
+        login, _kind = _login(payload)
+        if (
+            not isinstance(number, int)
+            or not isinstance(issue.get("pull_request"), dict)
+            or self._owner_of_pull(repository, number) is not None
+            or self._no_work(repository, number) is None
+            or not await self._from_reviewer(repository, number, login, comment)
+        ):
+            return False
+        body = _text(comment.get("body"))
+        posted = _when(_text(comment.get("created_at")))
+        at = posted.timestamp() if posted is not None else None
+        key = f"comment:{comment.get('id')}"
+        commands = parse_verdicts(body)
+        if commands:
+            for command in commands:
+                if command.kind == CommandKind.REVIEWED:
+                    await self._check_verdict(repository, number, command, key, by=login, at=at)
+            return True
+        if _VERDICT_RE.match(body) or _ESCALATED_RE.match(body):
+            await self._check_findings(repository, number, body, key, at=at)
+            return True
+        return False
+
+    async def _from_reviewer(self, repository: str, number: int, login: str, comment: dict) -> bool:
+        """The reviewer's account, or the connector of the ChatGPT reviewing this pull request's
+        live head. The app alone proves nothing: a colleague's ChatGPT has it too, and could pass
+        their own pull request. The owner of the chat's repository is the one whose ChatGPT runs
+        these reviews, so a comment needs both. Only the newest chat at the live head speaks: an
+        older chat's owner has no say over a head it was not asked about."""
+        if login.casefold() in reviewer_logins():
+            return True
+        app = comment.get("performed_via_github_app")
+        if not login or not isinstance(app, dict) or app.get("slug") != REVIEWER_CONNECTOR:
+            return False
+        head = await self._live_ready_head(repository, number)
+        chats = [
+            _text(event.data.get("chat"))
+            for event in self._history(f"{repository}#{number}")
+            if event.kind == review_history.CHAT and head and same_commit(head, event.head)
+        ]
+        return bool(chats) and chats[-1].partition("/")[0].casefold() == login.casefold()
+
+    async def check_request(
+        self, repository: str, number: int, command: str, action_id: str
+    ) -> dict | None:
+        """A reviewer's ``agentdeck deck-request`` on a pull request no Work owns (#4152).
+
+        ``None`` when it is not that, so the Work's own handling answers. The answer is the
+        delivery, and nothing is posted: the check shows it.
+        """
+        from .poller_engine.intake import CommandKind, parse_verdicts
+
+        repository = repository.lower()
+        if (
+            self._check is None
+            or self._owner_of_pull(repository, number) is not None
+            or self._no_work(repository, number) is None
+        ):
+            return None
+        key = f"request:{action_id}"
+        commands = parse_verdicts(command)
+        if commands:
+            answers = [
+                await self._check_verdict(repository, number, item, key, by="", at=None)
+                if item.kind == CommandKind.REVIEWED
+                else "a verdict that did not read as one was dropped"
+                for item in commands
+            ]
+            detail = "; ".join(answers)
+        elif _VERDICT_RE.match(command) or _ESCALATED_RE.match(command):
+            detail = await self._check_findings(repository, number, command, key, at=None)
+        else:
+            detail = "no Work owns this pull request, so a plain comment goes nowhere"
+        return {"outcome": "done", "detail": f"{detail}. This answer is the delivery."}
+
+    async def _check_verdict(
+        self, repository: str, number: int, command, key: str, *, by: str, at: float | None
+    ) -> str:
+        """Record a verdict on a pull request no Work owns, by the rules the release keeps for
+        a Work's, but with none of its effects: nothing merges from here."""
+        pull = f"{repository}#{number}"
+        targets = command.targets
+        if targets and not any(_match_in(repository, target) == pull for target in targets):
+            return f"a verdict about {targets[0]} was dropped on {pull}"
+        head = await self._live_ready_head(repository, number)
+        about = (command.head or "").lower()
+        events = self._history(pull)
+        if not head or not (
+            same_commit(head, about) or review_history.same_change(events, head, about)
+        ):
+            return f"{pull} moved past {about[:12]}, so this verdict was dropped"
+        kinds = {
+            "pass": review_history.PASS,
+            "changes-needed": review_history.CHANGES,
+            NO_CODE: review_history.NO_CODE,
+        }
+        kind = kinds.get(command.verdict)
+        if kind is None:
+            return f"the verdict {command.verdict} was not understood"
+        data = {"by": by, "chat": self._review_chat_name(pull, head)}
+        if kind != review_history.CHANGES:
+            try:
+                digest = (await self._digest(pull, head) if self._digest else "") or ""
+            except Exception:  # noqa: BLE001 - unread is unproven, and the reviewer is told
+                log.warning("work-router: could not read %s's digest", pull, exc_info=True)
+                digest = ""
+            if not digest:
+                return f"{pull}'s diff could not be read: send the same verdict again"
+            if digest.lower() != (command.digest or "").lower():
+                return f"{pull}'s diff is not the one reviewed, so this verdict was dropped"
+            data["digest"] = digest.lower()
+        self._note(pull, head, kind, f"{key}:{pull}:{kind}", at=at, data=data)
+        self._check.wake()
+        return f"the verdict on {pull} at {head[:12]} is on its check"
+
+    def _review_chat_name(self, pull: str, head: str) -> str:
+        review = review_history.head_review(review_history.at_head(self._history(pull), head))
+        return review.review_chat
+
+    async def _check_findings(
+        self, repository: str, number: int, text: str, key: str, *, at: float | None
+    ) -> str:
+        """Record findings or an escalation at the live head, when they name it: findings about
+        a commit the branch has left must not turn the new head's check red."""
+        pull = f"{repository}#{number}"
+        head = await self._live_ready_head(repository, number)
+        if not head:
+            return f"{pull} is not open and ready, so these findings were dropped"
+        headed = {name.lower(): sha for name, sha in heading_targets(text, repository).items()}
+        named = [headed.get(pull, "")] if headed else _SHA_RE.findall(text)
+        if not any(same_commit(head, token) for token in named):
+            return f"these findings do not name {pull}'s head {head[:12]}, so they were dropped"
+        escalated = _ESCALATED_RE.match(text) is not None
+        kind = review_history.ESCALATED if escalated else review_history.FINDINGS
+        data = {"told": False, "text": review_history.clip_findings(text)}
+        self._note(pull, head, kind, f"{key}:{pull}:{kind}", at=at, data=data)
+        self._check.wake()
+        return f"the findings on {pull} at {head[:12]} are on its check"
+
+    async def _check_review(self, delivery: Delivery, event: Event) -> None:
+        """Review a pull request no Work owns (#4152): ``apply``'s own steps for a Work's, minus
+        all that speaks to a chat. ``_review`` does the rest with an owner that has none."""
+        own = self.own_logins()
+        if not self._check.eligible(delivery.payload.get("pull_request"), own):
+            return
+        pull = f"{event.repository}#{event.number}".lower()
+        reviewed = self._spent(pull, event.head)
+        if event.confirm or reviewed:
+            head = await self._live_ready_head(event.repository, event.number)
+            if not head or (event.explicit and reviewed and head == event.head):
+                # Marked ready again at a head already reviewed: Re-run is the way to ask.
+                return
+            event = replace(event, head=head, confirm=False)
+        self._note_seen(pull, event.head)
+        await self._review(("", pull), event)
+
     async def _load_owner(self, delivery: Delivery) -> None:
         """Bring back the chats of the Work an issue's event is about, if none is held (#3405).
 
@@ -1632,6 +1961,7 @@ class WorkRouterService:
             if not isinstance(pull, dict) or not pull.get("merged"):
                 return
             number = pull.get("number")
+            self._note_shipped_merge(repository, number, pull)
             owner = self._owner_of_pull(repository, number) if isinstance(number, int) else None
             if owner is None:
                 return
@@ -1644,6 +1974,19 @@ class WorkRouterService:
             self._merged[work] = self._clock()
             # The issue's close came first and is held: it was this merge's.
             self.pending.discard(f"{CLOSE}:{work}")
+
+    def _note_shipped_merge(self, repository: str, number: object, pull: dict) -> None:
+        """Keep the merge commit of a pull request shipped with findings left, so its
+        follow-up's review names exactly what landed (#4212 review). Matched by the pull
+        request, not its head: the merge queue merges the base in after the press, which makes
+        a new head of the same change. Any other merge writes nothing."""
+        merged = _text(pull.get("merge_commit_sha"))
+        if self._ship is None or not isinstance(number, int) or len(merged) != 40:
+            return
+        try:
+            self._ship.note_merged(f"{repository}#{number}", merged.lower())
+        except Exception:  # noqa: BLE001 - the range from its base still names the change
+            log.warning("work-router: could not keep %s#%s's merge", repository, number)
 
     async def _maybe_map_ready(self, delivery: Delivery) -> None:
         """Wake a wayfinder map's chat when its last open ticket closes (#3627).
@@ -1715,18 +2058,20 @@ class WorkRouterService:
         self._send(delivery, owner, event)
 
     async def _maybe_start_unblocked(self, delivery: Delivery) -> None:
-        """Start a wayfinder ticket once its last blocker closes (#3764).
+        """Start an issue once its last blocker closes (#3764, #4216).
 
-        A map files a blocked ticket with no agent; ``WAYFINDER.md`` once left adding it to
-        whoever closed the last blocker, and a chat that never read that (a Work the map
-        adopted) or a person closing it by hand left the ticket unstarted. Here a wayfinder
-        ticket's close, under any login, reads the tickets it blocks; a person removing a
-        blocker (``blocked_by_removed``) checks the one ticket it named. Each candidate's own
-        blockers are read live, and it starts only with every one closed, so a ticket with two
-        blockers waits for both and a re-asked ticket, whose replacement blocks the same
-        tickets before it closes, starts none. A ticket already labelled, held by the paused
-        label, closed, or not a wayfinder ticket is left alone. Best effort: a failed read or
-        write is logged and the delivery moves on; the Start button is still there."""
+        A map files a blocked ticket, and after its destination the blocked build issues, with
+        no agent; ``WAYFINDER.md`` once left adding it to whoever closed the last blocker, and
+        a chat that never read that (a Work the map adopted) or a person closing it by hand
+        left the issue unstarted. Here any issue's close, under any login, reads the issues it
+        blocks; a person removing a blocker (``blocked_by_removed``) checks the one issue it
+        named. Each candidate's own blockers are read live, and it starts only with every one
+        closed, so an issue with two blockers waits for both and a re-asked ticket, whose
+        replacement blocks the same tickets before it closes, starts none. Only wayfinder
+        tickets were started until #4216, which left a map's build issues unstarted. A
+        candidate held by the paused label, closed, a wayfinder map, or labelled and already
+        owned by a chat is left alone. Best effort: a failed read or write is logged and the
+        delivery moves on; the Start button is still there."""
         if self._read_dependencies is None or self._start_ticket is None:
             return
         payload = delivery.payload
@@ -1737,7 +2082,6 @@ class WorkRouterService:
                 not isinstance(issue, dict)
                 or not isinstance(issue.get("number"), int)
                 or isinstance(issue.get("pull_request"), dict)
-                or not _is_ticket(issue.get("labels"))
             ):
                 return
             repository, number = delivery.stream.lower(), issue["number"]
@@ -1761,6 +2105,7 @@ class WorkRouterService:
                     "number": blocked.get("number"),
                     "state": blocked.get("state"),
                     "labels": blocked.get("labels"),
+                    "assignee": assignee_of(blocked),
                 }
             ]
             cause = "a blocker removed"
@@ -1775,20 +2120,32 @@ class WorkRouterService:
         if not repository or not isinstance(number, int):
             return
         ticket = f"{repository}#{number}"
-        names = {_label_name(label).casefold() for label in candidate.get("labels") or ()}
+        labels = candidate.get("labels")
+        names = (
+            [name for name in (_label_name(label) for label in labels) if name]
+            if isinstance(labels, list)
+            else []
+        )
+        folded = {name.casefold() for name in names}
         starts = {item.casefold() for item in self._start_labels(repository)}
         holds = {item.casefold() for item in self._hold_labels(repository) if item}
+        labelled = bool(folded & starts)
+        assignee = _text(candidate.get("assignee"))
         why = ""
         if _text(candidate.get("state")).lower() != "open":
             why = "it is closed"
-        elif not _is_ticket(candidate.get("labels")):
-            why = "not a wayfinder ticket"
+        elif wayfinder_map.is_map(names):
+            why = "it is a wayfinder map"
         elif not starts:
             why = "its repository starts no Works"
-        elif names & starts:
-            why = "it already has its start label"
-        elif names & holds:
+        elif folded & holds:
             why = "it is paused"
+        elif labelled and self._chat_of_issue(repository, number) is not None:
+            why = "it already has its start label and a chat"
+        elif not self._mine(repository, assignee):
+            why = "another deck works it"
+        elif labelled and self._start_work is None:
+            why = "it already has its start label, and another deck works it"
         if why:
             log.info("work-router: %s, %s not started: %s", cause, ticket, why)
             return
@@ -1799,13 +2156,14 @@ class WorkRouterService:
             return
         if blockers is None:
             return
-        still = [
-            f"#{row.get('number')}"
-            for row in blockers
-            if _text(row.get("state")).lower() != "closed"
-        ]
+        still = _open_blockers(blockers)
         if still:
             log.info("work-router: %s, %s waits on %s", cause, ticket, ", ".join(still))
+            return
+        if labelled:
+            # Labelled while blocked, so its label's start waited (#4216): it starts now.
+            log.info("work-router: %s, %s has no open blocker: starting its Work", cause, ticket)
+            await self._start(repository, number, names, assignee)
             return
         try:
             outcome, text = await self._start_ticket(repository, number)
@@ -2127,6 +2485,14 @@ class WorkRouterService:
                 await release.on_pull_event(
                     _work_id(owner), f"{repository}#{number}", action, bool(pull.get("merged"))
                 )
+        elif delivery.event == "push":
+            # Any push to a branch: a pull request waiting on a Merge that merges into it may
+            # conflict now, whoever's it was (#4217). The release looks only at those.
+            ref = _text(payload.get("ref"))
+            if ref.startswith("refs/heads/") and not payload.get("deleted"):
+                looked = release.on_base_moved(repository, ref.removeprefix("refs/heads/"))
+                if looked:
+                    log.info("work-router: %s moved; looking again at %s", ref, looked)
         elif delivery.event == "issues" and action in {"labeled", "unlabeled"}:
             issue = payload.get("issue")
             label = payload.get("label")
@@ -2143,7 +2509,9 @@ class WorkRouterService:
             # before the rollup reads its last run done (#3911).
             suite = payload.get(delivery.event)
             pulls = suite.get("pull_requests") if isinstance(suite, dict) else None
-            for item in pulls if isinstance(pulls, list) else ():
+            # The deck's own review check finishing is no CI news (#4152).
+            own_check = review_history.deck_check_delivery(delivery.event, payload)
+            for item in () if own_check or not isinstance(pulls, list) else pulls:
                 number = item.get("number") if isinstance(item, dict) else None
                 owner = self._owner_of_pull(repository, number) if isinstance(number, int) else None
                 if owner is not None:
@@ -2204,7 +2572,8 @@ class WorkRouterService:
     async def _start_on_event(
         self, delivery: Delivery, repository: str, number: int, names: list[str], assignee: str
     ) -> None:
-        """Start a Work a label or an assignment delivery asks for, unless a filing holds it."""
+        """Start a Work a label or an assignment delivery asks for, unless a filing holds it.
+        An open blocker holds it in ``start_work`` (``start_unless_blocked``, #4216)."""
         filing = self._filing.get(repository) or self.filing_holds(repository)
         if filing and not delivery.delivery_id.startswith("deck-filed:"):
             # The deck may be filing this very issue with its agent already running (#3590):
@@ -2344,7 +2713,11 @@ class WorkRouterService:
             log.warning("work-router: start of %s#%s failed", repository, number, exc_info=True)
             self.pending.discard(key)
             return
-        if _start_is_retryable(outcome):
+        if outcome == BLOCKED:
+            # Its last blocker closing starts it (``_start_if_unblocked``), not a retry.
+            log.info("work-router: start of %s#%s waits on a blocker", repository, number)
+            self.pending.discard(key)
+        elif _start_is_retryable(outcome):
             log.info("work-router: start of %s#%s: %s; retrying", repository, number, outcome)
             self.pending.put(key, fields, self._clock())
         else:
@@ -2663,6 +3036,8 @@ class WorkRouterService:
     def _tell_no_reviewer(self, owner: Owner, pull: str, head: str) -> None:
         """Tell the chat once per head that no review is coming (#3849); the id absorbs a
         replayed ready event and a pending ask retried after an upgrade."""
+        if not owner[0]:
+            return
         now = datetime.now(UTC)
         self._deliver(
             ScheduledMessage(
@@ -2702,7 +3077,7 @@ class WorkRouterService:
         """
         repository = repository.lower()
         pull = f"{repository}#{number}"
-        owner = self._owner_of_pull(repository, number)
+        owner = self._review_owner(repository, number)
         if owner is None:
             raise AgainRefused(f"no Work's chat registered {pull}")
         if self.reviewer_off:
@@ -2714,6 +3089,11 @@ class WorkRouterService:
             raise AgainRefused(
                 f"{pull} is not open and ready for review (a draft, closed, or unreadable now):"
                 " mark it ready with `gh pr ready` instead"
+            )
+        if no_verdict and self._has_verdict(pull, head):
+            raise AgainRefused(
+                f"{pull} at {head[:12]} has its verdict, so no review is missing: read it in"
+                " this chat or on the Work page, and do not ask a person about this refusal"
             )
         why = self._again_refusal(repository, number, head, no_verdict=no_verdict)
         if why:
@@ -2744,14 +3124,17 @@ class WorkRouterService:
     async def _note_answered(self, delivery: Delivery, event: Event, owner: Owner) -> None:
         """Write down that findings or an escalation answered the review of each pull request
         they are about, as a ``findings`` or ``escalated`` event at its live head, when that
-        head was sent for review and the text names its commit id and no other head sent for
-        review (#3828 review).
+        head was sent for review and the comment is about it alone: its heading names that
+        commit for that pull request (#4069), or with no heading at all its text names that
+        commit id and no other head sent for review (#3828 review).
 
         Only such a head may pass on the owner's acceptance (``accept``): the review was
         asked for and came back with something for the owner to accept. Findings about an
         older head that arrive after a push name that head, not the live one, so they never
         mark it (owner's decision on #3828); text naming no commit marks nothing, and the
-        agent asks for a fresh review instead.
+        agent asks for a fresh review instead. A heading names one commit however many older
+        rounds the body retells, so an escalation marks its head at once (owner's decision on
+        #4069).
         """
         named = {token.lower() for token in _SHA_RE.findall(event.text)}
         if not named:
@@ -2760,6 +3143,8 @@ class WorkRouterService:
         # this runs only once its message was stored.
         comment = delivery.payload.get("comment")
         posted = _when(_text(comment.get("created_at"))) if isinstance(comment, dict) else None
+        body = _text(comment.get("body")) if isinstance(comment, dict) else ""
+        headed = heading_targets(body, event.repository)
         pulls = self._verdict_pulls(event, owner)
         if pulls is None:
             read = getattr(getattr(self._release, "ports", None), "pulls", None)
@@ -2778,15 +3163,20 @@ class WorkRouterService:
                 continue
             # Exactly one head sent for review named, the live one (owner's decision on the
             # second #3828 escalation): text about an older head that mentions the new one
-            # in passing names two, and marks nothing.
+            # in passing names two, and marks nothing. A heading says which pull requests
+            # and commits it means, so only those count, whatever the body quotes.
             pull = f"{repository}#{number}"
+            if headed and pull not in headed:
+                continue
+            about = {headed[pull]} if headed else named
             asked = {e.head for e in self._history(pull) if e.kind == review_history.ASKED}
-            if {item for item in asked if any(item.startswith(t) for t in named)} == {head}:
+            if {item for item in asked if any(item.startswith(t) for t in about)} == {head}:
                 escalated = ESCALATED_ASK in event.text
                 kind = review_history.ESCALATED if escalated else review_history.FINDINGS
                 at = posted.timestamp() if posted is not None else None
                 key = f"answered:{delivery.delivery_id}:{pull}"
-                self._note(pull, head, kind, key, at=at, data={"told": True})
+                data = {"told": True, "text": review_history.clip_findings(body)}
+                self._note(pull, head, kind, key, at=at, data=data)
 
     async def accept(self, repository: str, number: int, note: str) -> dict:
         """Count the review of the pull request's ready head as a pass, because the owner
@@ -2810,13 +3200,29 @@ class WorkRouterService:
                 f"{pull} is not open and ready for review (a draft, closed, or unreadable now):"
                 " mark it ready with `gh pr ready` first"
             )
-        if not review_history.answered(self._history(pull), head):
+        history = self._history(pull)
+        if not review_history.answered(history, head):
             # Asked for is not answered (#3828 review): a review still running has returned
             # nothing the owner could have accepted.
-            raise AgainRefused(
+            why = (
                 f"no findings or escalation came back from a review of {pull} at {head[:12]},"
-                " so there is nothing at it to accept: wait for the review's verdict, and a"
-                " push after the review is reviewed as usual"
+                " so there is nothing at it to accept"
+            )
+            if review_history.head_review(review_history.at_head(history, head)).review_since:
+                # An escalation with no commit in its first line that retells older rounds
+                # names several heads, so its comment marks none; the review chat's closing line
+                # names the one it reviewed, minutes later (#4069). Waiting for that line costs
+                # no review round.
+                raise AgainRefused(
+                    why + " yet: its review is still open. If the reviewer's escalation or"
+                    " findings are already posted, its review chat's closing line records them"
+                    f" at {head[:12]} within minutes: register a 10-minute time wait"
+                    " (`wake-on` with `after_minutes`) and call `review-accepted` again then,"
+                    " rather than asking for a new review"
+                )
+            raise AgainRefused(
+                why + ": wait for the review's verdict, and a push after the review is"
+                " reviewed as usual"
             )
         answer = str(await self._release.owner_accepted(_work_id(owner), pull, head, note))
         from .work_release import PASS_RECORDED
@@ -2825,6 +3231,262 @@ class WorkRouterService:
             raise AgainRefused(answer)
         self.pending.discard(f"review:{pull}@{head}")
         return {"pull_request": pull, "head": head, "outcome": answer}
+
+    async def ship_now(self, repository: str, number: int, head: str = "") -> dict:
+        """Ship the pull request at the head its review sent back with findings, and leave
+        those findings to a follow-up Work (#4212): the owner's Ship now, fix later.
+
+        The head must be the one the reviewer answered, with no newer review asked for
+        (``review_history.shippable``), so nothing the reviewer never read ships. A draft the
+        agent made of it is marked ready first, and refused if the branch moved meanwhile. The
+        head is recorded, with its base, then its follow-up issue filed and recorded; only
+        then does the review count as a pass there, as an owner's acceptance does, so nothing
+        merges without a follow-up, and a press cut off on the way is finished by the next one
+        (``_ship_now``). A project that waits for a person's Merge gets that press too, since
+        this press is one. The issue quotes the findings and starts its own Work, whose review
+        reads the shipped change again (``chat_review.SHIPPED_NOTE``). The agent hears all of
+        it in one message.
+
+        ``head``, when given, is the head whose findings the owner's confirm showed: a live
+        head past it ships nothing (#4212 review).
+
+        Raises ``AgainRefused`` with the reason; answers ``pull_request``, ``head``,
+        ``follow_up`` (``owner/repo#n``) and ``outcome``.
+        """
+        repository = repository.lower()
+        pull = f"{repository}#{number}"
+        owner = self._owner_of_pull(repository, number)
+        if owner is None:
+            raise AgainRefused(f"no Work's chat registered {pull}")
+        ship = self._ship
+        if not self._switched(repository) or self._release is None or ship is None:
+            raise AgainRefused(f"the deck does not release {repository}'s Works")
+        try:
+            live, draft, base = await ship.open_head(repository, number)
+        except Exception:  # noqa: BLE001 - unreadable ships nothing
+            log.warning("work-router: %s unreadable for Ship now", pull, exc_info=True)
+            live, draft, base = "", False, ""
+        live, shown = (live or "").lower(), head.lower()
+        if len(live) != 40:
+            raise AgainRefused(f"{pull} is not open, or could not be read now")
+        if shown and live != shown:
+            raise AgainRefused(
+                f"{pull} moved past {shown[:12]}, whose findings the owner was shown, so it was"
+                " not shipped: its new head is reviewed as usual"
+            )
+        head = live
+        history = self._history(pull)
+        # One rule finishes a press (#4212 review): a head whose pass an earlier press recorded
+        # (``ship_pass_head``, the head it passed when base updates carried it) is finished
+        # by the next press, which records what is still missing and files nothing twice.
+        passed = review_history.ship_pass_head(history, head)
+        if passed:
+            earlier = ship.shipped(pull, passed)
+            if earlier is not None and earlier.follow_up and earlier.shipped:
+                raise AgainRefused(
+                    f"{pull} at {passed[:12]} was already shipped: its follow-up is"
+                    f" {earlier.follow_up}"
+                )
+            head, draft = passed, False
+        elif review_history.shippable(history, head) is None:
+            raise AgainRefused(
+                f"the review of {pull} at {head[:12]} has not come back with findings, or a"
+                " newer review of it is still running, so there is nothing to ship past yet"
+            )
+        key = f"{pull}@{head}"
+        if key in self._shipping:
+            raise AgainBusy(f"Ship now of {pull} at {head[:12]} is still running")
+        self._shipping.add(key)
+        try:
+            return await self._ship_now(
+                ship, owner, repository, number, head, draft, base, accepted=bool(passed)
+            )
+        finally:
+            self._shipping.discard(key)
+
+    async def _ship_now(
+        self,
+        ship: ShipPorts,
+        owner: tuple[str, str],
+        repository: str,
+        number: int,
+        head: str,
+        draft: bool,
+        base: str,
+        *,
+        accepted: bool = False,
+    ) -> dict:
+        """``ship_now`` past its checks, one press of a head at a time. Each step is kept
+        before the next, so a press cut off anywhere is finished by the next press: the head
+        is recorded, then its follow-up filed (or found, when an earlier filing's outcome was
+        not known) and recorded, then the review counts as passed (``accepted`` when an
+        earlier press recorded that), then a Work that waits for a Merge press has it, and
+        last the head is marked shipped. The release merges a Ship now pass only once it is
+        (``Ports.ship_unfinished``), so nothing merges without its follow-up, and a press
+        refused after its pass leaves the Work page offering Ship now again (#4212 review)."""
+        pull = f"{repository}#{number}"
+        history = self._history(pull)
+        text, url = review_history.findings_text(history, head)
+        if draft:
+            try:
+                readied = bool(await ship.mark_ready(repository, number))
+            except Exception:  # noqa: BLE001 - a draft not readied ships nothing
+                log.warning("work-router: could not mark %s ready", pull, exc_info=True)
+                readied = False
+            if not readied:
+                raise AgainRefused(f"{pull} is a draft and could not be marked ready")
+            if await self._live_ready_head(repository, number) != head:
+                raise AgainRefused(
+                    f"{pull} moved past {head[:12]} or is still a draft, so it was not shipped:"
+                    " a fix is already in review, and its new head is reviewed as usual"
+                )
+        issue = owner[1].lower()
+        ship.claim(pull, head, text, url, issue, base)  # False: an earlier press recorded it
+        record = ship.shipped(pull, head)
+        if record is None:
+            raise AgainRefused(f"{pull} at {head[:12]} could not be recorded, so nothing shipped")
+        issue_repository = issue.rpartition("#")[0]
+        follow_up = record.follow_up
+        if not follow_up:
+            follow_up, why = await self._file_follow_up(
+                ship,
+                issue_repository,
+                issue,
+                pull,
+                head,
+                record.findings,
+                record.url,
+                record.at,
+            )
+            if not follow_up:
+                raise AgainRefused(
+                    f"{pull} was not shipped: its follow-up issue could not be filed ({why})."
+                    " Press Ship now again; an issue already filed for it is found, not"
+                    " filed twice"
+                )
+        work_id = _work_id(owner)
+        from .work_release import MERGE_OFFERED, PASS_RECORDED, PressRefused
+
+        if accepted:
+            answer = f"Ship now of {pull} at {head[:12]} finished"
+        else:
+            answer = str(await self._release.owner_accepted(work_id, pull, head, SHIP_NOTE))
+            if not answer.startswith(PASS_RECORDED):
+                raise AgainRefused(f"{answer}; its follow-up {follow_up} is filed")
+        unfinished = (
+            f"so it does not merge yet. Its pass and its follow-up {follow_up} are recorded;"
+            " press Ship now again to finish it"
+        )
+        merge = ""
+        if self._release.approval(work_id) == MERGE_OFFERED:
+            # Pressing Ship now is the person's Merge too, on a project that waits for one.
+            try:
+                merge = str(await self._release.request_merge(work_id))
+            except PressRefused as refused:
+                raise AgainRefused(
+                    f"{pull}'s Merge was not recorded ({refused}), {unfinished}"
+                ) from None
+        if not self._mark_shipped(ship, pull, head):
+            raise AgainRefused(f"{pull} at {head[:12]} could not be marked shipped, {unfinished}")
+        self.pending.discard(f"review:{pull}@{head}")
+        try:
+            # Marked last, so the release looks again now: the pass held until here.
+            await self._release.evaluate(work_id)
+        except Exception:  # noqa: BLE001 - the release looks again at its next event
+            log.warning("work-router: release of %s after Ship now failed", pull, exc_info=True)
+        now = datetime.now(UTC)
+        self._deliver(
+            ScheduledMessage(
+                id=f"work-event:ship-now:{pull}@{head}",
+                chat_id=owner[0],
+                text=(
+                    f"AgentDeck: the owner chose Ship now on {pull} at {head[:12]}:"
+                    " it merges as it is once its tests are green, with no new review. Stop"
+                    " fixing the review's findings here and push nothing more to this pull"
+                    " request; a push would need a new review and hold the merge back. Its"
+                    f" findings were filed as {follow_up}, which starts its own Work; fix them"
+                    " there."
+                ),
+                due_at=now,
+                created_at=now,
+            )
+        )
+        outcome = f"{answer}; follow-up {follow_up}"
+        return {
+            "pull_request": pull,
+            "head": head,
+            "follow_up": follow_up,
+            "outcome": f"{outcome}; {merge}" if merge else outcome,
+        }
+
+    @staticmethod
+    def _mark_shipped(ship: ShipPorts, pull: str, head: str) -> bool:
+        """Mark ``pull`` at ``head`` shipped, the last step of a press: only then does the
+        release merge its pass, the Work page say Shipped, and the follow-up's review read it
+        as a shipped change (#4212 review). Whether it is marked, now or before."""
+        try:
+            if ship.note_shipped(pull, head):
+                return True
+            record = ship.shipped(pull, head)
+        except Exception:  # noqa: BLE001 - not marked: the next press marks it
+            log.warning("work-router: could not mark %s at %s shipped", pull, head[:12])
+            return False
+        return record is not None and bool(record.shipped)
+
+    async def _file_follow_up(
+        self,
+        ship: ShipPorts,
+        repository: str,
+        issue: str,
+        pull: str,
+        head: str,
+        text: str,
+        url: str,
+        since: float,
+    ) -> tuple[str, str]:
+        """File the follow-up issue of ``pull`` shipped at ``head``, record it and start its
+        Work: ``(owner/repo#n, "")``, or ``("", why not)``. An issue already carrying the
+        head's marker (an earlier press whose filing timed out, or whose record failed) is
+        taken instead of filing a second one; ``since`` is when the head was recorded, before
+        any filing of it."""
+        marker = SHIPPED_MARKER.format(pull=pull, head=head)
+        # Filed only once a whole read proves none was: an unread lookup files nothing, so a
+        # retried press never makes a second follow-up Work (#4212 review).
+        try:
+            number = await ship.find_filed(repository, marker, since)
+        except Exception as exc:  # noqa: BLE001 - unread is not "none filed"
+            log.warning("work-router: could not look for %s", marker, exc_info=True)
+            return "", f"whether one was already filed could not be read: {exc}"
+        if number is None:
+            title = f"Fix the review findings shipped in {pull}"
+            body = follow_up_body(issue, pull, head, text, url)
+            try:
+                outcome = await ship.file_issue(repository, title, body)
+            except Exception:  # noqa: BLE001 - a filing that raised may have been made
+                log.warning("work-router: filing %s's follow-up failed", pull, exc_info=True)
+                outcome = None
+            state = str(getattr(outcome, "state", ""))
+            found = _ISSUE_URL.search(str(getattr(outcome, "url", "") or ""))
+            if state == "done" and found is not None:
+                number = int(found.group(1))
+                try:
+                    self.note_filed(repository, number, self._start_labels(repository))
+                except Exception:  # noqa: BLE001 - its label starts it from GitHub's delivery too
+                    log.warning("work-router: could not start %s#%s", repository, number)
+            else:
+                # It may have been made all the same: look for it once more.
+                why = str(getattr(outcome, "text", "") or "it was not filed").rstrip(".")
+                try:
+                    number = await ship.find_filed(repository, marker, since)
+                except Exception:  # noqa: BLE001 - the next press reads again before filing
+                    log.warning("work-router: could not look for %s", marker, exc_info=True)
+                    return "", why
+                if number is None:
+                    return "", why
+        follow_up = f"{repository}#{number}"
+        if not ship.note_follow_up(pull, head, follow_up):
+            return "", f"{follow_up} was filed but could not be recorded"
+        return follow_up, ""
 
     async def _may_instruct(self, event: Event) -> bool:
         """Does the comment's author hold the project's Work tier, as the Poller requires?
@@ -2981,6 +3643,10 @@ class WorkRouterService:
         # review, and a later base merge of it compares with this digest.
         data = {**verdict.data, "digest": digest, "carried_from": before}
         self._note(pull, head, verdict.kind, f"carried:{key}", data=data)
+        if not owner[0]:
+            # A pull request no Work owns: only its check says so, and no chat waits.
+            self.pending.discard(f"review:{key}")
+            return ""
         now = datetime.now(UTC)
         delivered = self._deliver(
             ScheduledMessage(
@@ -3017,7 +3683,8 @@ class WorkRouterService:
         proved it a base merge away (``same_change``). Anything else is reviewed as usual.
         """
         release = self._release
-        if release is None or not hasattr(release, "no_code_head"):
+        if not owner[0] or release is None or not hasattr(release, "no_code_head"):
+            # With no Work the release has no record of it, and must not make one (#4152).
             return False
         pull = f"{event.repository}#{event.number}".lower()
         head = (head or event.head).lower()
@@ -3069,6 +3736,12 @@ class WorkRouterService:
         if self._spent(pull, event.head, event.again):
             self.pending.discard(pending_key)
             return
+        if event.again.startswith(NO_VERDICT) and self._has_verdict(pull, event.head):
+            # The verdict came while this ask waited for the open review chat to close. Its
+            # ``asked`` row would void that pass, as metso#77's did at 20:49 (#4089).
+            self.pending.discard(pending_key)
+            log.info("work-router: %s has its verdict; no-verdict ask dropped", key)
+            return
         if key in self._in_flight:
             return
         if self.reviewer_off:
@@ -3090,9 +3763,10 @@ class WorkRouterService:
                     return
             if (
                 self.pre_review_on
+                and owner[0]
                 and not asked
                 and not event.again
-                and self._held_for_checklist(
+                and await self._held_for_checklist(
                     owner, pull, event, again=event.explicit or checklist_again
                 )
             ):
@@ -3101,7 +3775,13 @@ class WorkRouterService:
         finally:
             self._in_flight.discard(key)
 
-    def _held_for_checklist(
+    def _has_verdict(self, pull: str, head: str) -> bool:
+        """Whether a verdict stands at ``head``, so an ask made for want of one has no reason
+        left (#4089). A review asked for after that verdict leaves none standing."""
+        events = review_history.at_head(self._history(pull), head)
+        return review_history.standing_verdict(events) is not None
+
+    async def _held_for_checklist(
         self, owner: Owner, pull: str, event: Event, *, again: bool = False
     ) -> bool:
         """Whether the review of ``event``'s head waits on the agent's pre-review (#3880).
@@ -3112,21 +3792,17 @@ class WorkRouterService:
         an older head never leaves it silent (#3896); the same head's is absorbed by its message
         id. A head the agent cleared goes on to review.
         """
-        events = self._history(pull)
-        if any(
-            item.kind == review_history.CHECKLIST_DONE
-            for item in review_history.at_head(events, event.head)
-        ):
-            return False
-        # Nothing to retry while the agent works through it: ``pre_review_done`` asks.
-        self.pending.discard(f"review:{pull}@{event.head}")
-        if review_history.checklist_waits(events) and not again:
-            covered = f"checklist-covered:{pull}@{event.head}"
-            self._note(pull, event.head, review_history.CHECKLIST, covered, data={"covered": True})
-            return True
+        settled = self._checklist_settled(pull, event, again=again)
+        if settled is not None:
+            return settled
+        grown = await self._growth(pull, event)
+        # The read let other work run, which may have sent a checklist or cleared this head.
+        settled = self._checklist_settled(pull, event, again=again)
+        if settled is not None:
+            return settled
         now = datetime.now(UTC)
         policy = f" The reviewer's full rules: {self._review_policy}" if self._review_policy else ""
-        text = PRE_REVIEW_TEXT.format(pull=pull, short=event.head[:12], policy=policy)
+        text = PRE_REVIEW_TEXT.format(pull=pull, short=event.head[:12], policy=policy, grown=grown)
         # A row the store refuses is kept pending and sent later by ``_deliver`` itself.
         self._deliver(
             ScheduledMessage(
@@ -3144,6 +3820,51 @@ class WorkRouterService:
         log.info("work-router: %s@%s waits on its pre-review", pull, event.head)
         return True
 
+    def _checklist_settled(self, pull: str, event: Event, *, again: bool) -> bool | None:
+        """Whether ``_held_for_checklist`` is answered without sending a checklist: ``False``
+        once the agent cleared the head, ``True`` for a push a waiting checklist covers, and
+        ``None`` when this head's checklist is to be sent."""
+        events = self._history(pull)
+        if any(
+            item.kind == review_history.CHECKLIST_DONE
+            for item in review_history.at_head(events, event.head)
+        ):
+            return False
+        # Nothing to retry while the agent works through it: ``pre_review_done`` asks.
+        self.pending.discard(f"review:{pull}@{event.head}")
+        if review_history.checklist_waits(events) and not again:
+            covered = f"checklist-covered:{pull}@{event.head}"
+            self._note(pull, event.head, review_history.CHECKLIST, covered, data={"covered": True})
+            return True
+        return None
+
+    async def _growth(self, pull: str, event: Event) -> str:
+        """``GROWN_TEXT`` for ``event``'s head, or "" (#4220).
+
+        The previous round is the head of the newest ``asked`` row at another head, whoever
+        wrote it: the router's own ask, a ``review-request``, the backstop or a person's press
+        on the Review form or Work page. A checklist not yet cleared is no round. Both sizes
+        are read from GitHub here, so no review start has to record one; unread is nothing.
+        """
+        if self._diff_sizes is None:
+            return ""
+        rounds = [
+            item
+            for item in self._history(pull)
+            if item.kind == review_history.ASKED and item.head.lower() != event.head.lower()
+        ]
+        previous = max(rounds, key=lambda item: (item.at, item.seq), default=None)
+        if previous is None:
+            return ""
+        heads = (previous.head.lower(), event.head.lower())
+        try:
+            sizes = await self._diff_sizes(event.repository, event.number, heads)
+        except Exception:  # noqa: BLE001 - unread: the checklist goes out without the point
+            log.warning("work-router: sizes of %s unread", pull, exc_info=True)
+            return ""
+        sizes = {str(head).lower(): size for head, size in (sizes or {}).items()}
+        return _grown(sizes.get(heads[0]), sizes.get(heads[1]))
+
     def _checklist_waits(self, event: Event) -> bool:
         """Whether ``event``'s pull request has a pre-review checklist waiting (#3896)."""
         return self.pre_review_held(f"{event.repository}#{event.number}")
@@ -3157,8 +3878,9 @@ class WorkRouterService:
         ready head now, and register the chat's wait on its verdict.
 
         Raises ``AgainRefused`` with the reason when it is not ready, or its ready head was
-        already asked about. Answers ``asked``, ``pending`` (the start is retried on its own)
-        or ``not reviewed`` (its diff was already reviewed, and the chat was told so).
+        already asked about. Answers ``asked``, ``pending`` (the start is retried on its own,
+        or another call is starting it right now, #4208) or ``not reviewed`` (its diff was
+        already reviewed, and the chat was told so).
 
         A ready head nobody asked about is asked about even with no checklist waiting: a
         reload that cut off an earlier call between dropping the hold and asking (#3893), or a
@@ -3188,7 +3910,10 @@ class WorkRouterService:
         await self._review(owner, Event(REVIEW, repository, number, True, head=head))
         if self._spent(pull, head):
             outcome = "asked"
-        elif f"review:{key}" in self.pending:
+        elif f"review:{key}" in self.pending or key in self._in_flight:
+            # In flight: another call (the ready event, or one just before) is starting this
+            # very review, so ``_review`` returned at once. Twice on store#3943 that answered
+            # "not reviewed" and the agent went to the logs to find its review (#4208).
             outcome = "pending"
         else:
             return {"pull_request": pull, "head": head, "outcome": "not reviewed"}
@@ -3254,6 +3979,76 @@ class WorkRouterService:
         key = f"asked:{pull}@{event.head}+{event.again}"
         self._note(pull, event.head, review_history.ASKED, key, data=data)
 
+
+def _grown(before: object, after: object) -> str:
+    """``GROWN_TEXT`` when ``after`` changed lines grew past ``GROWTH_PERCENT`` and
+    ``GROWTH_FLOOR`` of the previous round's ``before`` (#4220); "" when either is unread."""
+    if not _lines(before) or not _lines(after):
+        return ""
+    growth = after - before
+    if before <= 0 or growth < GROWTH_FLOOR or growth * 100 <= before * GROWTH_PERCENT:
+        return ""
+    return GROWN_TEXT.format(before=before, after=after, percent=growth * 100 // before)
+
+
+def _lines(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+@dataclass(frozen=True)
+class ShipPorts:
+    """What Ship now, fix later reads and writes beyond the router's own ports (#4212).
+
+    ``open_head(repository, n)`` is ``(head, draft, base commit)`` of the open pull request
+    read live, or ``("", False, "")``; ``mark_ready`` takes it out of draft; ``file_issue
+    (repository, title, body)`` files the follow-up with the repository's ownership label,
+    answering a ``new_work.Outcome``; ``find_filed(repository, marker, since)`` is the number of
+    an issue updated since then whose body carries ``marker``, ``None`` only when every such
+    issue was read, and raises when they could not be. ``claim``, ``note_follow_up``,
+    ``note_merged`` (a pull request's merge commit, on its heads not yet merged),
+    ``note_shipped`` (the head shipped: its review counted as passed) and
+    ``shipped`` are the ``shipped_follow_ups`` table, ``claim`` answering
+    ``False`` for a head already recorded; its last two arguments are the shipping Work's
+    issue, which chains a follow-up shipped again, and the base commit.
+    """
+
+    open_head: Callable[[str, int], Awaitable[tuple[str, bool, str]]]
+    mark_ready: Callable[[str, int], Awaitable[bool]]
+    file_issue: Callable[[str, str, str], Awaitable[object]]
+    find_filed: Callable[[str, str, float], Awaitable[int | None]]
+    claim: Callable[[str, str, str, str, str, str], bool]
+    note_follow_up: Callable[[str, str, str], bool]
+    note_merged: Callable[[str, str], bool]
+    note_shipped: Callable[[str, str], bool]
+    shipped: Callable[[str, str], review_history.ShippedFollowUp | None]
+
+
+#: The owner's note kept on a pass that ships its findings to a follow-up (#4212).
+SHIP_NOTE = review_history.SHIP_NOTE
+
+_ISSUE_URL = re.compile(r"/issues/(\d+)/?$")
+#: Names the shipped head in its follow-up issue, for a person and any later reader.
+SHIPPED_MARKER = "<!-- agentdeck-shipped: {pull}@{head} -->"
+
+
+def follow_up_body(issue: str, pull: str, head: str, text: str, url: str) -> str:
+    """The follow-up issue of ``pull`` shipped at ``head`` with findings left (#4212)."""
+    if text:
+        # Quoted, and a ``<`` escaped so nothing in them reads as the deck's own marker.
+        quoted = "\n".join(f"> {line}".rstrip() for line in text.replace("<", "&lt;").splitlines())
+        where = f"\n\nPosted in {url}." if url else ""
+        findings = quoted + where
+    elif url:
+        findings = f"The review posted them in {url}."
+    else:
+        findings = f"Read them in the review comments on {issue}."
+    return (
+        f"Follow-up to {issue}: {pull} shipped at `{head}` with its review's findings left for"
+        " this Work (Ship now).\n\n"
+        "Fix these findings in a new pull request. Its review also reads the whole change"
+        f" {pull} shipped, to find what the first review missed.\n\n"
+        f"## The findings\n\n{findings}\n\n" + SHIPPED_MARKER.format(pull=pull, head=head) + "\n"
+    )
 
 class AgainRefused(ValueError):
     """A request to review a head again that the router turns down, with the reason."""
@@ -3388,16 +4183,26 @@ def owner_of_pull(state, repository: str, number: int) -> Owner | None:
 def _place_pull(state, legs: dict[str, str], projection) -> Owner | None:
     """``owner_of_pull``'s rule for the legs that registered one pull request.
 
-    ``legs`` maps each leg to the Work its registration named, "" for none. The Work the
-    chosen chat's registration named wins while the chat is still in it (#3392); otherwise
-    the one Work the chat joined. ``projection`` is called only once a chat is found, and
-    the caller may hand the same projection to every pull request it places.
+    ``legs`` maps each leg to the Work its registration named, "" for none. A registration
+    naming a Work its chat joined says what the pull request is for, so only those chats are
+    weighed, however long ago the others last moved (#4125). The Work the chosen chat's
+    registration named wins while the chat is still in it (#3392); otherwise the one Work the
+    chat joined. ``projection`` is called only once a chat or a named Work is found, and the
+    caller may hand the same projection to every pull request it places.
     """
-    chat = _latest_chat(state, (state.chat_identity_key(leg) for leg in legs))
-    if chat is None:
-        return None
     from .work import WorkRef
 
+    def joined_named(leg: str, work_id: str) -> bool:
+        ref = WorkRef.from_work_id(work_id)
+        return ref is not None and any(
+            (work.repository.lower(), work.number) == (ref.repository, ref.number)
+            for work in projection().works_chat_joined(state.chat_identity_key(leg))
+        )
+
+    named_legs = [leg for leg, work_id in legs.items() if work_id and joined_named(leg, work_id)]
+    chat = _latest_chat(state, (state.chat_identity_key(leg) for leg in named_legs or legs))
+    if chat is None:
+        return None
     works = projection().works_chat_joined(chat)
     named = {
         (ref.repository, ref.number)
@@ -3434,12 +4239,17 @@ def pulls_lookup(state) -> Callable[[str], tuple[str, ...]]:
     return lambda work_id: placed.get(work_id.partition(":")[2].lower(), ())
 
 
-def pulls_by_work(state) -> dict[str, tuple[str, ...]]:
+def pulls_by_work(
+    state, work_projection=None, only: Collection[tuple[str, int]] | None = None
+) -> dict[str, tuple[str, ...]]:
     """Each Work's registered pull requests, keyed by lowercased ``owner/repo#n`` of the Work.
 
     One walk of the registrations and one Work projection for the whole deck (#2954): asking
     ``owner_of_pull`` for each of thousands of registered pull requests walked them all again
-    and rebuilt the projection's key every time.
+    and rebuilt the projection's key every time. ``work_projection`` is a caller's
+    already-built Work grouping. The Work pages read this too, so they list what the release
+    holds (#4125), and pass ``only``, the ``PullRequestRef.identity`` of the pull requests
+    they show: placing every one of the deck's doubled the time of a Work page.
     """
     from . import work_counter
 
@@ -3448,7 +4258,7 @@ def pulls_by_work(state) -> dict[str, tuple[str, ...]]:
     for leg, refs in tuple(state.session_pull_requests.items()):
         for ref in refs:
             legs_by_pull.setdefault(ref.identity, {}).setdefault(leg, ref.work_id)
-    projected = None
+    projected = work_projection
 
     def projection():
         nonlocal projected
@@ -3458,6 +4268,8 @@ def pulls_by_work(state) -> dict[str, tuple[str, ...]]:
 
     found: dict[str, set[str]] = {}
     for (repository, number), legs in legs_by_pull.items():
+        if only is not None and (repository, number) not in only:
+            continue
         owner = _place_pull(state, legs, projection)
         if owner is not None:
             found.setdefault(owner[1].lower(), set()).add(f"{repository}#{number}")

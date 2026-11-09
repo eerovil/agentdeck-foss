@@ -22,6 +22,7 @@ from agentdeck.poller_ops import work_accounts, work_start_labels
 from agentdeck.webhook_tailer import WebhookTailer
 from agentdeck.work import WorkRef
 from agentdeck.work_router import HANDED_OVER, WorkRouterService
+from agentdeck.work_signals import start_unless_blocked
 from agentdeck.work_start import start_action_id, start_work_agent
 
 ISSUE = "eerovil/agentdeck"
@@ -111,6 +112,69 @@ async def test_the_ownership_label_on_an_unowned_issue_starts_its_work(root):
     seen: list = []
     assert await route(root, labels=seen) == [(ISSUE, 7)]
     assert seen == [["agent", "spec-only"]]
+
+
+@pytest.mark.parametrize(
+    ("blockers", "outcome"),
+    [
+        (["acme/x#5"], "waits on a blocker"),
+        ([], "started"),
+        # Unread: held too, and tried again (#4216 review).
+        (None, "blockers unread"),
+        (RuntimeError("gh is down"), "blockers unread"),
+    ],
+)
+async def test_a_work_with_an_open_or_unread_blocker_is_not_started(blockers, outcome):
+    """#4216: the owner expected a labelled issue to wait for its blockers; every start the
+    deck makes by itself asks ``start_unless_blocked`` first."""
+    asked = []
+
+    async def read(repository, number):
+        if isinstance(blockers, Exception):
+            raise blockers
+        return blockers
+
+    async def runtime(repository, number, **kwargs):
+        asked.append((repository, number, kwargs))
+        return "started"
+
+    answer = await start_unless_blocked(runtime, ISSUE, 7, blockers=read, labels=["agent"])
+    assert answer == outcome
+    assert asked == ([(ISSUE, 7, {"labels": ["agent"]})] if outcome == "started" else [])
+
+
+async def test_a_retry_after_a_refusal_waits_on_a_blocker_added_since(root):
+    """#4216 review: the first start was refused, a blocker was added before the retry, and
+    the retry must not start the agent; it is dropped, as the last blocker closing starts it.
+    An unread list keeps the retry instead."""
+    blockers: list = [[]]
+    answers = iter(["refused: busy", "started"])
+    asked = []
+
+    async def read(repository, number):
+        return blockers[0]
+
+    async def runtime(repository, number, **kwargs):
+        asked.append(number)
+        return next(answers)
+
+    service, _ = router(root)
+    service._start_work = lambda repository, number, **kwargs: start_unless_blocked(
+        runtime, repository, number, blockers=read, **kwargs
+    )
+    labelled(root, "d1", labels=("agent",))
+    tailer = WebhookTailer(root, consumer="work-router")
+    await service.apply(list(tailer.deliveries()))
+    key = f"start:github_issue:{ISSUE}#7"
+    assert asked == [7] and key in service.pending.entries
+
+    blockers[0] = None
+    await service._retry_start(key, service.pending.entries[key])
+    assert asked == [7] and key in service.pending.entries
+
+    blockers[0] = ["eerovil/agentdeck#5"]
+    await service._retry_start(key, service.pending.entries[key])
+    assert asked == [7] and key not in service.pending.entries
 
 
 @pytest.mark.parametrize(
@@ -337,6 +401,12 @@ class FakeDb:
             self.actions.pop(action_id, None)
             self.settled.pop(action_id, None)
 
+    def work_start_choice(self, work_id):
+        return getattr(self, "choices", {}).get(work_id)
+
+    def work_agent_chat(self, work_id):
+        return getattr(self, "agent_chats", {}).get(work_id)
+
     def record_work_side_chat(self, action_id, work_id, pulls):
         self.side_chats[action_id] = work_id
         return True
@@ -393,7 +463,7 @@ def fake_runtime(handler=claimed) -> tuple[httpx.AsyncClient, list[dict]]:
     asked: list[dict] = []
 
     def record(request: httpx.Request) -> httpx.Response:
-        asked.append({"route": request.url.path, **json.loads(request.content)})
+        asked.append({"route": request.url.path, **json.loads(request.content or "{}")})
         return handler(request)
 
     transport = httpx.MockTransport(record)
@@ -571,6 +641,46 @@ async def test_a_finished_work_asks_the_runtime_to_release_its_worktrees(tmp_pat
     await work_start.release_work_worktrees(app, "github_issue:eerovil/agentdeck#7")  # no raise
 
 
+async def test_only_a_work_closed_three_days_ago_is_asked_to_give_its_worktrees_back(tmp_path):
+    now = datetime(2026, 11, 6, 12, tzinfo=UTC)
+
+    def closed(days):
+        return {"state": "closed", "closedAt": (now - timedelta(days=days)).isoformat()}
+
+    records = {
+        ("a/b", 1): closed(3),
+        ("a/b", 2): closed(2.9),
+        ("a/b", 3): {"state": "open"},
+        ("a/b", 5): closed(30),
+        ("a/b", 6): closed(30),
+        ("a/b", 7): {"state": "closed"},  # cached before it carried closedAt
+    }
+    claims = [{"work_id": f"github_issue:a/b#{n}"} for n in (1, 1, 2, 3, 4, 5, 7)]
+    claims += [
+        {"work_id": "github_issue:a/b#6", "release_requested_at": "2026-11-01"},
+        {"work_id": "not a work"},
+    ]
+
+    def runtime(request):
+        if request.url.path == work_start.CLAIMS_PATH:
+            return httpx.Response(200, json={"claims": claims})
+        if json.loads(request.content)["work_id"].endswith("#5"):
+            return httpx.Response(200, json={"released": [], "kept": "/x: it is busy"})
+        done = {"path": "/w", "released": True, "pending": ""}
+        return httpx.Response(200, json={"released": [done, done], "kept": ""})
+
+    app, _db, _injector = fake_app(tmp_path, runtime=runtime)
+    app.state.issues = SimpleNamespace(cached_issues=lambda refs: records)
+
+    result = await work_start.release_closed_work_worktrees(app, now=now)
+
+    assert result == {"released": 2, "kept": {"github_issue:a/b#5": "/x: it is busy"}}
+    assert app.state.runtime_asked[1:] == [
+        {"route": work_start.RELEASE_IDLE_PATH, "work_id": f"github_issue:a/b#{n}"}
+        for n in (1, 5)
+    ]
+
+
 async def test_a_second_start_of_the_same_work_starts_nothing(tmp_path, startable):
     app, _, injector = fake_app(tmp_path)
 
@@ -586,8 +696,9 @@ class FakeSpares:
         self.folder = folder
         self.events: list[str] = []
 
-    def claim_work(self, repository, *, account_key):
-        self.events.append(f"claim {repository} {account_key}")
+    def claim_work(self, repository, *, account_key, model=None, effort=None):
+        picked = "".join(f" {value}" for value in (model, effort) if value)
+        self.events.append(f"claim {repository} {account_key}{picked}")
         return "spare-token", "chat-spare", self.folder
 
     def replenish_after(self, name, answer):
@@ -1264,6 +1375,102 @@ async def test_the_work_starts_on_the_account_its_project_chose(tmp_path, monkey
     assert work_start.start_account(app, ISSUE).key == "claude_code:main"
 
 
+async def test_a_work_starts_on_the_account_and_model_picked_in_new_work(tmp_path, startable):
+    """#4181: the press's pick, saved under the Work, is what every start of it runs on."""
+    from agentdeck.db import StartChoice
+    from agentdeck.providers import PROVIDERS
+
+    app, db, injector = fake_app(tmp_path)
+    _accounts(app, "claude_code:main", "claude_code:alt")
+    spare = str(startable / ".worktrees" / "work-spare-1a2b3c4d")
+    app.state.start_spares = FakeSpares(spare)
+    db.choices = {
+        "github_issue:eerovil/agentdeck#7": StartChoice("claude_code:alt", "opus", "high"),
+        "github_issue:eerovil/agentdeck#8": StartChoice("claude_code:gone"),
+    }
+
+    assert await start_work_agent(app, ISSUE, 7) == "started"
+    (call,) = injector.calls
+    assert (call["account"], call["model"], call["effort"]) == ("claude_code:alt", "opus", "high")
+    # The spare is asked for the pick, so one booted with the defaults is not taken.
+    assert app.state.start_spares.events[0] == "claim eerovil/agentdeck claude_code:alt opus high"
+    # A picked account that may not start now starts nothing, rather than another account.
+    assert await start_work_agent(app, ISSUE, 8) == "no account"
+    assert len(injector.calls) == 1
+
+    # The early start takes the press's own pick; a model alone leaves the account to usage.
+    early = await work_start.start_before_issue(
+        app, ISSUE, request="Chart labels", press="press-2", choice=StartChoice(model="sonnet")
+    )
+    assert early is not None
+    last = injector.calls[-1]
+    assert (last["model"], last["effort"]) == ("sonnet", None)
+    assert last["account"] in {"claude_code:main", "claude_code:alt"}
+    # An unknown model (an old pick, a renamed one) is the account's default, never sent.
+    assert work_start.chosen_options(StartChoice(model="gpt-9"), PROVIDERS["claude_code"]) == {
+        "model": None,
+        "effort": None,
+    }
+
+
+async def test_a_codex_pick_starts_the_work_on_codex_after_its_issue_exists(
+    tmp_path, startable, monkeypatch
+):
+    """#4181: a Codex account may be picked, though the deck's own choice stays Claude.
+
+    Its start waits for the issue: the early start's bind reaches a Claude worker by key."""
+    from agentdeck.db import StartChoice
+    from agentdeck.providers import PROVIDERS
+
+    monkeypatch.setattr(PROVIDERS["codex"], "can_start_session", lambda account: True)
+    app, db, injector = fake_app(tmp_path)
+    _accounts(app, "codex:codex", "claude_code:main")
+    app.state.start_spares = FakeSpares(str(startable / ".worktrees" / "work-spare-1a2b3c4d"))
+    pick = StartChoice("codex:codex", "gpt-6-sol", "ultra")
+    db.choices = {"github_issue:eerovil/agentdeck#9": pick}
+
+    # Auto never lands on Codex, and a Claude model is not sent to it.
+    assert [a.key for a in work_start.work_accounts(app, ISSUE)] == ["claude_code:main"]
+    assert work_start.start_account(app, ISSUE).key == "claude_code:main"
+    assert work_start.chosen_options(StartChoice(model="opus"), PROVIDERS["codex"])["model"] is None
+    early = await work_start.start_before_issue(
+        app, ISSUE, request="Chart labels", press="press-9", choice=pick
+    )
+    assert early is None and injector.calls == []
+    assert await start_work_agent(app, ISSUE, 9) == "started"
+    (call,) = injector.calls
+    assert (call["account"], call["model"], call["effort"]) == ("codex:codex", "gpt-6-sol", "ultra")
+    assert call["role"] == "work" and "worker_key" not in call
+
+
+def test_a_chats_pick_is_its_one_works_pick(tmp_path):
+    """#4181: a usage move and Continue read the pick through the chat's one Work."""
+    from agentdeck.db import StartChoice
+
+    app, db, _injector = fake_app(tmp_path)
+    joined = {"chat-1": (WorkRef(ISSUE, 7),), "chat-2": (WorkRef(ISSUE, 7), WorkRef(ISSUE, 8))}
+    projection = SimpleNamespace(works_chat_joined=lambda chat: joined.get(chat, ()))
+    app.state.app_state = SimpleNamespace(
+        work_projection=lambda: projection, chat_identity_key=lambda key: key
+    )
+    db.choices = {"github_issue:eerovil/agentdeck#7": StartChoice(model="opus")}
+    db.agent_chats = {"github_issue:eerovil/agentdeck#7": "chat-1"}
+
+    assert work_start.session_start_choice(app, "chat-1") == StartChoice(model="opus")
+    # A reviewer or helper chat joined to the same one Work is not its agent: no pick.
+    joined["reviewer"] = (WorkRef(ISSUE, 7),)
+    assert work_start.session_start_choice(app, "reviewer") is None
+    # The agent chat later asked for another Work still follows its own Work's pick.
+    joined["chat-1"] = (WorkRef(ISSUE, 7), WorkRef(ISSUE, 9))
+    assert work_start.session_start_choice(app, "chat-1") == StartChoice(model="opus")
+    # A chat that is the own agent of two Works has no one pick.
+    db.agent_chats["github_issue:eerovil/agentdeck#9"] = "chat-1"
+    assert work_start.session_start_choice(app, "chat-1") is None
+    # In Works it is not the agent of, or in none: no pick to follow.
+    assert work_start.session_start_choice(app, "chat-2") is None
+    assert work_start.session_start_choice(app, "chat-3") is None
+
+
 def _usage(tmp_path, account, *, five_hour, seven_day):
     now = datetime.now(UTC)
     folder = tmp_path / "usage"
@@ -1308,12 +1515,14 @@ async def test_the_first_message_says_whether_the_project_merges_on_its_own(
     repository (here only the auto-releasing one does).
     #3134: an issue carrying the spec-only label is told to write the spec, not build it.
     #3147: it is told which repositories its CI or its review proves, so it runs no job there.
-    #3919: and which need its CI green beside the job."""
+    #3919: and which need its CI green beside the job.
+    #4172: and which repository of a project that waits merges on its own."""
     evidence = '[[repos]]\nid = "agent-evidence"\nholds_artifacts = true\n'
     proven = (
         '[[repos]]\nid = "store"\nholds_code = true\nverification = "github_checks"\n'
         '[[repos]]\nid = "docs"\nholds_code = true\nverification = "review_only"\n'
         '[[repos]]\nid = "games"\nholds_code = true\ngithub_checks_required = true\n'
+        '[[repos]]\nid = "robot"\nholds_code = true\nauto_release = true\n'
     )
     _manifest(
         tmp_path / "poller",
@@ -1344,6 +1553,9 @@ async def test_the_first_message_says_whether_the_project_merges_on_its_own(
     if not auto_release:
         wanted += (
             " "
+            # #4172: the one repository that merges on its own all the same.
+            + work_start.REPO_MERGES_ITSELF.format(repos="`eerovil/robot`")
+            + " "
             + work_start.CI_TESTS_TEXT.format(repos="`eerovil/store`")
             + " "
             + work_start.REVIEW_ONLY_TEXT.format(repos="`eerovil/docs`")

@@ -10,7 +10,7 @@ read; the route in ``web/routes_works.py`` makes the one write.
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -116,3 +116,48 @@ def context_line(issue: IssueRef, pulls: Sequence[PullRequestRef]) -> str:
 
 def first_message(issue: IssueRef, pulls: Sequence[PullRequestRef], text: str) -> str:
     return f"{context_line(issue, pulls)}\n\n{text.strip()}"
+
+
+# --- the side chat of a working Work (#4199) ------------------------------------------------
+
+# A side chat whose last activity is older than this starts afresh on the next press: a little
+# under the provider's one-hour prompt cache, so a carried-on side chat still reads its history
+# from the cache instead of paying for all of it again.
+SIDE_CHAT_FRESH = timedelta(minutes=55)
+
+
+def working_chat(chats: Sequence[Any]) -> Any | None:
+    """The chat a side chat copies: the Work's working chat, else its most recently active
+    one; None when the Work has no chat. A reviewer's chat is never the one."""
+    floor = datetime.min.replace(tzinfo=UTC)
+    own = [chat for chat in chats if not getattr(chat, "reviewer", False)]
+    ranked = sorted(
+        own, key=lambda chat: (bool(chat.working), chat.last_activity or floor), reverse=True
+    )
+    return ranked[0] if ranked else None
+
+
+def side_chat_fresh(last_activity: datetime | None, now: datetime | None = None) -> bool:
+    """Whether a side chat last active then is still worth carrying on."""
+    if last_activity is None:
+        return False
+    if last_activity.tzinfo is None:
+        last_activity = last_activity.replace(tzinfo=UTC)
+    return (now or datetime.now(UTC)) - last_activity < SIDE_CHAT_FRESH
+
+
+def side_chat_message(issue: IssueRef, agent_key: str) -> str:
+    """The side chat's first message: answer only, where the agent's newer messages are, and
+    how to pass the owner's words on, only when asked. The deck pastes nothing else in."""
+    owner, _, repo = issue.repository.partition("/")
+    return (
+        f"You are a side chat of the agent working on {issue.repository}#{issue.number}. "
+        "The owner asks you questions while that agent keeps working in this same folder. "
+        "Answer them; change no files and start no work. "
+        f"The agent's chat is {agent_key}; when a question needs what it did after this copy, "
+        f"read `$AGENTDECK_URL/sessions/{agent_key}/transcript.json`. "
+        "When — and only when — the owner asks you to tell the agent something, send it with "
+        f"`POST $AGENTDECK_URL/api/works/{owner}/{repo}/{issue.number}/message` and "
+        '`{"text": "The owner says: <their words>", "from": "<your session key>"}`, '
+        "and say that you sent it."
+    )

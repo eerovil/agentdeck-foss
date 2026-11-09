@@ -1,4 +1,4 @@
-// The New work form (#2415): which repository it starts on, whether it can attach files, and
+// The New work form (#2415): which repository it starts on, whether it offers Spec only, and
 // clearing it once a filing is known to have landed. Everything else — the draft kept across
 // reloads, file chips, paste-a-screenshot, the press's action id — is the deck's own composer
 // code, which applies because the form has the composer's shape.
@@ -19,22 +19,85 @@
     var select = form.querySelector('[data-new-work-repository]');
     var option = select && select.selectedOptions[0];
     if (!option) return;
-    var evidence = option.getAttribute('data-evidence') || '';
-    var attach = form.querySelector('[data-new-work-attach]');
-    if (attach) {
-      attach.hidden = !evidence;
-      var name = attach.querySelector('[data-new-work-evidence]');
-      if (name) name.textContent = evidence;
-      var files = attach.querySelector('input[type="file"][name="images"]');
-      // A project with nowhere to keep files must not send the ones picked for another.
-      if (!evidence && files && files.files && files.files.length) {
-        files.value = '';
-        files.dispatchEvent(new Event('change', { bubbles: true }));
-      }
-    }
     var spec = form.querySelector('[data-new-work-spec-only]');
     if (spec) spec.hidden = !option.getAttribute('data-spec-only');
+    syncAccounts(form, option.value.toLowerCase());
     warm(form);
+  }
+
+  // Edit advanced (#4181): only the accounts this repository's Work may run on are offered;
+  // a pick the new repository cannot take goes back to Auto. Where a Poller starts the Work
+  // nothing reads a pick, so the box is hidden and every pick in it cleared and not sent.
+  function syncAccounts(form, repository) {
+    var box = form.querySelector('[data-new-work-advanced]');
+    var select = form.querySelector('[data-new-work-account]');
+    if (!box || !select) return;
+    var served = (box.getAttribute('data-repositories') || '').split(' ');
+    var offered = served.indexOf(repository) !== -1;
+    box.hidden = !offered;
+    if (!offered) box.open = false;
+    Array.prototype.forEach.call(box.querySelectorAll('select'), function (each) {
+      if (!offered) each.value = '';
+      each.disabled = !offered;
+    });
+    keepOnly(select, function (option) {
+      var serves = option.getAttribute('data-repositories');
+      return serves === null || serves.split(' ').indexOf(repository) !== -1;
+    });
+    syncProvider(form);
+  }
+
+  // The model and effort lists are the chosen account's provider's own; Auto is the deck's
+  // choice, a Claude account. A pick the other provider does not offer goes back to Default.
+  function syncProvider(form) {
+    var box = form.querySelector('[data-new-work-advanced]');
+    var account = form.querySelector('[data-new-work-account]');
+    if (!box || !account) return;
+    var option = account.value ? account.selectedOptions[0] : null;
+    var provider = (option && option.getAttribute('data-provider'))
+      || box.getAttribute('data-auto-provider') || '';
+    ['[data-new-work-model]', '[data-new-work-effort]'].forEach(function (name) {
+      var select = form.querySelector(name);
+      if (!select) return;
+      keepOnly(select, function (each) {
+        var own = each.getAttribute('data-provider');
+        return own === null || own === provider;
+      });
+    });
+    summarize(form);
+  }
+
+  // Leaves only the options ``wanted`` keeps. They are taken out, not hidden: mobile Safari
+  // shows a hidden option anyway. The first call keeps every option, to rebuild from later.
+  function keepOnly(select, wanted) {
+    if (!select._allOptions) select._allOptions = Array.prototype.slice.call(select.options);
+    var previous = select.value;
+    var kept = select._allOptions.filter(wanted);
+    select.textContent = '';
+    kept.forEach(function (option) {
+      option.hidden = false;
+      option.disabled = false;
+      select.appendChild(option);
+    });
+    select.value = kept.some(function (o) { return o.value === previous; }) ? previous : '';
+  }
+
+  // The collapsed line names what the Work will run on, so nothing picked is hidden.
+  function summarize(form) {
+    var line = form.querySelector('[data-new-work-advanced-summary]');
+    if (!line) return;
+    function picked(name, fallback) {
+      var select = form.querySelector(name);
+      var option = select && select.value ? select.selectedOptions[0] : null;
+      return option ? option.textContent.trim() : fallback;
+    }
+    var parts = [
+      picked('[data-new-work-account]', 'Auto account'),
+      picked('[data-new-work-model]', 'default model')
+    ];
+    var effort = picked('[data-new-work-effort]', '');
+    if (effort) parts.push(effort + ' effort');
+    line.textContent = parts.join(' · ');
   }
 
   // While the form is open, the deck keeps a Work's agent booted for the chosen repository
@@ -222,6 +285,12 @@
   });
 
   document.addEventListener('change', function (event) {
+    var advanced = '[data-new-work-account], [data-new-work-model], [data-new-work-effort]';
+    if (event.target.matches && event.target.matches('[data-new-work-account]')) {
+      syncProvider(event.target.form);
+    } else if (event.target.matches && event.target.matches(advanced)) {
+      summarize(event.target.form);
+    }
     if (event.target.matches && event.target.matches('[data-new-work-repository]')) {
       // Only a person's pick fires `change`; the guesses above set the value quietly.
       var form = event.target.form;

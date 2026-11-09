@@ -286,8 +286,14 @@ class RouterLink:
     async def accept(self, *args: Any, **kwargs: Any) -> dict:
         return await self._transport.call("router", "accept", args, kwargs)
 
+    async def ship_now(self, *args: Any, **kwargs: Any) -> dict:
+        return await self._transport.call("router", "ship_now", args, kwargs)
+
     async def pre_review_done(self, *args: Any, **kwargs: Any) -> dict:
         return await self._transport.call("router", "pre_review_done", args, kwargs)
+
+    async def check_request(self, *args: Any, **kwargs: Any) -> dict | None:
+        return await self._transport.call("router", "check_request", args, kwargs)
 
 
 def _not_in_the_web(*_args: Any, **_kwargs: Any) -> Any:
@@ -337,11 +343,14 @@ class ReleaseLink:
     def queue(self, repository: str) -> list[dict]:
         return self._reader.queue(repository)
 
-    def approval(self, work_id: str) -> str:
-        return self._reader.approval(work_id)
+    def approval(self, work_id: str, pulls=None) -> str:
+        return self._reader.approval(work_id, pulls)
 
     def approval_waits(self, work_id: str) -> str:
         return self._reader.approval_waits(work_id)
+
+    def approval_reason(self, work_id: str, pulls=()) -> str:
+        return self._reader.approval_reason(work_id, pulls)
 
     def approval_cleared(self, work_id: str) -> str:
         return self._reader.approval_cleared(work_id)

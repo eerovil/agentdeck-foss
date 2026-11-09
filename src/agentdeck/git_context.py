@@ -36,9 +36,11 @@ log = logging.getLogger(__name__)
 # of it (#2331); ``gh`` stops it at 100 files, and a longer pull request shows no size.
 # ``autoMergeRequest`` says GitHub merges it by itself once its required checks pass, which is
 # what makes a Work worth asking ``merge_checks`` about (#2275); the same query again.
+# ``body`` is the pull request's own description, which a Work page row shows under its title
+# (#4137); the same query once more.
 _PR_FIELDS = (
     "number,title,url,state,isDraft,mergedAt,headRefName,baseRefName,headRefOid,updatedAt,"
-    "additions,deletions,changedFiles,files,autoMergeRequest"
+    "additions,deletions,changedFiles,files,autoMergeRequest,body"
 )
 _COMMIT_RE = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
 

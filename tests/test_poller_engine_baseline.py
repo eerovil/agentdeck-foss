@@ -142,16 +142,41 @@ def test_a_run_with_more_failures_than_the_bound_reports_an_incomplete_list():
     assert complete is False
 
 
-def test_only_the_last_summary_in_a_log_is_read():
+def test_every_summary_in_a_log_is_read():
+    """#4197: a script that runs pytest in three containers prints three summaries, and
+    reading only the last one missed two of the three failing tests."""
     text = (
-        "short test summary info\nFAILED tests/old.py::test_stale\n"
-        "short test summary info\nFAILED tests/new.py::test_fresh\n"
+        "short test summary info\nFAILED tests/one.py::test_a - NameError\n1 failed\n"
+        "ERROR: container 1 failed\nbuilding the next one\n"
+        "short test summary info\nFAILED tests/two.py::test_b - NameError\n"
+        "SKIPPED [1] tests/two.py:3: needs Chrome\n1 failed, 1 skipped\n"
+        "short test summary info\nFAILED tests/one.py::test_a - NameError\n"
     )
 
     failures, complete = baseline.extract_failures(text)
 
-    assert failures == ("tests/new.py::test_fresh",)
+    assert failures == ("tests/one.py::test_a", "tests/two.py::test_b")
     assert complete is True
+    # A tail cut short may have lost a summary before the cut, so it is not complete.
+    assert baseline.extract_failures("…" + text)[1] is False
+    single = "…ran\nshort test summary info\nFAILED tests/one.py::test_a\n"
+    assert baseline.extract_failures(single) == (("tests/one.py::test_a",), True)
+
+
+def test_only_the_tests_a_summary_lists_as_passed_passed():
+    """``pytest -rA`` lists each passed test; a skipped one is listed as skipped (#4197)."""
+    text = (
+        "short test summary info\n"
+        "PASSED tests/a.py::test_x[two words]\n"
+        "PASSED tests/a.py::test_y\n"
+        "SKIPPED [1] tests/a.py:9: needs Chrome\n"
+        "FAILED tests/a.py::test_z - AssertionError\n"
+        "2 passed, 1 skipped, 1 failed in 1.0s\n"
+    )
+
+    assert baseline.extract_passed(text) == ("tests/a.py::test_x[two words]", "tests/a.py::test_y")
+    assert baseline.extract_passed("1 skipped in 1.19s\n") == ()
+    assert baseline.extract_passed("PASSED tests/a.py::test_y\n") == (), "outside a summary"
 
 
 # ---- what may become a base result -----------------------------------------

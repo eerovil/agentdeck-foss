@@ -121,10 +121,17 @@ class JobQueueView:
     holders: tuple[SlotHolderRow, ...] = ()
     # How many waiting local jobs this host holds back for lack of memory (#3614).
     memory_waiting: int = 0
+    # How many wait because their temp folder's disk cannot be used (#4143).
+    scratch_waiting: int = 0
 
     @property
     def waiting_label(self) -> str:
         """What the waiting jobs are waiting for: a slot, or memory for the ones held here."""
+        no_room = min(self.scratch_waiting, self.queued_count)
+        if no_room == self.queued_count and no_room:
+            return f"{no_room} waiting for room on the jobs' disk"
+        if no_room:
+            return f"{self.queued_count} waiting, {no_room} of them for room on the jobs' disk"
         held = min(self.memory_waiting, self.queued_count)
         if not held:
             return f"{self.queued_count} waiting for a slot"
@@ -193,6 +200,7 @@ class JobQueueView:
             queued=tuple(one(row) for row in self.queued),
             holders=self.holders,
             memory_waiting=self.memory_waiting,
+            scratch_waiting=self.scratch_waiting,
         )
 
 
@@ -267,7 +275,11 @@ def _count(value: Any) -> int:
 
 
 def build_view(
-    rows: Iterable[Any], slots: Iterable[Any] = (), *, memory_waiting: int = 0
+    rows: Iterable[Any],
+    slots: Iterable[Any] = (),
+    *,
+    memory_waiting: int = 0,
+    scratch_waiting: int = 0,
 ) -> JobQueueView:
     """Turn the runtime's ``GET /jobs`` payload into what the topbar renders."""
     parsed = [_row(raw) for raw in rows if isinstance(raw, dict)]
@@ -286,6 +298,7 @@ def build_view(
         ),
         holders=tuple(row for row in held if row is not None),
         memory_waiting=memory_waiting,
+        scratch_waiting=scratch_waiting,
     )
 
 
@@ -318,4 +331,5 @@ async def read_job_queue(client: httpx.AsyncClient) -> JobQueueView | None:
         rows,
         slots if isinstance(slots, list) else (),
         memory_waiting=_count(payload.get("memory_waiting")),
+        scratch_waiting=_count(payload.get("scratch_waiting")),
     )

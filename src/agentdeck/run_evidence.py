@@ -57,6 +57,8 @@ FIELDS = (
     "follows",
     "follow_kind",
     "follow_tests",
+    # The tests a rerun's summary lists as passed: only those it forgives (#4197).
+    "passed",
     # Which failures the merge base already has; the rest are never forgiven (#2552).
     "base_present",
 )

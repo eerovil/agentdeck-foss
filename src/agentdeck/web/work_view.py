@@ -18,7 +18,9 @@ import functools
 import json
 import logging
 import os
+import re
 import time
+import unicodedata
 from collections import OrderedDict
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from contextvars import ContextVar
@@ -68,7 +70,9 @@ from ..work_actions import (
     merge_approval_control,
     pause_control,
     pause_refusal,
+    ship_now_control,
     star_control,
+    tried_buttons,
 )
 from ..work_attention import (
     ISSUE_CLOSED,
@@ -84,6 +88,7 @@ from ..work_facts import (
     WorkFacts,
     awaiting_finish,
     discovery_urls,
+    page_text,
     pull_identity,
     pull_state,
     work_facts,
@@ -121,6 +126,7 @@ from ..work_overview import (
     work_project,
     work_title,
 )
+from ..work_release import hold_line
 from ..work_resolution import WorkResolution
 from ..work_status_log import StatusPoint, changes
 from ..work_stops import FORGET_AFTER, facts_mark, is_unseen, track_stops
@@ -425,6 +431,8 @@ class _Pass:
     # Every scheduled/dispatching message id in one pass-wide DB read. A cancelled or failed
     # quota retry is absent, so its stopped chat returns to Needs retry (#2928 review).
     pending_message_ids: frozenset[str] = frozenset()
+    # The quota retries a person cancelled: their chat is theirs, not a bug (#4074).
+    cancelled_retry_ids: frozenset[str] = frozenset()
     # The chats a message is being handed to, or was just delivered to (#3084).
     message_handoffs: dict[str, datetime] = field(default_factory=dict)
 
@@ -499,6 +507,7 @@ class _PassReads:
     chat_titles: dict[str, tuple[str, str]]
     review_events: dict[str, tuple[review_history.ReviewEvent, ...]]
     pending_message_ids: frozenset[str]
+    cancelled_retry_ids: frozenset[str]
     message_handoffs: dict[str, datetime]
 
 
@@ -513,6 +522,8 @@ def _pass_reads(app: Any) -> _PassReads:
         if scheduler is not None and hasattr(scheduler, "pending_ids")
         else frozenset()
     )
+    cancelled = getattr(scheduler, "cancelled_retry_ids", None)
+    cancelled_retry_ids = cancelled() if cancelled is not None else frozenset()
     from ..work_derived import HANDOFF_GRACE
 
     now = datetime.now(UTC)
@@ -526,6 +537,7 @@ def _pass_reads(app: Any) -> _PassReads:
         chat_titles=_chat_titles(app),
         review_events=_review_events(app.state.app_state),
         pending_message_ids=pending_message_ids,
+        cancelled_retry_ids=cancelled_retry_ids,
         message_handoffs=message_handoffs,
     )
 
@@ -573,6 +585,7 @@ def gather_pass(app: Any, reads: _PassReads | None = None) -> _Pass:
         review_chats=_review_chats(app),
         insight_states=assistant_insight_states(assistant) if assistant is not None else {},
         pending_message_ids=reads.pending_message_ids,
+        cancelled_retry_ids=reads.cancelled_retry_ids,
         message_handoffs=reads.message_handoffs,
     )
 
@@ -1249,10 +1262,14 @@ def derived_for(
     # A turn that failed on a full account or a lost connection, with the deck's own retry
     # scheduled for the reset (#3305): that retry continues it, so it is a wait, not a death.
     retry_at = getattr(session, "automatic_retry_at", None) if session is not None else None
+    retry_cancelled = False
     if retry_at is not None and quota_retry_message_id(session) not in (
         getattr(snapshot, "pending_message_ids", None) or ()
     ):
         retry_at = None
+        retry_cancelled = quota_retry_message_id(session) in (
+            getattr(snapshot, "cancelled_retry_ids", None) or ()
+        )
     # A turn the CLI failed at once because the account's sign-in expired (#3354): the deck
     # did nothing wrong, and only a person's sign-in brings the account back.
     login_expired = ""
@@ -1289,6 +1306,7 @@ def derived_for(
         died_at=getattr(session, "last_message_at", None) if session is not None else None,
         retry_at=retry_at,
         login_expired=login_expired,
+        retry_cancelled=retry_cancelled,
         # A turn a runtime death cut off is not an ending (#3008): asking it for a next step
         # raced the runtime's own revival and read its lost question as none.
         cut_off=cut_off,
@@ -1443,6 +1461,10 @@ def _pr_hold(
     hold = entry.get("hold") if isinstance(entry.get("hold"), Mapping) else {}
     since = _stamp(hold.get("since"))
     words, person = str(hold.get("words") or ""), bool(hold.get("person"))
+    if len(answers) > 1 and words:
+        # "Its pull request" names none of several (#4089).
+        pressed = "Merge pressed; " if words.startswith("Merge pressed; ") else ""
+        words = pressed + hold_line(hold)
     if not hold and entry.get("needs_verify"):
         words = "no test run started"
     elif not hold and any(
@@ -1523,13 +1545,93 @@ def _queue_places(app: Any, work_id: str) -> list[tuple[str, int, int, int]]:
         return []
 
 
-def _release_read(release: Any, name: str, work_id: str) -> str:
+def _shown_pulls(card: Any) -> list[tuple[str, str, bool]]:
+    """The Work's pull requests as its page shows them, ``(ref, state, draft)``, for the
+    release's Merge reads (#4172 review): the web cannot ask the services process for them."""
+    return [
+        (f"{output.repository}#{output.number}".lower(), output.state, output.draft)
+        for output in card.outputs
+    ]
+
+
+def _release_read(release: Any, name: str, work_id: str, *args: Any) -> str:
     """One of the release's words about an early Merge (#3320); "" when it has none."""
     read = getattr(release, name, None)
     try:
-        return str(read(work_id) or "") if read is not None else ""
+        return str(read(work_id, *args) or "") if read is not None else ""
     except Exception:  # noqa: BLE001 -- unreadable: nothing offered
         return ""
+
+
+def _shippable(snapshot: Any, card: Any) -> tuple[str, ...]:
+    """The card's open pull requests whose head stands at findings or an escalation of its
+    review, with no newer review running (#4212): what Ship now, fix later may ship. Also one
+    whose Ship now press passed it but did not finish (#4212 review): its merge holds until a
+    press finishes it. The router checks each head live again when pressed."""
+    history = getattr(snapshot, "review_events", None) or {}
+    found = []
+    for output in getattr(card, "outputs", ()):
+        if not output.is_open or len(output.head or "") < 7:
+            continue
+        pull = f"{output.repository}#{output.number}".lower()
+        events = history.get(pull, ())
+        if review_history.shippable(events, output.head) is not None or _ship_unfinished(
+            getattr(snapshot, "state", None), pull, _ship_head(events, output.head)
+        ):
+            found.append(pull)
+    return tuple(found)
+
+
+def _ship_head(events: Any, head: str) -> str:
+    """The head a Ship now press passed, when ``head``'s standing verdict is that pass."""
+    return review_history.ship_pass_head(events, head)
+
+
+def _ship_unfinished(state: Any, pull: str, head: str) -> bool:
+    """Whether the Ship now press that passed ``pull`` at ``head`` is not finished; the one
+    rule the release holds the merge by (``AppState.ship_unfinished``). Unread is not."""
+    if not head:
+        return False
+    try:
+        return bool(state.ship_unfinished(pull, head))
+    except Exception:  # noqa: BLE001 -- unreadable: nothing offered
+        return False
+
+
+def _ship_findings(
+    snapshot: Any, card: Any, shippable: tuple[str, ...]
+) -> tuple[tuple[str, str], ...]:
+    """``(pull, first line)`` of the findings Ship now would leave, for every such pull
+    request (#4212 D10 and review); a line is "" when the history kept no words."""
+    history = getattr(snapshot, "review_events", None) or {}
+    found = []
+    for output in getattr(card, "outputs", ()):
+        pull = f"{output.repository}#{output.number}".lower()
+        if pull in shippable:
+            events = history.get(pull, ())
+            head = _ship_head(events, output.head) or output.head
+            text, _url = review_history.findings_text(events, head)
+            found.append((pull, review_history.first_finding(text)))
+    return tuple(found)
+
+
+def _shipped_of(state: Any, ref: Any) -> tuple[tuple[str, str], ...]:
+    """This Work's pull requests shipped with findings left, and each one's follow-up issue
+    (#4212 D12). Unreadable is none."""
+    try:
+        records = state.shipped_by_work(f"{ref.repository}#{ref.number}")
+    except Exception:  # noqa: BLE001 - the line is a note, never a reason to fail the page
+        logger.warning("work page: shipped records unreadable for %s", ref.work_id, exc_info=True)
+        return ()
+    return tuple((record.pull, record.follow_up) for record in records)
+
+
+def _release_handles(release: Any, work_id: str) -> bool:
+    """Does the deck release this Work? Unreadable is no."""
+    try:
+        return bool(release is not None and release.handles(work_id))
+    except Exception:  # noqa: BLE001 - nothing offered on an unreadable release
+        return False
 
 
 def _pre_review_waits(app: Any, state: Any, work_id: str) -> str:
@@ -1632,6 +1734,10 @@ def _ready_for_merge(app: Any, work_id: str, outputs: Sequence[Any]) -> Any:
     offered = [output for output in outputs if not output.settled and not output.draft]
     if not awaiting or not offered:
         return None
+    if any(output.conflicting for output in offered):
+        # GitHub says one cannot merge as it is (#4217): never offered for Merge, even before
+        # the release has read it and told the agent.
+        return None
     for output in offered:
         head = awaiting.get(f"{output.repository}#{output.number}".lower())
         if not isinstance(head, str) or not same_commit(output.head, head):
@@ -1691,7 +1797,10 @@ def _card_inputs(
         owned,
         tuple(snapshot.insight_states.get(key) for key in owned_keys),
         tuple(
-            quota_retry_message_id(session) in snapshot.pending_message_ids
+            (
+                quota_retry_message_id(session) in snapshot.pending_message_ids,
+                quota_retry_message_id(session) in snapshot.cancelled_retry_ids,
+            )
             if session is not None
             else False
             for key in owned_keys
@@ -1972,9 +2081,12 @@ def _publish_live_works(
             task.add_done_callback(_LIVE_SCANS.discard)
 
 
-def _registrations(snapshot: _Pass, work: Work | None) -> tuple[Registration, ...]:
+def _registrations(
+    snapshot: _Pass, work: Work | None, placed: Mapping[str, Sequence[str]]
+) -> tuple[Registration, ...]:
     """The pull requests the Work's chats registered — the ones its Work page lists under
-    each chat — and whether each chat is in this Work alone."""
+    each chat — and whether each chat is in this Work alone. ``placed`` adds those the release
+    holds for it through a leg no loaded session names (#4125)."""
     if work is None:
         return ()
     found: dict[str, Registration] = {}
@@ -1983,9 +2095,54 @@ def _registrations(snapshot: _Pass, work: Work | None) -> tuple[Registration, ..
         for leg in snapshot.legs.get(membership.chat_id, ()) or (membership.chat_id,):
             for pull in snapshot.state.session_pull_requests.get(leg, ()):
                 held = found.get(pull.url.lower())
-                if held is None or (alone and not held.exclusive):
-                    found[pull.url.lower()] = Registration(pull.url, alone)
+                named = pull.work_id.lower() == work.ref.work_id.lower()
+                found[pull.url.lower()] = Registration(
+                    held.url if held else pull.url,
+                    alone or (held is not None and held.exclusive),
+                    named or (held is not None and held.named),
+                )
+    for pull in placed.get(f"{work.ref.repository}#{work.ref.number}".lower(), ()):
+        repository, _, number = pull.rpartition("#")
+        url = f"https://github.com/{repository}/pull/{number}"
+        found.setdefault(url, Registration(url, False))
     return tuple(found.values())
+
+
+def _placed_pulls(
+    snapshot: _Pass, candidates: Sequence[Any], *, strict: bool
+) -> dict[str, tuple[str, ...]]:
+    """Each Work's pull requests as the release places them (#4125), for these candidates:
+    the ones their chats registered and the open list joined to them.
+
+    Unreadable, the branch rules in ``work_facts`` stand alone, except on a ``strict`` pass.
+    """
+    from ..work_router import pulls_by_work
+
+    state = snapshot.state
+    try:
+        chats = {
+            membership.chat_id
+            for item in candidates
+            for membership in getattr(getattr(item, "work", None), "memberships", ())
+        }
+        wanted = {
+            ref.identity
+            for leg, refs in tuple(state.session_pull_requests.items())
+            if state.chat_identity_key(leg, snapshot.chats) in chats
+            for ref in refs
+        }
+        for item in candidates:
+            key = f"{item.ref.repository}#{item.ref.number}".lower()
+            for pull in snapshot.open_pulls.get(key, ()):
+                where = pull_identity(str(pull.get("url") or ""))
+                if where is not None:
+                    wanted.add((where[0].lower(), where[1]))
+        return pulls_by_work(state, snapshot.projection, wanted)
+    except Exception:  # noqa: BLE001 -- the page stands on what its chats registered
+        if strict:
+            raise
+        logger.debug("pull request placement unreadable for the Work pages", exc_info=True)
+        return {}
 
 
 def _cached_merge_checks(app: Any, rows: Mapping[str, Mapping[str, Any]]) -> dict[str, dict]:
@@ -2074,11 +2231,13 @@ def gather_facts(
     """
     records = _cached_issues(app, candidates, strict=strict)
     now = datetime.now(UTC)
+    placed = _placed_pulls(snapshot, candidates, strict=strict)
+    homes = {pull: work for work, pulls in placed.items() for pull in pulls}
     inputs = []
     for item in candidates:
         ref = item.ref
         open_pulls = snapshot.open_pulls.get(f"{ref.repository}#{ref.number}".lower(), ())
-        registered = _registrations(snapshot, getattr(item, "work", None))
+        registered = _registrations(snapshot, getattr(item, "work", None), placed)
         inputs.append((ref, open_pulls, registered))
     urls = [url for item in inputs for url in discovery_urls(*item)]
     rows = _cached_pulls(app, urls, strict=strict)
@@ -2099,6 +2258,7 @@ def gather_facts(
             open_pulls=open_pulls,
             registered=registered,
             checks=checks,
+            homes=homes,
         )
         signed = signoffs.get(ref.work_id)
         if awaiting_finish(
@@ -2130,12 +2290,15 @@ def deck_paused_ids(app: Any) -> frozenset[str]:
         return frozenset()
 
 
-def starred_ids(app: Any) -> frozenset[str]:
-    """The Works a person starred (#3116), casefolded, in one control-DB read."""
+def starred_works(app: Any) -> frozenset[str]:
+    """The Works a person starred (#3116), in one control-DB read."""
     control = getattr(app.state, "control_db", None)
-    if control is None:
-        return frozenset()
-    return frozenset(work_id.casefold() for work_id in control.starred_works())
+    return frozenset() if control is None else frozenset(control.starred_works())
+
+
+def starred_ids(app: Any) -> frozenset[str]:
+    """``starred_works``, casefolded for comparing with an id however it was spelled."""
+    return frozenset(work_id.casefold() for work_id in starred_works(app))
 
 
 def reconcile_deck_pauses(app: Any, facts: dict[str, WorkFacts]) -> None:
@@ -2780,10 +2943,7 @@ def wayfinder_maps(front: Any) -> tuple[wayfinder_map.Progress, ...]:
     if front is None:
         return ()
     found: dict[str, wayfinder_map.Progress] = {}
-    for row in (
-        *front.needs_you, *front.hidden, *front.active, *front.waiting, *front.live,
-        *front.finished, *front.paused,
-    ):
+    for row in front.rows:
         plan = getattr(row, "map", None)
         if plan is not None:
             found.setdefault(plan.work_id, plan)
@@ -2914,6 +3074,8 @@ POPULATION_SECTIONS = {
     "active": "Active",
     "waiting": "Waiting",
     "live": "Live checking",
+    "trying": "Waiting for a try",
+    "idle": "Starred, quiet",
     "finished": "Recently finished",
     "paused": "Paused",
     "folded": "Under its parent",
@@ -2971,6 +3133,8 @@ def population_rows(overview: WorkOverview) -> list[dict[str, Any]]:
         ("active", front.active),
         ("waiting", front.waiting),
         ("live", front.live),
+        ("trying", front.trying),
+        ("idle", front.idle),
         ("finished", front.finished),
         ("paused", front.paused),
     ):
@@ -3528,8 +3692,13 @@ async def _work_candidates(app: Any, snapshot: _Pass, queue: Sequence[dict]) -> 
         legs_by_chat=snapshot.legs,
         current_work_ids=await current_work_ids(app, queue),
         # A Work paused on the deck stays built, like one waiting for Finish, so it stays on
-        # the Paused list and its chats stay held however long it sits quiet (#2559).
-        awaiting_work_ids=await asyncio.to_thread(awaiting_work_ids, app) | held,
+        # the Paused list and its chats stay held however long it sits quiet (#2559). So does
+        # a starred one, on the Starred list (#4121).
+        awaiting_work_ids=(
+            await asyncio.to_thread(awaiting_work_ids, app)
+            | held
+            | await asyncio.to_thread(starred_works, app)
+        ),
         presentation=snapshot.presentation,
         let_go=_let_go_works(app),
         unstarted=unstarted_issues(
@@ -3649,7 +3818,7 @@ async def _load_work_overview(
     awaiting = frozenset(
         work_id
         for work_id, item in facts.items()
-        if item.awaiting_finish or (item.deck_paused and item.finished_at is None)
+        if item.awaiting_finish or item.starred or (item.deck_paused and item.finished_at is None)
     )
     selection = front_page_works(candidates, now=now, finished_at=finished_at, awaiting=awaiting)
     shown, buckets = selection.shown, selection.buckets
@@ -3720,6 +3889,7 @@ async def _load_work_overview(
                 *classified.needs_you,
                 *classified.hidden,
                 *classified.active,
+                *classified.idle,
                 *classified.finished,
             )
             # A parent row draws its children's state, so they are hydrated with it (#3622).
@@ -3885,6 +4055,8 @@ class WorkOverviewService:
         # ``("issue" | "pull", (repository, number))`` -> when it was last tried.
         self._backfill_tried: dict[tuple[str, tuple[str, int]], float] = {}
         self._merges_checked_at: float | None = None
+        # The conflicting heads each Work's release was last asked about (#4217).
+        self._conflicts_told: dict[str, tuple[str, ...]] = {}
         self._soon: asyncio.Task | None = None
         # A rebuild was asked for while ``_soon`` ran (#3328): that one owes another pass.
         self._again = False
@@ -4243,6 +4415,7 @@ class WorkOverviewService:
                     read += await self.check_merges(loop.time())
                     if read:
                         await self.refresh()
+                    await self.release_conflicts()
                 except asyncio.CancelledError:
                     raise
                 except Exception:  # noqa: BLE001 -- one bad pass must not stop the refresher
@@ -4320,6 +4493,49 @@ class WorkOverviewService:
         return read
 
 
+    async def release_conflicts(self) -> int:
+        """Have the release look again at each Work it holds Ready for merge whose pull request
+        now conflicts with its base (#4217); how many it was asked about.
+
+        Nothing on the Work's own pull requests moves when another pull request lands on their
+        base, in that repository or another, so the release would hold it Ready until a person
+        pressed Merge. ``check_merges`` keeps those pull requests' merge answers read; this
+        passes a conflict found there on, once per Work and heads, so its agent is told.
+        """
+        overview = self.overview
+        release = getattr(self._app.state, "work_release", None)
+        evaluate = getattr(release, "evaluate", None)
+        if overview is None or evaluate is None:
+            return 0
+        asked = 0
+        for card in overview.cards:
+            awaiting = _awaiting_merge(self._app, card.work_id)
+            if not awaiting:
+                continue
+            conflicts = tuple(
+                sorted(
+                    f"{output.label.lower()}@{output.head}"
+                    for output in card.outputs
+                    if not output.settled and output.conflicting
+                )
+            )
+            if not conflicts or self._conflicts_told.get(card.work_id) == conflicts:
+                continue
+            try:
+                await evaluate(card.work_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 -- one Work's failure must not skip the next
+                # Not kept as asked, so the next pass asks again (the services process may be
+                # restarting).
+                logger.warning(
+                    "work overview: release look at %s failed", card.work_id, exc_info=True
+                )
+                continue
+            self._conflicts_told[card.work_id] = conflicts
+            asked += 1
+        return asked
+
     async def check_merges(self, now: float) -> int:
         """Keep Merge candidates' check rows current; how many rows are held (#2275, #2332).
 
@@ -4383,6 +4599,25 @@ def work_diagram(app: Any, ref: WorkRef, chats: Sequence[WorkChat]) -> WorkDiagr
     return None
 
 
+# What of an issue's text the Work page shows shut (#4101): the lines ``app.css`` cuts the
+# preview to, and about as many characters as those lines hold on a phone.
+ISSUE_PREVIEW_LINES = 3
+# How many of the widest letters one row holds on the narrowest phone: the text is 275px wide
+# at 320px and a letter at most one em, 13.6px. Counting every letter that wide means a text
+# called short fits three rows on any screen; one that would just fit folds, which hides nothing.
+ISSUE_LINE_CHARS = 20
+
+# Markdown the page draws taller than a row of text: a heading, code, a table, a list, a rule.
+_ISSUE_BLOCK_RE = re.compile(r"^\s*(#|```|~~~|>|\||---|[-*+] |\d+[.)] )", re.MULTILINE)
+
+
+def _issue_line_rows(line: str) -> int:
+    """The rows one line of the issue's text wraps to on a phone; a wide character, such as
+    an emoji or a Chinese one, takes two characters' room."""
+    room = sum(2 if unicodedata.east_asian_width(char) in "WF" else 1 for char in line)
+    return max(1, -(-room // ISSUE_LINE_CHARS))
+
+
 @dataclass(frozen=True)
 class WorkDetail:
     card: WorkCard
@@ -4403,14 +4638,38 @@ class WorkDetail:
     # The release's ``approval`` for an early Merge (#3320), and its line once one was cleared.
     approval: str = ""
     approval_cleared: str = ""
+    # Why a Work with a pull request in a repository that merges on its own still waits for a
+    # person's Merge (#4172).
+    approval_reason: str = ""
     # While a press stands and something holds it: what it waits for (#3869).
     approval_waits: str = ""
     # A pull request whose review waits on the agent's pre-review checklist (#3880).
     pre_review_waits: str = ""
+    # Open pull requests standing at review findings, which Ship now, fix later may ship
+    # (#4212), and whether the deck releases this Work at all.
+    shippable: tuple[str, ...] = ()
+    deck_release: bool = False
+    # The first line of those findings, quoted in Ship now's confirm (#4212 D10).
+    ship_findings: tuple[tuple[str, str], ...] = ()
+    # This Work's pull requests shipped with findings left, each with its follow-up issue
+    # (``owner/repo#n``, "" while unfiled), so the page says the review never passed (D12).
+    shipped: tuple[tuple[str, str], ...] = ()
     # The issue's parent and sub-issues (#3622), or None when it is in no tree.
     tree: work_tree.WorkTree | None = None
     # The Diagram button (#3827), or None while no chat of the Work has drawn one.
     diagram: WorkDiagram | None = None
+    # The issue's own text as the page shows it (#4101), "" when there is none to show.
+    issue_text: str = ""
+
+    @property
+    def issue_short(self) -> bool:
+        """Whether the issue's text fits the lines a long one previews (#4101), so it shows
+        whole with nothing to open."""
+        return (
+            not _ISSUE_BLOCK_RE.search(self.issue_text)
+            and sum(_issue_line_rows(line) for line in self.issue_text.split("\n"))
+            <= ISSUE_PREVIEW_LINES
+        )
 
     @property
     def resolution_behind(self) -> datetime | None:
@@ -4447,14 +4706,16 @@ class WorkDetail:
 
     @property
     def buttons(self) -> tuple[ActionButton, ...]:
-        """The same controls the front page's row offers (#2237); Hide only while not hidden."""
+        """The same controls the front page's row offers (#2237); Hide only while not hidden.
+
+        A Work waiting for a person to try it (#4210) offers Works, close and Doesn't work."""
         return buttons(
             self.card,
             self.attention,
             self.status.where_href,
             page=True,
             hidden=self.hidden is not None,
-        )
+        ) + tried_buttons(self.card, page=True)
 
     @property
     def finish_control(self) -> ActionButton | None:
@@ -4470,6 +4731,11 @@ class WorkDetail:
     def merge_approval_control(self) -> ActionButton | None:
         """Merge when ready, or Withdraw while a press stands (#3320), beside the headline."""
         return merge_approval_control(self.card, self.attention, self.approval)
+
+    @property
+    def ship_now_control(self) -> ActionButton | None:
+        """Ship now, fix later beside the headline, at review findings (#4212)."""
+        return ship_now_control(self.card, self.deck_release, self.shippable, self.ship_findings)
 
     @property
     def merge_approved(self) -> bool:
@@ -4722,13 +4988,19 @@ async def load_work_detail(
         and not in_inventory(snapshot.state.db, ref)
     ):
         return None
-    tree = await _work_tree(app, ref, facts.record)
+    # One set of reads, so the tree and the issue's text share one refresh behind the page.
+    reads = _TreeReads(ref, getattr(app.state, "issues", None))
+    issue_text = page_text(await reads.read("issue_body", ref.repository, ref.number))
+    tree = await _work_tree(app, ref, facts.record, reads=reads)
+    if reads.stale:
+        _refresh_tree(app, ref, reads)
     lap("tree")
     control = getattr(app.state, "control_db", None)
     presses = control.load_work_actions(ref.work_id, limit=1) if control is not None else ()
     hidden = await asyncio.to_thread(_hidden_works, app, {ref.work_id: card})
     resolution = control.work_resolution(ref.work_id) if control is not None else None
     release = getattr(app.state, "work_release", None)
+    shippable = _shippable(snapshot, card)
     detail = WorkDetail(
         card=card,
         workspace=workspace,
@@ -4738,11 +5010,19 @@ async def load_work_detail(
         hidden=hidden.get(ref.work_id),
         custom_title=snapshot.titles.get(ref.work_id, ""),
         resolution=resolution,
-        approval=_release_read(release, "approval", ref.work_id),
+        approval=_release_read(release, "approval", ref.work_id, _shown_pulls(card)),
         approval_cleared=_release_read(release, "approval_cleared", ref.work_id),
+        approval_reason=_release_read(
+            release, "approval_reason", ref.work_id, _shown_pulls(card)
+        ),
         approval_waits=_release_read(release, "approval_waits", ref.work_id),
         pre_review_waits=_pre_review_waits(app, snapshot.state, ref.work_id),
+        shippable=shippable,
+        ship_findings=_ship_findings(snapshot, card, shippable),
+        shipped=_shipped_of(snapshot.state, ref),
+        deck_release=_release_handles(release, ref.work_id),
         tree=tree,
+        issue_text=issue_text,
         diagram=await asyncio.to_thread(work_diagram, app, ref, chats),
         message_target=message_target(card, chats, _can_send(app)),
         unplaced=unplaced_chats(
@@ -4786,10 +5066,7 @@ def _front_rows(app: Any) -> dict[str, FrontRow]:
     if front is None:
         return {}
     found: dict[str, FrontRow] = {}
-    for row in (
-        *front.needs_you, *front.hidden, *front.active, *front.waiting, *front.live,
-        *front.finished, *front.paused,
-    ):
+    for row in front.rows:
         for item in (row.own or row, *row.children):
             found.setdefault(item.card.work_id, item)
     return found
@@ -4801,16 +5078,15 @@ def tree_revision(overview: Any, work_id: str) -> str:
     front = getattr(overview, "front", None)
     if front is None:
         return ""
-    for row in (
-        *front.needs_you, *front.hidden, *front.active, *front.waiting, *front.live,
-        *front.finished, *front.paused,
-    ):
+    for row in front.rows:
         if (row.children or row.progress) and row.card.work_id == work_id:
             return row.revision
     return ""
 
 
-async def _work_tree(app: Any, ref: WorkRef, record: Any) -> work_tree.WorkTree | None:
+async def _work_tree(
+    app: Any, ref: WorkRef, record: Any, *, reads: _TreeReads | None = None
+) -> work_tree.WorkTree | None:
     """The Work page's tree (#3622): the issue's parent from its cached record, and its
     sub-issues from GitHub's own list through the shared cache, each with its front-page
     state. None when the issue has neither."""
@@ -4839,7 +5115,7 @@ async def _work_tree(app: Any, ref: WorkRef, record: Any) -> work_tree.WorkTree 
     children: list[work_tree.TreeLine] = []
     items: Sequence[dict] | None = None
     unreadable = False
-    reads = _TreeReads(ref, issues)
+    reads = reads or _TreeReads(ref, issues)
     if counts is not None:
         items = await reads.read("sub_issues", ref.repository, ref.number)
         unreadable = items is None
@@ -5044,6 +5320,7 @@ WORK_SECTIONS = (
     "message",
     "lifecycle",
     "result",
+    "issue",
     "resolution",
     "workspace",
     "chats",
@@ -5064,7 +5341,8 @@ SECTION_INPUTS: dict[str, Callable[[WorkDetail, Any], tuple]] = {
         # here so a control that starts reading something else cannot go stale.
         d.attention, d.buttons, d.finish_control, d.pause_control, d.star_control,
         d.pause_refusal, d.last_action_followed, d.bring_back, d.merge_approval_control,
-        d.approval, d.approval_cleared, d.approval_waits, d.pre_review_waits, d.diagram,
+        d.approval, d.approval_cleared, d.approval_reason, d.approval_waits, d.pre_review_waits,
+        d.diagram, d.ship_now_control, d.shipped,
     ),
     # The issue's parent and sub-issues (#3622), each line as the front page last drew it.
     "tree": lambda d, line: (d.tree,),
@@ -5073,6 +5351,7 @@ SECTION_INPUTS: dict[str, Callable[[WorkDetail, Any], tuple]] = {
     "result": lambda d, line: (
         d.card.outputs, d.card.staging, d.card.verification
     ),
+    "issue": lambda d, line: (d.card.work_id, d.issue_text),
     "resolution": lambda d, line: (d.resolution, d.resolution_behind),
     "workspace": lambda d, line: (
         d.card.work_id, d.card.workspace_note, d.card.workspace, d.workspace, d.workspace_rows
@@ -5157,17 +5436,18 @@ def render_changed_sections(
 
 # The front page's live parts (#2219), each its own stream event and swap target, in the order
 # the page lists them (#3818): the Work sections swap keyed by Work, the board line and the
-# other activity whole. ``needs``, ``stuck``, ``release`` and ``cleanup`` are the Needs you
-# groups at their places on the page (``work_attention.FRONT_PLACES``).
+# other activity whole. ``starred`` leads them (#4121). ``needs``, ``stuck``, ``release`` and
+# ``cleanup`` are the Needs you groups at their places on the page
+# (``work_attention.FRONT_PLACES``).
 FRONT_ROW_PARTS = frozenset(
     {
-        "needs", "active", "stuck", "waiting", "release", "live", "cleanup", "finished",
-        "paused", "stopped", "hidden",
+        "starred", "needs", "active", "stuck", "waiting", "release", "live", "try", "cleanup",
+        "finished", "paused", "stopped", "hidden",
     }
 )
 FRONT_PARTS = (
-    "summary", "needs", "release", "stuck", "active", "cleanup", "waiting", "live", "finished",
-    "paused", "stopped", "board",
+    "summary", "starred", "needs", "release", "stuck", "active", "cleanup", "waiting", "live",
+    "try", "finished", "paused", "stopped", "board",
 )
 # The ``/events?view=`` values that show Works: the front page, ``/works?view=hidden`` and the
 # default ``/works`` list. Every other page's stream neither subscribes to ``works`` nor sends it.

@@ -204,6 +204,7 @@ async def test_an_act_reaches_the_services_and_its_refusal_comes_back_by_name(tm
     router = services_link.RouterLink(work_services_config(tmp_path), transport, _NoState())
 
     assert await router.pre_review_done("eerovil/agentdeck", 9) == {"outcome": "asked"}
+    assert "check_request" in work_services.CALLS["router"]
     with pytest.raises(AgainRefused, match="already asked"):
         await router.ask_again("eerovil/agentdeck", 9, "the owner kept it")
     assert app.state.services.calls[1] == (
@@ -223,6 +224,41 @@ async def test_an_act_with_the_service_down_says_it_is_restarting(tmp_path, monk
     )
     with pytest.raises(services_link.ServicesUnavailable, match="restarting"):
         await release.request_merge("github_issue:eerovil/agentdeck#7")
+
+
+def test_the_web_reads_merge_from_the_pull_requests_the_page_shows(tmp_path):
+    """#4172 review: the web's release reader cannot list a Work's pull requests (that port
+    raises), so the Work page hands it the ones it shows, and Merge and its reason still read."""
+    from dataclasses import replace
+
+    from agentdeck.work_release import Policy
+
+    release = services_link.ReleaseLink(
+        work_services_config(tmp_path), services_link.SocketTransport(lambda: tmp_path / "x"),
+        _NoState(),
+    )
+    reader = release._reader
+    reader._enabled = True
+    reader.ports = replace(
+        reader.ports,
+        switched=lambda repository: True,
+        policy=lambda repository: Policy(auto_release_repos=frozenset({"o/robot"})),
+    )
+    with pytest.raises(RuntimeError):
+        reader.ports.pulls("github_issue:o/issues#1")
+    work = "github_issue:o/issues#1"
+    robot, store = ("o/robot#2", "open", False), ("O/Store#3", "OPEN", False)
+    assert release.approval(work, [robot]) == "", "robot alone merges on its own"
+    assert release.approval(work, [robot, (store[0], "open", True)]) == "", "a draft holds nothing"
+    assert release.approval(work, [robot, (store[0], "merged", False)]) == ""
+    assert release.approval(work, [robot, store]) == "offered"
+    assert release.approval(work, [robot, (store[0], "", False)]) == "offered", "unknown holds"
+    assert release.approval(work) == "offered", "not told which: a press stays possible"
+    assert release.approval_reason(work, [robot, store]) == (
+        "robot merges on its own, but this Work also has a pull request in store, so all of"
+        " them wait for your Merge."
+    )
+    assert release.approval_reason(work, [robot]) == release.approval_reason(work) == ""
 
 
 async def test_only_the_listed_calls_run_and_a_router_call_reads_the_registrations_first():

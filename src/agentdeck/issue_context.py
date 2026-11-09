@@ -627,9 +627,20 @@ class IssueResolver:
 
     async def refresh_merge_checks(self, refs: Iterable[tuple[str, int]], *, limit: int) -> int:
         """Re-read at most ``limit`` armed pull requests' required checks once their cached
-        row has aged out (#2275); ``git_context``'s fetch, through this shared cache."""
+        row has aged out (#2275); ``git_context``'s fetch, through this shared cache.
+
+        The oldest rows first, none read before them (#4217): a row still fresh costs no read
+        but took one of the ``limit`` places, so past ``limit`` candidates the same few were
+        asked every time and the rest never had their conflicts read."""
+        wanted = list(dict.fromkeys(refs))
+
+        def age(ref: tuple[str, int]) -> float:
+            found = self._metadata.peek(merge_checks.cache_key(*ref)).age_s
+            return float("inf") if found is None else found
+
+        wanted.sort(key=age, reverse=True)
         resolver = GitContextResolver(metadata_cache=self._metadata)
-        return await resolver.refresh_merge_checks(refs, limit=limit)
+        return await resolver.refresh_merge_checks(wanted, limit=limit)
 
     async def refresh_pull_rows(self, refs: Iterable[tuple[str, int]], *, limit: int) -> int:
         """Re-read at most ``limit`` pull requests' cached rows from GitHub (#2236).
@@ -1034,6 +1045,14 @@ class IssueResolver:
     def held_blocked_by(self, repository: str, number: int) -> tuple[tuple[dict, ...] | None, bool]:
         """``blocked_by``' held value without asking GitHub, and whether it is fresh."""
         return self._held(wayfinder_map.BLOCKED_BY_KEY, repository, number, _issue_rows)
+
+    def held_issue_body(self, repository: str, number: int) -> tuple[str | None, bool]:
+        """``issue_body``'s held value without asking GitHub, and whether it is fresh (#4101)."""
+        lookup = self._metadata.peek(
+            wayfinder_map.cache_key(wayfinder_map.ISSUE_BODY_KEY, repository, number)
+        )
+        value = _body_of(lookup.value)
+        return (value, lookup.complete) if value is not None else (None, False)
 
     def _held(self, prefix: str, repository: str, number: int, parse) -> tuple[Any, bool]:
         lookup = self._metadata.peek(wayfinder_map.cache_key(prefix, repository, number))

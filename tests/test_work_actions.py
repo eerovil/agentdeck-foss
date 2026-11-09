@@ -14,22 +14,25 @@ import os
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from public_copy import private_feature
-from test_work_attention import ORG, PR, STOPPED_CHAT, WORK, _derived, _row
+from test_work_attention import HEAD, ORG, PR, STOPPED_CHAT, WORK, _derived, _row
 from test_work_attention import _work as _work_of
 
 from agentdeck import chat_review, gh_cli
 from agentdeck import chat_review as _chat_review
 from agentdeck.work_actions import (
     RECENT_ACTION_S,
+    TRIED_COMMENT,
     WRITES,
     Refused,
     WorkActionPress,
     buttons,
     plan,
     recent_press,
+    tried_buttons,
 )
 from agentdeck.work_attention import operator_attention
 from agentdeck.work_facts import OutputFact
@@ -64,6 +67,11 @@ def _unstarted(**extra):
     return replace(_work_of(**extra), start_label="agent")
 
 
+def _tried(**extra):
+    """A merged Work whose agent recorded that only a person can try it live (#4210)."""
+    return _work_of(derived=_derived("try_wait", "Waiting for a try"), **extra)
+
+
 def _planned(work, action: str):
     return plan(action, work, operator_attention(work, work_status(work)))
 
@@ -92,6 +100,29 @@ def test_each_deck_write_makes_one_fixed_write_on_the_source_issue(work, action,
     assert (step.kind, step.issue, step.body) == (kind, ISSUE, body)
 
 
+def test_works_close_is_offered_only_while_the_work_waits_for_a_try():
+    """#4210: one press, no confirm; Doesn't work is only a link to the message box."""
+    work = _tried()
+
+    ok, bad = tried_buttons(work)
+    step = plan("tried_ok", work, None)
+
+    assert (ok.action, ok.confirm, ok.route) == ("tried_ok", "", "action")
+    assert (bad.action, bad.href) == ("tried_bad", f"{work.href}#work-message")
+    assert tried_buttons(work, page=True)[1].href == "#work-message"
+    assert tried_buttons(_idle()) == ()
+    assert (step.kind, step.issue, step.body) == ("close", ISSUE, "completed")
+    assert step.comment.startswith("Tried live by a person")
+    for other in (_idle(), _ready()):
+        with pytest.raises(Refused, match="not offered"):
+            plan("tried_ok", other, operator_attention(other, work_status(other)))
+    # A paused Work offers only Resume, so Works, close is neither shown nor run (review).
+    paused = replace(work, paused=True)
+    assert tried_buttons(paused) == ()
+    with pytest.raises(Refused, match="not offered"):
+        plan("tried_ok", paused, None)
+
+
 def test_merge_is_a_confirmed_form():
     """#2324: Merge no longer hands `/merge` to GitHub; it is one press, and it asks first."""
     work = _ready()
@@ -113,7 +144,7 @@ def test_merge_is_refused_for_a_work_the_deck_does_not_release():
 def test_the_writes():
     assert WRITES == {
         "close", "agent_review", "chatgpt_review", "merge", "pause", "resume", "approve_merge",
-        "withdraw_merge", "start",
+        "withdraw_merge", "start", "ship_now", "tried_ok",
     }
 
 
@@ -288,9 +319,11 @@ def _client(app):
 URL = work_href(WORK.work_id) + "/action"
 
 
-def _post(client, action, action_id="press-0001", **headers):
-    return client.post(URL, data={"action": action, "client_action_id": action_id},
-                       headers=headers)
+def _post(client, action, action_id="press-0001", confirmed="", **headers):
+    data = {"action": action, "client_action_id": action_id}
+    if confirmed:
+        data["confirmed"] = confirmed
+    return client.post(URL, data=data, headers=headers)
 
 
 def _closable_app(tmp_path, monkeypatch, **kwargs):
@@ -341,6 +374,29 @@ def test_close_closes_the_source_issue_as_completed(tmp_path, monkeypatch):
     assert response.status_code == 200 and f"Closed {ISSUE}" in response.text
     assert gh.calls[0][0] == ["/usr/bin/gh", "issue", "close", "5", "--repo", f"{ORG}/agentdeck",
                               "--reason", "completed"]
+
+
+def test_works_close_closes_records_verified_and_finishes_once(tmp_path, monkeypatch):
+    app, gh, _ = _route_app(tmp_path, monkeypatch, _tried)
+    client = _client(app)
+
+    first = _post(client, "tried_ok")
+    again = _post(client, "tried_ok")
+
+    assert first.status_code == again.status_code == 200 and len(gh.calls) == 1
+    assert gh.calls[0][0][-4:] == ["--reason", "completed", "--comment", TRIED_COMMENT]
+    check = app.state.control_db.work_live_check(WORK.work_id)
+    assert (check.result, check.note) == ("verified", "tried live by a person")
+    assert app.state.control_db.work_signoffs()[WORK.work_id][1] is not None
+
+
+def test_an_unconfirmed_works_close_records_no_live_check(tmp_path, monkeypatch):
+    app, gh, _ = _route_app(tmp_path, monkeypatch, _tried, gh=_Gh((1, b"", b"HTTP 404")))
+
+    response = _post(_client(app), "tried_ok")
+
+    assert response.status_code == 202  # it may have closed: nothing is recorded or retried
+    assert app.state.control_db.work_live_check(WORK.work_id) is None
 
 
 def test_an_action_the_work_no_longer_offers_is_refused_before_any_write(tmp_path, monkeypatch):
@@ -454,7 +510,10 @@ def test_chatgpt_review_is_the_existing_review_workflow(tmp_path, monkeypatch):
     app, gh, _ = _route_app(tmp_path, monkeypatch)
     asked: list[tuple[str, bool]] = []
 
-    async def open_review(config, target, *, start=True, pulls=(), board=None, releases=None):
+    async def open_review(
+        config, target, *, start=True, pulls=(), board=None, releases=None, earlier=None,
+        shipped=None,
+    ):
         asked.append((target, start))
         assert pulls == (f"{ORG}/agentdeck#7",), "the open pull request rides along (#2637)"
         if len(asked) == 1:
@@ -483,7 +542,10 @@ def test_agent_review_opens_the_review_chat_and_starts_a_claude_reviewer_on_it(
     asked: list[tuple[str, bool]] = []
     started: list[tuple[int, str]] = []
 
-    async def open_review(config, target, *, start=True, pulls=(), board=None, releases=None):
+    async def open_review(
+        config, target, *, start=True, pulls=(), board=None, releases=None, earlier=None,
+        shipped=None,
+    ):
         asked.append((target, start))
         assert pulls == (f"{ORG}/agentdeck#7",)
         return chat_review.ReviewOutcome(
@@ -514,7 +576,10 @@ def test_agent_review_opens_the_review_chat_and_starts_a_claude_reviewer_on_it(
 def test_agent_review_leaves_a_chat_someone_already_holds(tmp_path, monkeypatch):
     app, _gh, _ = _route_app(tmp_path, monkeypatch)
 
-    async def open_review(config, target, *, start=True, pulls=(), board=None, releases=None):
+    async def open_review(
+        config, target, *, start=True, pulls=(), board=None, releases=None, earlier=None,
+        shipped=None,
+    ):
         return chat_review.ReviewOutcome(
             f"{ORG}/agentdeck", 5, "u", 12, False, note="#12 is in-progress"
         )
@@ -587,6 +652,143 @@ def test_merge_when_ready_is_not_sent_when_refused_and_may_be_pressed_again(
     assert _post(client, "approve_merge", "press-0003").status_code == 409, "already approved"
     assert _post(client, "withdraw_merge", "press-0004").status_code == 200
     assert _post(client, "approve_merge", "press-0005").status_code == 200, "again at once"
+
+
+def test_ship_now_is_offered_at_findings_and_ships_through_the_router(tmp_path, monkeypatch):
+    """#4212: Ship now, fix later shows inline beside the headline only on a Work the deck
+    releases whose open pull request stands at review findings, and the press is the router's
+    ``ship_now`` for each of them, answered with the follow-up it filed."""
+    from agentdeck.web import routes_works
+    from agentdeck.web.work_view import WorkDetail, render_work_sections
+    from agentdeck.work_router import AgainRefused
+
+    app, _gh, _holder = _route_app(tmp_path, monkeypatch, _idle)
+    card = _idle()
+
+    def status(**extra):
+        detail = WorkDetail(card=card, workspace=None, chats=(), verifications=(), **extra)
+        return dict(render_work_sections(app.state.templates, detail))["status"]
+
+    offered = status(shippable=("eerovil/agentdeck#7",), deck_release=True)
+    assert "data-work-ship-now" in offered and 'value="ship_now"' in offered
+    assert 'hx-confirm="Ship this Work as it is?' in offered
+    assert "data-work-ship-now" not in status(shippable=("eerovil/agentdeck#7",))
+    assert "data-work-ship-now" not in status(deck_release=True)
+    # D10: the confirm quotes the findings' first line, and posts the head it showed them
+    # at; D12: a shipped pull request says so on its Work's page, and the status redraws live
+    # when that record appears.
+    quoted = status(
+        shippable=("eerovil/agentdeck#7",),
+        deck_release=True,
+        ship_findings=(("eerovil/agentdeck#7", "1. <a>"),),
+    )
+    assert "The findings start: eerovil/agentdeck#7: 1. &lt;a&gt;" in quoted
+    assert f'name="confirmed" value="eerovil/agentdeck#7@{HEAD}"' in quoted
+    # Every pull request it would ship is named with its own findings (#4212 review).
+    from agentdeck.work_actions import ship_now_control
+
+    two = SimpleNamespace(
+        paused=False,
+        outputs=(
+            SimpleNamespace(repository="a/b", number=1, head="1" * 40),
+            SimpleNamespace(repository="a/b", number=2, head="2" * 40),
+        ),
+    )
+    both = ship_now_control(two, True, ("a/b#1", "a/b#2"), (("a/b#1", "1. leaks a token"),))
+    assert "It ships 2 pull requests with their findings:\n- a/b#1: 1. leaks a token\n" in (
+        both.confirm
+    )
+    assert "- a/b#2: its findings kept no words" in both.confirm
+    assert both.confirmed == f"a/b#1@{'1' * 40} a/b#2@{'2' * 40}"
+    landed = status(shipped=(("eerovil/agentdeck#7", "eerovil/agentdeck#41"),))
+    assert 'data-work-shipped="eerovil/agentdeck#7"' in landed
+    assert 'href="https://github.com/eerovil/agentdeck/issues/41"' in landed
+    assert "data-work-shipped" not in offered
+    from agentdeck.web.work_view import SECTION_INPUTS, _shipped_of
+
+    before = WorkDetail(card=card, workspace=None, chats=(), verifications=())
+    after = WorkDetail(
+        card=card, workspace=None, chats=(), verifications=(), shipped=(("a/b#9", "a/b#41"),)
+    )
+    assert SECTION_INPUTS["status"](before, "") != SECTION_INPUTS["status"](after, "")
+    ref = SimpleNamespace(repository="a/b", number=7, work_id="github_issue:a/b#7")
+    reader = SimpleNamespace(
+        shipped_by_work=lambda work: (
+            [SimpleNamespace(pull="a/b#9", follow_up="a/b#41")] if work == "a/b#7" else []
+        )
+    )
+    assert _shipped_of(reader, ref) == (("a/b#9", "a/b#41"),)
+    assert _shipped_of(SimpleNamespace(), ref) == ()
+    # A press refused after it passed the head offers Ship now again, quoting the findings
+    # at the head it passed (a base update carried the pass to the live one), until marked.
+    from agentdeck.review_history import ACCEPTED, FINDINGS, PASS, SHIP_NOTE, ReviewEvent
+    from agentdeck.web.work_view import _ship_findings, _shippable
+
+    old, mid, new = "1" * 40, "3" * 40, "2" * 40
+    events = [
+        ReviewEvent("a/b#9", old, 1.0, FINDINGS, "f", {"text": "1. off"}, 0),
+        ReviewEvent("a/b#9", old, 2.0, ACCEPTED, "a", {"note": SHIP_NOTE}, 1),
+        ReviewEvent("a/b#9", mid, 3.0, PASS, "c", {"note": SHIP_NOTE, "carried_from": old}, 2),
+        ReviewEvent("a/b#9", new, 4.0, PASS, "d", {"note": SHIP_NOTE, "carried_from": mid}, 3),
+    ]
+    marked: set[str] = set()
+    shown = SimpleNamespace(
+        outputs=(SimpleNamespace(repository="a/b", number=9, head=new, is_open=True),)
+    )
+    snapshot = SimpleNamespace(
+        review_events={"a/b#9": events},
+        state=SimpleNamespace(ship_unfinished=lambda pull, head: head not in marked),
+    )
+    assert _shippable(snapshot, shown) == ("a/b#9",)
+    assert _ship_findings(snapshot, shown, ("a/b#9",)) == (("a/b#9", "1. off"),)
+    marked.add(old)
+    assert _shippable(snapshot, shown) == ()
+    events[1:] = [ReviewEvent("a/b#9", new, 3.0, ACCEPTED, "a", {"note": "keep it"}, 1)]
+    marked.clear()
+    assert _shippable(snapshot, shown) == ()  # an owner's own acceptance is no Ship now
+
+    shipped: list[tuple[str, int]] = []
+
+    class Router:
+        enabled = True
+
+        async def ship_now(self, repository, number, head=""):
+            shipped.append((repository, number, head))
+            if len(shipped) == 1:
+                raise AgainRefused("eerovil/agentdeck#9 moved past cccccccccccc")
+            return {"follow_up": "eerovil/agentdeck#41", "outcome": "review pass recorded"}
+
+    class Release:
+        def handles(self, work_id):
+            return True
+
+    app.state.work_router = Router()
+    app.state.work_release = Release()
+    real = routes_works.load_work_detail
+    holder = {"shippable": ()}
+
+    async def detail(app_, ref, **kw):
+        return replace(
+            await real(app_, ref, **kw), shippable=holder["shippable"], deck_release=True
+        )
+
+    monkeypatch.setattr(routes_works, "load_work_detail", detail)
+    client = _client(app)
+    nothing = _post(client, "ship_now", "press-0001")
+    assert nothing.status_code == 409 and "no open pull request stands" in nothing.text
+    assert shipped == []
+    holder["shippable"] = ("eerovil/agentdeck#7",)
+    # A press whose confirm showed none of it, or another head, ships nothing (#4212 review).
+    unshown = _post(client, "ship_now", "press-0004")
+    assert unshown.status_code == 409 and "changed since the page showed them" in unshown.text
+    stale = _post(client, "ship_now", "press-0005", confirmed=f"eerovil/agentdeck#7@{'d' * 40}")
+    assert stale.status_code == 409 and shipped == []
+    shown = f"eerovil/agentdeck#7@{HEAD}"
+    refused = _post(client, "ship_now", "press-0002", confirmed=shown)
+    assert refused.status_code == 409 and "moved past" in refused.text
+    done = _post(client, "ship_now", "press-0003", confirmed=shown)
+    assert done.status_code == 200 and "follow-up eerovil/agentdeck#41" in done.text
+    assert shipped == [("eerovil/agentdeck", 7, HEAD)] * 2
 
 
 def test_a_merge_the_work_no_longer_offers_writes_nothing(tmp_path, monkeypatch):
@@ -665,6 +867,21 @@ def test_the_work_page_shows_merge_when_ready_then_approved_then_cleared(
         app.state.templates, replace(detail, pre_review_waits=held), previous=before
     )
     assert held in released["status"][1]
+    # #4172: a Work held by a pull request outside the repository that merges on its own.
+    why = "o/robot merges on its own, but this Work also has a pull request in o/store"
+    assert f"data-work-merge-reason>{why}</p>" in status(approval="offered", approval_reason=why)
+    assert "data-work-merge-reason" not in status(approval_reason=why)
+    from types import SimpleNamespace
+
+    from agentdeck.web.work_view import _shown_pulls
+
+    rows = (OutputFact("u", "O/Robot", 2, "registered", state="open", draft=True),)
+    assert _shown_pulls(SimpleNamespace(outputs=rows)) == [("o/robot#2", "open", True)]
+    held_live = render_changed_sections(
+        app.state.templates, replace(detail, approval="offered", approval_reason=why),
+        previous=before,
+    )
+    assert why in held_live["status"][1], "the reason moves live with the release's read"
     cleared = status(approval="offered", approval_cleared="Merge approval cleared: x changed.")
     assert "data-work-merge-cleared" in cleared and "x changed." in cleared
     assert "approve_merge" not in status()

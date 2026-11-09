@@ -571,6 +571,7 @@ class _SubmitArgs:
         self.workspace = [str(path) for path in workspaces]
         self.work = ""
         self.max_minutes = None
+        self.progress = False
 
 
 def _cli(monkeypatch, *, records: bool, row: dict):

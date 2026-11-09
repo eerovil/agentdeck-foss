@@ -21,7 +21,15 @@ from starlette.responses import PlainTextResponse, StreamingResponse
 from starlette.routing import Route
 from uvicorn.logging import AccessFormatter
 
-from agentdeck import web_idle, web_supervisor, web_worker
+from agentdeck import shutdown, web_idle, web_supervisor, web_worker
+
+# What the code allows an old worker: its graceful window, which the test's open SSE stream
+# always uses up, then a delivery drain in app teardown, then some room. Ten seconds left five
+# for teardown, less than the code permits, and failed one nightly (#4160). A worker that never
+# exits still fails here, and requests are checked for the whole wait.
+_OLD_WORKER_EXIT_S = (
+    web_worker._GRACEFUL_SHUTDOWN_TIMEOUT_S + shutdown.DELIVERY_DRAIN_TIMEOUT_S + 10
+)
 
 
 def _unused_port() -> int:
@@ -542,13 +550,16 @@ db_path = "{database}"
         "AGENTDECK_CODEX_SOCKET": str(tmp_path / "runtime.sock"),
         "PYTHONPATH": str(Path(__file__).parents[1] / "src"),
     }
-    supervisor = subprocess.Popen(
-        [sys.executable, "-m", "agentdeck.web_supervisor"],
-        env=env,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        start_new_session=True,
-    )
+    # A file, not a pipe: nobody reads a pipe until the end, and both workers write here.
+    log_path = tmp_path / "supervisor.log"
+    with log_path.open("wb") as log:
+        supervisor = subprocess.Popen(
+            [sys.executable, "-m", "agentdeck.web_supervisor"],
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=log,
+            start_new_session=True,
+        )
     failures: list[str] = []
     successes = 0
     stop_requests = threading.Event()
@@ -588,7 +599,7 @@ db_path = "{database}"
         second_worker = pid_file.read_text().strip()
         successes_at_handoff = successes
         _wait_for(lambda: successes >= successes_at_handoff + 20)
-        _wait_for(lambda: not Path(f"/proc/{first_worker}").exists(), timeout=10)
+        _wait_for(lambda: not Path(f"/proc/{first_worker}").exists(), timeout=_OLD_WORKER_EXIT_S)
 
         assert second_worker != first_worker
         assert failures == []
@@ -608,9 +619,11 @@ db_path = "{database}"
         except subprocess.TimeoutExpired:
             os.killpg(supervisor.pid, signal.SIGKILL)
             supervisor.wait()
+        # Shown only when the test fails: without it a worker that outstayed says nothing.
+        output = log_path.read_text(errors="replace")
+        print(output)
         if supervisor.returncode != 0:
-            stderr = (supervisor.stderr.read() if supervisor.stderr else b"").decode()
-            raise AssertionError(f"supervisor exited {supervisor.returncode}:\n{stderr}")
+            raise AssertionError(f"supervisor exited {supervisor.returncode}:\n{output}")
 
 
 class _FakeSchedule:

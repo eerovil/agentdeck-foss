@@ -1,0 +1,6 @@
+{# The numbers behind the header's cost dot (#4168). `use` = ChatUse or None. #}
+{% if use %}
+<p class="use-info-level"><span class="use-dot use-{{ use.level }}"></span>{{ use.level | capitalize }}</p>
+{% for line in use.lines %}<p>{{ line }}</p>
+{% endfor %}
+{% endif %}

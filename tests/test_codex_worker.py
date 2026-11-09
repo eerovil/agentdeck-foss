@@ -166,6 +166,24 @@ async def test_the_role_is_persisted_and_sent_to_new_thread(tmp_path):
     assert reloaded.worker_role("owner/repo#1") == "primary"
 
 
+async def test_first_save_after_a_restart_drops_expired_receipts_of_a_quiet_chat(tmp_path):
+    """The hourly sweep starts over on a restart, and old state files load (#4143)."""
+    client = _client()
+    host = CodexWorkerHost(_account(tmp_path), client, state_dir=tmp_path / "state")
+    await host.deliver("quiet", "m", cwd=str(tmp_path), delivery_id="d0", delegated=True)
+    state = json.loads(host._state_path.read_text())
+    state["workers"][0]["deliveries"]["d0"]["at"] = 0.0
+    host._state_path.write_text(json.dumps(state, indent=2))  # As older code wrote it.
+
+    reloaded = CodexWorkerHost(_account(tmp_path), client, state_dir=tmp_path / "state")
+    await reloaded.deliver("other", "m", cwd=str(tmp_path), delivery_id="d1", delegated=True)
+
+    text = reloaded._state_path.read_text()
+    saved = {w["key"]: w["deliveries"] for w in json.loads(text)["workers"]}
+    assert saved["quiet"] == {} and "d1" in saved["other"]
+    assert "\n" not in text
+
+
 async def test_artifact_rollout_configures_an_existing_codex_thread_before_followup(tmp_path):
     client = _client()
     host = CodexWorkerHost(_account(tmp_path), client, state_dir=tmp_path / "state")

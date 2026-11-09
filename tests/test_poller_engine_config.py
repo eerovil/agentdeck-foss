@@ -943,6 +943,22 @@ def test_checks_required_only_beside_a_verification_job(tmp_path, verification, 
         )
 
 
+@pytest.mark.parametrize(
+    ("repo", "value", "ok"),
+    [("fork", "true", True), ("fork", '"yes"', False), ("issues", "true", False)],
+)
+def test_a_repository_may_merge_on_its_own_only_with_code(tmp_path, repo, value, ok):
+    """#4172: the deck's release reads ``auto_release`` per repository; the engine keeps no
+    field for it and refuses only what the deck could misread or a repo with no pull requests."""
+    manifest, overlay = _with_fork()
+    manifest = manifest.replace(f'id = "{repo}"\n', f'id = "{repo}"\nauto_release = {value}\n', 1)
+    assert f"auto_release = {value}" in manifest
+    draft = _inspect(tmp_path, manifest=manifest, overlay=overlay)
+    assert draft.ok is ok, draft.report.render()
+    if not ok:
+        assert any(p.location.endswith(".auto_release") for p in draft.report.problems)
+
+
 def test_a_code_only_repo_is_named_to_the_worker_but_never_worked_in(tmp_path):
     """#1578: the brief has to say the fork exists; no card may be dispatched into it."""
     manifest, overlay = _with_fork()

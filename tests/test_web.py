@@ -822,7 +822,12 @@ async def test_bypass_permissions_chip_only_shows_when_offered_and_reports_a_ref
         refused = await client.post(
             f"/sessions/{key}/bypass-permissions", data={"enabled": "true"}
         )
+        # A Codex turn keeps the settings it started with, and the chip says so (#4092).
+        monkeypatch.setattr(provider, "permission_prompts_next_turn", lambda _a, _s: True)
+        next_turn = await client.get(f"/sessions/{key}")
 
+    assert "Bypass permissions (next turn)" in next_turn.text
+    assert "Bypass permissions (next turn)" not in offered.text
     assert 'id="session-bypass-permissions"' not in without.text
     assert forbidden.status_code == 403
     assert 'id="session-bypass-permissions"' in offered.text
@@ -10845,6 +10850,7 @@ async def test_session_page_uses_the_same_render_as_each_live_fragment(
         "composer-controls": "composer-controls",
         "tools": "tool-activity",
         "related-links": "session-related-links",
+        "use-info": "session-use-numbers",
         "interaction": "pending-interaction-slot",
     }
     for fragment in SESSION_FRAGMENTS:
@@ -10871,6 +10877,7 @@ def test_live_fragment_signatures_ignore_tool_age_only(tmp_path):
         "composer-controls",
         "tools",
         "related-links",
+        "use-info",
         "interaction",
     )
 
@@ -10941,7 +10948,7 @@ async def test_session_sse_primes_and_pushes_each_live_fragment(
     try:
         events = [
             await asyncio.wait_for(gen.__anext__(), timeout=5.0)
-            for _ in range(9)
+            for _ in range(10)
         ]
         topics = [topic(event) for event in events]
         # No old Deckhand attention panel (#2256), no chat list (#2603) and no done
@@ -10956,6 +10963,7 @@ async def test_session_sse_primes_and_pushes_each_live_fragment(
             "composer-controls",
             "tools",
             "related-links",
+            "use-info",
             "needs_you",  # the top bar's list, once per connection (#3239)
         ]
         status, subagents = events[3:5]

@@ -11,7 +11,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from test_work_actions import _Gh
-from test_work_ui import WORK, _add, _app
+from test_work_ui import WORK, _add, _app, _no_blockers
 
 from agentdeck import gh_cli
 from agentdeck.issue_context import IssueBacklog, IssueContext, RepositoryIssues, RepositoryPulls
@@ -131,6 +131,113 @@ async def test_start_agent_adds_the_ownership_label(tmp_path, monkeypatch):
                                "eerovil/agentdeck", "--reason", "completed"]
 
 
+def test_a_chat_starts_an_issue_with_its_projects_own_label(tmp_path, monkeypatch):
+    """A chat that labelled by hand used `agent` on a `claude` board: nothing started (#4141)."""
+    from fastapi.testclient import TestClient
+
+    from agentdeck.web import routes_works
+
+    app = _app(tmp_path)
+    scope = BoardScope("p", org="Acme", ownership_labels=("claude",),
+                       issue_repositories=("Acme/Tickets",))
+    app.state.issues.read_board = lambda: BoardView(scopes=(scope,))
+    records = {7: {"state": "OPEN", "assignee": ""}}
+
+    reads = [1]
+
+    async def refresh(refs, *, limit):
+        return reads[0]
+
+    app.state.issues.refresh_issue_records = refresh
+    app.state.issues.cached_issues = lambda refs: {
+        ref: records[ref[1]] for ref in refs if ref[1] in records
+    }
+    # Another deck serves this repository too, so the issue is assigned first (#3731).
+    app.state.deck_claims = lambda repository, assignee: assignee == "me"
+    gh = _Gh((0, b"", b""), (0, b"", b""))
+    monkeypatch.setattr(gh_cli, "run_once", gh)
+    monkeypatch.setattr(routes_works.shutil, "which", lambda name: "/usr/bin/gh")
+    monkeypatch.setattr("agentdeck.work_claims.own_assignee", lambda repository, claims: "me")
+    client = TestClient(app)
+
+    started = client.post("/api/works/Acme/Tickets/7/start")
+
+    assert started.status_code == 200, started.text
+    assert started.json()["label"] == "claude" and started.json()["started"] is True
+    assert started.json()["waits_on"] == []
+
+    # An open blocker: labelled all the same, and the answer says the agent waits (#4216).
+    async def blocked(repository, number):
+        return ["acme/tickets#3"]
+
+    app.state.open_blockers = blocked
+    gh = _Gh((0, b"", b""), (0, b"", b""))
+    monkeypatch.setattr(gh_cli, "run_once", gh)
+    waiting = client.post("/api/works/acme/tickets/7/start").json()
+    assert waiting["started"] is False and waiting["waits_on"] == ["acme/tickets#3"]
+    assert waiting["detail"] == (
+        "Labelled acme/tickets#7: it has the claude label, so an agent starts on it once"
+        " acme/tickets#3 closes; it is assigned to me"
+    ), waiting["detail"]
+    assert [call[0][-1] for call in gh.calls] == ["me", "claude"]
+    assert waiting["blockers_read"] is True
+
+    # Blockers unread: it waits too, and says so rather than naming a blocker (#4216 review).
+    async def unread(repository, number):
+        return None
+
+    app.state.open_blockers = unread
+    gh = _Gh((0, b"", b""), (0, b"", b""))
+    monkeypatch.setattr(gh_cli, "run_once", gh)
+    waiting = client.post("/api/works/acme/tickets/7/start").json()
+    assert waiting["started"] is False and waiting["waits_on"] == []
+    assert waiting["blockers_read"] is False
+    assert "so an agent starts on it once its blockers can be read and none is open" in (
+        waiting["detail"]
+    ), waiting["detail"]
+    app.state.open_blockers = _no_blockers
+    assert [call[0][-2:] for call in gh.calls] == [
+        ["--add-assignee", "me"],
+        ["--add-label", "claude"],
+    ]
+
+    # Already this deck's person's: no refusal. The write is the same and changes nothing.
+    records[7] = {"state": "OPEN", "assignee": "ME"}
+    gh = _Gh((0, b"", b""), (0, b"", b""))
+    monkeypatch.setattr(gh_cli, "run_once", gh)
+    assert client.post("/api/works/acme/tickets/7/start").status_code == 200
+
+    # Not this deck's to start: refused before any write, never a quiet "started" (#4142).
+    gh = _Gh()
+    monkeypatch.setattr(gh_cli, "run_once", gh)
+    records.update(
+        {
+            8: {"state": "OPEN", "assignee": "them"},
+            9: {"state": "CLOSED", "assignee": ""},
+            10: {"state": "OPEN", "assignee": "", "is_pr": True},
+        }
+    )
+    other_deck = client.post("/api/works/acme/tickets/8/start")
+    assert other_deck.status_code == 409 and "assigned to them" in other_deck.json()["detail"]
+    assert client.post("/api/works/acme/tickets/9/start").status_code == 409
+    assert client.post("/api/works/acme/tickets/10/start").status_code == 409
+    assert client.post("/api/works/acme/tickets/11/start").status_code == 503  # never read
+    # The fresh read failed: a stale cached row saying open and free is not trusted.
+    reads[0] = 0
+    stale = client.post("/api/works/acme/tickets/7/start")
+    assert stale.status_code == 503 and "could not be read" in stale.json()["detail"]
+    reads[0] = 1
+    assert gh.calls == []
+
+    # Nothing manages it, or the write failed: the caller is told, never a quiet "started".
+    assert client.post("/api/works/acme/other/7/start").status_code == 409
+    assert client.post("/api/works/not-a-work/start").status_code == 404
+    gh = _Gh((1, b"", b"denied"), (1, b"", b"denied"))
+    monkeypatch.setattr(gh_cli, "run_once", gh)
+    uncertain = client.post("/api/works/acme/tickets/7/start")
+    assert uncertain.status_code == 502 and "denied" in uncertain.json()["detail"]
+
+
 async def test_start_agent_assigns_this_decks_person_where_another_deck_takes_unassigned(
     tmp_path, monkeypatch
 ):
@@ -197,8 +304,9 @@ async def test_start_agent_assigns_this_decks_person_where_another_deck_takes_un
     )
     head = "abc1234" + "0" * 33
     row = {"state": "OPEN", "headRefOid": head, "isDraft": False, "baseRefName": "master",
-           "changedFiles": 1, "files": [{"path": "src/a.py", "additions": 5, "deletions": 1,
-                                         "changeType": "MODIFIED"}]}
+           "title": "Their fix", "body": "What their fix does", "changedFiles": 1,
+           "files": [{"path": "src/a.py", "additions": 5, "deletions": 1,
+                      "changeType": "MODIFIED"}]}
     app.state.issues.cached_pulls = lambda wanted: {ref: row for ref in wanted}
     await app.state.work_overview.refresh()
     overview = await app.state.work_overview.current()
@@ -209,6 +317,7 @@ async def test_start_agent_assigns_this_decks_person_where_another_deck_takes_un
     page = client.get(work_href(WORK.work_id)).text
     assert "Reviewed on @coworker" in page and 'href="https://x/c7"' in page
     assert "data-wd-output-size" in page
+    assert "<summary>Their fix</summary>" in page and "data-open-by-default" in page  # #4137
 
     # Two pull requests: each lists its own verdict, and findings on one are not hidden by a
     # pass on the other (#3855 review).

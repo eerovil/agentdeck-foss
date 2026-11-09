@@ -232,11 +232,12 @@ async def read_parent(repository: str, number: int) -> tuple[str, int] | None:
 
 async def read_dependencies(repository: str, number: int, kind: str) -> list[dict] | None:
     """The issues an issue blocks (``kind`` ``blocking``) or waits on (``blocked_by``), read
-    live, each ``{repository, number, state, labels}``; ``None`` if unread.
+    live, each ``{repository, number, state, labels, assignee}``; ``None`` if unread.
 
-    The Work router reads them when a wayfinder ticket closes, to start a ticket it blocked
-    once that ticket has no open blocker left (#3764). Live, not from the ``blocked-by`` cache:
-    the close that asks may not have refreshed it yet."""
+    The Work router reads them when an issue closes, to start an issue it blocked once that
+    one has no open blocker left (#3764, #4216), and before it starts a labelled issue, which
+    waits while a blocker is open. Live, not from the ``blocked-by`` cache: the close that
+    asks may not have refreshed it yet."""
     gh = shutil.which("gh")
     if gh is None:
         return None
@@ -248,7 +249,8 @@ async def read_dependencies(repository: str, number: int, kind: str) -> list[dic
                 f"repos/{repository}/issues/{number}/dependencies/{kind}?per_page=100",
                 "--jq",
                 '[.[] | {repository: (.repository_url | split("/") | .[-2:] | join("/")),'
-                " number, state, labels: [.labels[]?.name]}]",
+                " number, state, labels: [.labels[]?.name],"
+                ' assignee: ((.assignees // [])[0].login // "")}]',
             ],
             timeout=GH_TIMEOUT_S,
             repo=repository,
@@ -261,6 +263,50 @@ async def read_dependencies(repository: str, number: int, kind: str) -> list[dic
         log.warning("work signal: %s of %s#%s unread (gh exit %s)", kind, repository, number, code)
         return None
     return [row for row in found if isinstance(row, dict)]
+
+
+async def open_blockers(repository: str, number: int) -> list[str] | None:
+    """The issues still blocking ``repository#number`` (``owner/repo#n``), read live;
+    ``None`` if unread. An issue with any waits for them: it starts when the last closes
+    (#4216)."""
+    rows = await read_dependencies(repository, number, "blocked_by")
+    if rows is None:
+        return None
+    return [
+        f"{row.get('repository')}#{row.get('number')}"
+        for row in rows
+        if str(row.get("state") or "").lower() != "closed"
+    ]
+
+
+# What a Work start answers when it did not ask the runtime because of the issue's blockers
+# (#4216): one is still open, so its last blocker closing starts it, or they could not be
+# read, so the start is tried again later.
+BLOCKED = "waits on a blocker"
+BLOCKERS_UNREAD = "blockers unread"
+
+
+async def start_unless_blocked(
+    start, repository: str, number: int, *, blockers=open_blockers, **kwargs
+) -> str:
+    """Start ``repository#number``'s Work with ``start`` only while no blocker is open
+    (#4216, owner's choice). Every Work start the deck makes by itself goes through this one
+    check: a label or assignment delivery, its retry after a refusal, the missed-start
+    backstop and the last blocker closing. The list is read live each time, so a blocker
+    added after the first try still holds the retry. An unread list holds it too
+    (``BLOCKERS_UNREAD``, tried again), rather than risk an agent on a blocked issue."""
+    try:
+        still = await blockers(repository, number)
+    except Exception:  # noqa: BLE001 - unread: held, and tried again later
+        log.warning("work signal: blockers of %s#%s unread", repository, number, exc_info=True)
+        still = None
+    if still is None:
+        log.info("work signal: %s#%s waits: its blockers are unread", repository, number)
+        return BLOCKERS_UNREAD
+    if still:
+        log.info("work signal: %s#%s waits on %s", repository, number, ", ".join(still))
+        return BLOCKED
+    return await start(repository, number, **kwargs)
 
 
 async def read_map_body(repository: str, number: int) -> dict | None:

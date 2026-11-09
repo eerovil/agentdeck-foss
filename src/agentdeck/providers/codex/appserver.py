@@ -12,7 +12,7 @@ import shlex
 import shutil
 import time
 import tomllib
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -26,6 +26,7 @@ from ...command_artifacts import (
     CONTEXT_DIR_ENV,
     hook_groups,
 )
+from ...job_scratch import point_chat_temp_files
 from ...models import (
     Account,
     ForkFrom,
@@ -58,8 +59,17 @@ REQUEST_TIMEOUT_S = 30.0
 # StreamReader limit is 64 KiB, so a single large event (e.g. a big tool result)
 # raises LimitOverrunError ("Separator is found, but chunk is longer than
 # limit") and kills the whole turn, dropping Codex's final message. Raise the
-# per-line buffer so realistic tool output does not break the transport.
-STDOUT_LINE_LIMIT = 16 * 1024 * 1024
+# per-line buffer so realistic tool output does not break the transport. The
+# buffer grows only as far as a line needs, so a high ceiling costs nothing until
+# a line is that long.
+STDOUT_LINE_LIMIT = 256 * 1024 * 1024
+
+# One ``thread/list`` reply is one stdout line, and every thread in it carries its
+# whole first message as ``preview``. A hundred chats opened with 400 KB prompts
+# made a 38 MB reply: past the old 16 MiB line limit, so recovery failed at startup
+# and the runtime could not come up at all. Small pages keep the reply far below
+# the limit; more of them cost only a few requests at startup.
+THREAD_LIST_PAGE_SIZE = 20
 
 # stderr is diagnostic rather than protocol data. Drain it in small chunks so
 # an unterminated message cannot block the child. Reassemble complete lines so
@@ -132,7 +142,7 @@ def _status_type(value: object) -> str:
     return "notLoaded"
 
 
-def _usage_limit_refusal(turn: dict[str, Any]) -> str:
+def usage_limit_refusal(turn: dict[str, Any]) -> str:
     """The account's own refusal of this turn, or ``""`` for anything else (#1519).
 
     A `turn/completed` whose status is `failed` carries a `TurnError`: a `message` and a
@@ -174,7 +184,7 @@ def _turn_failure(turn: object, status: object) -> str:
     check must not mistake for a broken CLI (#3210).
     """
     reason = f"Codex turn ended with status {status or 'unknown'}"
-    refusal = _usage_limit_refusal(turn) if isinstance(turn, dict) else ""
+    refusal = usage_limit_refusal(turn) if isinstance(turn, dict) else ""
     return f"{reason}: {refusal}" if refusal else reason
 
 
@@ -327,6 +337,7 @@ class CodexAppServer:
         persistent_backend: bool = True,
         backend_scope: str = "",
         permission_prompts_allowed: Callable[[str], bool] | None = None,
+        bypass_permissions_on: Callable[[str], bool] | None = None,
         artifact_root: Path | None = None,
     ) -> None:
         self.account = account
@@ -342,6 +353,7 @@ class CodexAppServer:
         self._permission_prompts_allowed = permission_prompts_allowed or (
             lambda _thread_id: False
         )
+        self._bypass_permissions_on = bypass_permissions_on or (lambda _thread_id: False)
         self._artifact_root = artifact_root
         self._process: asyncio.subprocess.Process | None = None
         self._reader_task: asyncio.Task | None = None
@@ -360,6 +372,7 @@ class CodexAppServer:
         self._idle_since: dict[str, float] = {}
         self._threads: dict[str, dict[str, Any]] = {}
         self._approval_policies: dict[str, str | dict[str, Any]] = {}
+        self._sandbox_policies: dict[str, dict[str, Any]] = {}
         self._active_turn: dict[str, str] = {}
         self._turn_started_waiters: dict[str, asyncio.Future] = {}
         self._turn_waiters: dict[str, asyncio.Future] = {}
@@ -400,6 +413,7 @@ class CodexAppServer:
             # Same caching, rate-limited `gh` the Claude workers get (#814):
             # every owned agent reads GitHub through one shared budget.
             env["PATH"] = gh_shim.worker_path(env)
+            point_chat_temp_files(env)
             # Keep #1346's PATH/Python queue interception even though current
             # Codex also supports per-thread hooks: queue safety must not depend
             # on an optional artifact policy or one provider hook generation.
@@ -542,6 +556,7 @@ class CodexAppServer:
                 LEDGER_PATH_ENV,
                 "PATH",
                 "PYTHONPATH",
+                "TMPDIR",
                 "GIT_CONFIG_COUNT",
             ):
                 if name in env:
@@ -618,6 +633,9 @@ class CodexAppServer:
                 LEDGER_PATH_ENV,
                 "PATH",
                 "PYTHONPATH",
+                # Only here: the idle refresh compares against this process's
+                # own environment, whose TMPDIR is not the one a chat gets.
+                "TMPDIR",
             } & env.keys()
         if not required:
             return False
@@ -910,9 +928,15 @@ class CodexAppServer:
             # source kind ``vscode``. Include both persisted kinds; the list
             # response loses ``threadSource`` after restart, so ownership must
             # be recovered from AgentDeck's durable transcript originator.
+            #
+            # ``useStateDbOnly`` answers from Codex's state database. Without it Codex
+            # walks the rollout files for every page: 115 pages took 113 s on live and
+            # still skipped 101 of 2,395 threads, while this takes about a second and
+            # returns them all with identical records (#4100).
             params: dict[str, Any] = {
                 "sourceKinds": ["appServer", "vscode"],
-                "limit": 200,
+                "limit": THREAD_LIST_PAGE_SIZE,
+                "useStateDbOnly": True,
             }
             if cursor is not None:
                 params["cursor"] = cursor
@@ -1006,7 +1030,7 @@ class CodexAppServer:
                 self._last_results[thread_id] = (
                     time.time(),
                     str(turn.get("status") or "unknown"),
-                    _usage_limit_refusal(turn),
+                    usage_limit_refusal(turn),
                 )
                 waiter = self._turn_waiters.pop(turn_id, None)
                 if waiter is not None and not waiter.done():
@@ -1145,12 +1169,20 @@ class CodexAppServer:
         }
         if self._permission_prompts_allowed(thread_id):
             params["approvalPolicy"] = "on-request"
+        if self._bypass_permissions_on(thread_id):
+            # A thread's settings live in the app-server, not its rollout, so a
+            # reload would otherwise fall back to the process's sandbox (#4092).
+            params["approvalPolicy"] = "never"
+            params["sandbox"] = "danger-full-access"
         return params
 
     def _record_approval_policy(self, thread_id: str, payload: dict[str, Any]) -> None:
         policy = payload.get("approvalPolicy")
         if isinstance(policy, (str, dict)):
             self._approval_policies[thread_id] = policy
+        sandbox = payload.get("sandbox")
+        if isinstance(sandbox, dict):
+            self._sandbox_policies[thread_id] = sandbox
 
     def approval_policy(self, thread_id: str) -> str | dict[str, Any] | None:
         return self._approval_policies.get(thread_id)
@@ -1165,6 +1197,19 @@ class CodexAppServer:
                 return None
             await self._ensure_loaded(thread_id)
             return self.approval_policy(thread_id)
+
+    async def current_permission_settings(self, thread_id: str) -> dict[str, Any] | None:
+        """Load an owned thread and return what switching bypass off must restore."""
+        await self.start()
+        async with self._thread_operation_lock(thread_id):
+            if thread_id not in self._owned:
+                return None
+            await self._ensure_loaded(thread_id)
+            policy = self.approval_policy(thread_id)
+            sandbox = self._sandbox_policies.get(thread_id)
+            if policy is None or sandbox is None:
+                return None
+            return {"approvalPolicy": policy, "sandboxPolicy": sandbox}
 
     def last_result(self, thread_id: str) -> tuple[float, str, str] | None:
         """When this thread's last turn finished, its status, and any refusal it named."""
@@ -1248,7 +1293,13 @@ class CodexAppServer:
         role: SessionRole | None = None,
         session_token: str | None = None,
         fork_from: ForkFrom | None = None,
+        before_first_turn: Callable[[str], Awaitable[InjectResult]] | None = None,
     ) -> InjectResult:
+        """Create a thread and send its first message.
+
+        ``before_first_turn`` runs between the two, so whatever it sets governs the
+        first turn too; a refusal there sends nothing and is returned as the answer.
+        """
         try:
             created = await self.create_thread(
                 cwd,
@@ -1274,6 +1325,10 @@ class CodexAppServer:
         if not created.accepted or not created.session_id:
             return created
         thread_id = created.session_id
+        if before_first_turn is not None:
+            prepared = await before_first_turn(thread_id)
+            if not prepared.accepted:
+                return prepared
         initial = await self.start_turn(
             thread_id, message, images=images, effort=effort, wait=False
         )
@@ -1385,6 +1440,38 @@ class CodexAppServer:
                 # Nothing to put back means no policy was sent, so leave the
                 # recorded one alone rather than claim a value we never asserted.
                 self._approval_policies[thread_id] = previous_policy
+        self._on_change(thread_id)
+        return InjectResult(True)
+
+    async def set_bypass_permissions(
+        self,
+        thread_id: str,
+        enabled: bool,
+        *,
+        previous_settings: dict[str, Any] | None = None,
+    ) -> InjectResult:
+        """Take this thread's sandbox and approvals off, or put them back (#4092).
+
+        ``previous_settings`` is ``current_permission_settings`` from before the
+        switch went on. A turn already running keeps the settings it started with.
+        """
+        settings: dict[str, Any] = (
+            {"approvalPolicy": "never", "sandboxPolicy": {"type": "dangerFullAccess"}}
+            if enabled
+            else dict(previous_settings or {})
+        )
+        if not settings:
+            return InjectResult(False, "the settings to put back are not known")
+        await self.start()
+        async with self._thread_operation_lock(thread_id):
+            if thread_id not in self._owned:
+                return InjectResult(False, "agentdeck does not own this Codex thread")
+            await self._ensure_loaded(thread_id)
+            await self._request(
+                "thread/settings/update", {"threadId": thread_id, **settings}
+            )
+            self._approval_policies[thread_id] = settings["approvalPolicy"]
+            self._sandbox_policies[thread_id] = settings["sandboxPolicy"]
         self._on_change(thread_id)
         return InjectResult(True)
 

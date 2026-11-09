@@ -17,6 +17,7 @@ from agentdeck import kanban
 from agentdeck.attachments import ATTACHMENT_HEADER, ATTACHMENT_MARKER
 from agentdeck.config import AccountConfig
 from agentdeck.models import (
+    SNAPSHOT_ROLE_V1,
     Account,
     Capability,
     InjectResult,
@@ -30,6 +31,7 @@ from agentdeck.providers import _filecache as filecache_mod
 from agentdeck.providers.codex import provider as provider_mod
 from agentdeck.providers.codex import transcripts
 from agentdeck.providers.codex.provider import CodexProvider
+from agentdeck.providers.codex.usage import limit_reset_at
 from agentdeck.providers.instructions import (
     agentdeck_session_instructions,
     wrap_session_guide,
@@ -54,16 +56,27 @@ def test_new_session_defaults_use_account_config_and_model_fallback(tmp_path):
     assert provider.new_session_defaults(account) == ("gpt-5.6-terra", "high")
 
 
-def test_astra_is_selectable_without_becoming_the_fallback_model(tmp_path):
+def test_gpt6_family_is_selectable_without_becoming_the_fallback_model(tmp_path):
     account = Account("codex:test", "codex", "test", tmp_path)
     provider = CodexProvider()
 
-    assert "gpt-6-astra" in [choice.value for choice in provider.selectable_models]
-    assert provider.new_session_defaults(
-        account, model_override="gpt-6-astra"
-    ) == ("gpt-6-astra", "medium")
+    for model in (
+        "gpt-6-luna",
+        "gpt-6-sol",
+        "gpt-6-astra",
+        "gpt-6.1-terra",
+        "gpt-6.1-sol",
+    ):
+        assert provider.is_valid_model(model)
+        assert provider.new_session_defaults(account, model_override=model) == (
+            model,
+            "medium",
+        )
     # Listing a pricier model must not silently move every new chat onto it.
     assert provider.new_session_defaults(account).model == "gpt-5.6-sol"
+    # Sol exists in three generations: the picker must tell them apart.
+    labels = [choice.label for choice in provider.selectable_models]
+    assert len(labels) == len(set(labels))
 
 
 async def test_new_session_state_hides_the_attachment_transport_note(tmp_path):
@@ -93,6 +106,74 @@ async def test_new_session_state_hides_the_attachment_transport_note(tmp_path):
     assert session.initial_prompt == "Read the brief"
     assert session.last_prompt == "Read the brief"
     client.start_thread.assert_awaited_once()
+
+
+async def test_new_codex_session_accepts_the_work_role(tmp_path):
+    account = Account("codex:test", "codex", "test", tmp_path)
+    provider = CodexProvider()
+    client = MagicMock()
+    client.start_thread = AsyncMock(return_value=InjectResult(True, session_id="thread-1"))
+    provider._clients[account.key] = client
+    result = await provider.start_session(
+        account, tmp_path, "Work on the issue", timeout_s=1, role="work"
+    )
+    assert result.accepted
+    assert client.start_thread.await_args.kwargs["role"] == "work"
+
+
+async def test_a_role_needs_the_runtime_rather_than_a_plain_codex_exec(tmp_path):
+    account = Account("codex:test", "codex", "test", tmp_path)
+    result = await CodexProvider().start_session(
+        account, tmp_path, "Work on the issue", timeout_s=1, role="work"
+    )
+    assert not result.accepted
+    assert "cannot start a chat with a role" in result.reason
+
+
+async def test_a_role_is_refused_by_a_runtime_that_would_drop_it(tmp_path):
+    account = Account("codex:test", "codex", "test", tmp_path)
+    provider = CodexProvider()
+    client = MagicMock()
+    client.supports.side_effect = lambda capability: capability != SNAPSHOT_ROLE_V1
+    client.start_thread = AsyncMock(return_value=InjectResult(True, session_id="thread-1"))
+    provider._clients[account.key] = client
+
+    refused = await provider.start_session(
+        account, tmp_path, "Work on the issue", timeout_s=1, role="work"
+    )
+    plain = await provider.start_session(account, tmp_path, "Hello", timeout_s=1)
+
+    assert not refused.accepted
+    assert "cannot start a chat with a role" in refused.reason
+    assert plain.accepted
+    client.start_thread.assert_awaited_once()
+
+
+async def test_codex_bypass_is_offered_on_owned_chats_only_and_reaches_the_runtime(tmp_path):
+    account = Account("codex:test", "codex", "test", tmp_path)
+    provider = CodexProvider()
+    client = MagicMock()
+    client.owns.side_effect = lambda thread_id: thread_id == "thread-1"
+    client.active_turn.return_value = None
+    client.bypass_permissions_on.return_value = True
+    client.set_bypass_permissions = AsyncMock(return_value=InjectResult(True))
+    provider._clients[account.key] = client
+
+    def session(thread_id):
+        return Session(
+            key=f"{account.key}:{thread_id}",
+            account_key=account.key,
+            session_id=thread_id,
+            status=SessionStatus.IDLE,
+        )
+
+    assert Capability.BYPASS_PERMISSIONS in provider._runtime_capabilities(account, "thread-1")
+    assert Capability.BYPASS_PERMISSIONS not in provider._runtime_capabilities(account, "other")
+    assert provider.bypass_permissions_on(account, session("thread-1")) is True
+    assert provider.bypass_permissions_on(account, session("other")) is False
+    assert (await provider.set_bypass_permissions(account, session("thread-1"), False)).accepted
+    client.set_bypass_permissions.assert_awaited_once_with("thread-1", False)
+    assert not (await provider.set_bypass_permissions(account, session("other"), True)).accepted
 
 
 def _message(role: str, text: str, *, phase: str | None = None) -> dict:
@@ -1162,6 +1243,55 @@ MEMORY.md:40-52|note=[internal provenance]
     assert meta.last_text == answer
 
 
+def test_an_accepted_async_question_is_the_turns_last_question(tmp_path):
+    """#4177: Codex 0.166's ``request_user_input_async`` returns at once, so the turn
+    ends with no question box. Its question becomes the reply's last paragraph, so the
+    Work waits for the answer in the chat, until a message follows it."""
+    from agentdeck.work_derived import asked_in_last_paragraph
+
+    def ask(call_id, title, accepted=True):
+        arguments = json.dumps({"questions": [{"title": title, "options": ["A", "B"]}]})
+        return [
+            _line("response_item", {"type": "function_call", "name": "request_user_input_async",
+                                    "arguments": arguments, "call_id": call_id}),
+            _line("response_item", {"type": "function_call_output", "call_id": call_id,
+                                    "output": json.dumps({"accepted": accepted})}),
+        ]
+
+    path = tmp_path / "rollout.jsonl"
+
+    def write(lines):
+        path.write_text("".join(json.dumps(line) + "\n" for line in lines))
+        return transcripts.transcript_meta(path).last_text
+
+    said = "Please pick one in the question box."
+    closing = _message("assistant", said)
+    last = write([*ask("c1", "Choose  graphics scope"), closing])
+    assert last == f"{said}\n\nChoose graphics scope?"
+    assert asked_in_last_paragraph(last)
+
+    # A turn that only called the tool, with no words of its own after the prompt.
+    meta_lines = [_message("user", "Plan the graphics"), *ask("c1", "Scope?")]
+    meta_lines.append(_line("event_msg", {"type": "task_complete"}))
+    path.write_text("".join(json.dumps(line) + "\n" for line in meta_lines))
+    meta = transcripts.transcript_meta(path)
+    assert (meta.last_text, meta.last_role) == ("Scope?", "agent")
+    # A call with no output yet is not accepted; a refused later call leaves the earlier.
+    assert write([ask("c1", "Scope?")[0], closing]) == said
+    refused_after = [*ask("c1", "Scope?"), *ask("c2", "Size?", accepted=False), closing]
+    assert write(refused_after) == f"{said}\n\nScope?"
+    # A refused call asks nothing; a message after the question answers it.
+    assert write([*ask("c1", "Scope?", accepted=False), closing]) == said
+    assert write([*ask("c1", "Scope?"), closing, _message("user", "A")]) == said
+    # Asked again after an answer, or twice in a row: the newest question is the one.
+    again = [*ask("c1", "Scope?"), _message("user", "A"), *ask("c2", "Size?"), *ask("c3", "Mode?")]
+    assert write([*again, closing]) == f"{said}\n\nMode?"
+    # Other tools and bad arguments ask nothing.
+    bad = ask("c2", "x")
+    bad[0]["payload"]["arguments"] = "not json"
+    assert write([*bad, closing]) == said
+
+
 def test_codex_drops_truncated_internal_memory_citation(tmp_path):
     path = tmp_path / "rollout.jsonl"
     path.write_text(
@@ -1362,6 +1492,7 @@ async def test_owned_runtime_projection_matches_scan_callback_and_sweep(tmp_path
     client.active_turn.return_value = "turn-1"
     client.interaction.return_value = None
     client.permission_prompts_available.return_value = True
+    client.role.return_value = "work"
     provider._clients[account.key] = client
 
     (session,) = await provider.scan_sessions(account)
@@ -1398,7 +1529,10 @@ async def test_owned_runtime_projection_matches_scan_callback_and_sweep(tmp_path
     session.question = "stale question"
     session.kind = None
     session.capabilities = frozenset()
+    session.owned_role = None
     provider.sweep_liveness(account, [session], state)
+    # Its next leg reads this, so a second hand-off stays a Work's agent (#4092).
+    assert session.owned_role == "work"
     sweep_fields = (
         session.status,
         session.thinking,
@@ -1502,7 +1636,8 @@ def test_watch_health_edges_reproject_stored_runtime_sessions(tmp_path):
     provider._refresh_ok[account.key] = False
     provider._reproject_runtime_sessions(account, state, client)
     assert session.capabilities == frozenset({Capability.TRANSCRIPT})
-    assert provider.pending_interaction(account, session) is None
+    # #4106: the question is still open, so the box stays and its answer waits.
+    assert provider.pending_interaction(account, session) == interaction
 
     provider._refresh_ok[account.key] = True
     provider._reproject_runtime_sessions(account, state, client)
@@ -2299,6 +2434,122 @@ def _owning_client(owned: set[str]) -> MagicMock:
     client.active_turn.return_value = None
     client.interaction.return_value = None
     return client
+
+
+def _limit_stop_rollout(root: Path, sid: str, *records: dict) -> Path:
+    """A rollout whose latest turn the real ``task_complete`` shape ended (#4118)."""
+    path = _rollout(root, sid)
+    with path.open("a") as handle:
+        for record in records:
+            handle.write(json.dumps(record) + "\n")
+    return path
+
+
+def _refused(message: str, at: str = "2026-11-05T09:44:34.401Z") -> dict:
+    error = {"message": message, "codex_error_info": "usage_limit_exceeded"}
+    return _line(
+        "event_msg",
+        {"type": "task_complete", "last_agent_message": None, "error": error},
+        at,
+    )
+
+
+REFUSAL = (
+    "You\u2019ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit"
+    " https://chatgpt.com/settings/usage to purchase more credits or try again at {when}."
+)
+
+
+@pytest.mark.parametrize(
+    ("when", "expected"),
+    [
+        ("12:05 PM", "2026-11-05T10:06:00+00:00"),
+        ("9:58 PM", "2026-11-05T19:59:00+00:00"),
+        ("Nov 7th, 2026 7:48 AM", "2026-11-07T05:49:00+00:00"),
+        ("Nov 22nd, 2026 12:00 AM", "2026-11-21T22:01:00+00:00"),
+    ],
+)
+def test_limit_reset_at_reads_both_of_codexs_forms(monkeypatch, when, expected):
+    monkeypatch.setenv("TZ", "Europe/Helsinki")
+    time.tzset()
+    refused = datetime(2026, 11, 5, 9, 44, tzinfo=UTC)
+    try:
+        assert limit_reset_at(REFUSAL.format(when=when), refused).isoformat() == expected
+    finally:
+        monkeypatch.undo()
+        time.tzset()
+
+
+@pytest.mark.parametrize("text", ["", "try again later.", "try again at 25:99 PM."])
+def test_limit_reset_at_gives_no_time_for_an_unreadable_refusal(text):
+    assert limit_reset_at(text, datetime(2026, 11, 5, tzinfo=UTC)) is None
+
+
+async def test_owned_chat_the_usage_limit_refused_reads_failed_with_its_retry(
+    tmp_path, monkeypatch
+):
+    """The deck must wait for the reset, not ask a refused chat for a next step (#4118)."""
+    runtime = tmp_path / "runtime"
+    runtime.mkdir(mode=0o700)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime))
+    root = tmp_path / "codex"
+    now = datetime.now(UTC)
+    reset = (now + timedelta(days=2)).astimezone()
+    when = f"{reset:%b} {reset.day}th, {reset.year} {reset:%I:%M %p}"
+    stamp = now.isoformat().replace("+00:00", "Z")
+    sids = {
+        "refused": "019f5b2b-c830-7922-a1ce-8c9c69526c10",
+        "unowned": "019f5b2b-c830-7922-a1ce-8c9c69526c11",
+        "old": "019f5b2b-c830-7922-a1ce-8c9c69526c12",
+        "no_time": "019f5b2b-c830-7922-a1ce-8c9c69526c13",
+        "overloaded": "019f5b2b-c830-7922-a1ce-8c9c69526c14",
+        "retried": "019f5b2b-c830-7922-a1ce-8c9c69526c15",
+        "stopped_after": "019f5b2b-c830-7922-a1ce-8c9c69526c16",
+        "running_again": "019f5b2b-c830-7922-a1ce-8c9c69526c17",
+    }
+    refusal = _refused(REFUSAL.format(when=when), stamp)
+    _limit_stop_rollout(root, sids["refused"], refusal)
+    _limit_stop_rollout(root, sids["unowned"], refusal)
+    _limit_stop_rollout(root, sids["old"], _refused(REFUSAL.format(when="Sep 11th, 2026 7:48 AM")))
+    _limit_stop_rollout(root, sids["no_time"], _refused("You've hit your usage limit."))
+    overloaded = {"message": "at capacity", "codex_error_info": "server_overloaded"}
+    _limit_stop_rollout(
+        root,
+        sids["overloaded"],
+        _line("event_msg", {"type": "task_complete", "error": overloaded}),
+    )
+    _limit_stop_rollout(
+        root,
+        sids["retried"],
+        refusal,
+        _line("event_msg", {"type": "task_started"}),
+        _line("event_msg", {"type": "task_complete", "last_agent_message": "Done."}),
+    )
+    _limit_stop_rollout(
+        root, sids["stopped_after"], refusal, _line("event_msg", {"type": "turn_aborted"})
+    )
+    _limit_stop_rollout(
+        root, sids["running_again"], refusal, _line("event_msg", {"type": "task_started"})
+    )
+    account = _account(root)
+    provider = CodexProvider()
+    owned = {sid for name, sid in sids.items() if name != "unowned"}
+    provider._clients[account.key] = _owning_client(owned)
+
+    found = {s.session_id: s for s in await provider.scan_sessions(account)}
+    read = {
+        name: (found[sid].turn_failed, found[sid].automatic_retry_at)
+        for name, sid in sids.items()
+    }
+
+    assert read["refused"] == (True, reset.replace(second=0, microsecond=0) + timedelta(minutes=1))
+    assert read["unowned"] == (False, None)
+    assert read["old"] == (True, None)
+    assert read["no_time"] == (True, None)
+    assert read["overloaded"] == (False, None)
+    assert read["retried"] == (False, None)
+    assert read["stopped_after"] == (False, None)
+    assert read["running_again"] == (False, None)
 
 
 async def test_owned_rescue_keeps_old_helpers_out_of_the_full_record_cache(tmp_path, monkeypatch):

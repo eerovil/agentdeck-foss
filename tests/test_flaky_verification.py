@@ -65,9 +65,13 @@ def _verif(job_id="v", *, failures=(FLAKE,), head="h", base="base-1", **extra) -
     return row
 
 
-def _follow(job_id, kind, tests, *, failures=(), head="h", of="v", state=None, **extra) -> dict:
-    """A follow-up the queue submitted, with what it ran and how it ended."""
+def _follow(
+    job_id, kind, tests, *, failures=(), head="h", of="v", state=None, passed=None, **extra
+) -> dict:
+    """A follow-up the queue submitted, with what it ran and how it ended. Its ``passed`` is
+    what ``pytest -rA`` lists as passed: every requested test it did not fail, by default."""
     row = {
+        "passed": [test for test in tests if test not in failures] if passed is None else passed,
         "id": job_id,
         "follows": of,
         "follow_kind": kind,
@@ -93,6 +97,41 @@ def test_a_failure_a_same_commit_rerun_passed_is_forgiven_as_flaky():
     assert flaky.forgiveness(_verif(), [rerun]) == (
         {"test": FLAKE, "kind": "flaky", "commit": "h", "job_id": "r"},
     )
+
+
+def test_a_rerun_that_lists_no_pass_forgives_nothing_and_is_rerun_again():
+    """#4197: a rerun on the host skipped a test that needs Chrome and exited 0. Only a test
+    the rerun's ``-rA`` summary lists as passed passed; a row from before that record has
+    none, so it forgives nothing either."""
+    skipped = _follow("r", flaky.RERUN, [FLAKE], passed=[])
+    legacy = {key: value for key, value in _follow("r", flaky.RERUN, [FLAKE]).items()
+              if key != "passed"}
+
+    assert flaky.forgiveness(_verif(), [skipped]) is None
+    assert flaky.forgiveness(_verif(), [legacy]) is None
+    assert flaky.follow_up(skipped, [_verif(), skipped]) == flaky.FollowUp(
+        flaky.RERUN, "v", (FLAKE,)
+    )
+
+
+def test_only_a_plain_pytest_verification_is_followed_up():
+    """#4197: a wrapper script sets up what its tests need (an image, containers, a flag),
+    so the same ids run bare would be skipped or fail for other reasons."""
+    for command in (
+        ["pytest", "-q"], ["uv", "run", "pytest"], [".venv/bin/pytest"],
+        ["python", "-m", "pytest", "-q"],
+    ):
+        assert flaky.runs_pytest(command), command
+    for command in (["bin/test.sh"], ["sh", "-c", "pytest"], ["make", "test"], [], None):
+        assert not flaky.runs_pytest(command), command
+    wrapped = _verif(command=["bin/test.sh"])
+    rerun = _follow("r", flaky.RERUN, [FLAKE])
+
+    assert flaky.follow_up(wrapped, [wrapped]) is None
+    assert flaky.forgiveness(wrapped, [wrapped, rerun]) is None
+    assert flaky.not_pytest(wrapped) is True
+    assert flaky.not_pytest(_verif()) is False
+    assert flaky.not_pytest(_verif(command=["bin/test.sh"], failures=())) is False
 
 
 def test_a_failure_the_merge_base_run_also_failed_is_forgiven_as_broken_on_master():
@@ -512,6 +551,8 @@ def _once_flaky_pytest(tmp_path: Path) -> Path:
         "fi\n"
         f"echo \"$(pwd -P) $(git rev-parse HEAD)\" >>'{tmp_path / 'reran-at'}'\n"
         "echo \"ran with $* ${AGENTDECK_QUARANTINED_TESTS-None}\"\n"
+        "echo '=== short test summary info ==='\n"
+        f"echo 'PASSED {FLAKE}'\n"
         "echo '1 passed'\n"
     )
     script.chmod(0o755)
@@ -586,7 +627,7 @@ async def test_the_queue_reruns_a_failed_verification_by_itself_and_forgives_it(
     [record] = quarantine.records()
     assert (record["label"], record["verification"], record["issue"]) == ("agent", failed.id, None)
     assert rerun.follow_kind == flaky.RERUN
-    assert rerun.command == [str(pytest_bin), "-q", FLAKE]
+    assert rerun.command == [str(pytest_bin), "-rA", "-q", FLAKE]
     # #3040: as free to move as the verification was, so a full slot here sends it to a pod.
     assert (rerun.lane, rerun.lane_defaulted) == (failed.lane, True)
     assert f"as job {rerun.id}" in queue.get(failed.id).note
@@ -706,6 +747,66 @@ async def test_a_verification_of_an_uncommitted_tree_says_why_it_gets_no_rerun(t
     )
 
 
+def test_a_cut_log_of_a_wrapper_script_is_never_a_complete_failure_list(tmp_path):
+    """#4197 review: when only a script's last summary is left in the tail read, an earlier
+    container's failures may lie before the cut, so the list cannot be called complete. One
+    pytest run prints one summary, so for it the header in the tail still proves the list."""
+    from types import SimpleNamespace
+
+    from agentdeck.jobs import FAILURE_SUMMARY_CHARS, _read_failures
+
+    log = tmp_path / "log"
+    log.write_text(
+        "=== short test summary info ===\nFAILED tests/one.py::test_a - NameError\n"
+        + "." * (FAILURE_SUMMARY_CHARS + 10) + "\n"
+        + f"=== short test summary info ===\nFAILED {REAL} - NameError\n1 failed\n"
+    )
+
+    def read(command):
+        return _read_failures(SimpleNamespace(log_path=str(log), command=command))
+
+    assert read(["bin/test.sh"]) == ((REAL,), False)
+    assert read(["uv", "run", "pytest", "-q"]) == ((REAL,), True)
+
+
+async def test_a_wrapper_script_verification_is_read_whole_and_never_rerun_alone(tmp_path):
+    """#4197: `bin/test.sh` built an image and ran three containers; the queue read only the
+    last container's summary, reran one test bare on the host where it was skipped, and
+    forgave a broken commit. Every summary is read now, and nothing is rerun outside it."""
+    from test_jobs import _queue
+
+    repo = _git_repo(tmp_path / "repo")
+    script = tmp_path / "bin" / "test.sh"
+    script.parent.mkdir(exist_ok=True)
+    script.write_text(
+        "#!/bin/sh\n"
+        "echo '=== short test summary info ==='\n"
+        f"echo 'FAILED {FLAKE} - NameError'\n"
+        "echo '1 failed in 1.0s'\n"
+        "echo 'container 2 starting'\n"
+        "echo '=== short test summary info ==='\n"
+        f"echo 'FAILED {REAL} - NameError'\n"
+        "echo '1 failed in 1.0s'\n"
+        "exit 1\n"
+    )
+    script.chmod(0o755)
+    queue = _queue(tmp_path)
+    await queue.start()
+    try:
+        failed = queue.submit(
+            command=[str(script)], cwd=str(repo),
+            purpose=VERIFICATION, run_id="gen-1", work_id="github_issue:org/store#5",
+        )
+        await _until(queue, lambda: queue.get(failed.id).is_final, "the verification")
+    finally:
+        await queue.stop()
+
+    done = queue.get(failed.id)
+    assert (done.failures, done.failures_complete) == (tuple(sorted((FLAKE, REAL))), True)
+    assert [job for job in queue.list() if job.follows] == []
+    assert "Its command is not a plain pytest call" in done.note
+
+
 def _fixing_pytest(tmp_path: Path) -> Path:
     """A `pytest` that fails one test, then on the rerun edits the checkout it runs in and
     passes, as #2493's worker did by fixing the test while the rerun's pod was copying it."""
@@ -773,6 +874,7 @@ async def test_a_killed_verification_is_resubmitted_once_by_the_queue(tmp_path):
             command=[sys.executable, "-c", "import sys; sys.exit(143)"], cwd=str(repo),
             purpose=VERIFICATION, run_id="gen-1", work_id="github_issue:org/store#5",
             max_minutes=0,
+            progress=True,
         )
         resubmitted = await _until(
             queue,
@@ -790,6 +892,7 @@ async def test_a_killed_verification_is_resubmitted_once_by_the_queue(tmp_path):
     assert again.exit_code == 143
     # The retry keeps the submitter's time limit (#3038): here, none at all.
     assert (again.max_minutes, again.time_limit_s) == (0, None)
+    assert again.progress is True
     assert [job.id for job in queue.list()] == [killed.id, again.id], "resubmitted once only"
 
 

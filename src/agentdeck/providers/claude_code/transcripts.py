@@ -16,7 +16,7 @@ import html
 import json
 import logging
 import re
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import NamedTuple
 
@@ -655,13 +655,59 @@ def recent_conversation(
     return _READER.recent_conversation(path, limit=limit, tail=tail)
 
 
-def last_context_tokens(path: Path, *, tail: int = 65536) -> int | None:
-    """Current context-window occupancy in tokens: the input side of the most
-    recent usage block (``input + cache_read + cache_creation``) — i.e. how large
-    the prompt last sent to the model was, which is how full the context window
-    is right now. Deliberately NOT ``token_totals``: that sums cache reads over
-    every turn and so balloons far past the window. Read cheaply from the tail
-    (the latest usage block lives near the end); None when no usage is present."""
+class ContextReading(NamedTuple):
+    """How full a chat's context window is. ``tokens`` is None when unknown, which is also
+    the state just after a compact, until the next message: ``compacted`` tells that one."""
+
+    tokens: int | None = None
+    compacted: bool = False
+    # When the prompt cache of the last call counts as gone (#4169): its time plus 90 % of
+    # the lifetime its usage block names, None when the tail names none.
+    cache_expires_at: datetime | None = None
+
+
+# The two lifetimes Anthropic's prompt cache has, shortest first: a usage block that
+# wrote both is counted gone when its 5-minute part goes, since a message then pays to
+# write that part again.
+_CACHE_LIFETIMES = (
+    ("ephemeral_5m_input_tokens", timedelta(minutes=5)),
+    ("ephemeral_1h_input_tokens", timedelta(hours=1)),
+)
+# Counted gone a little early: the clocks differ, and a write there costs the whole chat.
+_CACHE_SAFE_SHARE = 0.9
+
+
+def _cache_lifetime(usage: dict) -> timedelta | None:
+    """The shortest cache lifetime a usage block wrote, None when it wrote none."""
+    creation = usage.get("cache_creation")
+    if not isinstance(creation, dict):
+        return None
+    for name, lifetime in _CACHE_LIFETIMES:
+        value = creation.get(name)
+        if isinstance(value, int) and value > 0:
+            return lifetime
+    return None
+
+
+def _row_time(obj: dict) -> datetime | None:
+    raw = obj.get("timestamp")
+    if not isinstance(raw, str):
+        return None
+    try:
+        when = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return when if when.tzinfo else when.replace(tzinfo=UTC)
+
+
+# Past a compact the CLI re-attaches the files it read: the rows to the next usage block are
+# about 320 KB and were 1.2 MB at most over 352 real compacts, far beyond the usual tail.
+_CONTEXT_WIDE_TAIL = 4 * 1024 * 1024
+
+
+def _context_in_tail(path: Path, tail: int) -> tuple[ContextReading | None, bool]:
+    """The reading in the file's last ``tail`` bytes, None when they hold neither a usage
+    block nor a compact; and whether the file is longer than that."""
     try:
         size = path.stat().st_size
         with path.open("rb") as f:
@@ -670,35 +716,70 @@ def last_context_tokens(path: Path, *, tail: int = 65536) -> int | None:
                 f.readline()  # discard the partial first line after a mid-file seek
             data = f.read()
     except OSError:
-        return None
+        return None, False
     latest: dict | None = None
-    reset = False  # a compaction *after* the last usage block makes it stale
+    latest_at: datetime | None = None
+    lifetime: timedelta | None = None  # the newest one any block in the tail named
+    compacted = False  # a compaction *after* the last usage block makes it stale
     for raw in data.splitlines():
-        line = raw.strip()
-        if not line:
+        if b'"usage"' not in raw and b"isCompactSummary" not in raw:
             continue
         try:
-            obj = json.loads(line)
+            obj = json.loads(raw)
         except ValueError:
             continue
         if not isinstance(obj, dict):
             continue
         if obj.get("isCompactSummary"):
-            reset = True  # context was just compacted; the last usage predates it
+            compacted = True  # context was just compacted; the last usage predates it
         message = obj.get("message")
         usage = message.get("usage") if isinstance(message, dict) else None
-        if isinstance(usage, dict):
+        # A synthetic row is the CLI's own error text: it counts no tokens, and its zeros
+        # would read as an empty context.
+        if isinstance(usage, dict) and message.get("model") != "<synthetic>":
             latest = usage
-            reset = False  # a usage block after the compaction reflects the new size
-    if latest is None or reset:
-        # No usage yet, or the only usage predates a compaction — the real
-        # (smaller) context isn't known until the session's next turn.
-        return None
-    return (
+            latest_at = _row_time(obj)
+            lifetime = _cache_lifetime(usage) or lifetime
+            compacted = False  # a usage block after the compaction reflects the new size
+    if compacted:
+        return ContextReading(compacted=True), size > tail
+    if latest is None:
+        return None, size > tail
+    tokens = (
         int(latest.get("input_tokens", 0) or 0)
         + int(latest.get("cache_read_input_tokens", 0) or 0)
         + int(latest.get("cache_creation_input_tokens", 0) or 0)
     )
+    expires = (
+        latest_at + lifetime * _CACHE_SAFE_SHARE
+        if latest_at is not None and lifetime is not None
+        else None
+    )
+    return ContextReading(tokens, cache_expires_at=expires), size > tail
+
+
+def last_context_reading(path: Path, *, tail: int = 65536) -> ContextReading:
+    """Current context-window occupancy in tokens: the input side of the most
+    recent usage block (``input + cache_read + cache_creation``) — i.e. how large
+    the prompt last sent to the model was, which is how full the context window
+    is right now. Deliberately NOT ``token_totals``: that sums cache reads over
+    every turn and so balloons far past the window. Read cheaply from the tail
+    (the latest usage block lives near the end), and from a wider one only when
+    that holds nothing, as after a compact or a very large tool result. Tokens are
+    None when no usage is present, or the only usage predates a compaction: the
+    real (smaller) context isn't known until the session's next turn."""
+    found, longer = _context_in_tail(path, tail)
+    if longer and (found is None or _lifetime_further_back(found)):
+        wide, _ = _context_in_tail(path, _CONTEXT_WIDE_TAIL)
+        found = wide or found
+    return found or ContextReading()
+
+
+def _lifetime_further_back(found: ContextReading) -> bool:
+    """Whether the tail found a size but no cache lifetime (#4169): the last calls only
+    read the cache, and the call that wrote it, which names the lifetime, lies further
+    back. Without it a cold costly chat would not be asked about."""
+    return found.tokens is not None and found.cache_expires_at is None
 
 
 def _user_text(obj: dict) -> str | None:
@@ -1204,6 +1285,67 @@ def _prompt_line(obj: dict) -> bool:
     return isinstance(content, str)
 
 
+def newest_fork(path: Path, *, turn_finished: bool = True) -> tuple[int, str] | None:
+    """The line and uuid of the newest reply a Work's side chat cuts at, or None (#4199).
+
+    A side chat of a chat that is still working starts from its newest finished turn:
+    the last assistant line with text that no other assistant line follows before the
+    next prompt. The running turn's own last reply counts only when ``turn_finished``.
+
+    Only what follows the newest compaction counts: a resumed chat holds nothing before
+    it, so Claude refuses a cut there ("No message found"). When a compaction came and the
+    running turn is the only one since then, it is cut at its newest reply with text, the
+    agent's words so far, rather than refusing a side chat until that turn ends.
+    """
+    try:
+        lines = path.read_bytes().splitlines()
+    except OSError:
+        return None
+    confirmed: int | None = None
+    pending: int | None = None
+    newest: int | None = None  # the newest reply with text since the compaction
+    compacted = False
+    uuids: dict[int, str] = {}
+    for seq, raw in enumerate(lines, 1):
+        try:
+            obj = json.loads(raw)
+        except ValueError:
+            continue
+        if not isinstance(obj, dict) or obj.get("isSidechain"):
+            continue
+        if _is_compaction(obj):
+            confirmed = pending = newest = None
+            compacted = True
+        elif obj.get("type") == "assistant":
+            pending = seq if _reply_with_text(obj) else None
+            if pending is not None:
+                newest = seq
+                uuids[seq] = obj["uuid"]
+        elif _prompt_line(obj):
+            confirmed = pending or confirmed
+            pending = None
+    # A chat never compacted keeps its finished turns, so its first running turn waits.
+    fallback = newest if compacted else None
+    seq = pending if pending is not None and turn_finished else (confirmed or fallback)
+    return (seq, uuids[seq]) if seq is not None else None
+
+
+def _is_compaction(obj: dict) -> bool:
+    """Claude's compaction marker: a resumed chat starts here and holds nothing before."""
+    return obj.get("type") == "system" and obj.get("subtype") == "compact_boundary"
+
+
+def _reply_with_text(obj: dict) -> bool:
+    if obj.get("isApiErrorMessage") or not obj.get("uuid"):
+        return False
+    message = obj.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    return isinstance(content, list) and any(
+        isinstance(block, dict) and block.get("type") == "text" and block.get("text")
+        for block in content
+    )
+
+
 def first_prompt_seq(path: Path) -> int:
     """The line of the chat's first prompt, which no rollback can go before (#3474); 0
     when there is none yet. Reads only up to it."""
@@ -1294,6 +1436,8 @@ def fork_ref(path: Path, seq: int, *, turn_finished: bool = True) -> str | None:
     )
     if not isinstance(uuid, str) or not uuid or not has_text:
         return None
+    answer: str | None = None
+    decided = False
     for raw in lines[seq:]:
         try:
             obj = json.loads(raw)
@@ -1301,8 +1445,14 @@ def fork_ref(path: Path, seq: int, *, turn_finished: bool = True) -> str | None:
             continue
         if not isinstance(obj, dict) or obj.get("isSidechain"):
             continue
-        if obj.get("type") == "assistant":
+        if _is_compaction(obj):
+            # A resumed chat starts at its newest compaction; Claude cannot find a cut
+            # before it (#4199).
             return None
-        if _prompt_line(obj):
-            return uuid
-    return uuid if turn_finished else None
+        if decided:
+            continue
+        if obj.get("type") == "assistant":
+            answer, decided = None, True
+        elif _prompt_line(obj):
+            answer, decided = uuid, True
+    return answer if decided else (uuid if turn_finished else None)

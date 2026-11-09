@@ -13,15 +13,25 @@ Nothing here changes how a status is decided; it is a diagnostic record of this 
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
+import asyncio
+import logging
+import sqlite3
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, Protocol
 
 from .work_stops import facts_mark
 
-# Rows older than this are dropped when the database opens.
+logger = logging.getLogger(__name__)
+
+# Rows older than this are dropped by ``prune_forever``.
 RETENTION = timedelta(days=30)
+# One delete's rows, and the waits after a full batch and after the last one. A batch took
+# 0.09 s on a copy of the live data, so a burst day's 800,000 rows clear in under 3 minutes.
+PRUNE_BATCH = 5000
+PRUNE_BATCH_WAIT_S = 1.0
+PRUNE_IDLE_WAIT_S = 3600.0
 # A Work that left the overview altogether: no longer built, so no section.
 GONE = "gone"
 HIDDEN = "hidden"
@@ -282,3 +292,25 @@ def _flap(
         "entered": start.as_dict(),
         "left": end.as_dict(),
     }
+
+
+class PrunableLog(Protocol):
+    def prune_work_status_log(self, limit: int) -> int: ...
+
+
+async def prune_forever(
+    db: PrunableLog, wait: Callable[[float], Awaitable[None]] = asyncio.sleep
+) -> None:
+    """Drop rows past ``RETENTION`` in small batches, for as long as the web process runs.
+
+    Not at open (#4114): web, services and the runtime all open the database on a deploy,
+    and one delete of a day's rows held its write lock longer than the others wait for it.
+    Two workers overlapping during a reload only delete the same rows.
+    """
+    while True:
+        try:
+            deleted = await asyncio.to_thread(db.prune_work_status_log, PRUNE_BATCH)
+        except sqlite3.Error as exc:
+            logger.warning("work status log prune failed: %s", exc)
+            deleted = 0
+        await wait(PRUNE_BATCH_WAIT_S if deleted >= PRUNE_BATCH else PRUNE_IDLE_WAIT_S)

@@ -86,6 +86,7 @@ from pathlib import Path
 from . import chat_board, chat_review, review_refs, watch_retry
 from .github_webhook_log import raw_body
 from .models import PullRequestRef
+from .review_history import deck_check_delivery
 from .scheduled_messages import ScheduledMessage
 from .shared_file import SharedFile
 from .webhook_tailer import Delivery, WebhookTailer, WebhookWatcher
@@ -110,6 +111,9 @@ KIND_REVIEW = "review"
 #: A Work moving into Needs answer or Ready for merge (#3446): the deck's own Needs you list,
 #: no GitHub event. Not spent by a message; one message per Work that moves in.
 KIND_NEEDS_YOU = "needs_you"
+#: The waits on a GitHub event whose timeout is given one more round (#4080): most timeouts
+#: woke a chat only to read that the build, merge or deploy was still running.
+PATIENT_KINDS = frozenset({KIND_PULL_REQUEST, KIND_COMMIT, KIND_DEPLOYMENT})
 #: What ``only`` may name, and the ``work_attention`` category each stands for.
 NEEDS_YOU_CATEGORIES = {"answer": "needs_answer", "merge": "ready_for_merge"}
 #: A needs-you wait is meant to stay registered: a week, unless the chat asks for less.
@@ -209,6 +213,9 @@ class WakeRequest:
     only: str = ""
     #: A needs-you wait's stops already told (``NeedsYouStop.key``), so a pass repeats none.
     told: tuple[str, ...] = ()
+    #: The one more round a patient wait still has (``PATIENT_KINDS``), in seconds; 0 once it
+    #: is spent, on any other wait, and on a wait stored before #4080.
+    extra_s: float = 0.0
 
     @property
     def target(self) -> str:
@@ -542,7 +549,8 @@ def _text(value: object) -> str:
 def _result(event: str, payload: dict) -> tuple[str, str, str, str] | None:
     """``(sha, name, conclusion, url)`` for a finished CI or deploy result, else ``None``."""
     if event in {"check_suite", "check_run", "workflow_run"}:
-        if payload.get("action") != "completed":
+        if payload.get("action") != "completed" or deck_check_delivery(event, payload):
+            # The deck's own review check is no CI result to wake on (#4152).
             return None
         run = payload.get(event)
         if not isinstance(run, dict):
@@ -870,8 +878,17 @@ def _subject(event: str, payload: dict) -> tuple[str, str, datetime | None]:
             _text(payload.get("context")),
             _instant(payload.get("updated_at") or payload.get("created_at")),
         )
+    if event == "deployment_status":
+        status, deployment = payload.get(event), payload.get("deployment")
+        if not isinstance(status, dict) or not isinstance(deployment, dict):
+            return "", "", None
+        return (
+            _text(deployment.get("sha")),
+            _text(status.get("environment")) or _text(deployment.get("environment")),
+            _instant(status.get("updated_at") or status.get("created_at")),
+        )
     run = payload.get(event)
-    if not isinstance(run, dict):
+    if not isinstance(run, dict) or deck_check_delivery(event, payload):
         return "", "", None
     if event == "check_suite":
         app = run.get("app")
@@ -907,9 +924,34 @@ def seen_result(
     """
     if request.kind != KIND_COMMIT or not request.sha:
         return None
+    return _newest_outcome(streams_root, request, _CI_EVENTS, tail_bytes)
+
+
+def seen_deploy_result(
+    streams_root: Path | str, request: WakeRequest, *, tail_bytes: int = DEPLOY_TAIL_BYTES
+) -> Outcome | None:
+    """A finished deploy a deployment wait would fire on, already in the end of the stream,
+    else ``None``: what the wait's timeout reads (#4080).
+
+    It takes what the wait itself takes: a failure as well as a success, a commit status
+    when the wait has a name, and any commit when it names none. The newest state of each
+    environment decides, as in ``seen_result``, so a failed deploy after a good one is told
+    as failed and one running again is waited on; for a named wait everything the name
+    matches counts as one deploy, across both events. A wait with no commit is about deploys
+    after it was registered, so an older one does not count.
+    """
+    if request.kind != KIND_DEPLOYMENT:
+        return None
+    events = {"deployment_status", "status"} if request.name else {"deployment_status"}
+    return _newest_outcome(streams_root, request, events, tail_bytes)
+
+
+def _newest_outcome(
+    streams_root: Path | str, request: WakeRequest, events: set[str], tail_bytes: int
+) -> Outcome | None:
     #: Per check: (its newest state's time, that state's outcome); None once unknowable.
     newest: dict[tuple[str, str], tuple[datetime, Outcome | None] | None] = {}
-    for record in _tail_records(streams_root, request.repository, tail_bytes, _CI_EVENTS):
+    for record in _tail_records(streams_root, request.repository, tail_bytes, events):
         delivery = Delivery(
             stream=request.repository,
             delivery_id=str(record.get("delivery_id") or ""),
@@ -924,7 +966,12 @@ def seen_result(
             request.name and not _name_matches(request.name, name)
         ):
             continue
-        key = (delivery.event, name.lower())
+        if not request.sha and when is not None and when.timestamp() < request.registered_at:
+            continue
+        # A named deploy can report by commit status and by deployment status, under
+        # different words, and both are the one thing the wait names.
+        one_deploy = request.kind == KIND_DEPLOYMENT and request.name
+        key = ("", "") if one_deploy else (delivery.event, name.lower())
         if key in newest and newest[key] is None:
             continue
         if when is None:
@@ -1063,7 +1110,10 @@ def review_timeout_message(
         ' An answer with `"outcome": "already asked"` means that review is queued: end the'
         " turn on the wait it kept.\n"
         "3. Has the reviewer written anything there recently (a comment, or an `in-progress`"
-        " label)? If so it is working: register this review wait again and end the turn.\n\n"
+        " label)? If so it is working: register this review wait again and end the turn. A"
+        " `Claimed:` comment with nothing after it is a claim, not progress: when it goes"
+        " silent the deck starts its own reviewer on that chat by itself and tells this chat"
+        " (#4189), so register the wait again for that too.\n\n"
         "If the chat is open at your head but nothing moved in it since your last wait, or"
         " this is your second timeout on the same head with no review queued, or a fresh"
         " review is refused (409), stop waiting and tell the person in the question box what"
@@ -1162,6 +1212,7 @@ class WakeOnRegistry:
                         stopped="",
                         cut_from=0.0,
                         asked_at=max(held.asked_at, request.asked_at),
+                        extra_s=request.extra_s,
                     )
                     current[index] = renewed
                     self._save(current)
@@ -1188,8 +1239,9 @@ class WakeOnRegistry:
 
         ``pulls`` are the ``owner/repo#n`` the verdict is about, matched case-blind, and only
         their waits end. ``None`` is a verdict about the whole Work: posted on its issue and
-        naming none of its pull requests, it answers the Work's one review chat, which covers
-        every pull request the Work holds, so every review wait of the chat ends.
+        naming none of its pull requests, it answers the chat's one review wait. With several
+        it ends none, as nothing says which one it answers: findings about store#3849 ended
+        metso#77's wait too, and nothing then told the chat no verdict had come for it (#4089).
 
         The verdict is recorded (``answered``, #3611): the reviewer's closing line usually
         lands after it, and must not then cut short a merge wait held now or registered later.
@@ -1197,6 +1249,8 @@ class WakeOnRegistry:
         the verdict told the chat what the stop would have.
         """
         wanted = None if pulls is None else {str(pull).casefold() for pull in pulls}
+        if wanted is None and sum(i.kind == KIND_REVIEW for i in self.for_chat(chat_id)) > 1:
+            return 0
 
         def about(item: WakeRequest) -> bool:
             return wanted is None or f"{item.repository}#{item.number}".casefold() in wanted
@@ -1219,6 +1273,17 @@ class WakeOnRegistry:
         return self.remove(
             item.id for item in self.for_chat(chat_id) if item.kind == KIND_REVIEW and about(item)
         )
+
+    def extend(self, request_id: str, now: float) -> None:
+        """Give a timed-out wait its one more round, on the wait as it is held now: one
+        renewed or brought forward in between keeps what that write gave it."""
+        with self._file.locked():
+            current = list(self.all())
+            for index, held in enumerate(current):
+                if held.id == request_id and held.extra_s and held.deadline <= now:
+                    current[index] = replace(held, deadline=now + held.extra_s, extra_s=0.0)
+                    self._save(current)
+                    return
 
     def tell(self, request_id: str, told: tuple[str, ...]) -> None:
         """Record a needs-you wait's told stops on the wait as it is held now, so a renewal
@@ -1315,6 +1380,7 @@ def register(
         registered_at=now,
         deadline=now + timeout_s,
         asked_at=now if asked else 0.0,
+        extra_s=timeout_s if fields.get("kind") in PATIENT_KINDS else 0.0,
         **fields,
     )
     return registry.add(request)
@@ -1424,6 +1490,23 @@ class WakeOnService:
         """``seen_result`` over this service's streams."""
         return seen_result(self._streams_root, request)
 
+    def _seen_at_timeout(self, request: WakeRequest) -> Outcome | None:
+        """What the deck already holds for a wait at its timeout, else ``None``: the delivery
+        may have come in while the tailer was behind, or before the wait was registered.
+
+        A pull request wait has no such read: its delivery fires it from the stream, and the
+        deck keeps no other record of a merge. This runs on the event loop, once per timeout;
+        the largest stream took 12 ms to read back.
+        """
+        try:
+            if request.kind == KIND_COMMIT:
+                return self.seen_result(request)
+            if request.kind == KIND_DEPLOYMENT:
+                return seen_deploy_result(self._streams_root, request)
+        except Exception:  # noqa: BLE001 - a read of the stream never blocks a wake
+            log.warning("wake-on: stored result unreadable", exc_info=True)
+        return None
+
     def register(
         self, session_key: str, chat_id: str, *, timeout_s: float, asked: bool = False, **fields
     ) -> WakeRequest:
@@ -1531,7 +1614,7 @@ class WakeOnService:
             try:
                 async for batch in self._tailer.watch(stop_event=self._stop, watcher=self._watcher):
                     self.apply(batch)
-                    self._tailer.commit()
+                    await self._tailer.commit_off_loop()
                 return
             except asyncio.CancelledError:
                 raise
@@ -1686,6 +1769,14 @@ class WakeOnService:
                     log.info("wake-on: %s is away; ended %s", request.session_key, request.id)
                     self.registry.remove([request.id])
                     continue
+                if request.kind in PATIENT_KINDS and not request.stopped and not request.cut_from:
+                    outcome = self._seen_at_timeout(request)
+                    if outcome is not None:
+                        self._fire(request, fired_message(request, outcome))
+                        continue
+                    if request.extra_s:
+                        self.registry.extend(request.id, now)
+                        continue
                 down = ""
                 if request.kind == KIND_REVIEW:
                     try:

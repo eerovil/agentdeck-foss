@@ -1101,6 +1101,143 @@ def test_a_starred_work_leads_its_section():
     ]
 
 
+def _star(row):
+    from dataclasses import replace
+
+    return replace(row, card=replace(row.card, starred=True))
+
+
+def _ids(rows):
+    return [row.card.work_id for row in rows]
+
+
+def test_a_starred_work_is_listed_in_starred_alone():
+    """#4121: every listed starred Work, what needs you first, and in no other group; yet the
+    counts line and what tells a person per Work still read it where it is."""
+    from dataclasses import replace
+
+    from agentdeck.work_story import MAX_STOPPED, QUIET, front_sections
+
+    rows, _ = _tree_rows()
+    now = datetime.now(UTC)
+    asking = replace(_star(rows[11]), stopped_at=now)
+    plain = replace(
+        rows[11],
+        card=replace(rows[11].card, work_id="github_issue:eerovil/agentdeck#21"),
+        stopped_at=now - timedelta(hours=1),
+    )
+    working, quiet = _star(rows[12]), _star(rows[13])
+    front = front_sections([working, quiet, asking, plain], now=now)
+
+    assert _ids(front.starred) == [asking.card.work_id, working.card.work_id, quiet.card.work_id]
+    # Listed there, so never a place in another: Recently stopped gives its room to the rest.
+    assert [_ids(group.rows) for group in front.groups_in("start")] == [[plain.card.work_id]]
+    assert front.others(front.active) == () and front.quiet == 0
+    assert _ids(front.stopped) == [plain.card.work_id] and MAX_STOPPED > 1
+    assert asking in front.needs_you_works and working in front.active
+    assert dict((key, count) for key, count, _ in front.summary)["answer"] == 2
+    assert quiet.section == QUIET and quiet in front.rows
+
+    # A row the person hid stays hidden, quiet or not, and an unstarred quiet Work is counted.
+    put_away = front_sections(
+        [asking, quiet, rows[13]], now=now, hidden={asking.card.work_id, quiet.card.work_id}
+    )
+    assert put_away.starred == () and _ids(put_away.hidden) == [asking.card.work_id]
+    assert put_away.quiet == 2
+
+
+def test_a_star_takes_no_place_from_a_bounded_group_and_is_never_cut():
+    """#4121: the bounds count what their group lists, and a starred row is past none of them."""
+    from dataclasses import replace
+
+    from agentdeck.work_story import MAX_FINISHED, front_row, front_sections
+
+    now = datetime.now(UTC)
+    base = _work(pull=True, chats=(_chat("c:a:worker", "Worker", working=True),))
+
+    def active(number, **fields):
+        return replace(
+            base, work_id=f"github_issue:o/r#{number}",
+            last_activity=now - timedelta(minutes=number), **fields,
+        )
+
+    rows = [front_row(active(n, starred=n == 3), current=True) for n in range(1, 5)]
+    front = front_sections(rows, now=now, max_active=2)
+    assert _ids(front.starred) == [rows[2].card.work_id]
+    assert _ids(front.others(front.active)) == [rows[0].card.work_id, rows[1].card.work_id]
+    assert front.active_more == 1
+
+    def done(number, **fields):
+        card = replace(
+            active(number, **fields), finished_at=now - timedelta(minutes=number)
+        )
+        return replace(front_row(card, current=False), section="finished")
+
+    finished = [done(n, starred=n == MAX_FINISHED + 2) for n in range(1, MAX_FINISHED + 3)]
+    front = front_sections(finished, now=now)
+    assert _ids(front.starred) == [finished[-1].card.work_id]
+    assert len(front.others(front.finished)) == MAX_FINISHED and front.finished_more == 1
+
+    # Finished long ago, it stays until its star goes; hidden or unstarred, it is only counted.
+    long_ago = now - timedelta(days=30)
+    old = replace(done(1, starred=True), card=replace(
+        done(1).card, starred=True, finished_at=long_ago, last_activity=long_ago
+    ))
+    front = front_sections([old], now=now)
+    assert front.starred == (old,) and front.quiet == 0
+    assert front_sections([old], now=now, hidden={old.card.work_id}).starred == ()
+    plain = replace(old, card=replace(old.card, starred=False))
+    front = front_sections([plain], now=now)
+    assert front.starred == () and front.quiet == 1
+
+
+def test_a_star_folded_under_a_parent_brings_the_parent_row_to_starred():
+    """#4121: a sub-issue has no row of its own, so its star lifts the row it is shown in, and
+    every part of the page draws that one row once."""
+    from dataclasses import replace
+
+    from starlette.templating import Jinja2Templates
+
+    from agentdeck import app as app_mod
+    from agentdeck.web import render as render_mod
+    from agentdeck.web.work_view import WorkOverview, render_work_front
+    from agentdeck.work_story import front_sections
+    from agentdeck.work_tree import fold
+
+    rows, parents = _tree_rows()
+    parent_id = rows[10].card.work_id
+    rows[12] = _star(rows[12])
+    folded = fold(list(rows.values()), parents=parents, counts={parent_id: (1, 4)})
+    front = front_sections(folded)
+    assert _ids(front.starred) == [parent_id] and front.groups_in("start") == ()
+
+    templates = Jinja2Templates(directory=str(app_mod._TEMPLATES_DIR))
+    render_mod.register_filters(templates)
+    overview = WorkOverview(front=front)
+    html = render_work_front(templates, overview, "starred")
+    assert 'data-front-group="starred"' in html and 'data-front-in="starred"' in html
+    assert 'class="fr-star"' in html
+    # Under one header, the row names the category a group's header would have said.
+    label = rows[11].attention.label
+    assert f'<span class="fr-headline">{label}</span>' in html
+    assert f'data-work-id="{parent_id}"' not in render_work_front(templates, overview, "needs")
+    # What the page says when nothing is starred: nothing, no empty header.
+    empty = WorkOverview(front=replace(front, needs_you=()))
+    assert render_work_front(templates, empty, "starred").strip() == ""
+    # With no Recently finished header over it, a finished row says so itself.
+    done = _star(replace(rows[11], section="finished", attention=None))
+    done = replace(done, card=replace(done.card, finished_at=datetime.now(UTC)))
+    shown = WorkOverview(front=front_sections([done], now=datetime.now(UTC)))
+    assert '<span class="fr-headline">Finished</span>' in render_work_front(
+        templates, shown, "starred"
+    )
+    # A starred paused row keeps its Resume in Starred.
+    paused = _star(replace(rows[11], section="paused", attention=None))
+    held = WorkOverview(front=front_sections([paused]))
+    assert 'value="resume"' in render_work_front(templates, held, "starred")
+    assert render_work_front(templates, held, "paused").strip() == ""
+
+
 def _woken(key: str, title: str) -> WorkChat:
     """A chat working on a turn only its own background notification opened (#2760)."""
     from dataclasses import replace
@@ -1324,6 +1461,31 @@ def _tree_rows():
     parents = {f"github_issue:eerovil/agentdeck#{n}": "github_issue:eerovil/agentdeck#10"
                for n in (11, 12, 13)}
     return rows, parents
+
+
+def test_a_folded_rows_finish_reads_the_work_it_leads_with():
+    """Finish on a folded row acts on its leading child, so that child decides it (#4126)."""
+    from dataclasses import replace
+
+    from agentdeck.work_derived import NOT_LIVE, DerivedStatus
+    from agentdeck.work_story import front_row
+    from agentdeck.work_tree import fold
+
+    rows, parents = _tree_rows()
+    said = "not live yet: VPS connector"
+
+    def unproven(row):
+        derived = DerivedStatus(NOT_LIVE, f"Needs you — {said}", summary=said)
+        return front_row(replace(row.card, derived=derived), current=False)
+
+    [child_leads] = fold([rows[10], unproven(rows[13])], parents=parents)
+    assert child_leads.lead.card.work_id == rows[13].card.work_id
+    assert child_leads.finish_unproven and child_leads.finish.action == "finish"
+
+    # The parent is the unproven one, and a child's question leads: Finish would act on it.
+    [parent_unproven] = fold([unproven(rows[10]), rows[11]], parents=parents)
+    assert parent_unproven.lead.card.work_id == rows[11].card.work_id
+    assert not parent_unproven.finish_unproven
 
 
 def test_a_parent_row_folds_its_children_and_leads_with_the_one_that_needs_you():
@@ -1676,6 +1838,17 @@ async def test_a_maps_page_draws_held_reads_at_once_and_refreshes_behind_it():
     await work_view._work_tree(app, ref, record)
     await app.state.work_tree_refreshes.get(ref.work_id, task)
     assert wm.generation() == generation + 1 and published == ["works"]
+
+    # #4101: the Work page's text read shares the tree's reads, so one refresh covers both
+    # and the map reads the body once; a tree it does not have still gets its refresh.
+    fetched["issue_body"] = "## Destination\n\nShip it."
+    reads = work_view._TreeReads(ref, issues)
+    calls.clear()
+    assert await reads.read("issue_body", ref.repository, ref.number) == "## Destination\n\nShip."
+    await work_view._work_tree(app, ref, record, reads=reads)
+    assert ("issue_body", ref.repository, ref.number) in reads.drawn and reads.stale
+    await app.state.work_tree_refreshes[ref.work_id]
+    assert calls.count("issue_body") == 1 and wm.generation() == generation + 2
 
 
 @pytest.mark.asyncio

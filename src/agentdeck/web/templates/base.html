@@ -247,6 +247,7 @@
   <script src="/static/work_list.js?v={{ asset_ver }}" defer></script>
   <script src="/static/work_stop_sound.js?v={{ asset_ver }}" defer></script>
   <script src="/static/sse.js?v={{ asset_ver }}" defer></script>
+  <script src="/static/cold_chat.js?v={{ asset_ver }}" defer></script>
   <script src="/static/action_timing.js?v={{ asset_ver }}" defer></script>
   <script src="/static/mobile_session_stack.js?v={{ asset_ver }}" defer></script>
   <script src="/static/session_diff.js?v={{ asset_ver }}" defer></script>
@@ -772,7 +773,8 @@
     function enhance(scope) {
       (scope || document).querySelectorAll(
         '.ev-text:not([data-md]),'
-        + ' .interaction-prompt:not([data-md])'
+        + ' .interaction-prompt:not([data-md]),'
+        + ' .wd-issue-text:not([data-md])'
       ).forEach(function (el) {
         var sessionScope = el.closest('[data-session-key]');
         var sessionKey = sessionScope && sessionScope.getAttribute('data-session-key');

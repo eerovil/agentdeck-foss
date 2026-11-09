@@ -10,7 +10,9 @@
 // 2. `details[data-keep-open]` remembers being opened. The Work page swaps a whole section
 //    when it changes, and the Deckhand panel is replaced on every push; either would shut a
 //    disclosure the reader had just opened. The open set lives in sessionStorage, keyed by
-//    the attribute's value, and is re-applied to whatever a swap brought in.
+//    the attribute's value, and is re-applied to whatever a swap brought in. One drawn with
+//    `data-open-by-default` (#4137) is the other way round: there the set holds that the
+//    reader shut it.
 // 3. The Work page's message box (#2218). Its text box sits outside the section a live update
 //    swaps, so typed text is never touched; this only empties it after a send the server
 //    accepted, and keeps its placeholder in step with whether the target is a question.
@@ -41,9 +43,10 @@
     } catch (_) { return []; }
   }
 
-  function remember(name, open) {
+  function remember(details, open) {
+    var name = details.getAttribute('data-keep-open');
     var next = stored().filter(function (item) { return item !== name; });
-    if (open) next.push(name);
+    if (open !== details.hasAttribute('data-open-by-default')) next.push(name);
     try { sessionStorage.setItem(KEY, JSON.stringify(next.slice(-64))); } catch (_) {}
   }
 
@@ -53,7 +56,8 @@
     var found = Array.prototype.slice.call(scope.querySelectorAll('details[data-keep-open]'));
     if (scope.matches && scope.matches('details[data-keep-open]')) found.push(scope);
     found.forEach(function (details) {
-      var wanted = open.indexOf(details.getAttribute('data-keep-open')) !== -1;
+      var listed = open.indexOf(details.getAttribute('data-keep-open')) !== -1;
+      var wanted = listed !== details.hasAttribute('data-open-by-default');
       if (details.open !== wanted) details.open = wanted;
     });
   }
@@ -61,7 +65,7 @@
   document.addEventListener('toggle', function (e) {
     var details = e.target;
     if (!details || !details.matches || !details.matches('details[data-keep-open]')) return;
-    remember(details.getAttribute('data-keep-open'), details.open);
+    remember(details, details.open);
   }, true);
 
   // `toggle` fires a task after the click, so a swap landing in between would read the old
@@ -71,7 +75,7 @@
     if (!summary || (e.target.closest && e.target.closest('a'))) return;
     var details = summary.parentElement;
     if (details && details.matches('details[data-keep-open]')) {
-      remember(details.getAttribute('data-keep-open'), !details.open);
+      remember(details, !details.open);
     }
   }, true);
 

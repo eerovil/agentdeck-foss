@@ -47,6 +47,7 @@ __all__ = [
     "brief",
     "compare",
     "extract_failures",
+    "extract_passed",
     "lookup_key",
 ]
 
@@ -63,7 +64,7 @@ MAX_FAILURES = 200
 # construction.  Seeing the header is how a bounded read of the end of a log proves it holds
 # the whole list rather than the tail of one.
 _SUMMARY_HEADER = "short test summary info"
-_SUMMARY_LINE = re.compile(r"^(?:FAILED|ERROR)\s+(.+)$")
+_SUMMARY_LINE = re.compile(r"^(FAILED|ERROR|PASSED|SKIPPED|XFAIL|XPASS)\s+(.+)$")
 # A parametrized id may hold spaces (``test_x[everything else]``), so an id with brackets runs to
 # the first ``]`` that ends the line or precedes pytest's `` - `` reason separator; reading only
 # up to the first space made the rerun collect nothing (#3865). The summary line alone cannot
@@ -89,6 +90,11 @@ def extract_failures(
     opens it is inside the part that was read.  A command that is not pytest prints no such
     header and therefore never compares -- the honest answer for output nobody can parse.
 
+    A script that runs pytest in several containers prints one summary per run, and every
+    one of them is read (#4197): reading only the last missed two of three failing tests.
+    When the read was cut short (``read_tail`` opens it with ``…``) and holds more than one
+    summary, an earlier one may lie before the cut, so the list is not called complete.
+
     ``succeeded`` short-circuits all of that, because a run that exited zero failed nothing and
     needs no output read to prove it.  Without this the feature has no clean-base case at all:
     pytest prints the summary section only when it has something to put in it, so an all-pass
@@ -100,22 +106,62 @@ def extract_failures(
     """
     if succeeded:
         return (), True
-    header = text.rfind(_SUMMARY_HEADER)
-    if header < 0:
+    sections = _summary_sections(text)
+    if not sections:
         return (), False
     seen: list[str] = []
     unique: set[str] = set()
-    for line in text[header:].splitlines()[1:]:
-        match = _SUMMARY_LINE.match(line.strip())
-        if match is None:
-            continue
-        node = _summary_id(match.group(1).strip(), known)
-        if node not in unique:
-            unique.add(node)
-            seen.append(node)
+    for section in sections:
+        for word, body in section:
+            if word not in {"FAILED", "ERROR"}:
+                continue
+            node = _summary_id(body, known)
+            if node not in unique:
+                unique.add(node)
+                seen.append(node)
     if len(seen) > MAX_FAILURES:
         return tuple(sorted(seen[:MAX_FAILURES])), False
-    return tuple(sorted(seen)), True
+    complete = len(sections) == 1 or not text.startswith("…")
+    return tuple(sorted(seen)), complete
+
+
+def extract_passed(text: str) -> tuple[str, ...]:
+    """The test ids a run's summary lists as ``PASSED``: only ``pytest -rA`` prints them.
+
+    A rerun of failing tests is run with ``-rA`` so that a test counts as passed only when
+    pytest says it ran and passed it. Exit 0 alone also covers a test that was skipped,
+    deselected or never collected (#4197).
+    """
+    passed: list[str] = []
+    for section in _summary_sections(text):
+        for word, body in section:
+            if word == "PASSED":
+                node = _SUMMARY_ID.match(body)
+                if node is not None and node.group(0) not in passed:
+                    passed.append(node.group(0))
+    return tuple(sorted(passed))
+
+
+def _summary_sections(text: str) -> list[list[tuple[str, str]]]:
+    """Each short test summary in ``text``: its lines as (outcome word, rest of the line).
+
+    A section runs to the next header, skipping lines that are not per-test summary lines, as
+    the one summary always was read: dropping a failure line would forgive a broken commit,
+    while a stray line read as one only keeps a run red.
+    """
+    sections: list[list[tuple[str, str]]] = []
+    current: list[tuple[str, str]] | None = None
+    for line in text.splitlines():
+        if _SUMMARY_HEADER in line:
+            current = []
+            sections.append(current)
+            continue
+        if current is None:
+            continue
+        match = _SUMMARY_LINE.match(line.strip())
+        if match is not None:
+            current.append((match.group(1), match.group(2).strip()))
+    return sections
 
 
 def baseline_key(

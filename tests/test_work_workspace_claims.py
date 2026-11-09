@@ -869,6 +869,75 @@ def test_a_live_worker_in_the_tree_defers_its_release(store, checkout):
     assert service.release_pending(execution_active=lambda _path: False)[0].released is True
 
 
+def test_an_idle_closed_work_gives_its_worktree_back(store, checkout):
+    service = claims.WorkWorkspaceService(store, host=CountingHost())
+    made = service.ensure(_request(checkout))
+
+    outcomes, kept = service.release_idle(WORK, execution_active=lambda _path: False)
+
+    assert [item.released for item in outcomes] == [True] and kept == ""
+    assert not Path(made.claim.path).exists() and store.active(WORK) == []
+
+
+@pytest.mark.parametrize(
+    ("busy", "why"),
+    [
+        ("changed", "it has uncommitted changes"),
+        ("process", "a process is running in it"),
+        ("run", "a Run may be working in it"),
+        ("unknown run", "a Run may be working in it"),
+        ("detached", "its commit is not on any origin branch"),
+    ],
+)
+def test_a_closed_work_in_use_keeps_every_worktree_and_shows_no_problem(store, checkout, busy, why):
+    """#4148: unlike a Finish, housekeeping must leave no pending release or error behind."""
+
+    class Host(CountingHost):
+        def running_in(self, path):
+            return busy == "process"
+
+    service = claims.WorkWorkspaceService(store, host=Host())
+    idle = service.ensure(_request(checkout, "issue-7-a")).claim
+    used = service.ensure(_request(checkout, "issue-7-b", purpose=claims.PURPOSE_REVIEW)).claim
+    if busy == "changed":
+        (Path(used.path) / "note.txt").write_text("not committed\n")
+    if busy == "detached":
+        _git(Path(used.path), "checkout", "--detach", "-q")
+        _git(
+            Path(used.path),
+            "-c",
+            "user.email=t@example.com",
+            "-c",
+            "user.name=T",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "only here",
+        )
+    run = {"run": True, "unknown run": None}.get(busy, False)
+
+    outcomes, kept = service.release_idle(
+        WORK, execution_active=lambda path: run if path == used.path else False
+    )
+
+    assert outcomes == [] and why in kept
+    assert Path(idle.path).exists() and Path(used.path).exists()
+    assert [(c.release_requested_at, c.last_error) for c in store.active(WORK)] == [("", "")] * 2
+
+
+def test_running_in_sees_a_process_inside_the_path_only(tmp_path):
+    inside = tmp_path / "tree" / "src"
+    inside.mkdir(parents=True)
+    (tmp_path / "tree-2").mkdir()
+    host = claims.GitHost()
+    process = subprocess.Popen(["cat"], cwd=inside, stdin=subprocess.PIPE)
+    try:
+        assert host.running_in(str(tmp_path / "tree"))
+        assert not host.running_in(str(tmp_path / "tree-2"))
+    finally:
+        process.communicate()
+
+
 def test_a_reopened_work_withdraws_a_pending_release(service, checkout):
     first = service.ensure(_request(checkout))
     (Path(first.claim.path) / "unsaved.txt").write_text("x\n")
@@ -978,6 +1047,10 @@ async def test_the_runtime_routes_ensure_list_and_release_one_claim(tmp_path, ch
         again = (await client.post(claims.ENSURE_PATH, json={**body, "run_id": "gen-2"})).json()
         listed = (await client.get(claims.CLAIMS_PATH)).json()
         refused = await client.post(claims.ENSURE_PATH, json={**body, "path": "/tmp/x"})
+        note = Path(made["claim"]["path"]) / "note.txt"
+        note.write_text("not committed\n")
+        kept = (await client.post(claims.RELEASE_IDLE_PATH, json={"work_id": WORK})).json()
+        note.unlink()
         released = (
             await client.post(
                 claims.RELEASE_PATH,
@@ -989,6 +1062,10 @@ async def test_the_runtime_routes_ensure_list_and_release_one_claim(tmp_path, ch
     assert again["claim"]["path"] == made["claim"]["path"]
     assert [row["path"] for row in listed["claims"]] == [made["claim"]["path"]]
     assert refused.status_code == 422
+    assert kept == {
+        "released": [],
+        "kept": f"{made['claim']['path']}: it has uncommitted changes",
+    }
     assert released == {
         "released": [{"path": made["claim"]["path"], "released": True, "pending": ""}],
         "unclaimed": ["/else/.worktrees/x"],

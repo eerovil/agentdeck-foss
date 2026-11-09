@@ -8,7 +8,7 @@ import logging
 import time
 import tomllib
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
@@ -55,6 +55,7 @@ from ..base import (
     recency_deadline,
 )
 from . import transcripts as transcripts_mod
+from .appserver import usage_limit_refusal
 from .inject import (
     inject_session,
     is_injectable_rollout,
@@ -63,7 +64,7 @@ from .inject import (
     start_session as start_codex_session,
 )
 from .runtime_client import CodexRuntimeClient
-from .usage import CodexUsagePoller, fetch_usage_once
+from .usage import CodexUsagePoller, fetch_usage_once, limit_reset_at
 
 if TYPE_CHECKING:
     from ...state import AppState
@@ -96,6 +97,9 @@ _CORPUS_CACHE_BYTES = 16 * 1024 * 1024
 # time (#2652). Sized well above today's set; a scan warns before it outgrows it.
 _META_CACHE_BYTES = 192 * 1024 * 1024
 _META_CACHE_WARN_SHARE = 0.8
+#: A limit stop whose reset passed longer ago than this is an old chat nobody retried, not one
+#: to wake: the deck had no Codex retry before #4118, and such rollouts stay on disk for good.
+_RETRY_HORIZON = timedelta(days=1)
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,6 +190,20 @@ class _RolloutRole(Protocol):
     is_spawned_subagent: bool
 
 
+def _limit_stop(meta: transcripts_mod.TranscriptMeta) -> tuple[bool, datetime | None]:
+    """Whether the account's usage limit refused this chat's latest turn, and its retry time.
+
+    Only a usage limit counts as a failed turn (#4118). A turn that stopped on a full model
+    still reads as ended, because the deck's request for a next step is what restarts it.
+    """
+    refusal = usage_limit_refusal({"status": "failed", "error": meta.turn_error})
+    if not refusal:
+        return False, None
+    now = datetime.now(UTC)
+    reset = limit_reset_at(refusal, meta.task_finished_at or now)
+    return True, reset if reset is not None and now - reset < _RETRY_HORIZON else None
+
+
 @dataclass(frozen=True, slots=True)
 class _CorpusMeta:
     """What the whole-corpus scan passes need from a rollout, and nothing else.
@@ -249,10 +267,16 @@ class CodexProvider(SessionProvider):
     # Chosen at thread/start (new chat only); the app-server turn protocol has no
     # model field, so a running thread keeps its creation model.
     selectable_models = (
-        ModelChoice("gpt-5.6-luna", "Luna"),
-        ModelChoice("gpt-5.6-terra", "Terra"),
-        ModelChoice("gpt-5.6-sol", "Sol"),
-        ModelChoice("gpt-6-astra", "Astra"),
+        # Sol and Luna now exist in more than one generation, so every label
+        # names its generation; stored preferences hold the slug, not the label.
+        ModelChoice("gpt-5.6-luna", "GPT-5.6 Luna"),
+        ModelChoice("gpt-5.6-terra", "GPT-5.6 Terra"),
+        ModelChoice("gpt-5.6-sol", "GPT-5.6 Sol"),
+        ModelChoice("gpt-6-luna", "GPT-6 Luna"),
+        ModelChoice("gpt-6-sol", "GPT-6 Sol"),
+        ModelChoice("gpt-6-astra", "GPT-6 Astra"),
+        ModelChoice("gpt-6.1-terra", "GPT-6.1 Terra"),
+        ModelChoice("gpt-6.1-sol", "GPT-6.1 Sol"),
     )
     selectable_efforts = tuple(
         EffortChoice(value, label)
@@ -267,10 +291,14 @@ class CodexProvider(SessionProvider):
     )
     _default_model = "gpt-5.6-sol"
     _model_default_efforts = {
-        # Astra is listed but is not `_default_model`: the account's own
-        # config.toml still wins, and which model the deck falls back to is a
-        # spend decision, not a support one (#1913).
+        # The GPT-6 family is listed but is not `_default_model`: the account's
+        # own config.toml still wins, and which model the deck falls back to is
+        # a spend decision, not a support one (#1913, #4099).
+        "gpt-6.1-sol": "medium",
+        "gpt-6.1-terra": "medium",
         "gpt-6-astra": "medium",
+        "gpt-6-sol": "medium",
+        "gpt-6-luna": "medium",
         "gpt-5.6-sol": "medium",
         "gpt-5.6-terra": "medium",
         "gpt-5.6-luna": "medium",
@@ -541,6 +569,8 @@ class CodexProvider(SessionProvider):
             last_event = None
         session.last_event_seq = last_event.seq if last_event is not None else 0
         session.question = None
+        session.turn_failed = False
+        session.automatic_retry_at = None
         client = self._clients.get(account.key)
         if client is None or not client.owns(session.session_id):
             return False
@@ -586,6 +616,10 @@ class CodexProvider(SessionProvider):
         session.question = self._interaction_summary(interaction)
         session.kind = "appServer"
         session.capabilities = self._runtime_capabilities(account, session.session_id)
+        client = self._clients.get(account.key)
+        session.owned_role = client.role(session.session_id) if client is not None else None
+        if path is not None and not session.thinking:
+            session.turn_failed, session.automatic_retry_at = _limit_stop(meta)
         return True
 
     @staticmethod
@@ -607,6 +641,18 @@ class CodexProvider(SessionProvider):
         ):
             return None
         return client.interaction(thread_id)
+
+    def _last_seen_interaction(
+        self, account: Account, thread_id: str
+    ) -> PendingInteraction | None:
+        client = self._clients.get(account.key)
+        return client.interaction(thread_id) if client is not None else None
+
+    def forget_held_interaction(self, account, session, question_ids) -> None:
+        del question_ids  # a Codex box is answered whole
+        client = self._clients.get(account.key)
+        if client is not None:
+            client.forget_interaction(session.session_id)
 
     def interactions_unknown(self, account: Account) -> bool:
         return account.key in self._clients and not self._refresh_ok.get(account.key, True)
@@ -650,6 +696,8 @@ class CodexProvider(SessionProvider):
                 }
             if client.permission_prompts_available(thread_id):
                 capabilities |= {Capability.PERMISSION_PROMPTS}
+            if client.bypass_permissions_available(thread_id):
+                capabilities |= {Capability.BYPASS_PERMISSIONS}
         return capabilities
 
     def _cached_meta(self, path: Path) -> transcripts_mod.TranscriptMeta:
@@ -817,6 +865,10 @@ class CodexProvider(SessionProvider):
     def fork_ref(self, account: Account, session: Session, seq: int) -> str | None:
         path = self._transcript_path(account, session)
         return transcripts_mod.fork_turn(path, seq) if path is not None else None
+
+    def newest_fork_seq(self, account: Account, session: Session) -> int | None:
+        path = self._transcript_path(account, session)
+        return transcripts_mod.newest_fork_seq(path) if path is not None else None
 
     def _transcript_path(self, account: Account, session: Session) -> Path | None:
         path = self._paths.get((str(account.root), session.session_id))
@@ -1578,11 +1630,10 @@ class CodexProvider(SessionProvider):
         # Interactive Codex starts currently have no usage-admission gate; keep
         # the provider-neutral argument so manual starts share one contract.
         del allow_over_budget
-        if role:
-            # The Codex runtime's start takes no role yet, so a Work agent (#2895 step 5b)
-            # starts on a Claude account; refusing beats a chat without its role.
-            return InjectResult(False, "a Codex chat cannot start with a session role yet")
         client = self._clients.get(account.key)
+        if role and (client is None or not client.supports(models_mod.SNAPSHOT_ROLE_V1)):
+            # The exec fallback takes no role, and an older runtime would drop it.
+            return InjectResult(False, "the Codex runtime cannot start a chat with a role yet")
         if fork_from is not None and (
             client is None or not client.supports(models_mod.SNAPSHOT_FORK_V1)
         ):
@@ -1599,6 +1650,7 @@ class CodexProvider(SessionProvider):
                 effort=effort,
                 approval_policy=approval_policy,
                 delegated=delegated,
+                role=role,
                 session_token=session_token,
                 **({"fork_from": fork_from} if fork_from is not None else {}),
             )
@@ -1626,6 +1678,7 @@ class CodexProvider(SessionProvider):
                             last_activity=now,
                             show_when_idle=True,
                             capabilities=self._runtime_capabilities(account, result.session_id),
+                            owned_role=role,
                         )
                     )
             return result
@@ -1706,6 +1759,22 @@ class CodexProvider(SessionProvider):
             and client.permission_prompts_allowed(session.session_id)
         )
 
+    def bypass_permissions_on(self, account: Account, session: Session) -> bool:
+        client = self._clients.get(account.key)
+        return bool(
+            client is not None
+            and client.owns(session.session_id)
+            and client.bypass_permissions_on(session.session_id)
+        )
+
+    async def set_bypass_permissions(
+        self, account: Account, session: Session, enabled: bool
+    ) -> InjectResult:
+        client = self._clients.get(account.key)
+        if client is None or not client.owns(session.session_id):
+            return InjectResult(False, "Codex app-server is unavailable")
+        return await client.set_bypass_permissions(session.session_id, enabled)
+
     def permission_prompts_next_turn(self, account: Account, session: Session) -> bool:
         # A Codex turn already in flight keeps the reviewer it started with; the
         # new setting governs the approvals of the turns after it.
@@ -1773,13 +1842,18 @@ class CodexProvider(SessionProvider):
         )
 
     async def tail_transcript(
-        self, account: Account, session: Session, byte_offset: int, seq: int
+        self,
+        account: Account,
+        session: Session,
+        byte_offset: int,
+        seq: int,
+        limit: int | None = None,
     ) -> tuple[list[TranscriptEvent], int, int]:
         path = self._transcript_path(account, session)
         if path is None:
             return ([], byte_offset, seq)
         read = await asyncio.to_thread(
-            transcripts_mod.read_events, path, byte_offset=byte_offset, seq=seq
+            transcripts_mod.read_events, path, byte_offset=byte_offset, seq=seq, limit=limit
         )
         events = self._decorate_events(read.events, self._cached_meta(path).model)
         return (events, read.byte_offset, read.seq)

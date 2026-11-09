@@ -819,6 +819,56 @@ def test_the_opt_out_files_the_issue_as_written(shim, tmp_path, monkeypatch, cap
     assert "added label" not in capsys.readouterr().err
 
 
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["issue", "edit", "9", "--add-label", "agent"],
+        ["issue", "create", "--title", "t", "--label", "agent"],
+    ],
+)
+def test_a_start_label_that_starts_nothing_here_is_warned_about(
+    shim, tmp_path, monkeypatch, capsys, argv
+):
+    """Tickets labelled `agent` on a `claude` board waited in silence (#4141)."""
+    _managed(tmp_path, 'ownership_label = "claude"')
+    other = tmp_path / "poller" / "instances" / "aaa"
+    other.mkdir()
+    (other / "poller.toml").write_text(
+        '[board]\norg = "o"\nownership_label = "agent"\n\n'
+        '[[repos]]\nid = "x"\nholds_issues = true\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AGENTDECK_NO_OWNER_LABEL", "1")
+    shim.answer = "https://github.com/o/r/issues/9\n"
+
+    assert main.main(argv) == 0
+
+    assert shim.reads == [argv]  # the write goes out as written
+    err = capsys.readouterr().err
+    assert "'agent' does not start a Work" in err and "start label is 'claude'" in err
+    assert "/start" in err
+
+    shim.code = 1
+    assert main.main(argv) == 1  # a write that failed left no label to warn about
+    assert "does not start a Work" not in capsys.readouterr().err
+
+
+def test_the_right_start_label_and_a_broken_manifest_say_nothing(
+    shim, tmp_path, monkeypatch, capsys
+):
+    _managed(tmp_path, 'ownership_label = "claude"')
+
+    assert main.main(["issue", "edit", "9", "--add-label", "claude"]) == 0
+    assert capsys.readouterr().err == ""
+
+    def broken(root):
+        raise OSError("gone")
+
+    monkeypatch.setattr("agentdeck.poller_ops.issue_label_targets", broken)
+    assert main.main(["issue", "edit", "9", "--add-label", "agent"]) == 0
+    assert capsys.readouterr().err == ""
+
+
 def test_an_issue_already_handed_over_by_an_alias_is_left_alone(shim, tmp_path):
     _managed(tmp_path)
 

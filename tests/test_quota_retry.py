@@ -42,6 +42,16 @@ def test_quota_retry_is_one_durable_message_for_the_provider_boundary(tmp_path):
     assert message.id in scheduled.pending_ids()
     assert scheduled.cancel(message.id, message.chat_id)
     assert message.id not in scheduled.pending_ids()
+    # #4074: the person's cancel stands, through the next pass and a restart.
+    assert message.id in scheduled.cancelled_retry_ids()
+    assert service.reconcile(now=now + timedelta(minutes=2)) == 0
+    restarted = ScheduledMessageService(store, None, lambda _chat: None)
+    assert message.id in restarted.cancelled_retry_ids()
+    # A later limit stop is a new retry, which the old cancel says nothing about.
+    later = message_for(_session(reset + timedelta(hours=5)), now=now)
+    assert later is not None and scheduled.schedule(later) is not None
+    assert later.id in scheduled.pending_ids()
+    assert later.id not in scheduled.cancelled_retry_ids()
 
 
 def test_quota_retry_is_only_scheduled_for_the_current_chat_leg(tmp_path):
@@ -73,6 +83,11 @@ def test_only_scheduled_or_dispatching_quota_rows_are_pending(tmp_path):
     store.settle_scheduled_message(retry.id, "failed", "refused")
 
     assert retry.id not in scheduled.pending_ids()
+    # A retry that failed to send was nobody's choice: still a death, so still a bug (#4074).
+    assert retry.id not in scheduled.cancelled_retry_ids()
+    # Removing the failed row from the chat ends in the same state, but it is still no choice.
+    assert scheduled.cancel(retry.id, retry.chat_id)
+    assert retry.id not in scheduled.cancelled_retry_ids()
 
 
 class _Injector:
@@ -146,7 +161,7 @@ def _account(key: str):
     return Account(key=key, provider_id=provider, label=label, root=Path("/nonexistent"))
 
 
-def _moves(tmp_path, session, accounts, *, repository="owner/repo", started=None):
+def _moves(tmp_path, session, accounts, *, repository="owner/repo", started=None, choice=None):
     from agentdeck.usage_move import UsageMoveService
 
     started = [] if started is None else started
@@ -166,7 +181,7 @@ def _moves(tmp_path, session, accounts, *, repository="owner/repo", started=None
         lambda: tmp_path / "usage",
         store,
         start,
-        lambda key: f"http://deck/sessions/{key}/transcript.json",
+        start_choice=lambda _session: choice,
     )
     return service, started
 
@@ -193,7 +208,7 @@ async def test_a_work_chat_the_limit_stopped_moves_once_to_the_next_listed_accou
     (move,) = started
     assert move.account.key == "claude_code:main"
     assert "The previous account (alt) reached its usage limit" in move.message
-    assert "http://deck/sessions/claude_code:alt:source/transcript.json" in move.message
+    assert (move.model, move.effort) == (None, None)
     # The same stop never starts a second chat, not even after a restart.
     assert await service.reconcile(now=now) == 0
     again, started_again = _moves(tmp_path, session, accounts)
@@ -229,6 +244,22 @@ async def test_a_stopped_chat_waits_when_it_cannot_usefully_move(tmp_path, monke
         assert started == []
     service, started = _moves(tmp_path, far, both, repository=None)
     assert await service.reconcile(now=now) == 0
+    # #4181: an account picked in New work is waited for, never left; a picked model is
+    # carried to the new leg instead.
+    from agentdeck.db import StartChoice
+
+    service, started = _moves(tmp_path, far, both, choice=StartChoice("claude_code:alt"))
+    assert await service.reconcile(now=now) == 0
+    assert started == []
+    later = replace(far, automatic_retry_at=now + timedelta(hours=3))
+    picked = StartChoice(model="opus", effort="high")
+    service, started = _moves(tmp_path, later, both, choice=picked)
+    assert await service.reconcile(now=now) == 1
+    assert (started[0].account.key, started[0].model, started[0].effort) == (
+        "claude_code:main",
+        "opus",
+        "high",
+    )
     monkeypatch.setattr(
         github, "account_refusal_detail", lambda _cache, _account, **_: ("5h at 100%", None)
     )
@@ -263,8 +294,10 @@ async def test_a_moved_leg_starts_as_the_same_chat_with_the_work_role(tmp_path):
     class _Starter:
         accept = True
         answer = None
+        config = SimpleNamespace(too_long=lambda text: False)
 
         async def start_new(self, account, provider, cwd, message, **kwargs):
+            self.message = message
             calls.append(("start", account.key, cwd, kwargs))
             return InjectResult(self.accept)
 
@@ -288,7 +321,9 @@ async def test_a_moved_leg_starts_as_the_same_chat_with_the_work_role(tmp_path):
             calls.append(("released", token))
 
     state, starter, store = _State(), _Starter(), _Db()
-    app = SimpleNamespace(state=SimpleNamespace(app_state=state, injector=starter, db=store))
+    app = SimpleNamespace(
+        state=SimpleNamespace(app_state=state, injector=starter, db=store, accounts=[])
+    )
     move = Move(session, _account("claude_code:main"), token, "carry on")
 
     assert await start_moved_leg(app, move) == STARTED
@@ -301,6 +336,16 @@ async def test_a_moved_leg_starts_as_the_same_chat_with_the_work_role(tmp_path):
     assert kwargs["session_token"] == token
     assert kwargs["source_session_key"] == session.key
     assert kwargs["model"] is None
+    # #4181: a model picked in New work goes with the chat, over the saved default.
+    from dataclasses import replace
+
+    calls.clear()
+    assert await start_moved_leg(app, replace(move, model="opus", effort="high")) == STARTED
+    assert (calls[-1][3]["model"], calls[-1][3]["effort"]) == ("opus", "high")
+    calls.clear()
+    # The reason comes first; the note says to read how the old part ended in full.
+    assert starter.message.startswith("carry on\n\n")
+    assert f"chat-read {session.key} --last 2 --tools all" in starter.message
     # Every proof that nothing started frees both fences and asks for another try:
     # a refusal up front (another start running), and a clean refusal from the spawn.
     for refusal in ("now", "later"):

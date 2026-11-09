@@ -8,6 +8,7 @@ import signal
 from pathlib import Path
 
 from ... import gh_shim, github_identity
+from ...job_scratch import point_chat_temp_files
 from ...models import Account, InjectResult, Session
 from . import (
     APPROVALS_REVIEWER_CONFIG_OVERRIDE,
@@ -63,6 +64,7 @@ async def inject_session(
     # Every GitHub transport goes through the owner rule, never the host login (#2289):
     # `gh` through the shim, `git` through AgentDeck's helper.
     env["PATH"] = gh_shim.worker_path(env)
+    point_chat_temp_files(env)
     github_identity.configure_github_git(env)
     try:
         args = [
@@ -132,6 +134,7 @@ async def start_session(
     # Every GitHub transport goes through the owner rule, never the host login (#2289):
     # `gh` through the shim, `git` through AgentDeck's helper.
     env["PATH"] = gh_shim.worker_path(env)
+    point_chat_temp_files(env)
     github_identity.configure_github_git(env)
     try:
         args = [

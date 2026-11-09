@@ -14,14 +14,18 @@ is the third. The rule lives here so they cannot drift apart again.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import logging
+from collections.abc import Callable, Iterable
 from datetime import UTC, datetime, timedelta
-from shlex import quote
 from typing import Any
 
 from fastapi import Request
 
+from ..chat_read import continuation_note as note_text
+from ..chat_read import load_lines
 from .deps import get_injector, get_state
+
+log = logging.getLogger(__name__)
 
 # How long the status strip keeps calling a dropped token provisional. A start whose
 # in-memory record is gone only means "gone" once the strip itself would have given up,
@@ -103,15 +107,44 @@ def reserve_successor(
     return state.reserve_chat_successor(token, source_session_key, newest_run=newest_run)
 
 
-def transcript_continuation(transcript_url: str) -> str:
-    """The first message of a chat continued from its predecessor's transcript."""
-    return (
-        "Continue the work from this AgentDeck chat in the new session:\n"
-        f"{transcript_url}\n\n"
-        "Before taking any substantive action, fetch and read the complete transcript "
-        "with:\n"
-        f"curl --fail --silent --show-error {quote(transcript_url)}\n\n"
-        "Treat it as the prior conversation context and continue from where it ended."
-        " A final departure message that links to this new chat and tells the old chat "
-        "to stop applies only to that source chat, not to this session."
+async def continuation_note(
+    state: Any,
+    accounts: Iterable[Any],
+    session: Any,
+    *,
+    provider: Any,
+    config: Any,
+    before: str = "",
+    after: str = "",
+    mid_task: bool = False,
+) -> str:
+    """The first message of a chat continued from ``session``, note and all (#4169).
+
+    A transcript that cannot be read costs the quotes, never the start: the new chat can
+    still read the old one, or say that it could not. So does a quote that would stop the
+    message: words from the old chat can make it too long, or be ones the target provider
+    silently drops (`user_message_refusal`), and only the deck's own words are safe there.
+    """
+    from ..providers import PROVIDERS
+
+    try:
+        lines = await load_lines(
+            session.key,
+            leg_keys=state.chat_session_keys(session.key),
+            sessions=state.sessions,
+            accounts_by_key={account.key: account for account in accounts},
+            providers=PROVIDERS,
+        )
+    except Exception:  # noqa: BLE001 - the quotes are a help, not the point
+        log.exception("continue: could not read %s for its note", session.key)
+        lines = None
+    issues = [f"{ref.repository}#{ref.number}" for ref in session.issues]
+    title = session.display_title
+    message = (
+        before
+        + note_text(session.key, title=title, issues=issues, lines=lines or (), mid_task=mid_task)
+        + after
     )
+    if config.too_long(message) or provider.user_message_refusal(message) is not None:
+        message = before + note_text(session.key, issues=issues, mid_task=mid_task) + after
+    return message

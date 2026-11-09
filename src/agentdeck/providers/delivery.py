@@ -23,7 +23,7 @@ import asyncio
 import hashlib
 import json
 import time
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
@@ -41,6 +41,8 @@ from .instructions import SessionRole
 DELIVERY_RETRY_HORIZON_S = 24 * 3600.0
 DELIVERY_RECEIPT_TTL_S = DELIVERY_RETRY_HORIZON_S
 DELIVERY_RECEIPT_CAP = 4096
+# How often a worker host walks every record for expired receipts (#4143).
+RECEIPT_SWEEP_INTERVAL_S = 3600.0
 
 
 @dataclass
@@ -591,6 +593,10 @@ class DeliveryReceipts:
             receipt["delivery_stage"] = "prepared_before_write"
         return DeliverResult(True, "resolved", session_id=session_id)
 
+    def expire_settled(self) -> None:
+        """Drop settled history past the retry horizon, with no delivery in hand."""
+        self._prune()
+
     def _prune(self) -> None:
         """Expire settled history only after the retry horizon has passed.
 
@@ -610,6 +616,27 @@ class DeliveryReceipts:
                 and now - float(receipt.get("at", 0.0)) > DELIVERY_RETRY_HORIZON_S
             ):
                 self._store.pop(did, None)
+
+
+class ReceiptSweep:
+    """Expires old receipts on every record of a worker host, at most once an hour.
+
+    A delivery only cleans its own record, so a chat that went quiet kept its receipts
+    for good, and the host rewrites all of them on each state change: 96% of the bytes
+    in the receipts of the live state files were past the horizon, in files rewritten
+    several times a minute (#4143). The rule is ``DeliveryReceipts._prune``'s, unchanged.
+    """
+
+    def __init__(self) -> None:
+        self._next_at = 0.0
+
+    def run(self, stores: Iterable[DeliveryReceipts]) -> None:
+        now = time.time()
+        if now < self._next_at:
+            return
+        self._next_at = now + RECEIPT_SWEEP_INTERVAL_S
+        for receipts in stores:
+            receipts.expire_settled()
 
 
 class SessionDeliveryFence:

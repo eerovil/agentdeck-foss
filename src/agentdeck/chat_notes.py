@@ -302,7 +302,7 @@ class ChatNotesService:
             try:
                 async for batch in self._tailer.watch(stop_event=self._stop, watcher=self._watcher):
                     await self.apply(batch)
-                    self._tailer.commit()
+                    await self._tailer.commit_off_loop()
                 return
             except asyncio.CancelledError:
                 raise

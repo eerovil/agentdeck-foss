@@ -32,12 +32,13 @@ from agentdeck.work_facts import (
     OutputFact,
     Registration,
     diffstat,
+    merge_word,
     new_source_size,
     source_size,
     target_branches,
     work_facts,
 )
-from agentdeck.work_overview import WorkAttention, build_work_card
+from agentdeck.work_overview import OtherDeckWork, WorkAttention, build_work_card
 from agentdeck.work_story import NEEDS_YOU, front_row, work_status
 from agentdeck.work_workspace import RunVerification
 
@@ -377,6 +378,40 @@ def test_needs_you_is_grouped_by_category_in_the_front_pages_order():
     }
 
 
+def test_a_work_waiting_for_a_try_has_its_own_group_outside_needs_you():
+    """#4210: no Needs you count, its own Works, close and Doesn't work on the row."""
+    from agentdeck.work_story import front_sections
+
+    tried = _work(
+        rows={PR.lower(): _row("merged")},
+        derived=_derived("try_wait", "open the cart"),
+    )
+    answer = _work(attention=(_ask(),))
+
+    front = front_sections([front_row(work, current=True) for work in (tried, answer)])
+
+    (row,) = front.trying
+    assert row.card is tried and row in front.rows
+    assert row not in front.needs_you and row not in front.active
+    assert [b.action for b in row.tried] == ["tried_ok", "tried_bad"]
+    assert dict((key, count) for key, count, _ in front.summary) == {"answer": 1}
+    # The row's buttons take no column: an unseen copy keeps their place at the line's end.
+    from pathlib import Path
+
+    from jinja2 import Environment, FileSystemLoader
+
+    import agentdeck.web
+
+    templates = Path(agentdeck.web.__file__).parent / "templates"
+    page = Environment(loader=FileSystemLoader(templates)).get_template(
+        "partials/work_front.html"
+    ).make_module({"work_overview": {}, "part": ""})
+    room = str(page.room(row.tried, True))
+    assert room.startswith('<span class="fr-room fr-tried" aria-hidden="true">')
+    assert "Works, close" in room and "Doesn't work" in room and "data-front-action" not in room
+    assert str(page.room([], True)) == ""
+
+
 def test_a_closed_issue_is_not_listed_as_recently_stopped():
     """Issue closed only waits for Finish: Needs you lists it, Recently stopped does not (#3388)."""
     from datetime import UTC, datetime
@@ -451,10 +486,10 @@ def _output(
     )
 
 
-def test_the_size_sums_every_counted_output_across_repositories():
+def test_the_size_sums_only_the_open_outputs_across_repositories():
     outputs = (
-        _output(1, "merged"),
-        _output(2, "merged", size=(5, 5, 3), new=(6, 2)),
+        _output(1),
+        _output(2, size=(5, 5, 3), new=(6, 2)),
         _output(3, "closed", size=(99, 99, 9), new=(None, None)),
     )
 
@@ -463,16 +498,18 @@ def test_the_size_sums_every_counted_output_across_repositories():
     # One output's split unknown keeps the size but drops the split, never half of it (#3617).
     unsplit = diffstat((_output(1), _output(4, new=(None, None))))
     assert unsplit == DiffStat(20, 4, 2) and not unsplit.split
-    # While one is open, a merged one (even of unknown size) is history: only the open count,
-    # a draft among them (#4010).
+    # A merged one (even of unknown size) is history: only the open count, a draft among
+    # them (#4010).
     draft = replace(_output(5, size=(3, 1, 1)), draft=True)
-    pending = (*outputs, _output(4, "merged", size=(None, None, None)), _output(6), draft)
+    merged = (_output(4, "merged", size=(None, None, None)), _output(8, "merged"))
+    pending = (*merged, _output(6), draft)
     assert diffstat(pending) == DiffStat(13, 3, 2, 0, 0)
     assert diffstat(pending[::-1]) == DiffStat(13, 3, 2, 0, 0)
-    # A state not resolved yet is not open (#3187): out beside an open one, in without one.
+    # A state not resolved yet is not open (#3187): never counted.
     unresolved = _output(7, "", size=(50, 50, 5))
     assert diffstat((*pending, unresolved)) == DiffStat(13, 3, 2, 0, 0)
-    assert diffstat((*outputs, unresolved)) == DiffStat(65, 57, 9, 6, 2)
+    # Nothing open, nothing left to merge: no size, however much merged (#4195).
+    assert diffstat((_output(8, "merged"), _output(3, "closed"), unresolved)) is None
 
 
 @pytest.mark.parametrize(
@@ -512,8 +549,9 @@ def test_the_target_is_named_only_when_it_is_not_master():
     assert target_branches((_output(1), _output(2, base=""))) == ()
     assert target_branches((_output(1), _output(2, base="release"))) == ("release",)
     assert target_branches((_output(1, "closed", base="old"),)) == ()
-    # A merged one's target is history while another is open (#4010).
+    # A merged one's target is history (#4010), with or without another open (#4195).
     assert target_branches((_output(1, "merged", base="release"), _output(2))) == ()
+    assert target_branches((_output(1, "merged", base="release"),)) == ()
 
 
 def test_the_size_comes_from_the_cached_row_and_is_on_the_card(tmp_path):
@@ -552,7 +590,87 @@ def test_a_work_with_only_tests_and_docs_says_so(tmp_path):
 
     assert work.diffstat == DiffStat(0, 0, 0, 0, 0)
     html = render_work_front(_templates(tmp_path), overview, "release")
-    assert '<span class="fr-size" data-work-diffstat>no source change</span>' in html
+    assert (
+        '<span class="fr-merge fr-merge-unmerged" data-work-merge="unmerged">unmerged</span> '
+        '<span class="fr-size" data-work-diffstat>no source change</span>'
+    ) in html
+
+
+@pytest.mark.parametrize(
+    ("states", "word"),
+    [
+        (("open",), "unmerged"),
+        (("open", "merged"), "unmerged"),
+        (("merged", "closed", "open"), "unmerged"),
+        (("merged",), "merged"),
+        (("merged", "closed"), "merged"),
+        (("closed",), ""),
+        (("merged", ""), ""),
+        (("",), ""),
+        ((), ""),
+    ],
+)
+def test_the_merge_word_never_claims_what_the_deck_does_not_know(states, word):
+    outputs = [OutputFact(PR, "o/r", 1, "registered", state) for state in states]
+
+    assert merge_word(outputs) == word
+
+
+def test_a_row_says_whether_its_changes_are_merged_with_or_without_a_size(tmp_path):
+    from agentdeck.web.work_view import WorkOverview, render_work_front
+    from agentdeck.work_story import front_sections
+
+    templates = _templates(tmp_path)
+
+    def html(rows, *, draft=False):
+        rows = {PR.lower(): {**row, "isDraft": draft} for row in rows}
+        work = _work(rows=rows, derived=_derived("pr_held", "Held for a person"))
+        overview = WorkOverview(front=front_sections([front_row(work, current=True)]))
+        return render_work_front(templates, overview, "release")
+
+    tag = '<span class="fr-merge fr-merge-{0}" data-work-merge="{0}">{0}</span>'
+    size = '<span class="fr-size" data-work-diffstat>'
+    reason = '<span class="fr-reason">Held for a person</span>'
+    # It leads the size, and a draft has changes to merge just the same.
+    assert f"{reason} · {tag.format('unmerged')} {size}+40" in html([_row()])
+    assert tag.format("unmerged") in html([_row()], draft=True)
+    # Merged, nothing is left to review: the word alone, no size or diff square (#4195).
+    done = html([_row("merged")])
+    assert f"{reason} · {tag.format('merged')}</span>" in done
+    assert "data-work-diffstat" not in done and "data-work-diff=" not in done
+    # Before the size is known the word still shows, and no separator trails it.
+    assert f"{reason} · {tag.format('unmerged')}</span>" in html([_row(sized=False)])
+
+    # A merge changes the row's revision, so an open page swaps the word without a reload.
+    work = _work(rows={PR.lower(): _row()})
+    merged = _work(rows={PR.lower(): _row("merged")})
+    assert front_row(work, current=True).revision != front_row(merged, current=True).revision
+
+    # With no pull request the row says nothing, and leaves no stray separator.
+    bare = _work(rows={}, derived=_derived("pr_held", "Held for a person"))
+    overview = WorkOverview(front=front_sections([front_row(bare, current=True)]))
+    empty = render_work_front(templates, overview, "release")
+    assert "data-work-merge" not in empty and f"{reason}</span>" in empty
+
+
+def test_another_decks_row_says_it_through_the_shared_macro(tmp_path):
+    template = _templates(tmp_path).env.from_string(
+        '{% from "partials/work_macros.html" import size %}{{ size(item) }}'
+    )
+    rows = {PR.lower(): _row("merged")}
+    item = OtherDeckWork(
+        WORK,
+        "Work",
+        "",
+        "someone",
+        True,
+        (),
+        "",
+        facts=work_facts(WORK, rows=rows, registered=(Registration(PR, True),)),
+    )
+
+    rendered = template.render(item=item)
+    assert 'data-work-merge="merged"' in rendered and "data-work-diffstat" not in rendered
 
 
 def test_the_webhook_write_through_keeps_the_size_gh_pr_view_stores():

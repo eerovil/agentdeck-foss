@@ -9,11 +9,13 @@
     message box, the result and the details; its state chip, milestones and Chats go. #}
 {%- set derived = card.derived -%}
 {%- from "partials/work_actions.html" import control -%}
+{%- from "partials/work_macros.html" import output_about, use_dot -%}
 {%- if section == "status" %}
 <header class="wd-head" data-work-id="{{ card.work_id }}">
   <p class="wd-source">
     <a href="{{ card.source_url|issue_href }}" target="_blank" rel="noopener">{{ card.source_label }}</a>
     {%- if card.work_state and not derived %}<span class="wk-state" data-wk-state="{{ card.work_state }}">{{ card.work_state }}</span>{% endif %}
+    {{- use_dot(card.use) }}
     {%- if card.last_activity %}<time class="wk-age" datetime="{{ card.last_activity.isoformat() }}" data-activity-age>{{ card.last_activity | reltime_ago }}</time>{% endif %}
     {#- The Work's diagram (#3827), on this line so it adds no height. #}
     {%- set diagram = detail.diagram %}
@@ -34,6 +36,11 @@
   <div class="wd-op" data-op-category="{{ op.category }}" data-op-actions="{{ op.actions | join(' ') }}">
     {#- The status box under it already says the same line when it is the derived one (#2944). #}
     <p class="wd-op-head">{{ op.label }}{% if op.reason and op.reason != status.summary.rstrip('.') %}<span class="wd-op-reason"> · {{ op.reason }}</span>{% endif %}</p>
+    {%- for button in detail.buttons %}{{ control(card, button) }}{% endfor %}
+  </div>
+  {%- elif detail.buttons %}
+  {#- Waiting for a try (#4210): not in Needs you, so no category, but its two controls. #}
+  <div class="wd-op" data-work-tried>
     {%- for button in detail.buttons %}{{ control(card, button) }}{% endfor %}
   </div>
   {%- endif %}
@@ -63,6 +70,9 @@
     {%- set approval = detail.merge_approval_control %}
     {%- if detail.merge_approved %}<span class="wd-merge-approval" data-work-merge-approved>Merge approved</span>{% endif %}
     {%- if approval %}<span class="wd-merge-approval" data-work-merge-approval="{{ approval.action }}">{{ control(card, approval) }}</span>{% endif %}
+    {#- Ship now, fix later (#4212): only at review findings; inline, no height. #}
+    {%- set ship = detail.ship_now_control %}
+    {%- if ship %}<span class="wd-merge-approval" data-work-ship-now>{{ control(card, ship) }}</span>{% endif %}
     {%- set finish = detail.finish_control %}
     {%- if finish %}<span class="wd-pause" data-work-finish>{{ control(card, finish) }}</span>{% endif %}
     {#- Star (#3116): this Work goes ahead in the merge queue, the job queue, review starts,
@@ -70,6 +80,8 @@
     {%- set star = detail.star_control %}<span class="wd-star" data-work-star="{{ star.action }}">{{ control(card, star) }}</span></div>
   <p class="wd-status-summary">{% if status.summary_href %}<a href="{{ status.summary_href|issue_href }}" data-wd-summary-link target="_blank" rel="noopener">{{ status.summary }}</a>{% else %}{{ status.summary }}{% endif %}</p>
   {%- if status.detail %}<p class="wd-status-detail">{{ status.detail }}</p>{% endif %}
+  {#- Why a Work in a repository that merges on its own still waits for a Merge (#4172). #}
+  {%- if detail.approval_reason and detail.approval %}<p class="wd-status-detail" data-work-merge-reason>{{ detail.approval_reason }}</p>{% endif %}
   {%- if detail.approval_cleared %}<p class="wd-status-detail" data-work-merge-cleared>{{ detail.approval_cleared }}</p>{% endif %}
   {#- What a standing Merge press waits for now (#3869), when the receipt above is another press's. #}
   {%- if detail.approval_waits and detail.merge_approved and detail.last_action_followed != detail.approval_waits %}<p class="wd-status-detail" data-work-merge-armed>{{ detail.approval_waits }}</p>{% endif %}
@@ -92,6 +104,11 @@
   {%- endif %}
   <dl class="wd-status-lines">
     {%- if status.next %}<div data-wk-next="{{ status.next }}"><dt>Next</dt><dd>waiting for {{ status.next }}</dd></div>{% endif %}
+    {#- Shipped with its review findings left to a follow-up Work (#4212 D12): only once the
+        press finished (its follow-up filed and its pass recorded); this says where its findings
+        are fixed. #}
+    {%- for pull, follow_up in detail.shipped %}<div data-work-shipped="{{ pull }}"><dt>Shipped</dt><dd>{{ pull }} with its review findings
+      {%- if follow_up %} → <a href="https://github.com/{{ follow_up.split('#')[0] }}/issues/{{ follow_up.split('#')[1] }}" target="_blank" rel="noopener">{{ follow_up }}</a>{% endif %}</dd></div>{% endfor %}
     <div class="wd-you" data-wd-you><dt>You</dt><dd>{{ status.you }}
       {%- if status.where %} · {% if status.where_href %}<a href="{{ status.where_href|issue_href }}" data-wd-where{% if status.where_href.startswith("http") %} target="_blank" rel="noopener"{% endif %}>{{ status.where }}</a>{% else %}<span data-wd-where>{{ status.where }}</span>{% endif %}{% endif %}</dd></div>
   </dl>
@@ -176,7 +193,8 @@
     {%- for output in card.outputs %}
     <li data-wd-output="{{ output.url }}"><a href="{{ output.url }}" target="_blank" rel="noopener">PR {{ output.label }}</a>{% if output.state %} · <span class="wo-state">{{ output.state }}</span>{% endif %}
       {%- if output.additions is not none and output.deletions is not none and output.files is not none %} · <span data-wd-output-size>{% if output.files %}+{{ output.additions }}/−{{ output.deletions }} · {{ output.files }} {{ "file" if output.files == 1 else "files" }}{% else %}no source change{% endif %}</span>{% endif %}
-      {%- if output.base and output.base != "master" %} · <span data-wd-output-target>into {{ output.base }}</span>{% endif %}</li>
+      {%- if output.base and output.base != "master" %} · <span data-wd-output-target>into {{ output.base }}</span>{% endif %}
+      {{- output_about(output, card.work_id) }}</li>
     {%- endfor %}
     {%- if card.staging %}
     {#- Staging already runs every open pull request's head (#3180), even while review and
@@ -192,6 +210,22 @@
   <p class="rt-note" data-wk-verification="none">No pull request or verification job names this Work yet.</p>
   {%- endif %}
 </section>
+{%- elif section == "issue" %}
+{#- The issue's own text (#4101), which the page's markdown pass formats. A long one shows its
+    first lines shut, in the summary because a shut <details> hides all the rest; a short one
+    has nothing to open. The preview is inert: the whole text below is the one to read aloud,
+    and a link in it must not take focus or a tap meant to open the section. #}
+{%- if detail.issue_text and detail.issue_short %}
+<section class="wd-section wd-issue" id="work-issue" data-work-issue="short">
+  <h3 class="wd-title-sm">Issue</h3>
+  <div class="wd-issue-text">{{ detail.issue_text }}</div>
+</section>
+{%- elif detail.issue_text %}
+<details class="wd-section wd-fold wd-issue" id="work-issue" data-work-issue="long" data-keep-open="work-issue:{{ card.work_id }}">
+  <summary>Issue<div class="wd-issue-text wd-issue-preview" inert>{{ detail.issue_text }}</div></summary>
+  <div class="wd-issue-text">{{ detail.issue_text }}</div>
+</details>
+{%- endif %}
 {%- elif section == "resolution" %}
 {#- The Work's own summary (#2328): what the issue is about, what the problem was, what
     changed, why this solution over the alternatives, and why it is believed correct. The
@@ -258,6 +292,7 @@
     {%- for chat in detail.chats %}
     <li class="wd-row{% if chat.working %} is-working{% endif %}" data-wd-chat="{{ chat.chat_id }}">
       <a href="{{ chat.href }}" data-session-key="{{ chat.session_key }}">{{ chat.title }}</a>
+      {{- use_dot(chat.use) }}
       <span class="wo-state">{{ "working" if chat.working else "idle" }}</span>
       {%- if chat.last_activity %}<time class="wo-age" datetime="{{ chat.last_activity.isoformat() }}" data-activity-age>{{ chat.last_activity | reltime_ago }}</time>{% endif %}
       {%- if chat.other_works %}<span class="rt-note">also in {{ chat.other_works }} other {{ "Work" if chat.other_works == 1 else "Works" }}</span>{% endif %}
