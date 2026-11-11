@@ -36,7 +36,7 @@ Arguments (all optional, any order): `[effort] [PR#]`
 - **effort** ∈ `low | medium | high | max`. Default `high`. `ultra` is an
   alias for `max` (this skill is local; there is no separate cloud engine).
   Effort scales the **correctness** fan-out only. Both passes run at every level.
-  - `low` / `medium` → a narrow correctness scan, few high-confidence findings.
+  - `low` / `medium` → a narrow correctness scan with fewer sub-reviewers.
   - `high` / `max` → a wider correctness scan; broader coverage, may surface
     uncertain findings clearly labelled as such.
 - **PR#** — a GitHub PR number (or `#123`). If given, review that PR. If
@@ -107,10 +107,18 @@ keep that name — it is how a lane is identified if it comes back unusable. Eac
 gets the diff, the reviewed sha, the CLAUDE.md/AGENTS.md paths, the three quoted
 rules from *Evidence rules* below verbatim, and this brief:
 
-> Review ONLY the changed lines for correctness bugs and regressions. Focus on
-> real bugs a senior engineer would block a merge on. Ignore nitpicks, style,
-> and anything a linter/typechecker/CI would catch. Ignore pre-existing issues
-> on unmodified lines. When you confirm a finding inside a function, do not
+> Review ONLY the changed lines for correctness bugs and regressions. Report
+> every real problem you find there, not only the ones a senior engineer would
+> block a merge on: an edge case, and a doc, diagram or test the change left
+> wrong, count too. Read every changed file to its end; do not stop at the
+> first finding. Ignore style and anything a linter/typechecker/CI would catch.
+> Ignore pre-existing issues on unmodified lines. Mark each finding `bug` (wrong
+> on an ordinary path, loses data, or breaks a rule the repository's guide
+> states), `edge case` (wrong only on an unusual input, ordering or failure), or
+> `cosmetic` (docs, diagrams, comments, wording, test-only). When a finding
+> breaks a rule — a guard, a normalization, a convention — search the whole
+> diff for every other place the same rule applies and list each `file:line`
+> where it is broken, not only the first. When you confirm a finding inside a function, do not
 > move on: re-read that whole function and check the same region for sibling
 > bugs of the standard classes — case folding and normalization, None/empty
 > handling, multi-repository or multi-tenant identity, boundaries and
@@ -131,11 +139,43 @@ full ground truth was known (`#2095`'s two bugs, `#2079`'s three findings),
 every real finding was reported by at least two of three sub-reviewers while
 self-rating confidence 38–70, so a ≥70-only gate dropped nearly all of them —
 and the one-off extras the agreement rule excludes were exactly the findings
-no second reviewer could reproduce. At `low` effort there is one sub-reviewer
-and the confidence gate stands alone. Deduplicate across sub-reviewers by
+no second reviewer could reproduce. When only one correctness judgment comes
+back, the paragraph after this one sets the gate instead. Deduplicate across sub-reviewers by
 file+line after gating, and label each kept finding with the gate that passed
 it (`conf` or `2-of-N`). Record any lane that returned
 `LANE UNRELIABLE` by its name — the report header lists them.
+
+When only one correctness judgment comes back — a runner that cannot spawn
+sub-reviewers and so runs correctness as one pass, `low` effort's single
+sub-reviewer, or a run where every other correctness lane returned `LANE
+UNRELIABLE` — no second report can ever agree with the first, and a ≥ 70 gate
+alone is the gate the benchmark above showed dropping real bugs. Such a run keeps an evidenced
+finding at confidence **≥ 35** and labels it `conf`: below the lowest rating a real
+bug got in that benchmark (38), so none of them would be dropped. Evidence stays the
+first gate, whatever the confidence.
+
+### The first review reports everything at once
+
+A finding held back now comes back as a round later: the worker fixes what was
+reported, the suite runs, the review runs again, and finds the next thing on code
+that never changed. In `eerovil/agentdeck` between 2026-10-12 and 2026-11-09, 40
+of the 70 findings from a pull request's second round onward were on code already
+in its first reviewed commit, and 14 were a rule already reported once, broken
+again in another place; `#3254` got one new finding per round for five rounds on
+unchanged code (`#4230`). So on every round, and on the first above all:
+
+- the correctness pass reads every changed file to its end before reporting,
+  however strong the first finding is. This is a rule about correctness only: each
+  architecture lane keeps Step 3's read budget, since it rates a design question
+  rather than hunting line-level defects;
+- report every correctness finding that passes the gates, sorted `bug` first, then
+  `edge case`, then `cosmetic`, each labelled with its kind. Architecture items keep
+  their own prefixes (`Simplify:`, `Design question:`, `Design finding:`) and follow
+  the correctness list;
+- for a rule broken in one place, list every place in the diff it is broken.
+
+The kinds are for the reader's order of work, not a filter: a `cosmetic` finding
+is still a finding to fix. Pre-existing problems on unmodified lines stay out.
 
 ## Step 3 — Architecture pass (always runs)
 
@@ -399,11 +439,11 @@ Reviewed <reviewed sha (short)><, now <new sha | working tree changed> — findi
 <"Ask: not recorded — scope judged against the branch's own stated intent." when applicable>
 
 ### Correctness (<N> issues)
-1. <file:line> — <description> (<confidence>)
+1. <bug | edge case | cosmetic> <file:line> — <description> (<confidence>)
    > <the cited source line, quoted verbatim>
    <why it's a real bug>
 ...
-(or: "No correctness issues found.")
+(sorted bug, then edge case, then cosmetic; or: "No correctness issues found.")
 
 ### Architecture verdict: <Sound | Questionable | Reconsider>
 <2–4 sentence overall judgement of whether this change was a good idea.>

@@ -61,8 +61,14 @@ def main() -> None:
         raise SystemExit(_secret_run(sys.argv[2:]))
     if len(sys.argv) > 1 and sys.argv[1] == "job":
         raise SystemExit(_job(sys.argv[2:]))
+    if len(sys.argv) > 1 and sys.argv[1] == "mcp-call":
+        from .mcp_call import main as mcp_call
+
+        raise SystemExit(mcp_call(sys.argv[2:]))
     if len(sys.argv) > 1 and sys.argv[1] == "session-key":
         raise SystemExit(_session_key(sys.argv[2:]))
+    if len(sys.argv) > 1 and sys.argv[1] == "bookkeep":
+        raise SystemExit(_bookkeep(sys.argv[2:]))
     if len(sys.argv) > 1 and sys.argv[1] == "chat-read":
         raise SystemExit(_chat_read(sys.argv[2:]))
     if len(sys.argv) > 1 and sys.argv[1] == "artifact":
@@ -990,6 +996,98 @@ def _session_key(argv: list[str]) -> int:
         return 1
     print(payload["session_key"])
     return 0
+
+
+#: The parts of a Work summary ``bookkeep --summary`` sends (``WorkResolutionRequest``).
+SUMMARY_PARTS = ("background", "problem", "solution", "rationale", "correctness", "work_id")
+
+
+def _bookkeep(argv: list[str]) -> int:
+    """A Work agent's start and end bookkeeping in one call (#4254).
+
+    Each of these was a call of its own (resolve the key, name the chat, write the summary,
+    register a pull request, register a wake-on), a model turn apiece. This resolves the
+    session token once and makes every asked request in order, going on past one that fails,
+    printing one JSON line per step. Exit 1 when any step failed.
+    """
+    parser = argparse.ArgumentParser(
+        prog="agentdeck bookkeep",
+        description=(
+            "Name this chat, write its Work summary, register pull requests and wake-ons, "
+            "in one call. Prints this chat's session key first."
+        ),
+    )
+    parser.add_argument(
+        "--session-token",
+        default=os.environ.get("AGENTDECK_SESSION_TOKEN", ""),
+        help="this chat's session token (default: $AGENTDECK_SESSION_TOKEN)",
+    )
+    parser.add_argument("--title", default="", help="the chat's title")
+    parser.add_argument(
+        "--summary",
+        default="",
+        help="a JSON file of the Work summary's parts (background, problem, solution, "
+        "rationale, correctness), or - for standard input",
+    )
+    parser.add_argument(
+        "--pull-request", action="append", default=[], help="owner/repo#n or URL; repeatable"
+    )
+    parser.add_argument(
+        "--wake-on", action="append", default=[], help="one wake-on as a JSON object; repeatable"
+    )
+    args = parser.parse_args(argv)
+    token = args.session_token.strip()
+    if not token:
+        parser.exit(2, "agentdeck bookkeep: no --session-token and no $AGENTDECK_SESSION_TOKEN\n")
+    steps: list[tuple[str, str, str, dict]] = []
+    if args.title.strip():
+        steps.append(("title", "PUT", "title", {"title": args.title.strip()}))
+    if args.summary:
+        try:
+            raw = sys.stdin.read() if args.summary == "-" else Path(args.summary).read_text()
+            summary = json.loads(raw)
+        except (OSError, ValueError) as exc:
+            parser.exit(2, f"agentdeck bookkeep: could not read the summary: {exc}\n")
+        if not isinstance(summary, dict) or set(summary) - set(SUMMARY_PARTS):
+            parser.exit(
+                2,
+                "agentdeck bookkeep: the summary must be a JSON object of "
+                + ", ".join(SUMMARY_PARTS)
+                + "\n",
+            )
+        steps.append(("summary", "PUT", "work-resolution", summary))
+    for pull in args.pull_request:
+        steps.append(("pull_request", "POST", "pull-requests", {"pull_request": pull.strip()}))
+    for raw_wake in args.wake_on:
+        try:
+            wake = json.loads(raw_wake)
+        except ValueError as exc:
+            parser.exit(2, f"agentdeck bookkeep: --wake-on is not JSON: {exc}\n")
+        if not isinstance(wake, dict):
+            parser.exit(2, "agentdeck bookkeep: --wake-on must be a JSON object\n")
+        steps.append(("wake_on", "POST", "wake-on", wake))
+    try:
+        key = _resolve_session_token(token)["session_key"]
+    except JobClientError as exc:
+        print(f"agentdeck bookkeep: {exc}", file=sys.stderr)
+        return 1
+    print(json.dumps({"session_key": key}))
+    base = os.environ.get("AGENTDECK_URL", "").strip()
+    failed = False
+    for name, method, path, body in steps:
+        url = urljoin(base + "/", f"api/sessions/{quote(key, safe='')}/{path}")
+        try:
+            response = httpx.request(method, url, json=body, timeout=30.0)
+            try:
+                answer: object = response.json()
+            except ValueError:
+                answer = response.text[:500]
+            ok = response.is_success
+        except httpx.HTTPError as exc:
+            answer, ok = str(exc), False
+        failed = failed or not ok
+        print(json.dumps({"step": name, "ok": ok, "answer": answer}, ensure_ascii=False))
+    return 1 if failed else 0
 
 
 def _chat_read(argv: list[str]) -> int:

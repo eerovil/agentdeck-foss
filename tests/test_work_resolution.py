@@ -3,13 +3,22 @@
 from __future__ import annotations
 
 import dataclasses
+from functools import partial
 
 import pytest
 from httpx import ASGITransport, AsyncClient
 
 from agentdeck import gh_cli
 from agentdeck.work_overview import work_href, work_title
-from agentdeck.work_resolution import MAX_TITLE, WorkResolution, normalize_title
+from agentdeck.work_resolution import (
+    MAX_PART,
+    MAX_TITLE,
+    ResolutionError,
+    WorkResolution,
+    evidence_added,
+    normalize_title,
+    with_evidence,
+)
 
 WORK_ID = "github_issue:eerovil/agentdeck#2147"
 
@@ -65,6 +74,62 @@ def test_a_resolution_write_replaces_the_one_record_and_keeps_the_title(tmp_path
     # A title written after a resolution leaves the resolution alone.
     reopened.set_work_title(WORK_ID, "")
     assert reopened.work_resolution(WORK_ID) == stored
+
+
+def test_the_decks_evidence_is_added_to_the_correctness_part_once_and_only_if_it_fits():
+    """#4253: the deck writes its own review and test evidence once a Work waits for Merge."""
+    resolution = _resolution()
+    sentence = "Pakka tarkisti:  katselmointi hyväksyi\n abc123."
+
+    added = with_evidence(resolution, sentence)
+
+    assert added.correctness == (
+        "Focused tests pass; the selected suite is running.\n\n"
+        "Pakka tarkisti: katselmointi hyväksyi abc123."
+    )
+    assert (added.background, added.solution) == (resolution.background, resolution.solution)
+    assert with_evidence(added, sentence) is added, "not twice"
+    assert with_evidence(resolution, "  ") is resolution
+    assert with_evidence(_resolution(correctness=""), sentence).correctness.startswith("Pakka")
+    full = _resolution(correctness="x" * (MAX_PART - 5))
+    with pytest.raises(ResolutionError):  # never past the part's limit: the agent is asked
+        with_evidence(full, sentence)
+    assert with_evidence(_resolution(correctness=f"x\n\n{added.correctness}"), sentence)
+
+
+def test_the_decks_evidence_writes_only_its_part_and_keeps_an_edit_made_meanwhile(tmp_path):
+    """#4253 review: the deck's append and a person's PUT interleave. Only ``correctness`` is
+    written, by a compare-and-swap, so their edit is kept, and the evidence is added to it."""
+    from agentdeck.db import Db
+
+    db = Db(tmp_path / "control.sqlite3")
+    db.set_work_resolution(_resolution())
+    sentence = "Deck: review passed at abc123."
+    reads: list[str] = []
+
+    def append(current: str) -> str:
+        reads.append(current)
+        if len(reads) == 1:  # a person's whole-summary write lands between read and write
+            db.set_work_resolution(
+                _resolution(problem="Edited problem.", correctness="Edited correctness.")
+            )
+        return evidence_added(current, sentence)
+
+    assert db.append_work_correctness(WORK_ID, append) is True
+    stored = db.work_resolution(WORK_ID)
+    assert stored.problem == "Edited problem."
+    assert stored.correctness == f"Edited correctness.\n\n{sentence}"
+    assert reads[1] == "Edited correctness.", "read again after the swap missed"
+    # Already there: nothing written. No summary: None. Always beaten: False, nothing lost.
+    assert db.append_work_correctness(WORK_ID, partial(evidence_added, sentence=sentence))
+    assert db.append_work_correctness("github_issue:o/r#404", str.upper) is None
+
+    def always_beaten(current: str) -> str:
+        db.set_work_resolution(_resolution(correctness=current + "!"))
+        return current + " evidence"
+
+    assert db.append_work_correctness(WORK_ID, always_beaten) is False
+    assert "evidence" not in db.work_resolution(WORK_ID).correctness
 
 
 @pytest.mark.parametrize(

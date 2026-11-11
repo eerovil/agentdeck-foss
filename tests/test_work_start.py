@@ -523,7 +523,9 @@ def _claude_may_start(monkeypatch) -> None:
     monkeypatch.setattr(PROVIDERS["claude_code"], "can_start_session", lambda account: True)
 
 
-async def test_a_work_starts_one_claude_chat_with_the_work_role(tmp_path, startable, announced):
+async def test_a_work_starts_one_claude_chat_with_the_work_role(
+    tmp_path, startable, announced, monkeypatch
+):
     app, db, injector = fake_app(tmp_path)
 
     assert await start_work_agent(app, ISSUE, 7) == "started"
@@ -564,6 +566,27 @@ async def test_a_work_starts_one_claude_chat_with_the_work_role(tmp_path, starta
     assert announced == [
         (ISSUE, 7, action_id, "https://deck.example/works/github_issue:eerovil%2Fagentdeck%237")
     ]
+    # #4254: the issue as read at the start follows the brief, so the agent need not read it.
+    async def read(repository, number):
+        return f"<issue>{repository}#{number}</issue>" + (" Stuck?" if number == 9 else "")
+
+    monkeypatch.setattr(work_start, "_issue_text", read)
+    assert await start_work_agent(app, ISSUE, 8) == "started"
+    assert injector.calls[1]["message"].endswith(
+        work_start.WORKTREE_TEXT.format(
+            path=startable / ".worktrees" / "issue-8", branch="agent/issue-8", main=startable
+        )
+        + f"\n\n<issue>{ISSUE}#8</issue>"
+    )
+    await _settled()
+    # An issue Claude Code would drop the whole first message for is left out, not sent.
+    assert await start_work_agent(app, ISSUE, 9) == "started"
+    assert injector.calls[2]["message"].endswith(
+        work_start.WORKTREE_TEXT.format(
+            path=startable / ".worktrees" / "issue-9", branch="agent/issue-9", main=startable
+        )
+    )
+    await _settled()
 
 
 def _answer(status: int, body: dict):
@@ -1508,9 +1531,10 @@ def test_an_unreadable_overlay_never_falls_back_to_an_unnamed_account(tmp_path, 
 
 @pytest.mark.parametrize("auto_release", [True, False])
 async def test_the_first_message_says_whether_the_project_merges_on_its_own(
-    tmp_path, startable, auto_release
+    tmp_path, startable, auto_release, monkeypatch
 ):
     """#3092: trailhead's agent told its owner the deck would merge what waits for a press.
+    #4233: it is told to read its project's other checkouts at GitHub's branch, not on disk.
     #3098: it is also told where its screenshots go, when its project has an evidence
     repository (here only the auto-releasing one does).
     #3134: an issue carrying the spec-only label is told to write the spec, not build it.
@@ -1529,12 +1553,36 @@ async def test_the_first_message_says_whether_the_project_merges_on_its_own(
         "agentdeck",
         'contract = 1\n[board]\norg = "eerovil"\nproject_number = 1\n'
         'spec_only_label = "Spec-Only"\n'
-        '[[repos]]\nid = "agentdeck"\nholds_issues = true\n'
+        '[[repos]]\nid = "agentdeck"\nholds_issues = true\nholds_code = true\n'
         + (evidence if auto_release else proven)
         + f"[capabilities]\nauto_release = {str(auto_release).lower()}\n",
     )
-    (tmp_path / "poller" / "instances" / "agentdeck" / "overlay.toml").write_text("")
+    # #4233: its project's other code checkouts, never its own, which may sit behind GitHub.
+    # A clone the manifest does not say holds code (an evidence clone) is not named.
+    overlay = (
+        f'[checkouts]\nagentdeck = "{startable}"\nstore = "~/store"\nrobot = "~/robot"\n'
+        'agent-evidence = "~/evidence"\n'
+    )
+    (tmp_path / "poller" / "instances" / "agentdeck" / "overlay.toml").write_text(
+        "" if auto_release else overlay
+    )
+    # Another Poller project's code checkout: refreshed too, never named in this brief.
+    _manifest(
+        tmp_path / "poller",
+        "games",
+        'contract = 1\n[board]\norg = "eerovil"\nproject_number = 2\n'
+        '[[repos]]\nid = "games"\nholds_issues = true\nholds_code = true\n',
+    )
+    (tmp_path / "poller" / "instances" / "games" / "overlay.toml").write_text(
+        '[checkouts]\ngames = "~/games"\n'
+    )
     app, _, injector = fake_app(tmp_path)
+    refreshed: list[list[str]] = []
+    from agentdeck import checkout_refresh
+
+    monkeypatch.setattr(
+        checkout_refresh, "refresh_checkouts", lambda paths: refreshed.append(paths)
+    )
     pull = "https://github.com/eerovil/agentdeck/pull/70"
     if not auto_release:
         # #3834: a pull request already open for it, as on a Work taken over from another deck.
@@ -1569,6 +1617,7 @@ async def test_the_first_message_says_whether_the_project_merges_on_its_own(
         )
     else:
         wanted += " " + work_start.OPEN_PULL_TEXT.format(pulls=pull)
+        wanted += " " + work_start.OTHER_CHECKOUTS_TEXT.format(paths="`~/store`, `~/robot`")
     # #3274: last, where it works; claimed under the id Finish releases, whatever the case.
     assert app.state.runtime_asked[0]["work_id"] == "github_issue:eerovil/agentdeck#7"
     wanted += " " + work_start.WORKTREE_TEXT.format(
@@ -1585,6 +1634,10 @@ async def test_the_first_message_says_whether_the_project_merges_on_its_own(
         assert spec not in message
         assert message.endswith(f"{work_start.FIRST_TEXT} {wanted}")
     await _settled()
+    # #4233: the deck also moves every project's, its own main checkout first, to master.
+    await asyncio.gather(*work_start._REFRESHING)
+    others = [] if auto_release else ["~/store", "~/robot"]
+    assert refreshed == [[str(startable), *others, "~/games"]]
 
 
 def test_a_deck_with_no_reviewer_tells_the_agent_to_wait_for_merge(monkeypatch):

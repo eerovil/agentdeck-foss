@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from . import default_db, worker_limits
 from .github_webhook_log import KEEP_ROTATIONS, ROTATE_BYTES
 from .models import Account
+from .worker_cuts import WorkerCuts
 
 log = logging.getLogger(__name__)
 
@@ -285,6 +286,28 @@ class ClaudeWorkerOverrides(BaseModel):
         return value
 
 
+#: Tools taken out of every owned Claude worker's tool list, unless its repository says
+#: otherwise (#4252): their definitions cost about 4,500 tokens on every call of every chat,
+#: and in the 14 days to 2026-11-10 1,586 chats called them once between them (#4247).
+DEFAULT_DISABLED_TOOLS = ["Workflow", "ScheduleWakeup", "ReportFindings", "ShareOnboardingGuide"]
+#: Plugins switched off for owned Claude workers (#4252), as ``<name>@<marketplace>``: the
+#: claude.ai organisation's ``productivity`` and ``engineering`` plugins, whose 14 skills no
+#: chat used and whose 11 connectors never connect (#4247).
+DEFAULT_DISABLED_PLUGINS = ["productivity@synced", "engineering@synced"]
+
+
+class ClaudeWorkerRepository(BaseModel):
+    """One repository's own worker settings (#4252): unset fields keep the host's lists.
+
+    Keyed ``owner/repo`` under ``[claude_workers.repositories]``, so a repository whose
+    chats need a tool or plugin the host cuts can turn it back on (an empty list cuts
+    nothing). A name ``mcp__<server>`` among the tools drops that whole connector.
+    """
+
+    disabled_tools: list[str] | None = None
+    disabled_plugins: list[str] | None = None
+
+
 class ClaudeWorkersConfig(BaseModel):
     """Deck-owned Claude worker processes (spawn/steer/revive via the runtime API)."""
 
@@ -333,8 +356,27 @@ class ClaudeWorkersConfig(BaseModel):
     # 200k were 53 % of a week's use, and compacting there would have saved about
     # 30 % (#4058). 0 leaves the CLI's own default.
     auto_compact_window: int = 200_000
+    # Taken out of each worker's tool list and plugins, through its settings file (#4252).
+    disabled_tools: list[str] = list(DEFAULT_DISABLED_TOOLS)
+    disabled_plugins: list[str] = list(DEFAULT_DISABLED_PLUGINS)
+    # Keyed "owner/repo": [claude_workers.repositories."owner/repo"] (#4252).
+    repositories: dict[str, ClaudeWorkerRepository] = {}
     # Keyed by account label: [claude_workers.accounts.<label>]
     accounts: dict[str, ClaudeWorkerOverrides] = {}
+
+    def worker_cuts(self) -> WorkerCuts:
+        """What each repository's workers run without, for the worker host (#4252)."""
+        return WorkerCuts(
+            tools=tuple(self.disabled_tools),
+            plugins=tuple(self.disabled_plugins),
+            repositories={
+                name.strip().casefold(): (
+                    None if repo.disabled_tools is None else tuple(repo.disabled_tools),
+                    None if repo.disabled_plugins is None else tuple(repo.disabled_plugins),
+                )
+                for name, repo in self.repositories.items()
+            },
+        )
 
     def for_account(self, label: str) -> ClaudeWorkersConfig:
         """Effective settings for one account (base + that account's overrides)."""
@@ -511,17 +553,12 @@ class GitHubWebhookConfig(BaseModel):
 class ServicesConfig(BaseModel):
     """The services process: the Work router, the merge release and the backstop (#4016).
 
-    ``in_web`` is the switch back: on, the web runs them itself and ``agentdeck services``
-    stands down, read at each start, so going back needs no deploy. On by default until the
-    cutover, so a deck that deploys this before it installs ``agentdeck-services.service``
-    keeps its router; the cutover sets it off. It lives only until the move's 7-day check
-    passes (#4017). ``enabled`` runs them at all; unset follows
+    ``enabled`` runs them at all; unset follows
     ``github_webhook.enabled``, so staging, whose streams are off, can still run them in its
     services twin over a copied stream (#4018). ``socket`` overrides the socket's path, as
     ``AGENTDECK_SERVICES_SOCKET`` does.
     """
 
-    in_web: bool = True
     enabled: bool | None = None
     socket: str = ""
 
@@ -573,6 +610,10 @@ class ChatBoardConfig(BaseModel):
     # review a first run finished that day took 15 minutes or less from claim to close, and
     # the workers' own PROTOCOL.md frees a claim after the same 30 silent minutes.
     auto_nudge_stalled_after_s: float = 30 * 60.0
+    # When a chat nobody claimed counts as not coming: no `Claimed:` and no `in-progress` for
+    # this long. Ten minutes (#4227): a Work waits 20 minutes for its review's verdict before
+    # its agent asks the owner, so the fallback reviewer must start well inside that.
+    auto_nudge_unclaimed_after_s: float = 10 * 60.0
     # The Claude fallback reviewer (#2736), used only while its switch is on. The checkout is
     # where the reviewer runs and reads ChatGPT's own instructions from; the account is empty
     # for the `agentdeck` Poller instance's worker account, which the owner asked for.
@@ -610,7 +651,7 @@ class ChatBoardConfig(BaseModel):
             raise ValueError("chat_board.review_fallback_codex_max_reviewers must be non-negative")
         return value
 
-    @field_validator("auto_nudge_stalled_after_s")
+    @field_validator("auto_nudge_stalled_after_s", "auto_nudge_unclaimed_after_s")
     @classmethod
     def _above_zero(cls, value: float, info) -> float:
         if value <= 0:

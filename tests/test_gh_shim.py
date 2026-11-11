@@ -771,6 +771,7 @@ def test_a_ready_press_is_told_to_the_deck_so_its_row_is_read_again(
 ):
     """#3903: a dropped ready event left the cached row a draft; the deck re-reads it now."""
     told: list[tuple[str, dict]] = []
+    checklist: dict = {"text": "", "number": None, "heads": ["abc"]}
 
     class Answer:
         def __enter__(self):
@@ -779,6 +780,10 @@ def test_a_ready_press_is_told_to_the_deck_so_its_row_is_read_again(
         def __exit__(self, *exc):
             return False
 
+        def read(self):
+            answer = {"refreshed": 1, **checklist, "checklist": checklist.get("text")}
+            return json.dumps(answer).encode()
+
     def urlopen(request, timeout):
         told.append((request.full_url, json.loads(request.data)))
         return Answer()
@@ -786,21 +791,55 @@ def test_a_ready_press_is_told_to_the_deck_so_its_row_is_read_again(
     monkeypatch.setattr(main.urllib.request, "urlopen", urlopen)
     monkeypatch.setattr(main, "_current_branch", lambda: "agent/issue-5")
     monkeypatch.setenv("AGENTDECK_URL", "http://127.0.0.1:9/")
+    monkeypatch.delenv("AGENTDECK_SESSION_TOKEN", raising=False)
 
     assert main.main(["pr", "ready", "https://github.com/o/r/pull/13"]) == 0
     assert main.main(["pr", "ready", "12", "--repo", "o/r", "--undo"]) == 0
-    environment = {"AGENTDECK_URL": "http://127.0.0.1:9/"}
+    environment = {"AGENTDECK_URL": "http://127.0.0.1:9/", "AGENTDECK_SESSION_TOKEN": "tok"}
     main._tell_deck_ready(["pr", "ready", "--repo", "o/r", "#12"], environment, None)
     # The current branch's, in a checkout whose remote is a git URL.
     main._tell_deck_ready(["pr", "ready"], environment, "git@github.com:o/r.git")
     main._tell_deck_ready(["pr", "ready", "fix/x", "-R", "o/r"], environment, None)
     url = "http://127.0.0.1:9/api/works/pr-ready"
+    # The chat's own session token rides along, so only its own pull request is pressed for.
+    token = {"session_token": "tok"}
     assert told == [
-        (url, {"repository": "o/r", "number": 13, "branch": ""}),
-        (url, {"repository": "o/r", "number": 12, "branch": ""}),
-        (url, {"repository": "o/r", "number": None, "branch": "agent/issue-5"}),
-        (url, {"repository": "o/r", "number": None, "branch": "fix/x"}),
+        (url, {"repository": "o/r", "number": 13, "branch": "", "session_token": ""}),
+        (url, {"repository": "o/r", "number": 12, "branch": "", "session_token": "tok"}),
+        (url, {"repository": "o/r", "number": None, "branch": "agent/issue-5", **token}),
+        (url, {"repository": "o/r", "number": None, "branch": "fix/x", **token}),
     ], "turning it back to a draft tells nothing"
+    assert "AgentDeck: before" not in capsys.readouterr().out
+
+    # The checklist the press started is printed in the command's reply, with no routine
+    # line and no turn of its own (#4253), and the deck is told it was printed, so it takes
+    # back the message it kept pending for it (#4253 review).
+    told.clear()
+    checklist.update(text="AgentDeck: before o/r#12 at abc goes to review, check these.", number=12)
+    main._tell_deck_ready(["pr", "ready", "--repo", "o/r"], environment, "git@github.com:o/r.git")
+    assert capsys.readouterr().out == f"\n{checklist['text']}\n"
+    assert told[-1] == (
+        f"{url}/received",
+        {"repository": "o/r", "number": 12, "heads": ["abc"], "session_token": "tok"},
+    )
+    # An answer with a checklist but no pull request named is not printed, nor confirmed.
+    told.clear()
+    checklist["number"] = None
+    main._tell_deck_ready(["pr", "ready", "12", "--repo", "o/r"], environment, None)
+    assert capsys.readouterr().out == "" and [u for u, _ in told] == [url]
+
+    # Printed but the word back fails: noted, and the deck sends the checklist itself.
+    checklist["number"] = 12
+
+    def answer_then_down(request, timeout):
+        if request.full_url.endswith("/received"):
+            raise OSError("down")
+        return Answer()
+
+    monkeypatch.setattr(main.urllib.request, "urlopen", answer_then_down)
+    main._tell_deck_ready(["pr", "ready", "12", "--repo", "o/r"], environment, None)
+    out = capsys.readouterr()
+    assert checklist["text"] in out.out and "it will send it" in out.err
 
     def down(request, timeout):
         raise OSError("down")

@@ -439,6 +439,75 @@ def _evidence_text(app: Any, repository: str, number: int) -> str:
     return EVIDENCE_TEXT.format(evidence=evidence, folder=folder)
 
 
+#: What the Work's agent is told about its project's other code checkouts (#4233): one agent
+#: read a sibling repository from its shared checkout, left detached 35 commits behind GitHub,
+#: and built its answer on code that had since changed. The deck moves each one it safely can
+#: to GitHub's default branch as the Work starts (``checkout_refresh``), but one with local
+#: changes stays put, and the agent may read before the move ends.
+OTHER_CHECKOUTS_TEXT = (
+    "Your project's other code is in {paths}. Those are shared checkouts: the deck moves each "
+    "to GitHub's default branch as this Work starts, but leaves one with local changes where "
+    "it is. Before you read one, fetch it (`git -C <path> fetch -q origin`) and read its "
+    "`origin/HEAD` (`git -C <path> show origin/HEAD:<file>`, `git -C <path> grep <text> "
+    "origin/HEAD`), not its files on disk; change one only in your own worktree under its "
+    "`.worktrees/`."
+)
+
+
+def _other_checkouts_text(app: Any, repository: str, main: str) -> str:
+    """Where the project's other code lives, for the first message; empty when its overlay
+    names no checkout but the Work's own."""
+    from .poller_ops import work_code_checkouts
+
+    poller = getattr(app.state.config, "poller", None)
+    if poller is None:
+        return ""
+    try:
+        paths = work_code_checkouts(poller.root).get(repository.lower(), ())
+    except Exception:  # noqa: BLE001 - a missing line must never stop the start
+        log.warning("work start: could not read the project's checkouts", exc_info=True)
+        return ""
+    own = _resolved(main)
+    others = [path for path in paths if not own or _resolved(path) != own]
+    if not others:
+        return ""
+    return OTHER_CHECKOUTS_TEXT.format(paths=", ".join(f"`{path}`" for path in others))
+
+
+#: Background checkout refreshes in flight, held so none is collected before it ends.
+_REFRESHING: set[asyncio.Future] = set()
+
+
+def _refresh_checkouts_in_background(app: Any, repository: str, main: str) -> None:
+    """Move every Poller project's shared code checkouts, this Work's own main checkout
+    first, to GitHub's default branch, off the start (#4233): the owner wants them all on
+    master, refreshed whenever a new Work starts. The start never waits for a fetch."""
+    from .checkout_refresh import refresh_checkouts
+    from .poller_ops import work_code_checkouts
+
+    poller = getattr(app.state.config, "poller", None)
+    try:
+        projects = work_code_checkouts(poller.root) if poller else {}
+    except Exception:  # noqa: BLE001 - a refresh must never stop the start
+        log.warning("work start: could not read the projects' checkouts", exc_info=True)
+        projects = {}
+    own = projects.get(repository.lower(), ())
+    paths = [*own, *(path for found in projects.values() for path in found)]
+    wanted = list(dict.fromkeys(filter(None, (main, *paths))))
+    if not wanted:
+        return
+    task = asyncio.ensure_future(asyncio.to_thread(refresh_checkouts, wanted))
+    _REFRESHING.add(task)
+    task.add_done_callback(_REFRESHING.discard)
+
+
+def _resolved(path: str) -> str:
+    try:
+        return str(Path(path).expanduser().resolve()) if path else ""
+    except (OSError, RuntimeError):
+        return path
+
+
 #: A Work started with a pull request already open for it (#3834): one taken over from another
 #: deck, whose agent's work is on that branch. The deck reviews and merges only pull requests
 #: this deck's chats registered, so the agent registers it before anything else.
@@ -738,13 +807,24 @@ async def start_work_agent(
         return "not linked"
     # After the reservation, so a replayed delivery never claims while a start is under way.
     timing = StartTiming(time.monotonic(), warm=taken is not None)
+    # Read while the worktree is claimed: the issue goes in the first message (#4254).
+    issue = asyncio.ensure_future(_issue_text(repository, number))
+    main = folder
     if taken is not None:
         folder, where = await adopt_spare_worktree(app, ref, folder, taken[2])
     else:
         folder, where = await work_worktree(app, ref, folder)
     timing.mark("worktree")
+    # After the worktree claim, which fetches in the same main checkout.
+    _refresh_checkouts_in_background(app, repository, main)
+    brief = _brief(app, ref, FIRST_TEXT, labels, where, main)
+    pasted = await issue
+    if pasted and provider.user_message_refusal(pasted) is not None:
+        # The CLI would drop the whole first message for a word in the issue ("Stuck?"):
+        # leave the issue out, and the agent reads it itself as before (#4254).
+        pasted = ""
     message = first_message(
-        IssueRef(repository, number), (), _brief(app, ref, FIRST_TEXT, labels, where)
+        IssueRef(repository, number), (), f"{brief}\n\n{pasted}" if pasted else brief
     )
     try:
         result = await app.state.injector.start_new(
@@ -789,8 +869,22 @@ async def start_work_agent(
     return "started"
 
 
-def _brief(app: Any, ref: WorkRef, opening: str, labels: Iterable[str], where: str) -> str:
-    """A deck start's brief after its opening line: spec-only, merging, evidence, folder."""
+async def _issue_text(repository: str, number: int) -> str:
+    """The issue for the first message, or "" when it could not be read (#4254)."""
+    from .work_issue_text import issue_text
+
+    try:
+        return await issue_text(repository, number)
+    except Exception:  # noqa: BLE001 - the agent reads the issue itself then
+        log.warning("work start: could not read %s#%s", repository, number, exc_info=True)
+        return ""
+
+
+def _brief(
+    app: Any, ref: WorkRef, opening: str, labels: Iterable[str], where: str, main: str = ""
+) -> str:
+    """A deck start's brief after its opening line: spec-only, merging, evidence, the
+    project's other checkouts, folder. ``main`` is the Work's own main checkout."""
     return " ".join(
         filter(
             None,
@@ -800,6 +894,7 @@ def _brief(app: Any, ref: WorkRef, opening: str, labels: Iterable[str], where: s
                 _merge_text(app, ref.repository),
                 _evidence_text(app, ref.repository, ref.number),
                 _open_pull_text(app, ref.repository, ref.number),
+                _other_checkouts_text(app, ref.repository, main),
                 where,
             ),
         )
@@ -1049,10 +1144,11 @@ async def bind_before_issue(
             on_refused()
 
     folder, where = await adopt_spare_worktree(app, ref, early.main, early.folder)
+    _refresh_checkouts_in_background(app, ref.repository, early.main)
     # The worker must exist before it can be told anything: a cold spawn may still be under
     # way. A start the runtime refused gets no message; its settle starts the Work again.
     if await _launched(early):
-        text = _brief(app, ref, ISSUE_FILED_TEXT.format(url=url), labels, where)
+        text = _brief(app, ref, ISSUE_FILED_TEXT.format(url=url), labels, where, early.main)
         message = first_message(IssueRef(ref.repository, ref.number), (), text)
         if not await _tell(provider, early, message, work_id):
             # Told to wait for this message, it would sit idle with the Work marked started:

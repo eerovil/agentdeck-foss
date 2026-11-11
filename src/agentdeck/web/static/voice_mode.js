@@ -790,8 +790,9 @@
     if (win.pending || win.since < WINDOW_EVERY_MS || win.chunks.length * chunkMs < WINDOW_MS) return;
     win.since = 0;
     win.pending = true;
-    fetch('/api/speech/wake?window=1', {
-      method: 'POST', headers: { 'Content-Type': 'audio/wav' }, body: wav(win.chunks, rate)
+    var clip = wav(win.chunks, rate);
+    fetch('/api/speech/wake?window=1' + micQuery(clip), {
+      method: 'POST', headers: { 'Content-Type': 'audio/wav' }, body: clip
     }).then(function (response) {
       return response.json();
     }).then(function (found) {
@@ -1004,8 +1005,11 @@
   // words said while the last phrase is being transcribed are kept.
   var Capture = shared.Capture;
   var wav = shared.wav;
-  var loudness = shared.loudness;
+  var level = shared.level;
   var Gate = shared.Gate;
+
+  // Which microphone heard a phrase, as its WAV carries it (#4249).
+  var micQuery = shared.micQuery;
 
   // One phrase, with a speech recognizer's shape (start, abort, onresult, onerror,
   // onend, plus onspeechstart), which `run` drives. It
@@ -1038,8 +1042,8 @@
       if (self.done) return;
       if (self.onchunk) self.onchunk(samples, cap.rate);
       self.fedAt = Date.now();
-      var level = loudness(samples);
-      var loud = gate.loud(level, phrase.length > 0);
+      var heard = level(samples);
+      var loud = gate.loud(heard, phrase.length > 0);
       if (!phrase.length) {
         before.push(samples);
         if (before.length > 4) before.shift();
@@ -1065,7 +1069,7 @@
       // after the words cannot hold it open to its cap. Steady noise is a pause at
       // once (`flat`). Soft sound past that still is not quiet the early words may
       // stand for: the whole phrase is heard at its end (`late`).
-      var soft = !loud && gate.sound(level) && !gate.flat();
+      var soft = !loud && gate.sound(heard) && !gate.flat();
       softFor = loud ? 0 : softFor + chunkMs;
       var goesOn = loud || (soft && softFor <= HOST_SOFT_MS);
       quiet = goesOn ? 0 : quiet + chunkMs;
@@ -1135,7 +1139,7 @@
     // detector and Whisper each made of it.
     var id = wakeLogId();
     var ended = Date.now();
-    var url = '/api/speech/wake?id=' + id;
+    var url = '/api/speech/wake?id=' + id + micQuery(body);
     var init = { method: 'POST', headers: { 'Content-Type': 'audio/wav' }, body: body };
     if (wake === 'shadow') {
       fetch(url, init).catch(function () { /* only logged */ });
@@ -1227,7 +1231,7 @@
     var hint = v.heardLang ? '&language=' + v.heardLang : '';
     var stopWatch = this.watchAnswer();
     // `source` keeps the phrase for the speech bench as voice mode's (#3934).
-    var asked = hostRequest(v, '/api/speech/transcribe?source=voice' + hint, {
+    var asked = hostRequest(v, '/api/speech/transcribe?source=voice' + hint + micQuery(body), {
       method: 'POST', headers: { 'Content-Type': 'audio/wav' }, body: body
     }, function () { return !self.aborted; }, function () {
       if (v.mode === 'listening') showStatus(v.purpose === 'question' ? 'Listening for your answer…' : 'Listening…');
@@ -1384,13 +1388,9 @@
   function openMicrophone(v) {
     var ask = v.micAsk = (v.micAsk || 0) + 1;
     function stale() { return voice !== v || v.micAsk !== ask; }
-    var headset = false;
-    v.captureReady = shared.micSettings().then(function (audio) {
-      headset = audio.echoCancellation;
-      return navigator.mediaDevices.getUserMedia({ audio: audio });
-    }).then(function (stream) {
-      if (stale()) { stream.getTracks().forEach(function (t) { t.stop(); }); return; }
-      v.capture = new Capture(v.audio, stream, headset);
+    v.captureReady = shared.micSettings().then(shared.openMic).then(function (opened) {
+      if (stale()) { opened.stream.getTracks().forEach(function (t) { t.stop(); }); return; }
+      v.capture = new Capture(v.audio, opened);
       // Device names show only once the microphone is allowed: look again.
       v.capture.rematch();
     }).catch(function () {

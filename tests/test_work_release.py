@@ -78,6 +78,7 @@ class Fake:
         self.history: list[tuple] = []  # (pull, head, kind, key, data) each event (#3957)
         self.events: list[ReviewEvent] = []  # what ``reviews`` reads back (#3956)
         self.forgotten: list[str] = []
+        self.merge_commit = ""  # what GitHub reads back as a merge's commit (#4253)
         self.service = WorkReleaseService(
             ReleaseStore(tmp_path / "work-release.json"),
             Ports(
@@ -144,7 +145,7 @@ class Fake:
         self.merged.append((ref, method))
         self.merge_heads.append(head)
         if self.merge_answer == MERGED:
-            self.set(ref, state="MERGED")
+            self.set(ref, state="MERGED", merge_commit=self.merge_commit)
         return self.merge_answer, "Required status check is expected"
 
     async def update_branch(self, ref):
@@ -232,6 +233,84 @@ async def test_a_merge_seen_live_asks_for_a_live_check_once_nothing_is_open(fake
     assert said.startswith("eerovil/agentdeck#3196: This deck deploys it")
     assert "eerovil/other-tool#7: Nothing on this host watches" in said
     assert "deploy by hand is `not_live`" in said, "not a nothing_to_check and a Finish"
+
+
+MERGE_SHA = "e" * 40
+
+
+def waiting_deploys(fake, ok=True):
+    """The release's ``wait_deploy`` port (#4253): each call it makes, answered ``ok``."""
+    waits = []
+
+    def wait_deploy(chat, refs, bodies, then):
+        waits.append((chat, bodies, then))
+        return ok
+
+    fake.service.ports.wait_deploy = wait_deploy
+    return waits
+
+
+async def test_a_merge_the_deck_deploys_registers_the_deploy_wait_instead_of_asking(fake):
+    """#4253: the deck registers the wait the live-check message asked for, carrying that
+    request, so the chat wakes once, when it is live; GitHub's event asks nothing more."""
+    waits = waiting_deploys(fake)
+    fake.merge_commit = MERGE_SHA
+    await passed(fake)
+    assert fake.merged == [(PR, "merge")] and live_checks(fake) == []
+    [(chat, bodies, then)] = waits
+    assert chat == "chat-a" and bodies == [{"deck_deploy": MERGE_SHA}]
+    assert then.startswith(f"AgentDeck: {PR} merged.") and "/live-check" in then
+    assert "The deck registered the wait for its deploy" in then and '"deck_deploy"' not in then
+    assert fake.entry["live_check_asked"]["pulls"] == [PR]
+    await fake.service.on_pull_event(WORK, PR, "closed", True)
+    await fake.service.evaluate(WORK)
+    assert len(waits) == 1 and live_checks(fake) == []
+
+
+@pytest.mark.parametrize(
+    "why", ["unwatched", "no merge commit", "refused", "two in one repo", "two watched repos"]
+)
+async def test_a_merge_the_deck_cannot_wait_on_is_told_as_before(fake, why):
+    """#4253: a repository nothing on this host watches, a merge commit not read, a store that
+    refused the wait, or two merges at once, in one repository or two watched ones (each wait
+    would wake the chat to check both before the other is live): the chat waits itself."""
+    site = "eerovil/site#4"
+    waits = waiting_deploys(fake, ok=why != "refused")
+    fake.policy = Policy(
+        auto_release=False, deploys=frozenset({"eerovil/site", "eerovil/shop"})
+    )
+    refs = {
+        "two in one repo": [site, "eerovil/site#5"],
+        "two watched repos": [site, "eerovil/shop#6"],
+    }.get(why, [site])
+    if why == "unwatched":
+        fake.policy = Policy(auto_release=False)
+    fake.pulls = {
+        ref: Pull(ref, "OPEN", False, HEAD, "MERGEABLE", "CLEAN", "green") for ref in refs
+    }
+    await fake.service.evaluate(WORK)
+    for ref in refs:
+        sha = "" if why == "no merge commit" else MERGE_SHA
+        fake.set(ref, state="MERGED", merge_commit=sha)
+        await fake.service.on_pull_event(WORK, ref, "closed", True)
+    await fake.service.evaluate(WORK)
+    [text] = live_checks(fake)
+    assert "registered the wait" not in text and fake.entry["live_check_asked"]
+    assert len(waits) == (1 if why == "refused" else 0)
+
+
+async def test_a_merge_in_an_auto_deploying_repository_waits_on_that_deploy(fake):
+    site = "eerovil/site#4"
+    waits = waiting_deploys(fake)
+    fake.policy = Policy(auto_release=False, deploys=frozenset({"eerovil/site"}))
+    fake.pulls = {site: Pull(site, "OPEN", False, HEAD, "MERGEABLE", "CLEAN", "green")}
+    await fake.service.evaluate(WORK)
+    fake.set(site, state="MERGED", merge_commit=MERGE_SHA)
+    await fake.service.on_pull_event(WORK, site, "closed", True)
+    await fake.service.evaluate(WORK)
+    assert live_checks(fake) == []
+    [(_chat, bodies, _then)] = waits
+    assert bodies == [{"deployment": f"eerovil/site@{MERGE_SHA}"}]
 
 
 async def test_a_merge_github_refuses_is_told_once_and_tried_again(fake):
@@ -1252,6 +1331,8 @@ async def test_behind_is_read_as_the_poller_reads_it(fake, merge_state, behind_b
     await passed(fake)
     assert (fake.updated == [PR]) is updates
     assert (fake.merged == []) is updates
+    # The base merged in is no message (#4253): the new head's tests are what it waits on.
+    assert problems(fake) == []
 
 
 async def test_an_unreadable_comparison_never_merges(fake):
@@ -1294,20 +1375,20 @@ async def test_a_pass_whose_verification_already_runs_is_not_told_to_verify(fake
     fake.green = set()
     fake.verifying = True
     await passed(fake)
-    assert [m for _c, m, _t in fake.told] == [_pass()]
-    assert "verification job" not in fake.told[0][2]
+    # Its running job tells the agent the result, so the pass itself sends nothing (#4253).
+    assert fake.told == []
     # The job failed: its agent heard that from the job, and is not told to run it again.
     fake.verifying = False
     fake.red = {HEAD}
     await fake.service.on_tests(jobs=True, chats=False)
-    assert [m for _c, m, _t in fake.told] == [_pass()]
+    assert fake.told == []
     assert fake.entry["waiting_tests"] and "needs_verify" not in fake.entry
     # A job cut off with no result: nothing tests that head now, so the agent hears once.
     fake.red = set()
     await fake.service.on_tests(jobs=True, chats=False)
     await fake.service.on_tests(jobs=True, chats=False)
-    assert [m for _c, m, _t in fake.told] == [_pass(), _verify()]
-    assert "passed at " + HEAD[:12] in fake.told[1][2]
+    assert [m for _c, m, _t in fake.told] == [_verify()]
+    assert "passed at " + HEAD[:12] in fake.told[0][2]
     assert fake.entry["needs_verify"] is True
     assert fake.entry["hold"]["words"] == "no test run started"
     # #3097: choir-tracks-cf#46 passed twice at its head while a test rewrote a tracked file.
@@ -1320,8 +1401,8 @@ async def test_a_pass_whose_verification_already_runs_is_not_told_to_verify(fake
     )
     # In this order the call to verify was already spent: the agent hears why on its own, once.
     await fake.service.evaluate(WORK)
-    assert [m for _c, m, _t in fake.told] == [_pass(), _verify(), _moved()]
-    assert "the checkout changed while it ran" in fake.told[2][2]
+    assert [m for _c, m, _t in fake.told] == [_verify(), _moved()]
+    assert "the checkout changed while it ran" in fake.told[1][2]
     # #3397: score-plugins#444 passed twice at its head on a tree a disk-full pytest
     # had littered with untracked files. The line and the agent hear that, once.
     fake.unclean = {HEAD}
@@ -1331,8 +1412,8 @@ async def test_a_pass_whose_verification_already_runs_is_not_told_to_verify(fake
     assert fake.entry["hold"]["words"] == (
         "tests passed but the checkout had uncommitted or untracked files"
     )
-    assert [m for _c, m, _t in fake.told] == [_pass(), _verify(), _moved(), _unclean()]
-    assert "git status --porcelain -uall" in fake.told[3][2]
+    assert [m for _c, m, _t in fake.told] == [_verify(), _moved(), _unclean()]
+    assert "git status --porcelain -uall" in fake.told[2][2]
     # A red run at the same head is the answer then, not the green one that proved nothing.
     fake.red = {HEAD}
     answer = await fake.service.evaluate(WORK)
@@ -1356,20 +1437,54 @@ async def test_a_reviewed_head_gone_back_to_draft_or_closed_asks_for_no_verifica
     assert "needs_verify" not in fake.entry
 
 
+async def test_a_pass_nothing_tests_is_run_again_by_the_deck_not_the_agent(fake):
+    """#4253: a reviewed head nothing tests (a pass, or the base merged in) has the Work's last
+    verification run again there by the deck; the agent hears nothing unless the deck cannot,
+    or that run ends with no result."""
+    reruns = []
+
+    async def rerun(work_id, repository, head):
+        reruns.append((work_id, repository, head))
+        return queued
+
+    fake.service.ports.rerun_verification = rerun
+    queued = True
+    fake.green = set()
+    await passed(fake)
+    assert reruns == [(WORK, "eerovil/agentdeck", HEAD)] and fake.told == []
+    # Its run is going: nothing more is asked, and the run's result tells the chat.
+    fake.verifying = True
+    await fake.service.on_tests(jobs=True, chats=False)
+    assert len(reruns) == 1 and fake.told == []
+    # Cut off with no result: not asked twice; the agent is told to run it, once.
+    fake.verifying = False
+    await fake.service.on_tests(jobs=True, chats=False)
+    await fake.service.on_tests(jobs=True, chats=False)
+    assert len(reruns) == 1 and [m for _c, m, _t in fake.told] == [_verify()]
+    # A new head the runtime has nothing to run again for: the pass carries the call.
+    queued = False
+    fake.set(PR, head=OTHER)
+    fake.digests[(PR, OTHER)] = "e" * 64
+    await passed(fake, head=OTHER, digest="e" * 64)
+    assert reruns[1:] == [(WORK, "eerovil/agentdeck", OTHER)]
+    assert [m for _c, m, _t in fake.told][1:] == [_pass(OTHER)]
+    assert "verification job" in fake.told[1][2]
+
+
 async def test_a_busy_agent_is_told_to_verify_once_its_turn_ends(fake):
     fake.green = set()
     fake.busy = True
     await passed(fake)
-    assert [m for _c, m, _t in fake.told] == [_pass()]
+    assert fake.told == []  # held by the turn: nothing to tell yet (#4253)
     fake.busy = False
     await fake.service.on_tests(jobs=False, chats=True)
-    assert [m for _c, m, _t in fake.told] == [_pass(), _verify()]
+    assert [m for _c, m, _t in fake.told] == [_verify()]
     # A new reviewed head is a new message.
     fake.set(PR, head=OTHER)
     fake.digests[(PR, OTHER)] = "e" * 64
     await passed(fake, head=OTHER, digest="e" * 64)
-    assert [m for _c, m, _t in fake.told][2:] == [_pass(OTHER)]
-    assert "verification job" in fake.told[2][2]
+    assert [m for _c, m, _t in fake.told][1:] == [_pass(OTHER)]
+    assert "verification job" in fake.told[1][2]
 
 
 async def test_a_repeat_pass_at_a_head_told_while_held_still_tells_the_agent_to_verify(fake):
@@ -1377,13 +1492,12 @@ async def test_a_repeat_pass_at_a_head_told_while_held_still_tells_the_agent_to_
     fake.green = set()
     fake.paused = True
     await passed(fake)
-    assert [m for _c, m, _t in fake.told] == [_pass()]
-    assert "verification job" not in fake.told[0][2]
+    assert fake.told == []  # held by the pause: nothing to tell yet (#4253)
     fake.paused = False
     await passed(fake)
-    assert [m for _c, m, _t in fake.told] == [_pass(), _verify()]
+    assert [m for _c, m, _t in fake.told] == [_verify()]
     await passed(fake)
-    assert len(fake.told) == 2, "once per head"
+    assert len(fake.told) == 1, "once per head"
 
 
 def test_only_this_works_unfinished_verification_counts_as_verifying():
@@ -1508,6 +1622,28 @@ async def test_the_release_records_when_only_a_persons_merge_is_missing(fake):
     assert "in Finnish" in ready[0]
     assert await fake.service.evaluate(WORK) == AWAITING_MERGE
     assert len([key for _chat, key, _text in fake.told if ":ready:" in key]) == 1
+    # #4253: where the deck can write the evidence into the summary itself, it does, and
+    # wakes nobody; a write that fails asks the agent as before.
+    notes = []
+    fake.service.ports.note_evidence = lambda work_id, text: notes.append((work_id, text)) or True
+    fake.set(PR, head=OTHER)
+    fake.digests[(PR, OTHER)] = DIGEST
+    fake.green = {OTHER}
+    await passed(fake, head=OTHER)
+    assert await fake.service.evaluate(WORK) == AWAITING_MERGE
+    assert len([key for _chat, key, _text in fake.told if ":ready:" in key]) == 1
+    [(work_id, text)] = notes
+    assert work_id == WORK and f"{PR}@{OTHER[:12]}" in text and "katselmointi" in text
+    fake.service.ports.note_evidence = lambda work_id, text: False
+    third = "c" * 40
+    fake.set(PR, head=third)
+    fake.digests[(PR, third)] = DIGEST
+    fake.green = {third}
+    await passed(fake, head=third)
+    assert await fake.service.evaluate(WORK) == AWAITING_MERGE
+    assert len([key for _chat, key, _text in fake.told if ":ready:" in key]) == 2
+    fake.set(PR, head=HEAD)
+    fake.green = {HEAD}
     # Anything else holding it clears the record: here, a push past the reviewed head.
     fake.set(PR, head=OTHER)
     assert await fake.service.evaluate(WORK) != AWAITING_MERGE
@@ -1722,6 +1858,8 @@ async def test_a_failed_read_keeps_ready_for_merge(fake):
 
 async def test_a_recorded_pass_is_told_once_naming_the_pull_head_and_review_chat(fake):
     fake.policy = Policy(auto_release=False)
+    # Untested: a pass at a tested head sends nothing (#4253), so this one carries the call.
+    fake.green = set()
     # The chats opened about each head are its ``chat`` rows (#3956).
     fake.note(PR, OTHER, "chat", "c0", 1.0, {"chat": "eerovil/review-chats#5165"})
     fake.note(PR, HEAD, "chat", "c1", 1.0, {"chat": "eerovil/review-chats#5166"})
@@ -1731,7 +1869,7 @@ async def test_a_recorded_pass_is_told_once_naming_the_pull_head_and_review_chat
     assert [m for _c, m, _t in verdicts] == [f"work-release:{WORK}:verdict:pass:{PR}@{HEAD[:12]}"]
     text = verdicts[0][2]
     assert PR in text and HEAD[:12] in text and "eerovil/review-chats#5166" in text
-    assert "passed clean" in text and "waiting for a person's Merge" in text
+    assert "passed clean" in text and "verification job" in text
     assert fake.passed().data["chat"] == "eerovil/review-chats#5166"
     assert fake.passed().at == fake.now
     # What a review asked for before this pass reads to drop its retry (#3324).
@@ -1800,7 +1938,9 @@ async def test_a_pass_whose_read_failed_is_held_and_merges_once_it_reads(fake, f
     await fake.service.look_at_reviewed()
     assert fake.passed() is not None and fake.merged == [(PR, "merge")]
     assert HELD_PASSES not in fake.entry
-    assert [t for t in fake.told if ":verdict:pass:" in t[1]]
+    # A tested pass is recorded as told but sends nothing: the merge follows (#4253).
+    assert [key for key in fake.entry["told"] if key.startswith("verdict:pass:")]
+    assert not [t for t in fake.told if ":verdict:pass:" in t[1]]
 
 
 async def test_a_held_pass_is_looked_at_again_when_the_look_at_start_raises(fake):
@@ -1839,7 +1979,8 @@ async def test_two_held_passes_and_two_looks_at_once_record_each_once(fake):
     await asyncio.gather(fake.service.evaluate(WORK), fake.service.evaluate(WORK))
     assert HELD_PASSES not in fake.entry
     assert fake.passed(PR) is not None and fake.passed(nxt) is not None
-    assert len([t for t in fake.told if ":verdict:pass:" in t[1]]) == 2
+    assert len([key for key in fake.entry["told"] if key.startswith("verdict:pass:")]) == 2
+    assert not [t for t in fake.told if ":verdict:pass:" in t[1]]  # tested: quiet (#4253)
 
 
 async def test_the_same_pass_sent_again_while_held_keeps_its_clock(fake):
@@ -2305,7 +2446,8 @@ async def test_a_second_no_code_fix_at_one_head_writes_its_own_pass(fake):
         await fake.service.on_verdict(WORK, "no-code", HEAD[:12], DIGEST, source=source)
         assert fake.service.no_code_head(WORK, PR) is not None
         assert verdict_settled(await fake.service.no_code_fixed(WORK, PR, HEAD))
-        assert fake.passed() is not None and fake.service.no_code_head(WORK, PR) is None
+        # Its pass now stands, and a later doc-only push keeps it (#4257).
+        assert fake.passed() is not None and fake.service.no_code_head(WORK, PR) == (HEAD, None)
     assert len([e for e in fake.events if e.key.startswith("no-code-fixed:")]) == 2
 
 
@@ -2412,17 +2554,74 @@ async def test_a_no_code_verdict_holds_the_merge_and_its_fix_passes_with_no_revi
     answer = await fake.service.no_code_fixed(WORK, PR, OTHER)
     assert verdict_settled(answer) and fake.merge_heads == [OTHER]
     assert fake.passed().head == OTHER and fake.passed().data["no-code"] == HEAD
-    assert any(
-        ":verdict:pass:" in key and "changed only doc files since" in text
-        for _chat, key, text in fake.told
-    )
-    assert fake.service.no_code_head(WORK, PR) is None
-    assert "no no-code verdict" in await fake.service.no_code_fixed(WORK, PR, OTHER)
+    # Tested, so the pass sends nothing (#4253); it is recorded as told all the same.
+    assert f"verdict:pass:{PR}@{OTHER[:12]}" in fake.entry["told"]
+    assert not any(":verdict:pass:" in key for _chat, key, _text in fake.told)
+    # The pass it wrote is a standing pass: a doc-only push keeps it, its own head needs none.
+    assert fake.service.no_code_head(WORK, PR) == (OTHER, None)
+    assert "already passed at" in await fake.service.no_code_fixed(WORK, PR, OTHER)
     # Any other verdict on the pull request replaces a no-code one.
     fake.set(PR, state="OPEN")
     await fake.service.on_verdict(WORK, "no-code", OTHER[:12], "e" * 64)
     await fake.service.on_verdict(WORK, "changes-needed", OTHER[:12], "")
     assert fake.service.no_code_head(WORK, PR) is None
+
+
+async def test_a_doc_only_push_keeps_a_standing_pass_with_no_review(fake):
+    """#4257: a push of doc files alone after a pass (a diagram or guide fix) keeps that pass
+    at the new head, with no new review; a pass asked about again, or findings after it, keep
+    nothing, and the passed head itself needs no second pass."""
+    fake.policy = Policy(auto_release=False)
+    await fake.service.on_verdict(WORK, "pass", HEAD[:12], DIGEST, source="comment:1")
+    assert fake.service.no_code_head(WORK, PR) == (HEAD, None)
+    assert "already passed at" in await fake.service.no_code_fixed(WORK, PR, HEAD)
+    # A review asked for again at the passed head: its own verdict decides.
+    fake.note(PR, HEAD, "asked", f"asked:{PR}@{HEAD}", fake.now + 1, {})
+    assert fake.service.no_code_head(WORK, PR) is None
+    assert "no no-code verdict or standing pass" in await fake.service.no_code_fixed(
+        WORK, PR, OTHER
+    )
+    fake.now += 5
+    await fake.service.on_verdict(WORK, "pass", HEAD[:12], DIGEST, source="comment:2")
+    assert fake.service.no_code_head(WORK, PR) == (HEAD, None)
+    # The agent pushed a diagram fix: the pass carries to the new head, from the passed one.
+    fake.set(PR, head=OTHER)
+    fake.digests[(PR, OTHER)] = "e" * 64
+    fake.now += 5
+    assert verdict_settled(await fake.service.no_code_fixed(WORK, PR, OTHER))
+    kept = fake.passed()
+    assert kept.head == OTHER and kept.data["doc-only"] == HEAD and kept.key.startswith("doc-only:")
+    assert kept.data["carried_from"] == HEAD and kept.data["digest"] == "e" * 64
+    assert any(
+        ":verdict:pass:" in key and "which passed review" in text for _c, key, text in fake.told
+    )
+    # A second doc push chains on: each row names only the head before it.
+    third = "9" * 40
+    assert fake.service.no_code_head(WORK, PR) == (OTHER, None)
+    fake.set(PR, head=third)
+    fake.digests[(PR, third)] = "f" * 64
+    fake.now += 5
+    assert verdict_settled(await fake.service.no_code_fixed(WORK, PR, third))
+    assert fake.passed().head == third and fake.passed().data["carried_from"] == OTHER
+    # Findings after it hold the pull request again: a doc push no longer keeps anything.
+    await fake.service.on_verdict(WORK, "changes-needed", third[:12], "")
+    assert fake.service.no_code_head(WORK, PR) is None
+
+
+async def test_a_doc_only_push_after_ship_now_stays_held_by_the_press(fake):
+    """#4257: a Ship now pass a doc push keeps still carries its note, so the merge stays held
+    by the head the press passed (#4212), not the pushed one."""
+    from agentdeck.review_history import SHIP_NOTE, ship_pass_head
+
+    fake.policy = Policy(auto_release=False)
+    await fake.service.on_verdict(WORK, "changes-needed", HEAD[:12], "")
+    await fake.service.owner_accepted(WORK, PR, HEAD, SHIP_NOTE)
+    assert fake.service.no_code_head(WORK, PR) == (HEAD, None)
+    fake.set(PR, head=OTHER)
+    fake.digests[(PR, OTHER)] = "e" * 64
+    assert verdict_settled(await fake.service.no_code_fixed(WORK, PR, OTHER))
+    assert fake.passed().data["note"] == SHIP_NOTE
+    assert ship_pass_head(fake.service._history(PR), OTHER) == HEAD
 
 
 async def test_an_owner_accepting_findings_passes_the_head_with_no_review(fake):
@@ -2434,10 +2633,8 @@ async def test_an_owner_accepting_findings_passes_the_head_with_no_review(fake):
     answer = await fake.service.owner_accepted(WORK, PR, HEAD, " Owner: accept as is ")
     assert verdict_settled(answer) and fake.merge_heads == [HEAD]
     assert fake.passed().kind == "accepted" and fake.passed().data["note"] == "Owner: accept as is"
-    assert any(
-        ":verdict:pass:" in key and "the owner accepted the review's findings" in text
-        for _chat, key, text in fake.told
-    )
+    assert f"verdict:pass:{PR}@{HEAD[:12]}" in fake.entry["told"]
+    assert not any(":verdict:pass:" in key for _chat, key, _text in fake.told)  # #4253
 
 
 async def test_a_ship_now_pass_merges_only_once_its_press_finished(fake):
@@ -2477,6 +2674,98 @@ async def test_a_ship_now_pass_merges_only_once_its_press_finished(fake):
     unfinished[HEAD] = False
     await fake.service.evaluate(WORK)
     assert fake.merge_heads == [third]
+
+
+async def test_a_shipped_merge_keeps_the_issue_open_until_its_fix_merges(fake):
+    """#4212 review: Ship now merges a head with its findings left to this Work, so every live
+    check of the Work says to keep the issue open until the pull request named as their fix
+    merges; an unrelated pull request merging, with it or after it, fixes nothing. The fix's
+    own merge then asks the usual live check, which closes it."""
+    from agentdeck.review_history import SHIP_NOTE
+
+    fixes = {PR: ""}
+    fake.service.ports.shipped_findings = lambda work_id: (
+        list(fixes.items()) if work_id == WORK else []
+    )
+    await fake.service.on_verdict(WORK, "changes-needed", HEAD[:12], "")
+    await fake.service.owner_accepted(WORK, PR, HEAD, SHIP_NOTE)
+    assert fake.merge_heads == [HEAD]
+    [shipped] = live_checks(fake)
+    assert f"But {PR} shipped with Ship now" in shipped
+    assert "keep the issue open, whatever the result" in shipped
+    assert '"fixes": "<the shipped pull request>"' in shipped
+    # Merged in one batch with an unrelated pull request, it is still left.
+    entry: dict = {}
+    assert fake.service._findings_left(WORK, entry, [PR, "eerovil/agentdeck#10"]) == [PR]
+
+    async def merge(pull):
+        fake.pulls[pull] = Pull(pull, "OPEN", False, OTHER, "MERGEABLE", "CLEAN", "green")
+        fake.digests[(pull, OTHER)] = DIGEST
+        fake.green = {OTHER}
+        await fake.service.evaluate(WORK)
+        fake.set(pull, state="MERGED")
+        await fake.service.on_pull_event(WORK, pull, "closed", True)
+        await fake.service.evaluate(WORK)
+        return live_checks(fake)[-1]
+
+    # An unrelated pull request merges before the fix: the issue still stays open.
+    unrelated = await merge("eerovil/agentdeck#11")
+    assert len(live_checks(fake)) == 2
+    assert f"But {PR} shipped with Ship now" in unrelated
+    # The agent names its fix when it registers it; that one's merge closes the issue.
+    fixes[PR] = "eerovil/agentdeck#12"
+    fixed = await merge("eerovil/agentdeck#12")
+    assert len(live_checks(fake)) == 3
+    assert "shipped with Ship now" not in fixed
+    assert "close the issue yourself" in fixed
+    # A split head's fix merged in an earlier live check stays merged.
+    later = {"merged_pulls": ["eerovil/agentdeck#12"]}
+    assert fake.service._findings_left(WORK, later, ["eerovil/agentdeck#13"]) == []
+    # The shipped pull request named as its own fix fixes nothing (#4212 review).
+    fixes[PR] = PR
+    assert fake.service._findings_left(WORK, later, [PR]) == [PR]
+
+    # An unreadable record is unknown, not "none left": no close is authorized.
+    def unreadable(work_id):
+        raise OSError("db locked")
+
+    fake.service.ports.shipped_findings = unreadable
+    unread = await merge("eerovil/agentdeck#13")
+    assert "could not read whether this Work shipped" in unread
+    assert "keep it open while any shipped" in unread
+
+
+@pytest.mark.parametrize("by_deck", [True, False])
+async def test_a_split_ship_tells_the_agent_once_when_its_head_merges_beside_the_draft_fix(
+    fake, by_deck
+):
+    """#4212 review: Ship now split reviewed A from fix B, which waits as a draft until A
+    merges. A merging, by the deck's own merge or by hand, tells the agent once, with its
+    GitHub event after, though B is still open; B stays the draft the agent turns ready."""
+    fix = "eerovil/agentdeck#12"
+    fake.service.ports.shipped_findings = lambda work_id: [(PR, fix)] if work_id == WORK else []
+    fake.pulls[fix] = Pull(fix, "OPEN", True, OTHER, "MERGEABLE", "CLEAN", "green")
+    if by_deck:
+        await passed(fake, targets=(PR,))
+        assert fake.merge_heads == [HEAD]
+    fake.set(PR, state="MERGED")
+    await fake.service.on_pull_event(WORK, PR, "closed", True)
+    await fake.service.evaluate(WORK)
+    [told] = live_checks(fake)
+    assert PR in told and fix not in told.split("shipped with Ship now")[0]
+    assert "merge its base into it now and mark it ready" in told
+    assert "keep the issue open" in told
+    assert fake.pulls[fix].draft and fake.pulls[fix].state == "OPEN"
+    # B goes ready and merges: the Work's usual live check, which closes it.
+    fake.set(fix, draft=False)
+    fake.digests[(fix, OTHER)] = DIGEST
+    fake.green = {OTHER}
+    await passed(fake, head=OTHER, targets=(fix,))
+    fake.set(fix, state="MERGED")
+    await fake.service.on_pull_event(WORK, fix, "closed", True)
+    await fake.service.evaluate(WORK)
+    assert len(live_checks(fake)) == 2
+    assert "shipped with Ship now" not in live_checks(fake)[-1]
 
 
 async def test_each_verdict_is_written_into_its_full_heads_history(fake):

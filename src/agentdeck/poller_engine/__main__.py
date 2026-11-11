@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import shutil
 import sys
@@ -478,6 +479,9 @@ def _cmd_reap_worktrees(args: argparse.Namespace) -> int:
         print("no checkouts configured for this instance; nothing to scan")
         return 0
 
+    if args.apply and args.save_after_days and args.leftovers:
+        for path in reaper.recover_hidden(checkouts):
+            print(f"  keep  {'save-stuck':<12} {path} (could not be moved back to resume)")
     verdicts = reaper.plan(
         reaper.scan(checkouts, now=datetime.now(UTC)),
         claimed,
@@ -502,6 +506,8 @@ def _cmd_reap_worktrees(args: argparse.Namespace) -> int:
     if args.size and reapable:
         print(f"  reclaimable: {_format_size(total)}")
 
+    saved = _save_idle_leftovers(kept, args)
+
     if not args.apply:
         if reapable:
             print("dry run: nothing was removed. Re-run with --apply to release these.")
@@ -520,7 +526,70 @@ def _cmd_reap_worktrees(args: argparse.Namespace) -> int:
         print(f"released {released}, {len(cleanup.failed)} failed")
         return 1
     print(f"released {released} worktrees")
-    return 0
+    return 0 if saved else 1
+
+
+def _save_days(text: str) -> float:
+    """``--save-after-days``: 0 for off, else a finite number of days above zero.
+
+    A negative or NaN count would put the idle cutoff in the future or make every
+    comparison false, and either would let a worktree edited today pass as idle.
+    """
+    try:
+        days = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number of days: {text!r}") from None
+    if not math.isfinite(days) or days < 0:
+        raise argparse.ArgumentTypeError(f"must be 0 (off) or a positive number: {text!r}")
+    return days
+
+
+def _save_idle_leftovers(kept: list[reaper.Verdict], args: argparse.Namespace) -> bool:
+    """Save and remove kept dirty or unmerged worktrees idle ``--save-after-days`` (#4267).
+
+    Off unless both ``--save-after-days`` and ``--leftovers`` are given, and only acts on
+    ``--apply``. A leftovers folder that is missing (the hard disk not mounted) saves
+    nothing rather than filling the disk being cleaned. False when a save failed.
+    """
+    if not args.save_after_days or not args.leftovers:
+        return True
+    leftovers = Path(args.leftovers)
+    if not leftovers.is_dir():
+        print(f"leftovers folder {leftovers} is missing; nothing saved")
+        return True
+    now = datetime.now(UTC)
+    use = reaper.paths_in_use()
+    if use is None:
+        print("the process list could not be read; nothing saved")
+        return True
+    ok = True
+    for item in sorted(kept, key=lambda held: held.path):
+        # A ``.<name>.saving`` this cleanup noted moving is a save a cut-off run started: it
+        # resumes at once, since the move itself made it look new, whatever the reaper calls
+        # it now. One only named like that waits out the idle days like any other.
+        resume = reaper.moved_aside(item.candidate) and item.reason not in (
+            reaper.CLAIMED,
+            reaper.UNREGISTERED,
+        )
+        if not resume:
+            if item.reason not in (reaper.DIRTY, reaper.UNMERGED):
+                continue
+            if reaper.untouched_for(item.path, args.save_after_days, now=now) is not True:
+                continue
+        why = reaper.unknown_use(use, item.path)
+        if why:
+            print(f"  keep  {'maybe-in-use':<12} {item.path} ({why})")
+            continue
+        if not args.apply:
+            print(f"  would save {item.path}")
+            continue
+        why = reaper.save_and_remove(item.candidate, leftovers, now=now)
+        if why:
+            print(f"  keep  {'save-failed':<12} {item.path} ({why})")
+            ok = False
+        else:
+            print(f"  saved {item.path} to {leftovers}")
+    return ok
 
 
 def activation_plan(manifest) -> dict:
@@ -939,6 +1008,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="how quiet a worktree must have been before it is even considered",
     )
     reap.add_argument("--size", action="store_true", help="also report what each one holds")
+    reap.add_argument(
+        "--save-after-days",
+        type=_save_days,
+        default=0.0,
+        help="also save to --leftovers and remove a kept dirty or unmerged worktree nothing"
+        " has changed in for this many days (0, the default, never does)",
+    )
+    reap.add_argument("--leftovers", default="", help="where --save-after-days saves to")
     reap.add_argument(
         "--runtime-socket",
         default="",

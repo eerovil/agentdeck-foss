@@ -31,10 +31,9 @@ EIGHT = IssueRef("eerovil/agentdeck", 8)
 # --- the web starts none of them (#3999's first guard) ----------------------------------
 
 
-@pytest.mark.parametrize("in_web", [False, True])
-def test_the_web_starts_the_work_services_only_with_the_switch_back(tmp_path, monkeypatch, in_web):
-    """Switched off, the web builds and starts none of the three: it keeps stand-ins that send
-    every act to the services socket. With ``[services] in_web`` it runs them itself (#4017)."""
+def test_the_web_starts_none_of_the_work_services(tmp_path, monkeypatch):
+    """Outside the tests' stand-in the web builds and starts none of the three: it keeps
+    stand-ins that send every act to the services socket (#4016, #4017)."""
     from fastapi.testclient import TestClient
     from test_web import _app_with_state
 
@@ -51,19 +50,14 @@ def test_the_web_starts_the_work_services_only_with_the_switch_back(tmp_path, mo
     monkeypatch.setattr(
         work_services, "build", lambda *a, **k: built.append(1) or real_build(*a, **k)
     )
-    app = _app_with_state(tmp_path, services_in_web=in_web)
+    app = _app_with_state(tmp_path)
     with TestClient(app):
         pass
 
     assert isinstance(app.state.work_router, services_link.RouterLink)
     assert isinstance(app.state.work_release, services_link.ReleaseLink)
-    if in_web:
-        assert built
-        assert set(started) == {WorkRouterService, WorkReleaseService, MissedStartBackstop}
-        assert app.state.session_copy is None
-    else:
-        assert built == [] and started == [] and app.state.work_services is None
-        assert isinstance(app.state.session_copy, session_copy.SessionCopyFeed)
+    assert built == [] and started == [] and app.state.work_services is None
+    assert isinstance(app.state.session_copy, session_copy.SessionCopyFeed)
 
 
 # --- the session copy (#4001) ---------------------------------------------------------------
@@ -339,6 +333,7 @@ def _hooks(tmp_path) -> work_services.Hooks:
         runtime_http=lambda: None,
         scanned=nothing,
         wake_registry=WakeOnRegistry(tmp_path / "wake-on.json"),
+        register_pull=nothing,
     )
 
 
@@ -429,6 +424,165 @@ async def test_the_services_follow_the_webs_chats_with_the_caller_key_only(tmp_p
     assert await follower.holds(("claude_code:test:a",), 0.01)
     assert not await follower.holds(("claude_code:test:gone",), 0.01)
     await stranger.aclose()
+    await calls.aclose()
+
+
+async def test_ship_nows_new_pull_request_is_registered_by_the_web_not_the_copy(
+    tmp_path, monkeypatch
+):
+    """The services' copy of a chat cannot be republished (#4212: Ship now's split stopped at
+    ``CopyFieldError``), so the web registers the opened pull request with the same Work."""
+    from test_web import _app_with_state
+
+    from agentdeck.services_process import (
+        SessionFollower,
+        WebCalls,
+        caller_key_path,
+        remote_hooks,
+        write_caller_key,
+    )
+    from agentdeck.work_services import register_split
+
+    monkeypatch.setattr(services_link, "IN_PROCESS", False)
+    app = _app_with_state(tmp_path)
+    web = app.state.app_state
+    leg = "claude_code:test:a"
+    web.db.ensure_session_chats((leg,))
+    web.sessions = {leg: _session(leg, minutes=2)}
+    work = "github_issue:eerovil/agentdeck#7"
+    web.set_pull_requests(
+        leg,
+        (
+            PullRequestRef("eerovil/agentdeck", 9, work_id=work),
+            PullRequestRef("eerovil/agentdeck", 4, work_id=work),
+        ),
+    )
+    key = write_caller_key(caller_key_path(app.state.config))
+    calls = WebCalls("http://deck", key, transport=httpx.ASGITransport(app=app))
+    copy = AppState(db=web.db, budget_db=web.db)
+    SessionFollower(calls, copy, web.db, on_registered=lambda *ref: None).apply(
+        await calls.get("sessions", {}, timeout=5.0)
+    )
+    with pytest.raises(session_copy.CopyFieldError):
+        copy.add_pull_request(leg, PullRequestRef("eerovil/agentdeck", 30))  # the old path
+
+    async def nothing(*_args, **_kwargs):
+        return None
+
+    hooks = remote_hooks(
+        app.state.config,
+        web=calls,
+        state=copy,
+        db=web.db,
+        feed=None,
+        scanned=nothing,
+        runtime_http=lambda: None,
+        wake_registry=None,
+        copied=nothing,
+    )
+
+    # The store refuses the write once (SQLite busy): no registration is answered, and the
+    # chat's other registrations stay stored, so a web restart still has them; the next
+    # press stores it.
+    def stored():
+        return {
+            (key, ref.number, ref.work_id)
+            for key, refs in web.db.load_session_pull_requests().items()
+            for ref in refs
+        }
+
+    def refuse(number: int | None) -> None:
+        """SQLite rejects inserting ``number`` (``None``: lets it again), mid-transaction."""
+        with web.db._lock, web.db._conn:
+            web.db._conn.execute("DROP TRIGGER IF EXISTS refuse_pull")
+            if number is not None:
+                web.db._conn.execute(
+                    "CREATE TRIGGER refuse_pull BEFORE INSERT ON session_pull_requests"
+                    f" WHEN NEW.number = {number} BEGIN SELECT RAISE(ABORT, 'busy'); END"
+                )
+
+    before = stored()
+    assert {(leg, 9, work), (leg, 4, work)} <= before
+    refuse(20)
+    assert not await register_split(copy, hooks.register_pull, "EerOvil/AgentDeck", 9, 20)
+    assert stored() == before, "nothing deleted"
+    assert 20 not in {ref.number for ref in web.pull_requests_for(leg)}
+    restarted = AppState(db=web.db, budget_db=web.db)
+    restarted.session_pull_requests = web.db.load_session_pull_requests()
+    assert {9, 4} <= {ref.number for ref in restarted.pull_requests_for(leg)}
+    refuse(None)
+    assert await register_split(copy, hooks.register_pull, "EerOvil/AgentDeck", 9, 20)
+    assert stored() == before | {(leg, 20, work)}, "stored with its Work"
+    assert [(ref.number, ref.work_id) for ref in web.pull_requests_for(leg)][-1] == (20, work)
+    assert web.sessions[leg].pull_requests[-1].number == 20, "the web's chat shows it"
+    assert (("eerovil/agentdeck", 20)) in {
+        ref.identity for refs in copy.session_pull_requests.values() for ref in refs
+    }, "the copy reads it at once"
+    assert not await register_split(copy, hooks.register_pull, "eerovil/agentdeck", 8, 21)
+    # Already registered with no Work (an earlier press, or the chat itself): the same one
+    # statement sets the Work on it, never a second row.
+    web.set_pull_requests(
+        leg, (*web.pull_requests_for(leg), PullRequestRef("eerovil/agentdeck", 21))
+    )
+    assert (leg, 21, "") in stored()
+    assert await register_split(copy, hooks.register_pull, "eerovil/agentdeck", 9, 21)
+    assert (leg, 21, work) in stored() and (leg, 21, "") not in stored()
+    assert (21, work) in {(ref.number, ref.work_id) for ref in web.pull_requests_for(leg)}
+
+    # A chat that moved to a new leg: its older leg still registers the new number, for
+    # another Work or none. The one transaction leaves it on the working leg alone, for the
+    # original's Work, so the web, the copy and a restarted web all place it there.
+    old, new = "claude_code:test:o", "claude_code:test:n"
+    other = "github_issue:eerovil/agentdeck#8"
+    web.db.ensure_session_chats((old,))
+    for key, minutes in ((old, 40), (new, 1)):
+        web.update_session(_session(key, minutes=minutes))
+    for key in web.db.append_chat_leg(old, new).legs:
+        web.update_session(web.sessions[key])
+    assert web.chat_session_keys(new) == (old, new) and web.chat_current_session_key(old) == new
+    web.set_issues(new, (EIGHT,))
+    web.set_pull_requests(new, (PullRequestRef("eerovil/agentdeck", 12, work_id=other),))
+    # Rows the older leg wrote before the chat moved on, as a restarted web reads them.
+    web.db.record_session_pull_request(old, PullRequestRef("eerovil/agentdeck", 22, work))
+    web.db.record_session_pull_request(old, PullRequestRef("eerovil/agentdeck", 23))
+    web.session_pull_requests = web.db.load_session_pull_requests()
+    assert {(old, 22, work), (old, 23, ""), (new, 12, other)} <= stored()
+    app.state.session_copy.compare()  # what the web announces on its bus
+    SessionFollower(calls, copy, web.db, on_registered=lambda *ref: None).apply(
+        await calls.get("sessions", {}, timeout=5.0)
+    )
+    # The insert fails after the older leg's row was deleted in the same transaction: the
+    # whole change rolls back, so the older leg still holds it, after a restart too.
+    refuse(22)
+    with_old = stored()
+    assert not await register_split(copy, hooks.register_pull, "eerovil/agentdeck", 12, 22)
+    assert stored() == with_old and (old, 22, work) in with_old
+    assert (old, 22, work) in {
+        (key, ref.number, ref.work_id)
+        for key, refs in AppState(db=web.db, budget_db=web.db).session_pull_requests.items()
+        for ref in refs
+    }
+    refuse(None)
+    for number in (22, 23):
+        assert await register_split(copy, hooks.register_pull, "eerovil/agentdeck", 12, number)
+        assert {row for row in stored() if row[1] == number} == {(new, number, other)}
+        restarted = AppState(db=web.db, budget_db=web.db)  # reads what was stored
+        for session in web.sessions.values():
+            restarted.update_session(session)
+        for state in (web, copy, restarted):
+            assert [
+                (key, ref.work_id)
+                for key, refs in state.session_pull_requests.items()
+                for ref in refs
+                if ref.number == number
+            ] == [(new, other)]
+            assert owner_of_pull(state, "eerovil/agentdeck", number) == owner_of_pull(
+                web, "eerovil/agentdeck", 12
+            )
+    assert owner_of_pull(web, "eerovil/agentdeck", 12) is not None
+    # Asked from the older leg, and with no Work named: the chat's own Work stays.
+    assert await hooks.register_pull(old, PullRequestRef("eerovil/agentdeck", 22))
+    assert {row for row in stored() if row[1] == 22} == {(new, 22, other)}
     await calls.aclose()
 
 

@@ -26,7 +26,16 @@ The rules this holds to:
   other way.
 
 A time wait (``at`` or ``after_minutes``, #2968) is the one kind with no event: long local
-work such as a render reports nothing to GitHub, so its deadline is the wake.
+work such as a render reports nothing to GitHub, so its deadline is the wake. It may fall up
+to ``MAX_TIME_WAIT_MINUTES`` (14 days, #4266) ahead, so a chat can come back for a check a
+week after its change shipped; its Work stays current (``waiting_work_ids`` in
+``web/work_view``) and reads "Waiting on …" until then. It may carry a ``check`` (#4256): a
+shell command the deck runs every so often until the deadline. Exit 0
+says the awaited thing happened and wakes the chat with the output; ``CHECK_NOT_YET`` says
+not yet and stays silent; any other exit, a run past ``CHECK_TIMEOUT_S`` or a command that
+will not start wakes the chat with the reason. Most day-later live checks woke a chat only
+to read "nothing yet" (#4244), so the deck reads it instead. The deck never records a live
+check or closes an issue from a check: a woken chat reads the result and does that.
 
 A review wait (``review``, #3183) waits on the reviewer's verdict on a pull request. The
 deck already hands that verdict to the Work's chat as a message of its own, so the verdict
@@ -74,18 +83,20 @@ import contextlib
 import hashlib
 import json
 import logging
+import os
 import re
 import secrets
+import signal
 import subprocess
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import asdict, dataclass, fields, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from . import chat_board, chat_review, review_refs, watch_retry
+from . import chat_board, chat_review, deck_notices, review_refs, watch_retry
 from .github_webhook_log import raw_body
-from .models import PullRequestRef
+from .models import IssueRef, PullRequestRef
 from .review_history import deck_check_delivery
 from .scheduled_messages import ScheduledMessage
 from .shared_file import SharedFile
@@ -154,10 +165,50 @@ DEFAULT_TIMEOUT_MINUTES = 120
 #: the worker is sent to check the reviewer's progress after this instead.
 REVIEW_TIMEOUT_MINUTES = 20
 MAX_TIMEOUT_MINUTES = 24 * 60
+#: How far ahead a time wait may fall (#4266). It was ``MAX_TIMEOUT_MINUTES`` (#2968), so a
+#: chat asked to check back a week after a change shipped could only re-register a day at a
+#: time, each wake re-reading the whole chat for nothing. An event wait keeps the day: its
+#: timeout only covers a dropped webhook.
+MAX_TIME_WAIT_MINUTES = 14 * 24 * 60
+#: The exit code a time wait's check gives for "not yet": run again later, wake nobody.
+#: Distinct from 1 and 2, which most commands give for an error a chat must hear of.
+CHECK_NOT_YET = 3
+#: How often a check runs, in minutes: the default, and the bounds a chat may ask for.
+CHECK_EVERY_DEFAULT = 60
+CHECK_EVERY_MIN = 5
+CHECK_EVERY_MAX = 24 * 60
+#: How long one run of a check may take before it is stopped and the chat woken.
+CHECK_TIMEOUT_S = 300.0
+#: The longest check command a time wait takes.
+MAX_CHECK_COMMAND = 2000
+#: How much of a check's output a wake quotes, from its end.
+MAX_CHECK_OUTPUT = 3000
+#: How much of a "not yet" run's output is kept for the deadline's message.
+MAX_CHECK_LAST = 600
+#: Checks running at once in this process: each is a read, but a burst must not swamp the host.
+MAX_CHECKS_AT_ONCE = 4
 #: Per chat. A chat waiting on more than this at once is more likely looping than waiting.
 MAX_ACTIVE_PER_CHAT = 10
 #: The longest ``waiting_for`` a time wait takes: it is shown in the Work's status line.
 MAX_NOTE = 80
+#: A merge or CI wait whose extra round passed with nothing in the stream is read from GitHub
+#: once (#4253); still running, it waits this much longer, up to ``LIVE_READ_CAP_S`` from its
+#: registration, and wakes its chat only with a result or at that cap.
+LIVE_READ_AGAIN_S = 30 * 60.0
+LIVE_READ_CAP_S = 24 * 3600.0
+#: The waits that read: a deploy has no cheap read, so it keeps the timeout message.
+LIVE_READ_KINDS = frozenset({KIND_PULL_REQUEST, KIND_COMMIT})
+#: A merge wait ends with no message when the release's own merge notice reached the same chat
+#: this recently (#4253): the chat already heard of the merge.
+MERGE_TOLD_S = 30 * 60.0
+#: The release's merge notice: ``work-release:<work>:live-check:<owner/repo#n,...>``.
+RELEASE_NOTICE_PREFIX = "work-release:"
+LIVE_CHECK_KEY = ":live-check:"
+#: Outcomes the chat hears as a routine notice (``deck_notices.routine``); failures never are.
+SUCCESS_STATES = frozenset({"success", "merged"})
+#: The words of a review stop that closed on a comment (``review_stop``): the stop the deck
+#: answers by asking for a fresh review itself (#4253); a label stop still wakes the chat.
+CLOSED_REVIEW = "closed its review"
 
 #: A commit status or deployment status in one of these states is a result; anything
 #: else (``pending``, ``queued``, ``in_progress``) is a run still going.
@@ -216,6 +267,25 @@ class WakeRequest:
     #: The one more round a patient wait still has (``PATIENT_KINDS``), in seconds; 0 once it
     #: is spent, on any other wait, and on a wait stored before #4080.
     extra_s: float = 0.0
+    #: What the chat is to do once this wait ends, when the deck registered it on the chat's
+    #: behalf (#4253): the live check after a merge, carried by the deploy wait the deck
+    #: registered instead of asking the chat to. "" on a wait the chat registered itself.
+    then: str = ""
+    #: The Work this wait is for (#4272), a ``github_issue:`` Work id; "" when the chat did
+    #: not name one. A chat directly in several Works names it, or only the one Work its
+    #: wait points at stays current (``waiting_work_ids`` in ``web/work_view``).
+    work_id: str = ""
+    #: A time wait's check (#4256): the shell command, where it runs, how often, when it next
+    #: runs, how many runs said "not yet", and the newest of those (its time and output tail).
+    check_command: str = ""
+    check_cwd: str = ""
+    check_every_s: float = 0.0
+    check_at: float = 0.0
+    check_runs: int = 0
+    check_last: str = ""
+    #: Which registration of this wait the check belongs to: registering it again bumps it,
+    #: so a run started before that is ignored when it ends (it ran the old command).
+    check_gen: int = 0
 
     @property
     def target(self) -> str:
@@ -247,6 +317,7 @@ class WakeRequest:
             self.name.lower(),
             self.note.lower(),
             self.only,
+            self.work_id,
         ) == (
             other.chat_id,
             other.kind,
@@ -256,9 +327,21 @@ class WakeRequest:
             other.name.lower(),
             other.note.lower(),
             other.only,
+            other.work_id,
         )
 
     def payload(self) -> dict:
+        check = (
+            {
+                "command": self.check_command,
+                "cwd": self.check_cwd,
+                "every_minutes": round(self.check_every_s / 60),
+                "next_run": self.check_at,
+                "not_yet_runs": self.check_runs,
+            }
+            if self.check_command
+            else None
+        )
         return {
             "id": self.id,
             "kind": self.kind,
@@ -270,6 +353,8 @@ class WakeRequest:
             "waiting_for": self.target,
             "registered_at": self.registered_at,
             "deadline": self.deadline,
+            "work_id": self.work_id or None,
+            **({"check": check} if check else {}),
         }
 
 
@@ -294,18 +379,82 @@ def parse_request(
     waiting_for: str | None = None,
     name: str | None = None,
     timeout_minutes: int | None = None,
+    work_id: str | None = None,
+    check: dict | None = None,
     now: datetime | None = None,
 ) -> dict:
     """Validate one registration body into the fields of a ``WakeRequest``.
 
     ``now`` is when a time wait counts from, an aware datetime whose zone a bare ``11:30``
-    is read in; this host's clock and zone by default.
+    is read in; this host's clock and zone by default. ``work_id`` names the Work the wait
+    is for (#4272), as a Work id or ``owner/repo#n``.
     """
+    fields = _request_fields(
+        pull_request=pull_request,
+        review=review,
+        commit=commit,
+        deployment=deployment,
+        deck_deploy=deck_deploy,
+        at=at,
+        after_minutes=after_minutes,
+        needs_you=needs_you,
+        only=only,
+        waiting_for=waiting_for,
+        name=name,
+        timeout_minutes=timeout_minutes,
+        check=check,
+        now=now,
+    )
+    wanted = (work_id or "").strip()
+    if not wanted:
+        return fields
+    if fields["kind"] == KIND_NEEDS_YOU:
+        raise WakeRequestError("a needs_you wait listens to every Work; it takes no work_id")
+    return {**fields, "work_id": _work_id(wanted)}
+
+
+def _work_id(value: str) -> str:
+    """One spelling of the Work ``value`` names: a Work id or ``owner/repo#n``."""
+    from .work import WorkRef
+
+    ref = WorkRef.from_work_id(value)
+    if ref is None and (issue := IssueRef.parse(value)) is not None:
+        ref = WorkRef.from_issue(issue)
+    if ref is None:
+        raise WakeRequestError(f"work_id must be a Work id or owner/repo#number; got {value!r}")
+    return ref.work_id
+
+
+def _request_fields(
+    *,
+    pull_request: str | None,
+    review: str | None,
+    commit: str | None,
+    deployment: str | None,
+    deck_deploy: str | None,
+    at: str | None,
+    after_minutes: int | None,
+    needs_you: str | None,
+    only: str | None,
+    waiting_for: str | None,
+    name: str | None,
+    timeout_minutes: int | None,
+    check: dict | None,
+    now: datetime | None,
+) -> dict:
+    """``parse_request`` without the Work the wait is for."""
     at = at or None
     given = [
         value
         for value in (
-            pull_request, review, commit, deployment, deck_deploy, at, after_minutes, needs_you
+            pull_request,
+            review,
+            commit,
+            deployment,
+            deck_deploy,
+            at,
+            after_minutes,
+            needs_you,
         )
         if value is not None and value != ""
     ]
@@ -324,7 +473,12 @@ def parse_request(
         raise WakeRequestError("only filters a needs_you wait")
     note = " ".join((waiting_for or "").split())
     if at is not None or after_minutes is not None:
-        return _time_request(at, after_minutes, note, name, timeout_minutes, now)
+        fields = _time_request(at, after_minutes, note, name, timeout_minutes, now)
+        if check is not None:
+            fields.update(_check_fields(check, fields["timeout_s"]))
+        return fields
+    if check is not None:
+        raise WakeRequestError("check belongs to a time wait (at or after_minutes)")
     if note:
         raise WakeRequestError("waiting_for describes a time wait (at or after_minutes)")
     default = REVIEW_TIMEOUT_MINUTES if review else DEFAULT_TIMEOUT_MINUTES
@@ -411,9 +565,10 @@ def _time_request(
     else:
         due = _parse_at(str(at), current)
         minutes = (due - current).total_seconds() / 60
-    if not 1 <= minutes <= MAX_TIMEOUT_MINUTES:
+    if not 1 <= minutes <= MAX_TIME_WAIT_MINUTES:
         raise WakeRequestError(
-            f"a time wait must fall between 1 minute and {MAX_TIMEOUT_MINUTES // 60} hours from now"
+            "a time wait must fall between 1 minute and"
+            f" {MAX_TIME_WAIT_MINUTES // (24 * 60)} days from now"
         )
     return {
         "timeout_s": minutes * 60.0,
@@ -421,6 +576,44 @@ def _time_request(
         "kind": KIND_TIME,
         "repository": "",
         "note": note,
+    }
+
+
+def _check_fields(check: object, wait_s: float) -> dict:
+    """A time wait's ``check`` (#4256): ``command``, and optional ``every_minutes`` and ``cwd``."""
+    if not isinstance(check, dict):
+        raise WakeRequestError("check must be an object with a command")
+    unknown = set(check) - {"command", "every_minutes", "cwd"}
+    if unknown:
+        raise WakeRequestError(f"check takes command, every_minutes and cwd; got {sorted(unknown)}")
+    command = check.get("command")
+    if not isinstance(command, str) or not command.strip():
+        raise WakeRequestError("check.command must be a shell command")
+    if len(command) > MAX_CHECK_COMMAND:
+        raise WakeRequestError(f"check.command is at most {MAX_CHECK_COMMAND} characters")
+    every = check.get("every_minutes")
+    every = CHECK_EVERY_DEFAULT if every is None else every
+    if isinstance(every, bool) or not isinstance(every, int):
+        raise WakeRequestError("check.every_minutes must be a whole number of minutes")
+    if not CHECK_EVERY_MIN <= every <= CHECK_EVERY_MAX:
+        raise WakeRequestError(
+            f"check.every_minutes must be between {CHECK_EVERY_MIN} and {CHECK_EVERY_MAX}"
+        )
+    if every * 60.0 >= wait_s:
+        raise WakeRequestError(
+            "check.every_minutes must be shorter than the wait, or the check would never run"
+        )
+    cwd = check.get("cwd")
+    if cwd is None:
+        cwd = ""
+    if not isinstance(cwd, str):
+        raise WakeRequestError("check.cwd must be an absolute directory")
+    if cwd and not (Path(cwd).is_absolute() and Path(cwd).is_dir()):
+        raise WakeRequestError(f"check.cwd must be an existing absolute directory; got {cwd!r}")
+    return {
+        "check_command": command.strip(),
+        "check_cwd": cwd,
+        "check_every_s": every * 60.0,
     }
 
 
@@ -454,11 +647,23 @@ def _repository_at(value: str, *, sha_required: bool) -> tuple[str, str]:
     return repository.lower(), sha.lower()
 
 
+#: The webhook events that are only ever CI. A commit status may be a deploy (Vercel reports
+#: one so) and a deployment status always is, so their result always reaches the chat.
+CI_EVENTS = frozenset({"check_suite", "check_run", "workflow_run"})
+
+
 @dataclass(frozen=True)
 class Outcome:
     """What a matching delivery said, in words for the woken chat."""
 
     summary: str
+    #: The result in one lowercased word: a check's conclusion, a deploy's state, or
+    #: ``merged`` / ``closed`` for a pull request; "" when unknown.
+    state: str = ""
+    #: Whether it is surely CI: a check run, check suite or workflow run. A deploy reports as
+    #: a deployment status or, like Vercel, as a commit status, so neither is CI here; only
+    #: surely-CI green on a ready head is the deck's own to settle (#4253, ``CI_EVENTS``).
+    ci: bool = False
 
 
 def match(request: WakeRequest, delivery: Delivery) -> Outcome | None:
@@ -502,7 +707,7 @@ def match(request: WakeRequest, delivery: Delivery) -> Outcome | None:
     )
     if url:
         summary += f" ({url})"
-    return Outcome(summary)
+    return Outcome(summary, conclusion.lower(), ci=delivery.event in CI_EVENTS)
 
 
 _WORD_RE = re.compile(r"[^\W_]+")
@@ -538,8 +743,8 @@ def _pull_request_outcome(request: WakeRequest, event: str, payload: dict) -> Ou
     if pull.get("merged"):
         sha = pull.get("merge_commit_sha")
         commit = f" as {sha[:12]}" if isinstance(sha, str) and sha else ""
-        return Outcome(f"pull request {where} was merged{commit}")
-    return Outcome(f"pull request {where} was closed without merging")
+        return Outcome(f"pull request {where} was merged{commit}", "merged")
+    return Outcome(f"pull request {where} was closed without merging", "closed")
 
 
 def _text(value: object) -> str:
@@ -625,6 +830,9 @@ class ReviewStop:
     pulls: tuple[str, ...]  # lowercased owner/repo#n
     note: str
     opened_at: float | None = None  # when the chat was opened, if the payload says
+    #: The chat was closed (#4253), which says nothing new to a wait an earlier stop of the
+    #: same chat already cut: its closing comment is the better note.
+    closed: bool = False
 
 
 def _quote(body: str) -> str:
@@ -666,7 +874,7 @@ def review_stop(
         lines = chat_board.verdict_lines(body)
         if not lines:
             return None
-        note = f"the review chat {url} closed its review, saying:\n\n{_quote(body)}"
+        note = f"the review chat {url} {CLOSED_REVIEW}, saying:\n\n{_quote(body)}"
     elif delivery.event == "issues" and action == "labeled":
         label = payload.get("label")
         name = _text(label.get("name")).strip().lower() if isinstance(label, dict) else ""
@@ -675,6 +883,13 @@ def review_stop(
         said = (noted or {}).get(number, "")
         note = f"the review chat {url} was labelled `{name}`: its reviewer stopped"
         note += f", saying:\n\n{_quote(said)}" if said else "; its newest comment says why."
+        lines = []
+    elif delivery.event == "issues" and action == "closed":
+        # A review chat closed with no verdict line (#4253): the deck asks for a fresh
+        # review itself once the settle window passes with no verdict reaching the chat.
+        said = (noted or {}).get(number, "")
+        note = f"the review chat {url} {CLOSED_REVIEW}: it was closed"
+        note += f", its newest comment saying:\n\n{_quote(said)}" if said else " with no comment."
         lines = []
     else:
         return None
@@ -706,7 +921,8 @@ def review_stop(
         opened_at = datetime.fromisoformat(_text(issue.get("created_at"))).timestamp()
     except ValueError:
         opened_at = None
-    return ReviewStop(number, pulls, note, opened_at) if pulls else None
+    closed = delivery.event == "issues" and action == "closed"
+    return ReviewStop(number, pulls, note, opened_at, closed) if pulls else None
 
 
 def stopped_message(request: WakeRequest) -> str:
@@ -720,29 +936,83 @@ def stopped_message(request: WakeRequest) -> str:
         ' "note": "<what the last review chat said instead of a verdict>"}`. An answer with'
         ' `"outcome": "already asked"` means a review is still to come: end the turn on the'
         " wait it kept. Ask the person in the question box only if the request is refused"
-        " (409). Never post the reviewer's verdict for it."
-        + (
-            " Your wait on its merge ended early because its review stopped: once you have"
-            " acted, register the merge wait again."
-            if request.kind == KIND_PULL_REQUEST
-            else ""
-        )
+        " (409). Never post the reviewer's verdict for it." + _merge_wait_note(request)
     )
 
 
-def fired_message(request: WakeRequest, outcome: Outcome) -> str:
+def _merge_wait_note(request: WakeRequest) -> str:
     return (
-        f"AgentDeck wake-on: {outcome.summary}. You asked to be woken for {request.target}."
-        " Webhooks are a hint, so confirm it with one read before you act on it, then"
-        " carry on with the work that was waiting for it."
+        " Your wait on its merge ended early because its review stopped: once you have"
+        " acted, register the merge wait again."
+        if request.kind == KIND_PULL_REQUEST
+        else ""
     )
+
+
+def reask_refused_message(request: WakeRequest, refusal: str = "", down: str = "") -> str:
+    """A stopped review the deck could not answer by asking again itself (#4253): what it tried."""
+    head = (
+        f"AgentDeck wake-on: {request.stopped}\n\nNo verdict reached this chat for"
+        f" {request.target} in the {round(STOP_SETTLE_S / 60)} minutes after that."
+    )
+    if down:
+        return (
+            f"{head} The deck did not ask for a fresh review itself, because the reviewer is not"
+            f" running: {down}. Do not ask for one either; it would only open another chat"
+            " nobody reads. Tell the person in the question box that reviews are down and why,"
+            " and wait for them." + _merge_wait_note(request)
+        )
+    return (
+        f"{head} The deck already asked for a fresh review of"
+        f" {request.repository}#{request.number} itself (the same request as `review-request`"
+        f" with `no_verdict`), and it was refused: {refusal}. Do not ask again. Read the review"
+        " chat once: act on findings it names and answer a question it asks. If it needs a"
+        " person's decision, ask in the question box. Never post the reviewer's verdict for it."
+        + _merge_wait_note(request)
+    )
+
+
+def fired_message(request: WakeRequest, outcome: Outcome, *, read: bool = False) -> str:
+    """The wake for a result; a success opens with the routine line (#4253).
+
+    ``read`` is a result the deck read from GitHub itself at the wait's timeout.
+    """
+    asked = f"AgentDeck wake-on: {outcome.summary}. You asked to be woken for {request.target}."
+    if request.then:
+        # The deck registered it when it merged the chat's pull request (#4253), carrying
+        # what the chat is to do once it lands.
+        text = (
+            f"AgentDeck wake-on: {outcome.summary}. The deck registered this wait for"
+            f" {request.target} when it merged your pull request.\n\n{request.then}"
+        )
+    elif read:
+        text = asked + (
+            " No webhook brought it, so the deck read it from GitHub itself when the wait timed"
+            " out. Carry on with the work that was waiting for it."
+        )
+    else:
+        text = asked + (
+            " Webhooks are a hint, so confirm it with one read before you act on it, then"
+            " carry on with the work that was waiting for it."
+        )
+    return deck_notices.routine(text) if outcome.state in SUCCESS_STATES else text
 
 
 def deck_deploy_message(request: WakeRequest, revision: str, skills: str = "") -> str:
     installed = f", and bundled skills are installed at {skills[:12]}" if skills else ""
-    return (
+    landed = (
         f"AgentDeck wake-on: the web worker serving this deck now runs {revision[:12]}, which"
-        f" includes commit {request.sha}{installed}. You asked to be woken for"
+        f" includes commit {request.sha}{installed}."
+    )
+    if request.then:
+        # The deck registered it when it merged the chat's pull request (#4253), carrying
+        # what the chat is to do once it is live.
+        return deck_notices.routine(
+            f"{landed} The deck registered this wait for {request.target} when it merged your"
+            f" pull request.\n\n{request.then}"
+        )
+    return deck_notices.routine(
+        f"{landed} You asked to be woken for"
         f" {request.target}. Check the deployed behaviour live, then carry on with the work"
         " that was waiting for it."
     )
@@ -985,6 +1255,102 @@ def _newest_outcome(
     return max(done, key=lambda held: held[0])[1] if done else None
 
 
+@dataclass(frozen=True)
+class NothingToReport:
+    """A live read's third answer (#4253 review): GitHub holds nothing that will ever report
+    for this wait, so it ends now rather than being read again. ``found`` says what the read
+    found, in words for the chat."""
+
+    found: str
+
+
+async def read_live(
+    request: WakeRequest, fetch: Callable[[str], Awaitable[object]]
+) -> Outcome | NothingToReport | None:
+    """What GitHub says now about a timed-out merge or CI wait (#4253), as one of three
+    answers: an ``Outcome`` is the result; ``None`` means something is still open, pending or
+    queued, so it is worth reading again; ``NothingToReport`` means nothing will ever report
+    (no checks or statuses at all, or for an unnamed wait only skipped or neutral checks, as
+    a webhook of those says nothing to it either). ``fetch`` reads one REST path and returns
+    its JSON; a failed read raises, and so does an answer of the wrong shape.
+
+    A commit wait reads the commit's check runs and statuses (``name`` filters them as a
+    delivery's name is filtered); it is finished once every one it counts completed. A pull
+    request wait reads the pull request.
+    """
+    if request.kind == KIND_PULL_REQUEST:
+        pull = await fetch(f"repos/{request.repository}/pulls/{request.number}")
+        if not isinstance(pull, dict):
+            raise ValueError("the pull request read was not an object")
+        if str(pull.get("state") or "").lower() != "closed":
+            return None
+        payload = {"action": "closed", "number": request.number, "pull_request": pull}
+        return _pull_request_outcome(request, "pull_request", payload)
+    if request.kind != KIND_COMMIT:
+        return None
+    base = f"repos/{request.repository}/commits/{request.sha}"
+    runs = await fetch(f"{base}/check-runs?per_page=100")
+    statuses = await fetch(f"{base}/status?per_page=100")
+    if not isinstance(runs, dict) or not isinstance(statuses, dict):
+        raise ValueError("the commit's checks read was not an object")
+    found: list[tuple[str, bool, str]] = []  # name, finished, conclusion
+    for run in runs.get("check_runs") or []:
+        if isinstance(run, dict):
+            finished = str(run.get("status") or "") == "completed"
+            found.append((_text(run.get("name")), finished, _text(run.get("conclusion"))))
+    for status in statuses.get("statuses") or []:
+        if isinstance(status, dict):
+            state = _text(status.get("state"))
+            found.append((_text(status.get("context")), state != "pending", state))
+    if request.name:
+        found = [item for item in found if _name_matches(request.name, item[0])]
+    if not found:
+        named = f" named {request.name}" if request.name else ""
+        return NothingToReport(f"the commit has no check runs or commit statuses{named}")
+    if not all(finished for _, finished, _ in found):
+        return None
+    has_status = any(
+        _name_matches(request.name, _text(status.get("context"))) if request.name else True
+        for status in statuses.get("statuses") or []
+        if isinstance(status, dict)
+    )
+    counted = [(name, result.lower()) for name, _, result in found if result.lower()]
+    results = [item for item in counted if item[1] not in _NO_RESULT]
+    if counted and not results:
+        if not request.name:
+            # Only skipped or neutral checks: they say nothing about the commit, as the same
+            # result by webhook says nothing to an unnamed wait (#3910), and nothing else will
+            # report (#4253 review). A named wait asked for that check, and takes it.
+            names = ", ".join(name or "(unnamed)" for name, _ in counted[:5])
+            return NothingToReport(f"its only finished checks were skipped or neutral ({names})")
+        results = counted
+    failing = [name or "(unnamed)" for name, result in results if result != "success"]
+    state = next((result for _, result in results if result != "success"), "success")
+    if not results:
+        state = "neutral"
+    summary = (
+        f"CI on {request.repository}@{request.sha[:12]} finished: {state}"
+        f" ({len(found)} check{'s' if len(found) != 1 else ''}"
+        + (f"; not passing: {', '.join(failing[:5])}" if failing else "")
+        + ")"
+    )
+    # Only check runs read are surely CI: a commit status among them may be a deploy.
+    return Outcome(summary, state, ci=not has_status)
+
+
+def merge_notice_told(message_ids: Iterable[str], pull: str) -> bool:
+    """Whether one of these stored message ids is the release's merge notice about ``pull``
+    (``owner/repo#n``, matched case-blind): ``work-release:<work>:live-check:<refs>``."""
+    wanted = pull.casefold()
+    for message_id in message_ids:
+        if not str(message_id).startswith(RELEASE_NOTICE_PREFIX):
+            continue
+        _, found, refs = str(message_id).partition(LIVE_CHECK_KEY)
+        if found and wanted in {ref.strip().casefold() for ref in refs.split(",")}:
+            return True
+    return False
+
+
 def _raw(record: dict) -> bytes:
     try:
         return raw_body(record)
@@ -1124,6 +1490,19 @@ def review_timeout_message(
 def timeout_message(request: WakeRequest, review_chats: str = "", reviewer_down: str = "") -> str:
     if request.stopped:
         return stopped_message(request)
+    if request.kind == KIND_TIME and request.check_command:
+        said = (
+            f" Your check said not yet {request.check_runs} time(s); the last run, at"
+            f" {request.check_last}"
+            if request.check_runs
+            else " Your check never got to run."
+        )
+        return (
+            f"AgentDeck wake-on: the time you set for {request.target} has come, and your"
+            f" check never said it happened.{said} Decide what that means now: no evidence by"
+            " the deadline may itself be the answer. Register another time wait only if it"
+            " is still running."
+        )
     if request.kind == KIND_TIME:
         return (
             f"AgentDeck wake-on: it is time to check on {request.target}, as you asked."
@@ -1138,11 +1517,112 @@ def timeout_message(request: WakeRequest, review_chats: str = "", reviewer_down:
         )
     if request.kind == KIND_REVIEW:
         return review_timeout_message(request, minutes, review_chats, reviewer_down)
-    return (
+    text = (
         f"AgentDeck wake-on: nothing arrived for {request.target} within {minutes}"
         " minutes. A webhook can be dropped, so check its state once yourself, then carry"
         " on, or register the wait again if it is still running."
     )
+    if request.then:
+        # The deck registered it when it merged (#4253): what the chat was to do once the
+        # deploy landed is still to do, whether or not it did.
+        text += (
+            f" The deck registered this wait when it merged your pull request.\n\n{request.then}"
+        )
+    return text
+
+
+def _clock(at: float) -> str:
+    return datetime.fromtimestamp(at).astimezone().strftime("%H:%M")
+
+
+def _fenced(output: str) -> str:
+    text = output.strip() or "(no output)"
+    if len(text) > MAX_CHECK_OUTPUT:
+        text = "…" + text[-MAX_CHECK_OUTPUT:]
+    return "\n```\n" + text.replace("```", "` ` `") + "\n```"
+
+
+def check_message(request: WakeRequest, code: int | None, output: str, why: str, at: float) -> str:
+    """The wake a check's run sends: exit 0 (it happened), else what went wrong."""
+    if code == 0:
+        return (
+            f"AgentDeck wake-on: your check for {request.target} says it happened (exit 0 at"
+            f" {_clock(at)}), so the wait has ended. Its output:{_fenced(output)}"
+        )
+    return (
+        f"AgentDeck wake-on: your check for {request.target} went wrong at {_clock(at)}"
+        f" ({why}), so the wait has ended. Its output:{_fenced(output)}\nLook at it yourself"
+        f" once, then fix the command and register the wait again (exit {CHECK_NOT_YET} means"
+        " not yet), or carry on."
+    )
+
+
+#: How much of a check's output the deck holds while it runs: the tail, never the whole of a
+#: busy log query's output in the web process.
+CHECK_OUTPUT_HELD = 4 * MAX_CHECK_OUTPUT
+
+
+async def run_check(
+    command: str, cwd: str, timeout_s: float, env: dict[str, str] | None = None
+) -> tuple[int | None, str, str]:
+    """Run one check: (exit code or None, output tail, why it failed in words, or "").
+
+    ``env`` is laid over the web's environment, without its own ``CLAUDE_CONFIG_DIR``: the
+    check runs as its chat's account (``WakeOnService``'s ``check_env``, built by
+    ``check_account_env``), and with none named ``agentdeck mcp-call`` refuses.
+    """
+    from .mcp_call import MCP_CONFIG_ENV
+
+    # Never the web's own account: with no ``env`` naming one, ``mcp-call`` refuses.
+    environment = {
+        k: v for k, v in os.environ.items() if k not in ("CLAUDE_CONFIG_DIR", MCP_CONFIG_ENV)
+    }
+    environment[MCP_CONFIG_ENV] = ""
+    environment.update(env or {})
+    try:
+        process = await asyncio.create_subprocess_exec(
+            "/bin/bash",
+            "-c",
+            command,
+            cwd=cwd or str(Path.home()),
+            env=environment,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        return None, "", f"it could not start: {exc}"
+    held = bytearray()
+
+    async def drain() -> None:
+        assert process.stdout is not None
+        while chunk := await process.stdout.read(65536):
+            held.extend(chunk)
+            del held[:-CHECK_OUTPUT_HELD]
+
+    def tail() -> str:
+        return held.decode("utf-8", "replace")[-(MAX_CHECK_OUTPUT + 1) :]
+
+    reading = asyncio.ensure_future(drain())
+    try:
+        await asyncio.wait_for(asyncio.gather(reading, process.wait()), timeout=timeout_s)
+    except TimeoutError:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
+        reading.cancel()
+        with contextlib.suppress(Exception, asyncio.CancelledError):
+            await reading
+        with contextlib.suppress(Exception):
+            await process.wait()
+        return None, tail(), f"it ran past {round(timeout_s / 60)} minutes and was stopped"
+    except asyncio.CancelledError:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
+        reading.cancel()
+        raise
+    code = process.returncode
+    return code, tail(), "" if code in (0, CHECK_NOT_YET) else f"exit {code}"
 
 
 def _received_at(delivery: Delivery) -> float | None:
@@ -1213,6 +1693,17 @@ class WakeOnRegistry:
                         cut_from=0.0,
                         asked_at=max(held.asked_at, request.asked_at),
                         extra_s=request.extra_s,
+                        # The deck's live-check request rides on whichever wait it lands on
+                        # (#4253): a chat that registered the same deploy wait still gets it.
+                        then=request.then or held.then,
+                        # Registered again with a check, or without one: the new one stands.
+                        check_command=request.check_command,
+                        check_cwd=request.check_cwd,
+                        check_every_s=request.check_every_s,
+                        check_at=request.check_at,
+                        check_runs=0,
+                        check_last="",
+                        check_gen=held.check_gen + 1,
                     )
                     current[index] = renewed
                     self._save(current)
@@ -1274,6 +1765,60 @@ class WakeOnRegistry:
             item.id for item in self.for_chat(chat_id) if item.kind == KIND_REVIEW and about(item)
         )
 
+    def claim_check(self, request_id: str, now: float) -> WakeRequest | None:
+        """Take a time wait's due check run, moving its next run on; None when it is not due.
+
+        Under the file's lock, so of two web workers side by side (#3070) only one runs it.
+        """
+        with self._file.locked():
+            current = list(self.all())
+            for index, held in enumerate(current):
+                if (
+                    held.id == request_id
+                    and held.check_command
+                    and not held.pending_text
+                    and held.check_at <= now < held.deadline
+                ):
+                    current[index] = replace(held, check_at=now + held.check_every_s)
+                    self._save(current)
+                    return current[index]
+        return None
+
+    def settle_check(
+        self,
+        request_id: str,
+        gen: int,
+        now: float,
+        *,
+        last: str = "",
+        wake: Callable[[WakeRequest], str] | None = None,
+    ) -> WakeRequest | None:
+        """End one check run on the wait as it is held now, in one locked step.
+
+        Only while the run still belongs to it: same registration (``check_gen``), not
+        owing a message, before its deadline. ``wake`` gives the message it then owes,
+        stored as ``pending_text`` and returned for sending; without it the run said not
+        yet and is counted (``last``). None when the run no longer belongs to the wait.
+        """
+        with self._file.locked():
+            current = list(self.all())
+            for index, held in enumerate(current):
+                if (
+                    held.id != request_id
+                    or held.check_gen != gen
+                    or held.pending_text
+                    or now >= held.deadline
+                ):
+                    continue
+                if wake is None:
+                    settled = replace(held, check_runs=held.check_runs + 1, check_last=last)
+                else:
+                    settled = replace(held, pending_text=wake(held))
+                current[index] = settled
+                self._save(current)
+                return settled
+        return None
+
     def extend(self, request_id: str, now: float) -> None:
         """Give a timed-out wait its one more round, on the wait as it is held now: one
         renewed or brought forward in between keeps what that write gave it."""
@@ -1284,6 +1829,19 @@ class WakeOnRegistry:
                     current[index] = replace(held, deadline=now + held.extra_s, extra_s=0.0)
                     self._save(current)
                     return
+
+    def revise(self, request_id: str, due_by: float, **changes) -> WakeRequest | None:
+        """Change a wait the deck settled itself (#4253), on the wait as it is held now, and
+        only while it is still due by ``due_by`` and owes no message: one renewed, answered or
+        cancelled in between keeps what that write gave it. The wait as written, else None."""
+        with self._file.locked():
+            current = list(self.all())
+            for index, held in enumerate(current):
+                if held.id == request_id and held.deadline <= due_by and not held.pending_text:
+                    current[index] = replace(held, **changes)
+                    self._save(current)
+                    return current[index]
+        return None
 
     def tell(self, request_id: str, told: tuple[str, ...]) -> None:
         """Record a needs-you wait's told stops on the wait as it is held now, so a renewal
@@ -1381,9 +1939,70 @@ def register(
         deadline=now + timeout_s,
         asked_at=now if asked else 0.0,
         extra_s=timeout_s if fields.get("kind") in PATIENT_KINDS else 0.0,
+        # A check first runs one interval on: the chat has just looked for itself.
+        check_at=now + fields["check_every_s"] if fields.get("check_command") else 0.0,
         **fields,
     )
     return registry.add(request)
+
+
+def settled_head(row: dict, sha: str) -> bool:
+    """Whether a cached pull-request row's head is ``sha`` and the release settles its green
+    CI (#4253): the head of an open, non-draft pull request it will merge, or of one it
+    merged, whose deploy wait and live check it now carries. Green CI landing after the
+    merge is the same result, so it wakes nobody either (#4253 review); a pull request
+    closed without a merge settles nothing."""
+    if not sha or not str(row.get("headRefOid") or "").lower().startswith(sha.lower()):
+        return False
+    if row.get("mergedAt") or str(row.get("state") or "").lower() == "merged":
+        return True
+    return str(row.get("state") or "").lower() == "open" and not row.get("isDraft")
+
+
+def register_deck_wait(
+    registry: WakeOnRegistry,
+    streams_root: Path | str,
+    session_key: str,
+    chat_id: str,
+    *,
+    then: str,
+    **fields,
+) -> WakeRequest:
+    """Store a wait the deck registers for a chat when it merges (#4253), carrying ``then``.
+
+    A deploy that already finished before the wait was stored (a late release pass, a
+    restart) sends no second delivery, so the wait would only find it at its timeout; it is
+    made due at once instead, and the web's deadline pass reads the same result and delivers
+    it with ``then`` (#4253 review). Should that read miss, the wait gets one full round.
+    """
+    wait = register(registry, session_key, chat_id, then=then, **fields)
+    if seen_deploy_result(streams_root, wait) is not None:
+        made = registry.revise(wait.id, wait.deadline, deadline=wait.registered_at)
+        wait = made or wait
+    return wait
+
+
+def check_account_env(config: object, session_key: str) -> dict[str, str]:
+    """The environment a chat's check adds: which account's MCP servers it may use.
+
+    ``AGENTDECK_MCP_CONFIG`` (``mcp_call.MCP_CONFIG_ENV``) names the chat's own Claude
+    account's ``.claude.json``, and ``CLAUDE_CONFIG_DIR`` points at that account as the
+    deck's Claude processes do (``claude_env``). A Codex chat or an account the config no
+    longer names gets it empty, and ``agentdeck mcp-call`` then refuses: no fallback to
+    another account's server of the same name.
+    """
+    from . import claude_env
+    from .mcp_call import MCP_CONFIG_ENV
+    from .restart_nudge import session_key_parts
+
+    parts = session_key_parts(session_key)
+    env: dict[str, str] = {MCP_CONFIG_ENV: ""}
+    for account in getattr(config, "accounts", ()) if parts else ():
+        if account.provider == parts[0] == "claude_code" and account.label == parts[1]:
+            claude_env.point_at(env, account.root)
+            folder = Path.home() if claude_env.uses_default_login(account.root) else account.root
+            env[MCP_CONFIG_ENV] = str(Path(folder) / ".claude.json")
+    return env
 
 
 class WakeOnService:
@@ -1413,8 +2032,33 @@ class WakeOnService:
         present: Callable[[WakeRequest], bool] = lambda request: True,
         skills_sha: Callable[[], str | None] = lambda: None,
         reviewer_down: Callable[[], str] = lambda: "",
+        live_read: Callable[[WakeRequest], Awaitable[Outcome | NothingToReport | None]]
+        | None = None,
+        ask_review: Callable[[str, int, str], Awaitable[str]] | None = None,
+        ready_head: Callable[[WakeRequest], bool] = lambda request: False,
+        release_notices: Callable[[str, datetime], Iterable[str]] = lambda chat_id, since: (),
+        check_env: Callable[[str], dict[str, str]] = lambda session_key: {},
     ) -> None:
         self._enabled = bool(enabled)
+        # The routine wakes the deck settles itself (#4253). ``live_read`` reads a timed-out
+        # merge or CI wait from GitHub (``read_live``); ``ask_review`` asks for a fresh review
+        # of a pull request whose review chat closed with no verdict, answering "" when asked
+        # (or already asked) and the refusal in words otherwise; ``ready_head`` says, from
+        # cached rows alone, whether a commit wait's commit is the head of an open, non-draft
+        # pull request the release merges, or of one it merged (``settled_head``);
+        # ``release_notices`` lists the release's message ids stored for a chat since a time.
+        # None of the reads blocks the event loop.
+        self._live_read = live_read
+        self._ask_review = ask_review
+        self._ready_head = ready_head
+        self._release_notices = release_notices
+        # Waits a read or a re-ask is settling now: ``expire_due`` and ``next_due`` leave them.
+        self._settling: set[str] = set()
+        self._side_tasks: set[asyncio.Task] = set()
+        # What a chat's check runs with on top of the web's environment, by session key: its
+        # own Claude account's ``CLAUDE_CONFIG_DIR``, so ``agentdeck mcp-call`` reads that
+        # account's MCP servers and keys, never another account's of the same name.
+        self._check_env = check_env
         # Why no reviewer is starting, in words, or "" (#4064): a review wait's timeout says
         # so rather than sending the worker to ask for another chat nobody reads.
         self._reviewer_down = reviewer_down
@@ -1460,6 +2104,9 @@ class WakeOnService:
         self._needs_you_retry: tuple[list[NeedsYouStop], bool, float] | None = None
         self._task: asyncio.Task | None = None
         self._deadline_task: asyncio.Task | None = None
+        # Time-wait checks running now (#4256), by wait id.
+        self._checks: dict[str, asyncio.Task] = {}
+        self._check_slots = asyncio.Semaphore(MAX_CHECKS_AT_ONCE)
         self._stop = asyncio.Event()
         # Set by every registry write, so the deadline task re-plans when a wait is added,
         # renewed, answered or cancelled — the cancel route writes the registry directly.
@@ -1512,8 +2159,13 @@ class WakeOnService:
     ) -> WakeRequest:
         """Store one wait; ``asked`` is a review wait the chat asked for the review of now."""
         return register(
-            self.registry, session_key, chat_id, timeout_s=timeout_s, asked=asked,
-            clock=self._clock, **fields,
+            self.registry,
+            session_key,
+            chat_id,
+            timeout_s=timeout_s,
+            asked=asked,
+            clock=self._clock,
+            **fields,
         )
 
     def start(self) -> None:
@@ -1525,6 +2177,9 @@ class WakeOnService:
 
     async def stop(self) -> None:
         tasks = [task for task in (self._task, self._deadline_task) if task is not None]
+        tasks += list(self._side_tasks)
+        tasks += list(self._checks.values())
+        self._checks.clear()
         self._task = self._deadline_task = None
         if not tasks:
             return
@@ -1548,10 +2203,14 @@ class WakeOnService:
         due: list[float] = []
         now = self._clock()
         for request in self.registry.all():
+            if request.id in self._settling:
+                continue  # its read or re-ask re-plans when it ends
             if request.pending_text:
                 due.append(self._retry_at.get(request.id, now))
                 continue
             due.append(request.deadline)
+            if request.check_command and request.id not in self._checks:
+                due.append(request.check_at)
             if request.kind == KIND_DECK_DEPLOY and request.sha in self._unsure_at:
                 due.append(self._unsure_at[request.sha] + UNSURE_RETRY_S)
             if request.kind == KIND_DECK_DEPLOY and request.sha in self._skills_wait:
@@ -1572,6 +2231,10 @@ class WakeOnService:
             retry_s: float | None = None
             try:
                 self.expire_due()
+                for request in self.due_checks():
+                    self._checks[request.id] = asyncio.create_task(
+                        self._run_check(request), name=f"wake-on-check-{request.id}"
+                    )
                 due = self.next_due()
                 backoff.succeeded()
             except Exception:  # noqa: BLE001 - one bad wait must not stop the others' clocks
@@ -1642,7 +2305,7 @@ class WakeOnService:
                     continue
                 outcome = match(request, delivery)
                 if outcome is not None:
-                    self._fire(request, fired_message(request, outcome))
+                    self._deliver(request, outcome)
         self.expire_due()
 
     def _cut_short(
@@ -1666,6 +2329,7 @@ class WakeOnService:
             if (
                 request.kind not in (KIND_REVIEW, KIND_PULL_REQUEST)
                 or request.pending_text
+                or (stop.closed and request.stopped)
                 or at < request.registered_at
                 or f"{request.repository}#{request.number}" not in stop.pulls
             ):
@@ -1756,6 +2420,8 @@ class WakeOnService:
             stops, complete, _ = self._needs_you_retry
             self.needs_you(stops, complete=complete)
         for request in self.registry.all():
+            if request.id in self._settling:
+                continue
             if request.pending_text:
                 self._fire(request, request.pending_text)
             elif request.kind == KIND_DECK_DEPLOY and self._deck_includes(request.sha):
@@ -1772,11 +2438,25 @@ class WakeOnService:
                 if request.kind in PATIENT_KINDS and not request.stopped and not request.cut_from:
                     outcome = self._seen_at_timeout(request)
                     if outcome is not None:
-                        self._fire(request, fired_message(request, outcome))
+                        self._deliver(request, outcome)
                         continue
                     if request.extra_s:
                         self.registry.extend(request.id, now)
                         continue
+                    if (
+                        request.kind in LIVE_READ_KINDS
+                        and self._live_read is not None
+                        and self._settle(request, self._read_at_timeout)
+                    ):
+                        continue
+                if (
+                    CLOSED_REVIEW in request.stopped
+                    and request.kind in (KIND_REVIEW, KIND_PULL_REQUEST)
+                    and request.number is not None
+                    and self._ask_review is not None
+                    and self._settle(request, self._ask_again)
+                ):
+                    continue
                 down = ""
                 if request.kind == KIND_REVIEW:
                     try:
@@ -1784,6 +2464,203 @@ class WakeOnService:
                     except Exception:  # noqa: BLE001 - a health read never blocks a wake
                         log.warning("wake-on: reviewer health unreadable", exc_info=True)
                 self._fire(request, timeout_message(request, self._review_chats, down))
+
+    def _settle(self, request: WakeRequest, work: Callable[[WakeRequest], Awaitable[None]]) -> bool:
+        """Start ``work`` on a due wait off the deadline pass, once; False with no event loop,
+        when the wait takes today's path instead."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return False
+        self._settling.add(request.id)
+
+        async def run() -> None:
+            try:
+                await work(request)
+            except Exception:  # noqa: BLE001 - the wait is told on its next pass
+                log.exception("wake-on: settling %s failed", request.id)
+            finally:
+                self._settling.discard(request.id)
+                self._changed.set()
+
+        task = loop.create_task(run(), name=f"wake-on-settle-{request.id}")
+        self._side_tasks.add(task)
+        task.add_done_callback(self._side_tasks.discard)
+        return True
+
+    async def _read_at_timeout(self, request: WakeRequest) -> None:
+        """B1 of #4253: read a timed-out merge or CI wait from GitHub once. A result wakes
+        the chat; still running, it waits again up to a day from its registration, silently;
+        a failed read, nothing that will ever report, or the day's end, sends the timeout
+        message saying what the deck read, and ends the wait."""
+        failed = ""
+        outcome: Outcome | NothingToReport | None = None
+        try:
+            outcome = await self._live_read(request)  # type: ignore[misc]
+        except Exception as exc:  # noqa: BLE001 - a failed read falls back to the timeout
+            log.warning("wake-on: live read of %s failed", request.target, exc_info=True)
+            failed = str(exc).strip()[:200] or type(exc).__name__
+        now = self._clock()
+        held = next((item for item in self.registry.all() if item.id == request.id), None)
+        if held is None or held.deadline > now or held.pending_text:
+            return  # answered, cancelled or renewed while it read
+        if failed:
+            self._fire(
+                held,
+                timeout_message(held)
+                + f" The deck tried to read it from GitHub itself at the timeout, and the read"
+                f" failed ({failed}).",
+            )
+            return
+        if isinstance(outcome, NothingToReport):
+            self._fire(
+                held,
+                timeout_message(held)
+                + f" The deck read it from GitHub itself at the timeout: {outcome.found}, so"
+                " nothing is left to report and it stopped waiting.",
+            )
+            return
+        if outcome is not None:
+            self._deliver(held, outcome, read=True)
+            return
+        cap = held.registered_at + LIVE_READ_CAP_S
+        if now >= cap - 1:
+            self._fire(
+                held,
+                timeout_message(held)
+                + " The deck read it from GitHub itself at each timeout and it was still"
+                " running, so it waited again, up to a day from when you registered the wait.",
+            )
+            return
+        deadline = min(now + LIVE_READ_AGAIN_S, cap)
+        log.info("wake-on: %s still running; reading again at %s", request.target, deadline)
+        self.registry.revise(held.id, now, deadline=deadline)
+
+    async def _ask_again(self, request: WakeRequest) -> None:
+        """B2 of #4253: a review chat closed with no verdict, so ask for a fresh review the way
+        ``review-request`` with ``no_verdict`` does. Accepted, the wait keeps waiting without
+        a message; refused, or with the reviewer down, the chat hears what the deck tried."""
+        down = ""
+        try:
+            down = self._reviewer_down()
+        except Exception:  # noqa: BLE001 - a health read never blocks a wake
+            log.warning("wake-on: reviewer health unreadable", exc_info=True)
+        refusal = ""
+        if not down:
+            note = (
+                "The deck asked again by itself: the last review ended with no verdict for this"
+                f" head. {request.stopped}"
+            )[:1800]
+            try:
+                refusal = await self._ask_review(  # type: ignore[misc]
+                    request.repository, int(request.number or 0), note
+                )
+            except Exception as exc:  # noqa: BLE001 - an unclear ask is told, never retried
+                log.warning("wake-on: asking again for %s failed", request.target, exc_info=True)
+                refusal = f"the request failed ({str(exc).strip()[:200] or type(exc).__name__})"
+        now = self._clock()
+        held = next((item for item in self.registry.all() if item.id == request.id), None)
+        if held is None or held.deadline > now or held.pending_text or not held.stopped:
+            return  # a verdict, a renewal or a cancel reached it meanwhile
+        if down or refusal:
+            self._fire(held, reask_refused_message(held, refusal, down))
+            return
+        log.info("wake-on: asked again for %s; %s keeps waiting", request.target, held.session_key)
+        if held.kind == KIND_REVIEW:
+            deadline = now + REVIEW_TIMEOUT_MINUTES * 60
+        else:
+            deadline = max(held.cut_from, now)
+        self.registry.revise(
+            held.id, now, deadline=deadline, stopped="", cut_from=0.0, asked_at=now
+        )
+
+    def _deliver(self, request: WakeRequest, outcome: Outcome, *, read: bool = False) -> None:
+        """Wake the chat with a result, unless the deck already settles it (#4253): green CI
+        on the head of a ready pull request the release merges or merged (a deploy's result
+        at that head still wakes it), or a merge the release's own
+        notice told the chat of in the last ``MERGE_TOLD_S``."""
+        quiet = ""
+        try:
+            if (
+                request.kind == KIND_COMMIT
+                and outcome.ci
+                and outcome.state == "success"
+                and self._ready_head(request)
+            ):
+                quiet = "green on the head of a ready pull request the deck merges"
+            elif request.kind == KIND_PULL_REQUEST and outcome.state == "merged":
+                since = datetime.now(UTC) - timedelta(seconds=MERGE_TOLD_S)
+                ids = self._release_notices(request.chat_id, since)
+                if merge_notice_told(ids, f"{request.repository}#{request.number}"):
+                    quiet = "the deck's own merge notice already told the chat"
+        except Exception:  # noqa: BLE001 - an unread cache wakes the chat as before
+            log.warning("wake-on: could not tell whether %s is settled", request.id, exc_info=True)
+        if quiet:
+            log.info(
+                "wake-on: ended %s's wait on %s: %s", request.session_key, request.target, quiet
+            )
+            self._retry_at.pop(request.id, None)
+            self.registry.remove([request.id])
+            return
+        self._fire(request, fired_message(request, outcome, read=read))
+
+    def due_checks(self) -> list[WakeRequest]:
+        """Claim every time-wait check due now that is not already running here."""
+        now = self._clock()
+        claimed = []
+        for request in self.registry.all():
+            if (
+                request.check_command
+                and request.id not in self._checks
+                and not request.pending_text
+                and request.check_at <= now < request.deadline
+            ):
+                taken = self.registry.claim_check(request.id, now)
+                if taken is not None:
+                    claimed.append(taken)
+        return claimed
+
+    async def _run_check(self, request: WakeRequest) -> None:
+        try:
+            async with self._check_slots:
+                code, output, why = await run_check(
+                    request.check_command,
+                    request.check_cwd,
+                    CHECK_TIMEOUT_S,
+                    env=self._check_env(request.session_key),
+                )
+            self.check_done(request, code, output, why)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - one check's fault never stops the deadlines
+            log.exception("wake-on: check for %s failed", request.id)
+        finally:
+            self._checks.pop(request.id, None)
+            self._changed.set()
+
+    def check_done(self, request: WakeRequest, code: int | None, output: str, why: str) -> None:
+        """Act on one check run: not yet is counted silently, anything else wakes the chat.
+
+        Both go through one locked registry step that first checks the run still belongs
+        to the wait as held (``WakeOnRegistry.settle_check``): a wait cancelled, timed out,
+        already owing its message, or registered again while this ran (by either web
+        worker) is left alone. A wake is written into the wait as the message it owes
+        before it is sent, so a renewal after that cannot change or repeat it.
+        """
+        now = self._clock()
+        if code == CHECK_NOT_YET:
+            tail = " ".join(output.split())[-MAX_CHECK_LAST:]
+            last = f"{_clock(now)}, printed: {tail or '(nothing)'}"
+            self.registry.settle_check(request.id, request.check_gen, now, last=last)
+            return
+        owed = self.registry.settle_check(
+            request.id,
+            request.check_gen,
+            now,
+            wake=lambda held: check_message(held, code, output, why, now),
+        )
+        if owed is not None:
+            self._fire(owed, owed.pending_text)
 
     def needs_you_waited(self) -> bool:
         """Whether any chat waits on Works needing the owner: the overview then rebuilds on

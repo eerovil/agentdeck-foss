@@ -19,6 +19,8 @@ def test_a_chat_moves_through_its_stages_on_the_decks_own_messages():
         [
             "Context: Work for eerovil/agentdeck#1.",
             "I approve the spec. Remove possible spec-only label and start implementing.",
+            # A success notice's routine line (#4253) is read past.
+            "Routine notice: do what it asks, then answer in one or two sentences.\n\n"
             "Your queued job 12 finished successfully",
             "AgentDeck: before eerovil/agentdeck#2 at abc goes to review",
             "AgentDeck: the deck's reviewer asks for changes on eerovil/agentdeck#2",
@@ -39,6 +41,19 @@ def test_a_chat_moves_through_its_stages_on_the_decks_own_messages():
     ]
     assert token_report.stage_turns(["You are AgentDeck's Claude reviewer."])[0][0] == "review"
     assert token_report.stage_turns([]) == []
+    assert (
+        token_report.reviewed_work(
+            "You are AgentDeck's Claude reviewer. The deck started you to review pull request"
+            " A/b#7 at commit `abc` for the Work A/b#6. This directory"
+        )
+        == "a/b#6"
+    )
+    fallback = (
+        "You are AgentDeck's Claude reviewer. ChatGPT was not started: chat x/chat#9"
+        " (https://github.com/x/chat/issues/9), which asks for a review of a/b#5.\n"
+    )
+    assert token_report.reviewed_work(fallback) == "a/b#5"
+    assert token_report.reviewed_work("Context: Work for a/b#1. for the Work a/b#2.") == ""
 
 
 def test_a_transcript_counts_one_call_per_request_and_each_tool_it_asks_for(tmp_path):
@@ -126,6 +141,146 @@ def test_a_chat_belongs_to_a_work_only_on_evidence_the_deck_accepts(tmp_path):
     assert token_report.work_at(works["two-runs"], later - 1) == "a/b#11"
     assert token_report.work_at(works["two-runs"], later) == "a/b#12"
     assert token_report.work_at([], later) == ""
+
+
+def test_units_per_finished_work_spread_every_unit_over_the_works_closed_in_the_window(tmp_path):
+    path = tmp_path / "deck.db"
+    db = sqlite3.connect(path)
+    db.executescript(
+        """
+        create table works (work_id, source_kind, source_key, created_at);
+        insert into works values
+            ('github_issue:A/b#1', 'github_issue', 'A/b#1', '1'),
+            ('github_issue:a/b#2', 'github_issue', 'a/b#2', '1'),
+            ('github_issue:a/c#3', 'github_issue', 'a/c#3', '1'),
+            ('github_issue:Z/d#1', 'github_issue', 'Z/d#1', '1');
+        """
+    )
+    db.commit()
+    db.close()
+    since = token_report._stamp("2026-11-03T08:00:00+00:00")
+    until = token_report._stamp("2026-11-10T08:00:00+00:00")
+    asked = []
+
+    def closes(repository, start, end, numbers):  # GitHub's answer: every close, cached or not
+        asked.append((repository, numbers))
+        if repository == "z/d":
+            raise token_report.subprocess.CalledProcessError(1, "gh")
+        return {"a/b#1", "a/b#9", "a/c#3"}
+
+    finished, unread = token_report.finished_works(str(path), since, until, closes)
+    # b#9 closed but no chat worked on it; b#2 did not close; z/d could not be read.
+    # Nothing here is in the deck's issue cache or work_signoff: GitHub alone decides.
+    assert finished == {"a/b#1", "a/c#3"}
+    # one read per repository, names folded, asking only about its Works
+    assert asked == [("a/b", {"1", "2"}), ("a/c", {"3"}), ("z/d", {"1"})]
+    assert unread == ["z/d"]
+
+    def call(ts, work, output):
+        made = token_report.Call(ts, 1, output=output)
+        made.work = work
+        return made
+
+    unit = 1 / token_report.OUTPUT
+    chats = {
+        ("w", ""): [
+            call(since - 40 * 86400, "a/c#3", unit),  # an old turn of a recently changed chat
+            call(since - 86400, "a/c#3", unit),
+            call(since + 1, "a/c#3", unit),
+        ],
+        ("o", ""): [call(since + 1, "a/b#9", unit)],
+        ("n", ""): [call(since + 1, "", unit), call(until, "", 5 * unit)],
+    }
+    lines = token_report.per_finished_work(chats, finished, since, until, since - 30 * 86400)
+    assert lines[0].startswith("2 Works finished, 3.0 units: 1.500 units per finished Work")
+    assert "on them 1.0u" in lines[1] and "not finished in the window 1.0u" in lines[1]
+    assert lines[2].startswith("  as if all on one account: 1.500")
+    assert "(0.0u): 1.500" in lines[3]
+    assert "mean 1.000u, median 1.000u" in lines[4] and "with no Claude use 1" in lines[4]
+    assert "p90 1.800u" in lines[4]  # within the two costs, 0 and 2, not past the dearest
+
+    short = token_report.per_finished_work(chats, finished, since, until, None, unread)
+    assert short[0].endswith("n/a units per finished Work")  # z/d's Works are unknown
+    assert "n/a" in short[2] and "n/a" in short[3]
+    assert short[4] == "  n/a: closes not read for z/d, so the count is short"
+    assert short[5] == "  life cost per finished Work: n/a, and no per-repository figures"
+    assert len(short) == 6  # no life cost or repository row from a short finished set
+
+    quiet = token_report.per_finished_work(chats, set(), since, until)
+    assert quiet[0].endswith("n/a units per finished Work")
+    assert "n/a" in quiet[2] and "n/a" in quiet[3]
+    assert len(quiet) == 4  # no life cost line when no Work finished
+
+
+def test_github_closes_counts_a_close_as_it_stood_at_the_window_end(monkeypatch):
+    since = token_report._stamp("2026-11-03T08:00:00+00:00")
+    until = token_report._stamp("2026-11-10T08:00:00+00:00")
+    events = {  # each issue's close and reopen events, oldest first
+        "5": "closed\t2026-11-04T00:00:00Z\nreopened\t2026-11-12T00:00:00Z",  # reopened later
+        "6": "closed\t2026-11-04T00:00:00Z\nreopened\t2026-11-05T00:00:00Z",  # in the window
+        "7": "closed\t2026-11-05T00:00:00Z\nreopened\t2026-11-11T00:00:00Z\n"
+        "closed\t2026-11-20T00:00:00Z",  # closed again in a later week
+        "2": "closed\t2026-11-10T08:00:00Z",  # the window's end is outside it
+    }
+    paths = []
+
+    def run(args, **kwargs):
+        path = args[2]
+        paths.append(path)
+        if "/events" in path:
+            out = events[path.split("/")[4]]
+        else:
+            # GitHub lists only issues updated strictly after ``since``; #1's last update
+            # is its close, exactly at the window's start
+            after = token_report._stamp(path.split("since=")[1].split("&")[0])
+            assert after < since
+            out = "\n".join(
+                [
+                    "1\tclosed\t2026-11-03T08:00:00Z",
+                    "2\tclosed\t2026-11-10T08:00:00Z",
+                    "4\tclosed\t2026-11-02T08:00:00Z",  # closed before, updated since
+                    "5\topen\t\treopened",
+                    "6\topen\t\treopened",
+                    "7\tclosed\t2026-11-20T00:00:00Z",
+                    "8\topen\t",  # never closed, so its events are not read
+                    "9\tclosed\t2026-11-04T00:00:00Z",  # not one of the Works asked about
+                    "x\tclosed\t2026-11-04T00:00:00Z",
+                    "short",
+                ]
+            )
+        return token_report.subprocess.CompletedProcess(args, 0, out, "")
+
+    monkeypatch.setattr(token_report.subprocess, "run", run)
+    works = {"1", "2", "4", "5", "6", "7", "8"}
+    assert token_report.github_closes("A/B", since, until, works) == {"a/b#1", "a/b#5", "a/b#7"}
+    assert paths[0] == "repos/A/B/issues?state=all&since=2026-11-03T07:59:59Z&per_page=100"
+    # only the issues the list cannot settle have their events read
+    assert sorted(path.split("/")[4] for path in paths[1:]) == ["2", "5", "6", "7"]
+    assert token_report.github_closes("A/B", since, until) >= {"a/b#9"}
+    day = 86400.0
+    # newest first is read the same as oldest first
+    assert token_report.closed_at_end(
+        [("reopened", since + 2 * day), ("closed", since + 3 * day), ("closed", since + day)],
+        since, until,
+    )  # fmt: skip
+    # a close and a reopen in the same second leave it open
+    assert not token_report.closed_at_end(
+        [("reopened", since + day), ("closed", since + day)], since, until
+    )
+    # closed before the window and reopened in it: not finished in this week
+    assert not token_report.closed_at_end(
+        [("closed", since - day), ("reopened", since + day)], since, until
+    )
+    assert not token_report.closed_at_end([], since, until)
+
+
+def test_a_chat_the_database_ties_to_no_work_takes_the_one_its_first_message_names():
+    assert token_report.prompt_work("You are working A/b#12 for the AgentDeck poller.") == "a/b#12"
+    assert token_report.prompt_work("Run the kanban-worker skill for a/b#3.") == "a/b#3"
+    assert token_report.prompt_work("You are working b#12 for the poller.") == ""  # no owner
+    brief = "You are AgentDeck's Claude reviewer. Review pull request a/b#7 for the Work a/b#6."
+    assert token_report.prompt_work(brief) == "a/b#6"
+    assert token_report.prompt_work("hello") == ""
 
 
 def test_compacting_pays_only_once_enough_calls_follow_it():

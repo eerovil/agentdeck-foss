@@ -1347,7 +1347,7 @@ async def _agent_review(request: Request, step: work_actions.Step, label: str) -
     there by head and diff like any other. A chat someone already holds is left to them.
     """
     from .. import chat_board, chat_review
-    from .routes_chat_board import earlier_of, note_review_head, releases_of, shipped_of
+    from .routes_chat_board import earlier_of, note_review_head, releases_of
 
     service = getattr(request.app.state, "review_fallback", None)
     if service is None:
@@ -1360,7 +1360,6 @@ async def _agent_review(request: Request, step: work_actions.Step, label: str) -
             pulls=step.pulls,
             releases=releases_of(request.app),
             earlier=earlier_of(request.app),
-            shipped=shipped_of(request.app),
         )
     except chat_review.ReviewError as exc:
         return "failed", str(exc)
@@ -1408,7 +1407,6 @@ async def _write(
             earlier_of,
             note_review_head,
             releases_of,
-            shipped_of,
         )
 
         try:
@@ -1420,7 +1418,6 @@ async def _write(
                 board=chat_board_of(request.app),
                 releases=releases_of(request.app),
                 earlier=earlier_of(request.app),
-                shipped=shipped_of(request.app),
             )
         except chat_review.ReviewError as exc:
             # ``open_review`` finds the open chat before it writes one, so a refusal here is
@@ -1454,7 +1451,7 @@ async def _write(
         return "done", f"{label} asked for {step.issue}: {answer}"
     if step.kind == "deck_ship_now":
         # Ship now, fix later (#4212): the router checks each pull request's head against its
-        # review, records the pass, files the follow-up and tells the agent.
+        # review, records the pass and tells the agent to fix the findings in this Work.
         router_service = getattr(request.app.state, "work_router", None)
         if router_service is None or not getattr(router_service, "enabled", True):
             return "failed", "this deck does not route Work events; nothing was sent."
@@ -1475,11 +1472,11 @@ async def _write(
             except Exception as exc:  # noqa: BLE001 - its pass or issue may have been written
                 logger.exception("work action Ship now for %s failed", pull)
                 return "uncertain", f"{label} did not finish for {pull} ({exc}); it may have run"
-            follow_up = shipped.get("follow_up") or ""
+            # A fix pushed on top meanwhile: the reviewed commit ships in its own pull request.
+            via = str(shipped.get("pull_request") or pull) if isinstance(shipped, dict) else pull
             done.append(
-                f"{pull} ships once its tests are green; follow-up {follow_up}"
-                if follow_up
-                else f"{pull} ships once its tests are green; {shipped.get('outcome', '')}"
+                f"{via} ships once its tests are green; this Work then fixes its findings"
+                + (f" in {pull}" if via != pull else "")
             )
         return "done", "; ".join(done) or "nothing to ship"
     if step.kind == "deck_withdraw":

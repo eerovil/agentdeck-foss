@@ -5,7 +5,7 @@ release's walks over every registered pull request froze pages for up to 88 s (#
 #3998). Now they run in their own process, ``agentdeck-services.service``
 (``services_process``), and the web reaches them through ``services_link``. This module is
 what both places build them with: the services process for real, and the web itself only
-with the switch back on (``[services] in_web``) or under the tests' in-process stand-in.
+under the tests' in-process stand-in.
 
 ``Hooks`` is everything they need from outside their own files and the database: what only
 the web can do (start or interrupt a chat, start a reviewer, open a review chat, load a
@@ -25,10 +25,17 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from . import agent_review, review_refs, work_release
+from . import agent_review, review_paperwork, review_refs, work_release
 from .poller_ops import work_hold_labels, work_start_labels, work_unassigned_elsewhere
 from .scheduled_messages import ScheduledMessage
-from .wake_on import WakeOnRegistry, parse_request, register, registry_path
+from .wake_on import (
+    KIND_PULL_REQUEST,
+    WakeOnRegistry,
+    parse_request,
+    register,
+    register_deck_wait,
+    registry_path,
+)
 from .work import WorkRef
 from .work_backstop import MissedStartBackstop
 from .work_claims import start_issue
@@ -51,6 +58,7 @@ from .work_router import owner_of_pull as work_owner_of_pull
 from .work_signals import (
     acknowledge_comment,
     latest_comment,
+    read_comment,
     read_dependencies,
     read_map,
     read_map_body,
@@ -95,6 +103,9 @@ class Hooks:
     scanned: Callable[[], Awaitable[object]]
     #: The wake-on waits a review registers and a verdict ends (#3183).
     wake_registry: WakeOnRegistry
+    #: Register a pull request with a chat leg, done where the chats live (#4212): the
+    #: services process holds only a copy of them, which cannot republish a chat.
+    register_pull: Callable[[str, Any], Awaitable[bool]]
 
 
 def make_deck_claims(config) -> Callable[[str, str], bool]:
@@ -139,6 +150,46 @@ def services_enabled(config) -> bool:
     """
     chosen = config.services.enabled
     return config.github_webhook.enabled if chosen is None else bool(chosen)
+
+
+def held(stored: dict, keys, ref: Any) -> bool:
+    """Whether ``stored`` (``load_session_pull_requests``) registers ``ref`` with exactly one
+    of the chat's legs ``keys``, for its Work when it names one (#4212): a second leg holding
+    it could place it in another Work."""
+    found = [
+        item
+        for key in dict.fromkeys(keys)
+        for item in stored.get(key, ())
+        if item.identity == ref.identity
+    ]
+    return len(found) == 1 and (not ref.work_id or found[0].work_id == ref.work_id)
+
+
+async def register_split(
+    state: Any,
+    add: Callable[[str, Any], Awaitable[bool]],
+    repository: str,
+    number: int,
+    new: int,
+) -> bool:
+    """Register pull request ``new`` with every chat that registered ``number``, for the same
+    Work: the deck opened it to ship ``number``'s reviewed commit (#4212 review). Whether any
+    chat had and every one took it. ``add`` is ``Hooks.register_pull``: the web registers it,
+    since the services process's copy of a chat cannot be republished."""
+    from .models import PullRequestRef
+
+    wanted = (repository.lower(), number)
+    legs = [
+        (leg, ref.work_id)
+        for leg, refs in state.session_pull_requests.items()
+        for ref in refs
+        if ref.identity == wanted
+    ]
+    added = [
+        await add(leg, PullRequestRef(repository.lower(), new, work_id=work_id))
+        for leg, work_id in legs
+    ]
+    return bool(legs) and all(added)
 
 
 def check_on(config) -> bool:
@@ -247,6 +298,8 @@ CALLS: dict[str, tuple[str, ...]] = {
         "ship_now",
         "pre_review_done",
         "check_request",
+        "ready_press",
+        "ready_received",
     ),
     "services": (
         "hold_filing",
@@ -505,11 +558,79 @@ def build(
         repository, _, number = pull.rpartition("#")
         return await pull_files(repository, int(number)) if number.isdigit() else None
 
+    def release_wait_deploy(chat_id: str, refs: list[str], bodies: list[dict], then: str) -> bool:
+        # The deploy waits the live-check request asked the agent to register (#4253), on the
+        # chat's working leg as its own would be, carrying that request for when they end.
+        chat = state.chat_by_id(chat_id)
+        session = state.current_session_for_chat(chat) if chat is not None else None
+        session_key = session.key if session is not None else chat_id
+        requests = [parse_request(**body) for body in bodies]
+        for fields in requests:
+            register_deck_wait(
+                hooks.wake_registry,
+                config.github_webhook.path,
+                session_key,
+                chat_id,
+                then=then,
+                **fields,
+            )
+        # The chat's own waits on these merges are answered by the deploy wait, which says
+        # they merged: one wake, not two.
+        merged = {ref.casefold() for ref in refs}
+        hooks.wake_registry.remove(
+            item.id
+            for item in hooks.wake_registry.for_chat(chat_id)
+            if item.kind == KIND_PULL_REQUEST
+            and not item.pending_text
+            and f"{item.repository}#{item.number}".casefold() in merged
+        )
+        return bool(requests)
+
+    def release_note_evidence(work_id: str, sentence: str) -> bool:
+        # Appended to the summary's ``correctness`` part in place of the agent rewriting it
+        # (#4253); a Work with no summary yet has nothing to append to, so its agent is asked.
+        # Only that part is written, by a compare-and-swap, so a person's or agent's summary
+        # write from the web meanwhile is kept (#4253 review).
+        from functools import partial
+
+        from .web.work_view import WORK_INPUTS_TOPIC
+        from .work_resolution import ResolutionError, evidence_added
+
+        if db is None:
+            return False
+        try:
+            written = db.append_work_correctness(
+                work_id, partial(evidence_added, sentence=sentence)
+            )
+        except ResolutionError:
+            return False  # no room in the part: the agent is asked to rewrite it
+        if not written:
+            return False
+        state.bus.publish(WORK_INPUTS_TOPIC)
+        return True
+
+    async def release_rerun(work_id: str, repository: str, head: str) -> bool:
+        client = hooks.runtime_http()
+        if client is None:
+            return False
+        response = await client.post(
+            "/jobs/rerun-verification",
+            json={"work_id": work_id, "repository": repository, "head": head},
+            timeout=180.0,
+        )
+        response.raise_for_status()
+        return bool(response.json().get("job"))
+
     release = work_release.WorkReleaseService(
         work_release.ReleaseStore(config.github_webhook.store_path / work_release.STORE_FILENAME),
         work_release.Ports(
             press_is_review=reviewer == agent_review.OFF,
             ship_unfinished=state.ship_unfinished,
+            shipped_findings=lambda work_id: [
+                (record.pull, record.fix)
+                for record in state.shipped_by_work(work_id.removeprefix("github_issue:"))
+                if record.shipped
+            ],
             switched=switched_repositories,
             paused=release_paused,
             starred=work_starred,
@@ -536,6 +657,9 @@ def build(
             reviews=state.review_events,
             forget_reviews=state.forget_review_events,
             pull_files=release_pull_files,
+            wait_deploy=release_wait_deploy,
+            note_evidence=release_note_evidence,
+            rerun_verification=release_rerun,
         ),
         enabled=enabled,
     )
@@ -625,17 +749,13 @@ def build(
                 ),
             )
 
-    async def ship_open_head(repository: str, number: int) -> tuple[str, bool, str]:
+    async def ship_open_head(repository: str, number: int) -> tuple[str, bool]:
         from .review_refs import pull_facts
 
         facts = await pull_facts(repository, number) or {}
         if str(facts.get("state") or "").upper() != "OPEN":
-            return "", False, ""
-        return (
-            str(facts.get("headRefOid") or ""),
-            bool(facts.get("isDraft")),
-            str(facts.get("baseRefOid") or ""),
-        )
+            return "", False
+        return str(facts.get("headRefOid") or ""), bool(facts.get("isDraft"))
 
     async def ship_mark_ready(repository: str, number: int) -> bool:
         from .work_claims import run_gh_write
@@ -644,22 +764,21 @@ def build(
         outcome, _why = await run_gh_write(argv, repository, "Mark ready")
         return outcome == "done"
 
-    async def ship_file_issue(repository: str, title: str, body: str):
-        from .work_claims import own_assignee
+    async def ship_split(repository: str, number: int, head: str, issue: int) -> int:
+        from .ship_split import open_ship_pull
 
-        assignee = own_assignee(repository, deck_claims)
-        return await file_shipped_issue(config.poller.root, repository, title, body, assignee)
+        return await open_ship_pull(repository, number, head, issue)
 
     ship = ShipPorts(
         open_head=ship_open_head,
         mark_ready=ship_mark_ready,
-        file_issue=ship_file_issue,
-        find_filed=find_shipped_issue,
         claim=state.claim_shipped,
-        note_follow_up=state.note_follow_up,
-        note_merged=state.note_shipped_merge,
         note_shipped=state.note_shipped,
         shipped=state.shipped,
+        split=ship_split,
+        register=lambda repository, number, new: register_split(
+            state, hooks.register_pull, repository, number, new
+        ),
     )
 
     router = WorkRouterService(
@@ -683,6 +802,8 @@ def build(
         ready_head=ready_pull_head,
         # Review fixes that grew the diff over 15% add a design check to the checklist (#4220).
         diff_sizes=review_refs.diff_sizes,
+        # Missing paperwork refuses pre-review-done before any review starts (#4261).
+        paperwork=review_paperwork.check,
         enabled=enabled,
         watcher=watcher,
         # The ownership label on an issue no chat owns starts its Work's agent (step 5b).
@@ -708,6 +829,8 @@ def build(
         finished=work_finished,
         # The closing comment a restart kept the router from seeing is read from GitHub.
         latest_comment=latest_comment,
+        # A findings comment a review chat's closing line links is read back (#4279).
+        read_comment=read_comment,
         busy=lambda work_id: work_busy(state, work_id),
         # The reviewer's verdict handed to a chat ends its review waits quietly (#3183).
         on_verdict=hooks.wake_registry.answer_reviews,
@@ -776,58 +899,6 @@ def build(
     )
     router.filing_holds = services._filing_now
     return services
-
-
-async def file_shipped_issue(root: str, repository: str, title: str, body: str, assignee: str = ""):
-    """File a shipped head's follow-up issue as a New work is, with the repository's
-    canonical ownership label (the first its manifest names), so its Work starts.
-
-    Read in the manifest's order (#4223): ``work_start_labels`` keeps the labels as an
-    unordered set, which names no first one."""
-    from . import new_work
-    from .poller_ops import issue_label_targets
-
-    wanted = repository.lower()
-    labels = next(
-        (
-            target.ownership_labels
-            for target in issue_label_targets(root)
-            if target.repository.lower() == wanted
-        ),
-        (),
-    )
-    if not labels:
-        return new_work.Outcome("failed", f"{repository} has no ownership label to start it")
-    target = new_work.Target(repository, project="", ownership_label=labels[0])
-    return await new_work._create(target, title, body, False, assignee)
-
-
-async def find_shipped_issue(repository: str, marker: str, since: float) -> int | None:
-    """The issue of ``repository`` whose body carries ``marker``, among every issue updated
-    since ``since`` (#4212 review): ``None`` only once all of them were read.
-
-    Listed, not searched (a search index lags a filing by minutes), and every page, not the
-    newest few: an issue filed after ``since`` was updated after it too, and an hour's slack
-    covers a clock off from GitHub's. An unread page raises, so only a whole read proves
-    none was filed."""
-    import json
-    from datetime import UTC, datetime
-
-    from . import gh_cli
-
-    after = datetime.fromtimestamp(max(0.0, since - 3600), UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-    argv = ["gh", "api", "--paginate"]
-    argv += [f"repos/{repository}/issues?state=all&since={after}&per_page=100"]
-    argv += ["--jq", ".[] | {number, body}"]
-    code, stdout = await gh_cli.run(argv, timeout=60)
-    if code != 0:
-        raise RuntimeError(f"listing {repository}'s issues exited {code}")
-    for line in (stdout or b"").decode().splitlines():
-        if line.strip():
-            item = json.loads(line)
-            if marker in str(item.get("body") or ""):
-                return int(item["number"])
-    return None
 
 
 def wake_registry_for(config) -> WakeOnRegistry:

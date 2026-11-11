@@ -17,7 +17,7 @@ from typing import Any
 
 from .. import agent_review, live_chats, work_actions
 from ..providers import PROVIDERS
-from ..work_services import Hooks, wake_registry_for
+from ..work_services import Hooks, held, wake_registry_for
 
 log = logging.getLogger(__name__)
 
@@ -120,6 +120,33 @@ async def refresh_overview(app: Any) -> None:
         await service.refresh()
 
 
+async def register_pull(app: Any, leg: str, ref: Any) -> bool:
+    """Register a pull request with a chat for its Work (#4212): one transaction puts it on
+    the working leg alone, takes it off the chat's older legs and leaves every other
+    registration alone, answered yes only once the database reads it back that way. A
+    failed write changes nothing, in the database or in memory, so the next press writes it
+    again; the web's memory then takes, for every leg of the chat, what was committed."""
+    state = app.state.app_state
+    if state.db is None:
+        state.add_pull_request(leg, ref)
+        return True
+    current = state.chat_current_session_key(leg)
+    keys = (*dict.fromkeys((*state.chat_session_keys(leg), leg, current)),)
+    if not state.db.register_chat_pull_request(current, keys, ref):
+        log.warning("services: %s was not stored for %s", ref.identity, leg)
+        return False
+    stored = state.db.load_session_pull_requests()
+    if not held(stored, keys, ref):
+        return False
+    for key in keys:
+        if stored.get(key):
+            state.session_pull_requests[key] = stored[key]
+        else:
+            state.session_pull_requests.pop(key, None)
+    state._republish_chat(leg)
+    return True
+
+
 def in_process_hooks(app: Any, *, scheduled_messages, chat_board, collector) -> Hooks:
     """The hooks of services built inside the web: the switch back, or the tests' stand-in."""
 
@@ -149,4 +176,5 @@ def in_process_hooks(app: Any, *, scheduled_messages, chat_board, collector) -> 
         wake_registry=app.state.wake_on.registry
         if getattr(app.state, "wake_on", None) is not None
         else wake_registry_for(app.state.config),
+        register_pull=lambda leg, ref: register_pull(app, leg, ref),
     )

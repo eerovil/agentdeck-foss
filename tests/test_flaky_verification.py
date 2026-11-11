@@ -723,6 +723,76 @@ async def test_a_rerun_tests_the_verified_commit_after_the_worktree_moves_on(
     assert (repo / "a.txt").read_text() == "still editing\n", "the worktree is left alone"
 
 
+async def test_the_deck_runs_a_works_last_verification_again_at_a_new_head(
+    tmp_path, monkeypatch
+):
+    """#4253: after the deck merged the base in, or a review passed a head nothing tests, it
+    runs the Work's last verification again in a clean checkout of the new head, for the same
+    chat, instead of waking that chat to do it; not while one still runs."""
+    from dataclasses import replace
+
+    from test_jobs import _queue
+
+    from agentdeck import jobs
+
+    repo = _git_repo(tmp_path / "repo")
+    real_git = jobs._git
+    monkeypatch.setattr(
+        jobs, "_git", lambda *args, cwd: "" if args[0] == "fetch" else real_git(*args, cwd=cwd)
+    )
+    queue = _queue(tmp_path)  # never started: what is queued is what is checked
+    first = queue.submit(
+        command=["uv", "run", "pytest", "-q"], cwd=str(repo), purpose=VERIFICATION,
+        run_id="gen-1", work_id=WORK, session_key="claude_code:chat", max_minutes=30,
+    )
+    (repo / "a.txt").write_text("base merged in\n")
+    subprocess.run(["git", "-C", str(repo), "commit", "-qam", "merge"], check=True)
+    head = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True, check=True
+    ).stdout.strip()
+    (repo / "a.txt").write_text("the chat's own edit\n")
+
+    assert await queue.rerun_verification(WORK, REPO, head) is None, "its result is to come"
+    queue._jobs[first.id] = replace(first, state=jobs.DONE, tested_workspace=_tested("0" * 40))
+    assert await queue.rerun_verification(WORK, "eerovil/other", head) is None
+    assert await queue.rerun_verification("github_issue:org/store#9", REPO, head) is None
+    again = await queue.rerun_verification(WORK.upper(), REPO, head.upper())
+
+    checkout = repo / ".worktrees" / f"verify-head-{head[:12]}"
+    assert again.cwd == str(checkout)
+    assert real_git("rev-parse", "HEAD", cwd=str(checkout)) == head
+    assert again.command == ["uv", "run", "pytest", "-q"]
+    assert (again.purpose, again.session_key, again.work_id, again.run_id) == (
+        VERIFICATION, "claude_code:chat", WORK, "gen-1",
+    )
+    assert again.max_minutes == 30
+    assert (repo / "a.txt").read_text() == "the chat's own edit\n", "its worktree is left alone"
+    assert await queue.rerun_verification(WORK, REPO, head) is None, "one at a time"
+
+    # That run ends and its checkout is removed; the next head is made from the repository.
+    queue._jobs[again.id] = replace(again, state=jobs.DONE, tested_workspace=_tested(head))
+    jobs._remove_pinned_checkout(str(checkout))
+    assert not checkout.exists()
+    (repo / "a.txt").write_text("base merged in again\n")
+    subprocess.run(["git", "-C", str(repo), "commit", "-qam", "merge 2"], check=True)
+    second = real_git("rev-parse", "HEAD", cwd=str(repo))
+    third = await queue.rerun_verification(WORK, REPO, second)
+    assert third is not None
+    assert third.cwd == str(repo / ".worktrees" / f"verify-head-{second[:12]}")
+    assert real_git("rev-parse", "HEAD", cwd=third.cwd) == second
+
+
+def test_only_what_a_fresh_checkout_can_run_is_run_again_there():
+    from agentdeck import jobs
+
+    assert jobs._fresh_checkout_command(["uv", "run", "pytest", "-q"]) == [
+        "uv", "run", "pytest", "-q",
+    ]
+    assert jobs._fresh_checkout_command(["pytest", "-q"]) == [*jobs._checkout_pytest(), "-q"]
+    for command in (["make", "test"], ["scripts/kube_pytest.sh"], [".venv/bin/pytest"], []):
+        assert jobs._fresh_checkout_command(command) is None
+
+
 async def test_a_verification_of_an_uncommitted_tree_says_why_it_gets_no_rerun(tmp_path):
     from test_jobs import _queue
 
@@ -896,7 +966,7 @@ async def test_a_killed_verification_is_resubmitted_once_by_the_queue(tmp_path):
     assert [job.id for job in queue.list()] == [killed.id, again.id], "resubmitted once only"
 
 
-@pytest.mark.parametrize("prefix", ["verify-base-", "verify-rerun-"])
+@pytest.mark.parametrize("prefix", ["verify-base-", "verify-rerun-", "verify-head-"])
 def test_a_pinned_checkout_is_made_detached_and_removed_again(tmp_path, prefix):
     from agentdeck.jobs import JobError, _pinned_checkout, _remove_pinned_checkout
 

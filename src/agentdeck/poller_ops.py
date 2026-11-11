@@ -443,6 +443,8 @@ class _ManifestFacts:
     deploy_repos: tuple[str, ...] = ()
     # Every ``[[repos]]`` id, issue repository or not, as the manifest names it.
     repos: tuple[str, ...] = ()
+    # The ``[[repos]]`` ids that hold code (``holds_code = true``, #4233).
+    code_repos: tuple[str, ...] = ()
     # ``[policy] merge_method``: how a release merges (#2895 step 2 merges in the deck).
     merge_method: str = "merge"
     # The ``[authorization]`` slot as the engine parses it (``authorization.parse_policy``):
@@ -566,6 +568,11 @@ def _manifest(path: Path) -> _ManifestFacts:
             str(entry.get("id")).strip()
             for entry in (repos if isinstance(repos, list) else [])
             if isinstance(entry, dict) and entry.get("id")
+        ),
+        code_repos=tuple(
+            str(entry.get("id")).strip()
+            for entry in (repos if isinstance(repos, list) else [])
+            if isinstance(entry, dict) and entry.get("holds_code") is True and entry.get("id")
         ),
         main_deck=_main_deck(raw.get("decks")),
         readable=True,
@@ -710,6 +717,43 @@ def work_evidence_repositories(root: str | Path) -> dict[str, str]:
         evidence = _qualified(facts.org, facts.artifact_repos[0])
         for repo in facts.issue_repos:
             found.setdefault(_qualified(facts.org, repo).lower(), evidence)
+    return found
+
+
+def work_code_checkouts(root: str | Path) -> dict[str, tuple[str, ...]]:
+    """Each project's code checkouts on this host, by lowercased issue repository (#4233).
+
+    The folders its machine-local overlay's ``[checkouts]`` names for a repository its
+    manifest says ``holds_code`` (not an evidence clone), as written there (``~`` not
+    expanded), in its order; a project whose overlay names none, or cannot be read, is
+    left out. These are shared main checkouts a person or another agent may have left on
+    any branch or commit, so a Work's agent is told to read GitHub's branch in them.
+    """
+    base_root = Path(root).expanduser() / "instances"
+    found: dict[str, tuple[str, ...]] = {}
+    for instance in _instance_names(root):
+        facts = _manifest(base_root / instance / "poller.toml")
+        if not (facts.readable and facts.org):
+            continue
+        try:
+            with (base_root / instance / "overlay.toml").open("rb") as handle:
+                checkouts = tomllib.load(handle).get("checkouts")
+        except (OSError, tomllib.TOMLDecodeError):
+            continue
+        if not isinstance(checkouts, dict):
+            continue
+        code = {repo.lower() for repo in facts.code_repos}
+        paths = tuple(
+            dict.fromkeys(
+                value.strip()
+                for key, value in checkouts.items()
+                if str(key).lower() in code and isinstance(value, str) and value.strip()
+            )
+        )
+        if not paths:
+            continue
+        for repo in facts.issue_repos:
+            found.setdefault(_qualified(facts.org, repo).lower(), paths)
     return found
 
 

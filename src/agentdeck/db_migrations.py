@@ -126,6 +126,13 @@ def _drop_chat_review_heads(connection: sqlite3.Connection) -> None:
     connection.execute("DROP TABLE IF EXISTS chat_review_heads")
 
 
+def _drop_shipped_follow_ups(connection: sqlite3.Connection) -> None:
+    """Drop ``shipped_follow_ups``: a shipped head's findings stay with its own Work now, so
+    ``shipped_heads`` keeps only which head shipped and for which Work (#4212); nothing was
+    ever stored in it on the live deck, so nothing is copied."""
+    connection.execute("DROP TABLE IF EXISTS shipped_follow_ups")
+
+
 def _widen_chat_review_heads(connection: sqlite3.Connection) -> None:
     """Key ``chat_review_heads`` by chat *and* pull request (#2637).
 
@@ -296,6 +303,7 @@ MIGRATIONS = (
         "a question box's answer held while the runtime restarts",
         (("scheduled_messages", "interaction_answer", "TEXT"),),
     ),
+    Migration(21, "drop shipped_follow_ups", (), _drop_shipped_follow_ups),
 )
 
 

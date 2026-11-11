@@ -242,6 +242,29 @@ def remote_hooks(
     async def refresh_overview() -> None:
         await resent("refresh_overview", {})
 
+    async def register_pull(leg: str, ref) -> bool:
+        body = {
+            "leg": leg,
+            "repository": ref.repository,
+            "number": ref.number,
+            "work_id": ref.work_id,
+        }
+        try:
+            answer = await resent("register_pull", body)
+        except (WebUnreachable, WebNoAnswer):
+            log.warning("services: registering %s did not reach the web", ref.identity)
+            return False
+        if not (answer or {}).get("ok"):
+            return False
+        # Read at once what the web just wrote, as its own memory would hold it; the copy's
+        # next ``registrations`` then finds nothing new to act on, as in the web. A read that
+        # failed answers no rows: it is not taken, and the split stops for another press.
+        stored = db.load_session_pull_requests()
+        if not work_services.held(stored, (*state.chat_session_keys(leg), leg), ref):
+            return False
+        state.session_pull_requests = stored
+        return True
+
     def schedule(message: ScheduledMessage) -> ScheduledMessage | None:
         recorded = db.record_scheduled_message(message)
         if recorded is not None:
@@ -285,6 +308,7 @@ def remote_hooks(
         runtime_http=runtime_http,
         scanned=scanned,
         wake_registry=wake_registry,
+        register_pull=register_pull,
     )
 
 
@@ -538,10 +562,6 @@ def main(argv: list[str]) -> None:
     )
     initialize_error_reporting("services")
     config = load_config(config_path())
-    if config.services.in_web:
-        # The switch back (#4017): the web runs them, so this process stands down.
-        log.info("services: [services] in_web is on; the web runs the Work services")
-        return
     socket = services_socket_path(config)
     socket.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     socket.unlink(missing_ok=True)

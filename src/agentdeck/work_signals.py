@@ -136,6 +136,23 @@ async def latest_comment(repository: str, number: int, since: str, login: str) -
     return max(found, key=lambda item: str(item.get("created_at") or ""), default=None)
 
 
+async def read_comment(repository: str, comment_id: int) -> dict | None:
+    """One issue comment by its id, as GitHub's REST API gives it; ``None`` if unread (#4279)."""
+    gh = shutil.which("gh")
+    if gh is None:
+        return None
+    path = f"repos/{repository}/issues/comments/{int(comment_id)}"
+    try:
+        code, out, _err = await gh_cli.run_once(
+            [gh, "api", path], timeout=GH_TIMEOUT_S, repo=repository
+        )
+        comment = json.loads(out) if code == 0 else None
+    except Exception:  # noqa: BLE001 - unread recovers nothing, and the review is asked again
+        log.warning("work signal: comment %s of %s unread", comment_id, repository, exc_info=True)
+        return None
+    return comment if isinstance(comment, dict) else None
+
+
 async def read_map(repository: str, number: int) -> dict | None:
     """A parent issue's state, label names and sub-issue counts, its sub-issues' own
     ``repository``/``number``/``state``/``closed_at`` (``sub_issues``), and when the last of

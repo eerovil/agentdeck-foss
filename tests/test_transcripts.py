@@ -2342,10 +2342,18 @@ def test_a_turn_a_background_notification_opened_is_told_from_a_message(
 
 
 def test_the_job_report_prefix_is_what_the_queue_sends():
-    from agentdeck.jobs import DONE, Job, job_message
+    from agentdeck.deck_notices import ROUTINE_LINE
+    from agentdeck.jobs import DONE, FAILED, Job, job_message
 
     job = Job("abc123", ["pytest", "-q"], "/tmp", "/nonexistent.log", 0.0, state=DONE)
-    assert job_message(job).startswith(transcripts.JOB_MESSAGE_PREFIX)
+    passed = job_message(job)
+    # A passed job is a success notice and opens with the routine line (#4253); a failed one
+    # does not. Either is still read as the queue's own report.
+    assert passed.startswith(ROUTINE_LINE)
+    assert transcripts._is_background_text(passed)
+    failed = job_message(Job("abc123", ["pytest"], "/tmp", "/nonexistent.log", 0.0, state=FAILED))
+    assert failed.startswith(transcripts.JOB_MESSAGE_PREFIX)
+    assert transcripts._is_background_text(failed)
 
 
 def test_only_a_working_chat_carries_its_turns_opener(tmp_path):

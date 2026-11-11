@@ -19,8 +19,10 @@ number and the web holds a ``GET /changes`` open (:class:`ServicesFollower`). It
 republished on the web's bus, so the cards, the review chips and the message delivery move as
 they did when the services ran in the web.
 
-With the switch back on (``[services] in_web``), or under the tests' stand-in, the services
-are built inside the web and :class:`InProcessTransport` calls them directly.
+Under the tests' stand-in (:data:`IN_PROCESS`) the services are built inside the web and
+:class:`InProcessTransport` calls them directly. The production switch back,
+``[services] in_web``, was deleted once the move's 7-day check passed (#4017); going back
+now means reverting #4021.
 """
 
 from __future__ import annotations
@@ -99,9 +101,9 @@ def services_socket_path(config=None) -> Path:
     return base / "agentdeck-services" / "services.sock"
 
 
-def runs_in_web(config) -> bool:
-    """Whether the moved services run inside the web: the switch back, or the tests' stand-in."""
-    return bool(config.services.in_web) or IN_PROCESS
+def runs_in_web() -> bool:
+    """Whether the moved services run inside the web: only under the tests' stand-in."""
+    return IN_PROCESS
 
 
 # --- transports ---
@@ -294,6 +296,12 @@ class RouterLink:
 
     async def check_request(self, *args: Any, **kwargs: Any) -> dict | None:
         return await self._transport.call("router", "check_request", args, kwargs)
+
+    async def ready_press(self, *args: Any, **kwargs: Any) -> str:
+        return await self._transport.call("router", "ready_press", args, kwargs)
+
+    async def ready_received(self, *args: Any, **kwargs: Any) -> int:
+        return await self._transport.call("router", "ready_received", args, kwargs)
 
 
 def _not_in_the_web(*_args: Any, **_kwargs: Any) -> Any:

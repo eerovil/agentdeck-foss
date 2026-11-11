@@ -16,7 +16,7 @@ import logging
 import sqlite3
 import threading
 import uuid
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -38,7 +38,7 @@ from .models import (
     UsageSnapshot,
 )
 from .questions import OpenQuestion
-from .review_history import ReviewEvent, ShippedFollowUp
+from .review_history import ReviewEvent, ShippedHead
 from .scheduled_messages import HeldAnswer, HeldAttachment, ScheduledMessage
 from .sqlite_open import OPEN_LOCK_WAIT_S, create_schema, use_wal
 from .work import WorkRef
@@ -959,30 +959,22 @@ CREATE TABLE IF NOT EXISTS review_events (
 );
 CREATE INDEX IF NOT EXISTS idx_review_events_pull ON review_events(pull, head);
 
--- A pull request shipped with its review findings left to a follow-up Work (#4212): which
--- head shipped, and the follow-up issue that fixes them. Kept after the pull request merges,
--- unlike review_events: the follow-up's review reads the shipped change again from it.
--- ``follow_up`` is "" until its issue exists, so a press that could not file one says so.
--- ``work`` is the shipped Work's issue, which links a follow-up shipped again to its own.
--- ``base`` is the base branch's commit when it shipped (``base...head`` is its change) and
--- ``merged`` its merge commit, written when the merge is heard. ``shipped`` is when its review
--- counted as passed; 0 while a press is unfinished (its follow-up not filed, or its acceptance
--- refused), which the Work page and the follow-up's review leave out: it did not ship.
-CREATE TABLE IF NOT EXISTS shipped_follow_ups (
+-- A pull request head shipped with its review findings left to fix in the same Work (#4212).
+-- Kept after the pull request merges, unlike review_events, for the Work page's Shipped line.
+-- ``work`` is the shipping Work's issue. ``shipped`` is when its review counted as passed; 0
+-- while a press is unfinished, which the Work page leaves out: it did not ship. ``fix`` is
+-- the pull request that fixes its findings, '' until one is named; the Work's issue stays
+-- open until it merges.
+CREATE TABLE IF NOT EXISTS shipped_heads (
     pull TEXT NOT NULL,
     head TEXT NOT NULL,
-    follow_up TEXT NOT NULL DEFAULT '',
-    findings TEXT NOT NULL DEFAULT '',
-    url TEXT NOT NULL DEFAULT '',
-    at REAL NOT NULL,
     work TEXT NOT NULL DEFAULT '',
-    base TEXT NOT NULL DEFAULT '',
-    merged TEXT NOT NULL DEFAULT '',
+    at REAL NOT NULL,
     shipped REAL NOT NULL DEFAULT 0,
+    fix TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (pull, head)
 );
-CREATE INDEX IF NOT EXISTS idx_shipped_follow_ups_follow_up ON shipped_follow_ups(follow_up);
-CREATE INDEX IF NOT EXISTS idx_shipped_follow_ups_work ON shipped_follow_ups(work);
+CREATE INDEX IF NOT EXISTS idx_shipped_heads_work ON shipped_heads(work);
 
 -- What the GitHub check last said about each pull request head (#4152): its check run's id, its
 -- state and a hash of what was sent, so only a real change writes to GitHub. Head ``comment`` is
@@ -2612,6 +2604,49 @@ class Db:
             ),
         )
 
+    def register_chat_pull_request(
+        self, current: str, keys: Iterable[str], ref: PullRequestRef
+    ) -> bool:
+        """Register ``ref`` with a chat in one transaction (#4212): it ends up on the working
+        leg ``current`` alone, its rows on the chat's other legs ``keys`` removed, so no older
+        leg keeps it for another Work or none. The Work is ``ref``'s, else the one the chat
+        already gave it (the working leg's first); every other pull request is left alone.
+        Whether it committed: a failed statement rolls the whole change back."""
+        others = tuple(key for key in dict.fromkeys(keys) if key != current)
+        chat = (current, *others)
+        marks = ", ".join("?" for _ in chat)
+        try:
+            with self._lock, self._conn:
+                work = ref.work_id
+                if not work:
+                    row = self._conn.execute(
+                        "SELECT work_id FROM session_pull_requests"
+                        f" WHERE session_key IN ({marks}) AND repository = ? AND number = ?"
+                        " AND work_id != ''"
+                        " ORDER BY session_key = ? DESC, added_at LIMIT 1",
+                        (*chat, ref.repository, ref.number, current),
+                    ).fetchone()
+                    work = row[0] if row else ""
+                if others:
+                    self._conn.execute(
+                        "DELETE FROM session_pull_requests"
+                        f" WHERE session_key IN ({', '.join('?' for _ in others)})"
+                        " AND repository = ? AND number = ?",
+                        (*others, ref.repository, ref.number),
+                    )
+                self._conn.execute(
+                    "INSERT INTO session_pull_requests"
+                    "(session_key, repository, number, added_at, work_id)"
+                    " VALUES (?, ?, ?, ?, ?)"
+                    " ON CONFLICT(session_key, repository, number) DO UPDATE"
+                    " SET work_id = excluded.work_id",
+                    (current, ref.repository, ref.number, datetime.now(UTC).isoformat(), work),
+                )
+            return True
+        except sqlite3.Error as exc:
+            self._log_failure("write", exc)
+            return False
+
     def delete_session_pull_request(self, session_key: str, ref: PullRequestRef) -> None:
         self._write(
             "DELETE FROM session_pull_requests"
@@ -3127,6 +3162,17 @@ class Db:
             (message_id,),
         )
         return self._scheduled_message_from_row(rows[0]) if rows else None
+
+    def scheduled_message_ids_since(self, chat_id: str, prefix: str, since: datetime) -> list[str]:
+        """The ids starting with ``prefix`` stored for ``chat_id`` at or after ``since``, in any
+        state but cancelled (#4253): a wake-on merge wait asks whether the release's merge
+        notice reached the same chat."""
+        rows = self._query(
+            "SELECT id FROM scheduled_messages WHERE chat_id = ? AND substr(id, 1, ?) = ?"
+            " AND created_at >= ? AND state != 'cancelled'",
+            (chat_id, len(prefix), prefix, since.isoformat()),
+        )
+        return [str(row[0]) for row in rows]
 
     def has_scheduled_message(self, message_id: str) -> bool:
         rows = self._query(
@@ -4344,6 +4390,50 @@ class Db:
             return None
         return self.work_resolution(resolution.work_id)
 
+    def append_work_correctness(
+        self, work_id: str, append: Callable[[str], str], *, tries: int = 3
+    ) -> bool | None:
+        """Change only the resolution's ``correctness`` part to ``append(current)`` (#4253).
+
+        The deck's own evidence, written beside a person's or agent's ``PUT`` from another
+        process: a compare-and-swap on the part alone, so no other part is ever written back
+        and an edit to this one between the read and the write is read again, not lost.
+        ``None`` when the Work has no summary; ``False`` when it could not be written;
+        ``append`` raising leaves the record as it is and its error reaches the caller.
+        """
+        for _ in range(tries):
+            try:
+                with self._lock:
+                    row = self._conn.execute(
+                        "SELECT correctness_summary FROM work_metadata"
+                        " WHERE work_id = ? AND resolution_updated_at IS NOT NULL",
+                        (work_id,),
+                    ).fetchone()
+            except sqlite3.Error as exc:
+                log.debug("work resolution read failed: %s", exc)
+                return False
+            if row is None:
+                return None
+            current = str(row[0] or "")
+            changed = append(current)
+            if changed == current:
+                return True
+            try:
+                with self._lock, self._conn:
+                    cursor = self._conn.execute(
+                        "UPDATE work_metadata SET correctness_summary = ?,"
+                        " resolution_updated_at = ? WHERE work_id = ?"
+                        " AND resolution_updated_at IS NOT NULL"
+                        " AND COALESCE(correctness_summary, '') = ?",
+                        (changed, datetime.now(UTC).isoformat(), work_id, current),
+                    )
+            except sqlite3.Error as exc:
+                log.debug("work resolution write failed: %s", exc)
+                return False
+            if cursor.rowcount == 1:
+                return True
+        return False
+
     def work_live_check(self, work_id: str) -> LiveCheck | None:
         """The agent's live check of the Work (#3141), or None when none or unreadable."""
         from .work_resolution import LiveCheck
@@ -4860,102 +4950,69 @@ class Db:
         """Forget ``owner/repo#n``'s review history: it merged or closed."""
         self._write("DELETE FROM review_events WHERE pull = ?", (pull.lower(),))
 
-    # --- pull requests shipped with findings left to a follow-up (#4212) ---
+    # --- pull requests shipped with findings left to the same Work (#4212) ---
 
     def claim_shipped(
-        self,
-        pull: str,
-        head: str,
-        findings: str,
-        url: str,
-        at: float,
-        work: str = "",
-        base: str = "",
+        self, pull: str, head: str, at: float, work: str = "", fix: str = ""
     ) -> bool:
-        """Record that ``pull`` ships at ``head`` with its findings left; ``False`` when that
-        head was already recorded (or the write failed), so one press files one follow-up."""
+        """Record that ``pull`` ships at ``head`` with its findings left to the Work of issue
+        ``work``, fixed in pull request ``fix`` when known; ``False`` when that head was
+        already recorded (or the write failed)."""
         try:
             with self._lock, self._conn:
                 cursor = self._conn.execute(
-                    "INSERT OR IGNORE INTO shipped_follow_ups"
-                    "(pull, head, findings, url, at, work, base) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        pull.lower(),
-                        head.lower(),
-                        findings,
-                        url,
-                        float(at),
-                        work.lower(),
-                        base.lower(),
-                    ),
+                    "INSERT OR IGNORE INTO shipped_heads(pull, head, work, at, fix)"
+                    " VALUES (?, ?, ?, ?, ?)",
+                    (pull.lower(), head.lower(), work.lower(), float(at), fix.lower()),
                 )
             return cursor.rowcount > 0
         except sqlite3.Error as exc:
             self._log_failure("write", exc)
             return False
 
-    def note_follow_up(self, pull: str, head: str, follow_up: str) -> bool:
-        """Name the follow-up issue (``owner/repo#n``) of a shipped head."""
-        return self._write(
-            "UPDATE shipped_follow_ups SET follow_up = ? WHERE pull = ? AND head = ?",
-            (follow_up.lower(), pull.lower(), head.lower()),
-        )
-
     def note_shipped(self, pull: str, head: str, at: float) -> bool:
         """Mark ``pull`` at ``head`` shipped: its review counted as passed at ``at``."""
         return self._write(
-            "UPDATE shipped_follow_ups SET shipped = ? WHERE pull = ? AND head = ? AND shipped = 0",
+            "UPDATE shipped_heads SET shipped = ? WHERE pull = ? AND head = ? AND shipped = 0",
             (float(at), pull.lower(), head.lower()),
         )
 
-    def note_shipped_merge(self, pull: str, merged: str) -> bool:
-        """Name the merge commit of ``pull``, once its merge is heard, on each head it
-        shipped with no merge named yet: the base merged in after a press is a new head of
-        the same change (#4212 review), and a pull request merges once."""
-        return self._write(
-            "UPDATE shipped_follow_ups SET merged = ? WHERE pull = ? AND merged = ''",
-            (merged.lower(), pull.lower()),
-        )
+    def note_shipped_fix(self, pull: str, work: str, fix: str) -> int:
+        """Name ``fix`` as the pull request fixing the findings ``pull`` shipped with for the
+        Work of issue ``work``; how many shipped heads it names it for."""
+        try:
+            with self._lock, self._conn:
+                cursor = self._conn.execute(
+                    "UPDATE shipped_heads SET fix = ? WHERE pull = ? AND work = ?",
+                    (fix.lower(), pull.lower(), work.lower()),
+                )
+            return cursor.rowcount
+        except sqlite3.Error as exc:
+            self._log_failure("write", exc)
+            return 0
 
-    def shipped(self, pull: str, head: str) -> ShippedFollowUp | None:
+    def shipped(self, pull: str, head: str) -> ShippedHead | None:
         """The record of ``pull`` shipped at ``head``, or ``None``."""
         rows = self._shipped_rows(" WHERE pull = ? AND head = ?", (pull.lower(), head.lower()))
         return rows[0] if rows else None
 
-    def shipped_for(self, follow_up: str) -> list[ShippedFollowUp]:
-        """The shipped heads whose findings the issue ``owner/repo#n`` follows up; a press
-        left unfinished did not ship and is not one."""
-        if not follow_up:
-            return []
-        return self._shipped_rows(" WHERE follow_up = ? AND shipped > 0", (follow_up.lower(),))
-
-    def shipped_by_work(self, work: str) -> list[ShippedFollowUp]:
+    def shipped_by_work(self, work: str) -> list[ShippedHead]:
         """The heads the Work of issue ``owner/repo#n`` shipped with findings left; a press
         left unfinished did not ship and is not one."""
         if not work:
             return []
         return self._shipped_rows(" WHERE work = ? AND shipped > 0", (work.lower(),))
 
-    def _shipped_rows(self, where: str, params: tuple) -> list[ShippedFollowUp]:
+    def _shipped_rows(self, where: str, params: tuple) -> list[ShippedHead]:
         rows = self._query(
-            "SELECT pull, head, follow_up, findings, url, at, work, base, merged, shipped"
-            " FROM shipped_follow_ups" + where + " ORDER BY at",
+            "SELECT pull, head, work, at, shipped, fix FROM shipped_heads" + where + " ORDER BY at",
             params,
         )
         return [
-            ShippedFollowUp(
-                pull=pull,
-                head=head,
-                follow_up=follow_up,
-                findings=findings,
-                url=url,
-                at=float(at),
-                work=work,
-                base=base,
-                merged=merged,
-                shipped=float(shipped),
+            ShippedHead(
+                pull=pull, head=head, work=work, at=float(at), shipped=float(shipped), fix=fix
             )
-            for pull, head, follow_up, findings, url, at, work, base, merged, shipped in rows
+            for pull, head, work, at, shipped, fix in rows
         ]
 
     # --- notes a chat shows and its agent never sees (#3227) ---

@@ -45,13 +45,10 @@ from agentdeck.providers.claude_code.provider import worker_type
 from agentdeck.providers.delivery import DeliveryReceipts
 
 
-def _app_with_state(tmp_path, *, with_transcript=False, extra_accounts=(), services_in_web=False):
+def _app_with_state(tmp_path, *, with_transcript=False, extra_accounts=()):
     import json
 
-    from agentdeck.config import ServicesConfig
-
     config = AppConfig(
-        services=ServicesConfig(in_web=services_in_web),
         history=HistoryConfig(db_path=str(tmp_path / "budgets.db")),
         accounts=[
             AccountConfig(provider="claude_code", label="test", config_dir=str(tmp_path)),

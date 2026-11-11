@@ -1387,6 +1387,26 @@ def test_scheduled_message_handoffs_name_each_chat_being_sent_to(tmp_path):
         db.close()
 
 
+def test_scheduled_message_ids_since_find_the_releases_notices_in_one_chat(tmp_path):
+    """#4253: a merge wait asks whether the release's merge notice reached its chat lately."""
+    now = datetime.now(UTC)
+    db = Db(tmp_path / "scheduled.db")
+    try:
+        for name, chat, minutes in (
+            ("work-release:o/r#1:live-check:o/r#2", "chat-1", 0),
+            ("work-release:o/r#1:old", "chat-1", -60),
+            ("wake-on:abc", "chat-1", 0),
+            ("work-release:o/r#3:live-check:o/r#4", "chat-2", 0),
+        ):
+            at = now + timedelta(minutes=minutes)
+            db.record_scheduled_message(ScheduledMessage(name, chat, name, at, at))
+        since = now - timedelta(minutes=30)
+        found = db.scheduled_message_ids_since("chat-1", "work-release:", since)
+        assert found == ["work-release:o/r#1:live-check:o/r#2"]
+    finally:
+        db.close()
+
+
 def test_only_the_owning_chat_can_cancel_a_scheduled_message(tmp_path):
     db = Db(tmp_path / "scheduled-cancel.db")
     message = ScheduledMessage(

@@ -122,6 +122,23 @@ async def load_work(request: Request) -> dict:
     return {"legs": list(legs)}
 
 
+@router.post("/register_pull")
+async def register_pull(request: Request) -> dict:
+    """Register a pull request with a chat leg: the one Ship now opened (#4212)."""
+    from ..models import PullRequestRef
+
+    body = await _body(request)
+    ref = PullRequestRef(
+        str(body.get("repository") or "").lower(),
+        int(body.get("number") or 0),
+        work_id=str(body.get("work_id") or ""),
+    )
+    leg = str(body.get("leg") or "")
+    if not leg or not ref.repository or ref.number <= 0:
+        raise HTTPException(status_code=422, detail="name a leg, repository and number")
+    return {"ok": await services_hooks.register_pull(request.app, leg, ref)}
+
+
 @router.post("/refresh_overview")
 async def refresh_overview(request: Request) -> dict:
     await services_hooks.refresh_overview(request.app)

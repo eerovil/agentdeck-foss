@@ -20,6 +20,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import NamedTuple
 
+from ...deck_notices import without_routine
 from ...images import SUPPORTED_IMAGE_MEDIA_TYPES
 from ...models import TokenTotals, TranscriptEvent
 from ...questions import trailing_question as trailing_question
@@ -884,7 +885,8 @@ def _only_tool_results(obj: dict) -> bool:
 
 def _is_background_text(text: object) -> bool:
     return _is_task_notification_text(text) or (
-        isinstance(text, str) and text.lstrip().startswith(JOB_MESSAGE_PREFIX)
+        # A passed job's message opens with the routine line (#4253).
+        isinstance(text, str) and without_routine(text.lstrip()).startswith(JOB_MESSAGE_PREFIX)
     )
 
 

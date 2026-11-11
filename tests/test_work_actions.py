@@ -657,7 +657,7 @@ def test_merge_when_ready_is_not_sent_when_refused_and_may_be_pressed_again(
 def test_ship_now_is_offered_at_findings_and_ships_through_the_router(tmp_path, monkeypatch):
     """#4212: Ship now, fix later shows inline beside the headline only on a Work the deck
     releases whose open pull request stands at review findings, and the press is the router's
-    ``ship_now`` for each of them, answered with the follow-up it filed."""
+    ``ship_now`` for each of them, answered with the findings left to this Work."""
     from agentdeck.web import routes_works
     from agentdeck.web.work_view import WorkDetail, render_work_sections
     from agentdeck.work_router import AgainRefused
@@ -700,24 +700,24 @@ def test_ship_now_is_offered_at_findings_and_ships_through_the_router(tmp_path, 
     )
     assert "- a/b#2: its findings kept no words" in both.confirm
     assert both.confirmed == f"a/b#1@{'1' * 40} a/b#2@{'2' * 40}"
-    landed = status(shipped=(("eerovil/agentdeck#7", "eerovil/agentdeck#41"),))
+    landed = status(shipped=("eerovil/agentdeck#7",))
     assert 'data-work-shipped="eerovil/agentdeck#7"' in landed
-    assert 'href="https://github.com/eerovil/agentdeck/issues/41"' in landed
+    assert "with its review findings, fixed next in this Work" in landed
     assert "data-work-shipped" not in offered
     from agentdeck.web.work_view import SECTION_INPUTS, _shipped_of
 
     before = WorkDetail(card=card, workspace=None, chats=(), verifications=())
     after = WorkDetail(
-        card=card, workspace=None, chats=(), verifications=(), shipped=(("a/b#9", "a/b#41"),)
+        card=card, workspace=None, chats=(), verifications=(), shipped=("a/b#9",)
     )
     assert SECTION_INPUTS["status"](before, "") != SECTION_INPUTS["status"](after, "")
     ref = SimpleNamespace(repository="a/b", number=7, work_id="github_issue:a/b#7")
     reader = SimpleNamespace(
         shipped_by_work=lambda work: (
-            [SimpleNamespace(pull="a/b#9", follow_up="a/b#41")] if work == "a/b#7" else []
+            [SimpleNamespace(pull="a/b#9", work="a/b#7")] if work == "a/b#7" else []
         )
     )
-    assert _shipped_of(reader, ref) == (("a/b#9", "a/b#41"),)
+    assert _shipped_of(reader, ref) == ("a/b#9",)
     assert _shipped_of(SimpleNamespace(), ref) == ()
     # A press refused after it passed the head offers Ship now again, quoting the findings
     # at the head it passed (a base update carried the pass to the live one), until marked.
@@ -746,6 +746,36 @@ def test_ship_now_is_offered_at_findings_and_ships_through_the_router(tmp_path, 
     events[1:] = [ReviewEvent("a/b#9", new, 3.0, ACCEPTED, "a", {"note": "keep it"}, 1)]
     marked.clear()
     assert _shippable(snapshot, shown) == ()  # an owner's own acceptance is no Ship now
+    # A fix pushed on top of the findings, still in review or not yet asked about: the
+    # reviewed commit is offered at its own head, to ship in a pull request of its own
+    # (#4212 review), until this Work shipped it; never once the fix has a verdict.
+    from agentdeck.review_history import ASKED
+
+    events[:] = [
+        ReviewEvent("a/b#9", old, 1.0, FINDINGS, "f", {"text": "1. off"}, 0),
+        ReviewEvent("a/b#9", new, 2.0, ASKED, "n", {}, 1),
+    ]
+    records: list[SimpleNamespace] = []
+    split = SimpleNamespace(
+        work_id="github_issue:a/b#7",
+        outputs=(SimpleNamespace(repository="a/b", number=9, head=new, is_open=True),),
+    )
+    snapshot.state.shipped_by_work = lambda work: records if work == "a/b#7" else []
+    assert _shippable(snapshot, split) == (f"a/b#9@{old}",)
+    assert _ship_findings(snapshot, split, (f"a/b#9@{old}",)) == (("a/b#9", "1. off"),)
+    button = ship_now_control(
+        SimpleNamespace(paused=False, outputs=split.outputs), True, (f"a/b#9@{old}",),
+        (("a/b#9", "1. off"),),
+    )
+    assert button.confirmed == f"a/b#9@{old}"
+    assert f"a/b#9 (at {old[:12]}, in a new pull request; the fix stays in a/b#9)" in (
+        button.confirm
+    )
+    records.append(SimpleNamespace(pull="a/b#20", head=old, shipped=1.0))
+    assert _shippable(snapshot, split) == ()
+    records.clear()
+    events.append(ReviewEvent("a/b#9", new, 3.0, PASS, "p", {}, 2))
+    assert _shippable(snapshot, split) == ()
 
     shipped: list[tuple[str, int]] = []
 
@@ -756,7 +786,7 @@ def test_ship_now_is_offered_at_findings_and_ships_through_the_router(tmp_path, 
             shipped.append((repository, number, head))
             if len(shipped) == 1:
                 raise AgainRefused("eerovil/agentdeck#9 moved past cccccccccccc")
-            return {"follow_up": "eerovil/agentdeck#41", "outcome": "review pass recorded"}
+            return {"head": "a" * 40, "outcome": "review pass recorded"}
 
     class Release:
         def handles(self, work_id):
@@ -787,7 +817,7 @@ def test_ship_now_is_offered_at_findings_and_ships_through_the_router(tmp_path, 
     refused = _post(client, "ship_now", "press-0002", confirmed=shown)
     assert refused.status_code == 409 and "moved past" in refused.text
     done = _post(client, "ship_now", "press-0003", confirmed=shown)
-    assert done.status_code == 200 and "follow-up eerovil/agentdeck#41" in done.text
+    assert done.status_code == 200 and "this Work then fixes its findings" in done.text
     assert shipped == [("eerovil/agentdeck", 7, HEAD)] * 2
 
 

@@ -149,7 +149,8 @@ TOKEN_IN_ENV_PROVIDERS = frozenset({"claude_code"})
 SESSION_TOKEN_INSTRUCTIONS = """
 - Your own session key: this chat was started with the AgentDeck session token
   `{token}`. Resolve it once by running
-  `~/agentdeck/.venv/bin/agentdeck session-key {token}` as a command of its own;
+  `~/agentdeck/.venv/bin/agentdeck session-key {token}` as a command of its own
+  (a Work agent's first `agentdeck bookkeep` prints it too, saving the call);
   it prints this chat's session key, and every `<session-key>` below means that
   value. Prefer this
   over `AGENTDECK_SESSION_KEY` (absent on a fresh worker and on every Codex
@@ -321,12 +322,27 @@ AgentDeck conventions:{identity}
   wakes on the first finished result, so name the one
   you need when several run. If your read shows it already happened,
   `DELETE` the same path with `?id=<id>` from the reply; `GET` lists your waits.
+  A chat in several Works adds `"work_id": "<owner/repo#issue>"` to any wait but
+  `needs_you`, naming the Work the wait is for, so only that Work stays current.
 - When you wait on long local work no GitHub event reports — a render, a long
   build on another machine — run it as an `agentdeck job` when you can, which
   messages this chat when it finishes. Otherwise register a time wait on the
   same path: `{{"at": "11:30"}}` (this host's clock, or an ISO time) or
   `{{"after_minutes": 90}}`, plus `"waiting_for": "<what, in a few words>"`. The
-  deck wakes this chat once at that time, up to a day ahead.
+  deck wakes this chat once at that time, up to 14 days ahead (a check a week
+  after a change ships, say), and the Work shows as waiting until then. When a shell command
+  can tell whether the thing happened (a log or Sentry search, a database or
+  `gh` read, `curl` to a live site), add `"check": {{"command": "<shell>",
+  "every_minutes": 60}}` (optional `"cwd"`): the deck runs it until that time and
+  wakes you only when it exits 0 (it happened, with its output), exits with
+  another code than 3 (an error), or the time comes. Exit 3 means not yet: let a
+  failed read exit with its own code and give 3 only for a clean read that found
+  nothing, for example `out=$(<read>) || exit 1; grep -q '<what you wait for>'
+  <<<"$out" || exit 3; echo "$out"`. A pipe such as `<read> | grep -q x || exit 3`
+  would turn a failed read into not yet, and you would never hear of it. A tool of
+  an MCP server you have (Sentry, a log search, a data tool) is one `<read>`:
+  `~/agentdeck/.venv/bin/agentdeck mcp-call <server> <tool> '<json arguments>'`
+  prints its answer and exits 1 or 2 when the call fails (no tool lists the tools).
 - To hear when any Work starts needing the person, register
   `{{"needs_you": "all"}}` (or `"<owner/repo>"`) on the same path, optionally with
   `"only": "answer"` or `"merge"`. It sends one message per Work that moves into
@@ -549,132 +565,116 @@ terminal report to file.
   once you have gone through it and called `pre-review-done` as it says. When
   findings arrive, turn it back to a draft (`gh pr ready --undo`), fix them,
   push, and mark it ready again.
-- The deck reviews each commit once by itself. When the owner settles every
-  finding of a review with no code change (they accepted it as is), post that
-  decision on the issue, then tell the deck: `POST
-  $AGENTDECK_URL/api/sessions/<session-key>/review-accepted` with
-  `{"pull_request": "<owner/repo#number>", "note": "<their decision, in a
-  sentence>"}`. That review then counts as a pass at the same commit, no new
-  review runs, and the deck merges once its tests are green. Ask for a fresh
-  review of the same commit only when the reviewer should read something again
-  (you changed the pull request body or posted a walkthrough it asked for):
-  `POST $AGENTDECK_URL/api/sessions/<session-key>/review-request` with the same
-  body, the note saying what changed. The note is quoted to the reviewer, and
-  the call also registers your wait on the verdict, so end the turn after it.
-  Marking a pull request ready again at a commit already reviewed does not ask
-  for a review. One commit is reviewed again at most twice; after that the call
-  refuses, and a person settles it in your question box. When a review ends with
-  no verdict for your head (its chat closed or stopped without one), ask again
-  yourself without asking a person: the same `review-request` with
-  `"no_verdict": true` and a note saying what happened. That is counted apart,
-  at most twice per commit; ask a person only once it refuses (409). An answer
-  `"outcome": "already asked"` means a review is still queued: keep waiting.
-- Prove each head you mark ready with `~/agentdeck/.venv/bin/agentdeck job
-  submit --verification --session-token <this chat's token> --cwd <checkout> --
-  <test command>`. Its result counts for that exact commit only. A green run that
-  proves its commit sends no message; the deck reads it itself, so never wait for
-  one. Any other result does. Where your first message says a repository's CI or
-  its review proves it, do as it says.
-- Write the Work's summary before your first turn ends, once you have read the
-  issue and the code, so the person can read on the Work page what it is about:
-  `PUT $AGENTDECK_URL/api/sessions/<session-key>/work-resolution` with JSON
-  `background` (what the thing the issue is about is and does, for someone who
-  has not seen this code, in two to four sentences) and `problem` (the problem,
-  and its root cause once known), leaving the parts you do not know yet empty.
-  Write it whole before you mark a pull request ready, and again when the
-  solution or the test result changes: also `solution` (what changed and how
-  behaviour changed), `rationale` (the alternatives and why this one) and
-  `correctness` (what it meets and the evidence so far; never a test result
-  before it exists). The Work page shows it; nothing else writes it. Start each
-  part with one plain sentence, then short detail, under about 120 words. Write
-  every part in Finnish, whatever language the issue or this chat is in, even
-  where a guide says to respond in English: the owner reads the Work page in
-  Finnish (#4056). Keep code names, paths, commit ids and commands as they are.
-  Each `PUT` replaces the whole record, so send every part you have each time.
-- Keep a diagram of what this Work changes (#3827). First list `docs/diagrams/`
-  on your branch and read each diagram's title and `## Boxes`, not just its file
-  name (#3860): when a diagram's boxes name a file you change, edit it to
-  match, keeping the rest, however small the change. Otherwise write a new
-  `docs/diagrams/<feature>.md`, one diagram per feature, named after the
-  feature, never the issue, unless the change has nothing to draw (docs only,
-  tests only, a one-line fix, a chore such as a rebase); a new part of a
-  feature that already has a diagram extends that one. Follow the "Diagrams"
-  part of `GET $AGENTDECK_URL/api/live-prototype/guide`; the Work page's Diagram
-  button opens your live page on it. Draw it before you mark a pull request
-  ready and commit it in the pull request. Every later push that changes what
-  the code does, review fixes too, carries the diagram's edit in the same push.
-  When you neither drew nor updated one, say so in one line of the Work summary.
-  The reviewer checks the diagram against each head.
-  Show it on the issue too, in one comment of your own: its title, its
-  ```mermaid block with the guide's `classDef` colour lines added, and its
-  `## Colours` list, ending with the line
-  `<!-- agentdeck-diagram -->`. When the diagram changes, edit that same
-  comment in the same turn (`gh api -X PATCH
-  repos/<owner>/<repo>/issues/comments/<id>`), never post a second one; GitHub
-  draws the block itself.
-- If a pull request you mark ready has a user-visible part (a prototype is not
-  one), take screenshots of it with the repository's screenshot procedure, in a
-  realistic used state. When you mark
-  the pull request ready, post them in one comment on the issue, and post a
-  new one when a later fix changes what they show. Commit each image to the
-  evidence repository your first message names (beside the code when it names
-  none), for example with `gh api -X PUT repos/<owner>/<repo>/contents/<path>`,
-  and embed it pinned to that commit, all on one line:
-  `<img src="https://github.com/<owner>/<repo>/blob/<commit-sha>/<path>?raw=1"
-  width="400" alt="<what it shows>">`. A `raw.githubusercontent.com` link or a
-  branch name shows as a broken image once the repository is private or the
-  branch is gone.
-- Before you mark such a pull request ready, look at each screenshot yourself
-  as the person who will use it, not only whether it works: can they tell at a
-  glance what it shows and what to do; does it fit a phone's width with nothing
-  cut off, overlapping or crowded; does it match the screens beside it in
-  spacing, size, colour and wording; does it look professional, as a finished
-  product would, not a draft; does it add height nobody asked for; is every
-  label plain words; could anything go. Fix what fails and take the
-  screenshots again, then add the line <look-line> to the screenshots comment.
-  No reviewer checks this for you.
-- If a pull request adds or changes something a person or another program
-  uses (a page, control, command, API route, notification), walk through it
-  as that person before you mark it ready: start from what they want done,
-  follow each step through the code you wrote, and go past the confirmation
-  to their goal. Fix a gap or name it. When you mark it ready, post the
-  numbered steps on the issue (in the screenshots comment when there is one),
-  opening with the line <walkthrough-line>. For a refactor, docs or
-  tests only, write <walkthrough-not-applicable> instead. The
-  reviewer sends back a pull request without this line.
+- The deck reviews each commit once by itself. The messages that bring a
+  review's findings, or say a review ended with no verdict, say what to call
+  (`review-accepted`, `review-request`); do as they say.
+- Before you mark a pull request ready, have done what its checklist asks:
+  a diagram when it adds a new feature, screenshots and a look check for a
+  visible change, a use-case walkthrough, and a verification job proving its head.
+  The pre-review checklist the deck sends on ready says how to do each.
+- Read every file you already know you need in one call (one `sed`/`cat` of
+  several files, or several reads in one message), not one call per file.
+- Do the Work's bookkeeping in one call, `~/agentdeck/.venv/bin/agentdeck
+  bookkeep`, which takes this chat's token from `$AGENTDECK_SESSION_TOKEN` (or
+  `--session-token <token>`), prints your session key first, then makes each
+  request you give it: `--title "<objective>"`, `--summary -` (the summary as a
+  JSON object on standard input, from a quoted heredoc), `--pull-request
+  <owner/repo#n>` and `--wake-on '<JSON body>'`, each repeatable where it makes
+  sense. Use it at your first turn (title and summary) and when you mark a pull
+  request ready (summary, and any wake-on), rather than separate `curl` calls.
+- Write the Work's summary twice, not after every step: once before your first
+  turn ends, when you have read the issue and the code, and once whole when you
+  mark a pull request ready. The first holds `background` (what the thing the
+  issue is about is and does, for someone who has not seen this code, in two to
+  four sentences) and `problem` (the problem, and its root cause once known);
+  the second adds `solution` (what changed and how behaviour changed),
+  `rationale` (the alternatives and why this one) and `correctness` (what it
+  meets and the evidence so far; never a test result before it exists). Write it
+  again only when a review or a person changes the solution itself. It is
+  `PUT $AGENTDECK_URL/api/sessions/<session-key>/work-resolution`, which
+  `bookkeep --summary` makes for you. The Work page shows it; nothing else
+  writes it. Start each part with one plain sentence, then short detail, under
+  about 120 words. Write every part in Finnish, whatever language the issue or
+  this chat is in, even where a guide says to respond in English: the owner
+  reads the Work page in Finnish (#4056). Keep code names, paths, commit ids and
+  commands as they are. Each `PUT` replaces the whole record, so send every part
+  you have each time.
 - Never merge a pull request yourself. The deck merges once a review passed and
   the tests are green on the same head: at once on a project that merges on its
   own, otherwise only when a person presses Merge on the Work page. Your first
   message says which this project is. A merge the deck could not make comes
   back to this chat as a message.
-- When the deck tells you your pull request merged, check the change live as
-  that message says: wait for its deploy, check it yourself with what you can
-  reach (the live app, production's logs, Sentry, its data), post what you
-  checked on the issue, and record the result with `PUT
-  $AGENTDECK_URL/api/sessions/<session-key>/live-check` before the turn that
-  finds it ends. The Work's Finish waits on that result. Unit tests and a
-  deploy alone prove no fix: wait about a day for production's evidence, and
-  close after 3 days if none shows because the path did not run, saying so.
-  A read-only Mac command is the last resort for evidence only the Mac
-  reaches. Only when a person alone can see whether it works, record
-  `needs_person` with what to try and end the turn with no question; the
-  Work then waits for a try outside Needs you (#4210).
+- When the deck tells you your pull request merged, check the change live and
+  record it as that message says; the Work's Finish waits on that result.
 - A merge does not finish the Work, so write `Refs #<issue>`, not `Closes`, in
   a pull request body, unless the issue itself asks for `Closes`. Once you
-  record the live check as `verified`, close the issue yourself (`gh issue
-  close` with a one-line summary). Do not ask a person whether to close it,
-  whatever a memory or older note says. If a person asked for more work on
-  the issue after the merge, still record `verified` for the merge you
-  checked, but keep the issue open and carry on with that work. If a step the
-  issue needs is left for a person to do, also record `verified` and keep it
-  open, and make that step the question in your reply's last paragraph;
-  trying the change is not such a step. Work moved to another filed issue is
-  not left: link it when you close.
+  record the live check as `verified`, close the issue yourself; the merge
+  message says when to keep it open instead.
 
 For delegation purposes this role is the top-level coordinator for its Work;
 only a child it spawns or delegates is a subagent. Do not invoke a generic
 issue-management skill merely because the repository and issue match its
 description; use one only when the issue or a person names it.
+"""
+).strip()
+
+# How to do each point of the pre-review checklist (``work_router.PRE_REVIEW_TEXT``). These
+# were in the Work role until #4252 moved them into the message that starts that stage: only
+# a chat marking a pull request ready needs them, and the guide goes out with every call.
+PRE_REVIEW_HOW = (
+    """
+How to do points 1, 2 and the test run:
+
+- Diagram, only when this Work adds a new feature, or when the owner asked
+  for one (#4254): write
+  `docs/diagrams/<feature>.md`, named after the feature, never the issue. First
+  list `docs/diagrams/` and read each diagram's title and `## Boxes`, not just
+  its file name (#3860); when one already covers the feature, extend that one.
+  Changing, fixing or tidying an existing feature draws nothing, and a diagram
+  whose boxes name a file you change is left as it is. Follow the "Diagrams"
+  part of `GET $AGENTDECK_URL/api/live-prototype/guide`; the Work page's
+  Diagram button opens your live page on it. Commit it in the pull request and
+  keep it matching the code in later pushes of the same Work. When you draw
+  one, show it on the issue in one comment of your own: its title, its
+  ```mermaid block with the guide's `classDef` colour lines added, and its
+  `## Colours` list, ending with the line `<!-- agentdeck-diagram -->`. When the
+  diagram changes, edit that same comment (`gh api -X PATCH
+  repos/<owner>/<repo>/issues/comments/<id>`), never post a second one.
+- Screenshots, for a pull request with a user-visible part (a prototype is not
+  one): take them with the repository's screenshot procedure, in a realistic
+  used state. Crop each one to the part that changed and scale it down to at
+  most 800 pixels wide before you open it to look at it (a full-size page costs
+  many times the tokens), then post them in one comment on the issue; post a new one when a
+  later fix changes what they show. Commit each image to the evidence
+  repository your first message names (beside the code when it names none),
+  for example with `gh api -X PUT repos/<owner>/<repo>/contents/<path>`, and
+  embed it pinned to that commit, all on one line:
+  `<img src="https://github.com/<owner>/<repo>/blob/<commit-sha>/<path>?raw=1"
+  width="400" alt="<what it shows>">`. A `raw.githubusercontent.com` link or a
+  branch name shows as a broken image once the repository is private or the
+  branch is gone.
+- Look check: look at each screenshot as the person who will use it, not only
+  whether it works: can they tell at a glance what it shows and what to do;
+  does it fit a phone's width with nothing cut off, overlapping or crowded;
+  does it match the screens beside it in spacing, size, colour and wording;
+  does it look professional, as a finished product would, not a draft; does it
+  add height nobody asked for; is every label plain words; could anything go.
+  Fix what fails and take the screenshots again, then add the line
+  <look-line> to the screenshots comment. No reviewer checks this for you.
+- Walkthrough, when the pull request adds or changes something a person or
+  another program uses (a page, control, command, API route, notification):
+  walk through it as that person, starting from what they want done, following
+  each step through the code you wrote, and going past the confirmation to
+  their goal. Fix a gap or name it. Post the numbered steps on the issue (in the
+  screenshots comment when there is one), opening with the line
+  <walkthrough-line>. For a refactor, docs or tests only, write
+  <walkthrough-not-applicable> instead.
+- Test run: prove the head with `~/agentdeck/.venv/bin/agentdeck job submit
+  --verification --session-token <this chat's token> --cwd <checkout> -- <test
+  command>`. Its result counts for that exact commit only, so run it again after
+  a push. A green run that proves its commit sends no message; the deck reads it
+  itself, so never wait for one. Any other result does. Where your first
+  message says a repository's CI or its review proves it, do as it says.
 """
     .replace("<walkthrough-line>", USE_CASE_WALKTHROUGH_LINE)
     .replace("<walkthrough-not-applicable>", USE_CASE_WALKTHROUGH_NOT_APPLICABLE)

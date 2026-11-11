@@ -1492,6 +1492,7 @@ def test_the_older_slices_routes_are_the_work_page_now(tmp_path):
         "/works/seen",  # mark Works read from the top bar's list (#3246)
         "/api/works/filed",  # an issue the deck filed starts its Work now (#3371)
         "/api/works/pr-ready",  # an agent's `gh pr ready` re-reads its row now (#3903)
+        "/api/works/pr-ready/received",  # it printed that press's checklist (#4253)
         "/api/works/population",  # read-only rows for staging comparisons (#2250)
         "/api/works/needs-you",  # what needs the owner, for the deck chat (#3773)
         "/api/works/status-log",  # every logged status change (#2751)

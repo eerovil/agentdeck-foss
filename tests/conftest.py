@@ -88,8 +88,8 @@ _scratch_share_dir = tempfile.mkdtemp(prefix="agentdeck-test-share-")  # mode 07
 os.environ["AGENTDECK_WEBHOOK_STATE_DIR"] = str(Path(_scratch_share_dir) / "github-webhooks")
 # Each test app builds the Work router and the merge release inside itself (#4016), the
 # small in-process stand-in for the services process: no test needs a second process.
-# Not the production switch (``[services] in_web``), so deleting the switch takes nothing
-# from the tests; the guard that the web starts none of them turns it off for its own app.
+# The production switch back (``[services] in_web``) is gone (#4017); the guard that the web
+# starts none of them turns this off for its own app.
 os.environ["AGENTDECK_SERVICES_IN_PROCESS"] = "1"
 # No test may rewrite the host's `gh` or heavy-command shims (#4040). A test that spawns a
 # worker writes them through `worker_path`, pointed at the test venv's interpreter, so a
@@ -677,6 +677,23 @@ def _no_live_guesses(monkeypatch, tmp_path_factory):
     monkeypatch.setattr(
         live_prototype, "LIVE_DIR", tmp_path_factory.mktemp("live-prototypes")
     )
+
+
+@pytest.fixture(autouse=True)
+def _no_live_issue_text(monkeypatch):
+    """Never let a Work start read its issue from the real GitHub (#4254).
+
+    ``start_work_agent`` pastes the issue into the first message; a test of that stubs
+    ``work_start._issue_text`` or passes ``issue_text`` its own ``run``. This patches the
+    small module, not ``work_start``, so the test selector does not see every test reach
+    ``work.py`` through this fixture.
+    """
+    from agentdeck import work_issue_text
+
+    async def unread(_argv, _repository):
+        return 1, b"", b"tests never read GitHub"
+
+    monkeypatch.setattr(work_issue_text, "_gh", unread)
 
 
 @pytest.fixture(autouse=True)

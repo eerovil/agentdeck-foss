@@ -58,7 +58,14 @@ from ..review_refs import review_target
 from ..runtime_feed import RUNTIME_TOPIC
 from ..staging_deploys import staging_copy
 from ..state import REVIEWS_TOPIC, chat_topic
-from ..wake_on import KIND_COMMIT, KIND_PULL_REQUEST, KIND_REVIEW, NeedsYouStop, WakeRequest
+from ..wake_on import (
+    KIND_COMMIT,
+    KIND_NEEDS_YOU,
+    KIND_PULL_REQUEST,
+    KIND_REVIEW,
+    NeedsYouStop,
+    WakeRequest,
+)
 from ..work import Work, WorkRef, work_id_for
 from ..work_actions import (
     APPROVE_MERGE,
@@ -292,6 +299,99 @@ async def current_work_ids(app: Any, queue: Sequence[dict]) -> frozenset[str]:
     # One spelling per Work, so the ids match the Works list's own however a job typed it.
     refs = (parse_work_id(work_id) for work_id in named)
     return frozenset(ref.work_id for ref in refs if ref is not None)
+
+
+def waiting_work_ids(app: Any, projection: Any) -> frozenset[str]:
+    """Works a chat's wake-on is for (#4266): current until it fires, however quiet.
+
+    A time wait may fall two weeks ahead, past ``RECENT_WORK``: without this a Work waiting
+    for a check a week after its change shipped went Archived halfway and left the front page,
+    with nothing on it saying it would come back. A needs-you wait is the owner's chat
+    listening to every Work, not a step of its own Work, so it keeps none current.
+
+    Each wait keeps one Work current, never every Work its chat is in (#4272): a long wait
+    for one Work held a finished one in Active for two weeks. See ``wait_works``.
+    """
+    registry = getattr(getattr(app.state, "wake_on", None), "registry", None)
+    if registry is None:
+        return frozenset()
+    try:
+        waits = [wait for wait in registry.all() if wait.kind != KIND_NEEDS_YOU]
+    except Exception:  # noqa: BLE001 -- an unreadable registry keeps no Work current
+        return frozenset()
+    if not waits:
+        return frozenset()
+    works_of = _direct_works(projection, {wait.chat_id for wait in waits})
+    state = getattr(app.state, "app_state", None)
+    found = set()
+    for wait in waits:
+        works = works_of.get(wait.chat_id, ())
+        candidates = wait_works(state, wait, works)
+        if len(candidates) == 1 and set(candidates) <= set(works):
+            found |= candidates
+    return frozenset(found)
+
+
+def _direct_works(projection: Any, chats: Collection[str]) -> dict[str, Sequence[str]]:
+    """The Works each of ``chats`` is directly in, by chat id.
+
+    Read from the projection's own index, built once per projection: each Work card asks,
+    and a walk of every Work per card made a refresh quadratic (#4272 review).
+    """
+    direct = getattr(projection, "direct_works_for_chat", None)
+    if direct is not None:
+        return {chat: works for chat in chats if (works := direct(chat))}
+    works_of: dict[str, list[str]] = {}
+    for work in projection.works:
+        for chat in {m.chat_id for m in work.memberships if m.direct and m.chat_id in chats}:
+            works_of.setdefault(chat, []).append(work.work_id)
+    return works_of
+
+
+def _chat_pull_works(state: Any, wait: Any) -> frozenset[str]:
+    """The Works the waiting chat itself registered the wait's pull request for (#3392).
+
+    Only that chat's own registrations, on every one of its legs: another chat registering
+    the same pull request for another Work says nothing of this chat's wait, and two legs
+    naming two Works leave it undecided (#4272 review).
+    """
+    registered = getattr(state, "session_pull_requests", None) or {}
+    legs = getattr(state, "chat_session_keys", None)
+    keys = legs(wait.session_key) if legs is not None else (wait.session_key,)
+    wanted = (wait.repository, wait.number)
+    return frozenset(
+        ref.work_id
+        for key in dict.fromkeys((*keys, wait.session_key))
+        for ref in registered.get(key, ())
+        if getattr(ref, "work_id", "") and ref.identity == wanted
+    )
+
+
+def wait_works(state: Any, wait: Any, works: Sequence[str]) -> frozenset[str]:
+    """The Works ``wait`` may be for, of ``works`` (those its chat is directly in): #4272.
+
+    One rule for both questions a wait answers. A Work stays current only for a wait whose
+    answer is that one Work (``waiting_work_ids``), and a Work's status reads a wait only when
+    the answer holds that Work (``derived_for``). In order: the Work the wait names, even one
+    outside ``works`` (then it is no Work of this chat's); else the chat's only Work; else, of
+    several, the Works the chat registered the wait's pull request for (two legs naming two
+    Works leave those two undecided: the repository never breaks that tie), or the only one in
+    the wait's repository; else every one of them, undecided. Empty when the chat is in no
+    Work the projection knows.
+    """
+    if wait.work_id:
+        return frozenset((wait.work_id,))
+    if len(works) <= 1:
+        return frozenset(works)
+    if wait.number is not None:
+        registered = _chat_pull_works(state, wait) & set(works)
+        if registered:
+            return registered
+    if wait.repository:
+        same = [w for w in works if (r := parse_work_id(w)) and r.repository == wait.repository]
+        if len(same) == 1:
+            return frozenset(same)
+    return frozenset(works)
 
 
 def _read_claims(
@@ -1167,7 +1267,16 @@ def derived_for(
         all_heads = {
             (o.repository.casefold(), o.head.lower()) for o in card.outputs if o.head
         }
-        for wait in registry.for_chat(owner[0]):
+        # A wait tied to another Work is that Work's (#4272 review); one the deck cannot tie
+        # to a single Work still reads on each, though it keeps none current.
+        chat_waits = list(registry.for_chat(owner[0]))
+        works_of = (
+            _direct_works(projection or state.work_projection(), {owner[0]}) if chat_waits else {}
+        )
+        for wait in chat_waits:
+            waited = wait_works(state, wait, works_of.get(owner[0], ()))
+            if waited and ref.work_id not in waited:
+                continue
             own = (
                 wait.kind == KIND_PULL_REQUEST
                 and (wait.repository.casefold(), wait.number) in own_pulls
@@ -1569,17 +1678,44 @@ def _shippable(snapshot: Any, card: Any) -> tuple[str, ...]:
     whose Ship now press passed it but did not finish (#4212 review): its merge holds until a
     press finishes it. The router checks each head live again when pressed."""
     history = getattr(snapshot, "review_events", None) or {}
-    found = []
+    state = getattr(snapshot, "state", None)
+    found: list[str] = []
+    split: list[tuple[str, str]] = []
+    heads: set[str] = set()
     for output in getattr(card, "outputs", ()):
         if not output.is_open or len(output.head or "") < 7:
             continue
         pull = f"{output.repository}#{output.number}".lower()
         events = history.get(pull, ())
         if review_history.shippable(events, output.head) is not None or _ship_unfinished(
-            getattr(snapshot, "state", None), pull, _ship_head(events, output.head)
+            state, pull, _ship_head(events, output.head)
         ):
             found.append(pull)
+            heads.add(output.head.lower())
+        elif earlier := review_history.split_head(events, output.head):
+            split.append((pull, earlier))
+    # A fix pushed on top of the findings and not yet answered: the reviewed commit may still
+    # ship, in a pull request the deck opens for it (``pull@head``, #4212 review). Not once it
+    # shipped, nor while that pull request is offered at it itself (a press to finish).
+    found.extend(
+        f"{pull}@{head}"
+        for pull, head in split
+        if head not in heads and not _split_shipped(state, card, head)
+    )
     return tuple(found)
+
+
+def _split_shipped(state: Any, card: Any, head: str) -> bool:
+    """Whether this Work already shipped ``head`` in a pull request of its own (#4212).
+    Unread is shipped: nothing is offered twice on a guess."""
+    ref = WorkRef.from_work_id(getattr(card, "work_id", ""))
+    if ref is None or state is None:
+        return True
+    try:
+        records = state.shipped_by_work(f"{ref.repository}#{ref.number}".lower())
+    except Exception:  # noqa: BLE001 - unread: not offered
+        return True
+    return any(record.head == head and record.shipped for record in records)
 
 
 def _ship_head(events: Any, head: str) -> str:
@@ -1604,26 +1740,27 @@ def _ship_findings(
     """``(pull, first line)`` of the findings Ship now would leave, for every such pull
     request (#4212 D10 and review); a line is "" when the history kept no words."""
     history = getattr(snapshot, "review_events", None) or {}
+    split = dict(entry.partition("@")[::2] for entry in shippable if "@" in entry)
     found = []
     for output in getattr(card, "outputs", ()):
         pull = f"{output.repository}#{output.number}".lower()
-        if pull in shippable:
+        if pull in shippable or pull in split:
             events = history.get(pull, ())
-            head = _ship_head(events, output.head) or output.head
+            head = split.get(pull) or _ship_head(events, output.head) or output.head
             text, _url = review_history.findings_text(events, head)
             found.append((pull, review_history.first_finding(text)))
     return tuple(found)
 
 
-def _shipped_of(state: Any, ref: Any) -> tuple[tuple[str, str], ...]:
-    """This Work's pull requests shipped with findings left, and each one's follow-up issue
-    (#4212 D12). Unreadable is none."""
+def _shipped_of(state: Any, ref: Any) -> tuple[str, ...]:
+    """This Work's pull requests shipped with findings left to fix in it (#4212 D12).
+    Unreadable is none."""
     try:
         records = state.shipped_by_work(f"{ref.repository}#{ref.number}")
     except Exception:  # noqa: BLE001 - the line is a note, never a reason to fail the page
         logger.warning("work page: shipped records unreadable for %s", ref.work_id, exc_info=True)
         return ()
-    return tuple((record.pull, record.follow_up) for record in records)
+    return tuple(record.pull for record in records)
 
 
 def _release_handles(release: Any, work_id: str) -> bool:
@@ -3690,7 +3827,9 @@ async def _work_candidates(app: Any, snapshot: _Pass, queue: Sequence[dict]) -> 
         snapshot.projection,
         owned_insights=snapshot.owned,
         legs_by_chat=snapshot.legs,
-        current_work_ids=await current_work_ids(app, queue),
+        current_work_ids=(
+            await current_work_ids(app, queue) | waiting_work_ids(app, snapshot.projection)
+        ),
         # A Work paused on the deck stays built, like one waiting for Finish, so it stays on
         # the Paused list and its chats stay held however long it sits quiet (#2559). So does
         # a starred one, on the Starred list (#4121).
@@ -4651,9 +4790,9 @@ class WorkDetail:
     deck_release: bool = False
     # The first line of those findings, quoted in Ship now's confirm (#4212 D10).
     ship_findings: tuple[tuple[str, str], ...] = ()
-    # This Work's pull requests shipped with findings left, each with its follow-up issue
-    # (``owner/repo#n``, "" while unfiled), so the page says the review never passed (D12).
-    shipped: tuple[tuple[str, str], ...] = ()
+    # This Work's pull requests shipped with findings left to fix in it, so the page says
+    # the review never passed (D12).
+    shipped: tuple[str, ...] = ()
     # The issue's parent and sub-issues (#3622), or None when it is in no tree.
     tree: work_tree.WorkTree | None = None
     # The Diagram button (#3827), or None while no chat of the Work has drawn one.

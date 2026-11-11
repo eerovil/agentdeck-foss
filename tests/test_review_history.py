@@ -174,17 +174,13 @@ def test_the_table_keeps_each_event_once_and_forgets_a_closed_pull_request(tmp_p
     # The pass is older by its own time; the chat after it, with no ask, reviews nothing here.
     assert head_review(rows).verdict == PASS and head_review(rows).review_since is None
     # A head shipped with its findings left (#4212) is recorded once, outlives the history
-    # its merge drops, and is found from its follow-up issue.
-    assert db.claim_shipped(
-        PR, HEAD, "1. off by one", "https://c/1", 4.0, "EerOvil/AgentDeck#7", "B" * 40
-    )
-    assert not db.claim_shipped(PR.upper(), HEAD, "again", "", 5.0)
-    assert db.shipped_for("") == [] and db.shipped_for("eerovil/agentdeck#41") == []
-    assert db.note_follow_up(PR, HEAD, "EerOvil/AgentDeck#41")
-    # Unfinished (its pass not recorded): it did not ship, so neither the page nor the
-    # follow-up's review reads it (#4212 review); the press's own resume still does.
-    assert db.shipped_for("eerovil/agentdeck#41") == [] == db.shipped_by_work("eerovil/agentdeck#7")
-    assert db.shipped(PR, HEAD).follow_up == "eerovil/agentdeck#41"
+    # its merge drops, and is found from the Work that fixes them, its own.
+    assert db.claim_shipped(PR, HEAD, 4.0, "EerOvil/AgentDeck#7")
+    assert not db.claim_shipped(PR.upper(), HEAD, 5.0, "eerovil/agentdeck#8")
+    # Unfinished (its pass not recorded): it did not ship, so the page does not read it
+    # (#4212 review); the press's own resume still does.
+    assert db.shipped_by_work("eerovil/agentdeck#7") == []
+    assert db.shipped(PR, HEAD).work == "eerovil/agentdeck#7"
     # One rule the release holds a Ship now pass by and the page offers Ship now again by.
     from types import SimpleNamespace
 
@@ -199,23 +195,9 @@ def test_the_table_keeps_each_event_once_and_forgets_a_closed_pull_request(tmp_p
     assert db.shipped(PR, HEAD).shipped == 4.5
     db.drop_review_events(PR)
     assert db.review_events(PR) == [] and len(db.review_events("eerovil/agentdeck#10")) == 1
-    [shipped] = db.shipped_for("eerovil/agentdeck#41")
-    assert (shipped.pull, shipped.head, shipped.findings, shipped.url) == (
-        PR,
-        HEAD,
-        "1. off by one",
-        "https://c/1",
-    )
+    [shipped] = db.shipped_by_work("eerovil/agentdeck#7")
+    assert (shipped.pull, shipped.head, shipped.at) == (PR, HEAD, 4.0)
     assert db.shipped(PR, HEAD.upper()) == shipped and db.shipped(PR, "d" * 40) is None
-    # Its base is kept from the press and its merge commit once the merge is heard (D7).
-    assert shipped.base == "b" * 40 and shipped.merged == ""
-    # Named by the pull request: the base merged in after the press is a new head (D7 review).
-    assert db.note_shipped_merge(PR.upper(), "C" * 40)
-    shipped = db.shipped(PR, HEAD)
-    assert shipped.merged == "c" * 40
-    # A pull request merges once: a later merge event does not rename it.
-    db.note_shipped_merge(PR, "e" * 40)
-    assert db.shipped(PR, HEAD).merged == "c" * 40
     # The confirm quotes the first line that says something (D10).
     from agentdeck.review_history import first_finding
 
@@ -225,23 +207,6 @@ def test_the_table_keeps_each_event_once_and_forgets_a_closed_pull_request(tmp_p
     assert first_finding("") == "" == first_finding("<!-- marker -->\n")
     # The original Work's page reads it by its own issue (D12).
     assert db.shipped_by_work("eerovil/agentdeck#7") == [shipped] and db.shipped_by_work("") == []
-    # D11: the follow-up #41's own pull request shipped with findings again, to #42. #42's
-    # review reads the whole chain, newest first; #51 points back at #41, and the walk still
-    # reads each issue once and ends.
-    later = "eerovil/agentdeck#50"
-    assert db.claim_shipped(later, "e" * 40, "2. still off", "", 6.0, "eerovil/agentdeck#41")
-    db.note_follow_up(later, "e" * 40, "eerovil/agentdeck#42")
-    db.note_shipped(later, "e" * 40, 6.5)
-    assert db.claim_shipped("eerovil/agentdeck#51", "f" * 40, "", "", 7.0, "eerovil/agentdeck#42")
-    db.note_follow_up("eerovil/agentdeck#51", "f" * 40, "eerovil/agentdeck#41")
-    db.note_shipped("eerovil/agentdeck#51", "f" * 40, 7.5)
-    reader = SimpleNamespace(shipped_for=db.shipped_for)
-    chain = AppState.shipped_chain(reader, "EerOvil/AgentDeck#42")
-    assert [(item.pull, item.work) for item in chain] == [
-        ("eerovil/agentdeck#51", "eerovil/agentdeck#42"),
-        (later, "eerovil/agentdeck#41"),
-        (PR, "eerovil/agentdeck#7"),
-    ]
 
 
 def test_an_escalation_is_written_at_the_head_its_chat_reviewed_for_each_named_pull():
@@ -257,3 +222,25 @@ def test_an_escalation_is_written_at_the_head_its_chat_reviewed_for_each_named_p
     assert [row[0] for row in noted[1:]] == [PR, "eerovil/site#4"]
     note_escalation(CHATS, heads, note, 99, [], "", "79", 7.0)  # a chat the deck never opened
     assert len(noted) == 3
+
+
+def test_split_head_is_the_newest_answered_head_while_the_live_one_waits():
+    """#4212 review: Ship now may ship the commit a fix was pushed on, only while the fix has
+    no verdict and only when the newest answered head before it has findings."""
+    from agentdeck.review_history import (
+        ASKED,
+        FINDINGS,
+        PASS,
+        ReviewEvent,
+        split_head,
+    )
+
+    a, b, c = "1" * 40, "2" * 40, "3" * 40
+    events = [ReviewEvent("a/b#9", a, 1.0, FINDINGS, "f", {}, 0)]
+    assert split_head(events, c) == a  # pushed on top, not asked about yet
+    events.append(ReviewEvent("a/b#9", c, 2.0, ASKED, "x", {}, 1))
+    assert split_head(events, c) == a
+    events.append(ReviewEvent("a/b#9", b, 1.5, PASS, "p", {}, 2))
+    assert split_head(events, c) == ""  # the newest answered head passed
+    events.append(ReviewEvent("a/b#9", c, 3.0, FINDINGS, "g", {}, 3))
+    assert split_head(events, c) == ""  # the live head has its own findings: ship it

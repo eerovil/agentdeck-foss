@@ -109,24 +109,19 @@ class ReviewEvent:
 
 
 @dataclass(frozen=True)
-class ShippedFollowUp:
-    """A pull request shipped at ``head`` with its review findings left to the follow-up issue
-    ``follow_up`` (``owner/repo#n``, "" until filed); kept after the merge (#4212). ``work``
-    is the issue of the Work that shipped it; ``base`` the base branch's commit when it
-    shipped, so ``base...head`` is exactly its change, ``merged`` its merge commit once
-    it merged ("" until known), and ``shipped`` when its review counted as passed (0 while
-    the press is unfinished: then it did not ship)."""
+class ShippedHead:
+    """A pull request shipped at ``head`` with its review findings left to fix in the same
+    Work, the one of issue ``work`` (``owner/repo#n``); kept after the merge (#4212).
+    ``shipped`` is when its review counted as passed (0 while the press is unfinished: then
+    it did not ship). ``fix`` is the pull request that fixes those findings, "" until the
+    agent names one; the Work's issue stays open until it merges (#4212 review)."""
 
     pull: str
     head: str
-    follow_up: str = ""
-    findings: str = ""
-    url: str = ""
-    at: float = 0.0
     work: str = ""
-    base: str = ""
-    merged: str = ""
+    at: float = 0.0
     shipped: float = 0.0
+    fix: str = ""
 
 
 @dataclass(frozen=True)
@@ -249,18 +244,40 @@ def answered(events: Iterable[ReviewEvent], head: str) -> bool:
     return newest_verdict(at_head(events, head)) is not None
 
 
-#: The verdicts a person may ship anyway, leaving their findings to a follow-up Work (#4212).
+#: The verdicts a person may ship anyway, leaving their findings to fix in the same Work (#4212).
 SHIPPABLE = frozenset({CHANGES, FINDINGS, ESCALATED})
 
 
 def shippable(events: Iterable[ReviewEvent], head: str) -> ReviewEvent | None:
     """The findings or escalation that ``head``'s review came back with, when the owner may
-    ship ``head`` now and leave them to a follow-up Work (#4212); else ``None``.
+    ship ``head`` now and leave them to fix in the same Work (#4212); else ``None``.
 
     Only the newest verdict at the head, and only while no newer review was asked for: that
     review may pass, and shipping must never skip a diff the reviewer has not finished."""
     verdict = standing_verdict(at_head(events, head))
     return verdict if verdict is not None and verdict.kind in SHIPPABLE else None
+
+
+def split_head(events: Iterable[ReviewEvent], live: str) -> str:
+    """The earlier head that Ship now may still ship while ``live`` waits for its review
+    (#4212 review): the agent pushed a fix on top of findings, and the owner may ship the
+    reviewed commit in a pull request of its own. "" when ``live`` has a verdict standing
+    (ship or merge it instead) or the newest head answered before it was not answered with
+    findings or an escalation."""
+    events = list(events)
+    live = (live or "").lower()
+    if len(live) < 7 or standing_verdict(at_head(events, live)) is not None:
+        return ""
+    newest: ReviewEvent | None = None
+    for head in {event.head for event in events if not event.head.startswith(live)}:
+        verdict = standing_verdict(at_head(events, head))
+        if verdict is not None and (
+            newest is None or (verdict.at, verdict.seq) > (newest.at, newest.seq)
+        ):
+            newest = verdict
+    if newest is None or newest.kind not in SHIPPABLE or len(newest.head) != 40:
+        return ""
+    return newest.head
 
 
 _NOT_A_FINDING = ("/claude", "review findings", "#", "<!--", "**review")
@@ -334,7 +351,7 @@ def passed(event: ReviewEvent | None) -> bool:
 
 
 #: The note of the pass a Ship now press records (#4212).
-SHIP_NOTE = "Shipped now with its findings left to a follow-up Work"
+SHIP_NOTE = "Shipped now with its findings left to fix in this Work"
 
 
 def ship_pass_head(events: Iterable[ReviewEvent], head: str) -> str:

@@ -169,3 +169,8 @@ def test_a_config_with_removed_sections_and_keys_still_loads(tmp_path):
     assert not hasattr(config, "search")
     assert not hasattr(config.chat_board, "auto_nudge")
     assert config.chat_board.auto_nudge_stalled_after_s == 900
+    # #4227: an unclaimed review chat goes to the fallback reviewer well inside the Work's
+    # review wait, so its agent never has to ask the owner about a chat nobody took.
+    from agentdeck.wake_on import REVIEW_TIMEOUT_MINUTES
+
+    assert config.chat_board.auto_nudge_unclaimed_after_s <= REVIEW_TIMEOUT_MINUTES * 60 / 2

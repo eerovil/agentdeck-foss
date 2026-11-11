@@ -5,6 +5,7 @@ import pytest
 from agentdeck.command_artifacts import SESSION_TOKEN_ENV
 from agentdeck.providers.instructions import (
     LOOK_CHECK_LINE,
+    PRE_REVIEW_HOW,
     SESSION_GUIDE_OPEN,
     USE_CASE_WALKTHROUGH_LINE,
     USE_CASE_WALKTHROUGH_NOT_APPLICABLE,
@@ -489,33 +490,28 @@ def test_work_session_guide_says_what_the_deck_reads_and_names_no_poller():
         assert "`gh pr create --draft`" in flat
         assert "`gh pr ready`" in flat
         assert "`gh pr ready --undo`" in flat
-        assert "--verification --session-token" in flat
+        # How to prove a head, draw, screenshot and walk through is in the checklist the
+        # deck sends on ready, not in the guide every call carries (#4252).
+        assert "pre-review checklist the deck sends on ready says how" in flat
+        assert "--verification --session-token" not in flat
         # The Work page's summary (#3093): nothing but the Work agent writes it.
-        assert "/work-resolution` with JSON `background`" in flat
-        # ... with its background and problem from the first turn on (#3928).
-        assert "Write the Work's summary before your first turn ends" in flat
-        assert "leaving the parts you do not know yet empty" in flat
+        assert "/work-resolution`, which `bookkeep --summary` makes for you" in flat
+        # ... with its background and problem from the first turn on (#3928), and whole once
+        # at ready, not after every step (#4254).
+        assert "once before your first turn ends" in flat
+        assert "once whole when you mark a pull request ready" in flat
+        assert "Write it again only when a review or a person changes the solution" in flat
         # ... always in Finnish, over a guide's "respond in English" (#4056).
         assert "Write every part in Finnish" in flat
         assert "even where a guide says to respond in English" in flat
-        # Every Work keeps a diagram (#3827): an old one is edited, a chore draws none.
-        assert "First list `docs/diagrams/` on your branch" in flat
-        # ... read by its boxes, one per feature, and redrawn on review fixes (#3860).
-        assert "read each diagram's title and `## Boxes`" in flat
-        assert "one diagram per feature" in flat and "never the issue" in flat
-        assert "review fixes too, carries the diagram's edit" in flat
-        assert "however small the change" in flat
-        assert "the Work page's Diagram button opens your live page" in flat
-        # ... and shown on the issue in one comment, edited in place.
-        assert "`<!-- agentdeck-diagram -->`" in flat and "never post a second one" in flat
-        # Screenshots go on the issue, pinned to their commit (#3098), as the Poller's did.
-        assert "post them in one comment on the issue" in flat
-        assert "(a prototype is not one)" in flat
-        assert "/blob/<commit-sha>/<path>?raw=1" in flat
-        # ... and judged as their user would before the pull request is ready (#3877).
-        assert "as the person who will use it, not only whether it works" in flat
-        assert "does it look professional" in flat
-        assert f"add the line {LOOK_CHECK_LINE} to the screenshots comment" in flat
+        # How to draw and screenshot moved to the checklist sent on ready (#4252).
+        assert "`<!-- agentdeck-diagram -->`" not in flat
+        assert LOOK_CHECK_LINE not in flat
+        assert "a diagram when it adds a new feature" in flat
+        # The bookkeeping in one call, and reads batched (#4254).
+        assert "~/agentdeck/.venv/bin/agentdeck bookkeep" in flat
+        assert "`--summary -`" in flat and "`--wake-on '<JSON body>'`" in flat
+        assert "Read every file you already know you need in one call" in flat
         assert "Never merge a pull request yourself" in flat
         # #3437: a verified live check closes the issue, with no ask; a merge never does.
         assert "write `Refs #<issue>`, not `Closes`" in flat
@@ -523,17 +519,41 @@ def test_work_session_guide_says_what_the_deck_reads_and_names_no_poller():
         assert "unless the issue itself asks for `Closes`" in flat
         # Marking ready sends the pre-review checklist first (#3880).
         assert "short pre-review checklist" in flat and "`pre-review-done`" in flat
-        assert "Do not ask a person whether to close it" in flat
-        # ... but a step left for a person keeps it open, as a question (#4151).
-        assert "left for a person" in flat and "your reply's last paragraph" in flat
-        # ... trying the change is not such a step: it is `needs_person` (#4210).
-        assert "trying the change is not such a step" in flat
-        assert "record `needs_person` with what to try" in flat
-        assert "Unit tests and a deploy alone prove no fix" in flat
-        # The reviewer's walkthrough line (#3338), in the very form the poller brief asks for.
-        assert f"opening with the line {USE_CASE_WALKTHROUGH_LINE}" in flat
-        assert USE_CASE_WALKTHROUGH_NOT_APPLICABLE in flat
+        # The live check and the close are in the merge message (#4252).
+        assert "close the issue yourself; the merge message says when to keep it open" in flat
+        assert "check the change live and record it as that message says" in flat
         # No poller duties: nothing dispatches this chat, so nothing is owed to one.
         assert "There is no control command and no terminal report to file" in flat
         assert "worker-control" not in flat
         assert "poller dispatch owns" not in flat
+
+
+def test_the_pre_review_checklist_says_how_to_do_each_point():
+    """#4252: what only a chat marking a pull request ready needs moved out of the guide
+    into the checklist the deck sends then; each rule it held is still said there."""
+    flat = " ".join(PRE_REVIEW_HOW.split())
+    assert "--verification --session-token" in flat
+    # A diagram only for a new feature or when the owner asked for one (#4254), one per
+    # feature, read by its boxes (#3860).
+    assert "only when this Work adds a new feature" in flat
+    assert "or when the owner asked for one (#4254)" in flat
+    assert "read each diagram's title and `## Boxes`" in flat
+    assert "named after the feature, never the issue" in flat
+    assert "Changing, fixing or tidying an existing feature draws nothing" in flat
+    assert "the Work page's Diagram button opens your live page" in flat
+    # Screenshots are cropped and scaled before they are read (#4254).
+    assert "scale it down to at most 800 pixels wide before you open it" in flat
+    assert "`<!-- agentdeck-diagram -->`" in flat and "never post a second one" in flat
+    assert "post them in one comment on the issue" in flat
+    assert "(a prototype is not one)" in flat
+    assert "/blob/<commit-sha>/<path>?raw=1" in flat
+    assert "as the person who will use it, not only whether it works" in flat
+    assert "does it look professional" in flat
+    assert f"add the line {LOOK_CHECK_LINE} to the screenshots comment" in flat
+    # The reviewer's walkthrough line (#3338), in the very form the poller brief asks for.
+    assert f"opening with the line {USE_CASE_WALKTHROUGH_LINE}" in flat
+    assert USE_CASE_WALKTHROUGH_NOT_APPLICABLE in flat
+    # The deck's checklist carries it.
+    from agentdeck.work_router import PRE_REVIEW_TEXT
+
+    assert "{how}" in PRE_REVIEW_TEXT

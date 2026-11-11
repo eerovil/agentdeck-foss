@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import secrets
 import subprocess
@@ -77,7 +78,7 @@ from .state import AppState
 from .usage_move import UsageMoveService, start_moved_leg
 from .view_commands import ViewCommands
 from .voice_mode import deck_line
-from .wake_on import WakeOnService
+from .wake_on import WakeOnService, check_account_env, read_live, settled_head
 from .web import render as render_mod
 from .web import services_hooks
 from .web.action_timing import ActionTiming, identify_action
@@ -408,6 +409,49 @@ def create_app(config: AppConfig) -> FastAPI:
     # when its delivery lands, or when the wait times out (#2775). The message rides the
     # scheduled-message path, so its delivery id is stable across a crash and a replay.
     started_revision = _revision()
+
+    async def wake_fetch(path: str) -> object:
+        # One GitHub read of a timed-out merge or CI wait (#4253), off the event loop.
+        from . import gh_cli
+
+        code, stdout = await gh_cli.run(["gh", "api", path], timeout=30)
+        if code != 0:
+            raise RuntimeError(f"gh api {path} exited {code}")
+        return json.loads(stdout or b"null")
+
+    async def wake_ask_review(repository: str, number: int, note: str) -> str:
+        # The deck's own ``review-request`` with ``no_verdict`` (#4253): "" when asked.
+        from .review_refs import REVIEWER_OFF_TEXT
+        from .work_router import AgainBusy, AgainRefused
+
+        router_service = getattr(app.state, "work_router", None)
+        if router_service is None or not router_service.enabled:
+            return "this deck does not route Work events, so it starts no review"
+        if getattr(router_service, "reviewer_off", False):
+            return REVIEWER_OFF_TEXT
+        try:
+            await router_service.ask_again(repository, number, note, no_verdict=True)
+        except AgainBusy:
+            return ""  # a review is already coming: the wait keeps waiting for it
+        except AgainRefused as exc:
+            return str(exc) or "refused"
+        return ""
+
+    def wake_ready_head(request) -> bool:
+        # A commit wait on the head of a ready or merged pull request this chat registered in a
+        # repository the release merges (#4253), from cached rows alone.
+        router_service = getattr(app.state, "work_router", None)
+        if router_service is None or not router_service.enabled:
+            return False
+        refs = {
+            ref.identity
+            for ref in state.pull_requests_for(request.session_key)
+            if ref.identity[0] == request.repository
+        }
+        refs = {ref for ref in refs if router_service.switched(ref[0])}
+        rows = issues.cached_pulls(refs).values() if refs else ()
+        return any(settled_head(row, request.sha) for row in rows)
+
     wake_on = WakeOnService(
         config.github_webhook.path,
         schedule=scheduled_messages.schedule,
@@ -428,15 +472,24 @@ def create_app(config: AppConfig) -> FastAPI:
         skills_sha=skills_sha,
         # A review wait's timeout says when no reviewer can start at all (#4064).
         reviewer_down=lambda: review_reviewer_down(config, config.build_accounts()),
+        # The routine wakes the deck settles itself (#4253).
+        live_read=lambda request: read_live(request, wake_fetch),
+        ask_review=wake_ask_review,
+        ready_head=wake_ready_head,
+        release_notices=lambda chat_id, since: scheduled_messages.ids_since(
+            chat_id, "work-release:", since
+        ),
+        # A time wait's check runs as its chat's own Claude account (#4256).
+        check_env=lambda session_key: check_account_env(config, session_key),
     )
     # A Work hears its own GitHub events (#2895, ADR 0008), and the deck merges a switched
     # Work itself (#2895 step 2): the Work router, the merge release and the missed-start
     # backstop. They run in the services process (#4016), where a walk over every pull
     # request delays a merge rather than freezing pages; the web keeps stand-ins that read
     # the config, the release store and the review history here and send every act to the
-    # services socket (``services_link``). The switch back (``[services] in_web``) and the
-    # tests' stand-in build them in this process instead (``work_services.build`` below).
-    services_in_web = services_link.runs_in_web(config)
+    # services socket (``services_link``). The tests' stand-in builds them in this process
+    # instead (``work_services.build`` below).
+    services_in_web = services_link.runs_in_web()
     services_transport = (
         services_link.InProcessTransport(None)
         if services_in_web
@@ -810,7 +863,7 @@ def create_app(config: AppConfig) -> FastAPI:
         else None
     )
 
-    # The moved services inside this process: the switch back, or the tests' stand-in (#4016).
+    # The moved services inside this process: only the tests' stand-in (#4016).
     work_services_host = None
     if services_in_web:
         work_services_host = work_services.build(

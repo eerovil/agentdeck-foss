@@ -516,7 +516,7 @@ async def test_active_transcript_churn_does_not_rebuild_deckhand_projection(tmp_
         replace(session, thinking=False, last_text="the finished handoff")
     )
     assistant._wake.set()
-    await asyncio.sleep(0.05)
+    await _eventually(lambda: assistant.view.insights)
     task.cancel()
     assert builds == []
     assert [item.session_key for item in assistant.view.insights] == [session.key]
@@ -545,7 +545,7 @@ async def test_a_throwing_triage_pass_says_so_on_the_panel(tmp_path):
 
     task = asyncio.create_task(assistant._loop())
     assistant.request_refresh()
-    await asyncio.sleep(0.05)
+    await _eventually(lambda: assistant.view.error is not None)
     task.cancel()
 
     assert assistant.view.error is not None
@@ -596,6 +596,20 @@ async def _stop(assistant, state, session):
 
 def _cards(assistant):
     return {insight.session_key: insight for insight in assistant.view.insights}
+
+
+async def _eventually(check, timeout=5.0):
+    """Wait until the running loop's pass has made ``check()`` true.
+
+    A pass reads through a worker thread, so on a busy host it can take far longer
+    than a fixed short sleep (#4270). Waiting for the result keeps the test fast
+    when the host is quiet and correct when it is not.
+    """
+    deadline = asyncio.get_running_loop().time() + timeout
+    while not check():
+        if asyncio.get_running_loop().time() > deadline:
+            return
+        await asyncio.sleep(0.01)
 
 
 async def test_a_chat_at_rest_that_moved_since_it_was_opened_cards(tmp_path):
@@ -1061,16 +1075,16 @@ async def test_the_loop_cards_a_turn_that_lands_entirely_between_two_looks(tmp_p
         )
     )
     assistant._wake.set()
-    await asyncio.sleep(0.05)
 
     try:
+        await _eventually(lambda: _cards(assistant))
         assert list(_cards(assistant)) == [session.key]
 
         state.update_session(
             replace(session, status=SessionStatus.LIVE, thinking=True)
         )
         assistant._wake.set()
-        await asyncio.sleep(0.05)
+        await _eventually(lambda: not assistant.view.insights)
 
         assert assistant.view.insights == ()
     finally:

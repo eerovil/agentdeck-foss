@@ -645,6 +645,8 @@ def test_the_workspace_is_served_only_inside_the_work_page(tmp_path):
         "/api/works/filed",
         # An agent's `gh pr ready` (#3903) re-reads a pull request's row; no workspace.
         "/api/works/pr-ready",
+        # ...and its word that it printed the checklist that press handed it (#4253).
+        "/api/works/pr-ready/received",
         "/api/works/population",
         # What needs the owner (#3773) reads the same overview; no workspace.
         "/api/works/needs-you",

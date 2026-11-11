@@ -110,6 +110,12 @@ def test_a_chat_joins_only_the_works_it_saved_itself():
     assert projection.works_chat_joined("reader") == ()
     assert projection.works_chat_joined("other") == (WORK_A,)
     assert projection.works_chat_joined("nobody") == ()
+    # #4272 review: the Works a chat is directly in, a read URL included and a parent's Work
+    # not, come from one index built once per projection.
+    direct = projection.direct_works_for_chat("mixed")
+    assert direct == tuple(r.work_id for r in order if r in {WORK_A, WORK_B, work_c, work_d})
+    assert projection.direct_works_for_chat("mixed") is direct
+    assert projection.direct_works_for_chat("nobody") == ()
 
 
 def test_two_independent_chats_share_one_work():

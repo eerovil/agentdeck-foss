@@ -614,6 +614,7 @@ def _state(session):
         current_session_for_chat=lambda chat: None,
         sessions={"chat-a": session},
         work_projection=lambda: SimpleNamespace(
+            works=(),
             get=lambda ref: SimpleNamespace(
                 ref=WORK, memberships=(SimpleNamespace(chat_id="chat-a", direct=True),)
             )
@@ -1148,7 +1149,7 @@ def test_a_reviewers_escalation_needs_the_owner_not_a_review_wait():
     escalated = [_event("escalated", "a" * 40, at, chat="eerovil/review-chats#5914", url=url)]
     waits = (SimpleNamespace(
         kind="review", repository="eerovil/agentdeck", number=9, deadline=UNTIL.timestamp(),
-        target="the review of pull request eerovil/agentdeck#9",
+        target="the review of pull request eerovil/agentdeck#9", work_id="", session_key="",
     ),)
     found = _derived_with_reviews({}, history=escalated, waits=waits)
     assert found.kind == REVIEW_ESCALATED and found.at == at
@@ -2128,7 +2129,7 @@ def test_a_chat_that_moved_on_to_another_work_leaves_a_closed_one_closed():
 
     def wait(kind, **fields):
         base = dict(kind=kind, repository="eerovil/agentdeck", number=0, sha="",
-                    deadline=None, target="")
+                    deadline=None, target="", work_id="", session_key="chat-a")
         return SimpleNamespace(**{**base, **fields})
 
     waits = [wait(KIND_PULL_REQUEST, number=10, target="#10")]
@@ -2146,6 +2147,27 @@ def test_a_chat_that_moved_on_to_another_work_leaves_a_closed_one_closed():
     state.sessions["chat-a"].stalled = True
     joined.pop()
     assert derived_for(_app(), snapshot, WORK, closed).kind == STALLED
+    # #4272 review: of two open Works sharing the chat, a wait tied to the other one is not
+    # this one's, and one tied to this one is.
+    from agentdeck.wake_on import KIND_TIME
+
+    state.sessions["chat-a"].stalled = False
+    member = (SimpleNamespace(chat_id="chat-a", direct=True),)
+    projection.works = tuple(
+        SimpleNamespace(work_id=ref.work_id, memberships=member) for ref in (WORK, other)
+    )
+    elsewhere = wait(KIND_TIME, repository="", number=None, target="the report",
+                     work_id=other.work_id)
+    waits[:] = [elsewhere]
+    open_card = card(outputs=(output(9, "open"),))
+    assert "the report" not in derived_for(live, snapshot, WORK, open_card).line
+    waits[:] = [SimpleNamespace(**{**vars(elsewhere), "work_id": WORK.work_id})]
+    assert derived_for(live, snapshot, WORK, open_card).line == "Waiting on the report"
+    # A wait naming a third Work is neither one's; one naming none reads on each.
+    waits[:] = [SimpleNamespace(**{**vars(elsewhere), "work_id": "github_issue:x/y#3"})]
+    assert "the report" not in derived_for(live, snapshot, WORK, open_card).line
+    waits[:] = [SimpleNamespace(**{**vars(elsewhere), "work_id": ""})]
+    assert derived_for(live, snapshot, WORK, open_card).line == "Waiting on the report"
 
 
 @pytest.mark.parametrize(

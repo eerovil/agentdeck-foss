@@ -192,10 +192,12 @@ async def test_a_green_retest_merges_the_first_and_moves_the_next_up(deck):
     assert len(deck.updated) == 2
 
 
-async def test_the_agent_is_told_its_round_when_its_branch_is_updated(deck):
+async def test_the_agent_is_not_woken_when_the_deck_updates_its_branch(deck):
+    """#4253: the deck merges the base in and re-tests the new head itself, so the chat is
+    not told; the line and its round stay on the Work page."""
     await deck.review_all()
-    told = [text for key, text in deck.told if ":behind:" in key]
-    assert len(told) == 1 and "first in the merge queue (round 1)" in told[0]
+    assert deck.updated
+    assert [key for key, _text in deck.told if ":behind:" in key] == []
 
 
 async def test_a_failed_retest_drops_the_first_and_the_next_goes(deck):
@@ -292,9 +294,9 @@ async def test_without_auto_release_only_a_pressed_merge_joins_the_line(deck):
     await deck.service.request_merge(work(1))
     assert deck.line() == [pull(103), pull(101)]
     assert deck.updated == [pull(103)]
-    # #3175: the press survives the deck's update to base, and the line says it waits.
-    told = [text for key, text in deck.told if ":behind:" in key]
-    assert "A person pressed Merge: the press carries over" in told[-1]
+    # #3175: the press survives the deck's update to base, and the line says it waits. The
+    # chat is not told of the update (#4253).
+    assert [key for key, _text in deck.told if ":behind:" in key] == []
     assert deck.service.store.get(work(3))["hold"]["words"].startswith("Merge pressed; ")
     deck.retest(3)
     await deck.service.on_tests()

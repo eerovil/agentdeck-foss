@@ -69,6 +69,9 @@ FRESH_FLAG = "--agentdeck-fresh"
 _TIMEOUT_S = 120.0
 # Telling the deck about a filed issue must not hold the caller up (#3371).
 _DECK_TIMEOUT_S = 3.0
+#: ``gh pr ready``'s wait for the deck, which answers with the checklist it starts (#4253):
+#: the router's own wait for it, a services restart and the re-read all fit inside.
+_READY_TIMEOUT_S = 20.0
 
 # Filing an issue without the poller's ownership label, which `gh issue create` otherwise
 # gains in a repository a poller manages (#2505). An environment variable rather than a
@@ -452,7 +455,10 @@ def _tell_deck_ready(argv: list[str], environment: dict[str, str], remote: str |
         repository = f"{named.group(1)}/{named.group(2)}"
     if not re.fullmatch(r"[\w.-]+/[\w.-]+", repository):
         return
-    body = json.dumps({"repository": repository, "number": number, "branch": branch})
+    token = environment.get("AGENTDECK_SESSION_TOKEN", "").strip()
+    body = json.dumps(
+        {"repository": repository, "number": number, "branch": branch, "session_token": token}
+    )
     request = urllib.request.Request(
         f"{base}/api/works/pr-ready",
         data=body.encode("utf-8"),
@@ -460,10 +466,42 @@ def _tell_deck_ready(argv: list[str], environment: dict[str, str], remote: str |
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=_DECK_TIMEOUT_S):  # noqa: S310
-            pass
+        with urllib.request.urlopen(request, timeout=_READY_TIMEOUT_S) as response:  # noqa: S310
+            answer = json.loads(response.read() or b"{}")
     except Exception as exc:  # noqa: BLE001 — GitHub's own event is still on its way
         _note(f"could not tell the deck {repository} is ready for review ({exc})")
+        return
+    # The pre-review checklist this press started, in this command's reply rather than a
+    # message of its own (#4253). With none the deck sends it to the chat, as before.
+    checklist = answer.get("checklist") if isinstance(answer, dict) else ""
+    printed = answer.get("number") if isinstance(answer, dict) else None
+    if not (isinstance(checklist, str) and checklist.strip()) or not isinstance(printed, int):
+        return
+    try:
+        sys.stdout.write("\n" + checklist.strip() + "\n")
+        sys.stdout.flush()
+    except OSError:
+        return  # not printed: the deck sends it to the chat in a minute
+    # Printed: the deck's pending message for it is taken back (#4253 review). Unsaid, it is
+    # sent anyway, so a lost answer or a failed word here never loses the checklist.
+    received = urllib.request.Request(
+        f"{base}/api/works/pr-ready/received",
+        data=json.dumps(
+            {
+                "repository": repository,
+                "number": printed,
+                "heads": answer.get("heads") or [],
+                "session_token": token,
+            }
+        ).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(received, timeout=_READY_TIMEOUT_S) as response:  # noqa: S310
+            response.read()
+    except Exception as exc:  # noqa: BLE001 — the deck sends the checklist again instead
+        _note(f"could not tell the deck the checklist was printed ({exc}); it will send it")
 
 
 def _current_branch() -> str:

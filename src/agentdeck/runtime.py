@@ -189,6 +189,14 @@ class SessionSecretClaimRequest(BaseModel):
     ticket: str
 
 
+class VerificationRerunRequest(BaseModel):
+    """Which Work's verification to run again, and at which head (#4253)."""
+
+    work_id: str
+    repository: str
+    head: str
+
+
 class JobSubmitRequest(BaseModel):
     command: list[str]
     cwd: str
@@ -474,6 +482,7 @@ class ClaudeWorkerRuntime:
                 idle_after_s=effective.idle_after_s,
                 interactive_prompts=effective.interactive_prompts,
                 classifier_skip_rules=list(self.settings.classifier_skip_rules),
+                worker_cuts=self.settings.worker_cuts(),
                 memory_max=effective.memory_max,
                 auto_compact_window=effective.auto_compact_window,
                 hold_processes=effective.hold_across_restarts,
@@ -2175,6 +2184,16 @@ def create_runtime_app(config: AppConfig) -> FastAPI:
         except JobError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from None
         return job.to_dict()
+
+    @app.post("/jobs/rerun-verification")
+    async def rerun_verification(body: VerificationRerunRequest) -> dict[str, Any]:
+        """The deck runs a Work's last verification again at a new head (#4253).
+
+        ``{"job": null}`` when there is nothing it can run again, so the caller tells the
+        Work's chat to run it instead.
+        """
+        job = await _require_jobs().rerun_verification(body.work_id, body.repository, body.head)
+        return {"job": job.to_dict() if job is not None else None}
 
     @app.get("/jobs")
     async def list_jobs(work_id: str = "", active: bool = False) -> dict[str, Any]:

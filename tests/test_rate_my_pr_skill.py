@@ -104,3 +104,21 @@ def test_review_fix_pr_hands_a_design_question_back_instead_of_deleting():
 
     assert "Never act on a\n  `Design question:` item" in procedure
     assert "report `needs_more_info` with the question quoted" in procedure
+
+
+def test_the_first_review_reports_every_finding_sorted_by_kind():
+    """#4230: 40 of 70 later-round findings were on code the first review had already read,
+    and an inline reviewer's ≥ 70 gate dropped the 38–70 confidence bugs the benchmark found."""
+    review = REVIEW.read_text()
+    start = review.index("> Review ONLY the changed lines")
+    brief = review[start : review.index("Gate by evidence first")]
+    assert "do not stop at the\n> first finding" in brief
+    for kind in ("`bug`", "`edge case`", "`cosmetic`"):
+        assert kind in brief
+    assert "every other place the same rule applies" in brief
+    assert "senior engineer would\n> block a merge on" in brief  # now "not only" those
+    assert "### The first review reports everything at once" in review
+    assert "keeps an evidenced\nfinding at confidence **≥ 35**" in review
+    assert "each\n  architecture lane keeps Step 3's read budget" in review
+    assert "Architecture items keep\n  their own prefixes" in review
+    assert "1. <bug | edge case | cosmetic> <file:line>" in review

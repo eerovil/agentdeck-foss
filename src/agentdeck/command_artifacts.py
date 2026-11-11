@@ -25,6 +25,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from .worker_cuts import Cut
+
 CONTEXT_DIR_ENV = "AGENTDECK_COMMAND_ARTIFACT_ROOT"
 ACCOUNT_KEY_ENV = "AGENTDECK_ACCOUNT_KEY"
 WORKER_KEY_ENV = "AGENTDECK_WORKER_KEY"
@@ -150,20 +152,34 @@ SKILL_DESCRIPTION_CHARS = 200
 
 
 def ensure_claude_settings(
-    root: Path, allow_rules: list[str] | None = None, *, capture: bool = True
+    root: Path,
+    allow_rules: list[str] | None = None,
+    *,
+    capture: bool = True,
+    cut: Cut | None = None,
 ) -> Path:
     """Write one of the settings files an owned Claude worker runs with.
 
     ``capture`` adds the kanban command-capture hooks. ``allow_rules`` is the
     classifier skip list; a chat that does not run in ``auto`` gets none, since
     in ``plan`` or ``default`` mode an allow rule would pre-approve a write the
-    mode exists to stop (#2271). Each combination is its own file, so a spawn
-    only ever points at one that already says what it needs.
+    mode exists to stop (#2271). ``cut`` names the tools and plugins its
+    repository's chats start without (#4252). Each combination is its own file,
+    so a spawn only ever points at one that already says what it needs.
     """
     name = "claude-command-artifact-hooks" if capture else "claude-worker-settings"
-    target = root / f"{name}{'' if allow_rules else '-no-skip'}.json"
+    cut_settings = cut.settings() if cut is not None else {}
+    suffix = ""
+    if cut_settings:
+        digest = hashlib.sha256(json.dumps(cut_settings, sort_keys=True).encode()).hexdigest()
+        suffix = f"-cut-{digest[:12]}"
+    target = root / f"{name}{'' if allow_rules else '-no-skip'}{suffix}.json"
     settings = claude_permission_settings(allow_rules or [])
     settings["skillListingMaxDescChars"] = SKILL_DESCRIPTION_CHARS
+    if deny := cut_settings.get("permissions", {}).get("deny"):
+        settings["permissions"]["deny"] = deny
+    if plugins := cut_settings.get("enabledPlugins"):
+        settings["enabledPlugins"] = plugins
     if capture:
         hooks = hook_groups()
         for event, groups in settings["hooks"].items():

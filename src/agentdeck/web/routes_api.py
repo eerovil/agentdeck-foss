@@ -496,6 +496,9 @@ class PullRequestRequest(BaseModel):
     # The Work this pull request is for (#3392): a ``work_id`` or ``owner/repo#n`` of an
     # issue this chat registered. Needed only by a chat in several Works.
     work_id: str = ""
+    # The pull request this one fixes the review findings of, one its Work shipped with
+    # Ship now (#4212 review): the Work's issue then stays open until this one merges.
+    fixes: str = ""
 
 
 class IssuesRequest(BaseModel):
@@ -656,10 +659,26 @@ class ReadyPressRequest(BaseModel):
     repository: str
     number: int | None = None
     branch: str = ""
+    #: The pressing chat's own ``AGENTDECK_SESSION_TOKEN``: a checklist is printed only for
+    #: a pull request that chat registered (#4253 review).
+    session_token: str = ""
+
+
+class ReadyReceivedRequest(BaseModel):
+    repository: str
+    number: int
+    #: The heads the press's answer named: only their checklists are taken back.
+    heads: list[str] = []
+    session_token: str = ""
 
 
 #: How many of a repository's registered pull requests one ``gh pr ready`` re-reads at most.
 READY_PRESS_MAX = 4
+#: How long the answer waits for that re-read once the checklist is in (#4253); past it the
+#: read goes on, so the shim's own wait is never spent on it.
+READY_REFRESH_WAIT_S = 2.0
+#: The re-reads left running past ``READY_REFRESH_WAIT_S``, held so they are not collected.
+_READY_REFRESHES: set[asyncio.Task] = set()
 
 
 @router.post("/works/pr-ready")
@@ -674,9 +693,17 @@ async def note_ready_press(request: Request, body: ReadyPressRequest) -> dict:
     head branch. Only when no cached row names the branch is each open registered one read,
     at most ``READY_PRESS_MAX``. Nothing the caller says is trusted but which pull request
     to read.
+
+    The answer's ``checklist`` is the pre-review checklist that press started (#4253), which
+    the shim prints in ``gh pr ready``'s reply, then says so (``note_ready_received``); until
+    it does, the router keeps that checklist's message pending and sends it after a minute.
+    A checklist is pressed for only when the call names one pull request, by number or by
+    the one cached row on its branch, and handed back only when the caller's own session
+    token is the chat the router places that pull request with (#4253 review). Every other
+    call only re-reads, and any checklist goes to the chat that owns it as a message.
     """
     repository = body.repository.strip().lower()
-    answer = {"repository": repository, "refreshed": 0}
+    answer: dict[str, Any] = {"repository": repository, "refreshed": 0, "checklist": ""}
     router_service = getattr(request.app.state, "work_router", None)
     issues = getattr(request.app.state, "issues", None)
     if router_service is None or issues is None or not router_service.switched(repository):
@@ -687,10 +714,10 @@ async def note_ready_press(request: Request, body: ReadyPressRequest) -> dict:
             ref.identity
             for refs in tuple(state.session_pull_requests.values())
             for ref in refs
-            if ref.identity[0] == repository
-            and (body.number is None or ref.number == body.number)
+            if ref.identity[0] == repository and body.number in (None, ref.number)
         }
     )
+    named = registered if body.number is not None else []
     if body.number is None and registered:
         try:
             rows = issues.cached_pulls(registered)
@@ -702,21 +729,63 @@ async def note_ready_press(request: Request, body: ReadyPressRequest) -> dict:
             if str((rows.get(ref) or {}).get("state") or "open").lower() == "open"
             and not (rows.get(ref) or {}).get("mergedAt")
         ]
-        on_branch = [
+        named = [
             ref
             for ref in registered
             if body.branch and (rows.get(ref) or {}).get("headRefName") == body.branch
         ]
-        registered = on_branch or registered
+        # No cached row names the branch: every open one is re-read, none pressed for.
+        registered = named or registered
     if not registered:
         return answer
-    try:
-        answer["refreshed"] = await issues.refresh_pull_rows(
-            registered[-READY_PRESS_MAX:], limit=READY_PRESS_MAX
-        )
-    except Exception:  # noqa: BLE001 - the webhook and the backstop's other wakes remain
-        log.warning("ready press on %s could not be read back", repository, exc_info=True)
+    pulls = registered[-READY_PRESS_MAX:]
+    refresh = asyncio.create_task(issues.refresh_pull_rows(pulls, limit=READY_PRESS_MAX))
+    _READY_REFRESHES.add(refresh)
+    refresh.add_done_callback(_READY_REFRESHES.discard)
+    caller = state.session_key_for_token(body.session_token) if body.session_token else None
+    if len(named) == 1 and caller is not None:
+        number = named[0][1]
+        try:
+            # The router hands a checklist back only to the chat it places the pull request
+            # with (``owner_of_pull``); any other caller's press only looks (#4253 review).
+            pressed = await router_service.ready_press(
+                repository, number, caller=state.chat_identity_key(caller)
+            )
+        except Exception:  # noqa: BLE001 - unknown: the router sends any checklist itself
+            log.warning("ready press on %s#%s not looked at", repository, number, exc_info=True)
+            pressed = {}
+        pressed = pressed if isinstance(pressed, dict) else {}
+        answer["checklist"] = str(pressed.get("checklist") or "")
+        if answer["checklist"]:
+            answer["number"] = number
+            answer["heads"] = [str(head) for head in pressed.get("heads") or ()]
+    await asyncio.wait({refresh}, timeout=READY_REFRESH_WAIT_S)
+    if refresh.done():
+        try:
+            answer["refreshed"] = refresh.result()
+        except Exception:  # noqa: BLE001 - the webhook and the backstop's other wakes remain
+            log.warning("ready press on %s could not be read back", repository, exc_info=True)
     return answer
+
+
+@router.post("/works/pr-ready/received")
+async def note_ready_received(request: Request, body: ReadyReceivedRequest) -> dict:
+    """The shim printed the checklist ``note_ready_press`` answered with (#4253 review).
+
+    The router takes back the message it kept pending for that checklist only at the heads
+    the answer named, and only when the caller's own session token is the chat that message
+    is for. With no word here that message is sent, so a lost answer never loses it.
+    """
+    repository = body.repository.strip().lower()
+    router_service = getattr(request.app.state, "work_router", None)
+    state = request.app.state.app_state
+    caller = state.session_key_for_token(body.session_token) if body.session_token else None
+    if router_service is None or caller is None or not body.heads:
+        return {"taken": 0}
+    taken = await router_service.ready_received(
+        repository, body.number, body.heads, caller=state.chat_identity_key(caller)
+    )
+    return {"taken": int(taken or 0)}
 
 
 def _changed_lately(stamp: object) -> bool:
@@ -805,10 +874,59 @@ async def add_session_pull_request(
         ref = dataclasses.replace(
             ref, work_id=_pull_work(request, session_key, named, body.work_id)
         )
+    if body.fixes:
+        await _note_shipped_fix(request, ref, known.get(ref.identity, ref), body.fixes)
     session_key = named
     saved = get_state(request).add_pull_request(session_key, ref)
     _note_registered(request, [ref])
     return _pull_requests_payload(session_key, saved)
+
+
+async def _note_shipped_fix(
+    request: Request, ref: PullRequestRef, known: PullRequestRef, fixes: str
+) -> None:
+    """Record ``ref`` as the fix of what pull request ``fixes`` shipped with for its Work
+    (#4212 review), or 409 when ``fixes`` shipped with Ship now for no Work ``ref`` is for.
+
+    Refused too when ``ref`` is the shipped pull request itself, or has already merged (or
+    GitHub cannot say it has not): either would count the findings fixed with no fix merging.
+    """
+    shipped = _pull_request_ref(fixes)
+    work = (ref.work_id or known.work_id).removeprefix("github_issue:")
+    named = f"{shipped.repository}#{shipped.number}"
+    fix = f"{ref.repository}#{ref.number}"
+    if fix.lower() == named.lower():
+        raise HTTPException(status_code=409, detail=f"{fix} cannot be the fix of its own findings")
+    state = await _pull_state(fix)
+    if state != "OPEN":
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{fix} is not an open pull request ({state or 'unreadable'}); name an open "
+                "pull request that fixes the findings"
+            ),
+        )
+    if not work or not get_state(request).note_shipped_fix(named, work, fix):
+        raise HTTPException(
+            status_code=409,
+            detail=f"{named} did not ship with Ship now for the Work this pull request is for",
+        )
+
+
+async def _pull_state(ref: str) -> str:
+    """GitHub's ``OPEN``/``MERGED``/``CLOSED`` for pull request ``owner/repo#n``, or ``""``
+    when it cannot be read."""
+    from .. import gh_cli
+
+    repository, _, number = ref.partition("#")
+    try:
+        code, out = await gh_cli.run(
+            ["gh", "pr", "view", number, "--repo", repository, "--json", "state"], timeout=20
+        )
+        raw = json.loads(out) if code == 0 else None
+    except (OSError, TimeoutError, ValueError):
+        return ""
+    return str(raw.get("state") or "").upper() if isinstance(raw, dict) else ""
 
 
 def _pull_work(request: Request, session_key: str, chat_key: str, named: str) -> str:
@@ -1358,6 +1476,12 @@ class WakeOnRequest(BaseModel):
     waiting_for: str | None = None
     name: str | None = None
     timeout_minutes: int | None = None
+    # The Work the wait is for (#4272): a Work id or ``owner/repo#n``. A chat directly in
+    # several Works names it, so the wait keeps only that Work current.
+    work_id: str | None = None
+    # A time wait's check (#4256): {"command": "<shell>", "every_minutes": 60, "cwd": "/abs"},
+    # run until the wait's time; it wakes the chat only on exit 0, an error or the deadline.
+    check: dict | None = None
 
 
 def _wake_on_service(request: Request):
@@ -1597,6 +1721,96 @@ async def post_session_review_accepted(
     except AgainRefused as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return {"session_key": session_key, **accepted}
+
+
+class ShipNowTarget(BaseModel):
+    pull_request: str
+    head: str
+
+
+class ShipNowBody(BaseModel):
+    """One pull request (``pull_request`` and ``head``), or several (``pull_requests``)."""
+
+    pull_request: str = ""
+    head: str = ""
+    pull_requests: list[ShipNowTarget] = []
+
+
+@router.post("/sessions/{session_key}/ship-now")
+async def post_session_ship_now(request: Request, session_key: str, body: ShipNowBody) -> dict:
+    """The owner picked "Ship now, fix later" in the Work's agent's question (#4212): the
+    same as the Work page's Ship now button. Each pull request merges at the head whose
+    findings the owner was shown (``head``, the full commit id) once its tests are green, and
+    its findings are left to this Work's next pull request. When a fix was pushed on top of
+    that head, the head ships in a pull request the deck opens for it (#4212 review).
+
+    Several pull requests are shipped in the order given, as the button ships all of the
+    Work's; the first refused one stops the rest, which are named in ``not_shipped``."""
+    from ..services_link import ServicesUnavailable
+    from ..work_router import AgainRefused
+
+    session_key, _session = resolve_chat_key(request, session_key)
+    targets = list(body.pull_requests)
+    if body.pull_request:
+        targets.insert(0, ShipNowTarget(pull_request=body.pull_request, head=body.head))
+    if not targets:
+        raise HTTPException(status_code=422, detail="name a pull_request and its head")
+    state = get_state(request)
+    held = _work_pulls_of_chat(state, session_key)
+    refs = []
+    for target in targets:
+        ref = _pull_request_ref(target.pull_request)
+        head = target.head.strip().lower()
+        if len(head) != 40 or any(c not in "0123456789abcdef" for c in head):
+            raise HTTPException(
+                status_code=422,
+                detail=f"head of {ref.repository}#{ref.number} must be the full commit id whose"
+                " findings the owner was shown",
+            )
+        if f"{ref.repository}#{ref.number}".lower() not in held:
+            raise HTTPException(
+                status_code=409,
+                detail=f"{ref.repository}#{ref.number} is not registered for a Work this chat"
+                " is in; register it first (POST …/pull-requests)",
+            )
+        refs.append((ref, head))
+    router_service = getattr(request.app.state, "work_router", None)
+    if router_service is None or not router_service.enabled:
+        raise HTTPException(
+            status_code=409, detail="this deck does not route Work events, so it ships nothing"
+        )
+    shipped: list[dict] = []
+    for index, (ref, head) in enumerate(refs):
+        try:
+            shipped.append(await router_service.ship_now(ref.repository, ref.number, head=head))
+        except (AgainRefused, ServicesUnavailable) as exc:
+            if not shipped:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            rest = [f"{r.repository}#{r.number}" for r, _ in refs[index:]]
+            return {
+                "session_key": session_key,
+                **shipped[0],
+                "shipped": shipped,
+                "not_shipped": rest,
+                "refused": str(exc),
+            }
+    return {"session_key": session_key, **shipped[0], "shipped": shipped}
+
+
+def _work_pulls_of_chat(state, session_key: str) -> set[str]:
+    """Every pull request of each Work this chat joined, whichever of the Work's chats
+    registered it (#4212 review): the set the release merges and the Work page's Ship now
+    button ships. A pull request placed in another Work is not in it. Lowercased
+    ``owner/repo#n``."""
+    from ..work_router import pulls_by_work
+
+    projection = state.work_projection()
+    works = projection.works_chat_joined(state.chat_identity_key(session_key))
+    if not works:
+        return set()
+    placed = pulls_by_work(state, projection)
+    keys = {f"{work.repository}#{work.number}".lower() for work in works}
+    return {pull for key in keys for pull in placed.get(key, ())}
 
 
 class PreReviewDoneBody(BaseModel):

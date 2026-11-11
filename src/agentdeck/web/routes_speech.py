@@ -95,6 +95,8 @@ MAX_ID_CHARS = 40
 # Phrases kept for comparing speech-to-text models (#3499, #3934), and where each
 # came from: 🎧 voice mode or 🎤 dictation.
 KEPT_LOG = "kept.jsonl"
+# The longest microphone name a kept or wake log line carries (#4249).
+MIC_CHARS = 80
 SOURCES = ("voice", "dictation")
 ENGINES = ("whisper", "parakeet")
 _kept_lock = threading.Lock()
@@ -209,6 +211,7 @@ async def _keep_phrase(
         "snr_db": snr if isinstance(snr, (int, float)) and not isinstance(snr, bool) else None,
         "seconds": _seconds(audio),
         "ms": round(took_s * 1000),
+        "mic": _mic(request),
     }
     try:
         await asyncio.to_thread(
@@ -300,6 +303,14 @@ def _line_at(text: str) -> float:
     return at if isinstance(at, (int, float)) and not isinstance(at, bool) else 0.0
 
 
+def _mic(request: Request) -> str:
+    """Which microphone heard the phrase, as the page names it (``?mic=``, #4249):
+    the track's label, and ``call`` when it was opened in call mode for a headset.
+    Printable text only, cut short; ``""`` when the page did not say."""
+    value = request.query_params.get("mic", "")
+    return "".join(ch for ch in value if ch.isprintable())[:MIC_CHARS]
+
+
 def _phrase_id(value: object) -> str:
     text = str(value or "")
     return text if PHRASE_ID.fullmatch(text) else ""
@@ -346,6 +357,7 @@ async def wake(request: Request) -> JSONResponse:
         "mode": speech.wake,
         "seconds": _seconds(audio),
         "ms": round((time.monotonic() - started) * 1000),
+        "mic": _mic(request),
         **result,
     }
     await asyncio.to_thread(

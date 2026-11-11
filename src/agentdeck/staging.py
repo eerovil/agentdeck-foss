@@ -250,10 +250,6 @@ def check_isolation(
     from .work_services import services_enabled
 
     settings = {
-        "services.in_web with the Work services enabled": (
-            staging_config.services.in_web and services_enabled(staging_config),
-            False,
-        ),
         "github_webhook.enabled": (staging_config.github_webhook.enabled, False),
         "chat_board.enabled": (staging_config.chat_board.enabled, False),
         "poller.issue_refresh_interval_s": (staging_config.poller.issue_refresh_interval_s, 0),

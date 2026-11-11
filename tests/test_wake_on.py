@@ -7,6 +7,7 @@ which message each registration produces and how often, not the injection path.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from dataclasses import replace
@@ -18,6 +19,7 @@ from httpx import ASGITransport, AsyncClient
 from public_copy import private_feature
 
 from agentdeck import chat_board as _chat_board
+from agentdeck import chat_review as _chat_review
 from agentdeck.app import create_app
 from agentdeck.config import (
     AccountConfig,
@@ -26,18 +28,28 @@ from agentdeck.config import (
     HistoryConfig,
     RestartNudgeConfig,
 )
+from agentdeck.deck_notices import ROUTINE_LINE
 from agentdeck.github_webhook_log import Repository, WebhookLog
 from agentdeck.models import PullRequestRef
 from agentdeck.providers.instructions import agentdeck_session_instructions
 from agentdeck.wake_on import (
+    LIVE_READ_AGAIN_S,
+    LIVE_READ_CAP_S,
+    REVIEW_TIMEOUT_MINUTES,
     STOP_SETTLE_S,
     NeedsYouStop,
+    NothingToReport,
     WakeOnRegistry,
     WakeOnService,
+    WakeRequest,
     WakeRequestError,
+    merge_notice_told,
     parse_request,
+    read_live,
+    register_deck_wait,
     registry_path,
     seen_result,
+    settled_head,
     timeout_message,
 )
 from agentdeck.webhook_tailer import Delivery, WebhookTailer
@@ -157,6 +169,8 @@ def test_a_merge_wakes_the_chat_once_with_what_happened(root, service, scheduled
 
     assert [message.id for message in scheduled] == [f"wake-on:{request.id}"]
     assert "pull request eerovil/agentdeck#12 was merged as abcdef123456" in scheduled[0].text
+    # A merge is routine (#4253); a pull request closed unmerged is not.
+    assert scheduled[0].text.startswith(ROUTINE_LINE + "\n\nAgentDeck wake-on: ")
     assert scheduled[0].chat_id == "claude_code:alt:one"
     assert service.registry.all() == ()
 
@@ -239,8 +253,9 @@ def test_a_review_wait_ends_quietly_on_the_verdict_and_wakes_only_on_its_timeout
     clock.now += 10 * 60
     service.expire_due()
     texts = {message.id: message.text for message in scheduled}
-    assert "the reviewer is not running: ChatGPT has failed to start 3 times since 16:53 UTC." in (
-        texts[f"wake-on:{down.id}"]
+    assert (
+        "the reviewer is not running: ChatGPT has failed to start 3 times since 16:53 UTC."
+        in (texts[f"wake-on:{down.id}"])
     )
     assert "Do not ask for a fresh review" in texts[f"wake-on:{down.id}"]
     assert "Check once that the reviewer is making progress" in texts[f"wake-on:{broken.id}"]
@@ -268,26 +283,33 @@ def test_a_review_chat_that_stops_wakes_its_review_waits_unless_a_verdict_lands(
     still = register(service, "claude_code:alt:four", review="eerovil/agentdeck#14")
     # #3453: this chat asked for a fresh review, still pending behind an older chat.
     asked = service.register(
-        "claude_code:alt:five", "claude_code:alt:five", asked=True,
+        "claude_code:alt:five",
+        "claude_code:alt:five",
+        asked=True,
         **parse_request(review="eerovil/agentdeck#15"),
     )
-    merge = register(service, "claude_code:alt:six", pull_request="acmecorp/bazaar#351",
-                     timeout_minutes=120)
-    told = register(service, "claude_code:alt:two", pull_request="eerovil/agentdeck#12",
-                    timeout_minutes=120)
+    merge = register(
+        service, "claude_code:alt:six", pull_request="acmecorp/bazaar#351", timeout_minutes=120
+    )
+    told = register(
+        service, "claude_code:alt:two", pull_request="eerovil/agentdeck#12", timeout_minutes=120
+    )
     other = register(service, "claude_code:alt:three", pull_request="eerovil/agentdeck#13")
     # A clean pass usually reaches the chat before the reviewer's closing line: that line is
     # no news then, and a review chat opened after the pass still cuts.
-    passed = register(service, "claude_code:alt:seven", pull_request="eerovil/agentdeck#17",
-                      timeout_minutes=120)
-    later = register(service, "claude_code:alt:eight", pull_request="eerovil/agentdeck#18",
-                     timeout_minutes=120)
+    passed = register(
+        service, "claude_code:alt:seven", pull_request="eerovil/agentdeck#17", timeout_minutes=120
+    )
+    later = register(
+        service, "claude_code:alt:eight", pull_request="eerovil/agentdeck#18", timeout_minutes=120
+    )
     service.registry.answer_reviews("claude_code:alt:seven", ["eerovil/agentdeck#17"])
     service.registry.answer_reviews("claude_code:alt:eight", ["eerovil/agentdeck#18"])
     # The pass came first and the merge wait after it: the closing line is no news either.
     service.registry.answer_reviews("claude_code:alt:nine", ["eerovil/agentdeck#19"])
-    after = register(service, "claude_code:alt:nine", pull_request="eerovil/agentdeck#19",
-                     timeout_minutes=120)
+    after = register(
+        service, "claude_code:alt:nine", pull_request="eerovil/agentdeck#19", timeout_minutes=120
+    )
 
     def chat(number, target, pull, head=SHA):
         return {
@@ -300,36 +322,82 @@ def test_a_review_chat_that_stops_wakes_its_review_waits_unless_a_verdict_lands(
 
     bazaar = chat(6231, "acmecorp/bazaar#344", "acmecorp/bazaar#351")
     why = "Review found no actionable findings, but the release verdict was not posted: 404."
-    deliver(root, event="issue_comment", delivery="c1", repository=chats, action="created",
-            issue=bazaar, comment={"body": why})
-    deliver(root, event="issues", delivery="l1", repository=chats, action="labeled",
-            issue=bazaar, label={"name": "blocked"})
+    deliver(
+        root,
+        event="issue_comment",
+        delivery="c1",
+        repository=chats,
+        action="created",
+        issue=bazaar,
+        comment={"body": why},
+    )
+    deliver(
+        root,
+        event="issues",
+        delivery="l1",
+        repository=chats,
+        action="labeled",
+        issue=bazaar,
+        label={"name": "blocked"},
+    )
     closing = f"Reviewed agentdeck#12 at `{SHA[:12]}`: 1 outstanding finding (sent)."
     two = chat(6226, "eerovil/agentdeck#11", "eerovil/agentdeck#12")
     two["body"] += f"\n<!-- agentdeck: review-head {SHA} eerovil/agentdeck#14 -->"
-    deliver(root, event="issue_comment", delivery="c2", repository=chats, action="created",
-            issue=two, comment={"body": closing})
+    deliver(
+        root,
+        event="issue_comment",
+        delivery="c2",
+        repository=chats,
+        action="created",
+        issue=two,
+        comment={"body": closing},
+    )
     # The older chat closing on its own summary does not end the wait on the review asked for.
     opened = datetime.fromtimestamp(clock.now - 600, UTC).isoformat()
     old = {**chat(6230, "eerovil/agentdeck#16", "eerovil/agentdeck#15"), "created_at": opened}
-    deliver(root, event="issue_comment", delivery="c4", repository=chats, action="created",
-            issue=old, comment={"body": f"Reviewed agentdeck#15 at `{SHA[:12]}`: pass."})
+    deliver(
+        root,
+        event="issue_comment",
+        delivery="c4",
+        repository=chats,
+        action="created",
+        issue=old,
+        comment={"body": f"Reviewed agentdeck#15 at `{SHA[:12]}`: pass."},
+    )
     for number, pull, opened_at in (
         (6240, "eerovil/agentdeck#17", clock.now - 600),
         (6241, "eerovil/agentdeck#18", clock.now + 0.5),
         (6242, "eerovil/agentdeck#19", clock.now - 600),
     ):
         created = datetime.fromtimestamp(opened_at, UTC).isoformat()
-        deliver(root, event="issue_comment", delivery=f"c{number}", repository=chats,
-                action="created", issue={**chat(number, pull, pull), "created_at": created},
-                comment={"body": f"Reviewed {pull.partition('/')[2]} at `{SHA[:12]}`: pass."})
+        deliver(
+            root,
+            event="issue_comment",
+            delivery=f"c{number}",
+            repository=chats,
+            action="created",
+            issue={**chat(number, pull, pull), "created_at": created},
+            comment={"body": f"Reviewed {pull.partition('/')[2]} at `{SHA[:12]}`: pass."},
+        )
     # Not a review chat, and not a closing line: neither cuts anything short.
-    deliver(root, event="issues", delivery="l2", repository=chats, action="labeled",
-            issue={**chat(7, "x", "eerovil/agentdeck#13"), "title": "Something else"},
-            label={"name": "blocked"})
-    deliver(root, event="issue_comment", delivery="c3", repository=chats, action="created",
-            issue=chat(8, "eerovil/agentdeck#11", "eerovil/agentdeck#13"),
-            comment={"body": "Reviewed the protocol; reading the diff next."})
+    deliver(
+        root,
+        event="issues",
+        delivery="l2",
+        repository=chats,
+        action="labeled",
+        issue={**chat(7, "x", "eerovil/agentdeck#13"), "title": "Something else"},
+        label={"name": "blocked"},
+    )
+    deliver(
+        root,
+        event="issue_comment",
+        delivery="c3",
+        repository=chats,
+        action="created",
+        issue=chat(8, "eerovil/agentdeck#11", "eerovil/agentdeck#13"),
+        comment={"body": "Reviewed the protocol; reading the diff next."},
+    )
     clock.now += 1
     drain(service)
     assert scheduled == []
@@ -368,9 +436,7 @@ def test_a_review_chat_that_stops_wakes_its_review_waits_unless_a_verdict_lands(
     assert '{"pull_request": "acmecorp/bazaar#351", "no_verdict": true,' in text
     assert "without asking the person" in text
     held = {item.id: item for item in service.registry.all()}
-    assert set(held) == {
-        untouched.id, still.id, asked.id, told.id, other.id, passed.id, after.id
-    }
+    assert set(held) == {untouched.id, still.id, asked.id, told.id, other.id, passed.id, after.id}
     assert (held[told.id].deadline, held[told.id].stopped) == (told.deadline, "")
 
 
@@ -386,6 +452,7 @@ def test_a_pull_request_closed_unmerged_says_so(root, service, scheduled):
     )
     drain(service)
     assert "was closed without merging" in scheduled[0].text
+    assert scheduled[0].text.startswith("AgentDeck wake-on: ")
 
 
 def test_a_commit_wait_takes_the_first_finished_result_on_that_commit(root, service, scheduled):
@@ -431,6 +498,7 @@ def test_a_commit_wait_takes_the_first_finished_result_on_that_commit(root, serv
     assert len(scheduled) == 1
     assert "continuous-integration/drone/push" in scheduled[0].text
     assert "finished: failure (https://ci/1)" in scheduled[0].text
+    assert scheduled[0].text.startswith("AgentDeck wake-on: ")  # a failure is never routine
 
 
 def test_a_commit_wait_on_a_replaced_head_is_dropped_without_a_wake(root, scheduled, clock, caplog):
@@ -736,8 +804,10 @@ def test_a_deck_deploy_wait_waits_for_the_serving_worker_and_its_skills(
     clock.now += SKILLS_RETRY_S
     service.expire_due()
     assert len(scheduled) == 1
+    # A deploy that landed is routine (#4253): the notice opens with the routine line.
     assert scheduled[0].text.startswith(
-        "AgentDeck wake-on: the web worker serving this deck now runs 222222222222"
+        ROUTINE_LINE + "\n\nAgentDeck wake-on: the web worker serving this deck now runs"
+        " 222222222222"
     )
     assert "bundled skills are installed at 222222222222" in scheduled[0].text
 
@@ -867,6 +937,45 @@ def test_a_delivery_received_before_the_registration_does_not_fire(root, service
     assert len(service.registry.all()) == 1
 
 
+def test_a_deploy_wait_the_deck_registered_on_merge_carries_its_live_check(
+    root, service, scheduled, clock
+):
+    """#4253: the deck registers the deploy wait itself when it merges, instead of asking the
+    chat to; the wait's message is a routine notice that says so and carries the live check,
+    on a landed deploy and on a timeout alike, and a renewal by the chat keeps it."""
+    from agentdeck.deck_notices import ROUTINE_LINE
+    from agentdeck.wake_on import deck_deploy_message, fired_message
+
+    then = "Check it live, then record the live check."
+    request = service.register(
+        "claude_code:alt:one", "claude_code:alt:one", then=then,
+        **parse_request(deployment="eerovil/store@abc1234", timeout_minutes=5),
+    )
+    renewed = register(service, deployment="eerovil/store@abc1234", timeout_minutes=5)
+    assert (renewed.id, renewed.then) == (request.id, then), "the chat's own renewal keeps it"
+    assert WakeOnRegistry(registry_path(root)).all()[0].then == then, "kept across a restart"
+
+    landed = fired_message(
+        request, SimpleNamespace(summary="deployment succeeded", state="success")
+    )
+    assert landed.startswith(ROUTINE_LINE)
+    assert "The deck registered this wait for" in landed and landed.endswith(then)
+    assert "You asked" not in landed
+    deck = replace(request, kind="deck_deploy", sha="abc1234")
+    deployed = deck_deploy_message(deck, "f" * 40)
+    assert deployed.startswith(ROUTINE_LINE) and deployed.endswith(then)
+    assert "You asked" not in deployed
+    assert "You asked" in deck_deploy_message(replace(deck, then=""), "f" * 40)
+
+    for _ in range(2):  # its own round, then the one more round (#4080)
+        clock.now += 5 * 60
+        service.expire_due()
+        service.expire_due()
+    [timed_out] = scheduled
+    assert "when it merged your pull request" in timed_out.text
+    assert timed_out.text.endswith(then)
+
+
 def test_a_wait_that_times_out_still_wakes_the_chat_once(root, service, scheduled, clock):
     request = register(service, pull_request="eerovil/agentdeck#12", timeout_minutes=5)
     service.expire_due()
@@ -954,6 +1063,378 @@ def test_a_wait_stored_before_the_extra_round_times_out_at_once(root, service, s
     assert len(scheduled) == 1
 
 
+def settling_service(root, scheduled, clock, **hooks):
+    return WakeOnService(
+        root,
+        schedule=lambda message: scheduled.append(message) or message,
+        message_exists=lambda message_id: any(m.id == message_id for m in scheduled),
+        clock=clock,
+        **hooks,
+    )
+
+
+async def settle(service) -> None:
+    service.expire_due()
+    while service._side_tasks:
+        await asyncio.gather(*list(service._side_tasks))
+
+
+async def test_a_timed_out_wait_is_read_from_github_and_waits_again_while_running(
+    root, scheduled, clock
+):
+    """#4253: past its extra round, the deck reads a merge or CI wait itself; still running,
+    it waits again silently up to a day; a result, a failed read or the cap wakes the chat."""
+    answers: list[object] = []
+    reads: list[str] = []
+
+    async def fetch(path):
+        reads.append(path)
+        answer = answers.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    service = settling_service(
+        root, scheduled, clock, live_read=lambda request: read_live(request, fetch)
+    )
+    pull = register(service, pull_request="eerovil/agentdeck#12", timeout_minutes=5)
+    clock.now += 5 * 60
+    await settle(service)  # the extra round first, with no read
+    assert reads == [] and scheduled == []
+
+    # Still open: one read, waited again; not woken, and not read again before it is due.
+    clock.now += 5 * 60
+    answers.append({"state": "open"})
+    await settle(service)
+    assert reads == ["repos/eerovil/agentdeck/pulls/12"] and scheduled == []
+    (held,) = service.registry.all()
+    assert held.deadline == clock.now + LIVE_READ_AGAIN_S
+    await settle(service)
+    assert len(reads) == 1
+
+    # Merged: a routine wake that says the deck read it.
+    clock.now = held.deadline
+    answers.append({"state": "closed", "merged": True, "merge_commit_sha": SHA})
+    await settle(service)
+    assert [m.id for m in scheduled] == [f"wake-on:{pull.id}"]
+    text = scheduled[0].text
+    assert text.startswith(ROUTINE_LINE) and "was merged as abcdef123456" in text
+    assert "the deck read it from GitHub itself" in text
+    assert service.registry.all() == ()
+
+    # A failed read falls back to the timeout message, saying what the deck tried.
+    scheduled.clear()
+    commit = register(service, commit=f"eerovil/agentdeck@{SHA}", timeout_minutes=5)
+    clock.now += 5 * 60
+    service.expire_due()  # the extra round
+    clock.now += 5 * 60
+    answers.append(RuntimeError("gh api exited 1"))
+    await settle(service)
+    assert len(scheduled) == 1 and "nothing arrived for CI" in scheduled[0].text
+    assert "the read failed (gh api exited 1)" in scheduled[0].text
+
+    # Still running at the day's cap: the timeout message, saying the deck kept reading.
+    scheduled.clear()
+    commit = register(service, commit=f"eerovil/agentdeck@{SHA}", timeout_minutes=5)
+    clock.now += 5 * 60
+    service.expire_due()  # the extra round
+    clock.now += 5 * 60
+    running = {"check_runs": [{"name": "ci", "status": "in_progress", "conclusion": None}]}
+    while not scheduled:
+        answers.extend([running, {"statuses": []}])
+        await settle(service)
+        (held,) = service.registry.all() or (None,)
+        if held is not None:
+            assert held.deadline <= commit.registered_at + LIVE_READ_CAP_S
+            clock.now = held.deadline
+    assert clock.now == commit.registered_at + LIVE_READ_CAP_S
+    assert "it was still running, so it waited again, up to a day" in scheduled[0].text
+
+    # Nothing will ever report (#4253 review): no checks at all, or only skipped ones for an
+    # unnamed wait. One read ends the wait with the timeout message saying what it found.
+    skipped = {"check_runs": [{"name": "lint", "status": "completed", "conclusion": "skipped"}]}
+    for runs, found in (
+        ({"check_runs": []}, "the commit has no check runs or commit statuses"),
+        (skipped, "its only finished checks were skipped or neutral (lint)"),
+    ):
+        scheduled.clear()
+        reads.clear()
+        register(service, commit=f"eerovil/agentdeck@{SHA}", timeout_minutes=5)
+        clock.now += 5 * 60
+        service.expire_due()  # the extra round
+        clock.now += 5 * 60
+        answers.extend([runs, {"statuses": []}])
+        await settle(service)
+        assert len(reads) == 2 and len(scheduled) == 1
+        assert "nothing arrived for CI" in scheduled[0].text
+        assert found in scheduled[0].text and "stopped waiting" in scheduled[0].text
+        assert service.registry.all() == ()
+
+
+async def test_a_live_read_says_what_the_commit_checks_finished_with():
+    request = WakeRequest(
+        id="w", session_key="k", chat_id="k", kind="commit", repository="o/r", sha=SHA
+    )
+
+    def reading(runs, statuses):
+        async def fetch(path):
+            return {"check_runs": runs} if "check-runs" in path else {"statuses": statuses}
+
+        return fetch
+
+    done = {"status": "completed"}
+    green = await read_live(
+        request,
+        reading(
+            [{**done, "name": "test", "conclusion": "success"}],
+            [{"context": "drone", "state": "success"}],
+        ),
+    )
+    assert green.state == "success" and "2 checks" in green.summary
+    # A commit status may be a deploy, so only check runs alone are surely CI (#4253).
+    assert not green.ci
+    runs_only = await read_live(
+        request, reading([{**done, "name": "test", "conclusion": "success"}], [])
+    )
+    assert runs_only.ci and runs_only.state == "success"
+    # A skipped job says nothing; a failing status is the result.
+    red = await read_live(
+        request,
+        reading(
+            [{**done, "name": "deploy", "conclusion": "skipped"}],
+            [{"context": "drone", "state": "failure"}],
+        ),
+    )
+    assert red.state == "failure" and "not passing: drone" in red.summary
+    # Only a skipped or neutral check: nothing to tell an unnamed wait, as by webhook; a
+    # wait that names that check takes it (#4253 review).
+    skipped = reading([{**done, "name": "deploy", "conclusion": "skipped"}], [])
+    assert isinstance(await read_live(request, skipped), NothingToReport)
+    assert (await read_live(replace(request, name="deploy"), skipped)).state == "skipped"
+    # Pending somewhere: still running. Nothing at all: nothing will report.
+    assert await read_live(request, reading([], [{"context": "x", "state": "pending"}])) is None
+    assert isinstance(await read_live(request, reading([], [])), NothingToReport)
+    # A named wait counts only its own check.
+    named = replace(request, name="drone")
+    assert (
+        await read_live(
+            named,
+            reading(
+                [{"status": "queued", "name": "test"}], [{"context": "drone", "state": "success"}]
+            ),
+        )
+    ).state == "success"
+
+
+async def test_a_review_chat_closing_with_no_verdict_is_asked_again_by_the_deck(
+    root, scheduled, clock
+):
+    """#4253: the deck asks for a fresh review itself; only a refusal or a reviewer that is
+    down wakes the chat, saying what the deck tried. A label stop still wakes it as before."""
+    asks: list[tuple] = []
+    refusals: list[str] = []
+    down = [""]
+
+    async def ask_review(repository, number, note):
+        asks.append((repository, number, note))
+        return refusals.pop(0) if refusals else ""
+
+    service = settling_service(
+        root, scheduled, clock, ask_review=ask_review, reviewer_down=lambda: down[0]
+    )
+    stopped = "the review chat https://x/9 closed its review, saying:\n\nno verdict"
+
+    def stop(**body):
+        request = register(service, **body)
+        cut = replace(request, stopped=stopped, deadline=clock.now)
+        if request.kind == "pull_request":
+            cut = replace(cut, cut_from=request.deadline)
+        service.registry.update(cut)
+        return request
+
+    review = stop(review="eerovil/agentdeck#12")
+    merge = stop(pull_request="eerovil/agentdeck#12")
+    await settle(service)
+    assert scheduled == [] and [ask[:2] for ask in asks] == [("eerovil/agentdeck", 12)] * 2
+    assert "no verdict" in asks[0][2]
+    held = {item.id: item for item in service.registry.all()}
+    assert held[review.id].stopped == "" and held[review.id].asked_at == clock.now
+    assert held[review.id].deadline == clock.now + REVIEW_TIMEOUT_MINUTES * 60
+    assert (held[merge.id].stopped, held[merge.id].deadline) == ("", merge.deadline)
+
+    # Refused: the chat hears the refusal and is told not to ask again.
+    service.registry.update(replace(held[review.id], stopped=stopped, deadline=clock.now))
+    refusals.append("this head was already asked again twice")
+    await settle(service)
+    assert len(scheduled) == 1
+    assert "it was refused: this head was already asked again twice" in scheduled[0].text
+    assert "Do not ask again" in scheduled[0].text
+
+    # The reviewer is down: no ask, and the chat is told why.
+    scheduled.clear()
+    asks.clear()
+    down[0] = "no reviewer account is signed in"
+    stop(review="eerovil/agentdeck#12")
+    await settle(service)
+    assert asks == [] and len(scheduled) == 1
+    assert "did not ask for a fresh review itself" in scheduled[0].text
+    assert "no reviewer account is signed in" in scheduled[0].text
+
+    # A label stop wakes the chat with today's message, and asks nothing.
+    scheduled.clear()
+    down[0] = ""
+    request = register(service, review="eerovil/agentdeck#13")
+    service.registry.update(
+        replace(request, stopped="the review chat x was labelled `blocked`", deadline=clock.now)
+    )
+    await settle(service)
+    assert asks == [] and "ask for the review again yourself" in scheduled[0].text
+
+
+@private_feature(_chat_review)
+async def test_a_review_chat_closed_on_github_with_no_verdict_is_asked_again(
+    root, scheduled, clock
+):
+    """#4253 review: the close itself, from its webhook, starts the deck's own re-ask once the
+    settle window passes; a verdict in that window, or an earlier stop's note, wins."""
+    asks: list[tuple] = []
+
+    async def ask_review(repository, number, note):
+        asks.append((repository, number, note))
+        return ""
+
+    chats = Repository(owner="eerovil", name="review-chats")
+    service = settling_service(
+        root, scheduled, clock, ask_review=ask_review, review_chats="eerovil/review-chats"
+    )
+    waiting = register(service, review="eerovil/agentdeck#12")
+    answered = register(service, "claude_code:alt:two", review="eerovil/agentdeck#14")
+
+    def chat(number, pull):
+        return {
+            "number": number,
+            "title": f"Review {pull}",
+            "state": "closed",
+            "html_url": f"https://github.com/eerovil/review-chats/issues/{number}",
+            "body": f"<!-- agentdeck: review-head {SHA} {pull} -->",
+        }
+
+    clock.now += 1
+    deliver(
+        root, event="issue_comment", delivery="c1", repository=chats, action="created",
+        issue=chat(70, "eerovil/agentdeck#12"), comment={"body": "Ran out of time."},
+    )
+    for number, pull in ((70, "eerovil/agentdeck#12"), (71, "eerovil/agentdeck#14")):
+        deliver(
+            root, event="issues", delivery=f"x{number}", repository=chats, action="closed",
+            issue=chat(number, pull),
+        )
+    drain(service)
+    held = {item.id: item for item in service.registry.all()}
+    assert "closed its review: it was closed" in held[waiting.id].stopped
+    assert "Ran out of time." in held[waiting.id].stopped
+    service.registry.answer_reviews("claude_code:alt:two", ["eerovil/agentdeck#14"])
+    clock.now = datetime.now(UTC).timestamp() + STOP_SETTLE_S + 5  # deliveries: wall clock
+    await settle(service)
+
+    assert [ask[:2] for ask in asks] == [("eerovil/agentdeck", 12)] and scheduled == []
+    assert answered.id not in {item.id for item in service.registry.all()}, "its verdict won"
+
+
+def test_green_ci_on_a_ready_head_and_an_already_told_merge_end_without_a_message(
+    root, scheduled, clock
+):
+    """#4253: the release merges a ready head that went green, and its merge notice already
+    told the chat of a merge; a draft's, a failing or a deploy's result still wakes the chat."""
+    ready: list[bool] = [True]
+    notices: list[str] = []
+    service = settling_service(
+        root,
+        scheduled,
+        clock,
+        ready_head=lambda request: ready[0],
+        release_notices=lambda chat_id, since: list(notices),
+    )
+
+    def status(delivery, state):
+        deliver(
+            root,
+            event="check_suite",
+            delivery=delivery,
+            action="completed",
+            check_suite={"head_sha": SHA, "conclusion": state, "app": {"name": "ci"}},
+        )
+        drain(service)
+
+    register(service, commit=f"eerovil/agentdeck@{SHA}")
+    status("g1", "success")
+    assert scheduled == [] and service.registry.all() == ()
+    register(service, commit=f"eerovil/agentdeck@{SHA}")
+    status("r1", "failure")
+    assert len(scheduled) == 1  # a failure wakes, ready or not
+    # A deploy at that head is not CI, in either form GitHub sends it: a deployment status,
+    # or a commit status as Vercel sends. Its result still wakes the chat waiting on it.
+    register(service, commit=f"eerovil/agentdeck@{SHA}")
+    deliver(
+        root,
+        event="deployment_status",
+        delivery="p1",
+        action="created",
+        deployment_status={"state": "success", "environment": "preview"},
+        deployment={"sha": SHA},
+    )
+    drain(service)
+    assert len(scheduled) == 2 and "deployment to preview" in scheduled[1].text
+    register(service, commit=f"eerovil/agentdeck@{SHA}", name="Vercel")
+    deliver(root, event="status", delivery="p2", state="success", sha=SHA, context="Vercel")
+    drain(service)
+    assert len(scheduled) == 3 and "commit status Vercel" in scheduled[2].text
+    ready[0] = False  # a draft, or a head the cache does not know
+    register(service, commit=f"eerovil/agentdeck@{SHA}")
+    status("g2", "success")
+    assert len(scheduled) == 4 and scheduled[3].text.startswith(ROUTINE_LINE)
+    # #4253 review: the cached row the deck reads, in order: ready, merged, then green CI
+    # landing after the merge, which the release's deploy wait carries on from: no message.
+    # A pull request closed without a merge settles nothing.
+    row = {"state": "OPEN", "isDraft": False, "headRefOid": SHA.upper(), "mergedAt": None}
+    service._ready_head = lambda request: settled_head(row, request.sha)
+    register(service, commit=f"eerovil/agentdeck@{SHA}")
+    row.update(state="MERGED", mergedAt="2026-11-11T07:00:00Z")
+    status("g3", "success")
+    assert len(scheduled) == 4 and service.registry.all() == ()
+    row.update(state="CLOSED", mergedAt=None)
+    register(service, commit=f"eerovil/agentdeck@{SHA}")
+    status("g4", "success")
+    assert len(scheduled) == 5
+    assert not settled_head({**row, "state": "OPEN", "isDraft": True}, SHA)
+    assert not settled_head({"state": "OPEN", "headRefOid": "f" * 40}, SHA)
+
+    def merged(delivery, number):
+        deliver(
+            root,
+            event="pull_request",
+            delivery=delivery,
+            action="closed",
+            number=number,
+            pull_request={"number": number, "merged": True},
+        )
+        drain(service)
+
+    notices.append("work-release:eerovil/agentdeck#7:live-check:eerovil/agentdeck#12")
+    register(service, pull_request="eerovil/agentdeck#12")
+    register(service, pull_request="eerovil/agentdeck#13")
+    merged("m1", 12)
+    merged("m2", 13)
+    assert len(scheduled) == 6 and "agentdeck#13 was merged" in scheduled[5].text
+    assert service.registry.all() == ()
+    assert merge_notice_told(
+        ["work-release:x:live-check:EeroVil/AgentDeck#12,o/r#1"], "eerovil/agentdeck#12"
+    )
+    assert not merge_notice_told(
+        ["work-release:x:ready:eerovil/agentdeck#12"], "eerovil/agentdeck#12"
+    )
+
+
 def test_a_timeout_sends_a_result_the_deck_already_holds(root, service, scheduled, clock):
     finished = {"sha": SHA, "context": "ci", "state": "success"}
     deliver(root, event="status", delivery="d1", updated_at="2026-11-04T10:00:00Z", **finished)
@@ -980,6 +1461,16 @@ def test_a_timeout_sends_a_result_the_deck_already_holds(root, service, schedule
     assert service.registry.all() == ()
     assert "commit status ci" in scheduled[0].text
     assert "deployment to production" in scheduled[1].text
+    # #4253 review: a deploy the deck waits on after its merge, finished before that wait was
+    # stored, wakes the chat at the next deadline pass, with the live check it carries.
+    fields = parse_request(deployment=f"eerovil/agentdeck@{SHA}")
+    register_deck_wait(service.registry, root, "k", "k", then="Check it live.", **fields)
+    fields = parse_request(deployment=f"eerovil/agentdeck@{'f' * 40}")
+    pending = register_deck_wait(service.registry, root, "k", "k", then="Later.", **fields)
+    service.expire_due()
+    assert service.registry.all() == (pending,)
+    assert "deployment to production" in scheduled[2].text
+    assert scheduled[2].text.endswith("Check it live.")
 
 
 def deploy_state(root, delivery, state, at, *, sha=SHA, environment="production"):
@@ -1298,7 +1789,20 @@ def test_a_chat_cannot_hold_unbounded_waits(service):
         {"at": "tomorrow"},
         {"at": "11:30", "pull_request": "eerovil/agentdeck#1"},
         {"after_minutes": 0},
-        {"after_minutes": 24 * 60 + 1},
+        {"after_minutes": 14 * 24 * 60 + 1},
+        {"at": "2026-11-26T09:00:00+02:00"},  # 15 days past the test's now below
+        # #4256: a check belongs to a time wait, runs a command, and runs within the wait.
+        {"pull_request": "eerovil/agentdeck#1", "check": {"command": "true"}},
+        {"after_minutes": 300, "check": {"command": "  "}},
+        {"after_minutes": 300, "check": "true"},
+        {"after_minutes": 300, "check": {"command": "true", "every_minutes": 4}},
+        {"after_minutes": 300, "check": {"command": "true", "every_minutes": 300}},
+        {"after_minutes": 300, "check": {"command": "true", "every_minutes": True}},
+        {"after_minutes": 300, "check": {"command": "true", "every": 10}},
+        {"after_minutes": 300, "check": {"command": "true", "cwd": "relative/dir"}},
+        {"after_minutes": 300, "check": {"command": "true", "cwd": False}},
+        {"after_minutes": 300, "check": {"command": "true", "cwd": 0}},
+        {"after_minutes": 300, "check": {"command": "x" * 2001}},
         {"after_minutes": 30, "timeout_minutes": 30},
         {"after_minutes": 30, "name": "ci"},
         {"after_minutes": 30, "waiting_for": "x" * 81},
@@ -1316,15 +1820,56 @@ def test_a_chat_cannot_hold_unbounded_waits(service):
 )
 def test_a_malformed_registration_is_refused(body):
     with pytest.raises(WakeRequestError):
-        parse_request(**body)
+        parse_request(**body, now=datetime(2026, 11, 11, 8, tzinfo=timezone(timedelta(hours=2))))
 
 
 def test_a_time_wait_wakes_the_chat_at_its_time_naming_what_it_waits_on(
     root, service, scheduled, clock
 ):
     """#2968: a render on another machine reports nothing to GitHub; the time is the wake."""
+    # #4266: a check a week after a change ships fits, up to two weeks ahead.
+    week = parse_request(
+        at="2026-11-18T09:00:00+02:00",
+        waiting_for="the week's token report",
+        now=datetime(2026, 11, 11, 8, tzinfo=timezone(timedelta(hours=2))),
+    )
+    assert week["timeout_s"] == (7 * 24 + 1) * 3600
+    assert parse_request(after_minutes=14 * 24 * 60)["timeout_s"] == 14 * 24 * 3600
     request = register(service, after_minutes=90, waiting_for="the  render on the GTX 970")
     assert request.target == "the render on the GTX 970"
+    # Its Work stays current until the wait fires, however long it sits quiet; the owner's
+    # needs-you wait keeps no Work current.
+    from agentdeck.web.work_view import wait_works, waiting_work_ids
+    from agentdeck.work import WorkEvidence, WorkMembership, WorkProvenance, WorkRef
+
+    def work(number, chat, evidence=WorkEvidence.REGISTERED_ISSUE):
+        ref = WorkRef("eerovil/agentdeck", number)
+        provenance = (WorkProvenance(evidence=evidence),)
+        return SimpleNamespace(
+            work_id=ref.work_id, memberships=(WorkMembership(ref, chat, provenance),)
+        )
+
+    register(service, "claude_code:alt:deck", needs_you="all")
+    projection = SimpleNamespace(
+        works=(
+            work(1, "claude_code:alt:one"),
+            work(2, "claude_code:alt:one", WorkEvidence.DELEGATED),
+            work(3, "claude_code:alt:deck"),
+            work(4, "claude_code:alt:two"),
+        )
+    )
+    app = SimpleNamespace(state=SimpleNamespace(wake_on=service))
+    assert waiting_work_ids(app, projection) == {"github_issue:eerovil/agentdeck#1"}
+    # Two Works waiting at once, each by its own chat; a restart reads both from the file.
+    register(service, "claude_code:alt:two", after_minutes=120, waiting_for="the backup")
+    both = {"github_issue:eerovil/agentdeck#1", "github_issue:eerovil/agentdeck#4"}
+    assert waiting_work_ids(app, projection) == both
+    restarted = SimpleNamespace(
+        state=SimpleNamespace(
+            wake_on=SimpleNamespace(registry=WakeOnRegistry(registry_path(root)))
+        )
+    )
+    assert waiting_work_ids(restarted, projection) == both
     deliver(
         root,
         event="pull_request",
@@ -1342,7 +1887,99 @@ def test_a_time_wait_wakes_the_chat_at_its_time_naming_what_it_waits_on(
     service.expire_due()
     assert [message.id for message in scheduled] == [f"wake-on:{request.id}"]
     assert "it is time to check on the render on the GTX 970" in scheduled[0].text
-    assert service.registry.all() == ()
+    # Only its own wait fired: the other Work still waits.
+    assert sorted(wait.kind for wait in service.registry.all()) == ["needs_you", "time"]
+    assert waiting_work_ids(app, projection) == {"github_issue:eerovil/agentdeck#4"}
+    # #4272: a chat directly in two Works keeps only the one its wait is for current.
+    def work_in(repo, number, chat):
+        ref = WorkRef(repo, number)
+        provenance = (WorkProvenance(evidence=WorkEvidence.REGISTERED_ISSUE),)
+        return SimpleNamespace(
+            work_id=ref.work_id, memberships=(WorkMembership(ref, chat, provenance),)
+        )
+
+    shared = "claude_code:alt:both"
+    busy = "github_issue:eerovil/trailhead#8"
+    two = SimpleNamespace(
+        works=(work_in("eerovil/agentdeck", 7, shared), work_in("eerovil/trailhead", 8, shared))
+    )
+    service.registry.remove([wait.id for wait in service.registry.all()])
+    unsure = register(service, shared, after_minutes=7 * 24 * 60, waiting_for="the report")
+    assert waiting_work_ids(app, two) == frozenset()  # neither named: neither held
+    service.registry.remove([unsure.id])
+    named = register(
+        service,
+        shared,
+        after_minutes=7 * 24 * 60,
+        waiting_for="the report",
+        work_id="Eerovil/Trailhead#8",
+    )
+    assert named.work_id == busy and named.payload()["work_id"] == busy
+    assert waiting_work_ids(app, two) == {busy}
+    assert waiting_work_ids(restarted, two) == {busy}  # the file keeps the Work it names
+    # The same wait for the other Work is a wait of its own, not a renewal of this one
+    # (#4272 review).
+    other = register(
+        service,
+        shared,
+        after_minutes=7 * 24 * 60,
+        waiting_for="the report",
+        work_id="eerovil/agentdeck#7",
+    )
+    assert other.id != named.id and other.work_id == "github_issue:eerovil/agentdeck#7"
+    assert waiting_work_ids(app, two) == {busy, other.work_id}
+    service.registry.remove([other.id])
+    service.registry.remove([named.id])
+    ci = register(service, shared, commit="eerovil/trailhead@abc1234")  # its repository says
+    assert waiting_work_ids(app, two) == {busy}
+    service.registry.remove([ci.id])
+    # A pull request wait in a repository both Works share follows the pull request's own
+    # registration (#3392).
+    third = work_in("eerovil/trailhead", 9, shared)
+    three = SimpleNamespace(works=(*two.works, third))
+    register(service, shared, pull_request="eerovil/trailhead#20")
+    assert waiting_work_ids(app, three) == frozenset()
+    pull = PullRequestRef("eerovil/trailhead", 20, work_id=third.work_id)
+    # Another chat registering the same pull request for another Work says nothing of this
+    # chat's wait (#4272 review): only the waiting chat's own registrations count.
+    theirs = PullRequestRef("eerovil/trailhead", 20, work_id=busy)
+    app.state.app_state = SimpleNamespace(
+        session_pull_requests={"claude_code:alt:other": (theirs,)}
+    )
+    assert waiting_work_ids(app, three) == frozenset()
+    app.state.app_state = SimpleNamespace(
+        session_pull_requests={shared: (pull,), "claude_code:alt:other": (theirs,)},
+        chat_session_keys=lambda key: (key,),
+    )
+    assert waiting_work_ids(app, three) == {third.work_id}
+    # Two legs of the one chat naming two Works leave it undecided (#4272 review).
+    app.state.app_state = SimpleNamespace(
+        session_pull_requests={shared: (pull,), "claude_code:alt:leg2": (theirs,)},
+        chat_session_keys=lambda key: (key, "claude_code:alt:leg2"),
+    )
+    assert waiting_work_ids(app, three) == frozenset()
+    # Nor does the pull request's repository break that tie when the two Works are in two
+    # repositories (#4272 review round 3): both stay undecided, for status and currentness.
+    service.registry.remove([wait.id for wait in service.registry.all()])
+    across = register(service, shared, pull_request="eerovil/agentdeck#20")
+    mine = PullRequestRef("eerovil/agentdeck", 20, work_id="github_issue:eerovil/agentdeck#7")
+    yours = PullRequestRef("eerovil/agentdeck", 20, work_id=busy)
+    app.state.app_state = SimpleNamespace(
+        session_pull_requests={shared: (mine,), "claude_code:alt:leg2": (yours,)},
+        chat_session_keys=lambda key: (key, "claude_code:alt:leg2"),
+    )
+    assert waiting_work_ids(app, two) == frozenset()
+    [held] = [w for w in service.registry.all() if w.id == across.id]
+    both = [w.work_id for w in two.works]
+    assert wait_works(app.state.app_state, held, both) == set(both)
+    # A wait naming a Work its chat is not in holds nothing.
+    service.registry.remove([wait.id for wait in service.registry.all()])
+    register(service, shared, after_minutes=60, work_id=busy)
+    assert waiting_work_ids(app, SimpleNamespace(works=(two.works[0],))) == frozenset()
+    with pytest.raises(WakeRequestError, match="work_id"):
+        parse_request(after_minutes=5, work_id="not a work")
+    with pytest.raises(WakeRequestError, match="work_id"):
+        parse_request(needs_you="all", work_id="eerovil/agentdeck#1")
 
 
 def needs_you_stop(work=1, *, category="needs_answer", at=0.0, repo="eerovil/agentdeck", **kw):
@@ -1476,6 +2113,223 @@ def test_a_needs_you_wake_whose_save_failed_is_retried_on_a_timer(root, clock):
     assert len(saved) == 1 and service.registry.all()[0].told == (away.key,)
 
 
+def test_a_time_wait_check_stays_silent_until_it_says_it_happened(root, service, scheduled, clock):
+    """#4256: a check runs every interval until the deadline; exit 3 wakes nobody, exit 0
+    wakes the chat once with its output, and two workers never run the same run twice."""
+    from agentdeck.wake_on import CHECK_NOT_YET, MAX_TIME_WAIT_MINUTES
+
+    assert MAX_TIME_WAIT_MINUTES == 14 * 24 * 60
+    request = register(
+        service,
+        after_minutes=3 * 24 * 60,  # past the old one-day cap
+        waiting_for="the error not coming back",
+        check={"command": "sentry-search", "every_minutes": 60, "cwd": str(root.parent)},
+    )
+    assert request.payload()["check"] == {
+        "command": "sentry-search",
+        "cwd": str(root.parent),
+        "every_minutes": 60,
+        "next_run": clock.now + 3600,
+        "not_yet_runs": 0,
+    }
+    assert service.next_due() == clock.now + 3600 and service.due_checks() == []
+    clock.now += 3600
+    claimed = service.due_checks()
+    assert [item.id for item in claimed] == [request.id]
+    assert service.due_checks() == []  # claimed: its next run moved an hour on
+    service.check_done(claimed[0], CHECK_NOT_YET, "0 events\n", "")
+    service.expire_due()
+    assert scheduled == []
+    (held,) = service.registry.all()
+    assert held.check_runs == 1 and "printed: 0 events" in held.check_last
+    clock.now += 3600
+    (second,) = service.due_checks()
+    service.check_done(second, 0, "SENTRY-12 seen again at 14:02", "")
+    assert [m.id for m in scheduled] == [f"wake-on:{request.id}"]
+    assert "says it happened (exit 0 at" in scheduled[0].text
+    assert "SENTRY-12 seen again at 14:02" in scheduled[0].text
+    assert service.registry.all() == ()
+    service.check_done(second, 0, "late duplicate", "")  # the wait is gone: nothing more
+    assert len(scheduled) == 1
+
+
+def test_a_time_wait_check_error_wakes_and_the_deadline_quotes_the_last_not_yet(
+    root, service, scheduled, clock
+):
+    """#4256: any exit but 0 and 3 wakes with the reason; a check that only ever said not yet
+    wakes at the deadline with its newest run; a renewal starts the check afresh."""
+    from agentdeck.wake_on import CHECK_NOT_YET
+
+    broken = register(
+        service, after_minutes=120, waiting_for="the job", check={"command": "jq -e .ok"}
+    )
+    clock.now += 3600
+    (run,) = service.due_checks()
+    service.check_done(run, 5, "jq: error: syntax", "exit 5")
+    assert "went wrong at" in scheduled[0].text and "(exit 5)" in scheduled[0].text
+    assert "jq: error: syntax" in scheduled[0].text and "exit 3 means not yet" in scheduled[0].text
+    assert scheduled[0].id == f"wake-on:{broken.id}"
+
+    quiet = register(
+        service, after_minutes=150, waiting_for="the log line", check={"command": "grep -q x"}
+    )
+    clock.now += 3600
+    (run,) = service.due_checks()
+    service.check_done(run, CHECK_NOT_YET, "", "")
+    clock.now += 60
+    (in_flight,) = service.registry.all()  # a run of the old command, still going...
+    again = register(
+        service, after_minutes=90, waiting_for="The log line", check={"command": "grep -q y"}
+    )
+    assert again.id == quiet.id and again.check_runs == 0 and again.check_command == "grep -q y"
+    assert again.check_at == clock.now + 3600 and again.check_gen == in_flight.check_gen + 1
+    # ...ends after the renewal: neither its success nor its "not yet" touches the new wait.
+    service.check_done(in_flight, 0, "old command matched", "")
+    service.check_done(in_flight, CHECK_NOT_YET, "old", "")
+    assert len(scheduled) == 1 and service.registry.all()[-1].check_runs == 0
+    clock.now += 3600
+    (run,) = service.due_checks()
+    service.check_done(run, CHECK_NOT_YET, "no match", "")
+    clock.now += 30 * 60
+    assert service.due_checks() == []  # the next run falls after the deadline
+    service.expire_due()
+    assert [m.id for m in scheduled][-1] == f"wake-on:{quiet.id}"
+    text = scheduled[-1].text
+    assert "has come, and your check never said it happened" in text
+    assert "said not yet 1 time(s)" in text and "printed: no match" in text
+
+
+
+def test_a_check_result_and_the_other_workers_renewal_never_cross(root, service, scheduled, clock):
+    """#4256: two web workers share the registry during a deploy. A renewal by the other
+    one before a run ends turns that run's result away; one that lands after the result
+    was settled, while its wake is being sent, finds the wake already owed and changes
+    nothing, so the chat gets exactly that one message."""
+    from agentdeck import wake_on
+    from agentdeck.wake_on import CHECK_NOT_YET
+
+    other = WakeOnRegistry(service.registry.path)
+
+    def renew(command):
+        fields = parse_request(after_minutes=150, waiting_for="the fix", check={"command": command})
+        key = "claude_code:alt:one"
+        return wake_on.register(other, key, key, clock=clock, **fields)
+
+    request = register(service, after_minutes=150, waiting_for="the fix", check={"command": "a"})
+    clock.now += 3600
+    (run,) = service.due_checks()
+    renew("b")  # the other worker, while "a" runs
+    service.check_done(run, 0, "a found it", "")
+    service.check_done(run, CHECK_NOT_YET, "a: nothing", "")
+    assert scheduled == []
+    (held,) = service.registry.all()
+    assert held.check_command == "b" and held.check_runs == 0 and not held.pending_text
+
+    clock.now += 3600
+    (run,) = service.due_checks()
+    sending = service._schedule
+
+    def renewed_while_sending(message):
+        renew("c")
+        return sending(message)
+
+    service._schedule = renewed_while_sending
+    service.check_done(run, 0, "b found it", "")
+    assert [m.id for m in scheduled] == [f"wake-on:{request.id}"]
+    assert "b found it" in scheduled[0].text
+    assert service.registry.all() == ()
+
+@pytest.mark.asyncio
+async def test_a_check_runs_its_shell_command_and_is_stopped_at_its_time_limit(
+    tmp_path, monkeypatch
+):
+    """#4256: the real run, in its cwd, with its exit code and output; one that hangs is
+    killed and reported, as is one whose directory has gone."""
+    from agentdeck.wake_on import run_check
+
+    code, output, why = await run_check("pwd; echo oops >&2; exit 3", str(tmp_path), 5)
+    assert (code, why) == (3, "") and str(tmp_path) in output and "oops" in output
+    assert (await run_check("exit 7", str(tmp_path), 5))[::2] == (7, "exit 7")
+    code, output, why = await run_check("echo before the hang; sleep 5", str(tmp_path), 0.25)
+    assert code is None and "was stopped" in why and "before the hang" in output
+    # The guide's pattern: a failed read wakes (exit 1), a clean empty read is not yet.
+    pattern = 'out=$({read}) || exit 1; grep -q SENTRY-12 <<<"$out" || exit 3; echo "$out"'
+    assert (await run_check(pattern.format(read="false"), "", 5))[0] == 1
+    assert (await run_check(pattern.format(read="echo none"), "", 5))[0] == 3
+    code, output, _ = await run_check(pattern.format(read="echo SENTRY-12 is back"), "", 5)
+    assert code == 0 and "SENTRY-12 is back" in output
+    # A noisy command: only the tail is held, and its last line survives.
+    code, output, _ = await run_check("yes x | head -c 3000000; echo; echo END", "", 5)
+    assert code == 0 and output.rstrip().endswith("END") and len(output) <= 3001
+    code, _, why = await run_check("true", str(tmp_path / "gone"), 5)
+    assert code is None and "could not start" in why
+    # It runs as its chat's account: the web's own CLAUDE_CONFIG_DIR is not passed on.
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/web/own")
+    _, output, _ = await run_check('echo "[$CLAUDE_CONFIG_DIR]"', "", 5)
+    assert output.strip() == "[]"
+    account = {"CLAUDE_CONFIG_DIR": "/acct"}
+    _, output, _ = await run_check('echo "$CLAUDE_CONFIG_DIR"', "", 5, env=account)
+    assert output.strip() == "/acct"
+
+
+ACCOUNT_SERVER = r"""
+import json, sys
+for line in sys.stdin:
+    message = json.loads(line)
+    if "id" not in message:
+        continue
+    if message["method"] == "initialize":
+        result = {"protocolVersion": "2025-06-18", "capabilities": {}, "serverInfo": {}}
+    else:
+        result = {"content": [{"type": "text", "text": "data of " + sys.argv[1]}]}
+    print(json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}), flush=True)
+"""
+
+
+@pytest.mark.asyncio
+async def test_a_check_reads_only_its_own_chat_claude_account_mcp_servers(tmp_path):
+    """#4256: two Claude accounts each name a ``sentry``; a chat's check, through the real
+    ``agentdeck mcp-call``, reads its own account's, and a Codex chat's or an unknown
+    account's check is refused rather than reading the web user's default Claude config."""
+    import sys
+
+    from agentdeck.wake_on import check_account_env, run_check
+
+    script = tmp_path / "server.py"
+    script.write_text(ACCOUNT_SERVER)
+    accounts = []
+    for provider, label in (("claude_code", "main"), ("claude_code", "alt"), ("codex", "cx")):
+        root = tmp_path / label
+        root.mkdir()
+        server = {"command": sys.executable, "args": [str(script), label]}
+        (root / ".claude.json").write_text(json.dumps({"mcpServers": {"sentry": server}}))
+        accounts.append(SimpleNamespace(provider=provider, label=label, root=root))
+    home = tmp_path / "home"
+    home.mkdir()
+    default = {"command": sys.executable, "args": [str(script), "default"]}
+    (home / ".claude.json").write_text(json.dumps({"mcpServers": {"sentry": default}}))
+    config = SimpleNamespace(accounts=accounts)
+    # The real ``agentdeck mcp-call`` entry, without the CLI's slower start-up.
+    call = "import sys; from agentdeck.mcp_call import main; raise SystemExit(main(sys.argv[1:]))"
+    command = f"HOME={home} {sys.executable} -c '{call}' sentry search"
+
+    run = await run_check(command, "", 20, env=check_account_env(config, "claude_code:alt:a1"))
+    assert run[0] == 0 and run[1].strip() == "data of alt"
+    codex = check_account_env(config, "codex:cx:t1")
+    code, output, why = await run_check(command, "", 20, env=codex)
+    assert (code, why) == (2, "exit 2") and "no Claude account" in output
+    assert "data of" not in output
+    main = check_account_env(config, "claude_code:main:a2")
+    assert main["AGENTDECK_MCP_CONFIG"] == str(tmp_path / "main" / ".claude.json")
+    run = await run_check(command, "", 20, env=main)
+    assert run[0] == 0 and run[1].strip() == "data of main"
+    # An account the config no longer names, a malformed key, and no account at all are
+    # refused like the Codex chat: nothing falls back to the web user's own config.
+    for key in ("claude_code:gone:a3", "bogus"):
+        assert check_account_env(config, key)["AGENTDECK_MCP_CONFIG"] == ""
+    code, output, _ = await run_check(command, "", 20)
+    assert code == 2 and "no Claude account" in output
+
 def test_a_time_wait_at_a_clock_time_takes_its_next_occurrence():
     tz = timezone(timedelta(hours=3))
     now = datetime(2026, 10, 13, 10, 0, tzinfo=tz)
@@ -1515,6 +2369,11 @@ def test_the_session_guide_offers_the_wait_next_to_the_no_polling_rule():
         assert flat.index("Never wait by polling") < flat.index("/wake-on")
         assert '{"after_minutes": 90}' in flat
         assert '{"needs_you": "all"}' in flat
+        # #4256: a time wait's check, its "not yet" exit, and the MCP tool command.
+        assert '"check": {"command": "<shell>", "every_minutes": 60}' in flat
+        assert "agentdeck mcp-call <server> <tool>" in flat
+        guide_pattern = "out=$(<read>) || exit 1; grep -q '<what you wait for>' <<<\"$out\""
+        assert guide_pattern + " || exit 3" in flat
 
 
 def test_a_finished_check_is_seen_in_each_ci_shape_until_it_runs_again(root, monkeypatch):
@@ -1569,7 +2428,7 @@ def test_a_finished_check_is_seen_in_each_ci_shape_until_it_runs_again(root, mon
 
 
 @pytest.mark.anyio
-async def test_the_api_registers_lists_and_cancels_a_wait(tmp_path):
+async def test_the_api_registers_lists_and_cancels_a_wait(tmp_path, monkeypatch):
     config = AppConfig(
         history=HistoryConfig(db_path=str(tmp_path / "budgets.db")),
         restart_nudge=RestartNudgeConfig(file=str(tmp_path / "restart-nudge.json")),
@@ -1657,8 +2516,22 @@ async def test_the_api_registers_lists_and_cancels_a_wait(tmp_path):
         assert no_reviewer.status_code == 409 and "no Work reviewer" in no_reviewer.text
         timed = await client.post(
             f"/api/sessions/{key}/wake-on",
-            json={"after_minutes": 45, "waiting_for": "the render"},
+            json={
+                "after_minutes": 45,
+                "waiting_for": "the render",
+                "work_id": "eerovil/agentdeck#7",
+                "check": {"command": "test -f done || exit 3", "every_minutes": 10},
+            },
         )
+        # #4272: the Work the wait is for, in one spelling.
+        assert timed.json()["registered"]["work_id"] == "github_issue:eerovil/agentdeck#7"
+        # #4256: the check rides the time wait and comes back in the reply.
+        assert timed.json()["registered"]["check"]["every_minutes"] == 10
+        bad_check = await client.post(
+            f"/api/sessions/{key}/wake-on",
+            json={"after_minutes": 45, "check": {"command": "true", "every_minutes": 50}},
+        )
+        assert bad_check.status_code == 422 and "shorter than the wait" in bad_check.text
         await client.delete(
             f"/api/sessions/{key}/wake-on", params={"id": timed.json()["registered"]["id"]}
         )
@@ -1719,8 +2592,21 @@ async def test_the_api_registers_lists_and_cancels_a_wait(tmp_path):
                 raise AgainRefused("no pre-review checklist waits for it")
             return {"pull_request": f"{repository}#{number}", "outcome": "asked"}
 
+        ships = []
+
+        async def ship_now(repository, number, head=""):
+            ships.append((number, head))
+            if number != 9:
+                raise AgainRefused("its review has not come back with findings")
+            return {"pull_request": f"{repository}#{number}", "head": head, "outcome": "shipped"}
+
         app.state.work_router = SimpleNamespace(
-            enabled=True, ask_again=ask_again, accept=accept, pre_review_done=pre_review_done
+            enabled=True,
+            ask_again=ask_again,
+            accept=accept,
+            pre_review_done=pre_review_done,
+            ship_now=ship_now,
+            note_registered=lambda repository, number: None,
         )
         app.state.app_state.add_pull_request(key, PullRequestRef.parse("eerovil/agentdeck#9"))
         # #3828: the owner's acceptance passes the head with no review and no wait.
@@ -1737,6 +2623,95 @@ async def test_the_api_registers_lists_and_cancels_a_wait(tmp_path):
         )
         assert checked.status_code == 200 and checked.json()["outcome"] == "asked"
         assert checked_other.status_code == 409 and "register it first" in checked_other.text
+        # #4212: the owner picked "Ship now, fix later" in the agent's question, at the head
+        # whose findings it showed (review): a head that is not a full commit id ships nothing.
+        # What may ship is the chat's Work's pull requests (`_work_pulls_of_chat`, tested in
+        # test_work_router); here, the ones this chat registered.
+        from agentdeck.web import routes_api
+
+        monkeypatch.setattr(
+            routes_api,
+            "_work_pulls_of_chat",
+            lambda state, chat: {
+                f"{ref.repository}#{ref.number}".lower() for ref in state.pull_requests_for(chat)
+            },
+        )
+        headless = await client.post(
+            f"/api/sessions/{key}/ship-now", json={"pull_request": "eerovil/agentdeck#9"}
+        )
+        assert headless.status_code == 422 and "full commit id" in headless.text
+        shipped = await client.post(
+            f"/api/sessions/{key}/ship-now",
+            json={"pull_request": "eerovil/agentdeck#9", "head": "C" * 40},
+        )
+        assert shipped.status_code == 200 and shipped.json()["outcome"] == "shipped"
+        assert ships == [(9, "c" * 40)]
+        not_mine = await client.post(
+            f"/api/sessions/{key}/ship-now",
+            json={"pull_request": "eerovil/agentdeck#8", "head": "c" * 40},
+        )
+        assert not_mine.status_code == 409 and "register it first" in not_mine.text
+        # Every pull request the question showed ships, in order, as the button ships them
+        # all (review); a refused one stops the rest and is named.
+        app.state.app_state.add_pull_request(key, PullRequestRef.parse("eerovil/agentdeck#8"))
+        both = await client.post(
+            f"/api/sessions/{key}/ship-now",
+            json={
+                "pull_requests": [
+                    {"pull_request": "eerovil/agentdeck#9", "head": "d" * 40},
+                    {"pull_request": "eerovil/agentdeck#8", "head": "e" * 40},
+                ]
+            },
+        )
+        assert both.status_code == 200, both.text
+        assert [item["head"] for item in both.json()["shipped"]] == ["d" * 40]
+        assert both.json()["not_shipped"] == ["eerovil/agentdeck#8"]
+        assert "findings" in both.json()["refused"]
+        assert ships[-2:] == [(9, "d" * 40), (8, "e" * 40)]
+        app.state.app_state.remove_pull_request(key, PullRequestRef.parse("eerovil/agentdeck#8"))
+        # The fix of a shipped head is named when it is registered (#4212 review), and only for
+        # a pull request that shipped for the Work the fix is for.
+        monkeypatch.setattr(
+            routes_api, "_pull_work", lambda *args: "github_issue:eerovil/agentdeck#7"
+        )
+        pull_states = {"eerovil/agentdeck#11": "OPEN", "eerovil/agentdeck#12": "MERGED"}
+
+        async def pull_state(ref):
+            return pull_states.get(ref, "")
+
+        monkeypatch.setattr(routes_api, "_pull_state", pull_state)
+        stranger = await client.post(
+            f"/api/sessions/{key}/pull-requests",
+            json={"pull_request": "eerovil/agentdeck#11", "fixes": "eerovil/agentdeck#9"},
+        )
+        assert stranger.status_code == 409 and "did not ship" in stranger.text
+        assert "eerovil/agentdeck#11" not in {
+            f"{ref.repository}#{ref.number}" for ref in app.state.app_state.pull_requests_for(key)
+        }
+        state = app.state.app_state
+        assert state.claim_shipped("eerovil/agentdeck#9", "c" * 40, "eerovil/agentdeck#7")
+        assert state.note_shipped("eerovil/agentdeck#9", "c" * 40)
+        fixing = await client.post(
+            f"/api/sessions/{key}/pull-requests",
+            json={"pull_request": "eerovil/agentdeck#11", "fixes": "EEROVIL/agentdeck#9"},
+        )
+        assert fixing.status_code == 200, fixing.text
+        [record] = state.shipped_by_work("eerovil/agentdeck#7")
+        assert record.fix == "eerovil/agentdeck#11"
+        # Neither the shipped pull request itself nor one already merged can be its fix.
+        own = await client.post(
+            f"/api/sessions/{key}/pull-requests",
+            json={"pull_request": "eerovil/agentdeck#9", "fixes": "eerovil/agentdeck#9"},
+        )
+        assert own.status_code == 409 and "its own findings" in own.text
+        merged = await client.post(
+            f"/api/sessions/{key}/pull-requests",
+            json={"pull_request": "eerovil/agentdeck#12", "fixes": "eerovil/agentdeck#9"},
+        )
+        assert merged.status_code == 409 and "MERGED" in merged.text
+        [record] = state.shipped_by_work("eerovil/agentdeck#7")
+        assert record.fix == "eerovil/agentdeck#11"
+        app.state.app_state.remove_pull_request(key, PullRequestRef.parse("eerovil/agentdeck#11"))
         blank_accept = await client.post(
             f"/api/sessions/{key}/review-accepted",
             json={"pull_request": "eerovil/agentdeck#9", "note": " "},

@@ -110,6 +110,35 @@ class ResolutionError(ValueError):
     """A resolution write that cannot be stored as asked."""
 
 
+def with_evidence(resolution: WorkResolution, sentence: str) -> WorkResolution:
+    """``resolution`` with ``sentence`` added to its ``correctness`` part (#4253), by
+    ``evidence_added``; the same ``resolution`` back when nothing changes."""
+    from dataclasses import replace
+
+    correctness = evidence_added(resolution.correctness, sentence)
+    if correctness == resolution.correctness:
+        return resolution
+    return replace(resolution, correctness=correctness)
+
+
+def evidence_added(correctness: str, sentence: str) -> str:
+    """``correctness`` with ``sentence`` added as a paragraph of its own at the end (#4253).
+
+    The deck's own evidence, once a Work waits only for Merge, in place of asking its agent to
+    rewrite the part. ``correctness`` back unchanged when the sentence is empty or already
+    there; ``ResolutionError`` when it would take the part past ``MAX_PART``, so the caller
+    asks the agent instead (#4253 review).
+    """
+    sentence = " ".join(str(sentence or "").split())
+    current = correctness.rstrip()
+    if not sentence or sentence in current:
+        return correctness
+    added = f"{current}\n\n{sentence}" if current else sentence
+    if len(added) > MAX_PART:
+        raise ResolutionError(f"correctness would pass {MAX_PART} characters")
+    return added
+
+
 def normalize_title(value: object) -> str:
     """One line of at most ``MAX_TITLE`` characters; empty means "no custom title"."""
     text = " ".join(str(value or "").split())

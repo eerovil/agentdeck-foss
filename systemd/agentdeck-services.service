@@ -8,9 +8,9 @@
 #
 # The deploy restarts it (stop, then start) right after the web reload when a
 # file it loads moved (scripts/runtime_paths.py --services). It owns no agent
-# process, so it waits for no idle chat. With `[services] in_web = true` in the
-# config (the switch back, #4017, and the default until the cutover sets it off)
-# it stands down at start and the web runs them.
+# process, so it waits for no idle chat. The web never runs them itself: the
+# switch back was deleted after the move's 7-day check (#4017); going back is
+# reverting #4021.
 #
 # Install: ln -s ~/agentdeck/systemd/agentdeck-services.service ~/.config/systemd/user/
 #          systemctl --user daemon-reload && systemctl --user enable --now agentdeck-services

@@ -59,7 +59,7 @@ DECK_UNITS = (
     "agentdeck.socket",
     "agentdeck.service",
     "agentdeck-codex.service",
-    # The Work router and the merge release (#4016); it stands down while `[services] in_web`.
+    # The Work router, the merge release and the missed-start backstop (#4016).
     "agentdeck-services.service",
 )
 DEFAULT_REPO_NAME = "agent-tasks"

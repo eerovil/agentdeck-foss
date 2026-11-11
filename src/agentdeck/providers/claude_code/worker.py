@@ -57,6 +57,7 @@ from ...models import (
     ForkFrom,
     open_questions_id,
 )
+from ...worker_cuts import Cut, WorkerCuts, repository_of
 from ...worker_limits import EXIT_MEMORY_CAP
 from .. import account_health
 from ..delivery import (
@@ -795,6 +796,7 @@ class ClaudeWorkerHost:
         idle_after_s: float = 0.0,
         interactive_prompts: bool = True,
         classifier_skip_rules: list[str] | None = None,
+        worker_cuts: WorkerCuts | None = None,
         memory_max: str = "",
         auto_compact_window: int = 0,
         hold_processes: bool = False,
@@ -840,14 +842,15 @@ class ClaudeWorkerHost:
         self._state_path = state_dir / f"{account.label}.json"
         self._receipt_sweep = ReceiptSweep()
         self._artifact_root = artifact_root or state_dir / "command-artifacts"
-        allow_rules = permission_rules.allow_rules(classifier_skip_rules or ())
-        # Keyed by whether the chat runs in auto: only an auto chat gets the skip list.
-        self._settings_files = {
-            auto: ensure_claude_settings(
-                self._artifact_root, allow_rules if auto else None, capture=False
-            )
-            for auto in (True, False)
-        }
+        self._allow_rules = permission_rules.allow_rules(classifier_skip_rules or ())
+        # What each repository's chats start without (#4252). None for a directly-constructed
+        # host, so every test double keeps the full tool list unless it opts in.
+        self._worker_cuts = worker_cuts or WorkerCuts()
+        # Keyed by whether the chat runs in auto (only an auto chat gets the skip list) and
+        # by its repository's cut; written on first use.
+        self._settings_files: dict[tuple[bool, Cut], Path] = {}
+        for auto in (True, False):
+            self._settings_file(auto, self._worker_cuts.for_repository(None))
         # Answers to classifier blocks the hook has not collected yet, by block id.
         self._block_results: dict[str, str] = {}
         # Told that a worker (a key) or any of them (None) may have changed, so the
@@ -874,6 +877,27 @@ class ClaudeWorkerHost:
                 )
                 self._publish_artifact_context(record)
         self._reconcile_orphans()
+
+    def _settings_file(self, auto: bool, cut: Cut) -> Path:
+        """The settings file a chat in this mode and with this cut runs with."""
+        path = self._settings_files.get((auto, cut))
+        if path is None:
+            path = ensure_claude_settings(
+                self._artifact_root,
+                self._allow_rules if auto else None,
+                capture=False,
+                cut=cut,
+            )
+            self._settings_files[(auto, cut)] = path
+        return path
+
+    async def _cut_for(self, cwd: str) -> Cut:
+        """What a chat starting in ``cwd`` runs without: its repository's cut (#4252)."""
+        if not self._worker_cuts.repositories:
+            # Every repository has the host's cut, so there is no remote to read.
+            return self._worker_cuts.for_repository(None)
+        repository = await asyncio.to_thread(repository_of, cwd)
+        return self._worker_cuts.for_repository(repository)
 
     @staticmethod
     def _publish_artifact_context(record: WorkerRecord) -> bool:
@@ -3236,6 +3260,7 @@ class ClaudeWorkerHost:
         fork_from: ForkFrom | None = None,
         relocated: tuple[str, str] | None = None,
         resume_at: str | None = None,
+        cut: Cut | None = None,
     ) -> list[str]:
         instructions = agentdeck_session_instructions(
             role=resolve_session_role(delegated=delegated, role=role),
@@ -3277,7 +3302,9 @@ class ClaudeWorkerHost:
         # Chosen by the chat's own mode, not the bypass it may start in, so
         # switching bypass off lands in an auto chat with its skip list (#2319).
         settings_mode = base_permission_mode or effective_permission_mode
-        settings = self._settings_files[settings_mode == "auto"]
+        settings = self._settings_file(
+            settings_mode == "auto", cut or self._worker_cuts.for_repository(None)
+        )
         cmd += ["--settings", str(settings)]
         if resume_id:
             cmd += ["--resume", resume_id]
@@ -3642,6 +3669,7 @@ class ClaudeWorkerHost:
         # Each worker gets a cgroup of its own, so a runaway one is killed alone
         # instead of taking the runtime and every other chat with it (#1546).
         scope_unit, scope_prefix = await self._memory_scope(key)
+        cut = await self._cut_for(rec.cwd)
         command = self._command(
             resume_id,
             model=model,
@@ -3658,6 +3686,7 @@ class ClaudeWorkerHost:
             resume_at=(
                 rec.resume_at if resume_id and resume_id == rec.resume_at_session else None
             ),
+            cut=cut,
         )
         return env, scope_unit, scope_prefix, command
 

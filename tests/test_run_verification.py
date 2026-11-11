@@ -205,6 +205,67 @@ def test_session_key_prints_the_token_s_chat_or_fails(monkeypatch, capsys):
     assert "bound to no session" in capsys.readouterr().err
 
 
+def test_bookkeep_makes_each_asked_request_once_and_goes_on_past_a_failure(
+    monkeypatch, capsys
+):
+    # A Work agent's start and end bookkeeping in one call (#4254).
+    import io
+    import json
+
+    monkeypatch.setenv("AGENTDECK_URL", "http://deck")
+    monkeypatch.setenv("AGENTDECK_SESSION_TOKEN", "tok")
+    monkeypatch.setattr(
+        cli, "_resolve_session_token", lambda token: {"session_key": f"c:a:{token}"}
+    )
+    sent = []
+
+    def request(method, url, json=None, timeout=None):
+        sent.append((method, url, json))
+        status = 422 if url.endswith("/pull-requests") else 200
+        return httpx.Response(status, json={"ok": status == 200})
+
+    monkeypatch.setattr(cli.httpx, "request", request)
+    monkeypatch.setattr(sys, "stdin", io.StringIO('{"background": "Tausta", "problem": "Ongelma"}'))
+    code = cli._bookkeep(
+        [
+            "--title", "Cut the bookkeeping",
+            "--summary", "-",
+            "--pull-request", "o/r#5",
+            "--wake-on", '{"review": "o/r#5"}',
+        ]
+    )
+
+    assert code == 1  # the refused pull request
+    assert sent == [
+        ("PUT", "http://deck/api/sessions/c%3Aa%3Atok/title", {"title": "Cut the bookkeeping"}),
+        (
+            "PUT",
+            "http://deck/api/sessions/c%3Aa%3Atok/work-resolution",
+            {"background": "Tausta", "problem": "Ongelma"},
+        ),
+        ("POST", "http://deck/api/sessions/c%3Aa%3Atok/pull-requests", {"pull_request": "o/r#5"}),
+        ("POST", "http://deck/api/sessions/c%3Aa%3Atok/wake-on", {"review": "o/r#5"}),
+    ]
+    lines = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert lines[0] == {"session_key": "c:a:tok"}
+    assert [(line["step"], line["ok"]) for line in lines[1:]] == [
+        ("title", True), ("summary", True), ("pull_request", False), ("wake_on", True)
+    ]
+
+
+def test_bookkeep_refuses_a_bad_summary_before_any_request(monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENTDECK_SESSION_TOKEN", "tok")
+    monkeypatch.setattr(cli, "_resolve_session_token", lambda _t: pytest.fail("resolved"))
+    summary = tmp_path / "s.json"
+    summary.write_text('{"problme": "typo"}')
+    with pytest.raises(SystemExit) as exit_:
+        cli._bookkeep(["--summary", str(summary)])
+    assert exit_.value.code == 2
+    monkeypatch.delenv("AGENTDECK_SESSION_TOKEN")
+    with pytest.raises(SystemExit):
+        cli._bookkeep(["--title", "x"])
+
+
 def test_verification_without_a_session_token_is_refused_before_anything_is_queued(
     monkeypatch, tmp_path
 ):

@@ -1478,18 +1478,18 @@ class AppState:
             self.db.drop_review_events(pull)
             self.bus.publish(REVIEWS_TOPIC)
 
-    def claim_shipped(
-        self, pull: str, head: str, findings: str, url: str, work: str = "", base: str = ""
-    ) -> bool:
-        """Record ``pull`` shipping at ``head`` with its findings left (#4212); ``False`` when
-        that head was recorded already or nothing could be stored."""
+    def claim_shipped(self, pull: str, head: str, work: str = "", fix: str = "") -> bool:
+        """Record ``pull`` shipping at ``head`` with its findings left to the Work of issue
+        ``work`` (#4212), fixed in pull request ``fix`` when known; ``False`` when that head
+        was recorded already or nothing could be stored."""
         if self.db is None or not pull or len(head or "") != 40:
             return False
-        at = datetime.now(UTC).timestamp()
-        return self.db.claim_shipped(pull, head, findings, url, at, work, base)
+        return self.db.claim_shipped(pull, head, datetime.now(UTC).timestamp(), work, fix)
 
-    def note_follow_up(self, pull: str, head: str, follow_up: str) -> bool:
-        return self.db is not None and self.db.note_follow_up(pull, head, follow_up)
+    def note_shipped_fix(self, pull: str, work: str, fix: str) -> bool:
+        """Name ``fix`` as the pull request fixing what ``pull`` shipped with for the Work of
+        issue ``work`` (#4212 review); whether ``pull`` shipped for that Work."""
+        return self.db is not None and self.db.note_shipped_fix(pull, work, fix) > 0
 
     def note_shipped(self, pull: str, head: str) -> bool:
         """Mark ``pull`` at ``head`` shipped once its review counted as passed (#4212 review);
@@ -1499,46 +1499,20 @@ class AppState:
         self.bus.publish(REVIEWS_TOPIC)
         return True
 
-    def note_shipped_merge(self, pull: str, merged: str) -> bool:
-        """Name the merge commit of a pull request shipped with findings left (#4212 review)."""
-        return self.db is not None and self.db.note_shipped_merge(pull, merged)
-
-    def shipped(self, pull: str, head: str) -> review_history.ShippedFollowUp | None:
+    def shipped(self, pull: str, head: str) -> review_history.ShippedHead | None:
         return self.db.shipped(pull, head) if self.db is not None and pull else None
 
     def ship_unfinished(self, pull: str, head: str) -> bool:
         """Whether the Ship now press that passed ``pull`` at ``head`` has not finished
-        (#4212 review): no record of it, or one not marked shipped. Marked last, after its
-        follow-up and any Merge press were recorded, so the release merges such a pass only
-        then, and the Work page offers Ship now again until it is."""
+        (#4212 review): no record of it, or one not marked shipped. Marked last, after any
+        Merge press was recorded, so the release merges such a pass only then, and the Work
+        page offers Ship now again until it is."""
         record = self.shipped(pull.lower(), head.lower())
-        return record is None or not record.follow_up or not record.shipped
+        return record is None or not record.shipped
 
-    def shipped_for(self, follow_up: str) -> list[review_history.ShippedFollowUp]:
-        """The heads shipped with findings that the issue ``follow_up`` fixes (#4212)."""
-        return self.db.shipped_for(follow_up) if self.db is not None else []
-
-    def shipped_by_work(self, work: str) -> list[review_history.ShippedFollowUp]:
+    def shipped_by_work(self, work: str) -> list[review_history.ShippedHead]:
         """The heads the Work of issue ``work`` shipped with findings left (#4212)."""
         return self.db.shipped_by_work(work) if self.db is not None else []
-
-    def shipped_chain(self, follow_up: str) -> list[review_history.ShippedFollowUp]:
-        """Every shipped head the issue ``follow_up`` fixes, its own and, when a follow-up was
-        itself shipped with findings, those its Work followed up in turn, newest first
-        (#4212 D11). Each issue is read once, so a loop in the records ends."""
-        found: list[review_history.ShippedFollowUp] = []
-        seen: set[str] = set()
-        todo = [follow_up.lower()] if follow_up else []
-        while todo:
-            issue = todo.pop(0)
-            if issue in seen:
-                continue
-            seen.add(issue)
-            for record in self.shipped_for(issue):
-                found.append(record)
-                if record.work:
-                    todo.append(record.work)
-        return sorted(found, key=lambda record: record.at, reverse=True)
 
     def review_events(self, pull: str) -> list[review_history.ReviewEvent]:
         """``pull``'s review history, every head, in arrival order (#3956)."""

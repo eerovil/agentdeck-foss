@@ -68,21 +68,28 @@
   // The microphone, recorded until closed. A listener takes the samples through
   // `sink`; while there is none and `keep` is set they wait in `carry`, so words
   // said while voice mode's last phrase is being transcribed are kept.
-  function Capture(ctx, stream, headset) {
+  // `opened` is what `openMic` gave: the stream, whether it was opened for a
+  // Bluetooth headset (`micSettings`, #3842) and which device it got (#4249).
+  function Capture(ctx, opened) {
     var self = this;
     this.ctx = ctx;
-    this.stream = stream;
-    // Whether it was opened for a Bluetooth headset (`micSettings`, #3842).
-    this.headset = !!headset;
+    this.use(opened);
+    var stream = this.stream;
     this.closed = false;
     this.rate = ctx.sampleRate;
     this.sink = null;
     this.keep = false;
     this.carry = [];
+    this.rumble = new Rumble(this.rate);
     this.source = ctx.createMediaStreamSource(stream);
     this.node = ctx.createScriptProcessor(4096, 1, 1);
     this.node.onaudioprocess = function (event) {
       var samples = new Float32Array(event.inputBuffer.getChannelData(0));
+      // Measured here, in order, so the filter's memory follows the sound (#4249).
+      samples.level = self.rumble.level(samples);
+      // Which microphone heard it, fixed as it is heard, so a phrase sent later
+      // still names its own (#4249).
+      samples.mic = self.micName;
       if (self.sink) self.sink(samples);
       else if (self.keep) self.carry.push(samples);
     };
@@ -103,9 +110,22 @@
     this.stream.getTracks().forEach(function (track) { track.stop(); });
   };
 
-  Capture.prototype.attach = function (stream) {
-    this.stream = stream;
-    this.source = this.ctx.createMediaStreamSource(stream);
+  // The stream `openMic` opened, and the name of the microphone it records from,
+  // for the speech logs (#4249): the opened track's own name, "call" when opened
+  // in call mode for a headset, and "not the headset asked for" when the browser
+  // could not open that one and gave its default instead.
+  Capture.prototype.use = function (opened) {
+    this.stream = opened.stream;
+    this.headset = !!opened.headset;
+    this.device = opened.device || '';
+    var track = opened.stream.getAudioTracks ? opened.stream.getAudioTracks()[0] : null;
+    this.micName = ((track && track.label) || 'unnamed') + (this.headset ? ' · call' : '') +
+      (opened.missed ? ' · not the headset asked for' : '');
+  };
+
+  Capture.prototype.attach = function (opened) {
+    this.use(opened);
+    this.source = this.ctx.createMediaStreamSource(opened.stream);
     this.source.connect(this.node);
   };
 
@@ -122,20 +142,21 @@
     if (this.closed) return;
     if (this.rematching) { this.rematchAgain = true; return; }
     this.rematching = true;
-    function open(headset) {
-      return navigator.mediaDevices.getUserMedia({ audio: micConstraints(headset) })
-        .then(function (stream) {
-          if (self.closed) { stream.getTracks().forEach(function (t) { t.stop(); }); return; }
-          self.attach(stream);
-          self.headset = headset;
-        });
+    function open(audio) {
+      return openMic(audio).then(function (opened) {
+        if (self.closed) { opened.stream.getTracks().forEach(function (t) { t.stop(); }); return; }
+        self.attach(opened);
+      });
     }
     micSettings().then(function (audio) {
       var headset = audio.echoCancellation;
-      if (self.closed || headset === self.headset) return null;
+      // Another headset is a change too, such as AirPods put in while the car's
+      // own Bluetooth microphone is connected (#4249).
+      var same = headset === self.headset && wantedDevice(audio) === self.device;
+      if (self.closed || same) return null;
       var was = self.headset;
       self.release();
-      return open(headset).catch(function () { return open(was); });
+      return open(audio).catch(function () { return open(micConstraints(was)); });
     }).catch(function () { /* nothing to record from; the listener hears silence */ })
       .then(function () {
         self.rematching = false;
@@ -152,17 +173,65 @@
   // except with a Bluetooth headset, whose own microphone only listens in call
   // mode (the owner's choice: the phone may be in a pocket). A browser that hides
   // device labels (before the first permission) counts as having no headset.
-  function micConstraints(headset) {
-    return { echoCancellation: headset, noiseSuppression: headset, autoGainControl: headset };
+  // A headset is asked for by its device too (#4249), so the phone's own
+  // microphone is not used while one is in; `openMic` handles a browser that
+  // cannot open it.
+  function micConstraints(headset, deviceId) {
+    var audio = { echoCancellation: headset, noiseSuppression: headset, autoGainControl: headset };
+    if (headset && deviceId) audio.deviceId = { exact: deviceId };
+    return audio;
+  }
+
+  // The microphone opened as `audio` asks (#4249). A headset asked for by its
+  // device either opens, or, when the browser cannot open that one (gone a moment
+  // ago, or a browser that will not choose), the default microphone opens in the
+  // same mode and is marked `missed`, so its phrases say so and the next device
+  // change asks for the headset again. `device` is the device it holds: the
+  // headset's when that opened.
+  function openMic(audio) {
+    var wanted = wantedDevice(audio);
+    function opened(stream, missed) {
+      return { stream: stream, headset: !!audio.echoCancellation, device: missed ? '' : wanted, missed: missed };
+    }
+    var media = navigator.mediaDevices;
+    var asked = media.getUserMedia({ audio: audio });
+    if (!wanted) return asked.then(function (stream) { return opened(stream, false); });
+    return asked.then(function (stream) { return opened(stream, false); }, function () {
+      var any = micConstraints(!!audio.echoCancellation);
+      return media.getUserMedia({ audio: any }).then(function (stream) { return opened(stream, true); });
+    });
+  }
+
+  // A Bluetooth headset's microphone by its name: Chrome on Android says
+  // "Bluetooth headset", other browsers the product's own name, such as AirPods
+  // (#4249).
+  var HEADSET_NAME = /bluetooth|airpods|buds|hands-?free/i;
+  // Earbuds named as such are preferred over another Bluetooth microphone, such
+  // as a car's, and a real device over Chrome's "default" and "communications"
+  // entries, which only point at one (#4249).
+  var EARBUDS_NAME = /airpods|buds/i;
+
+  function headsetRank(device) {
+    var rank = EARBUDS_NAME.test(device.label) ? 0 : 2;
+    return rank + (device.deviceId === 'default' || device.deviceId === 'communications' ? 1 : 0);
+  }
+
+  function wantedDevice(audio) {
+    return (audio && audio.deviceId && audio.deviceId.exact) || '';
   }
 
   function micSettings() {
     var devices = navigator.mediaDevices;
     if (!devices || !devices.enumerateDevices) return Promise.resolve(micConstraints(false));
     return devices.enumerateDevices().then(function (list) {
-      return micConstraints(list.some(function (device) {
-        return device.kind === 'audioinput' && /bluetooth/i.test(device.label || '');
-      }));
+      var headsets = list.filter(function (device) {
+        return device.kind === 'audioinput' && HEADSET_NAME.test(device.label || '');
+      });
+      // Stable: the browser's own order breaks a tie.
+      var headset = headsets.map(function (device, at) { return [headsetRank(device), at, device]; })
+        .sort(function (a, b) { return a[0] - b[0] || a[1] - b[1]; })
+        .map(function (entry) { return entry[2]; })[0];
+      return micConstraints(!!headset, headset && headset.deviceId);
     }, function () { return micConstraints(false); });
   }
 
@@ -199,13 +268,63 @@
       var sample = flat[lo] + (flat[hi] - flat[lo]) * (pos - lo);
       view.setInt16(44 + i * 2, Math.max(-1, Math.min(1, sample)) * 0x7fff, true);
     }
-    return new Blob([buffer], { type: 'audio/wav' });
+    var blob = new Blob([buffer], { type: 'audio/wav' });
+    blob.mic = micOf(chunks);
+    return blob;
+  }
+
+  // The microphone that heard a phrase, from its chunks (#4249): one name, or
+  // each in turn when the microphone changed during it.
+  function micOf(chunks) {
+    var names = [];
+    chunks.forEach(function (chunk) {
+      if (chunk.mic && names[names.length - 1] !== chunk.mic) names.push(chunk.mic);
+    });
+    return names.join(' → ');
+  }
+
+  // The `mic` query a phrase's WAV is sent with, for the deck's speech logs.
+  function micQuery(body) {
+    return body && body.mic ? '&mic=' + encodeURIComponent(body.mic) : '';
   }
 
   function loudness(samples) {
     var sum = 0;
     for (var i = 0; i < samples.length; i++) sum += samples[i] * samples[i];
     return Math.sqrt(sum / samples.length);
+  }
+
+  // How loud a chunk is for telling words from quiet (#4249): its loudness with
+  // the sound under RUMBLE_HZ taken out. In a car the phone's plain microphone hears
+  // road and engine rumble there, 80 to 90 % of all the sound and louder than the
+  // voice: a phrase never paused and ran to its 28 s cap, and so did each wait for
+  // "Hey Jarvis". Speech is almost all above it. The audio sent on is not filtered.
+  // A chunk the capture did not measure (`level`) is measured whole.
+  var RUMBLE_HZ = 150;
+  function Rumble(rate) {
+    // A second-order Butterworth high-pass (the audio cookbook's biquad).
+    var w0 = 2 * Math.PI * RUMBLE_HZ / rate;
+    var alpha = Math.sin(w0) / Math.SQRT2;
+    var cos = Math.cos(w0);
+    var a0 = 1 + alpha;
+    this.b0 = (1 + cos) / 2 / a0;
+    this.b1 = -(1 + cos) / a0;
+    this.a1 = -2 * cos / a0;
+    this.a2 = (1 - alpha) / a0;
+    this.x1 = this.x2 = this.y1 = this.y2 = 0;
+  }
+  Rumble.prototype.level = function (samples) {
+    var sum = 0;
+    for (var i = 0; i < samples.length; i++) {
+      var x = samples[i];
+      var y = this.b0 * x + this.b1 * this.x1 + this.b0 * this.x2 - this.a1 * this.y1 - this.a2 * this.y2;
+      this.x2 = this.x1; this.x1 = x; this.y2 = this.y1; this.y1 = y;
+      sum += y * y;
+    }
+    return Math.sqrt(sum / samples.length);
+  };
+  function level(samples) {
+    return samples.level === undefined ? loudness(samples) : samples.level;
   }
 
   // Whether each chunk is louder than the room (#3424). Between phrases the room is
@@ -337,7 +456,7 @@
 
   // Voice mode (#3401) records for the host with the same microphone code.
   window.AgentDeckDictation = {
-    Capture: Capture, micSettings: micSettings, wav: wav, loudness: loudness, Gate: Gate, watchSlow: watchSlow
+    Capture: Capture, micSettings: micSettings, openMic: openMic, micQuery: micQuery, wav: wav, loudness: loudness, level: level, Rumble: Rumble, Gate: Gate, watchSlow: watchSlow
   };
 
   if (!Recognition && !canRecord) return;
@@ -373,13 +492,9 @@
     // Made inside the tap, so a phone lets it run.
     var ctx = this.ctx = new Context();
     this.backlog.forEach(function (body) { self.send(body); });
-    var headset = false;
-    micSettings().then(function (audio) {
-      headset = audio.echoCancellation;
-      return navigator.mediaDevices.getUserMedia({ audio: audio });
-    }).then(function (stream) {
-      if (self.done) { stream.getTracks().forEach(function (t) { t.stop(); }); return; }
-      self.capture = new Capture(ctx, stream, headset);
+    micSettings().then(openMic).then(function (opened) {
+      if (self.done) { opened.stream.getTracks().forEach(function (t) { t.stop(); }); return; }
+      self.capture = new Capture(ctx, opened);
       self.listen();
       self.capture.rematch();
     }, function () {
@@ -396,7 +511,7 @@
     var quiet = 0;
     var gate = new Gate(chunkMs);
     cap.sink = function (samples) {
-      var loud = gate.loud(loudness(samples), phrase.length > 0);
+      var loud = gate.loud(level(samples), phrase.length > 0);
       if (!phrase.length) {
         before.push(samples);
         if (before.length > 4) before.shift();
@@ -429,6 +544,7 @@
       // = "auto"`); a host listening for one language ignores it.
       // `source` tells a kept phrase's 🎤 from 🎧 for the speech bench (#3934).
       var hint = self.heard ? '&language=' + self.heard : '';
+      hint += micQuery(body);
       var done = self.watch();
       return fetch('/api/speech/transcribe?source=dictation' + hint, {
         method: 'POST', headers: { 'Content-Type': 'audio/wav' }, body: body

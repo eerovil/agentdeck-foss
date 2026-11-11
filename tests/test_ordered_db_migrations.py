@@ -193,7 +193,8 @@ def test_an_old_database_keeps_its_boss_windows_and_loses_the_secretary_tables(t
 
     The windows are copied into ``boss_turn_windows`` before the drop, including
     when that table does not exist yet, and a window already there is kept.
-    Migration 17 drops the removed message pins the same way (#3478).
+    Migration 17 drops the removed message pins the same way (#3478), and 21 the Ship now
+    follow-up records, replaced by ``shipped_heads`` (#4212).
     """
     path = tmp_path / "secretary.db"
     connection = sqlite3.connect(path)
@@ -208,6 +209,7 @@ def test_an_old_database_keeps_its_boss_windows_and_loses_the_secretary_tables(t
         CREATE TABLE secretary_issue_nudges (id TEXT PRIMARY KEY);
         CREATE TABLE message_pins (session_key TEXT, event_seq INTEGER);
         INSERT INTO message_pins VALUES ('codex:test:old', 1);
+        CREATE TABLE shipped_follow_ups (pull TEXT, head TEXT, follow_up TEXT);
         """
     )
     connection.commit()
@@ -221,6 +223,7 @@ def test_an_old_database_keeps_its_boss_windows_and_loses_the_secretary_tables(t
         }
         assert not {t for t in tables if t.startswith(("secretary_", "desk_"))}
         assert "message_pins" not in tables
+        assert "shipped_follow_ups" not in tables and "shipped_heads" in tables
         assert db._conn.execute(
             "SELECT session_key, opened_at FROM boss_turn_windows"
         ).fetchall() == [("codex:test:old", "2026-08-01T00:00:00+00:00")]

@@ -320,6 +320,10 @@ class ScheduledMessageService:
         """Whether any row, in any state, is stored under this id."""
         return self._store.has_scheduled_message(message_id)
 
+    def ids_since(self, chat_id: str, prefix: str, since: datetime) -> list[str]:
+        """Ids starting with ``prefix`` stored for ``chat_id`` since ``since`` (#4253)."""
+        return self._store.scheduled_message_ids_since(chat_id, prefix, since)
+
     def visible(self, chat_id: str) -> tuple[ScheduledMessage, ...]:
         return self._store.load_visible_scheduled_messages(chat_id)
 

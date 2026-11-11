@@ -104,11 +104,9 @@
   {%- endif %}
   <dl class="wd-status-lines">
     {%- if status.next %}<div data-wk-next="{{ status.next }}"><dt>Next</dt><dd>waiting for {{ status.next }}</dd></div>{% endif %}
-    {#- Shipped with its review findings left to a follow-up Work (#4212 D12): only once the
-        press finished (its follow-up filed and its pass recorded); this says where its findings
-        are fixed. #}
-    {%- for pull, follow_up in detail.shipped %}<div data-work-shipped="{{ pull }}"><dt>Shipped</dt><dd>{{ pull }} with its review findings
-      {%- if follow_up %} → <a href="https://github.com/{{ follow_up.split('#')[0] }}/issues/{{ follow_up.split('#')[1] }}" target="_blank" rel="noopener">{{ follow_up }}</a>{% endif %}</dd></div>{% endfor %}
+    {#- Shipped with its review findings left to fix in this Work (#4212 D12): only once the
+        press finished (its pass recorded). #}
+    {%- for pull in detail.shipped %}<div data-work-shipped="{{ pull }}"><dt>Shipped</dt><dd>{{ pull }} with its review findings, fixed next in this Work</dd></div>{% endfor %}
     <div class="wd-you" data-wd-you><dt>You</dt><dd>{{ status.you }}
       {%- if status.where %} · {% if status.where_href %}<a href="{{ status.where_href|issue_href }}" data-wd-where{% if status.where_href.startswith("http") %} target="_blank" rel="noopener"{% endif %}>{{ status.where }}</a>{% else %}<span data-wd-where>{{ status.where }}</span>{% endif %}{% endif %}</dd></div>
   </dl>

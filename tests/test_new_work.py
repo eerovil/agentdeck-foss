@@ -659,23 +659,50 @@ def test_an_agents_ready_press_rereads_only_its_registered_open_pull_requests(
     tmp_path, monkeypatch
 ):
     """#3903: the shim's `gh pr ready` re-reads the row from GitHub, which wakes the Work
-    router's backstop; only registered pull requests of a switched repository are read."""
+    router's backstop; only registered pull requests of a switched repository are read.
+    #4253 review: a checklist is pressed for, to print, only for the one pull request the
+    call names, registered by the calling chat; every other call only re-reads."""
     from agentdeck.models import PullRequestRef
 
     app, _gh = _app(tmp_path, monkeypatch)
+    pressed: list = []
+    received: list = []
+
+    # The chat the router places each pull request with (``owner_of_pull``), by the durable
+    # chat id ``chat_identity_key`` gives, which is also what the route passes on.
+    placed: dict[int, str] = {}
+
+    async def ready_press(repository, number, *, caller):
+        pressed.append((repository, number))
+        if number == 12:
+            raise RuntimeError("services down")  # the router sends that checklist itself
+        if placed.get(number) != caller:
+            return {"checklist": "", "heads": []}
+        return {"checklist": f"AgentDeck: before {repository}#{number}", "heads": ["abc"]}
+
+    async def ready_received(repository, number, heads, *, caller):
+        received.append((repository, number, heads, caller))
+        return 1
+
     app.state.work_router = SimpleNamespace(
-        switched=lambda repository: repository == "eerovil/agentdeck"
+        switched=lambda repository: repository == "eerovil/agentdeck",
+        ready_press=ready_press,
+        ready_received=ready_received,
     )
-    app.state.app_state.session_pull_requests["chat-a"] = (
+    state = app.state.app_state
+    state.session_pull_requests["chat-a"] = (
         PullRequestRef("eerovil/agentdeck", 9),
         PullRequestRef("EEROVIL/agentdeck", 12),
         PullRequestRef("eerovil/agentdeck", 13),
         PullRequestRef("eerovil/other", 3),
     )
     # More registered open ones than one press reads: the branch picks the oldest (#3904).
-    app.state.app_state.session_pull_requests["chat-b"] = tuple(
+    state.session_pull_requests["chat-b"] = tuple(
         PullRequestRef("eerovil/agentdeck", number) for number in (20, 21, 22, 23)
     )
+    state.bind_session_token("token-a", "chat-a")
+    state.bind_session_token("token-b", "chat-b")
+    placed.update({9: state.chat_identity_key("chat-a"), 20: state.chat_identity_key("chat-b")})
     rows = {("eerovil/agentdeck", 13): {"state": "MERGED", "mergedAt": "x"}}
     rows[("eerovil/agentdeck", 9)] = {"state": "OPEN", "headRefName": "agent/issue-9"}
     read: list = []
@@ -692,22 +719,66 @@ def test_an_agents_ready_press_rereads_only_its_registered_open_pull_requests(
     )
     client = _client(app)
 
-    def post(**body):
-        return client.post("/api/works/pr-ready", json=body).json()
+    def post(path="/api/works/pr-ready", **body):
+        return client.post(path, json=body).json()
 
-    assert post(repository="EEROVIL/agentdeck", number=9)["refreshed"] == 1
+    answer = post(repository="EEROVIL/agentdeck", number=9, session_token="token-a")
+    assert answer["refreshed"] == 1
     assert read == [[("eerovil/agentdeck", 9)]]
+    # The checklist this press started rides in the answer, for `gh pr ready` to print (#4253),
+    # with the pull request it is for, which the shim names back once printed.
+    assert answer["checklist"] == "AgentDeck: before eerovil/agentdeck#9"
+    assert answer["number"] == 9 and answer["heads"] == ["abc"]
+    assert pressed == [("eerovil/agentdeck", 9)]
+    assert post(repository="eerovil/agentdeck", number=12, session_token="token-a")[
+        "checklist"
+    ] == ""
     # The current branch's (no number): the one whose cached row has that branch, though
     # four newer ones are registered too.
-    assert post(repository="eerovil/agentdeck", branch="agent/issue-9")["refreshed"] == 1
+    answer = post(repository="eerovil/agentdeck", branch="agent/issue-9", session_token="token-a")
+    assert answer["refreshed"] == 1 and answer["checklist"].endswith("#9")
     assert read[-1] == [("eerovil/agentdeck", 9)]
-    # No cached row names the branch: the open registered ones, at most four.
-    post(repository="eerovil/agentdeck", branch="unknown")
+    # Another chat's pull request, even one both chats registered: re-read, but the router
+    # hands its checklist only to the chat it places it with (#4253 review).
+    state.session_pull_requests["chat-b"] += (PullRequestRef("eerovil/agentdeck", 9),)
+    answer = post(repository="eerovil/agentdeck", number=9, session_token="token-b")
+    assert answer["refreshed"] == 1 and answer["checklist"] == "" and "heads" not in answer
+    answer = post(repository="eerovil/agentdeck", number=20, session_token="token-a")
+    assert answer["refreshed"] == 1 and answer["checklist"] == ""
+    # No token, or an unknown one: re-read, not pressed for.
+    pressed.clear()
+    assert post(repository="eerovil/agentdeck", number=9)["checklist"] == "" and pressed == []
+    assert post(repository="eerovil/agentdeck", number=9, session_token="nope")["checklist"] == ""
+    # No cached row names the branch, with two chats' pull requests open: the open registered
+    # ones are re-read, at most four, and none is pressed for, so no chat's checklist lands
+    # in another's reply.
+    answer = post(repository="eerovil/agentdeck", branch="unknown", session_token="token-b")
     assert len(read[-1]) == 4 and ("eerovil/agentdeck", 13) not in read[-1]
+    assert answer["checklist"] == "" and pressed == []
     # Not registered, or not a switched repository: no GitHub read.
     assert post(repository="eerovil/agentdeck", number=99)["refreshed"] == 0
     assert post(repository="eerovil/other", number=3)["refreshed"] == 0
-    assert len(read) == 3
+    assert len(read) == 8
+    assert ("eerovil/agentdeck", 99) not in pressed and ("eerovil/other", 3) not in pressed
+
+    # The printed word names the heads, and the router matches them and the caller's chat
+    # against the pending message; no token, or no heads, asks it nothing.
+    received_path = "/api/works/pr-ready/received"
+    assert post(
+        received_path,
+        repository="EEROVIL/agentdeck",
+        number=9,
+        heads=["abc"],
+        session_token="token-a",
+    )["taken"] == 1
+    assert post(received_path, repository="eerovil/agentdeck", number=9, heads=["abc"])[
+        "taken"
+    ] == 0
+    assert post(received_path, repository="eerovil/agentdeck", number=9, session_token="token-a")[
+        "taken"
+    ] == 0
+    assert received == [("eerovil/agentdeck", 9, ["abc"], placed[9])]
+
 
 def test_unticking_spec_only_leaves_its_label_off(tmp_path, monkeypatch):
     app, gh = _app(tmp_path, monkeypatch)

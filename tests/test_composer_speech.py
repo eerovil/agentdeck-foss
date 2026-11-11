@@ -398,7 +398,10 @@ async def test_speech_routes_pass_audio_to_the_host_service_and_back(tmp_path):
                 "/api/speech/wake-log", json={"waiting": "start", "spell": "s1"}
             )
             stale_gone = not stale.exists()
-            woke = await client.post("/api/speech/wake?id=a1", content=b"RIFF..J")
+            # Which microphone heard it is logged, as the page names it (#4249).
+            woke = await client.post(
+                "/api/speech/wake?id=a1&mic=AirPods%20Pro%20%C2%B7%20call%0A", content=b"RIFF..J"
+            )
             missed = await client.post("/api/speech/wake?id=b2", content=b"RIFF..x")
             await client.post("/api/speech/wake?id=../c3", content=b"RIFF..x")
             # A reply's moments sent as windows (#3842): only a wake is logged.
@@ -436,7 +439,8 @@ async def test_speech_routes_pass_audio_to_the_host_service_and_back(tmp_path):
                 + json.dumps({"at": time.time() - 7 * 86400 + 60, "id": "stays"}) + "\n"
             )
             heard = await client.post(
-                "/api/speech/transcribe?id=k1&source=voice", content=b"RIFF....WAVE"
+                "/api/speech/transcribe?id=k1&source=voice&mic=" + "m" * 90,
+                content=b"RIFF....WAVE",
             )
             await client.post("/api/speech/transcribe?id=k2&source=probe", content=b"RIFF..")
             # A folder it cannot write to costs the phrase nothing (#3934).
@@ -489,6 +493,7 @@ async def test_speech_routes_pass_audio_to_the_host_service_and_back(tmp_path):
         (None, "window"), ("b2", "whisper"), ("s1", "waiting"),
     ]
     assert lines[5]["matched"] is True and lines[5]["ms"] == 812
+    assert (lines[1]["mic"], lines[2]["mic"]) == ("AirPods Pro · call", "")
     # The report counts the time really spent waiting, and a phrase the detector
     # never checked makes the switch verdict ineligible.
     import importlib.util
@@ -534,6 +539,7 @@ async def test_speech_routes_pass_audio_to_the_host_service_and_back(tmp_path):
     assert [(k["id"], k.get("source"), k.get("engine"), k.get("snr_db")) for k in kept] == [
         ("stays", None, None, None), ("k1", "voice", "whisper", 21.5)
     ]
+    assert kept[1]["mic"] == "m" * 80
     assert (warm.status_code, server.speech.warmed) == (204, 1)
     assert server.speech.previous == ["EN", "", "", "", "fi", ""]
     # Whisper's made-up closing lines and segments it rates as no speech are dropped.
@@ -1946,6 +1952,7 @@ class _HostVoice:
     def __init__(self, page):
         self.page = page
         self.said, self.phrases, self.queue, self.hung = [], [], [], []
+        self.bodies = []
         self.languages, self.narrated, self.doubted = [], [], set()
         self.narration = ""
         self.hold = self.hang = False
@@ -1980,6 +1987,7 @@ class _HostVoice:
     async def _transcribe(self, route):
         text = self.queue.pop(0) if self.queue else ""
         self.phrases.append(text)
+        self.bodies.append(route.request.post_data_buffer)
         if self.wait:
             await self.wait.wait()
         parts = [{"text": text, "unsure": text in self.doubted}]
@@ -3238,6 +3246,13 @@ _FAKE_MICROPHONE = """
     const dest = ctx.createMediaStreamDestination();
     osc.connect(gain).connect(dest);
     osc.start();
+    // Road rumble (#4249): a 40 Hz hum beside the 440 Hz "voice", silent until asked.
+    const low = ctx.createOscillator();
+    low.frequency.value = 40;
+    const lowGain = ctx.createGain();
+    lowGain.gain.value = 0;
+    low.connect(lowGain).connect(dest);
+    low.start();
     window.__mic = {
       level(value) { gain.gain.cancelScheduledValues(0); gain.gain.value = value; },
       // Sound for exactly `ms`, by the audio clock: a level set and unset from the
@@ -3257,6 +3272,16 @@ _FAKE_MICROPHONE = """
           at += ms / 1000;
         }
         gain.gain.setValueAtTime(0, at);
+      },
+      // Rumble rising and falling between `low` and `high` every 0.34 s for `ms`,
+      // in ramps, so no click reaches above the hum.
+      rumble(low, high, ms) {
+        let at = ctx.currentTime;
+        lowGain.gain.cancelScheduledValues(0);
+        lowGain.gain.setValueAtTime(low, at);
+        for (let n = 1; n * 340 <= ms; n++) {
+          lowGain.gain.linearRampToValueAtTime(n % 2 ? high : low, at + n * 0.34);
+        }
       },
       stream: dest.stream,
     };
@@ -3370,6 +3395,16 @@ async def test_voice_mode_listens_and_speaks_through_the_host(tmp_path):
         # Said in the very first chunk, before any room was heard, it starts one too.
         first = await page.evaluate("new AgentDeckDictation.Gate(85).loud(0.0106, false)")
         assert first is True
+        # Road rumble under 150 Hz barely counts toward how loud a chunk is; a voice's
+        # pitch above it does (#4249). The filter's memory carries across chunks.
+        rumble = await page.evaluate("""() => [60, 1000].map((hz) => {
+            const filter = new AgentDeckDictation.Rumble(48000);
+            const chunk = () => Float32Array.from({ length: 4096 }, (_, i) =>
+                0.3 * Math.sin(2 * Math.PI * hz * i / 48000));
+            filter.level(chunk());
+            return Math.round(filter.level(chunk()) * 1000) / 1000;
+        })""")
+        assert rumble[0] < 0.04 and rumble[1] > 0.19
         await page.evaluate("__mic.level(0.015)")
         await page.wait_for_timeout(500)
         await page.evaluate("__mic.level(0)")
@@ -3648,11 +3683,13 @@ async def test_voice_mode_listens_and_speaks_through_the_host(tmp_path):
     assert said[3] == {"text": "Valmis, testi lisätty.", "language": "fi"}
     assert said[4] == {"text": "Virhe korjattu.", "language": "fi"}
     # The first phrase is the host's own call; later ones carry what it heard, by
-    # the words. Each is marked voice mode's, so the speech bench can tell (#3934).
+    # the words. Each is marked voice mode's, so the speech bench can tell (#3934),
+    # and names the microphone that heard it, the fake one here (#4249).
+    mic = "MediaStreamAudioDestinationNode"
     assert phrases[:3] == [
-        ("source=voice", b"RIFF"),
-        ("source=voice&language=fi", b"RIFF"),
-        ("source=voice&language=en", b"RIFF"),
+        ("source=voice&mic=" + mic, b"RIFF"),
+        ("source=voice&language=fi&mic=" + mic, b"RIFF"),
+        ("source=voice&language=en&mic=" + mic, b"RIFF"),
     ]
     # The crashed phrase is sent twice; the last one once and three retries.
     assert [long_asked - before_crash, long_posts, noisy_posts] == [2, 1, 1]
@@ -4193,7 +4230,7 @@ async def test_voice_mode_waits_on_the_wake_word_detector(tmp_path, monkeypatch)
                 await route.fulfill(status=200, content_type="application/json",
                                     body=json.dumps(window_found[-1]))
                 return
-            woken.append(route.request.url.partition("?id=")[2])
+            woken.append(route.request.url.partition("?id=")[2].partition("&")[0])
             if stalls:
                 await stalls.pop().wait()
                 with contextlib.suppress(Exception):  # the page gave up on it
@@ -4872,6 +4909,7 @@ async def test_dictation_listens_through_the_host_and_falls_back_to_the_browser(
     listening to the browser's recognizer where there is one (#3422)."""
     import asyncio
     import json
+    from urllib.parse import quote
 
     from conftest import async_playwright, wait_until
     from test_inject import _live_server, _web_app
@@ -4880,7 +4918,7 @@ async def test_dictation_listens_through_the_host_and_falls_back_to_the_browser(
     app.state.templates.env.globals["host_speech"] = True
     async with _live_server(app) as base_url, async_playwright() as playwright:
         browser = await playwright.chromium.launch()
-        sent, phrases = [], []
+        sent, phrases, queries = [], [], []
         heard = ["Fix the login bug.", "and add a test"]
         host = {"up": True}
 
@@ -4890,6 +4928,7 @@ async def test_dictation_listens_through_the_host_and_falls_back_to_the_browser(
 
         async def transcribe(route):
             phrases.append(route.request.post_data_buffer[:4])
+            queries.append(route.request.url.partition("?")[2])
             if not host["up"]:
                 await route.fulfill(status=503, body="{}", content_type="application/json")
                 return
@@ -5058,6 +5097,8 @@ async def test_dictation_listens_through_the_host_and_falls_back_to_the_browser(
     assert pressed == "false"
     assert tracks == ["ended"]
     assert phrases[:4] == [b"RIFF"] * 4 and len(phrases) == 10
+    # Each phrase names the microphone that heard it, the earbuds in call mode (#4249).
+    assert queries[0] == "source=dictation&mic=" + quote("MediaStreamAudioDestinationNode · call")
     assert retried == 6
     assert recovered == "true"
     assert len(sent) == 1 and "It was lost. And this too." in sent[0]
@@ -5065,6 +5106,119 @@ async def test_dictation_listens_through_the_host_and_falls_back_to_the_browser(
     assert after_send == ""
     assert fallback == "Host unreachable · Suomi · Retry"
     assert typed == "Add a test"
+
+
+def _tone(body, hz):
+    """How loud the `hz` tone is in a 16 kHz WAV, as a sine's amplitude (Goertzel)."""
+    import io
+    import math
+    import wave
+
+    with wave.open(io.BytesIO(body)) as clip:
+        rate = clip.getframerate()
+        frames = clip.readframes(clip.getnframes())
+    samples = [v / 32767 for v in memoryview(frames).cast("h")]
+    coeff = 2 * math.cos(2 * math.pi * hz / rate)
+    s1 = s2 = 0.0
+    for sample in samples:
+        s1, s2 = sample + coeff * s1 - s2, s1
+    return 2 * math.sqrt(max(0.0, s1 * s1 + s2 * s2 - coeff * s1 * s2)) / max(1, len(samples))
+
+
+@pytest.mark.browser
+async def test_voice_mode_ends_a_phrase_in_road_rumble(tmp_path):
+    """On a phone's own microphone in a car, rumble under 150 Hz rising and falling
+    louder than the voice held every phrase open to its 28 s cap (#4249). Measured
+    above 150 Hz, the rumble keeps no phrase open: the words go to the host within
+    a few seconds of the owner stopping, in Always mode and to the wake word
+    detector in Jarvis mode alike, and what is sent holds the words. Each phrase
+    names the microphone that heard it, as heard."""
+    import json
+    import time
+
+    from conftest import async_playwright, wait_until
+    from test_inject import _live_server
+
+    app = _host_voice_app(tmp_path, max_message_chars=1000)
+    app.state.templates.env.globals["voice_wake"] = "detector"
+    async with _live_server(app) as base_url, async_playwright() as playwright:
+        browser, page, host = await _voice_page(playwright, base_url)
+        woken = []
+
+        async def wake(route):
+            woken.append((time.monotonic(), route.request.post_data_buffer))
+            await route.fulfill(status=200, content_type="application/json",
+                                body=json.dumps({"woken": False, "score": 0.01}))
+
+        await page.route("**/api/speech/wake?id=*", wake)
+        await page.goto(f"{base_url}/sessions/codex:test:sid")
+        await _voice_on(page)
+        await wait_until(page, "it listens", _LISTENING)
+        await page.evaluate("__mic.rumble(0.3, 0.5, 40000)")
+        # Long enough for the room's line to settle on the rumble; a phrase its first
+        # rise starts ends meanwhile.
+        await page.wait_for_timeout(3000)
+        before = len(host.phrases)
+        await host.sound(600)
+        stopped = time.monotonic()
+        for _ in range(100):
+            if len(host.phrases) > before:
+                break
+            await page.wait_for_timeout(50)
+        took = time.monotonic() - stopped
+        said = host.bodies[-1]
+        # Waiting for "Hey Jarvis", the phrase goes to the detector as soon.
+        await _pick(page, "jarvis")
+        await wait_until(page, "it waits for the wake word",
+                         f"() => ({_VOICE_STATE})() === 'waiting'")
+        await page.wait_for_timeout(1500)
+        before = len(woken)
+        await host.sound(600)
+        stopped = time.monotonic()
+        for _ in range(100):
+            if len(woken) > before:
+                break
+            await page.wait_for_timeout(50)
+        to_detector = (woken[-1][0] if len(woken) > before else time.monotonic()) - stopped
+        # The microphone a phrase names is the one that heard each chunk, fixed as it
+        # is heard: a headset the browser cannot open gives the default microphone,
+        # said so, and a switch mid-phrase names both in turn (#4249 review).
+        mics = await page.evaluate("""async () => {
+          const S = AgentDeckDictation, media = navigator.mediaDevices;
+          const open = media.getUserMedia, mic = window.__mic;
+          media.getUserMedia = (c) => c.audio.deviceId && c.audio.deviceId.exact === 'gone'
+            ? Promise.reject(new DOMException('gone', 'OverconstrainedError')) : open(c);
+          const headset = { echoCancellation: true, noiseSuppression: true, autoGainControl: true };
+          const missed = await S.openMic({ ...headset, deviceId: { exact: 'gone' } });
+          const got = await S.openMic({ ...headset, deviceId: { exact: 'pods' } });
+          media.getUserMedia = open;
+          window.__mic = mic;
+          const ctx = new AudioContext();
+          const cap = new S.Capture(ctx, got);
+          const heard = [];
+          const wait = (n) => new Promise((done) => {
+            const look = () => heard.length >= n ? done() : setTimeout(look, 20);
+            look();
+          });
+          cap.sink = (samples) => heard.push(samples);
+          await wait(2);
+          cap.release();
+          cap.attach(missed);
+          await wait(heard.length + 3);
+          const name = S.wav(heard, ctx.sampleRate).mic;
+          cap.close();
+          return [missed.missed, missed.device, got.device, name];
+        }""")
+        await browser.close()
+
+    assert took < 3, f"the phrase ended {took:.1f} s after the words"
+    assert to_detector < 3, f"the detector heard it {to_detector:.1f} s after the words"
+    # What was sent holds the "words" (a 440 Hz tone at 0.5 for 0.6 s), not rumble alone:
+    # averaged over a clip of up to 4 s, at least a quarter second of it.
+    assert _tone(said, 440) > 0.03
+    assert _tone(woken[-1][1], 440) > 0.03
+    node = "MediaStreamAudioDestinationNode · call"
+    assert mics == [True, "", "pods", f"{node} → {node} · not the headset asked for"]
 
 
 @pytest.mark.browser
@@ -5309,13 +5463,17 @@ async def test_a_microphone_granted_after_a_mute_is_let_go_of_at_once(tmp_path):
         await wait_until(page, "the plain stream arrived",
                          "() => __mic.stream.getTracks()[0].readyState === 'live'")
         # Two changes at once ask once; the headset leaving asks plain again.
-        change = """(label) => { window.__old = __mic.stream; window.__grant = null;
-            __devices = label ? [{ kind: 'audioinput', label: label }] : [];
+        change = """(list) => { window.__old = __mic.stream; window.__grant = null;
+            __devices = list.map(([label, deviceId]) => ({ kind: 'audioinput', label, deviceId }));
             navigator.mediaDevices.dispatchEvent(new Event('devicechange'));
             navigator.mediaDevices.dispatchEvent(new Event('devicechange')); }"""
         swapped = []
-        for label in ("Bluetooth headset", None):
-            await page.evaluate(change, label)
+        # A car's Bluetooth microphone, then AirPods put in beside it: the same call
+        # mode, but the AirPods are asked for by their device (#4249). Then none.
+        car = ["Bluetooth headset", "car"]
+        both = [car, ["AirPods Pro", "pods"]]
+        for devices in ([car], both, []):
+            await page.evaluate(change, devices)
             await wait_until(page, "it asks for the other microphone", "() => !!window.__grant")
             await page.evaluate("__grant()")
             await wait_until(page, "the old stream was let go of",
@@ -5323,9 +5481,15 @@ async def test_a_microphone_granted_after_a_mute_is_let_go_of_at_once(tmp_path):
             await page.wait_for_timeout(200)
             swapped.append(await page.evaluate(
                 f"() => [({state})(), __mic.stream.getTracks()[0].readyState]"))
+            if devices is both:
+                # The same AirPods listed again, in another order and with Chrome's
+                # "default" entry first, swap nothing.
+                await page.evaluate(change, [["Default - AirPods Pro", "default"], *both[::-1]])
+                await page.wait_for_timeout(300)
+                swapped.append(await page.evaluate("() => !!window.__grant"))
         # With 🎤 off, a headset connecting opens nothing.
         await _pick(page, "off")
-        await page.evaluate(change, "Bluetooth headset")
+        await page.evaluate(change, [car])
         await page.wait_for_timeout(300)
         asked = await page.evaluate("[!!window.__grant, __asked.slice(1), __liveAtOpen.slice(1)]")
         await browser.close()
@@ -5333,8 +5497,10 @@ async def test_a_microphone_granted_after_a_mute_is_let_go_of_at_once(tmp_path):
     assert got == ["idle", ["ended"]]
     plain = {"echoCancellation": False, "noiseSuppression": False, "autoGainControl": False}
     headset = {"echoCancellation": True, "noiseSuppression": True, "autoGainControl": True}
-    assert swapped == [["listening", "live"]] * 2
-    assert asked == [False, [plain, headset, plain], [0, 0, 0]]
+    live = ["listening", "live"]
+    assert swapped == [live, live, False, live]
+    car, pods = ({**headset, "deviceId": {"exact": name}} for name in ("car", "pods"))
+    assert asked == [False, [plain, car, pods, plain], [0, 0, 0, 0]]
 
 
 

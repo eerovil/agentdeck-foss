@@ -2714,3 +2714,33 @@ def test_a_job_on_a_remote_lane_keeps_its_temp_folder(tmp_path, monkeypatch):
 
     assert jobs_module._child_env(job)["TMPDIR"] == "/var/tmp"
     assert JOB_SCRATCH_ENV not in jobs_module._child_env(job)
+
+
+@pytest.mark.parametrize("lane", [LOCAL, "kube"])
+def test_a_job_reaches_github_as_its_chat_would_and_never_prompts(tmp_path, monkeypatch, lane):
+    """#4274: a queued `git ls-remote` opened the desktop's askpass box and died at its
+    own `timeout 30` with a bare exit 124, because the job kept the runtime's environment."""
+    shim = tmp_path / "gh-shim"
+    monkeypatch.setenv("AGENTDECK_GH_SHIM_DIR", str(shim))
+    monkeypatch.setenv("SSH_ASKPASS", "/usr/bin/ksshaskpass")
+    monkeypatch.setenv("GIT_ASKPASS", "/usr/bin/ksshaskpass")
+    monkeypatch.setenv("GH_TOKEN", "leaked")
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "user.name")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "kept")
+    job = SimpleNamespace(id="j", lane=lane, log_path=tmp_path / "j.log", quarantined=())
+
+    env = jobs_module._child_env(job)
+
+    assert not {"SSH_ASKPASS", "GIT_ASKPASS", "GH_TOKEN"} & set(env)
+    assert env["GIT_TERMINAL_PROMPT"] == "0"
+    assert env["PATH"].split(os.pathsep)[0] == str(shim)
+    entries = [
+        (env[f"GIT_CONFIG_KEY_{i}"], env[f"GIT_CONFIG_VALUE_{i}"])
+        for i in range(int(env["GIT_CONFIG_COUNT"]))
+    ]
+    assert entries[0] == ("user.name", "kept"), "the runtime's own entries are appended to"
+    assert ("credential.interactive", "false") in entries
+    helpers = [value for key, value in entries if key == "credential.https://github.com.helper"]
+    assert helpers[0] == "" and "agentdeck.git_credential" in helpers[-1]

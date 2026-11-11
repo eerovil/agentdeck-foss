@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import signal
+import subprocess
 import sys
 import tempfile
 import time
@@ -40,6 +41,7 @@ from agentdeck.providers.instructions import (
     agentdeck_session_instructions,
     relocation_notice,
 )
+from agentdeck.worker_cuts import Cut
 
 
 async def test_claude_worker_snapshot_declares_that_it_keeps_an_activity_clock(tmp_path):
@@ -2538,9 +2540,58 @@ def test_configured_skip_rules_are_added_and_guarded_ones_dropped(tmp_path):
     host, _ = _host(
         tmp_path, classifier_skip_rules=["Bash(make test *)", "Bash(gh pr view *)", "Bash(*)"]
     )
-    allow = json.loads(host._settings_files[True].read_text())["permissions"]["allow"]
+    allow = json.loads(host._settings_file(True, Cut()).read_text())["permissions"]["allow"]
     assert "Bash(make test *)" in allow
     assert "Bash(gh pr view *)" not in allow and "Bash(*)" not in allow
+
+
+async def test_each_repository_gets_its_own_cut_of_tools_and_plugins(tmp_path):
+    """#4252: unused tools and plugins are cut from every chat's start, and a repository
+    that needs one back names its own lists; a chat outside a checkout keeps the host's."""
+    from agentdeck.config import ClaudeWorkersConfig
+
+    cuts = ClaudeWorkersConfig.model_validate(
+        {"repositories": {"Owner/Needs-Workflow": {"disabled_tools": []}}}
+    ).worker_cuts()
+    host, spawned = _host(tmp_path, worker_cuts=cuts)
+    needs, plain, loose = (tmp_path / name for name in ("needs", "plain", "loose"))
+    for path, remote in (
+        (needs, "gh:owner/needs-workflow.git"),
+        (plain, "https://github.com/owner/plain"),
+    ):
+        path.mkdir()
+        subprocess.run(["git", "init", "-q", str(path)], check=True)
+        # An insteadOf alias is expanded as git itself would fetch it.
+        alias = ["git", "-C", str(path), "config", "url.git@github.com:.insteadOf", "gh:"]
+        subprocess.run(alias, check=True)
+        subprocess.run(["git", "-C", str(path), "remote", "add", "origin", remote], check=True)
+    loose.mkdir()
+    for key, cwd in (("a", needs), ("b", plain), ("c", loose)):
+        await host.deliver(key, "start", cwd=str(cwd), delegated=False)
+    needs_settings, plain_settings, loose_settings = (
+        _settings(item["args"]) for item in spawned
+    )
+    off = {"productivity@synced": False, "engineering@synced": False}
+    assert "deny" not in needs_settings["permissions"]
+    assert needs_settings["enabledPlugins"] == off
+    for settings in (plain_settings, loose_settings):
+        assert settings["permissions"]["deny"] == [
+            "Workflow",
+            "ScheduleWakeup",
+            "ReportFindings",
+            "ShareOnboardingGuide",
+        ]
+        assert settings["enabledPlugins"] == off
+        # The classifier skip list and hooks are still there beside the cut.
+        assert "Bash(git status *)" in settings["permissions"]["allow"]
+        assert set(settings["hooks"]) == {"PermissionDenied", "PreToolUse"}
+    await host.stop()
+
+
+def test_a_host_built_without_cuts_cuts_nothing(tmp_path):
+    host, _ = _host(tmp_path)
+    settings = json.loads(host._settings_file(True, Cut()).read_text())
+    assert "deny" not in settings["permissions"] and "enabledPlugins" not in settings
 
 
 async def test_the_classifier_fallback_gate_is_surfaced_not_denied(tmp_path):
@@ -4314,6 +4365,34 @@ async def test_a_work_spare_is_booted_with_the_work_role_and_taken_by_a_work_sta
     assert len(spawned) == 3  # the two spares, and the plain one's mismatch spawned cold
     assert spawned[0]["process"].stdin.lines[0]["message"]["content"][0]["text"] == "the request"
     assert spawned[1]["process"].returncode is not None
+    await host.stop()
+
+
+async def test_a_spare_in_a_repository_with_its_own_cut_is_taken_by_its_chat(tmp_path):
+    """#4252: a spare reads its checkout's repository as the chat does, so the repository's
+    own settings file does not turn every warm start into a cold one."""
+    from agentdeck.config import ClaudeWorkersConfig
+
+    cuts = ClaudeWorkersConfig.model_validate(
+        {"repositories": {"owner/own": {"disabled_plugins": []}}}
+    ).worker_cuts()
+    host, spawned = _spare_host(tmp_path, worker_cuts=cuts)
+    repo = tmp_path / "own"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "remote", "add", "origin", "https://github.com/Owner/Own.git"],
+        check=True,
+    )
+    await host.prepare_spare("new_chat", "chat-own", session_token="tok-o", cwd=str(repo))
+
+    taken = await host.deliver(
+        "chat-own", "the request", cwd=str(repo), fresh=True, session_token="tok-o",
+        delegated=False,
+    )
+
+    assert taken.accepted and len(spawned) == 1
+    assert "enabledPlugins" not in _settings(spawned[0]["args"])
     await host.stop()
 
 

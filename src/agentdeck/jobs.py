@@ -63,7 +63,7 @@ from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
-from . import job_durations, pid_watch, worker_limits
+from . import deck_notices, gh_shim, github_identity, job_durations, pid_watch, worker_limits
 from .context_delivery import RE_DECIDED_REFUSALS
 from .flaky_quarantine import Quarantine
 from .host_slots import (
@@ -1161,6 +1161,65 @@ class JobQueue:
         self._wake.set()
         return job
 
+    async def rerun_verification(self, work_id: str, repository: str, head: str) -> Job | None:
+        """Run this Work's last verification of ``repository`` again at ``head`` (#4253).
+
+        The deck asks for it where it would otherwise wake the Work's chat only to do this:
+        the base was merged into its pull request, or a review passed a head nothing tests.
+        It runs in a clean checkout of ``head`` beside the Work's own, as the flaky reruns do,
+        so the chat's working copy is never touched, and tells the same chat when it ends: a
+        pass merges with no message, a failure wakes it. ``None`` when there is nothing to
+        run again: no verification of this Work and repository the queue still holds, one of
+        those already queued or running, or a command a fresh checkout cannot run (only
+        ``pytest`` and ``uv run``, which bring their own environment there).
+        """
+        wanted_work = work_id.strip().casefold()
+        wanted_repo = repository.strip().casefold()
+        head = head.strip().lower()
+        if not wanted_work or not wanted_repo or not head:
+            return None
+        mine = [
+            job
+            for job in self._jobs.values()
+            if _is_verification(job)
+            and job.work_id.strip().casefold() == wanted_work
+            and str((job.tested_workspace or {}).get("repository") or "").casefold() == wanted_repo
+        ]
+        if any(
+            not job.is_final
+            for job in self._jobs.values()
+            if _is_verification(job) and job.work_id.strip().casefold() == wanted_work
+        ):
+            return None  # its result is still to come, and tells the chat itself
+        if not mine:
+            return None
+        last = max(mine, key=lambda job: job.submitted_at)
+        command = _fresh_checkout_command(last.command)
+        if command is None or last.workspaces:
+            # Another checkout it tested is not pinned with it, so its result would not prove
+            # that pull request's head either.
+            return None
+        # The last one is often the deck's own earlier run, whose pinned checkout is removed
+        # once it ends: the repository it was made in is the one that lasts (#4253 review).
+        source = _lasting_cwd(last.cwd)
+        try:
+            await asyncio.to_thread(_git, "fetch", "-q", "origin", head, cwd=source)
+            cwd = await asyncio.to_thread(_pinned_checkout, source, head, HEAD_CHECKOUT_PREFIX)
+        except Exception:  # noqa: BLE001 - nothing ran; the chat is told to run it instead
+            log.warning("jobs: no checkout of %s at %s to verify", repository, head, exc_info=True)
+            return None
+        return self.submit(
+            command=command,
+            cwd=cwd,
+            **_follow_up_lane(last, cwd, command, self._skipped_lanes()),
+            session_key=last.session_key,
+            label=f"the deck's run of verification {last.id} again at {head[:12]}",
+            purpose=VERIFICATION,
+            work_id=last.work_id,
+            run_id=last.run_id,
+            max_minutes=last.max_minutes,
+        )
+
     def get(self, job_id: str) -> Job | None:
         return self._jobs.get(job_id)
 
@@ -1833,7 +1892,12 @@ class JobQueue:
         finished = self._jobs.get(job_id)
         if finished is None:
             return
-        pinned = finished.cwd if finished.follow_kind in {flaky.RERUN, flaky.BASE} else ""
+        pinned = (
+            finished.cwd
+            if finished.follow_kind in {flaky.RERUN, flaky.BASE}
+            or Path(finished.cwd).name.startswith(HEAD_CHECKOUT_PREFIX)
+            else ""
+        )
         try:
             plan = flaky.follow_up(
                 finished.to_dict(), [job.to_dict() for job in self._jobs.values()]
@@ -2368,7 +2432,27 @@ def _follow_up_lane(
 # on by the time the rerun starts, and a pod copies the working copy as it is.
 BASE_CHECKOUT_PREFIX = "verify-base-"
 RERUN_CHECKOUT_PREFIX = "verify-rerun-"
-PINNED_CHECKOUT_PREFIXES = (BASE_CHECKOUT_PREFIX, RERUN_CHECKOUT_PREFIX)
+#: A head the deck verifies by itself (#4253): after it merged the base into a pull request,
+#: or once a review passed a head nothing tests, it runs the Work's last verification again
+#: there instead of waking the Work's chat to do it.
+HEAD_CHECKOUT_PREFIX = "verify-head-"
+PINNED_CHECKOUT_PREFIXES = (BASE_CHECKOUT_PREFIX, RERUN_CHECKOUT_PREFIX, HEAD_CHECKOUT_PREFIX)
+
+
+def _fresh_checkout_command(command: list[str]) -> list[str] | None:
+    """``command`` as a fresh checkout runs it, or ``None`` when one cannot (#4253).
+
+    A bare ``pytest`` needs the checkout's own virtualenv, which a fresh one does not have, so
+    it goes through ``uv run`` as the flaky reruns do (``_checkout_pytest``). Anything else
+    may need installed dependencies the checkout lacks, and a failure that only says so would
+    wake the chat for nothing, so it is not run again here.
+    """
+    parts = [str(part) for part in command]
+    if parts[:2] == ["uv", "run"]:
+        return parts
+    if parts[:1] == ["pytest"]:
+        return [*_checkout_pytest(), *parts[1:]]
+    return None
 
 
 def _git(*args: str, cwd: str) -> str:
@@ -2461,6 +2545,19 @@ def _pinned_checkout(cwd: str, sha: str, prefix: str) -> str:
         _remove_pinned_checkout(str(path))
     _git("worktree", "add", "--detach", str(path), sha, cwd=cwd)
     return str(path)
+
+
+def _lasting_cwd(cwd: str) -> str:
+    """``cwd``, or the repository a pinned checkout in it was made in (#4253 review).
+
+    ``_pinned_checkout`` puts each one in ``.worktrees`` of the repository's main checkout and
+    removes it once no job runs there, so a job's ``cwd`` may be gone by the time a later run
+    is made from it; that main checkout stays.
+    """
+    path = Path(cwd)
+    if path.name.startswith(PINNED_CHECKOUT_PREFIXES) and path.parent.name == ".worktrees":
+        return str(path.parent.parent)
+    return cwd
 
 
 def _remove_pinned_checkout(path: str) -> None:
@@ -2844,6 +2941,13 @@ def _project_suite(project: str, suites: dict[str, str], cwd: str, root: Path) -
 
 def _child_env(job: Job) -> dict[str, str]:
     env = {key: value for key, value in os.environ.items() if key not in _STRIPPED_ENV}
+    # A queued command reaches GitHub as the chat that sent it would (#4274): the caching
+    # `gh` first on PATH, AgentDeck's credential helper for git, and no password prompt.
+    # Without this a git call to a private repository opened the desktop's askpass box
+    # (#3632's box, on the job path) and waited until the command's own timeout killed it,
+    # which a script under `set -e` reported as a bare exit 124 with no output.
+    env["PATH"] = gh_shim.worker_path(env)
+    github_identity.configure_github_git(env)
     # The job already holds a heavy slot; anything inside it must not wait for a
     # second one (the conftest backstop reads this).
     env[HEAVY_SLOT_HELD_ENV] = "1"
@@ -3160,4 +3264,6 @@ def job_message(job: Job) -> str:
     if job.state == INTERRUPTED:
         lines.append("")
         lines.append("Resubmit it with `agentdeck job submit` if you still need it.")
-    return "\n".join(lines)
+    text = "\n".join(lines)
+    # A passed job is a success notice: one step and a short answer (#4253). A failure is not.
+    return deck_notices.routine(text) if job.state == DONE else text

@@ -73,6 +73,12 @@ WAKE = (
 )
 def test_each_deck_message_gets_a_one_line_label(text, kind, expected):
     assert deck_notices.label(text, kind) == expected
+    # A success notice opens with the routine line (#4253); its label and sender read the same.
+    routine = deck_notices.routine(text)
+    assert routine.startswith(deck_notices.ROUTINE_LINE)
+    assert deck_notices.label(routine, kind) == expected
+    if kind not in ("work-start",):
+        assert deck_notices.notice_kind(routine, {}) == deck_notices.notice_kind(text, {})
 
 
 def test_deck_messages_render_as_markers_and_a_persons_own_stay_messages(tmp_path):

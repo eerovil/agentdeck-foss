@@ -65,7 +65,7 @@ APPROVE_MERGE = "approve_merge"
 WITHDRAW_MERGE = "withdraw_merge"
 APPROVAL_ACTIONS = frozenset({APPROVE_MERGE, WITHDRAW_MERGE})
 # Ship now, fix later (#4212): merge a pull request its review sent back with findings, and
-# file those findings as a follow-up Work.
+# leave those findings to this same Work's next pull request.
 SHIP_NOW = "ship_now"
 # Works, close on a Work waiting for a person to try it live (#4210): closes its issue, records
 # the live check as verified and finishes the Work, in one press with no confirm. Offered from
@@ -137,8 +137,7 @@ CONFIRMS = {
     ),
     SHIP_NOW: (
         "Ship this Work as it is? The deck merges it once its tests are green, with no new"
-        " review, and files the review's findings as a follow-up Work whose review also reads"
-        " this change again."
+        " review. The Work stays open to fix the review's findings in a new pull request."
     ),
 }
 
@@ -318,11 +317,16 @@ def ship_now_refusal(card: Any, deck_release: bool, shippable: Sequence[str]) ->
 
 
 def ship_targets(card: Any, shippable: Sequence[str]) -> tuple[str, ...]:
-    """``pull@head`` of each open pull request in ``shippable``, at the head the card read."""
+    """``pull@head`` of each open pull request in ``shippable``, at the head the card read, or
+    at the earlier head a ``pull@head`` entry names: the reviewed commit a fix was pushed on
+    top of, which ships in a pull request of its own (#4212 review)."""
+    split = dict(entry.lower().partition("@")[::2] for entry in shippable if "@" in entry)
     found = []
     for output in getattr(card, "outputs", ()):
         pull = f"{output.repository}#{output.number}".lower()
-        if pull in shippable and output.head:
+        if pull in split:
+            found.append(f"{pull}@{split[pull]}")
+        elif pull in shippable and output.head:
             found.append(f"{pull}@{output.head.lower()}")
     return tuple(found)
 
@@ -339,10 +343,13 @@ def ship_now_control(
     if ship_now_refusal(card, deck_release, shippable):
         return None
     lines = dict(findings)
-    shown = [
-        f"{pull}: {lines.get(pull) or 'its findings kept no words; read them on its pull request'}"
-        for pull in shippable
-    ]
+    shown = []
+    for entry in shippable:
+        pull, _, head = entry.partition("@")
+        line = lines.get(pull) or "its findings kept no words; read them on its pull request"
+        # A fix was pushed on top: the reviewed commit ships in a pull request of its own.
+        where = f" (at {head[:12]}, in a new pull request; the fix stays in {pull})" if head else ""
+        shown.append(f"{pull}{where}: {line}")
     confirm = CONFIRMS[SHIP_NOW]
     if len(shown) == 1:
         confirm += f"\n\nThe findings start: {shown[0]}"

@@ -214,6 +214,19 @@ class WorkProjection:
         """
         return self._joined_by_chat.get(chat_id, ())
 
+    def direct_works_for_chat(self, chat_id: str) -> tuple[str, ...]:
+        """The ids of the Works this chat is directly in, in projection order (#4272)."""
+        return self._direct_by_chat.get(chat_id, ())
+
+    @cached_property
+    def _direct_by_chat(self) -> dict[str, tuple[str, ...]]:
+        # Built once per projection: every Work card's status asks per chat (#4272 review).
+        index: dict[str, list[str]] = {}
+        for work in self.works:
+            for chat in dict.fromkeys(m.chat_id for m in work.memberships if m.direct):
+                index.setdefault(chat, []).append(work.work_id)
+        return {chat_id: tuple(ids) for chat_id, ids in index.items()}
+
     @cached_property
     def _joined_by_chat(self) -> dict[str, tuple[WorkRef, ...]]:
         # Built once per projection: ``work_pulls`` asks per registered pull request, and a

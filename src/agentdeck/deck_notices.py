@@ -37,6 +37,21 @@ _START_RE = re.compile(r"Context: Work for \S+#\d+[^\n]*\n\nThis chat is the Wor
 
 _LABEL_MAX = 72
 
+#: The line a success notice opens with (#4253, owner's choice of 2026-11-10): a routine
+#: result needs one action and a short answer, not a report. A failure never carries it.
+ROUTINE_LINE = "Routine notice: do what it asks, then answer in one or two sentences."
+
+
+def routine(text: str) -> str:
+    """``text`` as a success notice: the routine line first, then the notice itself."""
+    return f"{ROUTINE_LINE}\n\n{text}"
+
+
+def without_routine(text: str) -> str:
+    """``text`` without a leading routine line, so its sender and label read as before."""
+    return text.removeprefix(ROUTINE_LINE).lstrip("\n") if text.startswith(ROUTINE_LINE) else text
+
+
 #: When the transcript event a delivery record wrote can carry a time, relative to the
 #: record's handover. A provider writes the turn within seconds of accepting it, but a
 #: message handed to a busy agent may be written only when its turn ends, so the window
@@ -83,6 +98,7 @@ def notice_kind(
         return None
     if _START_RE.match(text):
         return "work-start"
+    text = without_routine(text)
     for prefix, prefix_kind in _PREFIX_KINDS:
         if text.startswith(prefix):
             return "work-handover" if " is now run by the deck" in text[:120] else prefix_kind
@@ -123,6 +139,7 @@ def label(text: str, kind: str) -> str:
         return "Turn ended without a next step"
     if kind == "work-handover":
         return "Work handed over to the deck"
+    text = without_routine(text)
     body = text.split(": ", 1)[1] if ": " in text[:40] else text
     first = body.split("\n", 1)[0]
     if kind == "wake-on":
