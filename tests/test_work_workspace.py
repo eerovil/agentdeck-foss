@@ -609,6 +609,8 @@ def test_the_workspace_is_served_only_inside_the_work_page(tmp_path):
     paths = _route_paths(workspace_app(tmp_path).routes)
     assert {path for path in paths if "works" in path} == {
         "/works",
+        # Show older (#4289) lists finished Works' front-page rows; no workspace.
+        "/works/finished",
         "/works/{work_id:path}",
         # Message this Work (#2218) sends a message; it serves no workspace.
         "/works/{work_id:path}/message",

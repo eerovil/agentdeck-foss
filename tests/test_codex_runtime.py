@@ -1203,3 +1203,63 @@ async def test_runtime_unloads_idle_threads_past_a_failing_account(tmp_path, mon
         pass
 
     assert swept == ["codex:bad", "codex:ok"]
+
+
+async def test_a_web_only_start_is_locked_before_its_turn_and_takes_no_switch(tmp_path):
+    """#4381: the row is written before the first turn; bypass and prompts are refused."""
+    from agentdeck.providers.codex.web_only import WEB_ONLY_SWITCH_REFUSAL
+
+    app, runtime_client, _previous = _bypass_app(tmp_path, start_bypassed=True)
+    seen: dict = {}
+
+    async def start_thread(*_args, before_first_turn, **kwargs):
+        seen.update(kwargs)
+        return await before_first_turn("thread-1")
+
+    runtime_client.start_thread = start_thread
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://runtime"
+    ) as client:
+        response = await client.post(
+            "/accounts/local/start-web-only",
+            json={"cwd": str(tmp_path), "message": "go", "delegated": True},
+        )
+        forked = await client.post(
+            "/accounts/local/start-web-only",
+            json={"cwd": str(tmp_path), "message": "go", "fork_thread_id": "a",
+                  "fork_turn_id": "b"},
+        )  # fmt: skip
+
+    assert response.json()["accepted"] is True
+    assert forked.json()["accepted"] is False
+    assert seen["web_only"] is True
+    runtime = app.state.runtime
+    db = runtime._budget_db
+    assert db.web_only("codex:local:thread-1") is True
+    assert db.web_only("codex:local:thread-2") is False
+    assert db.bypass_permissions_on("codex:local:thread-1") is False
+    for refused in (
+        await runtime.set_permission_prompts("local", "thread-1", True),
+        await runtime.set_bypass_permissions("local", "thread-1", True),
+    ):
+        assert (refused.accepted, refused.reason) == (False, WEB_ONLY_SWITCH_REFUSAL)
+    runtime_client.set_permission_prompts.assert_not_awaited()
+    runtime_client.set_bypass_permissions.assert_not_awaited()
+
+
+async def test_a_runtime_without_the_web_only_route_starts_nothing(tmp_path):
+    """#4381: an older runtime answers 404 to the new route and no chat starts."""
+    paths = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        if request.url.path == "/accounts/local/start-web-only":
+            return httpx.Response(404, json={"detail": "Not Found"})
+        raise AssertionError(request.url.path)
+
+    client = CodexRuntimeClient(_account(tmp_path), transport=httpx.MockTransport(handler))
+    result = await client.start_thread(tmp_path, "go", delegated=True, web_only=True)
+
+    assert not result.accepted
+    assert paths == ["/accounts/local/start-web-only"]
+    await client.stop()

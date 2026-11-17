@@ -235,6 +235,14 @@ def _derived(card: WorkCard, row_reason: str, made) -> OperatorAttention:
     every review by itself.
     """
     kind = card.derived.kind
+    if kind in {"question", "asked_in_chat"} and card.derived.ready_pr is not None:
+        # Its pull request is Ready for merge too (#4294): the question keeps the headline,
+        # and Merge stays offered beside it rather than hidden until the answer.
+        answer = (ANSWER, OPEN) if kind == "asked_in_chat" else (OPEN,)
+        return OperatorAttention(
+            NEEDS_ANSWER, row_reason, (*answer, MERGE, HIDE), ", ".join(card.targets),
+            _review_url(card),
+        )
     if kind in {"question", "review_escalated", "spec_wait"}:
         # The reviewer's escalation is a question for the owner too (#3216), and so is a
         # posted spec waiting for approval (#3247).

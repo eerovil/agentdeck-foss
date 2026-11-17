@@ -25,7 +25,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from . import agent_review, review_paperwork, review_refs, work_release
+from . import agent_review, design_review, review_paperwork, review_refs, work_release
 from .poller_ops import work_hold_labels, work_start_labels, work_unassigned_elsewhere
 from .scheduled_messages import ScheduledMessage
 from .wake_on import (
@@ -58,6 +58,8 @@ from .work_router import owner_of_pull as work_owner_of_pull
 from .work_signals import (
     acknowledge_comment,
     latest_comment,
+    newest_comment,
+    open_blockers,
     read_comment,
     read_dependencies,
     read_map,
@@ -220,11 +222,15 @@ class WorkServices:
     before_router_call: Callable[[], object] | None = None
     #: The GitHub check's publisher (#4152), ``None`` when it is off.
     check: Any = None
+    #: Lighter review (#4399, ``light_review.LightReview``).
+    light: Any = None
 
     def start(self) -> None:
         self.router.start()
         self.backstop.start()
         self.release.start(self.state.bus, scanned=self.hooks.scanned)
+        if self.light is not None:
+            self.light.start()
         if self.check is not None:
             self.check.start()
 
@@ -234,6 +240,8 @@ class WorkServices:
         await self.backstop.stop()
         await self.router.stop()
         await self.release.stop()
+        if self.light is not None:
+            await self.light.stop()
 
     # --- the calls the web makes (``services_link``) ---
 
@@ -286,13 +294,18 @@ CALLS: dict[str, tuple[str, ...]] = {
         "withdraw_merge",
         "on_verdict",
         "on_findings",
+        "on_design_review",
         "stale_findings",
         "star",
         "reorder_and_wake",
     ),
     "router": (
+        "design_review",
+        "design_accept",
+        "design_record",
         "note_filed",
         "note_registered",
+        "note_deployed",
         "ask_again",
         "accept",
         "ship_now",
@@ -341,6 +354,35 @@ def build(
         if reviewer in agent_review.PROVIDERS
         else None
     )
+    # The design review (#4332) runs on the code reviewer, sharing its places and ledger. When
+    # ChatGPT reviews code, one Claude reviewer on that ledger is the only one writing it, made at
+    # the first design review.
+    design_reviewers: list[agent_review.AgentReviewer] = [agent_reviewer] if agent_reviewer else []
+
+    async def start_design(issue: str, design_url: str, *, checkout: str = "") -> object:
+        if not design_reviewers:
+            design_reviewers.append(
+                agent_review.AgentReviewer(
+                    kind=agent_review.CLAUDE,
+                    max_reviewers=config.review.max_reviewers,
+                    ledger=config.review.ledger_path,
+                    digest=review_refs.target_digest,
+                    **hooks.reviewer(),
+                )
+            )
+        return await design_reviewers[0].start_design(issue, design_url, checkout=checkout)
+
+    design = (
+        design_review.DesignRound(
+            start_design,
+            design_review.Verdicts.beside(config.review.ledger_path),
+            reviews=lambda token, issue, comment: agent_review.reviews_design(
+                config.review.ledger_path, token, issue, comment
+            ),
+        )
+        if reviewer != agent_review.OFF
+        else None
+    )
 
     async def start_work_review(
         pull: str, work: str, *, note: str = "", again: bool = False
@@ -356,6 +398,14 @@ def build(
 
         facts = await pull_facts(repository, number) or {}
         if str(facts.get("state") or "").upper() != "OPEN" or facts.get("isDraft"):
+            return ""
+        return str(facts.get("headRefOid") or "")
+
+    async def open_pull_head(repository: str, number: int) -> str:
+        from .review_refs import pull_facts
+
+        facts = await pull_facts(repository, number) or {}
+        if str(facts.get("state") or "").upper() != "OPEN":
             return ""
         return str(facts.get("headRefOid") or "")
 
@@ -518,6 +568,29 @@ def build(
             work_id, lambda row, rows: credited_head_for_work_alone(row, work_id=work_id, jobs=rows)
         )
 
+    async def release_script_green_heads(work_id: str) -> set[str]:
+        """Heads a green verification of exactly ``bin/test.sh`` proves (#4399)."""
+        from .poller_engine.verification import script_green_head_for_work_alone
+
+        return await heads_of(
+            work_id, lambda row, rows: script_green_head_for_work_alone(row, work_id=work_id)
+        )
+
+    async def release_script_failed_heads(work_id: str) -> set[str]:
+        """Heads a verification of exactly ``bin/test.sh`` failed at (#4401 review)."""
+        from .poller_engine.verification import script_failed_head_for_work_alone
+
+        return await heads_of(
+            work_id,
+            lambda row, rows: script_failed_head_for_work_alone(row, work_id=work_id, jobs=rows),
+        )
+
+    async def release_script_verifying(work_id: str) -> bool:
+        from .web.work_view import runtime_queue
+
+        queue = await runtime_queue(runtime_app(), work_id=work_id)
+        return work_release.verifies(queue, work_id, ["bin/test.sh"])
+
     async def release_failed_heads(work_id: str) -> set[str]:
         from .poller_engine.verification import failed_head_for_work_alone
 
@@ -539,6 +612,12 @@ def build(
             work_id, lambda row, rows: unclean_head_for_work_alone(row, work_id=work_id)
         )
 
+    async def work_verification_rows(work_id: str) -> list[dict]:
+        from .web.work_view import runtime_work_jobs
+
+        # Raises when unread, so the check holds nothing back (#4326 review).
+        return await runtime_work_jobs(runtime_app(), work_id)
+
     async def release_verifying(work_id: str) -> bool:
         from .web.work_view import runtime_queue
 
@@ -553,6 +632,10 @@ def build(
         )
         # ``None`` is a replay the store absorbed or a row it refused; only it can say which.
         return scheduled is not None or hooks.exists(message_id)
+
+    def release_note(chat_id: str, note_id: str, text: str) -> bool:
+        add = getattr(db, "add_pending_event", None)
+        return bool(add(note_id, chat_id, text)) if add is not None else False
 
     async def release_pull_files(pull: str) -> set[str] | None:
         repository, _, number = pull.rpartition("#")
@@ -609,13 +692,18 @@ def build(
         state.bus.publish(WORK_INPUTS_TOPIC)
         return True
 
-    async def release_rerun(work_id: str, repository: str, head: str) -> bool:
+    async def release_rerun(
+        work_id: str, repository: str, head: str, command: list[str] | None = None
+    ) -> bool:
         client = hooks.runtime_http()
         if client is None:
             return False
+        body: dict = {"work_id": work_id, "repository": repository, "head": head}
+        if command is not None:
+            body["command"] = command  # a light pull request's bin/test.sh (#4399)
         response = await client.post(
             "/jobs/rerun-verification",
-            json={"work_id": work_id, "repository": repository, "head": head},
+            json=body,
             timeout=180.0,
         )
         response.raise_for_status()
@@ -647,6 +735,9 @@ def build(
             merge=work_release.merge,
             update_branch=work_release.update_branch,
             tell=release_tell,
+            # A note for the chat's next message, waking nothing (#4303); in the control
+            # database the web's send paths read it from.
+            note=release_note,
             # A chat of the Work mid-turn may still push (#2481): read from the live sessions.
             busy=lambda work_id: work_busy(state, work_id),
             issue_labels=work_release.issue_labels,
@@ -721,6 +812,15 @@ def build(
 
     services: WorkServices
 
+    def deployed() -> frozenset[str]:
+        # The Works shown as Waiting for a try (#4384), or with a registered pull request
+        # merged (#4398): a blocker among them counts as done.
+        load = getattr(db, "load_done_blockers", None)
+        return load() if load is not None else frozenset()
+
+    def blockers(repository: str, number: int):
+        return open_blockers(repository, number, deployed=deployed)
+
     async def ask_runtime(repository: str, number: int, *, on_refused=None, **kwargs) -> str:
         # A start the runtime refuses later is reported back by the web (``start_refused``).
         work_id = WorkRef(repository.lower(), number).work_id
@@ -732,7 +832,9 @@ def build(
 
     async def start_work(repository: str, number: int, **kwargs) -> str:
         # Held while a blocker is open or unread (#4216), on every router start and retry.
-        return await start_unless_blocked(ask_runtime, repository, number, **kwargs)
+        return await start_unless_blocked(
+            ask_runtime, repository, number, blockers=blockers, **kwargs
+        )
 
     check = None
     if check_on(config) and db is not None:
@@ -781,8 +883,42 @@ def build(
         ),
     )
 
+    def tests_checked(repository: str) -> bool:
+        """Whether ``repository``'s manifest entry says ``check_tests = true`` (#4326)."""
+        return repository.lower() in release.ports.policy(repository).tests_checked
+
+    from . import light_review
+
+    # Lighter review of robot pull requests outside their guarded code (#4399): on only where
+    # a manifest entry says ``light_review``.
+    light = light_review.LightReview(
+        light_review.LightPorts(
+            policy=lambda repository: release.ports.policy(repository).light(repository),
+            store=db,
+            reviews=state.review_events,
+            live_head=light_review.gh_live_head,
+            base_branch=light_review.gh_base_branch,
+            digest=release_digest,
+            chat=release_chat,
+            tell=release_tell,
+            look=release.queue_bench_look,
+            fetch=light_review.git_fetch,
+            git=light_review.git_read,
+            bench=light_review.run_bench,
+            find_issue=light_review.gh_find_issue,
+            file_issue=light_review.gh_file_issue,
+            merged=light_review.gh_merged,
+        )
+    )
+    release.ports.light = light
+    release.ports.script_green_heads = release_script_green_heads
+    release.ports.script_failed_heads = release_script_failed_heads
+    release.ports.script_verifying = release_script_verifying
+
     router = WorkRouterService(
         config.github_webhook.path,
+        chat_repository=config.chat_board.repository,
+        newest_comment=newest_comment,
         switched=switched_repositories,
         release=release,
         owner_of_issue=lambda repository, number: work_owner_of_issue(state, repository, number),
@@ -800,10 +936,25 @@ def build(
         ),
         refusal=work_event_refusal,
         ready_head=ready_pull_head,
+        # A verdict on a head its agent turned back to draft still counts (#4352).
+        open_head=open_pull_head,
         # Review fixes that grew the diff over 15% add a design check to the checklist (#4220).
         diff_sizes=review_refs.diff_sizes,
         # Missing paperwork refuses pre-review-done before any review starts (#4261).
-        paperwork=review_paperwork.check,
+        # Where the manifest says ``check_tests = true``, Python code changed with no test, and
+        # a head with no test run, refuse it too (#4326).
+        # Before the first review, the helper checks' comment too (#4437).
+        paperwork=lambda repository, number, work, first=False: review_paperwork.check(
+            repository,
+            number,
+            work,
+            tests=tests_checked(repository),
+            helpers=first,
+        ),
+        design=design,
+        verification_rows=work_verification_rows,
+        tests_checked=tests_checked,
+        light=light,
         enabled=enabled,
         watcher=watcher,
         # The ownership label on an issue no chat owns starts its Work's agent (step 5b).
@@ -834,6 +985,8 @@ def build(
         busy=lambda work_id: work_busy(state, work_id),
         # The reviewer's verdict handed to a chat ends its review waits quietly (#3183).
         on_verdict=hooks.wake_registry.answer_reviews,
+        # A pass carried over a base merge is a pending note for the chat (#4306).
+        pending_note=release_note,
         # A head whose diff an earlier review read is not reviewed again (#3314).
         digest=release_digest,
         base_only=base_only_between,
@@ -850,6 +1003,12 @@ def build(
         # ... and an issue starts once its last blocker closes (#3764, #4216).
         read_dependencies=read_dependencies,
         start_ticket=start_unblocked_ticket,
+        # ... or once it is deployed and waits only for a person's try (#4384).
+        deployed=deployed,
+        # ... or once its Work's registered pull request merged into the default branch: the
+        # router records the merge, and a reopen of the Work's issue drops it (#4398).
+        note_merged=getattr(db, "note_merged_pull", None),
+        forget_merged=getattr(db, "forget_merged_pulls", None),
         hold_labels=lambda repository: work_hold_labels(config.poller.root).get(
             repository.lower(), ()
         ),
@@ -889,13 +1048,19 @@ def build(
         spent=work_start_spent,
         # Held while a blocker is open or unread (#4216), the same check as the router's.
         start_work=lambda repository, number, **kwargs: start_unless_blocked(
-            hooks.start_work, repository, number, wait=True, **kwargs
+            hooks.start_work, repository, number, blockers=blockers, wait=True, **kwargs
         ),
         mine=deck_claims,
         enabled=enabled,
     )
     services = WorkServices(
-        router=router, release=release, backstop=backstop, hooks=hooks, state=state, check=check
+        router=router,
+        release=release,
+        backstop=backstop,
+        hooks=hooks,
+        state=state,
+        check=check,
+        light=light,
     )
     router.filing_holds = services._filing_now
     return services

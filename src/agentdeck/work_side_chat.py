@@ -146,16 +146,31 @@ def side_chat_fresh(last_activity: datetime | None, now: datetime | None = None)
     return (now or datetime.now(UTC)) - last_activity < SIDE_CHAT_FRESH
 
 
-def side_chat_message(issue: IssueRef, agent_key: str) -> str:
+def side_chat_message(issue: IssueRef, agent_key: str, *, copied: bool = True) -> str:
     """The side chat's first message: answer only, where the agent's newer messages are, and
-    how to pass the owner's words on, only when asked. The deck pastes nothing else in."""
+    how to pass the owner's words on, only when asked. The deck pastes nothing else in.
+
+    ``copied`` False is a side chat started empty (#4314), because the agent's chat had no
+    reply yet to copy: it is told to read the agent's chat before its first answer.
+    """
     owner, _, repo = issue.repository.partition("/")
+    transcript = f"`$AGENTDECK_URL/sessions/{agent_key}/transcript.json`"
+    if copied:
+        reading = (
+            f"The agent's chat is {agent_key}; when a question needs what it did after this "
+            f"copy, read {transcript}. "
+        )
+    else:
+        reading = (
+            f"The agent's chat is {agent_key}. You start with no copy of it, because it had no "
+            f"reply yet to copy: before your first answer, read {transcript}, and read it "
+            "again when a question needs what the agent did since. "
+        )
     return (
         f"You are a side chat of the agent working on {issue.repository}#{issue.number}. "
         "The owner asks you questions while that agent keeps working in this same folder. "
         "Answer them; change no files and start no work. "
-        f"The agent's chat is {agent_key}; when a question needs what it did after this copy, "
-        f"read `$AGENTDECK_URL/sessions/{agent_key}/transcript.json`. "
+        f"{reading}"
         "When — and only when — the owner asks you to tell the agent something, send it with "
         f"`POST $AGENTDECK_URL/api/works/{owner}/{repo}/{issue.number}/message` and "
         '`{"text": "The owner says: <their words>", "from": "<your session key>"}`, '

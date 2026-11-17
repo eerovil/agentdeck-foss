@@ -314,6 +314,9 @@ def test_a_merge_candidate_is_watched_for_its_merge_answer(tmp_path):
 
     ready = replace(plain, derived=DerivedStatus(READY, "Ready for merge"))
     assert merge_watch_pulls([ready]) == ((f"{ORG}/agentdeck", 7),)
+    # A question over a ready pull request offers its Merge too (#4294).
+    asked = replace(plain, derived=DerivedStatus("asked_in_chat", "Needs you", ready_pr=7))
+    assert merge_watch_pulls([asked]) == ((f"{ORG}/agentdeck", 7),)
 
 
 # --- a conflict found after Ready for merge (#4217) -------------------------------------------

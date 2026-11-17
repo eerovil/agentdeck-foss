@@ -144,9 +144,12 @@ def test_claude_cut_never_goes_before_a_compaction(tmp_path):
     )
     assert claude_transcripts.newest_fork(done, turn_finished=False) == (11, "b-end")
     assert claude_transcripts.fork_ref(done, 11) == "b-end"
-    # With no compaction, a chat's first running turn has no finished reply: no cut.
+    # With no compaction, a chat's first running turn is cut at its words so far too (#4314),
+    # and before it has written any text there is nothing to cut at.
     first = _jsonl(tmp_path / "first.jsonl", [rows[0], *rows[7:10]])
-    assert claude_transcripts.newest_fork(first, turn_finished=False) is None
+    assert claude_transcripts.newest_fork(first, turn_finished=False) == (2, "b-mid")
+    tools_only = _jsonl(tmp_path / "tools.jsonl", [rows[0], *rows[8:10]])
+    assert claude_transcripts.newest_fork(tools_only, turn_finished=False) is None
 
 
 def test_claude_cut_refuses_an_api_error_reply(tmp_path):
@@ -197,6 +200,8 @@ def test_codex_cut_only_after_a_completed_turns_last_message(tmp_path):
     # A Work's side chat (#4199): the newest completed turn's last message, even mid-turn.
     assert codex_transcripts.newest_fork_seq(path) == 9
     assert codex_transcripts.newest_fork_seq(running) == 5
+    # A Work's start (#4314): the first turn is running and has replied, but Codex cannot cut
+    # a live turn, so there is no cut and the Work's side chat starts empty.
     unanswered = _jsonl(tmp_path / "e.jsonl", _codex_rows(finish_second=False)[:4])
     assert codex_transcripts.newest_fork_seq(unanswered) is None
 
@@ -677,8 +682,17 @@ async def test_a_side_chat_start_that_raises_releases_its_reservation(tmp_path, 
                 data={"seq": "7", "message": "hi"},
                 headers={"origin": "http://test", "x-agentdeck-action-id": "press-0003"},
             )
-    assert len(released) == 1
+        # The message box's side chat (#4313) does the same.
+        _box_side_chat(monkeypatch, app)
+        with _pytest.raises(RuntimeError):
+            await client.post(
+                "/sessions/codex:test:sid/side-chat",
+                data={"message": "hi"},
+                headers={"origin": "http://test", "x-agentdeck-action-id": "press-0004"},
+            )
+    assert len(released) == 2
     assert state.reserve_chat_fork("fresh", "codex:test:sid", 7, "press-0003") == "fresh"
+    assert state.side_chat_forks(["codex:test:sid"]) == []
     await app.state.injector.stop()
 
 
@@ -949,4 +963,467 @@ async def test_side_chat_controls_work_in_a_chat_the_desktop_front_page_opens(
             draft = await page.locator("#inject-message").input_value()
             assert "Summary from side chat “About X” (for information):" in draft
             assert "X is fine, ship it" in draft
+            await browser.close()
+
+
+# --- the message box's side chat (#4313) ---------------------------------------
+
+
+def test_claude_side_chat_copy_ends_at_the_cut(tmp_path):
+    path = _jsonl(
+        tmp_path / "side.jsonl",
+        [_prompt("first"), _assistant("a-end", _text("done")), _prompt("side q")],
+    )
+    assert claude_transcripts.fork_copy_end(path, "a-end") == 2
+    assert claude_transcripts.fork_copy_end(path, "missing") == 0
+    assert claude_transcripts.fork_copy_end(tmp_path / "gone.jsonl", "a-end") == 0
+
+
+def _box_side_chat(monkeypatch, app, newest=(7, "turn-3")):
+    """The codex chat's newest finished turn, and a record of sends to a live side chat."""
+    from agentdeck.providers import PROVIDERS
+
+    codex = PROVIDERS["codex"]
+    turn = {"newest": newest}
+    monkeypatch.setattr(codex, "newest_fork", lambda account, session: turn["newest"])
+    sends = []
+
+    async def start(account, session, provider, message, images, **kwargs):
+        sends.append({"key": session.key, "message": message, **kwargs})
+        return InjectResult(True)
+
+    monkeypatch.setattr(app.state.injector, "start", start)
+    return turn, sends
+
+
+def _live_side(app, token):
+    state = app.state.app_state
+    state.update_session(
+        Session(
+            "codex:test:side",
+            "codex:test",
+            "side",
+            SessionStatus.IDLE,
+            capabilities=frozenset({Capability.TRANSCRIPT, Capability.INJECT}),
+        )
+    )
+    state.bind_session_token(token, "codex:test:side")
+
+
+async def test_box_side_chat_starts_once_then_takes_every_later_message(tmp_path, monkeypatch):
+    app = _app(tmp_path)
+    starts = _forkable(monkeypatch)
+    turn, sends = _box_side_chat(monkeypatch, app)
+    state = app.state.app_state
+
+    def post(client, action, text):
+        return client.post(
+            "/sessions/codex:test:sid/side-chat",
+            data={"message": text},
+            headers={"origin": "http://test", "x-agentdeck-action-id": action},
+        )
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        assert (await post(client, "", "no id")).status_code == 422
+        first = await post(client, "side-0001", "what about X?")
+        assert first.status_code == 202
+        assert "data-side-view-body" in first.text
+        for _ in range(20):
+            await settle()
+            if starts:
+                break
+        # The same press again starts nothing more.
+        assert (await post(client, "side-0001", "what about X?")).status_code == 202
+        await settle()
+        assert len(starts) == 1
+        start = starts[0]
+        assert start["fork_from"] == ForkFrom("sid", "turn-3")
+        assert start["message"] == "what about X?"
+        [fork] = state.side_chat_forks(["codex:test:sid"])
+        assert (fork.cut_ref, fork.seen_seq) == ("turn-3", 7)
+        # Until the side chat is up, another message waits rather than starting a second.
+        early = await post(client, "side-0002", "and Y?")
+        assert early.status_code == 409
+        assert "still starting" in early.json()["detail"]
+        _live_side(app, start["session_token"])
+        second = await post(client, "side-0003", "and Y?")
+        assert second.status_code == 202
+        # The main chat has not moved on, so the message goes as it is.
+        assert [send["message"] for send in sends] == ["and Y?"]
+        assert sends[0]["key"] == "codex:test:side"
+        turn["newest"] = (11, "turn-5")
+        assert (await post(client, "side-0004", "and Z?")).status_code == 202
+        moved = sends[1]["message"]
+        assert "moved on" in moved
+        assert "chat-read codex:test:sid --after " in moved
+        assert moved.endswith("\n\nand Z?")
+        # Having said so once, it does not repeat it.
+        assert (await post(client, "side-0005", "ok")).status_code == 202
+        assert sends[2]["message"] == "ok"
+        # A send that may have written answers 5xx, so the page keeps its action id for a
+        # resend; one known to have written nothing is a plain refusal.
+        for outcome, status in (
+            (InjectResult(False, "unsure", write_uncertain=True), 503),
+            (InjectResult(False, "down", runtime_unreachable=True), 503),
+            (InjectResult(False, "full"), 409),
+        ):
+
+            async def answer(*args, outcome=outcome, **kwargs):
+                return outcome
+
+            monkeypatch.setattr(app.state.injector, "start", answer)
+            refused = await post(client, f"side-{status}-{outcome.reason}", "hm")
+            assert (refused.status_code, refused.json()["detail"]) == (status, outcome.reason)
+    assert len(starts) == 1
+    await app.state.injector.stop()
+
+
+async def test_box_side_chat_that_is_gone_is_replaced(tmp_path, monkeypatch):
+    app = _app(tmp_path)
+    starts = _forkable(monkeypatch)
+    _box_side_chat(monkeypatch, app)
+    state = app.state.app_state
+    state.reserve_chat_fork("old", "codex:test:sid", 3, "old-press", kind="side", cut_ref="t1")
+    state.bind_session_token("old", "codex:test:vanished")
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        view = await client.get("/partials/sessions/codex:test:sid/side-chat")
+        assert 'data-side-state="none"' in view.text
+        response = await client.post(
+            "/sessions/codex:test:sid/side-chat",
+            data={"message": "again"},
+            headers={"origin": "http://test", "x-agentdeck-action-id": "side-0006"},
+        )
+        assert response.status_code == 202
+        for _ in range(20):
+            await settle()
+            if starts:
+                break
+    assert len(starts) == 1
+    assert [fork.cut_ref for fork in state.side_chat_forks(["codex:test:sid"])] == ["turn-3", "t1"]
+    await app.state.injector.stop()
+
+
+async def test_box_side_chat_needs_a_finished_turn(tmp_path, monkeypatch):
+    app = _app(tmp_path)
+    starts = _forkable(monkeypatch)
+    _box_side_chat(monkeypatch, app, newest=None)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            "/sessions/codex:test:sid/side-chat",
+            data={"message": "hi"},
+            headers={"origin": "http://test", "x-agentdeck-action-id": "side-0007"},
+        )
+    assert response.status_code == 409
+    assert "no finished reply" in response.json()["detail"]
+    assert starts == []
+    assert app.state.app_state.side_chat_forks(["codex:test:sid"]) == []
+    await app.state.injector.stop()
+
+
+@pytest.mark.browser
+async def test_box_side_chat_takes_the_chats_place_with_its_own_draft(tmp_path, monkeypatch):
+    """The box's switch (#4313): the side chat's own talk in the chat's place, a draft of
+    its own, a send that never lands in the main chat, a dot, and the summary sent back."""
+    from agentdeck.providers import PROVIDERS
+
+    claude = PROVIDERS["claude_code"]
+    monkeypatch.setattr(claude, "fork_refusal", lambda account, session: None)
+    app = _claude_app_with_turns(tmp_path)
+    copied = (tmp_path / "projects" / "-tmp" / "sid1.jsonl").read_text()
+    side_file = tmp_path / "projects" / "-tmp" / "sid3.jsonl"
+    side_file.write_text(copied)
+    with side_file.open("a") as out:
+        out.write(json.dumps(_prompt("side question")) + "\n")
+        out.write(json.dumps(_assistant("s-end", _text("side answer"))) + "\n")
+    state = app.state.app_state
+    state.update_session(
+        replace(
+            state.sessions["claude_code:test:sid1"],
+            capabilities=frozenset({Capability.TRANSCRIPT, Capability.INJECT}),
+        )
+    )
+    state.update_session(
+        Session(
+            key="claude_code:test:sid3",
+            account_key="claude_code:test",
+            session_id="sid3",
+            status=SessionStatus.IDLE,
+            cwd=tmp_path,
+            capabilities=frozenset({Capability.TRANSCRIPT, Capability.INJECT}),
+        )
+    )
+    app.state.injector.can_queue = lambda session_key: True
+    state.reserve_chat_fork("tok", "claude_code:test:sid1", 7, None, kind="side", cut_ref="b-end")
+    state.bind_session_token("tok", "claude_code:test:sid3")
+    monkeypatch.setattr(claude, "newest_fork", lambda account, session: (7, "b-end"))
+    sends = []
+    gate = asyncio.Event()
+    gate.set()
+
+    async def start(account, session, provider, message, images, **kwargs):
+        await gate.wait()
+        sends.append((session.key, message))
+        if message.startswith("refuse me"):
+            return InjectResult(False, "No room for it.")
+        return InjectResult(True)
+
+    monkeypatch.setattr(app.state.injector, "start", start)
+    async with _served(app) as base:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch()
+            page = await browser.new_page(viewport={"width": 390, "height": 844})
+            posts = []
+            page.on("request", lambda r: posts.append(r.url) if r.method == "POST" else None)
+            await page.goto(f"{base}/sessions/claude_code:test:sid1")
+            await page.wait_for_function("() => !!window.agentdeckSidePanel")
+            box = page.locator("#inject-message")
+            side = page.locator("[data-side-view]")
+            transcript = page.locator(".session-detail .transcript")
+            assert await side.is_hidden()
+            await box.fill("for the main chat")
+            await page.locator('[data-side-mode="side"]').click()
+            await page.wait_for_function(
+                "() => document.querySelector('[data-side-view-log]')"
+            )
+            # The side chat's own talk only, in the chat's place.
+            assert await side.is_visible()
+            assert await transcript.is_hidden()
+            log = await page.locator("[data-side-view-log]").inner_text()
+            assert "side answer" in log and "second answer" not in log
+            assert await box.input_value() == ""
+            assert await box.get_attribute("placeholder") == "Ask the side chat…"
+            await box.fill("for the side chat")
+            await page.locator("[data-side-back]").click()
+            assert await transcript.is_visible()
+            assert await box.input_value() == "for the main chat"
+            await page.locator('[data-side-mode="side"]').click()
+            assert await box.input_value() == "for the side chat"
+            # Sent to the side chat only: no main send, and no bubble in the main chat.
+            await box.press("Enter")
+            await page.wait_for_function(
+                "() => !document.querySelector('[data-side-view]').dataset.sending"
+            )
+            assert sends == [("claude_code:test:sid3", "for the side chat")]
+            assert not [url for url in posts if url.endswith("/inject")]
+            assert "for the side chat" not in await transcript.inner_text()
+            assert await box.input_value() == ""
+            # Taken but still queued: the message stays shown until its line lands.
+            pending = page.locator(".side-view-pending")
+            assert await pending.inner_text() == "for the side chat"
+            sent_id = await pending.get_attribute("data-client-action-id")
+            await page.evaluate(
+                """id => document.querySelector('[data-side-view-log]').dispatchEvent(
+                     new CustomEvent('htmx:sseMessage', {bubbles: true, detail: {data:
+                       `<div class="ev user" data-event-seq="19" data-event-id="19"
+                        data-observed-action-id="${id}">
+                        <div class="ev-text">sent</div></div>`}}))""",
+                sent_id,
+            )
+            assert await pending.count() == 0
+            # A lost answer is an uncertain write: sending the same words again reuses the
+            # action id, so the deck can deliver it once.
+            ids = []
+            lost = []
+
+            async def lose_first(route, request):
+                ids.append(request.headers["x-agentdeck-action-id"])
+                if lost:
+                    await route.continue_()
+                    return
+                lost.append(await route.fetch())
+                await route.abort()
+
+            await page.route("**/side-chat", lose_first)
+            await box.fill("again")
+            await box.press("Enter")
+            await page.wait_for_function(
+                "() => !document.querySelector('[data-side-view]').dataset.sending"
+            )
+            assert await box.input_value() == "again"
+            assert await page.locator("[data-side-error]").is_visible()
+            await box.press("Enter")
+            await page.wait_for_function(
+                "() => !document.querySelector('[data-side-view]').dataset.sending"
+            )
+            assert len(ids) == 2 and ids[0] == ids[1] and ids[0] != sent_id
+            await page.unroute("**/side-chat")
+            files = 'form.inject-form input[type="file"][name="images"]'
+            names = "el => [...el.files].map(f => f.name)"
+            sending_done = "() => !document.querySelector('[data-side-view]').dataset.sending"
+
+            async def attach(name):
+                await page.set_input_files(
+                    files, files=[{"name": name, "mimeType": "text/plain", "buffer": b"hi"}]
+                )
+
+            # Each mode keeps its own files: one picked on Main never rides a side send.
+            await page.locator('[data-side-mode="main"]').click()
+            await attach("main.txt")
+            await page.locator('[data-side-mode="side"]').click()
+            assert await page.eval_on_selector(files, names) == []
+            await page.locator('[data-side-mode="main"]').click()
+            assert await page.eval_on_selector(files, names) == ["main.txt"]
+            await page.locator('[data-side-mode="side"]').click()
+            # A refusal goes back ahead of what was typed and attached since, losing neither.
+            gate.clear()
+            await box.fill("refuse me")
+            await attach("note.txt")
+            await box.press("Enter")
+            await box.fill("newer")
+            await attach("newer.txt")
+            gate.set()
+            await page.wait_for_function(sending_done)
+            assert await box.input_value() == "refuse me\n\nnewer"
+            assert await page.eval_on_selector(files, names) == ["note.txt", "newer.txt"]
+            # And by the same rule into the side draft when Main is shown by then.
+            gate.clear()
+            await box.press("Enter")
+            await page.locator('[data-side-mode="main"]').click()
+            gate.set()
+            await page.wait_for_function(sending_done)
+            assert await box.input_value() == "for the main chat"
+            assert await page.eval_on_selector(files, names) == ["main.txt"]
+            await page.locator('[data-side-mode="side"]').click()
+            assert await box.input_value() == "refuse me\n\nnewer"
+            assert await page.eval_on_selector(files, names) == ["note.txt", "newer.txt"]
+            await box.fill("")
+            await page.eval_on_selector(files, "el => { el.value = ''; }")
+            # Two equal sends: an older line with the same words answers neither, and one
+            # line answers one card, so the second stays until its own line lands.
+            land = """([id, words]) => {
+              const seq = String(id).split('.').pop();
+              const html = `<div class="ev user" data-event-seq="${seq}" data-event-id="${id}">
+                <div class="ev-text">${words}</div></div>`;
+              const log = document.querySelector('[data-side-view-log]');
+              log.insertAdjacentHTML('beforeend', html);
+              log.dispatchEvent(new CustomEvent('htmx:sseMessage',
+                {bubbles: true, detail: {data: html}}));
+            }"""
+            pending = page.locator(".side-view-pending")
+            await box.fill("ok")
+            await box.press("Enter")
+            await page.wait_for_function(sending_done)
+            assert await pending.count() == 1
+            await page.evaluate(land, [40, "ok"])
+            assert await pending.count() == 0
+            await box.fill("ok")
+            await box.press("Enter")
+            await page.wait_for_function(sending_done)
+            assert await pending.count() == 1
+            await page.evaluate(land, [41, "other"])
+            assert await pending.count() == 1
+            await page.evaluate(land, [42, "ok"])
+            assert await pending.count() == 0
+            # The side chat goes on in a new leg, whose own numbers start again: its line
+            # 40 is not the first leg's line 40, and it comes after line 42.
+            await box.fill("ok")
+            await box.press("Enter")
+            await page.wait_for_function(sending_done)
+            assert await pending.count() == 1
+            await page.evaluate(land, ["1.40", "ok"])
+            assert await pending.count() == 0
+            await page.locator('[data-side-mode="main"]').click()
+            await page.locator('[data-side-mode="side"]').click()
+            # A side reply that lands while the chat is shown lights the dot.
+            await page.locator('[data-side-mode="main"]').click()
+            dot = page.locator("[data-side-dot]")
+            assert await dot.is_hidden()
+            await page.evaluate(
+                """() => document.querySelector('[data-side-view-log]').dispatchEvent(
+                     new CustomEvent('htmx:sseMessage', {bubbles: true, detail: {
+                       data: '<div class="ev assistant" data-event-seq="20"></div>'}}))"""
+            )
+            assert await dot.is_visible()
+            await page.locator('[data-side-mode="side"]').click()
+            assert await dot.is_hidden()
+            # The summary goes into the main chat's box, after what was waiting there.
+            await page.locator("[data-side-send-back]").click()
+            assert await transcript.is_visible()
+            draft = await box.input_value()
+            assert draft.startswith("for the main chat\n\n")
+            assert "Summary from side chat “Side chat” (for information):" in draft
+            assert draft.endswith("side answer")
+            # The mode is kept for this tab. The reload also needs every send's replaced
+            # side stream closed, or the browser has no connection left for the page.
+            await page.locator('[data-side-mode="side"]').click()
+            await page.reload()
+            await page.wait_for_function("() => !!window.agentdeckSidePanel")
+            assert await page.locator("[data-side-view]").is_visible()
+            await browser.close()
+
+
+# Where the browser cannot size a box to its text, the page's own fallback must (#4330).
+_NO_FIELD_SIZING = """
+const supports = CSS.supports.bind(CSS);
+CSS.supports = (...args) => (String(args[0]).includes('field-sizing') ? false : supports(...args));
+"""
+
+
+@pytest.mark.browser
+@pytest.mark.parametrize("field_sizing", [True, False], ids=["css", "fallback"])
+async def test_the_box_is_as_tall_as_its_text_after_the_page_changes_it(
+    tmp_path, monkeypatch, field_sizing
+):
+    """The box only grew on typing (#4330): a send empties it from code, so it stayed as
+    tall as the message that left. A send, a quick phrase and a width change all refit it."""
+    app = _claude_app_with_turns(tmp_path)
+    state = app.state.app_state
+    state.update_session(
+        replace(
+            state.sessions["claude_code:test:sid1"],
+            capabilities=frozenset({Capability.TRANSCRIPT, Capability.INJECT}),
+        )
+    )
+    app.state.injector.can_queue = lambda session_key: True
+
+    async def start(account, session, provider, message, images, **kwargs):
+        return InjectResult(True)
+
+    monkeypatch.setattr(app.state.injector, "start", start)
+    async with _served(app) as base:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch()
+            page = await browser.new_page(viewport={"width": 390, "height": 844})
+            if not field_sizing:
+                await page.add_init_script(_NO_FIELD_SIZING)
+            await page.goto(f"{base}/sessions/claude_code:test:sid1")
+            await page.wait_for_function("() => !!window.agentdeckSidePanel")
+            box = page.locator("#inject-message")
+
+            async def height():
+                return await box.evaluate("el => el.getBoundingClientRect().height")
+
+            async def sent():
+                await page.wait_for_function(
+                    "() => !document.querySelector('#inject-message').value &&"
+                    " !document.querySelector('form.inject-form[data-sending]')"
+                )
+
+            one_line = await height()
+            await box.fill("one\ntwo\nthree")
+            three_lines = await height()
+            assert three_lines > one_line + 20
+            # A send empties the box from code: it is one line again.
+            await box.press("Enter")
+            await sent()
+            assert abs(await height() - one_line) < 1
+            # A quick phrase fills an empty box and sends it at once.
+            await page.locator("[data-quick-phrases] summary").click()
+            await page.locator("[data-quick-phrase]").first.click()
+            await sent()
+            assert abs(await height() - one_line) < 1
+            # Narrower, the same words wrap onto more lines; wider again, they do not.
+            await box.fill("word " * 40)
+            wide = await height()
+            await page.set_viewport_size({"width": 300, "height": 844})
+            await page.wait_for_function(
+                "h => document.querySelector('#inject-message').getBoundingClientRect().height > h",
+                arg=wide,
+            )
+            await page.set_viewport_size({"width": 390, "height": 844})
+            await page.wait_for_function(
+                "h => Math.abs(document.querySelector('#inject-message')"
+                ".getBoundingClientRect().height - h) < 1",
+                arg=wide,
+            )
             await browser.close()

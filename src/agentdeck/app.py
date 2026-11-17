@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
 import secrets
@@ -56,6 +57,7 @@ from .issue_latest_comment import LatestCommentService
 from .issue_marks import IssueMarksService
 from .issue_refresh import IssueRefreshService
 from .live_window import LiveWindow
+from .pending_events import PendingEvents
 from .poller_wake import KEEPALIVE_S as WEBHOOK_KEEPALIVE_S
 from .poller_wake import PollerWakeService
 from .providers import PROVIDERS, chat_target_for, delivery_target_for
@@ -99,6 +101,7 @@ from .web.routes_pwa import cache_stamp
 from .web.routes_pwa import router as pwa_router
 from .web.routes_rollback import router as rollback_router
 from .web.routes_services import router as services_router
+from .web.routes_side_chat import router as side_chat_router
 from .web.routes_speech import router as speech_router
 from .web.routes_sse import router as sse_router
 from .web.routes_webhook import router as webhook_router
@@ -224,6 +227,7 @@ def create_app(config: AppConfig) -> FastAPI:
     templates.env.globals["host_speech"] = bool(config.speech.socket)
     templates.env.globals["speech_language"] = config.speech.language
     templates.env.globals["voice_idle_seconds"] = config.speech.idle_listen_seconds
+    templates.env.globals["voice_tick_seconds"] = config.speech.working_tick_seconds
     # Who decides a phrase heard while waiting woke voice mode (#3476).
     templates.env.globals["voice_wake"] = (
         config.speech.wake if config.speech.wake_socket else "whisper"
@@ -252,6 +256,16 @@ def create_app(config: AppConfig) -> FastAPI:
     asset_version = cache_stamp()
     templates.env.globals["asset_ver"] = asset_version
     collector = Collector(config, state)
+
+    def chats_of(session_key: str) -> list[str]:
+        # A session's pending notes are kept under its chat's id, or its own key while no
+        # chat row names it, as the deck's scheduled messages address it (#4303).
+        chat = state.chat_for_session(session_key)
+        return [chat.chat_id, session_key] if chat is not None else [session_key]
+
+    pending_events = PendingEvents(db, chats_of)
+    # Delivered notes are kept a week for the record; waiting ones stay until they go.
+    pending_events.prune()
     injector = InjectionService(
         config.inject,
         on_change=lambda session_key: state.sessions_changed((session_key,)),
@@ -270,6 +284,7 @@ def create_app(config: AppConfig) -> FastAPI:
         was_dismissed=db.delivery_was_dismissed,
         delegation_store=db,
         session_key_for_token=state.session_key_for_token,
+        pending_events=pending_events,
     )
     # Web Push keys, subscriptions and mode are operational configuration, not history.
     push = PushService(config.push, db)
@@ -481,6 +496,8 @@ def create_app(config: AppConfig) -> FastAPI:
         ),
         # A time wait's check runs as its chat's own Claude account (#4256).
         check_env=lambda session_key: check_account_env(config, session_key),
+        # The routine ends that wake nobody leave a pending note for the chat (#4306).
+        note=lambda chat_id, note_id, text: pending_events.add(chat_id, note_id, text),
     )
     # A Work hears its own GitHub events (#2895, ADR 0008), and the deck merges a switched
     # Work itself (#2895 step 2): the Work router, the merge release and the missed-start
@@ -784,6 +801,7 @@ def create_app(config: AppConfig) -> FastAPI:
     app.state.templates = templates
     app.state.collector = collector
     app.state.injector = injector
+    app.state.pending_events = pending_events
     app.state.scheduled_messages = scheduled_messages
     app.state.quota_retries = quota_retries
     app.state.usage_moves = usage_moves
@@ -799,8 +817,10 @@ def create_app(config: AppConfig) -> FastAPI:
     app.state.work_router = work_router
     # The Work list leaves out an unlabelled issue another deck would work (#3731).
     app.state.deck_claims = deck_claims
-    # The Start button says when an open blocker holds the agent back (#4216).
-    app.state.open_blockers = open_blockers
+    # The Start button says when an open blocker holds the agent back (#4216); a blocker
+    # deployed and waiting only for a person's try does not (#4384), nor one whose Work's
+    # registered pull request merged (#4398).
+    app.state.open_blockers = functools.partial(open_blockers, deployed=db.load_done_blockers)
     app.state.work_release = work_release_service
     app.state.services_later = services_later
     app.state.session_copy = session_copy_feed
@@ -962,6 +982,7 @@ def create_app(config: AppConfig) -> FastAPI:
     app.include_router(speech_router)
     app.include_router(meta_chat_router)
     app.include_router(rollback_router)
+    app.include_router(side_chat_router)
     app.include_router(live_prototype_router)
     app.include_router(services_router)
     # Deliberately last: the local-file route is a catch-all for absolute paths

@@ -234,6 +234,41 @@ def card(**fields):
         ({"merged": True, "live_result": "verified", "waits": (("its tests", None),)},
          "Waiting", "Waiting on its tests"),
         ({"merged": True, "pr_open": True, "running": True}, "Working", ""),
+        # #4305: deployed, the proof not in yet (``not_live``), on an open issue is checked
+        # live too, not a plain wait; a fix's open pull request still leads.
+        ({"merged": True, "live_result": "not_live", "waits": (("Sentry quiet", AT),)},
+         "Live checking", "waiting on Sentry quiet, until 09:40"),
+        # #4305 review: one rule for what outranks a recorded ``not_live``: a new turn is a fix
+        # and reads Working, an ending the deck asks about reads Live checking, and an ending
+        # nothing wakes is Needs you (the cases below); an asked check's turn is the check.
+        ({"live_result": "not_live", "running": True, "progress": "Reading Sentry"},
+         "Working", "Reading Sentry"),
+        ({"live_result": "not_live", "live_pending": True, "running": True,
+          "progress": "Reading Sentry"}, "Live checking", "Reading Sentry"),
+        ({"merged": True, "running": True, "progress": "Reading Sentry"},
+         "Live checking", "Reading Sentry"),
+        ({"live_result": "not_live", "pr_open": True, "waits": (("its tests", None),)},
+         "Waiting", "Waiting on its tests"),
+        # #4305: a failed live check on an open issue is the person's, unless the agent works
+        # on it, its fix's pull request is open, or a new merge's live check is asked.
+        ({"live_result": "failed", "live_line": "live check failed: 500",
+          "waits": (("a dead job", None),)}, "Needs you", "live check failed: 500"),
+        ({"live_result": "failed", "running": True}, "Working", ""),
+        ({"live_result": "failed", "pr_open": True, "review_pr": 9}, "In review", ""),
+        ({"live_result": "failed", "live_pending": True, "waits": (("deploy", None),)},
+         "Live checking", "waiting on deploy"),
+        # #4305 review: no wait, and the deck does not ask (or asked already): nothing wakes
+        # the agent for its live check, so a person picks it up, told why.
+        ({"live_result": "not_live", "live_line": "not live yet: needs a migration",
+          "last_text": "Deployed.", "ended_at": AT},
+         "Needs you", "not live yet: needs a migration · the agent ended without a next step"
+         ' · last said "Deployed." · 09:40'),
+        ({"live_result": "failed", "live_line": "live check failed: 500", "live_pending": True,
+          "last_text": "Merged.", "ended_at": AT},
+         "Needs you", "no live check recorded · the agent ended without a next step"
+         ' · last said "Merged." · 09:40'),
+        ({"live_result": "not_live", "live_line": "not live yet", "last_text": "Deployed.",
+          "ended_at": AT, "asks": True}, "Live checking", "asking the agent for its next step"),
         ({"closed": True, "live_pending": True, "last_text": "Merged.", "ended_at": AT},
          "Needs you", 'no live check recorded · the agent ended without a next step · last said'
          ' "Merged." · 09:40'),
@@ -288,6 +323,9 @@ def test_the_work_page_reads_the_derived_line(fields, headline, summary):
          ["Merge", "Open", "Hide"]),
         ({"closed": True, "live_result": "failed", "live_line": "live check failed: 500"},
          "needs_you", "needs_answer", ["Open", "Finish", "Hide"]),
+        ({"live_result": "failed", "live_line": "live check failed: 500",
+          "waits": (("a dead job", None),)}, "needs_you", "needs_answer",
+         ["Open", "Finish", "Hide"]),
         # #4126: nothing else moves it on, so a person may finish it unproven.
         ({"closed": True, "live_result": "not_live", "live_line": "not live yet: VPS connector"},
          "needs_you", "needs_answer", ["Open", "Finish", "Hide"]),
@@ -545,6 +583,45 @@ def test_a_reply_ending_on_a_question_waits_for_the_answer_and_is_never_asked():
     assert (left.kind, left.summary) == (
         ASKED_IN_CHAT, 'answer in the chat: "Have you run the balance?"'
     )
+
+
+def merge_labels(derived):
+    return [button.label for button in front_row(card(derived=derived), current=False).buttons]
+
+
+def test_a_question_over_a_ready_pull_request_still_offers_its_merge():
+    """#4294: a reply ending on a question, the question box or a Mac approval keeps the
+    headline over Ready for merge, but its Merge is offered beside the answer, not hidden."""
+    ideas = "Merged the base in.\n\nShould I also tidy the docs?"
+    asked = status(last_text=ideas, ended_at=AT, asks=True, ready_pr=40)
+    assert (asked.kind, asked.ready_pr) == (ASKED_IN_CHAT, 40)
+    assert merge_labels(asked) == ["Answer", "Open", "Merge", "Hide"]
+    boxed = status(question="Which day?", ready_pr=40)
+    assert (boxed.kind, boxed.ready_pr) == (QUESTION, 40)
+    assert merge_labels(boxed) == ["Open", "Merge", "Hide"]
+    waits = status(waiting_on_you="Allow the deploy?", ended_at=AT, ready_pr=40)
+    assert (waits.kind, waits.ready_pr) == (QUESTION, 40)
+    assert merge_labels(waits) == ["Open", "Merge", "Hide"]
+    # The Mac approval keeps its own headline and link, with the Merge beside it.
+    mac = "https://mac.example/approve/1"
+    tap = status(approval_href=mac, ended_at=AT, ready_pr=40)
+    assert (tap.kind, tap.line, tap.approval_href, tap.ready_pr) == (
+        QUESTION, "Needs you — approve the Mac command", mac, 40
+    )
+    assert merge_labels(tap) == ["Open", "Merge", "Hide"]
+    # Not ready: the question offers no Merge, as before.
+    assert merge_labels(status(question="Which day?")) == ["Open", "Hide"]
+    assert merge_labels(status(last_text=ideas, ended_at=AT, asks=True)) == [
+        "Answer", "Open", "Hide"
+    ]
+    # A running or stalled turn carries no Merge: the release holds a merge until it ends.
+    assert status(running=True, ready_pr=40).ready_pr is None
+    assert status(running=True, stalled=True, last_progress=AT, ready_pr=40).ready_pr is None
+    # Nor does a question asked while its turn runs or stalls: the headline stays the question.
+    for turn in ({"running": True}, {"running": True, "stalled": True, "last_progress": AT}):
+        asking = status(question="Which day?", ready_pr=40, **turn)
+        assert (asking.kind, asking.ready_pr) == (QUESTION, None), turn
+        assert merge_labels(asking) == ["Open", "Hide"], turn
 
 
 def test_a_question_opens_the_chat_that_asked_it():
@@ -1326,7 +1403,8 @@ def test_a_wait_on_its_own_pull_request_does_not_hide_ready_for_merge():
     assert found.line == "Needs you — its pull request held: spec-only label"
     row = front_row(card(derived=found), current=False)
     assert (row.section, row.attention.category) == ("needs_you", "release_blocked")
-    # A wait on anything else still comes first: another pull request, or a render.
+    # #4294: a wait on anything else (another pull request, a render) no longer hides the
+    # Merge: Ready comes first and names that wait after its own words.
     for other in (
         wait(KIND_PULL_REQUEST, number=10),
         wait(KIND_PULL_REQUEST, repository="eerovil/other"),
@@ -1334,7 +1412,44 @@ def test_a_wait_on_its_own_pull_request_does_not_hide_ready_for_merge():
         wait(KIND_COMMIT, number=None, sha="b" * 12),
         wait(KIND_COMMIT, repository="eerovil/other", number=None, sha="a" * 12),
     ):
-        assert _derived_with_reviews({}, awaiting=awaiting, waits=(other,)).kind == WAITING
+        found = _derived_with_reviews({}, awaiting=awaiting, waits=(other,))
+        assert found.kind == READY, other
+        assert " · also waiting on " in found.line and ", until " in found.line
+        assert found.deadline is not None
+        assert merge_labels(found) == ["Merge", "Open", "Hide"]
+        # Not ready, the same wait is what the Work reads.
+        assert _derived_with_reviews({}, waits=(other,)).kind == WAITING
+
+
+def test_the_light_review_line_shows_beside_a_hold_and_reads_review_events(tmp_path):
+    """#4401 review: a held light pull request still says which review it takes, and a review
+    asked or answered shows it as full review."""
+    from agentdeck import review_history
+    from agentdeck.db import Db
+    from agentdeck.review_history import HeadReview
+    from agentdeck.web.work_view import _pr_hold
+
+    db = Db(tmp_path / "control.db")
+    pull, head = "acme/robot#5", "c" * 40
+    db.put_light_review(pull, "acme/robot", {"heads": {head: {"decision": "light"}}})
+    events: list = []
+    hold: dict = {}
+    state = SimpleNamespace(
+        db=db,
+        app_state=SimpleNamespace(review_events=lambda _pull: list(events)),
+        work_release=SimpleNamespace(store=SimpleNamespace(get=lambda _w: dict(hold))),
+    )
+    output = SimpleNamespace(draft=False, head=head, repository="acme/robot", number=5)
+    app = SimpleNamespace(state=state)
+
+    def words():
+        return _pr_hold(app, WORK, ((output, HeadReview()),)).words
+
+    assert words().startswith("Light review: no reviewer")
+    hold["hold"] = {"words": "checks are pending", "since": 1.0}
+    assert words().startswith("checks are pending. Light review: no reviewer")
+    events.append(review_history.ReviewEvent(pull, head, 1.0, review_history.ASKED, "k"))
+    assert words() == "checks are pending. Full review: a full review was asked for or ran"
 
 
 def test_a_quiet_review_is_reported_as_agentdecks_bug_not_a_review_to_start():
@@ -1692,6 +1807,70 @@ def test_a_parked_work_waits_for_a_person_and_is_never_asked_for_a_next_step(tmp
     assert ask_for_next_steps(app, [replace(task, derived=found)]) == 0 and scheduled == []
     assert front_row(replace(task, derived=found), current=False).section == "active"
     assert derived_story(replace(task, derived=found)).headline == "Parked"
+    # #4305: listed under Parked, out of Waiting, which lists only automatic waits; a Work
+    # waiting on a job is still in Waiting, and the population read names Parked.
+    from agentdeck.web.work_view import POPULATION_SECTIONS
+    from agentdeck.work_story import front_sections
+
+    parked = front_row(replace(task, derived=found), current=True)
+    other = replace(card(derived=status(waits=(("its tests", None),))),
+                    work_id="github_issue:o/r#2")
+    waiting = front_row(other, current=True)
+    assert parked.parked and parked.waits and not waiting.parked and waiting.waits
+    front = front_sections([parked, waiting])
+    assert [row.card.work_id for row in front.parked] == [WORK.work_id]
+    assert [row.card.work_id for row in front.waiting] == [other.work_id]
+    assert parked in front.rows and POPULATION_SECTIONS["parked"] == "Parked"
+    # A parent row folded over a parked child stands after Live checking (#3622).
+    from agentdeck.work_tree import _place
+
+    assert (_place(parked), _place(waiting)) == ("parked", "waiting")
+    # Folded, a parent row shows its leading child's status on its own card (#4305 review):
+    # Parked goes by that status, so an unparked parent led by a parked child is Parked and a
+    # parked parent led by a waiting child is Waiting. A finished parent ranks after Parked.
+    from agentdeck.work_story import FINISHED
+    from agentdeck.work_tree import fold
+
+    done = replace(waiting, section=FINISHED)
+    for parent, child, group in ((done, parked, "parked"), (parked, waiting, "waiting")):
+        child_id = f"{parent.card.work_id}-child"
+        folded = fold(
+            [parent, replace(child, card=replace(child.card, work_id=child_id))],
+            parents={child_id: parent.card.work_id},
+        )
+        assert [row.card.work_id for row in folded] == [parent.card.work_id]
+        lead = folded[0]
+        assert lead.card.derived.kind == parent.card.derived.kind
+        assert (lead.parked, lead.waits) == (group == "parked", True), group
+        sections = front_sections(folded)
+        assert [row.card.work_id for row in getattr(sections, group)] == [parent.card.work_id]
+    # A wayfinder map still counts a parked ticket as waiting, not working: its progress line
+    # and its box's colour both read ``waits`` (#4305 review).
+    from agentdeck import wayfinder_map
+    from agentdeck.work_tree import map_progress
+
+    the_map = replace(waiting, card=replace(waiting.card, labels=(wayfinder_map.MAP_LABEL,)))
+    assert map_progress(the_map, [parked], counts=(1, 1)).working == 0
+    assert wayfinder_map.ticket_state(
+        closed=False, section=parked.section, waits=bool(parked.waits)
+    ) == wayfinder_map.WAITING
+    assert front_sections([replace(parked, card=replace(parked.card, starred=True))]).starred
+    from starlette.templating import Jinja2Templates
+
+    from agentdeck import app as app_mod
+    from agentdeck.web import render as render_mod
+    from agentdeck.web.work_view import FRONT_PARTS, WorkOverview, render_work_front
+
+    templates = Jinja2Templates(directory=str(app_mod._TEMPLATES_DIR))
+    render_mod.register_filters(templates)
+    overview = WorkOverview(front=front)
+    html = render_work_front(templates, overview, "parked")
+    assert 'data-front-group="parked"' in html and "waits for your message" in html
+    assert f'data-work-id="{WORK.work_id}"' in html and 'data-front-in="parked"' in html
+    assert f'data-work-id="{WORK.work_id}"' not in render_work_front(templates, overview, "waiting")
+    assert "parked" in FRONT_PARTS
+    assert render_work_front(templates, WorkOverview(front=front_sections([waiting])),
+                             "parked").strip() == ""
     # #3733, #3757: whatever pull request is open, a rule that only waits on the person who
     # parked it reads Parked too. issues#855 was parked with its ready store#3687 escalated by
     # the reviewer to the owner, and read Needs answer.
@@ -1843,6 +2022,14 @@ def test_in_review_says_since_when_and_turns_to_needs_you_once_nobody_reviews():
     found = _derived_with_reviews({("eerovil/agentdeck", 9): (fresh,)})
     assert found.kind == REVIEW and found.line.startswith("In review — since ")
     assert found.deadline == soon
+    # #4311: in review, queued or not, is listed under Working now, never Waiting.
+    from agentdeck.work_story import front_sections
+
+    for derived in (found, status(review_pr=9, review_since=AT, review_active=AT,
+                                  review_stuck_at=now - timedelta(minutes=1))):
+        row = front_row(card(derived=derived), current=True)
+        assert row.status.headline == "In review" and not row.waits
+        assert front_sections([row]).active == (row,)
 
 
 def test_the_stuck_rule_on_its_own():

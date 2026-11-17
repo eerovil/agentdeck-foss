@@ -266,14 +266,18 @@
   var tallest = 0;
   var tallestWidth = 0;
   function checkKeyboard() {
-    if (window.innerWidth !== tallestWidth) { tallestWidth = window.innerWidth; tallest = 0; }
+    var turned = window.innerWidth !== tallestWidth;
+    if (turned) { tallestWidth = window.innerWidth; tallest = 0; }
     var height = viewport ? viewport.height * viewport.scale : window.innerHeight;
     if (height > tallest) tallest = height;
     var box = document.getElementById('inject-message');
-    var up = !!(mobile.matches && box && document.activeElement === box &&
-      height < tallest - KEYBOARD_PX);
+    var focused = !!(box && document.activeElement === box);
+    var up = !!(mobile.matches && focused && height < tallest - KEYBOARD_PX);
     if (up === detail.classList.contains('keyboard-up')) return;
     detail.classList.toggle('keyboard-up', up);
+    // Back closed the keyboard and left the box focused (#4313): let go of the box, so the
+    // next tap on it opens the keyboard again instead of doing nothing.
+    if (!up && focused && !turned && mobile.matches) box.blur();
     // The chat pane is the scroll box on a phone: keep its newest message in view as the
     // pills leave or come back.
     requestAnimationFrame(function () { detail.scrollTop = detail.scrollHeight; });

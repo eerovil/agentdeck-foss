@@ -50,6 +50,7 @@ async def _watched(
     caplog, body, report_s: float = 1.0, blocks: int = 1, blocked_s: float = 0.05
 ) -> list[logging.LogRecord]:
     caplog.set_level(logging.INFO, logger="agentdeck.loop_watchdog")
+    before = set(threading.enumerate())
     watcher = asyncio.create_task(
         loop_watchdog.watch(blocked_s=blocked_s, tick_s=0.01, report_s=report_s)
     )
@@ -59,6 +60,13 @@ async def _watched(
     await asyncio.sleep(0.02)
     watcher.cancel()
     await asyncio.gather(watcher, return_exceptions=True)
+    # #4362: a thread still in its last look when the test ended read the real clock once the
+    # test's fake one was put back, found its block thousands of seconds old, and wrote that
+    # error into the next test. So the thread ends here, inside the test that started it.
+    for thread in set(threading.enumerate()) - before:
+        if thread.name == "loop-watchdog":
+            thread.join(timeout=10)
+            assert not thread.is_alive()
     return [r for r in caplog.records if r.levelno >= logging.WARNING]
 
 

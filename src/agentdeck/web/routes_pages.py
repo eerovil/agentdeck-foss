@@ -793,7 +793,12 @@ def _live_page_links(request: Request, session_key: str, repository: str = "") -
 async def _render_session_detail(
     request: Request,
     session_key: str,
+    *,
+    template: str = "session.html",
+    extra: dict | None = None,
 ) -> HTMLResponse:
+    """The chat page, or with ``template`` another page built on the same context
+    (``extra`` adds to it)."""
     session_pane = request.query_params.get("pane") == "extra"
     detail_navigation = (
         request.headers.get("x-agentdeck-session-navigation") == "detail"
@@ -931,7 +936,7 @@ async def _render_session_detail(
     times.lap("context")
     resp = templates.TemplateResponse(
         request,
-        "session.html",
+        template,
         {
             "detail_navigation": detail_navigation,
             "session_pane": session_pane,
@@ -1062,6 +1067,7 @@ async def _render_session_detail(
             "host": state.host_stats,
             "active_account_key": session.account_key,
             **controls_context,
+            **(extra or {}),
         },
     )
     resp.headers["Cache-Control"] = "no-cache"

@@ -67,8 +67,14 @@ proposed to send, and whether it timed out or failed. The page then reports what
 really sent under the phrase's ``id`` (``sent``): a send by hand meanwhile, an edit
 or a disabled Send changes it. It also reports how long after the end of speech the
 words came back, the send went and the first voice was heard (``timed``, #3765).
-``/sessions/{key}/voice-log`` shows them. The saved file is only read back; the fast
-agent's memory is still the one above.
+Since #4360 those are a voice turn's every step the page can see — the host's speech
+model, the wait for more words, the fast agent, the Send press, the chat's answer
+landing and its voice starting — and the host adds two it reads from the chat's own
+transcript: how long the agent took to take the message (``agent``: the deck handing it
+over, and a Claude process started cold when it was not running) and to write its first
+words back (``answer``). ``/sessions/{key}/voice-log`` shows them per phrase, split into
+parts, with the median and the slowest of the recent ones. The saved file is only read
+back; the fast agent's memory is still the one above.
 """
 
 from __future__ import annotations
@@ -79,6 +85,7 @@ import json
 import logging
 import re
 import shutil
+import statistics
 import time
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -108,9 +115,17 @@ NONE = "NONE"
 # The saved voice conversations, one file per chat; past the size, the older half goes.
 LOG_DIR = Path("~/.local/share/agentdeck/voice-log")
 MAX_LOG_BYTES = 2 * 1024 * 1024
-# The page's measured waits for a phrase (#3765), in ms from the end of speech.
-TIMINGS = ("words", "sent", "voice")
+# The page's measured waits for a phrase (#3765, #4360), in ms from the end of speech,
+# but ``stt``: how long of ``words`` the host's speech model took.
+TIMINGS = ("words", "stt", "sent", "pressed", "shown", "voice")
+# The host's, from the chat's transcript (#4360): the Send report to the person's
+# message in it, and that to the agent's first words.
+HOST_TIMINGS = ("agent", "answer")
 MAX_TIMING_MS = 120_000
+# A transcript line is stamped a moment apart from the deck's clock reading of a send.
+SENT_CLOCK_SLACK_S = 2.0
+# The recent timed phrases the voice log's median and slowest are of.
+TIMED_SUMMARY = 20
 # How a phrase fared: answered, or why the words went to the chat as heard.
 ANSWERED, TIMED_OUT, FAILED, NO_ACCOUNT, ENDED = (
     "answered",
@@ -710,9 +725,30 @@ def _running(agent: _Agent) -> bool:
     return agent.proc is not None and agent.proc.returncode is None
 
 
+# Checks ``(app, key) -> bool`` that name a chat whose page must stay on that chat: a
+# page that shows nothing else, for people who must not reach the rest of the deck.
+# Such a chat is never offered the way back to the deck chat, and its fast agent is
+# told no project names or chat title. Optional modules add theirs at import.
+closed_chat_checks: list = []
+
+
+def _closed(app, key: str) -> bool:
+    for check in closed_chat_checks:
+        try:
+            if check(app, key):
+                return True
+        except Exception:  # noqa: BLE001 -- a broken check keeps the chat closed
+            log.exception("closed-chat check failed for %s", key)
+            return True
+    return False
+
+
 def _prompt(app, key: str, back: bool = False) -> str:
     """The instructions for chat ``key``: the projects the deck knows and its title, and
     with ``back`` the way back to the deck chat."""
+    if _closed(app, key):
+        finnish = app.state.config.speech.language == "fi"
+        return system_prompt((), "", finnish=finnish, back=False)
     sessions = getattr(app.state.app_state, "sessions", None) or {}
     projects = sorted(
         {
@@ -729,6 +765,8 @@ def _prompt(app, key: str, back: bool = False) -> str:
 
 def _can_go_back(app, key: str) -> bool:
     """Whether chat ``key`` is not the deck chat while one exists (#3816)."""
+    if _closed(app, key):
+        return False
     state = app.state.app_state
     db = getattr(app.state, "db", None)
     return meta_chat.deck_chat_session_key(state, db) is not None and not meta_chat.is_deck_chat(
@@ -801,9 +839,12 @@ def _save(key: str, record: dict) -> None:
         log.warning("voice log not saved for %s: %s", key, exc)
 
 
-async def sent(key: str, phrase_id: str, text: str | None, how: str) -> None:
-    """The page's report of what it really sent for phrase ``phrase_id``."""
+async def sent(key: str, phrase_id: str, text: str | None, how: str, to: str = "") -> None:
+    """The page's report of what it really sent for phrase ``phrase_id``; ``to``, the
+    chat it went to when that is not ``key``'s (the side chat, #4349, #4360)."""
     record = {"at": time.time(), "sent_for": phrase_id, "sent": text, "how": how}
+    if to and to != key:
+        record["to"] = to
     await asyncio.to_thread(_save, key, record)
 
 
@@ -814,20 +855,197 @@ async def spoken(key: str, phrase_id: str, text: str) -> None:
     await asyncio.to_thread(_save, key, record)
 
 
-async def timed(key: str, phrase_id: str, timing: dict) -> None:
-    """The page's measured waits for phrase ``phrase_id`` (#3765): ms from the end of
-    speech to its words, its send and the first voice heard. Unknown keys go."""
-    kept = {
+def _kept_timing(timing: dict, names) -> dict:
+    return {
         name: round(value)
         for name, value in timing.items()
-        if name in TIMINGS
+        if name in names
         and isinstance(value, int | float)
         and not isinstance(value, bool)
         and 0 <= value <= MAX_TIMING_MS
     }
+
+
+async def timed(key: str, phrase_id: str, timing: dict, host: dict | None = None) -> None:
+    """The page's measured waits for phrase ``phrase_id`` (#3765, #4360): ms from the
+    end of speech to each step, and ``host``'s from the chat's transcript (see
+    ``host_waits``). Unknown keys go."""
+    kept = _kept_timing(timing, TIMINGS)
     if kept:
+        kept.update(_kept_timing(host or {}, HOST_TIMINGS))
         record = {"at": time.time(), "timing_for": phrase_id, "timing": kept}
         await asyncio.to_thread(_save, key, record)
+
+
+def sent_reports(key: str, phrase_id: str) -> list[dict]:
+    """The page's reports of what it sent in chat ``key`` up to and including
+    ``phrase_id``'s, in send order: each ``{"at", "sent_for", "sent", "how"}`` and
+    ``to`` when it went to the side chat (the last report of each phrase). Only the
+    ones sent to the same chat, and recent enough that their answer could still have
+    been taking lines when ``phrase_id``'s was sent; empty without its report."""
+    try:
+        lines = log_path(key).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    reports: dict[str, dict] = {}
+    for line in lines:
+        if '"sent_for": ' not in line:
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if (
+            isinstance(record, dict)
+            and isinstance(record.get("sent_for"), str)
+            and isinstance(record.get("at"), int | float)
+        ):
+            reports[record["sent_for"]] = record
+    mine = reports.get(phrase_id)
+    if mine is None:
+        return []
+    window = MAX_TIMING_MS / 1000 + SENT_CLOCK_SLACK_S
+    ordered = []
+    for record in reports.values():
+        if record.get("to") == mine.get("to") and mine["at"] - window <= record["at"]:
+            ordered.append(record)
+        if record is mine:
+            break
+    return ordered
+
+
+def _own_line(lines: list, start: int, sent_at: float, head: str) -> int | None:
+    """The line the agent took in the phrase sent at ``sent_at`` with words ``head``:
+    the first of the chat's timed ``lines`` from ``start`` on with its words, stamped
+    no earlier than the send (less the clock slack) and within ``MAX_TIMING_MS`` of
+    it, or None while there is none.
+
+    A queued line (the CLI's enqueue behind a busy turn) is never the agent taking
+    it, nor any phrase's line: every queued copy is passed over, as the page's
+    ``phraseLine`` passes over ``data-queued`` rows, and the phrase's line is the
+    later one the chat really took in (delivered into the open turn, or the real line
+    once the turn ended). So two identical phrases queued together each wait for
+    their own delivery, in order."""
+    for index in range(start, len(lines)):
+        at, event = lines[index]
+        if event.role != "user" or event.queued or at < sent_at - SENT_CLOCK_SLACK_S:
+            continue
+        if at > sent_at + MAX_TIMING_MS / 1000:
+            break
+        parts = event.text_parts or (event.text or "",)
+        if any(head in " ".join(part.split()) for part in parts):
+            return index
+    return None
+
+
+def host_waits(events, reports: list[dict], phrase_id: str) -> dict:
+    """How long the chat took over phrase ``phrase_id``, from its transcript
+    ``events`` and the page's send ``reports`` (``sent_reports``, at the deck's clock)
+    (#4360): ``agent``, ms until the agent took the message in — the deck handing it
+    over, a Claude process started when none was running, a turn it waited behind —
+    and ``answer``, ms from there to its first words. Either is left out when the
+    transcript does not show it.
+
+    One rule binds each sent phrase to its own turn, here and in the page's
+    ``phraseLine`` (``voice_mode.js``): phrases in send order take the chat's lines in
+    transcript order, each line one phrase's at most, and a queued copy is no
+    phrase's line (``_own_line``). So the same
+    question asked twice close together binds the second send to the second line,
+    never to the first line or the first answer, which came before it was sent."""
+    lines = []
+    for event in events:
+        if event.ts is None or event.subagent:
+            continue
+        at = (event.ts if event.ts.tzinfo else event.ts.replace(tzinfo=UTC)).timestamp()
+        lines.append((at, event))
+    start = 0
+    for report in reports:
+        sent = report.get("sent")
+        head = " ".join(sent.split())[:40] if isinstance(sent, str) else ""
+        taken = _own_line(lines, start, report["at"], head) if head else None
+        if report.get("sent_for") != phrase_id:
+            if taken is not None:
+                start = taken + 1
+            continue
+        if taken is None:
+            return {}
+        asked = lines[taken][0]
+        waits = {"agent": max(0.0, asked - report["at"]) * 1000}
+        for at, event in lines[taken + 1 :]:
+            if event.role == "assistant" and not event.failed and (event.text or "").strip():
+                waits["answer"] = (at - asked) * 1000
+                break
+        return waits
+    return {}
+
+
+# The parts a timed phrase is shown in, in order: a label, and how it is worked out
+# from the saved waits; None when the waits it needs were not measured.
+def _between(later: str, earlier: str | None):
+    def part(t: dict) -> int | None:
+        if later not in t or (earlier and earlier not in t):
+            return None
+        return max(0, t[later] - (t[earlier] if earlier else 0))
+
+    return part
+
+
+def _to_page(t: dict) -> int | None:
+    """The answer's way from the transcript to the page: what the page waited from its
+    Send press to the answer, less the host's two parts of it."""
+    if not all(name in t for name in ("pressed", "shown", "agent", "answer")):
+        return None
+    return max(0, t["shown"] - t["pressed"] - t["agent"] - t["answer"])
+
+
+TIMING_PARTS = (
+    ("Speech to words", _between("words", None)),
+    ("of which speech model", lambda t: t.get("stt")),
+    ("Wait for more words", _between("sent", "words")),
+    ("Fast helper", _between("pressed", "sent")),
+    ("Agent takes it", lambda t: t.get("agent")),
+    ("Agent answers", lambda t: t.get("answer")),
+    ("Answer to the page", _to_page),
+    ("Voice made", _between("voice", "shown")),
+    ("Total", _between("voice", None)),
+    # An answer not read aloud (🎤 alone, or cut off) has no voice: its time ends on
+    # the page.
+    ("Total to the page", _between("shown", None)),
+)
+
+
+def timing_parts(timing: dict | None) -> list[tuple[str, int]]:
+    """A phrase's saved waits as the parts of its time, in order, each in ms."""
+    if not timing:
+        return []
+    parts = []
+    for label, part in TIMING_PARTS:
+        value = part(timing)
+        if value is not None:
+            parts.append((label, value))
+    return parts
+
+
+def timing_summary(phrases: list[dict]) -> list[dict]:
+    """Each part's median and slowest over the newest ``TIMED_SUMMARY`` phrases whose
+    answer reached the page, read aloud or not (``phrases`` newest first, as ``saved``
+    gives them)."""
+    timed_parts = [dict(timing_parts(p.get("timing"))) for p in phrases if p.get("timing")]
+    timed_parts = [p for p in timed_parts if "Total" in p or "Total to the page" in p]
+    timed_parts = timed_parts[:TIMED_SUMMARY]
+    summary = []
+    for label, _part in TIMING_PARTS:
+        values = sorted(parts[label] for parts in timed_parts if label in parts)
+        if values:
+            summary.append(
+                {
+                    "label": label,
+                    "median": round(statistics.median(values)),
+                    "slowest": values[-1],
+                    "count": len(values),
+                }
+            )
+    return summary
 
 
 def saved(keys) -> list[dict]:
@@ -850,8 +1068,14 @@ def saved(keys) -> list[dict]:
                 continue
             if record.get("sent_for"):
                 reports[record["sent_for"]] = record
-            elif record.get("timing_for"):
-                timings[record["timing_for"]] = record.get("timing")
+            elif record.get("timing_for") and isinstance(record.get("timing"), dict):
+                # A phrase is timed when its answer reaches the page and again with its
+                # voice, and the two requests can land in either order (#4360): every
+                # wait either measured is kept, the newer line's value on a clash.
+                timings[record["timing_for"]] = {
+                    **timings.get(record["timing_for"], {}),
+                    **record["timing"],
+                }
             elif record.get("spoken_for"):
                 spoken_lines[record["spoken_for"]] = record.get("spoken")
             elif "heard" in record or NARRATED in record:

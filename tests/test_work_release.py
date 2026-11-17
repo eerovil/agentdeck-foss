@@ -15,10 +15,18 @@ from types import SimpleNamespace
 import pytest
 
 from agentdeck.poller_ops import release_policies
-from agentdeck.review_history import CHECK_NAME, ReviewEvent, newest_verdict
+from agentdeck.review_history import (
+    CHECK_NAME,
+    ReviewEvent,
+    at_head,
+    newest_verdict,
+    standing_verdict,
+)
 from agentdeck.review_refs import head_digest
 from agentdeck.work_release import (
     ALREADY_MERGED,
+    CHECKS_NEVER_REPORTED,
+    CHECKS_STUCK_S,
     FAILED,
     HELD_PASSES,
     MERGED,
@@ -27,6 +35,7 @@ from agentdeck.work_release import (
     RETRY_FIRST_S,
     RETRY_MAX_AGE_S,
     RETRY_MAX_S,
+    SIBLING_SWEEP_ASK,
     Policy,
     Ports,
     PressRefused,
@@ -40,6 +49,7 @@ from agentdeck.work_release import (
     hold_line,
     hold_words,
     merge_outcome,
+    pending_since,
     same_commit,
     verdict_settled,
     verifies,
@@ -66,6 +76,8 @@ class Fake:
         self.merge_heads: list[str] = []
         self.updated: list[str] = []
         self.told: list[tuple[str, str, str]] = []
+        self.noted: list[tuple[str, str, str]] = []  # pending notes, waking nothing (#4303)
+        self.note_ok = True
         self.merge_answer = MERGED
         self.busy = False
         self.green_heads_fail = False
@@ -93,6 +105,9 @@ class Fake:
                 merge=self.merge,
                 update_branch=self.update_branch,
                 tell=lambda chat, message_id, text: self.told.append((chat, message_id, text)),
+                note=lambda chat, note_id, text: (
+                    self.note_ok and (self.noted.append((chat, note_id, text)) or True)
+                ),
                 clock=lambda: self.now,
                 busy=lambda work_id: self.busy,
                 issue_labels=self.issue_labels,
@@ -184,12 +199,40 @@ def live_checks(fake):
     return [text for _chat, message_id, text in fake.told if ":live-check:" in message_id]
 
 
+RX, RY = "r-" + "1" * 12, "r-" + "2" * 12
+CHATS = "eerovil/review-chats"
+
+
+def stamped(text, round_id):
+    return f"{text}\n\n<!-- chatgpt-review -->\n<!-- review-round: {round_id} -->"
+
+
+def opened(fake, head, number, round_id, pulls=(PR,)):
+    """The rows a review chat's opening writes (``record_chat_review_head``), and its ask."""
+    fake.now += 5
+    for pull in pulls:
+        fake.note(pull, head, "asked", f"asked:{number}:{pull}", fake.now, {})
+        data = {"chat": f"{CHATS}#{number}", "round": round_id}
+        fake.note(pull, head, "chat", f"chat:{CHATS}#{number}:{pull}@{head}", fake.now, data)
+
+
 # --- the verdict ---
 
 
 async def test_a_pass_at_the_current_head_and_diff_merges_a_tested_work_at_that_head(fake):
+    answered = []
+    fake.service.on_review_answer = lambda chat, pulls: answered.append(pulls)
     answer = await passed(fake)
     assert "review pass recorded" in answer
+    # #4303: the pass at a tested head wakes nobody, but the chat hears it with its next
+    # message, as one pending note; its review wait still ends, and a repeat adds no note.
+    assert answered == [[PR]]
+    [(chat, note_id, text)] = fake.noted
+    assert chat == "chat-a" and note_id == _pass()
+    assert HEAD[:12] in text and "records the pass" in text
+    assert not [m for _c, m, _t in fake.told if ":verdict:" in m]
+    await passed(fake)
+    assert len(fake.noted) == 1
     assert fake.merged == [(PR, "merge")] and fake.merge_heads == [HEAD]
     # #3141: its agent is asked once to check the merge live, on this deck's own deploy, and
     # GitHub's event for the same merge asks nothing more.
@@ -199,6 +242,16 @@ async def test_a_pass_at_the_current_head_and_diff_merges_a_tested_work_at_that_
     await fake.service.on_pull_event(WORK, PR, "closed", True)
     assert len(live_checks(fake)) == 1
     assert fake.entry["live_check_asked"]["at"] == asked_at
+
+
+async def test_a_pass_whose_note_cannot_be_kept_is_sent_as_a_message_instead(fake):
+    """#4303: a note the deck failed to store is not a pass the agent never hears."""
+    fake.note_ok = False
+    await passed(fake)
+    assert fake.noted == []
+    assert [m for _c, m, _t in fake.told if m == _pass()] == [_pass()]
+    await passed(fake)
+    assert [m for _c, m, _t in fake.told if m == _pass()] == [_pass()], "told once"
 
 
 async def test_a_merge_seen_live_asks_for_a_live_check_once_nothing_is_open(fake):
@@ -226,6 +279,16 @@ async def test_a_merge_seen_live_asks_for_a_live_check_once_nothing_is_open(fake
     # #4210: no close on unit tests alone, a 3-day cap, a read-only Mac command last, and a
     # check only a person can make rests as Waiting for a try.
     assert "Unit tests and a deploy alone" in text and "3 days" in text
+    assert "run it now and check that run" in text  # #4309: start the path, not wait for use
+    # #4320: a changed scheduled job is offered to run now, never left to its schedule, and
+    # the tap or an allow-once is the ask; it must not overlap a run already going.
+    assert "scheduled or nightly job, do not register a time wait for its schedule" in text
+    assert "offer to run that job once now in production" in text
+    assert "kubectl create job --from=cronjob/<name>" in text
+    assert "post its approval link" in text
+    assert "allow that run once with your question tool" in text
+    assert "a Mac script marked safe included" in text  # asked even with no tap (#4320 review)
+    assert "not already running" in text
     assert "read-only Mac command" in text and "last resort" in text
     assert "`needs_person`" in text and "trying it is not such a step" in text
     # #3220: each pull request is told how it goes live, not the deck's way for all of them.
@@ -233,6 +296,23 @@ async def test_a_merge_seen_live_asks_for_a_live_check_once_nothing_is_open(fake
     assert said.startswith("eerovil/agentdeck#3196: This deck deploys it")
     assert "eerovil/other-tool#7: Nothing on this host watches" in said
     assert "deploy by hand is `not_live`" in said, "not a nothing_to_check and a Finish"
+    # #4320: a change only a later deploy applies (a chart in another repository) is
+    # redeployed now by the guide's route, not mentioned as optional; a route the agent's tools
+    # refuse is asked once; a redeploy waits for a running job rather than cut it.
+    assert "another repository's deploy applies it" in said
+    assert "do not just mention it as a step someone could take" in said
+    assert "redeploy it now through the route the repository guide gives" in said
+    assert "allow that one deploy once" in said and "every production deploy is asked" in said
+    # A tool that refuses production stays refused after a yes: the person makes the promote.
+    assert "a yes does not make the tool do it" in said
+    assert "ask the person to make that promote themselves" in said
+    assert "will not cut a running job" in said
+    # #4285: a deploy done by hand is asked for on the Mac, not waited for.
+    assert "switch the Mac tool on" in said and "deploy script by name" in said
+    # A safe script needs no tap, and a run is not proof: the live check still decides.
+    assert "marked safe starts at once" in said and "`pending`" in said
+    assert "Wait for the outcome, then check the change live" in said
+    assert "Mac" not in said.split("eerovil/other-tool#7:")[0], "the deck's own deploy is not"
 
 
 MERGE_SHA = "e" * 40
@@ -430,6 +510,38 @@ def test_checks_state_reads_the_rollup():
     assert checks_state([{"conclusion": "FAILURE"}, {"state": "PENDING"}]) == "red"
 
 
+def test_pending_since_reads_the_oldest_pending_check():
+    """#4328: a stuck pull request's rollup as GitHub gave it; Drone built it in minutes and
+    its push status stayed pending, so only that status's start is when the wait began."""
+    rollup = [
+        {
+            "__typename": "StatusContext",
+            "context": "continuous-integration/drone/push",
+            "startedAt": "2026-11-13T14:19:55Z",
+            "state": "PENDING",
+        },
+        {
+            "__typename": "CheckRun",
+            "name": CHECK_NAME,
+            "startedAt": "2026-11-13T14:00:00Z",
+            "status": "IN_PROGRESS",
+        },
+        {
+            "__typename": "StatusContext",
+            "context": "continuous-integration/drone/pr",
+            "startedAt": "2026-11-13T14:25:02Z",
+            "state": "SUCCESS",
+        },
+        {"name": "build", "status": "QUEUED", "startedAt": "0001-01-01T00:00:00Z"},
+        {"name": "lint", "status": "IN_PROGRESS", "startedAt": "not a time"},
+    ]
+    assert checks_state(rollup) == "pending"
+    assert pending_since(rollup) == 1794579595.0  # 2026-11-13T14:19:55Z
+    assert pending_since(rollup[2:]) is None, "no pending check says when it started"
+    assert pending_since([{"state": "SUCCESS", "startedAt": "2026-11-13T14:19:55Z"}]) is None
+    assert pending_since(None) is None
+
+
 def test_merge_outcome_and_same_commit():
     assert merge_outcome(0, "") == MERGED
     assert merge_outcome(1, "Pull request is already merged") == ALREADY_MERGED
@@ -514,6 +626,29 @@ def test_release_policies_come_from_switched_manifests(tmp_path):
     )
     policy = release_policies(tmp_path)["eerovil/agentdeck"]
     assert not policy.auto_release and policy.auto_release_repos == {"eerovil/review-chats"}
+    # Its pre-review-done checks the tests (#4326), as the router reads it from [[repos]].
+    assert policy.tests_checked == set()
+    path.write_text(path.read_text().replace('id = "site"\n', 'id = "site"\ncheck_tests = true\n'))
+    assert release_policies(tmp_path)["eerovil/agentdeck"].tests_checked == {"eerovil/site"}
+    # Lighter review (#4399): the path, the limit (15 by default) and the overlay's checkout.
+    assert policy.light_review == () and policy.light("eerovil/site") is None
+    path.write_text(
+        path.read_text().replace(
+            'id = "site"\n', 'id = "site"\nlight_review = "guarded.json"\n'
+        )
+    )
+    (path.parent / "overlay.toml").write_text('[checkouts]\nSite = "~/robot"\n')
+    policy = release_policies(tmp_path)["eerovil/agentdeck"]
+    assert policy.light("Eerovil/Site") == ("guarded.json", 15, "~/robot")
+    path.write_text(
+        path.read_text().replace(
+            'light_review = "guarded.json"\n',
+            'light_review = "guarded.json"\nlight_review_limit = 4\n',
+        )
+    )
+    (path.parent / "overlay.toml").unlink()
+    policy = release_policies(tmp_path)["eerovil/agentdeck"]
+    assert policy.light("eerovil/site") == ("guarded.json", 4, "")
 
 
 def test_a_work_job_with_no_run_proves_its_work_head():
@@ -547,6 +682,42 @@ def test_a_work_job_with_no_run_proves_its_work_head():
     ordinary = credited_head_for_work_alone({**job, "purpose": ""}, work_id=WORK)
     assert credited_head_for_work(job, work_id=WORK) == "", "a card never takes a Run-less job"
     assert (credited, other, ordinary) == (HEAD, "", "")
+    # Exactly bin/test.sh, passing on its own (#4401 review): the script reader takes no
+    # follow-up as forgiving a failure, whatever rows sit beside it.
+    from agentdeck.poller_engine import flaky
+    from agentdeck.poller_engine.verification import (
+        script_failed_head_for_work_alone,
+        script_green_head_for_work_alone,
+    )
+
+    test = "tests/test_a.py::test_flake"
+    script = {**job, "id": "s", "command": ["bin/test.sh"]}
+    failed = {
+        **script,
+        "state": "failed",
+        "result_class": "failure",
+        "failures": [test],
+        "failures_complete": True,
+        "base_present": [test],
+    }
+    rerun = {
+        **job,
+        "id": "r",
+        "follows": "s",
+        "follow_kind": flaky.RERUN,
+        "follow_tests": [test],
+        "passed": [test],
+        "failures": [],
+        "failures_complete": True,
+        "command": ["pytest", "-q", test],
+    }
+    rows = [failed, rerun]
+    assert script_green_head_for_work_alone(script, work_id=WORK) == HEAD
+    assert script_green_head_for_work_alone(job, work_id=WORK) == "", "another command"
+    assert script_green_head_for_work_alone(failed, work_id=WORK) == ""
+    assert script_failed_head_for_work_alone(failed, work_id=WORK, jobs=rows) == HEAD
+    unsettled = [*rows, {**rerun, "id": "q", "state": "running"}]
+    assert script_failed_head_for_work_alone(failed, work_id=WORK, jobs=unsettled) == ""
 
 
 def test_the_queue_takes_verification_for_a_work_alone(tmp_path):
@@ -578,7 +749,7 @@ async def test_the_router_hands_a_reviewer_verdict_and_pull_events_to_the_releas
     dated = []  # each verdict's history key and time (#3957)
 
     class Release:
-        async def on_verdict(self, *args, by=None, source="", at=None):
+        async def on_verdict(self, *args, by=None, source="", at=None, stamp=""):
             calls.append(("verdict", *args, by))
             dated.append((source, at))
             return "ok"
@@ -724,6 +895,24 @@ async def test_the_deck_reviewers_verdict_reaches_the_release(fake):
     assert await _deck_released_verdict(request, "eerovil/agentdeck", 7, command) is None
 
 
+async def test_a_replaced_review_chats_stamped_request_verdict_answers_nothing(fake):
+    """#4386 review: the deck-request path reads the stamp from the request body, so chat X's
+    late ``changes-needed`` after Y opened writes nothing, and Y's own verdict is taken."""
+    from agentdeck.web.routes_works import _deck_released_verdict
+
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(work_release=fake.service)))
+    opened(fake, HEAD, 3, RX)
+    opened(fake, HEAD, 4, RY)
+    rows = len(fake.events)
+    late = stamped(f"/reviewed changes-needed {HEAD[:12]} agentdeck#9", RX)
+    receipt = await _deck_released_verdict(request, "eerovil/agentdeck", 7, late)
+    assert f"{CHATS}#3" in receipt and len(fake.events) == rows and fake.told == []
+    fake.now += 5
+    own = stamped(f"/reviewed changes-needed {HEAD[:12]} agentdeck#9", RY)
+    assert "changes needed" in await _deck_released_verdict(request, "eerovil/agentdeck", 7, own)
+    assert fake.events[-1].kind == "changes"
+
+
 async def test_the_deck_reviewers_findings_reach_the_works_chat_once(fake):
     """Findings on a Work the deck runs go to its agent, at most once per request (#3004)."""
     url = "https://github.com/eerovil/agentdeck/issues/7#issuecomment-1"
@@ -742,6 +931,22 @@ async def test_findings_the_chats_cli_would_drop_are_sent_as_a_link(fake):
     text = fake.told[0][2]
     assert "Stuck?" not in text and url in text
     assert OWNER_CALL_ASK in text  # #3314: the link form still says to ask the owner
+
+
+async def test_a_design_verdict_reaches_the_works_chat_once(fake):
+    """#4332: a gap asks for a fixed design, a pass to build to it."""
+    url = "https://github.com/eerovil/agentdeck/issues/7#issuecomment-3"
+    gap = "/claude Design review of eerovil/agentdeck#7: gap 2\n- two robots race for row 4"
+    for _ in range(2):
+        assert await fake.service.on_design_review(WORK, "abcdefgh15", gap, url, gap=True)
+    ((chat, message_id, text),) = fake.told
+    assert chat == "chat-a" and message_id == f"work-release:{WORK}:design:abcdefgh15"
+    assert "found a gap" in text and "race for row 4" in text and "/design-review" in text
+    passed = "/claude Design review of eerovil/agentdeck#7: pass 4\nok"
+    assert await fake.service.on_design_review(WORK, "abcdefgh16", passed, url, gap=False)
+    assert "passed" in fake.told[1][2] and "Build to this design" in fake.told[1][2]
+    fake.service.ports.chat = lambda work_id: None
+    assert not await fake.service.on_design_review(WORK, "abcdefgh17", passed, url, gap=False)
 
 
 async def test_findings_with_no_chat_to_hear_them_say_so(fake):
@@ -1203,6 +1408,10 @@ async def test_a_hold_names_what_each_pull_request_lacks(fake):
         {"pull": second, "lacks": "still a draft"},
         {"pull": third, "lacks": "checks are pending"},
     ]
+    # #4328: checks pending past ``CHECKS_STUCK_S`` say their CI never reported.
+    fake.set(third, pending_since=fake.now - CHECKS_STUCK_S)
+    waits = await fake.service._pull_waits(WORK, fake.policy, fake.pulls, sorted(fake.pulls))
+    assert waits[1] == {"pull": third, "lacks": hold_words(f"x {CHECKS_NEVER_REPORTED}")[0]}
     # #4090 review: a name that ends another is another pull request, and two of one short
     # name read in full. The first reason's own wait still shows once.
     hold = {"why": "org/api#7 has no review pass at x", "words": "not reviewed at its head"}
@@ -1634,6 +1843,11 @@ async def test_the_release_records_when_only_a_persons_merge_is_missing(fake):
     assert len([key for _chat, key, _text in fake.told if ":ready:" in key]) == 1
     [(work_id, text)] = notes
     assert work_id == WORK and f"{PR}@{OTHER[:12]}" in text and "katselmointi" in text
+    # #4306: and its agent hears what was added, as a pending note, so its next write keeps it.
+    [added] = [note for note in fake.noted if ":evidence:" in note[1]]
+    assert f"{PR}@{OTHER[:12]}" in added[2] and text in added[2] and "correctness" in added[2]
+    await fake.service.evaluate(WORK)
+    assert len([note for note in fake.noted if ":evidence:" in note[1]]) == 1
     fake.service.ports.note_evidence = lambda work_id, text: False
     third = "c" * 40
     fake.set(PR, head=third)
@@ -2206,6 +2420,7 @@ async def test_a_verdict_after_a_merge_by_hand_still_reaches_the_work(fake):
     await fake.service.on_verdict(WORK, "changes-needed", HEAD[:12], "", ())
     (findings,) = verdict_messages(fake, "changes-needed")
     assert "follow-up pull request" in findings and "mark it ready" not in findings
+    assert SIBLING_SWEEP_ASK in findings  # #4430: the sweep before a follow-up's push too
     # So are the deck's own reviewer's findings, which come by ``on_findings`` (#4189 review).
     text = f"Review of {PR} at {HEAD[:12]}: fix x"
     assert await fake.service.stale_findings(WORK, text, "", "r1") == ""
@@ -2213,6 +2428,7 @@ async def test_a_verdict_after_a_merge_by_hand_still_reaches_the_work(fake):
     deck = [t for _c, m, t in fake.told if m.endswith(":findings:r1")]
     assert len(deck) == 1 and "follow-up pull request" in deck[0]
     assert "mark the pull request ready again" not in deck[0]
+    assert f"follow-up pull request. {SIBLING_SWEEP_ASK}" in deck[0]
 
 
 async def test_open_pull_findings_still_ask_for_a_push(fake):
@@ -2221,6 +2437,12 @@ async def test_open_pull_findings_still_ask_for_a_push(fake):
     assert await fake.service.on_findings(WORK, "r1", text, "https://x/1")
     (told,) = [t for _c, m, t in fake.told if m.endswith(":findings:r1")]
     assert "mark the pull request ready again" in told and "follow-up" not in told
+    # The sibling sweep comes before the push (#4406, #4430).
+    assert f"Fix the findings. {SIBLING_SWEEP_ASK} Then push and mark the pull request" in told
+    # So does the reviewer's own changes-needed verdict on an open pull request.
+    await fake.service.on_verdict(WORK, "changes-needed", HEAD[:12], "", ())
+    (verdict,) = verdict_messages(fake, "changes-needed")
+    assert f"Fix the findings. {SIBLING_SWEEP_ASK} Then push and mark it ready" in verdict
 
 
 async def test_a_second_copy_of_the_pass_the_deck_merged_on_tells_nothing(fake):
@@ -2637,6 +2859,315 @@ async def test_an_owner_accepting_findings_passes_the_head_with_no_review(fake):
     assert not any(":verdict:pass:" in key for _chat, key, _text in fake.told)  # #4253
 
 
+@pytest.mark.parametrize("verdict", ["changes-needed", "no-code"])
+async def test_the_reviewers_verdict_line_after_an_acceptance_keeps_the_pass(fake, verdict):
+    """#4386: the agent accepts the findings comment, and the reviewer's own verdict line on
+    that round lands seconds later. It keeps its row but holds nothing, tells the agent
+    nothing, and the pull request merges once green. A review asked for again opens a round
+    whose verdict counts."""
+    fake.green = set()
+    await fake.service.on_verdict(WORK, "changes-needed", HEAD[:12], "", at=fake.now)
+    fake.now += 10
+    assert verdict_settled(await fake.service.owner_accepted(WORK, PR, HEAD, "accept as is"))
+    told = list(fake.told)
+    fake.now += 8
+    answer = await fake.service.on_verdict(
+        WORK, verdict, HEAD[:12], DIGEST, source="comment:6", at=fake.now
+    )
+    assert "review round is settled" in answer
+    assert fake.told == told and fake.events[-1].kind in ("changes", "no_code")
+    assert fake.passed().kind == "accepted"
+    fake.green = {HEAD}
+    await fake.service.evaluate(WORK)
+    assert fake.merge_heads == [HEAD]
+
+
+async def test_a_late_verdict_line_after_an_accepted_round_was_carried_keeps_the_pass(fake):
+    """#4386 review: the acceptance carried to a doc-only push's head; the reviewer's verdict
+    line naming the accepted head lands after it. The carried pass stands and merges."""
+    fake.green = set()
+    await fake.service.on_verdict(WORK, "changes-needed", HEAD[:12], "", at=fake.now)
+    fake.now += 10
+    assert verdict_settled(await fake.service.owner_accepted(WORK, PR, HEAD, "accept as is"))
+    fake.set(PR, head=OTHER)
+    fake.digests[(PR, OTHER)] = "e" * 64
+    fake.now += 5
+    assert verdict_settled(await fake.service.no_code_fixed(WORK, PR, OTHER))
+    told = list(fake.told)
+    fake.now += 5
+    answer = await fake.service.on_verdict(
+        WORK, "no-code", HEAD[:12], DIGEST, source="comment:6", at=fake.now
+    )
+    assert "review round is settled" in answer and fake.told == told
+    assert fake.events[-1].head == HEAD and fake.passed().head == OTHER
+    fake.green = {OTHER}
+    await fake.service.evaluate(WORK)
+    assert fake.merge_heads == [OTHER]
+
+
+async def test_a_verdict_line_posted_before_a_review_asked_again_at_its_head_moves_nothing(fake):
+    """#4386 review: findings at HEAD, the owner accepts, a review is asked again at HEAD
+    itself, and only then does the first reviewer's no-code line arrive, posted before that
+    ask. Dated by its comment, it answers the old round: the Work stays in line, the agent is
+    told nothing, and the new round stays unanswered until its own reviewer replies."""
+    fake.green = set()
+    await fake.service.on_verdict(WORK, "changes-needed", HEAD[:12], "", at=fake.now)
+    await fake.service.owner_accepted(WORK, PR, HEAD, "accept as is")
+    posted = fake.now + 2
+    fake.now += 5
+    fake.note(PR, HEAD, "asked", "ask:again", fake.now, {})
+    told = list(fake.told)
+    fake.now += 5
+    answer = await fake.service.on_verdict(
+        WORK, "no-code", HEAD[:12], DIGEST, source="comment:6", at=posted
+    )
+    assert "older than its newest" in answer and fake.told == told
+    assert standing_verdict(at_head(fake.events, HEAD)) is None
+    fake.now += 5
+    await fake.service.on_verdict(WORK, "pass", HEAD[:12], DIGEST, at=fake.now)
+    assert fake.passed().kind == "pass"
+
+
+@pytest.mark.parametrize("case", ["accepted, asked at carried", "asked at reviewed", "unaccepted"])
+async def test_a_late_verdict_answers_only_the_round_at_the_head_it_names(fake, case):
+    """#4386 review: HEAD's round carried to OTHER, then a review asked again. Asked at
+    OTHER, HEAD's late no-code line moves nothing (kept at HEAD when HEAD was accepted, where
+    it counts for nothing; else not written), and OTHER's own verdict decides; asked at HEAD
+    itself, the line answers that new round."""
+    fake.green = set()
+    await fake.service.on_verdict(WORK, "changes-needed", HEAD[:12], "", at=fake.now)
+    fake.set(PR, head=OTHER)
+    fake.digests[(PR, OTHER)] = "e" * 64
+    fake.now += 10
+    if case == "unaccepted":
+        fake.note(PR, OTHER, "changes", "carried:1", fake.now, {"carried_from": HEAD})
+    else:
+        fake.set(PR, head=HEAD)
+        await fake.service.owner_accepted(WORK, PR, HEAD, "accept as is")
+        fake.set(PR, head=OTHER)
+        fake.now += 5
+        assert verdict_settled(await fake.service.no_code_fixed(WORK, PR, OTHER))
+    fake.now += 5
+    fake.note(PR, HEAD if case == "asked at reviewed" else OTHER, "asked", "ask:2", fake.now, {})
+    told, rows = list(fake.told), len(fake.events)
+    fake.now += 5
+    answer = await fake.service.on_verdict(
+        WORK, "no-code", HEAD[:12], DIGEST, source="comment:6", at=fake.now
+    )
+    if case == "asked at reviewed":
+        # Dated after the new ask, it is the new review's own verdict: a review is asked again
+        # at the same commit only once no reviewer holds the old chat (``ReviewBusy``), so the
+        # old round's line was posted before the ask.
+        assert "review round is settled" not in answer
+        assert fake.events[-1].kind in ("changes", "no_code")
+        return
+    assert "review round is settled" in answer and fake.told == told
+    if case == "unaccepted":
+        assert len(fake.events) == rows
+    else:
+        assert fake.events[-1].head == HEAD and fake.service.no_code_head(WORK, PR) is None
+    fake.now += 5
+    answer = await fake.service.on_verdict(WORK, "changes-needed", OTHER[:12], "", at=fake.now)
+    assert answer == f"changes needed on {PR}" and fake.events[-1].head == OTHER
+
+
+@pytest.mark.parametrize("verdict", ["changes-needed", "no-code", "pass"])
+@pytest.mark.parametrize("asked_at", ["same head", "carried twice"])
+async def test_a_replaced_review_chats_stamped_line_answers_nothing(fake, verdict, asked_at):
+    """#4386 review: chat X reviewed HEAD, a review was asked again and chat Y opened (at
+    HEAD, or after the branch moved on twice), and only then did X's stamped verdict line
+    land, posted after Y's ask, so its time and head cannot tell it is old. Its stamp names
+    the replaced chat, whatever the verdict, a pass too: no row, nothing told or merged,
+    and Y's verdict decides."""
+    fake.green = set()
+    opened(fake, HEAD, 3, RX)
+    fake.now += 5
+    await fake.service.on_verdict(WORK, "changes-needed", HEAD[:12], "", at=fake.now, stamp=RX)
+    y_head = HEAD
+    if asked_at == "carried twice":
+        for step, y_head in enumerate(("c" * 40, OTHER)):
+            fake.set(PR, head=y_head)
+            fake.digests[(PR, y_head)] = DIGEST
+            fake.now += 5
+            fake.note(PR, y_head, "changes", f"carried:{step}", fake.now, {"carried_from": HEAD})
+    opened(fake, y_head, 4, RY)
+    told, rows = list(fake.told), len(fake.events)
+    fake.now += 5
+    answer = await fake.service.on_verdict(
+        WORK, verdict, HEAD[:12], DIGEST, source="comment:6", at=fake.now, stamp=RX
+    )
+    assert verdict_settled(answer) and f"{CHATS}#3" in answer
+    assert fake.told == told and len(fake.events) == rows
+    assert standing_verdict(at_head(fake.events, y_head)) is None
+    fake.green = {HEAD, y_head}
+    await fake.service.evaluate(WORK)
+    assert fake.merge_heads == []
+    fake.green = set()
+    fake.now += 5
+    await fake.service.on_verdict(WORK, "pass", y_head[:12], DIGEST, at=fake.now, stamp=RY)
+    assert fake.passed().kind == "pass" and fake.passed().head == y_head
+    fake.green = {y_head}
+    await fake.service.evaluate(WORK)
+    assert fake.merge_heads == [y_head]
+
+
+async def test_a_held_pass_whose_chat_is_replaced_before_its_read_is_dropped(fake):
+    """#4386 review: X's pass is held for a failed read; Y opens before the read works.
+    Read again, the pass answers X's replaced round: dropped, never recorded or merged. Its
+    time, before Y's ask, already says so; the stamp kept with the held pass agrees."""
+    opened(fake, HEAD, 3, RX)
+    plain_read = fake.service.ports.read_pull
+
+    async def unread(ref):
+        return None
+
+    fake.service.ports.read_pull = unread
+    fake.now += 5
+    answer = await fake.service.on_verdict(WORK, "pass", HEAD[:12], DIGEST, at=fake.now, stamp=RX)
+    assert fake.service._holds_pass(WORK), answer
+    opened(fake, HEAD, 4, RY)
+    fake.service.ports.read_pull = plain_read
+    await fake.service._read_held(WORK)
+    assert not fake.service._holds_pass(WORK)
+    assert fake.passed() is None and fake.merge_heads == []
+
+
+async def test_a_replaced_chats_late_pass_keeps_the_newer_chats_held_pass(fake):
+    """#4421 review: Y's own pass is held for a failed read; X's late pass, from the chat Y
+    replaced, answers nothing and leaves Y's held pass alone, so once the read works Y's
+    pass is recorded and merges."""
+    opened(fake, HEAD, 3, RX)
+    opened(fake, HEAD, 4, RY)
+    plain_read = fake.service.ports.read_pull
+
+    async def unread(ref):
+        return None
+
+    fake.service.ports.read_pull = unread
+    fake.now += 5
+    await fake.service.on_verdict(WORK, "pass", HEAD[:12], DIGEST, at=fake.now, stamp=RY)
+    assert fake.service._holds_pass(WORK)
+    fake.now += 5
+    late = await fake.service.on_verdict(WORK, "pass", HEAD[:12], DIGEST, at=fake.now, stamp=RX)
+    assert verdict_settled(late) and fake.service._holds_pass(WORK)
+    fake.service.ports.read_pull = plain_read
+    await fake.service._read_held(WORK)
+    assert not fake.service._holds_pass(WORK)
+    assert fake.passed().kind == "pass" and fake.merge_heads == [HEAD]
+
+
+async def test_the_same_chats_stamped_line_after_an_acceptance_keeps_the_pass(fake):
+    """#4383: X's own stamped line after the owner accepted its findings: X is still the
+    newest chat, so the stamp moves nothing and the settled round keeps the pass."""
+    fake.green = set()
+    opened(fake, HEAD, 3, RX)
+    await fake.service.on_verdict(WORK, "changes-needed", HEAD[:12], "", at=fake.now, stamp=RX)
+    fake.now += 10
+    assert verdict_settled(await fake.service.owner_accepted(WORK, PR, HEAD, "accept as is"))
+    fake.now += 8
+    answer = await fake.service.on_verdict(
+        WORK, "no-code", HEAD[:12], DIGEST, source="comment:6", at=fake.now, stamp=RX
+    )
+    assert "review round is settled" in answer and fake.passed().kind == "accepted"
+    fake.green = {HEAD}
+    await fake.service.evaluate(WORK)
+    assert fake.merge_heads == [HEAD]
+
+
+@pytest.mark.parametrize(
+    "heading",
+    [
+        f"Review findings for PR #9 at {HEAD[:12]}:",
+        f"/claude Review loop escalated to the operator for PR eerovil/agentdeck#9 at {HEAD[:7]}",
+        f"Review findings for PR other/repo#2 at {OTHER[:7]} and #9 at {HEAD[:7]}",
+    ],
+    ids=["findings", "escalation", "two pull requests"],
+)
+async def test_a_replaced_review_chats_stamped_findings_are_dropped(fake, heading):
+    """#4386 review: findings or an escalation from chat X, after Y replaced it, are dropped
+    before they are sent, on any pull request of the Work their heading names; unstamped or
+    stamped by the newest chat, they are handed on as before."""
+    fake.pulls["other/repo#2"] = Pull("other/repo#2", "OPEN", False, OTHER, "MERGEABLE", "CLEAN")
+    opened(fake, HEAD, 3, RX)
+    opened(fake, HEAD, 4, RY)
+    text = f"{heading}\n1. x"
+    why = await fake.service.stale_findings(WORK, stamped(text, RX), "eerovil/agentdeck")
+    assert "eerovil/agentdeck#9" in why and f"{CHATS}#3" in why
+    for kept in (text, stamped(text, RY), stamped(text, "r-" + "9" * 12)):
+        assert await fake.service.stale_findings(WORK, kept, "eerovil/agentdeck") == ""
+
+
+async def test_the_router_sends_nothing_from_a_replaced_review_chat(fake, tmp_path):
+    """#4386 review, through ``WorkRouter.apply`` with webhook deliveries: after Y replaced X,
+    X's stamped verdict line, findings and escalation reach no chat, end no wait for Y and
+    write no row; Y's own stamped findings are sent. A recovered copy of X's findings, which
+    Y's closing line cites, is neither sent nor recorded either."""
+    from agentdeck.github_webhook_log import Repository, WebhookLog
+    from agentdeck.webhook_tailer import WebhookTailer
+    from agentdeck.work_router import WorkRouterService
+
+    root = tmp_path / "github-webhooks"
+    repo = Repository(owner="eerovil", name="agentdeck")
+    reviewer = {"login": "review-bot[bot]", "type": "Bot"}
+    sent, waits = [], []
+    fake.policy = release_policy(release={"allow": ["review-bot[bot]"]})
+    opened(fake, HEAD, 3, RX)
+    opened(fake, HEAD, 4, RY)
+    findings = f"Review findings for PR #9 at {HEAD[:12]}:\n1. x"
+    escalation = f"Review loop escalated to the operator for PR #9 at {HEAD[:12]}\n/claude\nok"
+    bodies = {
+        "x-verdict": stamped(f"/reviewed changes-needed {HEAD[:12]}", RX),
+        "x-findings": stamped(f"/claude {findings}", RX),
+        "x-escalation": stamped(escalation, RX),
+        "y-findings": stamped(f"/claude {findings}", RY),
+    }
+    for number, (delivery, body) in enumerate(bodies.items(), start=40):
+        payload = {
+            "repository": {"full_name": repo.slug},
+            "action": "created",
+            "sender": reviewer,
+            "issue": {"number": 9, "pull_request": {}},
+            "comment": {"body": body, "id": number, "created_at": "2026-11-16T10:00:00Z"},
+        }
+        WebhookLog(root).append(
+            body=json.dumps(payload).encode(),
+            headers={"X-GitHub-Delivery": delivery, "X-GitHub-Event": "issue_comment"},
+        )
+
+    async def open_head(repository, number):
+        return HEAD
+
+    service = WorkRouterService(
+        root,
+        switched=lambda repository: True,
+        owner_of_issue=lambda repository, number: ("chat-a", "eerovil/agentdeck#7"),
+        owner_of_pull=lambda repository, number: ("chat-a", "eerovil/agentdeck#7"),
+        schedule=lambda message: sent.append(message) or message,
+        start_review=lambda pull, work: None,
+        own_logins=frozenset({"eerovil-agent"}),
+        release=fake.service,
+        ready_head=open_head,
+        open_head=open_head,
+        on_verdict=lambda chat, pulls: waits.append(pulls),
+        review_event=fake.note,
+        reviews=lambda pull: [event for event in fake.events if event.pull == pull],
+    )
+    rows = len(fake.events)
+    await service.apply(list(WebhookTailer(root, consumer="t").deliveries()))
+    assert [message.id for message in sent] == ["work-event:y-findings"]
+    assert len(waits) == 1 and fake.told == []
+    assert [event.kind for event in fake.events[rows:]] == ["findings"]
+
+    async def read_comment(repository, ident):
+        return {"id": 41, "body": bodies["x-findings"], "user": reviewer, "created_at": ""}
+
+    service._read_comment = read_comment
+    note = "Reviewed: see https://github.com/eerovil/agentdeck/pull/9#issuecomment-41"
+    owner = ("chat-a", "eerovil/agentdeck#7")
+    assert await service._recover_findings(owner, PR, HEAD, note) == ""
+    assert len(sent) == 1 and len(fake.events) == rows + 1
+
+
 async def test_a_ship_now_pass_merges_only_once_its_press_finished(fake):
     """#4212 review: a Ship now press passes the head before it marks it shipped, so the pass
     holds the merge, at the head a base update carries it to too, until the press finished;
@@ -2694,6 +3225,7 @@ async def test_a_shipped_merge_keeps_the_issue_open_until_its_fix_merges(fake):
     assert f"But {PR} shipped with Ship now" in shipped
     assert "keep the issue open, whatever the result" in shipped
     assert '"fixes": "<the shipped pull request>"' in shipped
+    assert SIBLING_SWEEP_ASK in shipped
     # Merged in one batch with an unrelated pull request, it is still left.
     entry: dict = {}
     assert fake.service._findings_left(WORK, entry, [PR, "eerovil/agentdeck#10"]) == [PR]
@@ -2869,15 +3401,85 @@ async def test_checks_still_pending_when_their_suite_completes_are_read_again(fa
     await passed(fake)
     assert await fake.service.on_checks_done(WORK) == f"{PR}'s checks are pending at {HEAD[:12]}"
     await fake.service.on_checks_done(WORK)  # a second run of the same suite finishes
-    assert fake.merged == [] and [t[2] for t in timers] == [True, False], "one look, not two"
+    # #4328: the hour-limit look is replaced by the settle look; one stays.
+    assert fake.merged == [] and [t[0] - fake.now for t in timers if not t[2]] == [60], (
+        "one look, not two"
+    )
     fake.set(PR, checks="green")  # the rollup catches up
     await tick(59)
     assert fake.merged == [], "not due yet"
     await tick(1)
     assert fake.merged == [(PR, "merge")] and fake.merge_heads == [HEAD]
     assert "waiting_checks" not in fake.entry
+    count = len(timers)
     await fake.service.on_checks_done(WORK)
-    assert len(timers) == 2, "a Work no longer waiting on its checks sets no look"
+    assert len(timers) == count, "a Work no longer waiting on its checks sets no look"
+
+
+@pytest.mark.parametrize("checks_gate", [True, False])
+async def test_checks_pending_past_an_hour_say_their_ci_never_reported(fake, checks_gate):
+    """#4328: Drone finished a pull request's build but its push status read pending for good;
+    the Work read "its checks are pending, until" its agent's day-long wake-on ran out. Past
+    ``CHECKS_STUCK_S`` the hold says the CI never reported, and only a person moves it; a
+    timed look brings that on time, since a lost status sends no delivery."""
+    tick, timers = timed(fake)
+    fake.policy = Policy(
+        auto_release=True, github_checks=frozenset({"eerovil/agentdeck"} if checks_gate else ())
+    )
+    fake.set(PR, checks="pending", pending_since=fake.now - 600)
+    await passed(fake)
+    assert await fake.service.evaluate(WORK) == f"{PR}'s checks are pending at {HEAD[:12]}"
+    assert fake.entry["hold"]["person"] is False
+    assert [t[0] for t in timers if not t[2]] == [fake.now + CHECKS_STUCK_S - 600 + 1]
+    await tick(CHECKS_STUCK_S - 600)
+    assert "never reported" not in fake.entry["hold"]["words"], "not due yet"
+    await tick(1)
+    stuck = f"{PR}'s checks are pending at {HEAD[:12]} {CHECKS_NEVER_REPORTED}"
+    assert fake.entry["hold"]["why"] == stuck
+    assert fake.entry["hold"]["person"] is True
+    assert "never reported" in fake.entry["hold"]["words"]
+    assert hold_words(stuck) == (fake.entry["hold"]["words"], True)
+    assert fake.entry.get("waiting_checks"), "a late status still releases it"
+    assert [t for t in timers if not t[2]] == [], "nothing more to look for by time"
+    assert fake.merged == []
+    fake.set(PR, checks="green", pending_since=None)  # its CI reported after all
+    await fake.service.on_status("eerovil/agentdeck", HEAD)
+    assert fake.merged == [(PR, "merge")]
+
+
+@pytest.mark.parametrize("checks_gate", [True, False])
+async def test_checks_pending_with_no_start_time_count_from_when_first_seen(fake, checks_gate):
+    """#4328 review: a rollup giving no start time (or GitHub's zero time) would have waited
+    silently for good. The hour runs from the first look that read that head pending, and a
+    head that stopped reading pending starts afresh when it reads pending again."""
+    tick, timers = timed(fake)
+    fake.policy = Policy(
+        auto_release=True, github_checks=frozenset({"eerovil/agentdeck"} if checks_gate else ())
+    )
+    fake.set(PR, checks="pending")
+    await passed(fake)
+    start = fake.now
+    assert fake.entry["pending_seen"] == {f"{PR}@{HEAD}": start}
+    await tick(CHECKS_STUCK_S / 2)
+    await fake.service.evaluate(WORK)  # another look keeps the first time
+    assert fake.entry["pending_seen"] == {f"{PR}@{HEAD}": start}
+    assert fake.entry["hold"]["person"] is False
+    await tick(CHECKS_STUCK_S / 2 + 1)
+    assert fake.entry["hold"]["why"].endswith(CHECKS_NEVER_REPORTED)
+    assert fake.entry["hold"]["person"] is True
+    waits = await fake.service._pull_waits(
+        WORK, fake.policy, fake.pulls, [PR], fake.entry["pending_seen"]
+    )
+    assert waits == [{"pull": PR, "lacks": hold_words(f"x {CHECKS_NEVER_REPORTED}")[0]}]
+    # A re-run: red once, then pending again later, counts from then.
+    fake.set(PR, checks="none")
+    fake.policy = Policy(auto_release=False, github_checks=fake.policy.github_checks)
+    await fake.service.evaluate(WORK)
+    assert "pending_seen" not in fake.entry
+    fake.set(PR, checks="pending")
+    await fake.service.evaluate(WORK)
+    assert fake.entry["pending_seen"] == {f"{PR}@{HEAD}": fake.now}
+    assert fake.entry["hold"]["person"] is False
 
 
 async def test_unreadable_labels_are_looked_at_again_after_a_back_off(fake):
@@ -2955,3 +3557,355 @@ def test_a_failed_read_is_told_apart_with_a_merge_queue_place():
     assert _failed_read(f"{PR} merged; {CHAT_PR} could not be compared with its base")
     assert not _failed_read(f"{PR} has no review pass at {HEAD[:12]} (merge queue 1 of 2)")
     assert not _failed_read("a Poller card holds this Work")
+
+
+# --- lighter review (#4399) ---
+
+
+class FakeLight:
+    """``light_review.LightReview`` as the release reads it."""
+
+    def __init__(self) -> None:
+        self.verdict = "pass"
+        self.light = True
+        self.go = (True, "")
+        self.noted = True
+        self.calls: list[tuple] = []
+
+    async def look(self, ref, head, updated=""):
+        self.calls.append(("look", ref, head, updated))
+        return {"verdict": self.verdict, "cases": ["case_a"]} if self.light else None
+
+    def is_light(self, ref, head):
+        return self.light
+
+    def answer_at(self, ref, head):
+        return {"verdict": self.verdict, "digest": "light-digest", "cases": ["case_a"]}
+
+    async def before_merge(self, work_id, ref, head):
+        self.calls.append(("before_merge", ref, head))
+        return self.go
+
+    async def merged(self, ref, head=""):
+        self.calls.append(("merged", ref, head) if head else ("merged", ref))
+
+    async def updating(self, ref, head):
+        self.calls.append(("updating", ref, head))
+        return self.noted
+
+
+async def _waits(fake):
+    return await fake.service._pull_waits(WORK, fake.policy, fake.pulls, sorted(fake.pulls))
+
+
+def _light(fake):
+    light = FakeLight()
+    fake.policy = Policy(
+        auto_release=True, light_review=(("eerovil/agentdeck", "guarded.json", 15, "~/x"),)
+    )
+    fake.service.ports.light = light
+    script = {HEAD}
+    reruns = []
+
+    async def script_green(work_id):
+        return set(script)
+
+    async def rerun(work_id, repository, head, command=None):
+        reruns.append((head, command))
+        return True
+
+    fake.service.ports.script_green_heads = script_green
+    fake.service.ports.rerun_verification = rerun
+    return light, script, reruns
+
+
+async def test_a_light_pull_request_merges_on_its_bench_and_bin_test_with_no_review(fake):
+    light, script, reruns = _light(fake)
+    fake.green = set()  # the Work's ordinary verification proves nothing here
+    await fake.service.evaluate(WORK)
+    assert fake.merged == [(PR, "merge")]
+    assert ("before_merge", PR, HEAD) in light.calls and ("merged", PR, HEAD) in light.calls
+    assert reruns == [] and problems(fake) == []
+
+
+async def test_a_light_pull_request_waits_for_checks_its_repository_requires(fake):
+    """#4401 review: a passing bench and a green script do not skip required checks."""
+    light, _script, _reruns = _light(fake)
+    fake.policy = Policy(
+        auto_release=True,
+        checks_required=frozenset({"eerovil/agentdeck"}),
+        light_review=(("eerovil/agentdeck", "guarded.json", 15, "~/x"),),
+    )
+    fake.set(PR, checks="none")
+    assert await fake.service.evaluate(WORK) == f"{PR}'s checks are none at {HEAD[:12]}"
+    assert fake.merged == [] and fake.entry.get("waiting_checks")
+    assert await _waits(fake) == [{"pull": PR, "lacks": "checks are none"}]
+    fake.set(PR, checks="green")
+    await fake.service.on_checks_done(WORK)
+    assert fake.merged == [(PR, "merge")]
+
+
+@pytest.mark.parametrize(
+    ("verdict", "words"),
+    [
+        ("pending", "waits for its bench verdict (pending: case_a)"),
+        ("unrun", "has a bench verdict that could not run"),
+        ("worse", "has a bench verdict of worse"),
+        ("running", "waits for its bench verdict (running)"),
+        ("limit", "no longer merges light (the review point is reached)"),
+        ("", "waits for its bench verdict"),
+    ],
+)
+async def test_a_light_pull_request_waits_on_its_bench_verdict(fake, verdict, words):
+    light, _script, _reruns = _light(fake)
+    light.verdict = verdict
+    answer = await fake.service.evaluate(WORK)
+    assert words in answer and fake.merged == []
+    lacks = await _waits(fake)
+    assert lacks[0]["lacks"].startswith(words) if verdict != "running" else lacks
+
+
+@pytest.mark.parametrize("verdict", ["pending", "unrun", "worse", "limit", "agent", "running"])
+async def test_a_light_answer_other_than_pass_leaves_the_merge_queue_at_once(fake, verdict):
+    """Rule 5: pending, could not run, worse, the review point and a head waiting for its
+    agent leave the queue at once, even with checks pending; a running bench keeps the place
+    of the first in line."""
+    light, _script, _reruns = _light(fake)
+    fake.service._join(WORK, "eerovil/agentdeck", PR)
+    fake.set(PR, checks="pending")  # which alone would keep a held place
+    light.verdict = verdict
+    await fake.service.evaluate(WORK)
+    placed = [ref for ref, *_rest in fake.service.store.place(WORK)]
+    if verdict == "running":
+        assert placed == [PR] and fake.entry.get("waiting_tests")
+        assert PR not in fake.entry.get("light_out", {})
+    else:
+        assert placed == [] and fake.entry["light_out"] == {PR: HEAD}
+    light.verdict = "pass"
+    fake.set(PR, checks="green")
+    await fake.service.evaluate(WORK)
+    assert fake.merged == [(PR, "merge")] and fake.entry["light_out"] == {}
+
+
+async def test_a_queued_light_pass_sent_to_full_review_leaves_the_queue_with_checks_pending(
+    fake,
+):
+    """One queue rule (#4401 review): a head that needs a new review pass leaves the queue
+    whatever its checks say. Here the agent's pre-review-done recorded the review point
+    (``past_limit``) between two looks, so the light service now answers the reviewed path."""
+    light, _script, _reruns = _light(fake)
+    fake.service._join(WORK, "eerovil/agentdeck", PR)
+    fake.set(PR, checks="pending")
+    light.light = False  # full for good now: no light hold, no review pass at the head
+    answer = await fake.service.evaluate(WORK)
+    assert f"{PR} has no review pass at {HEAD[:12]}" in answer
+    assert [ref for ref, *_rest in fake.service.store.place(WORK)] == []
+
+
+async def test_a_new_head_the_deck_did_not_make_waits_for_its_agent(fake):
+    light, _script, _reruns = _light(fake)
+    light.verdict = "agent"
+    answer = await fake.service.evaluate(WORK)
+    assert f"{PR}@{HEAD[:12]} is a new head; its agent calls pre-review-done" in answer
+    assert fake.merged == []
+
+
+async def test_an_unread_light_review_keeps_its_place_and_looks_again(fake):
+    light, _script, _reruns = _light(fake)
+    fake.service._join(WORK, "eerovil/agentdeck", PR)
+    light.verdict = "unread"
+    answer = await fake.service.evaluate(WORK)
+    assert "light review could not be read" in answer and fake.merged == []
+    assert [ref for ref, *_rest in fake.service.store.place(WORK)] == [PR]
+
+
+async def test_a_light_head_with_no_green_bin_test_has_the_deck_run_it_once(fake):
+    light, script, reruns = _light(fake)
+    script.clear()
+    answer = await fake.service.evaluate(WORK)
+    assert "no green bin/test.sh run" in answer and fake.merged == []
+    assert reruns == [(HEAD, ["bin/test.sh"])] and problems(fake) == []
+    await fake.service.evaluate(WORK)
+    assert len(reruns) == 1
+    # Asked again with no result (cut off): the agent is told, once.
+    told = f"work-release:{WORK}:light-tests:{PR}@{HEAD[:12]}"
+    assert [m for _c, m, _t in problems(fake)] == [told]
+    # #4401 review: the command it gives runs as written (the CLI needs the token).
+    [text] = [t for _c, _m, t in problems(fake)]
+    assert '--verification --session-token "$AGENTDECK_SESSION_TOKEN"' in text
+    assert "--work eerovil/agentdeck#7" in text
+    assert text.endswith("-- bin/test.sh`, with no arguments and no shell around it.")
+    assert await _waits(fake) == [{"pull": PR, "lacks": "bin/test.sh is not green"}]
+
+
+async def test_another_commands_run_does_not_stop_the_bin_test_rerun(fake):
+    """#4401 review: a failed or running verification of another command at the head says
+    nothing about bin/test.sh, so the deck still runs it once; a failed or running
+    bin/test.sh does hold it off."""
+    light, script, reruns = _light(fake)
+    script.clear()
+    fake.red, fake.verifying = {HEAD}, True  # an earlier pytest run failed, another runs
+    script_red: set[str] = set()
+    script_running = [False]
+
+    async def script_failed(work_id):
+        return set(script_red)
+
+    async def script_verifying(work_id):
+        return script_running[0]
+
+    fake.service.ports.script_failed_heads = script_failed
+    fake.service.ports.script_verifying = script_verifying
+    await fake.service.evaluate(WORK)
+    assert reruns == [(HEAD, ["bin/test.sh"])] and problems(fake) == []
+
+    other, script2, reruns2 = _light(fake)
+    script2.clear()
+    fake.service.ports.script_failed_heads = script_failed
+    fake.service.ports.script_verifying = script_verifying
+    fake.service.store.put(WORK, {})
+    script_red.add(HEAD)
+    await fake.service.evaluate(WORK)
+    script_red.clear()
+    script_running[0] = True
+    await fake.service.evaluate(WORK)
+    assert reruns2 == [] and problems(fake) == []
+
+
+async def test_a_review_asked_between_the_light_hold_and_the_merge_never_merges(fake):
+    """#4401 review round 3: the hold read the head light, then a review was asked, so it
+    reads full at the merge. With no review pass it still merges only through the light
+    check, which refuses."""
+    light, _script, _reruns = _light(fake)
+    looked = light.look
+
+    async def look_then_press(ref, head, updated=""):
+        answer = await looked(ref, head, updated)
+        light.light = False  # a Review press lands right after the hold passed
+        light.go = (False, f"{PR} takes a full review now")
+        return answer
+
+    light.look = look_then_press
+    answer = await fake.service.evaluate(WORK)
+    assert fake.merged == [] and ("before_merge", PR, HEAD) in light.calls
+    assert "full review" in answer or "review pass" in answer
+
+
+async def test_a_light_merge_holds_when_the_last_check_says_so(fake):
+    light, _script, _reruns = _light(fake)
+    light.go = (False, f"{PR} runs the bench verdict before the merge")
+    answer = await fake.service.evaluate(WORK)
+    assert "runs the bench verdict before the merge" in answer and fake.merged == []
+
+
+async def test_a_head_that_is_not_light_waits_for_its_review_as_before(fake):
+    light, _script, _reruns = _light(fake)
+    light.light = False
+    answer = await fake.service.evaluate(WORK)
+    assert "has no review pass" in answer and fake.merged == []
+
+
+async def test_a_light_pull_request_is_noted_before_the_deck_updates_it(fake):
+    """Rule 6: the head it updates from is saved first; unsaved, it is not updated."""
+    light, _script, _reruns = _light(fake)
+    fake.set(PR, merge_state="BEHIND", behind_by=2)
+    light.noted = False
+    answer = await fake.service.evaluate(WORK)
+    assert fake.updated == [] and "could not be read before its update" in answer
+    light.noted = True
+    await fake.service.evaluate(WORK)
+    assert fake.updated == [PR] and ("updating", PR, HEAD) in light.calls
+    assert fake.entry["updated"] == {PR: HEAD}
+
+
+async def test_a_light_pull_request_merged_by_hand_counts_only_through_the_service(fake):
+    light, _script, _reruns = _light(fake)
+    fake.set(PR, state="MERGED")
+    await fake.service.on_pull_event(WORK, PR, "closed", True)
+    assert ("merged", PR) in light.calls
+
+
+async def test_a_bench_answer_queues_one_look_and_one_more_behind_a_running_one(fake):
+    """#4399 rev 10, 11: calls before a queued look starts join it; a call while one runs
+    queues one more, which later calls join; a look cancelled before its first step, or an
+    older one ending late, never leaves the Work wrongly queued or unqueued."""
+    import asyncio
+
+    service = fake.service
+    runs: list[int] = []
+    gate = asyncio.Event()
+
+    async def evaluate(work_id):
+        runs.append(len(runs))
+        if len(runs) == 1:
+            await gate.wait()
+        return ""
+
+    service.evaluate = evaluate
+    service.queue_bench_look(WORK)
+    service.queue_bench_look(WORK)  # before the first starts: joined
+    first = service._bench_look_queued[WORK]
+    await asyncio.sleep(0)
+    assert runs == [0] and WORK not in service._bench_look_queued
+    service.queue_bench_look(WORK)  # while one runs: one more
+    second = service._bench_look_queued[WORK]
+    service.queue_bench_look(WORK)  # joined to the second
+    assert second is not first and service._bench_look_queued[WORK] is second
+    gate.set()
+    await asyncio.gather(first, second)
+    assert runs == [0, 1] and WORK not in service._bench_look_queued
+
+    # Cancelled before its first step: nothing is left queued, and the next call starts one.
+    service.queue_bench_look(WORK)
+    cancelled = service._bench_look_queued[WORK]
+    cancelled.cancel()
+    await asyncio.gather(cancelled, return_exceptions=True)
+    assert WORK not in service._bench_look_queued
+    service.queue_bench_look(WORK)
+    await service._bench_look_queued[WORK]
+    assert len(runs) == 3
+
+    # A newer look queued while an older one runs is not taken off by the older one's end.
+    # (asyncio always runs the newer task's first step before the older one's done-callbacks,
+    # so that step, not the callback, takes it off; the callback's identity check is what
+    # keeps a cancelled task from taking off a newer entry.)
+    gate.clear()
+    runs.clear()
+    service.queue_bench_look(WORK)
+    older = service._bench_look_queued[WORK]
+    await asyncio.sleep(0)  # the older one runs, waiting on the gate
+    service.queue_bench_look(WORK)
+    newer = service._bench_look_queued[WORK]
+    gate.set()
+    await asyncio.gather(older, newer)
+    assert len(runs) == 2 and WORK not in service._bench_look_queued
+
+
+async def test_a_look_queued_by_a_bench_answer_sees_the_answer_written_mid_look(fake):
+    """#4399 rev 10: an answer written while a look is past its bench read gets a look of its
+    own, which merges the light pull request instead of holding it on "bench pending"."""
+    import asyncio
+
+    light, _script, _reruns = _light(fake)
+    light.verdict = "pending"
+    looked = asyncio.Event()
+    go_on = asyncio.Event()
+    look = light.look
+
+    async def slow_look(ref, head, updated=""):
+        answer = await look(ref, head, updated)
+        if not looked.is_set():
+            looked.set()
+            await go_on.wait()
+        return answer
+
+    light.look = slow_look
+    fake.service.queue_bench_look(WORK)
+    first = fake.service._bench_look_queued[WORK]
+    await looked.wait()
+    light.verdict = "pass"  # the run ends now
+    fake.service.queue_bench_look(WORK)
+    second = fake.service._bench_look_queued[WORK]
+    go_on.set()
+    await asyncio.gather(first, second)
+    assert fake.merged == [(PR, "merge")]

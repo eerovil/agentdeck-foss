@@ -414,6 +414,100 @@ async def test_the_card_a_chat_works_is_answerable_from_either_leg(tmp_path):
     assert state.issues_for(CLAUDE_KEY) == (card,)
 
 
+async def test_a_worker_follow_up_carries_the_chats_pending_notes_once(tmp_path):
+    """A poller follow-up is the chat's next message too (#4303): it carries the notes,
+    its retry under the same delivery id carries the same ones, and a clean refusal puts
+    them back for the next delivery."""
+    from agentdeck.pending_events import with_notes
+
+    seen: list[dict] = []
+    answers = [
+        {"accepted": False, "action": "rejected", "provider_write_state": "not_started"},
+        {"accepted": True, "action": "spawned", "session_id": "leg-two"},
+        {"accepted": True, "action": "spawned", "session_id": "leg-two"},
+    ]
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        import json
+
+        seen.append(json.loads(request.content))
+        return httpx.Response(200, json=answers.pop(0))
+
+    app = _app(tmp_path, handle)
+    app.state.injector.config.max_message_chars = None  # notes make it longer
+    chat = app.state.budget_db.chat_for_session(CLAUDE_KEY)
+    notes = app.state.pending_events
+    notes.add(chat.chat_id, "n1", "Review passed.")
+    url = f"https://deck.example/chats/{chat.chat_id}"
+
+    async def deliver(delivery_id):
+        body = {
+            "key": "eerovil/agentdeck#1",
+            "message": "carry on",
+            "continues_session_url": url,
+            "delivery_id": delivery_id,
+        }
+        async with _client(app) as client:
+            return await client.post("/api/workers/accounts/codex/alt/deliver", json=body)
+
+    await deliver("d1")
+    assert seen[0]["message"] == with_notes(["Review passed."], "carry on")
+    assert [note["id"] for note in notes.waiting(chat.chat_id)] == ["n1"], "refused: back"
+
+    await deliver("d2")
+    notes.add(chat.chat_id, "n2", "Deploy landed.")
+    await deliver("d2")  # the poller's retry of the same delivery
+    assert seen[1]["message"] == seen[2]["message"] == seen[0]["message"]
+    assert [note["id"] for note in notes.waiting(chat.chat_id)] == ["n2"]
+
+
+async def test_a_worker_follow_up_takes_notes_only_once_bound_and_gives_back_a_404s(tmp_path):
+    """A follow-up whose successor could not be reserved runs as a chat of its own and takes
+    none of the old chat's notes; a runtime without the artifact route (404) never saw the
+    delivery, so its notes wait for the next one (#4303)."""
+    from agentdeck.pending_events import with_notes
+
+    seen: list[dict] = []
+    answers = [
+        httpx.Response(200, json={"accepted": True, "action": "spawned", "session_id": "solo"}),
+        httpx.Response(404, json={"detail": "Not Found"}),
+    ]
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        import json
+
+        seen.append({"path": request.url.path, **json.loads(request.content)})
+        return answers.pop(0)
+
+    app = _app(tmp_path, handle)
+    app.state.injector.config.max_message_chars = None
+    chat = app.state.budget_db.chat_for_session(CLAUDE_KEY)
+    notes = app.state.pending_events
+    notes.add(chat.chat_id, "n1", "Review passed.")
+    body = {
+        "key": "eerovil/agentdeck#1",
+        "message": "carry on",
+        "continues_session_url": f"https://deck.example/chats/{chat.chat_id}",
+    }
+    assert app.state.budget_db.reserve_chat_successor("other-token", CLAUDE_KEY) == "new"
+    async with _client(app) as client:
+        await client.post(
+            "/api/workers/accounts/codex/alt/deliver", json={**body, "delivery_id": "d1"}
+        )
+    assert seen[0]["message"] == "carry on", "unbound: not this chat's message"
+    assert [note["id"] for note in notes.waiting(chat.chat_id)] == ["n1"]
+
+    app.state.budget_db.release_chat_successor("other-token")
+    async with _client(app) as client:
+        await client.post(
+            "/api/workers/accounts/codex/alt/deliver",
+            json={**body, "delivery_id": "d2", "command_artifacts": {"mode": "observe"}},
+        )
+    assert seen[1]["path"].endswith("/deliver-command-artifacts-v1")
+    assert seen[1]["message"] == with_notes(["Review passed."], "carry on")
+    assert [note["id"] for note in notes.waiting(chat.chat_id)] == ["n1"], "404: back"
+
+
 async def test_an_uncertain_delivery_leaves_no_reservation_behind(tmp_path):
     """A runtime that names no session started nothing to link (#1267)."""
     seen: list[dict] = []

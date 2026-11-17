@@ -76,6 +76,9 @@ SNAPSHOT_RELOCATE_V1 = "relocate_v1"
 # The runtime keeps a booted Claude CLI waiting for a new chat when asked (#3420), so the
 # web asks only a runtime that says it can.
 SNAPSHOT_SPARE_V1 = "spare_v1"
+# The runtime starts an existing chat's Claude process when voice mode asks, ahead of the
+# phrase it is about to send (#4360); the web asks only a runtime that says it can.
+SNAPSHOT_WAKE_V1 = "wake_v1"
 # The snapshot carries ``SNAPSHOT_BOOTED_AT_KEY``: when the runtime process serving it
 # started. A restart replaces every owned worker process at once while the fresh runtime
 # wakes the chats that had a turn in flight, so without this a reader cannot tell that shape
@@ -813,6 +816,10 @@ class InjectResult:
     # The runtime could not be reached, or the connection broke before any answer: the
     # write may be tried again once it is back (#4106). Web-side, like the field above.
     runtime_unreachable: bool = False
+    # The provider write may have begun although the send is not accepted: the runtime
+    # answered ``uncertain``, or the request may have reached it before the connection
+    # broke (#4303). Only a refusal without it is known to have written nothing.
+    write_uncertain: bool = False
 
     @classmethod
     def from_wire(cls, data: object, *, source: str = "runtime") -> InjectResult:
@@ -820,13 +827,15 @@ class InjectResult:
         returns over its socket. Tolerant of a malformed reply: a non-dict or
         non-string field degrades to a rejection / None rather than raising."""
         if not isinstance(data, dict):
-            return cls(False, f"invalid response from {source}")
+            return cls(False, f"invalid response from {source}", write_uncertain=True)
         reason = data.get("reason")
         session_id = data.get("session_id")
         return cls(
             bool(data.get("accepted")),
             reason if isinstance(reason, str) else None,
             session_id if isinstance(session_id, str) else None,
+            write_uncertain=data.get("action") == "uncertain"
+            or data.get("provider_write_state") in {"started", "unknown"},
         )
 
     def to_wire(self) -> dict:

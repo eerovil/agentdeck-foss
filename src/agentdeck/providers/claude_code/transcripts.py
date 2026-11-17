@@ -1295,9 +1295,9 @@ def newest_fork(path: Path, *, turn_finished: bool = True) -> tuple[int, str] | 
     next prompt. The running turn's own last reply counts only when ``turn_finished``.
 
     Only what follows the newest compaction counts: a resumed chat holds nothing before
-    it, so Claude refuses a cut there ("No message found"). When a compaction came and the
-    running turn is the only one since then, it is cut at its newest reply with text, the
-    agent's words so far, rather than refusing a side chat until that turn ends.
+    it, so Claude refuses a cut there ("No message found"). When no turn since the start or
+    the compaction has finished, the running turn is cut at its newest reply with text, the
+    agent's words so far, rather than refusing a side chat until that turn ends (#4314).
     """
     try:
         lines = path.read_bytes().splitlines()
@@ -1306,7 +1306,6 @@ def newest_fork(path: Path, *, turn_finished: bool = True) -> tuple[int, str] | 
     confirmed: int | None = None
     pending: int | None = None
     newest: int | None = None  # the newest reply with text since the compaction
-    compacted = False
     uuids: dict[int, str] = {}
     for seq, raw in enumerate(lines, 1):
         try:
@@ -1317,7 +1316,6 @@ def newest_fork(path: Path, *, turn_finished: bool = True) -> tuple[int, str] | 
             continue
         if _is_compaction(obj):
             confirmed = pending = newest = None
-            compacted = True
         elif obj.get("type") == "assistant":
             pending = seq if _reply_with_text(obj) else None
             if pending is not None:
@@ -1326,9 +1324,7 @@ def newest_fork(path: Path, *, turn_finished: bool = True) -> tuple[int, str] | 
         elif _prompt_line(obj):
             confirmed = pending or confirmed
             pending = None
-    # A chat never compacted keeps its finished turns, so its first running turn waits.
-    fallback = newest if compacted else None
-    seq = pending if pending is not None and turn_finished else (confirmed or fallback)
+    seq = pending if pending is not None and turn_finished else (confirmed or newest)
     return (seq, uuids[seq]) if seq is not None else None
 
 
@@ -1403,6 +1399,29 @@ def rewind_ref(path: Path, seq: int) -> str | None:
             return parent
         parent = obj.get("parentUuid")
     return None
+
+
+def fork_copy_end(path: Path, cut: str) -> int:
+    """The line of a side chat's own transcript where its copied history ends, or 0 (#4313).
+
+    Claude copies the source's lines up to the cut into the new chat's file under their
+    own uuids, so the cut's uuid marks the last copied line. 0 when it is not there.
+    """
+    needle = cut.encode()
+    try:
+        lines = path.read_bytes().splitlines()
+    except OSError:
+        return 0
+    for seq, raw in enumerate(lines, 1):
+        if needle not in raw:
+            continue
+        try:
+            obj = json.loads(raw)
+        except ValueError:
+            continue
+        if isinstance(obj, dict) and obj.get("uuid") == cut:
+            return seq
+    return 0
 
 
 def fork_ref(path: Path, seq: int, *, turn_finished: bool = True) -> str | None:

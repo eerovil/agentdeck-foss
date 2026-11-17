@@ -632,6 +632,14 @@ class ClaudeCodeProvider(SessionProvider):
             **({"role": role} if role else {}),
         )
 
+    async def wake_worker(self, account: Account, session_id: str) -> str:
+        """Start this owned chat's Claude process ahead of a voice-mode phrase (#4360);
+        ``""`` with no runtime that can, and the send then spawns cold as before."""
+        client = self._workers.get(account.key)
+        if client is None or not client.supports(models_mod.SNAPSHOT_WAKE_V1):
+            return ""
+        return await client.wake_worker(session_id)
+
     async def drop_spare(self, account: Account, shape: str) -> str:
         """Stop the CLI this account keeps for ``shape``; ``""`` with no runtime that can."""
         client = self._workers.get(account.key)
@@ -690,6 +698,10 @@ class ClaudeCodeProvider(SessionProvider):
         if path is None:
             return None
         return transcripts_mod.fork_ref(path, seq, turn_finished=not session.thinking)
+
+    def fork_copy_end(self, account: Account, session: Session, cut: str) -> int:
+        path = self._transcript_path(account, session)
+        return transcripts_mod.fork_copy_end(path, cut) if path is not None else 0
 
     def newest_fork(self, account: Account, session: Session) -> tuple[int, str] | None:
         path = self._transcript_path(account, session)
@@ -942,7 +954,11 @@ class ClaudeCodeProvider(SessionProvider):
         fork_from: ForkFrom | None = None,
         role: str | None = None,
         worker_key: str | None = None,
+        web_only: bool = False,
     ) -> InjectResult:
+        if web_only:
+            # Only a Codex chat can be locked to the web (#4381).
+            return InjectResult(False, "a web-only chat needs a Codex account")
         client = self._workers.get(account.key)
         if client is None:
             return InjectResult(False, "Claude workers are not enabled on the runtime service")

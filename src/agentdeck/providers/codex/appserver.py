@@ -50,6 +50,17 @@ from . import (
     WRITABLE_ROOTS_CONFIG_OVERRIDE,
 )
 from .diagnostics import redact_diagnostic
+from .web_only import (
+    WEB_ONLY_CUT_OFF,
+    WEB_ONLY_FORK_REFUSAL,
+    WEB_ONLY_INSTRUCTIONS,
+    WEB_ONLY_RELOAD_REFUSAL,
+    WEB_ONLY_SWITCH_REFUSAL,
+    WEB_ONLY_TURN_REFUSAL,
+    mcp_server_names,
+    research_cwd_refusal,
+    web_only_config,
+)
 
 log = logging.getLogger(__name__)
 
@@ -87,6 +98,9 @@ APP_SERVER_SOCKET_WAIT_S = 10.0
 THREAD_IDLE_UNLOAD_S = 600.0
 # Headroom above the user manager's default soft limit; the sweep above is the fix.
 APP_SERVER_NOFILE = 65536
+# What a desktop session hands the user manager; no deck process may keep one (#4340).
+ASKPASS_VARIABLES = frozenset({b"SSH_ASKPASS", b"SUDO_ASKPASS", b"GIT_ASKPASS"})
+_PROC_ROOT = Path("/proc")
 COMMAND_ARTIFACT_HOOK_VERSION_ENV = "AGENTDECK_CODEX_COMMAND_HOOK_VERSION"
 COMMAND_ARTIFACT_HOOK_VERSION = "command-result-v1"
 
@@ -140,6 +154,21 @@ def _status_type(value: object) -> str:
     if isinstance(value, dict) and isinstance(value.get("type"), str):
         return value["type"]
     return "notLoaded"
+
+
+def _active_turn_id(thread: dict[str, Any]) -> str | None:
+    """The running turn's id in a thread record, when the record lists its turns."""
+    turns = thread.get("turns")
+    if not isinstance(turns, list):
+        return None
+    for turn in reversed(turns):
+        if (
+            isinstance(turn, dict)
+            and turn.get("status") == "inProgress"
+            and isinstance(turn.get("id"), str)
+        ):
+            return turn["id"]
+    return None
 
 
 def usage_limit_refusal(turn: dict[str, Any]) -> str:
@@ -338,6 +367,7 @@ class CodexAppServer:
         backend_scope: str = "",
         permission_prompts_allowed: Callable[[str], bool] | None = None,
         bypass_permissions_on: Callable[[str], bool] | None = None,
+        web_only: Callable[[str], bool] | None = None,
         artifact_root: Path | None = None,
     ) -> None:
         self.account = account
@@ -354,6 +384,14 @@ class CodexAppServer:
             lambda _thread_id: False
         )
         self._bypass_permissions_on = bypass_permissions_on or (lambda _thread_id: False)
+        # Whether a thread is locked to web search (#4381), from the runtime's DB.
+        self._web_only_on = web_only or (lambda _thread_id: False)
+        # Web-only threads started by this process, until their row is surely written,
+        # and those of them whose one turn has not been sent yet.
+        self._web_only_started: set[str] = set()
+        self._web_only_first_turn: set[str] = set()
+        # Web-only threads recovery found running and left alone (#4381).
+        self._cut_off_web_only: set[str] = set()
         self._artifact_root = artifact_root
         self._process: asyncio.subprocess.Process | None = None
         self._reader_task: asyncio.Task | None = None
@@ -526,7 +564,7 @@ class CodexAppServer:
                 env, unit, include_worker_paths=True
             ) or await self._persistent_backend_nofile_stale(unit) or (
                 await self._persistent_backend_args_stale(unit)
-            )
+            ) or await self._persistent_backend_askpass_stale(unit)
         else:
             self._backend_env_stale = False
             codex = shutil.which("codex", path=env.get("PATH")) or "codex"
@@ -543,6 +581,10 @@ class CodexAppServer:
                 "--property=StandardOutput=null",
                 "--property=StandardError=null",
                 f"--property=LimitNOFILE={APP_SERVER_NOFILE}",
+                # No desktop password box from a git or ssh call it runs (#4340).
+                "--property=UnsetEnvironment=SSH_ASKPASS SUDO_ASKPASS GIT_ASKPASS",
+                "--setenv=GIT_TERMINAL_PROMPT=0",
+                "--setenv=SSH_ASKPASS_REQUIRE=never",
                 f"--property=RuntimeDirectory={socket_path.parent.name}",
                 "--property=RuntimeDirectoryMode=0700",
                 f"--setenv=CODEX_HOME={self.account.root}",
@@ -682,6 +724,40 @@ class CodexAppServer:
             return int(stdout.decode(errors="replace").strip()) < APP_SERVER_NOFILE
         except ValueError:
             return False
+
+    async def _persistent_backend_askpass_stale(self, unit: str) -> bool:
+        """True when a running backend can still open a desktop password box (#4340).
+
+        A transient unit inherits the systemd user manager's environment from when it
+        started, which the KDE session filled with ``SSH_ASKPASS``; a git call from a
+        Codex turn could then open a box nobody sees. Only this owner knows when its
+        threads are idle, so the idle-only refresh replaces it, never the host guard.
+        An unreadable answer keeps a working backend.
+        """
+        shown = await asyncio.create_subprocess_exec(
+            "systemctl",
+            "--user",
+            "show",
+            "--property=MainPID",
+            "--value",
+            unit,
+            stdout=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await shown.communicate()
+        if shown.returncode != 0:
+            return False
+        try:
+            pid = int(stdout.decode(errors="replace").strip())
+            environ = (_PROC_ROOT / str(pid) / "environ").read_bytes() if pid > 0 else b""
+        except (ValueError, OSError):
+            return False
+        if not environ:
+            return False
+        items = environ.split(b"\0")
+        # With DISPLAY set, ssh runs its built-in askpass unless told never to.
+        return b"SSH_ASKPASS_REQUIRE=never" not in items or any(
+            item.partition(b"=")[0] in ASKPASS_VARIABLES for item in items
+        )
 
     async def _persistent_backend_args_stale(self, unit: str) -> bool:
         """True when a running backend was started without the login-shell override (#3350).
@@ -958,6 +1034,9 @@ class CodexAppServer:
                 self._owned.add(thread_id)
                 self._threads[thread_id] = thread
                 if _status_type(thread.get("status")) == "active":
+                    if self._refuse_web_only_reload(thread_id):
+                        await self._cut_off_web_only_thread(thread_id, thread)
+                        continue
                     owned.append(thread_id)
         # The persistent app-server replays unresolved approvals and questions
         # when a replacement AgentDeck client resumes the thread.
@@ -970,6 +1049,42 @@ class CodexAppServer:
             self._loaded.add(thread_id)
             if thread_id not in self._active_turn:
                 self._idle_since[thread_id] = time.monotonic()
+
+    def _is_web_only(self, thread_id: str) -> bool:
+        """Whether this thread is locked to web search; a failed read says yes (#4381)."""
+        if thread_id in self._web_only_started:
+            return True
+        try:
+            return bool(self._web_only_on(thread_id))
+        except Exception:
+            log.warning(
+                "could not read whether Codex thread %s is web-only; treating it as such",
+                thread_id,
+                exc_info=True,
+            )
+            return True
+
+    def _refuse_web_only_reload(self, thread_id: str) -> bool:
+        """Whether resuming this thread must be refused: it is web-only (#4381).
+
+        A web-only thread keeps the lock it was started with only while that start's
+        process holds it; ``thread/resume`` is never sent for one, from any path.
+        """
+        return self._is_web_only(thread_id)
+
+    async def _cut_off_web_only_thread(self, thread_id: str, thread: dict[str, Any]) -> None:
+        """Leave a running web-only thread unresumed and record it as cut off (#4381)."""
+        turn_id = _active_turn_id(thread)
+        if turn_id is not None:
+            try:
+                await self._request("turn/interrupt", {"threadId": thread_id, "turnId": turn_id})
+            except AppServerError as exc:
+                log.info("could not interrupt cut-off web-only thread %s: %s", thread_id, exc)
+        self._cut_off_web_only.add(thread_id)
+        # Nothing subscribes to it now, so its cached `active` would never change and
+        # would keep the backend from refreshing.
+        self._threads[thread_id] = {**thread, "status": {"type": "notLoaded"}}
+        self._last_results[thread_id] = (time.time(), "failed", WEB_ONLY_CUT_OFF)
 
     def _was_started_by_agentdeck(self, thread: dict[str, Any]) -> bool:
         """Check the persisted session marker without trusting arbitrary paths."""
@@ -1226,8 +1341,16 @@ class CodexAppServer:
         role: SessionRole | None = None,
         session_token: str | None = None,
         fork_from: ForkFrom | None = None,
+        web_only: bool = False,
     ) -> InjectResult:
         resolved_role = resolve_session_role(delegated=delegated, role=role)
+        if fork_from is not None and (web_only or self._is_web_only(fork_from.session_id)):
+            # A side chat would hold the same conversation with none of the lock (#4381).
+            return InjectResult(False, WEB_ONLY_FORK_REFUSAL)
+        if web_only:
+            refusal = research_cwd_refusal(cwd)
+            if refusal is not None:
+                return InjectResult(False, refusal)
         await self.start()
         async with self._backend_lifecycle_lock:
             if not await self._refresh_persistent_backend_if_idle():
@@ -1237,9 +1360,20 @@ class CodexAppServer:
                     "retry after it becomes idle",
                 )
             thread_config = _current_mcp_config(self.account.root)
+            if web_only:
+                # Every server either the account's file or this long-lived process
+                # knows, off by name; a failed read starts nothing.
+                effective = await self._request("config/read", {"cwd": str(cwd)})
+                loaded = effective.get("config") if isinstance(effective, dict) else None
+                if not isinstance(loaded, dict):
+                    return InjectResult(False, "Codex did not report its configuration")
+                thread_config = web_only_config(mcp_server_names(thread_config, loaded))
+                sandbox, approval_policy = "read-only", "never"
             params = {
                 "cwd": str(cwd),
-                "developerInstructions": agentdeck_session_instructions(
+                "developerInstructions": WEB_ONLY_INSTRUCTIONS
+                if web_only
+                else agentdeck_session_instructions(
                     role=resolved_role,
                     provider="codex",
                     session_token=session_token,
@@ -1272,6 +1406,9 @@ class CodexAppServer:
             if not isinstance(thread, dict) or not isinstance(thread.get("id"), str):
                 return InjectResult(False, "Codex did not return a new thread id")
             thread_id = thread["id"]
+            if web_only:
+                self._web_only_started.add(thread_id)
+                self._web_only_first_turn.add(thread_id)
             self._owned.add(thread_id)
             self._loaded.add(thread_id)
             self._threads[thread_id] = thread
@@ -1294,6 +1431,7 @@ class CodexAppServer:
         session_token: str | None = None,
         fork_from: ForkFrom | None = None,
         before_first_turn: Callable[[str], Awaitable[InjectResult]] | None = None,
+        web_only: bool = False,
     ) -> InjectResult:
         """Create a thread and send its first message.
 
@@ -1310,6 +1448,7 @@ class CodexAppServer:
                 role=role,
                 session_token=session_token,
                 fork_from=fork_from,
+                web_only=web_only,
             )
         except AppServerError as exc:
             if fork_from is None:
@@ -1351,6 +1490,8 @@ class CodexAppServer:
     async def _ensure_loaded(self, thread_id: str, *, cwd: str | None = None) -> None:
         if thread_id in self._loaded:
             return
+        if self._refuse_web_only_reload(thread_id):
+            raise AppServerError(WEB_ONLY_RELOAD_REFUSAL)
         params = self._resume_params(thread_id)
         if cwd is not None:
             params["cwd"] = cwd
@@ -1417,6 +1558,8 @@ class CodexAppServer:
         previous_policy: str | dict[str, Any] | None = None,
     ) -> InjectResult:
         """Route later approval requests to the boss or back to auto-review."""
+        if self._is_web_only(thread_id):
+            return InjectResult(False, WEB_ONLY_SWITCH_REFUSAL)
         await self.start()
         async with self._thread_operation_lock(thread_id):
             if thread_id not in self._owned:
@@ -1462,6 +1605,8 @@ class CodexAppServer:
         )
         if not settings:
             return InjectResult(False, "the settings to put back are not known")
+        if self._is_web_only(thread_id):
+            return InjectResult(False, WEB_ONLY_SWITCH_REFUSAL)
         await self.start()
         async with self._thread_operation_lock(thread_id):
             if thread_id not in self._owned:
@@ -1624,6 +1769,11 @@ class CodexAppServer:
                 )
             if thread_id not in self._owned:
                 return InjectResult(False, "agentdeck does not own this Codex thread")
+            if self._is_web_only(thread_id):
+                # Only the one turn its own start sends (#4381).
+                if thread_id not in self._web_only_first_turn:
+                    return InjectResult(False, WEB_ONLY_TURN_REFUSAL)
+                self._web_only_first_turn.discard(thread_id)
             relocated = (
                 self._relocation(thread_id) if self.active_turn(thread_id) is None else None
             )
@@ -1715,6 +1865,8 @@ class CodexAppServer:
     ) -> InjectResult:
         """Wait for the active turn, then start one ordinary follow-up turn."""
         await self.start()
+        if self._is_web_only(thread_id):
+            return InjectResult(False, WEB_ONLY_TURN_REFUSAL)
         async with self._thread_operation_lock(thread_id):
             active = self.active_turn(thread_id)
             if active is not None:
@@ -1744,6 +1896,8 @@ class CodexAppServer:
     async def _compact_unlocked(self, thread_id: str) -> InjectResult:
         if thread_id not in self._owned:
             return InjectResult(False, "agentdeck does not own this Codex thread")
+        if self._is_web_only(thread_id):
+            return InjectResult(False, WEB_ONLY_TURN_REFUSAL)
         active = self.active_turn(thread_id)
         if active is not None:
             await self._wait_for_turn(active)
@@ -1776,6 +1930,11 @@ class CodexAppServer:
             return await self._compact_unlocked(thread_id)
 
     async def wait_for_thread(self, thread_id: str) -> InjectResult:
+        if thread_id in self._cut_off_web_only or (
+            thread_id not in self._loaded and self._is_web_only(thread_id)
+        ):
+            # Before the unknown-turn answer below, which would read as finished (#4381).
+            return InjectResult(False, WEB_ONLY_CUT_OFF)
         turn_id = self.active_turn(thread_id)
         if turn_id is None:
             return InjectResult(True)
@@ -1795,6 +1954,8 @@ class CodexAppServer:
         images: list[Path] | None = None,
     ) -> InjectResult:
         await self.start()
+        if self._is_web_only(thread_id):
+            return InjectResult(False, WEB_ONLY_TURN_REFUSAL)
         target_turn_id = self.active_turn(thread_id)
         async with self._thread_operation_lock(thread_id):
             turn_id = self.active_turn(thread_id)

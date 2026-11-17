@@ -46,11 +46,34 @@
   </div>
 </section>
 {%- for part, label in (("cleanup", "Clean-up"), ("waiting", "Waiting"), ("live", "Live checking"),
-                        ("try", "Waiting for a try"), ("finished", "Recently finished"), ("paused", "Paused")) %}
+                        ("try", "Waiting for a try"), ("finished", "Recently finished"), ("paused", "Paused"),
+                        ("parked", "Parked")) %}
 <section class="front-sec front-{{ part }}" id="front-{{ part }}" aria-label="{{ label }}">
   <div class="front-rows" id="works-{{ part }}" sse-swap="works-{{ part }}" hx-swap="keyed-works">
     {%- include "partials/work_front.html" %}
   </div>
+  {%- if part == "finished" %}
+  {#- Show older and its search (#4289), outside the rows a live push replaces, so the older
+      rows loaded stay while the newest ones update. The wrapper folds with the group;
+      `front_filters.js` sends the project tab and empties it when the tab changes. #}
+  <div class="front-older" data-front-in="finished" data-front-older>
+    <div class="front-rows front-older-rows" id="front-older-rows"></div>
+    <div class="front-older-bar">
+      <button type="button" class="front-older-more" id="front-older-more" hx-get="/works/finished"
+              hx-target="#front-older-rows" hx-swap="beforeend" data-front-older-more>Show older</button>
+      <details class="front-older-find">
+        <summary aria-label="Search finished Works" title="Search finished Works">&#x2315;</summary>
+        <form class="front-older-search" role="search" hx-get="/works/finished"
+              hx-target="#front-older-rows" hx-swap="innerHTML">
+          <input type="hidden" name="search" value="1">
+          <input type="search" name="q" placeholder="Title or #number" aria-label="Search finished Works"
+                 autocomplete="off" hx-get="/works/finished" hx-include="closest form"
+                 hx-target="#front-older-rows" hx-swap="innerHTML" hx-trigger="input changed delay:400ms, search">
+        </form>
+      </details>
+    </div>
+  </div>
+  {%- endif %}
 </section>
 {%- endfor %}
 {# The newest few Works that stopped, and the category each landed in (#2283): a shortcut, so

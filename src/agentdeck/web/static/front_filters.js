@@ -143,8 +143,11 @@
     return '"' + String(value).replace(/["\\]/g, '\\$&') + '"';
   }
 
+  // Show older's rows (#4289) are hidden by project like the rest, but name no tab: an old
+  // project with nothing current must not get one by being scrolled past.
   function projectRows() {
-    return Array.prototype.slice.call(document.querySelectorAll('.front-page [data-work-project]'));
+    return Array.prototype.slice.call(
+      document.querySelectorAll('.front-page [data-work-project]:not([data-front-in="older"])'));
   }
 
   function shown(el, hidden) {
@@ -174,7 +177,8 @@
       // A row Finish is taking away (#3299, `work_list.js`) is off the count already, and
       // its group's header goes with the last one.
       var held = document.querySelector('article[data-front-in=' + quoted(key) + '][data-work-finishing]');
-      head.hidden = (any || !!held) && rows.length === 0;
+      // Recently finished stays even when empty (#4289): Show older is under it.
+      head.hidden = !head.hasAttribute('data-front-keep') && (any || !!held) && rows.length === 0;
     });
     Array.prototype.forEach.call(document.querySelectorAll('[data-front-summary][data-by-project]'), function (item) {
       var by;
@@ -459,6 +463,32 @@
     applyFolds();
     applyProjects();
   }
+
+  // Show older and its search (#4289) ask for the one project the tabs show alone, so a page
+  // is ten rows of that project; with several held together the rows of the others are
+  // hidden like any row. A tab change empties what was loaded and starts the button over.
+  document.addEventListener('htmx:configRequest', function (e) {
+    var el = e.detail && e.detail.elt;
+    if (!el || !el.closest || !el.closest('[data-front-older]')) return;
+    var project = onlyProject();
+    if (project) e.detail.parameters.project = project;
+    else delete e.detail.parameters.project;
+  });
+
+  function resetOlder() {
+    var rows = document.getElementById('front-older-rows');
+    var more = document.getElementById('front-older-more');
+    if (!rows || !more) return;
+    rows.textContent = '';
+    more.hidden = false;
+    more.setAttribute('hx-get', '/works/finished');
+    more.setAttribute('hx-target', '#front-older-rows');
+    more.setAttribute('hx-swap', 'beforeend');
+    if (window.htmx) window.htmx.process(more);
+    var box = document.querySelector('.front-older-search input[name="q"]');
+    if (box) box.value = '';
+  }
+  document.addEventListener('agentdeck:front-projects', resetOlder);
 
   // Run where this file loads, in the head: both stylesheets exist before the first row is
   // parsed, so a folded group or a hidden project is never painted first and hidden after.

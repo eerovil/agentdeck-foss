@@ -55,6 +55,8 @@ from typing import Any
 
 SLOT_DIR_ENV = "AGENTDECK_SLOT_DIR"
 HEAVY_SLOT_ENV = "AGENTDECK_HEAVY_SLOTS"
+HELPER_SLOT_ENV = "AGENTDECK_HELPER_SLOTS"
+DEFAULT_HELPER_SLOTS = 2
 HEAVY_SLOT_HELD_ENV = "AGENTDECK_HEAVY_SLOT_HELD"
 # Set on everything the job queue runs, here or in a pod (#2666). Unlike the
 # held-slot marker it is not also a manual escape hatch, so the conftest can tell
@@ -622,6 +624,20 @@ def _configured_count(variable: str, default: int) -> int:
         if requested >= 1:
             return requested
     return default
+
+
+def helper_slot_count() -> int:
+    """How many ``agentdeck pre-review-helpers`` runs may go at once on this host (#4437).
+
+    Two, so at most six ``claude -p`` helpers and six parallel calls on the accounts. A pool
+    of its own rather than ``heavy``: a heavy slot is held by whole test suites, and a helper
+    run is network-bound and light on CPU, so it would wait behind them for nothing.
+    """
+    return _configured_count(HELPER_SLOT_ENV, DEFAULT_HELPER_SLOTS)
+
+
+def helper_slot_paths(count: int | None = None, directory: Path | None = None) -> list[Path]:
+    return slot_paths("helpers", helper_slot_count() if count is None else count, directory)
 
 
 def heavy_slot_paths(count: int | None = None, directory: Path | None = None) -> list[Path]:

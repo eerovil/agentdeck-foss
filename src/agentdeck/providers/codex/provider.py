@@ -1626,11 +1626,21 @@ class CodexProvider(SessionProvider):
         session_token: str | None = None,
         fork_from: ForkFrom | None = None,
         role: str | None = None,
+        web_only: bool = False,
     ) -> InjectResult:
         # Interactive Codex starts currently have no usage-admission gate; keep
         # the provider-neutral argument so manual starts share one contract.
         del allow_over_budget
         client = self._clients.get(account.key)
+        if web_only:
+            # Only the runtime's app-server can lock a chat to the web (#4381); the
+            # exec fallback below would start an open one.
+            if client is None:
+                return InjectResult(False, "a web-only chat needs the Codex runtime")
+            if images or fork_from is not None or sandbox not in (None, "read-only"):
+                return InjectResult(
+                    False, "a web-only chat takes no images, fork or other sandbox"
+                )
         if role and (client is None or not client.supports(models_mod.SNAPSHOT_ROLE_V1)):
             # The exec fallback takes no role, and an older runtime would drop it.
             return InjectResult(False, "the Codex runtime cannot start a chat with a role yet")
@@ -1653,6 +1663,7 @@ class CodexProvider(SessionProvider):
                 role=role,
                 session_token=session_token,
                 **({"fork_from": fork_from} if fork_from is not None else {}),
+                **({"web_only": True} if web_only else {}),
             )
             if result.accepted and result.session_id:
                 state = self._states.get(account.key)

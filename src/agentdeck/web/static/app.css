@@ -1317,6 +1317,18 @@ details.ev.deck-notice > .ev-text { margin-top: 4px; padding: 6px 8px; border: 1
   color: var(--muted); background: var(--panel2); font-size: 12px; cursor: pointer; }
 .image-picker:active { color: var(--fg); }
 .paste-hint { color: var(--muted); font-size: 11px; font-weight: 400; }
+/* 📋 pastes a clipboard image in one tap (#4345); shown only where the browser can read it. */
+.clipboard-image-button { display: none; }
+.can-read-clipboard .clipboard-image-button { display: inline-flex; align-items: center;
+  justify-content: center; box-sizing: border-box; width: 30px; height: 29px; margin: 8px 0 0 6px;
+  padding: 0; border: 1px solid var(--line); border-radius: 7px; background: var(--panel2);
+  font-size: 14px; line-height: 1; vertical-align: bottom; cursor: pointer; }
+/* Where Chrome reports what was copied, 📋 waits until it was an image (#4345). */
+.can-read-clipboard.clipboard-watch:not(.clipboard-has-image) .clipboard-image-button {
+  display: none; }
+.clipboard-image-note { position: fixed; z-index: 60; max-width: 212px; padding: 5px 9px;
+  border: 1px solid var(--line); border-radius: 7px; background: var(--panel2); color: var(--fg);
+  font-size: 12px; pointer-events: none; }
 .image-input { position: absolute; width: 1px !important; height: 1px; padding: 0 !important;
   margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0 !important; }
 .effort-menu { position: relative; flex: none; }
@@ -1460,6 +1472,8 @@ details.ev.deck-notice > .ev-text { margin-top: 4px; padding: 6px 8px; border: 1
 .dictation-setting { display: flex; align-items: center; gap: 8px; }
 .dictation-setting select { padding: 6px 8px; border: 1px solid var(--line); border-radius: 7px;
   color: var(--fg); background: var(--panel2); font: inherit; }
+/* Emptied after a send, the row would still hold room under the box (#4336). */
+.paste-previews:empty { display: none; }
 .paste-previews { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; margin-top: 7px; }
 .paste-preview { position: relative; display: inline-flex; width: 54px; height: 42px;
   border: 1px solid var(--line); border-radius: 7px; overflow: visible; background: var(--bg); }
@@ -1489,12 +1503,84 @@ details.ev.deck-notice > .ev-text { margin-top: 4px; padding: 6px 8px; border: 1
   font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
 .composer-controls { display: flex; align-items: center; gap: 7px; }
 .inject-form .stop-button { background: var(--crit); }
-/* One width for Stop's spot whether it is blank, Stop or Stop…, so 🎤 and 🎧 left
-   of it never move (#3545). Only as wide as Stop: any wider and the phone row,
-   with an issue chip, runs over the ＋ button. */
-.inject-form :is(.stop-button, .stop-placeholder) { box-sizing: border-box; width: 4.4em;
-  padding-inline: 0; white-space: nowrap; text-align: center; }
-.inject-form .stop-placeholder { visibility: hidden; }
+/* The message box (#4313): one box with ＋ inside it on the left, and text that starts one
+   line high and grows as you type. Its "Message" label is for screen readers, except when
+   it warns that the box starts a new chat. */
+.inject-form > .composer-label { position: absolute; width: 1px; height: 1px; margin: 0;
+  overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+.inject-form[data-cold-new-chat] > .composer-label { position: static; width: auto; height: auto;
+  margin-bottom: 7px; clip: auto; }
+.composer-box { display: flex; align-items: flex-end; box-sizing: border-box;
+  border: 1px solid var(--line); border-radius: 8px; background: var(--bg); }
+.composer-box:focus-within { border-color: var(--remote); }
+/* The browser fits the box to its text whatever changes it: typing, a send that empties it
+   from code, a quick phrase, dictation, a new width (#4330). side_chat_panel.js covers a
+   browser without field-sizing. */
+.inject-form .composer-box textarea { flex: 1; min-width: 0; height: auto; min-height: 38px;
+  max-height: 40vh; padding: 8px 6px; border: 0; border-radius: 8px; background: transparent;
+  resize: none; overflow-y: auto; field-sizing: content; }
+.inject-form .composer-box .image-picker { flex: none; justify-content: center; box-sizing: border-box;
+  width: 30px; height: 30px; margin: 0 0 4px 4px; padding: 0; border: 0; border-radius: 6px;
+  overflow: hidden; background: transparent; white-space: nowrap; font-size: 0; }
+.inject-form .composer-box .image-picker::before { content: "＋"; font-size: 18px; }
+.inject-form .composer-box .paste-hint { display: none; }
+.can-read-clipboard .inject-form .composer-box .clipboard-image-button { flex: none;
+  width: 30px; height: 30px; margin: 0 0 4px 0; border: 0; border-radius: 6px;
+  background: transparent; font-size: 16px; }
+/* The tools sit on the left and Send on the right, so nothing moves when Stop comes: the
+   room once held for it (#3545) goes. Send and Stop are squares, ↑ and ■. */
+.inject-form .composer-actions { justify-content: flex-start; gap: 6px; margin-top: 6px; }
+.inject-form .composer-actions .composer-controls { margin-left: auto; gap: 6px; }
+.inject-form .composer-hint { flex: 0 1 auto; }
+.inject-form .composer-controls :is(button[type="submit"], .stop-button) { display: inline-flex;
+  align-items: center; justify-content: center; box-sizing: border-box; width: 34px; height: 34px;
+  padding: 0; font-size: 0; }
+.inject-form .composer-controls button[type="submit"]::after { content: "↑"; font-size: 19px; }
+/* Stop is a submit button too (of interrupt-form), so its ■ must outrank Send's ↑ (#4336). */
+.inject-form .composer-controls button.stop-button::after { content: "■"; font-size: 14px; }
+/* Where the box's message goes: the chat, or its one side chat (#4313). Side chat is
+   purple, as are the box and Send while it is on, so you can see where a message goes. */
+.side-switch { display: inline-flex; flex: none; padding: 2px; border: 1px solid var(--line);
+  border-radius: 7px; background: var(--bg); }
+.inject-form .side-switch button { position: relative; padding: 3px 10px; border-radius: 5px;
+  color: var(--muted); background: transparent; font-size: 12px; font-weight: 600;
+  white-space: nowrap; }
+.inject-form .side-switch button[aria-selected="true"] { color: var(--fg); background: var(--panel2); }
+.inject-form .side-switch button[data-side-mode="side"][aria-selected="true"] { color: #fff;
+  background: var(--wt-cloud); }
+.side-switch-dot { position: absolute; top: 2px; right: 3px; width: 7px; height: 7px;
+  border-radius: 50%; background: var(--wt-cloud); }
+.side-switch-dot[hidden] { display: none; }
+.inject-form.side-mode .composer-box { border-color: var(--wt-cloud); }
+.inject-form.side-mode .composer-controls button[type="submit"] { background: var(--wt-cloud); }
+/* The side chat takes the chat's place on every width; its cards are the chat's own. Only
+   the chat's title stays above it; the chat's info and controls step out. */
+.side-view[hidden] { display: none; }
+.session-detail.side-mode .transcript-stage > :not(.side-view) { display: none; }
+.session-detail.side-mode > :is(.detail-meta, .detail-controls, .continue-chat, .todos,
+  #assistant-session-details, #subagent-activity, .session-action-bar, .wm-strip) { display: none; }
+.session-detail.side-mode { display: flex; flex-direction: column; }
+.session-detail.side-mode > .transcript-stage { flex: 1 0 auto; }
+.side-view-head { display: flex; align-items: center; gap: 8px; padding: 0 0 6px; }
+.side-view-back { flex: none; padding: 4px 10px; border: 1px solid var(--line);
+  border-radius: var(--radius); color: var(--fg); background: var(--panel); font: inherit;
+  font-size: 13px; font-weight: 600; white-space: nowrap; cursor: pointer; }
+.side-view-title { flex: 1; min-width: 0; overflow: hidden; color: var(--muted); font-size: 13px;
+  font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.side-view-open { flex: none; padding: 2px 6px; color: var(--muted); font-size: 17px;
+  text-decoration: none; }
+.side-view-open[hidden] { display: none; }
+.side-view-log { display: flex; flex-direction: column; gap: 8px; padding-top: 8px; }
+.side-view-empty, .side-view-note { margin: 8px 0 0; color: var(--muted); font-size: 14px; }
+.side-view-empty[hidden] { display: none; }
+.side-view-pending { opacity: .7; }
+.side-view-error { margin: 8px 0 0; color: var(--crit); font-size: 13px; }
+.side-view-error[hidden] { display: none; }
+.side-view-foot { padding: 8px 0 0; }
+.side-view-foot[hidden] { display: none; }
+.side-view-foot .chip { padding: 4px 10px; border: 1px solid var(--line); border-radius: var(--radius);
+  color: var(--fg); background: var(--panel); font: inherit; font-size: 13px; font-weight: 600;
+  cursor: pointer; }
 /* Why a worker died, when the deck can name it (#1546). Present only on a chat
    whose worker was killed for a stated reason, so it costs no height otherwise. */
 .worker-exit-notice { margin: 8px 2px; padding: 7px 9px; border-radius: 8px;
@@ -1779,13 +1865,13 @@ body.bg-paused *, body.bg-paused *::before, body.bg-paused *::after {
     margin: 0; padding: 0; overflow: hidden; white-space: nowrap; font-size: 0; }
   .inject-form .image-picker::before { content: "＋"; font-size: 14px; }
   .inject-form .paste-hint { display: none; }
-  .inject-form .composer-actions { grid-column: 2; grid-row: 3; justify-content: flex-end;
-    gap: 6px; margin: 0; }
+  .inject-form .composer-actions { grid-column: 1 / -1; grid-row: 2; justify-content: flex-start;
+    gap: 5px; margin: 0; }
   .inject-form .composer-hint { display: none; }
   /* The row must be allowed to shrink, or the grid track it sits in stays as
      wide as its content and the buttons leave the composer. */
   .inject-form .composer-actions { min-width: 0; }
-  .inject-form .paste-previews { grid-column: 1 / -1; grid-row: 4; margin-top: 1px; }
+  .inject-form .paste-previews { grid-column: 1 / -1; grid-row: 3; margin-top: 1px; }
   .inject-form button { padding: 7px 14px; }
   /* Typing in another box on the chat page (a title, an answer, search, the Mac
      runner): the keyboard already takes half the screen, so the chat box steps
@@ -1802,6 +1888,54 @@ body.bg-paused *, body.bg-paused *::before, body.bg-paused *::after {
   .session-detail.keyboard-up .session-action-bar { display: none; }
   .session-detail.keyboard-up .transcript-stage { padding-bottom: 6px; }
   .session-detail.keyboard-up .inject-form { margin-top: 4px; }
+  /* The box's own rows (#4313): the box, then the tools under it, then attachments. A
+     warning that the box starts a new chat goes above them all. */
+  .inject-form .composer-input { grid-row: 1; }
+  .inject-form[data-cold-new-chat] > .composer-label { grid-row: 1; }
+  .inject-form[data-cold-new-chat] .composer-input { grid-row: 2; }
+  .inject-form[data-cold-new-chat] .composer-actions { grid-row: 3; }
+  .inject-form[data-cold-new-chat] .paste-previews { grid-row: 4; }
+  .inject-form textarea { height: auto; min-height: 38px; padding: 8px 6px; resize: none;
+    field-sizing: content; }
+  .inject-form .composer-actions button:not(.side-switch button) { padding: 6px 10px; }
+  .inject-form .composer-controls :is(button[type="submit"], .stop-button) { width: 30px;
+    height: 30px; padding: 0; }
+  .inject-form .side-switch button { padding: 3px 8px; }
+  .inject-form :is(.speech-button, .phrase-menu summary, .effort-menu summary) {
+    padding-top: 4px; padding-bottom: 4px; }
+  /* While typing, the tools row steps out too and Send moves inside the box, so the box
+     is all that is left above the keyboard. Stop waits in the tools row, which Back brings
+     back: beside Send under a thumb, a miss would stop the turn (#4336). Send shares the
+     box's own grid cell, so nothing under the box can push it off the box's edge. */
+  .session-detail.keyboard-up .inject-form .composer-actions > :not(.composer-controls),
+  .session-detail.keyboard-up .inject-form .composer-controls
+    > :not(button[type="submit"]:not(.stop-button)) { display: none; }
+  .session-detail.keyboard-up .inject-form .composer-actions { position: relative; z-index: 1;
+    grid-row: 1; grid-column: 1 / -1; justify-self: end; align-self: end; margin: 0 4px 3px 0; }
+  .session-detail.keyboard-up .inject-form[data-cold-new-chat] .composer-actions { grid-row: 2; }
+  .session-detail.keyboard-up .inject-form .composer-box textarea { padding-right: 46px; }
+  /* A bigger Send, with a 44px tap area around it. */
+  .session-detail.keyboard-up .inject-form .composer-controls button[type="submit"] {
+    position: relative; width: 34px; height: 34px; }
+  .session-detail.keyboard-up .inject-form .composer-controls button[type="submit"]::before {
+    content: ""; position: absolute; inset: -5px; }
+}
+/* Most phones need the switch's short words, Main and Side, for the fullest tools row
+   (🎤, 🎧, ⚡ and an issue chip) to fit beside Stop and Send. */
+@media (max-width: 430px) {
+  .inject-form .side-switch-more { display: none; }
+}
+/* The narrowest phones need tighter tools for Send to fit beside the switch. */
+@media (max-width: 380px) {
+  .inject-form .composer-actions, .inject-form .composer-actions .composer-controls { gap: 4px; }
+  .inject-form .composer-actions button:not(.side-switch button),
+  .inject-form .composer-actions .phrase-menu summary { padding-left: 7px; padding-right: 7px; }
+  .inject-form .side-switch button { padding: 3px 6px; }
+}
+/* Under 340px the fullest row cannot fit at all; Stop and Send go to a line of their own
+   rather than off the edge. */
+@media (max-width: 340px) {
+  .inject-form .composer-actions { flex-wrap: wrap; row-gap: 6px; }
 }
 
 @media (max-width: 999px) and (prefers-reduced-motion: reduce) {
@@ -2064,6 +2198,17 @@ body.voice-log-page main { width: min(800px, 100%); }
 .voice-log-label { display: inline-block; min-width: 3.5em; color: var(--muted); font-size: 12px; }
 .voice-log-reply pre { white-space: pre-wrap; margin: 4px 0; font-size: 12px; }
 .voice-log-link { text-decoration: none; }
+/* Where a voice turn's time goes (#4360). */
+.voice-log-timing-summary { padding: 8px 0; border-bottom: 1px solid var(--line); }
+.voice-log-timing-summary h2 { margin: 0 0 2px; font-size: 1rem; }
+.voice-log-timing-summary table { border-collapse: collapse; font-size: 13px; margin-top: 4px; }
+.voice-log-timing-summary th, .voice-log-timing-summary td { padding: 2px 12px 2px 0; text-align: left; }
+.voice-log-timing-summary th { color: var(--muted); font-weight: normal; font-size: 12px; }
+.voice-log-timing-summary td + td { font-variant-numeric: tabular-nums; }
+.voice-log-timing-total td { font-weight: 600; border-top: 1px solid var(--line); }
+.voice-log-timing { font-size: 12px; color: var(--muted); }
+/* A part keeps its label and seconds on one line (#4360). */
+.voice-log-timing-part { white-space: nowrap; }
 
 /* Local files opened from absolute transcript links. Active text formats are
    escaped into this viewer; only non-text files are handed directly to the browser. */
@@ -2566,7 +2711,17 @@ button.fr-action:disabled { opacity: .5; cursor: progress; }
 /* Nothing needs you: one calm line instead of a heading and an empty box. */
 .front-needs:has([data-front-empty]) .front-title { display: none; }
 .front-needs [data-front-empty]::before { content: "✓ "; color: var(--live); }
-.front-finished:has([data-front-none]) { display: none; }
+/* Show older and its search under Recently finished (#4289): one muted line, the search
+   box opening on the same line only when its icon is tapped. */
+.front-older-bar { display: flex; align-items: center; gap: .5rem; margin: .15rem 0 .35rem 1.1rem; }
+.front-older-more { background: none; border: 0; padding: 0; color: var(--muted); font: inherit; font-size: .8rem; text-decoration: underline; cursor: pointer; }
+.front-older-find { display: flex; align-items: center; gap: .35rem; }
+.front-older-find > summary { list-style: none; cursor: pointer; color: var(--muted); font-size: .9rem; }
+.front-older-find > summary::-webkit-details-marker { display: none; }
+.front-older-find[open] { flex: 1; }
+.front-older-search { flex: 1; display: inline-flex; }
+.front-older-search input[type="search"] { flex: 1; min-width: 0; font-size: 16px; padding: .15rem .35rem; }
+.front-older-find:not([open]) .front-older-search { display: none; }
 .front-board { display: flex; flex-wrap: wrap; align-items: baseline; gap: .15rem .5rem; margin: .5rem 0;
   font-size: .8rem; color: var(--muted); }
 .front-board a { color: var(--muted); }
@@ -2651,7 +2806,7 @@ button.fr-action:disabled { opacity: .5; cursor: progress; }
 .fr-group-label { color: var(--cat); }
 .fr-group-working .fr-group-label, .fr-group-waiting .fr-group-label,
 .fr-group-finished .fr-group-label, .fr-group-paused .fr-group-label,
-.fr-group-live .fr-group-label { color: var(--fg); }
+.fr-group-live .fr-group-label, .fr-group-parked .fr-group-label { color: var(--fg); }
 .fr-group-count { color: var(--muted); font-weight: 400; }
 .fr-group-note { margin-left: auto; color: var(--muted); font-weight: 400; letter-spacing: 0; text-transform: none;
   text-decoration: none; }
@@ -3070,4 +3225,5 @@ details.ev.chat-note > summary .ev-time { margin-left: auto; flex: none; }
 .inject-form[data-cold-started] > :not(#inject-result) { display: none !important; }
 .inject-form[data-cold-started] > .inject-result.start-status { margin-top: 0; }
 .inject-form[data-cold-new-chat] .image-picker,
+.inject-form[data-cold-new-chat] .clipboard-image-button,
 .inject-form[data-cold-new-chat] .issue-post-menu { display: none !important; }

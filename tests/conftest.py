@@ -664,7 +664,7 @@ def _no_live_guesses(monkeypatch, tmp_path_factory):
     # Voice mode's fast agent (#3444) is a Haiku process too: none starts here.
     from agentdeck import voice_helper
 
-    async def no_agent(account):
+    async def no_agent(account, *args, **kwargs):
         return None
 
     monkeypatch.setattr(voice_helper, "start_process", no_agent)

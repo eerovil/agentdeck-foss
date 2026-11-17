@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 from datetime import UTC, datetime, timedelta
@@ -2417,3 +2418,36 @@ async def test_a_spare_cli_is_asked_for_and_stopped_through_the_web_client():
              role="work"),
     ]
     host.drop_spare.assert_awaited_once_with("new_chat")
+
+
+async def test_the_web_asks_the_runtime_to_wake_and_a_dropped_ask_still_launches():
+    from agentdeck.models import Account
+    from agentdeck.providers.claude_code.worker_client import ClaudeWorkerClient
+
+    app = _runtime_app()
+    host = MagicMock()
+    gate, entered, finished = asyncio.Event(), asyncio.Event(), []
+
+    async def wake(key):
+        entered.set()
+        await gate.wait()
+        finished.append(key)
+        return "spawned"
+
+    host.wake = wake
+    app.state.claude_workers.hosts["main"] = host
+    web = ClaudeWorkerClient(
+        Account("claude_code:main", "claude_code", "main", None),
+        transport=httpx.ASGITransport(app=app),
+    )
+    web._key_for = lambda session_id: {"s1": "chat-1"}.get(session_id)
+
+    assert await web.wake_worker("unknown") == ""
+    asked = asyncio.create_task(web.wake_worker("s1"))
+    await asyncio.wait_for(entered.wait(), 1)
+    asked.cancel()
+    gate.set()
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert finished == ["chat-1"]
+    assert await web.wake_worker("s1") == "spawned"

@@ -575,6 +575,7 @@ async def test_only_a_green_run_that_proves_its_commit_wakes_nobody(tmp_path, co
     from test_jobs import _settle, _wait_for
 
     told: list[str] = []
+    notes: dict[str, str] = {}
 
     async def notify(job, message):
         told.append(message)
@@ -582,6 +583,8 @@ async def test_only_a_green_run_that_proves_its_commit_wakes_nobody(tmp_path, co
 
     repo = _git_repo(tmp_path / "repo")
     queue = queue_for(tmp_path, notify=notify)
+    # #4306: the run that wakes nobody leaves its chat a pending note, once per job and commit.
+    queue._keep_note = lambda job, note_id, text: notes.setdefault(note_id, text) is not None
     await queue.start()
     try:
         job = queue.submit(
@@ -596,6 +599,40 @@ async def test_only_a_green_run_that_proves_its_commit_wakes_nobody(tmp_path, co
         await queue.stop()
 
     assert bool(told) is woken
+    assert bool(notes) is not woken
+    if notes:
+        head = queue.get(job.id).tested_workspace["head"]
+        assert list(notes) == [f"job-proved:{job.id}@{head[:12]}"]
+        assert f"passed at {head[:12]}" in notes[f"job-proved:{job.id}@{head[:12]}"]
+
+
+async def test_a_green_run_whose_note_cannot_be_kept_is_silent_as_before(tmp_path):
+    """#4306: a note store that fails leaves the proved run as it was: done, and no wake."""
+    from test_jobs import _queue as queue_for
+    from test_jobs import _settle, _wait_for
+
+    told: list[str] = []
+
+    async def notify(job, message):
+        told.append(message)
+        return True
+
+    queue = queue_for(tmp_path, notify=notify)
+    queue._keep_note = lambda job, note_id, text: (_ for _ in ()).throw(OSError("disk"))
+    await queue.start()
+    try:
+        job = queue.submit(
+            command=[sys.executable, "-c", "print('ok')"],
+            cwd=str(_git_repo(tmp_path / "repo")),
+            session_key="claude_code:main:sid",
+            purpose=VERIFICATION,
+            work_id=WORK,
+        )
+        await _settle(queue, job.id)
+        await _wait_for(lambda: queue.get(job.id).notified, what="the queue to be done with it")
+    finally:
+        await queue.stop()
+    assert told == []
 
 
 async def test_a_green_run_finished_before_a_restart_stays_silent_after_it(tmp_path):

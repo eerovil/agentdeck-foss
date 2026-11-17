@@ -4322,6 +4322,64 @@ async def test_clipboard_screenshot_attaches_to_chat_composer(tmp_path):
                 };
             }"""
         )
+
+        # A file picked after the screenshot joins it rather than replacing it (#4425),
+        # and nothing is dropped as a duplicate: two files that share name, size, type and
+        # time but not content both stay (#4426 review). The page's own clearing after a
+        # send still empties the field.
+        # Playwright's own set_files fires untrusted events, unlike a real picker, so the
+        # pick goes through Chrome's DevTools command, whose change event is trusted.
+        files = {}
+        for folder, name, body in (
+            ("a", "notes.pdf", b"%PDF"),
+            ("b", "notes.pdf", b"%PDX"),
+            ("a", "more.pdf", b"%PDF"),
+        ):
+            path = tmp_path / folder / name
+            path.parent.mkdir(exist_ok=True)
+            path.write_bytes(body)
+            os.utime(path, (1_700_000_000, 1_700_000_000))
+            files[f"{folder}/{name}"] = str(path)
+        cdp = await page.context.new_cdp_session(page)
+
+        async def pick(*keys):
+            before = await page.evaluate(
+                "() => document.querySelector('input[name=\"images\"]').files.length"
+            )
+            async with page.expect_file_chooser():
+                await page.locator('input[name="images"]').click()
+            root = await cdp.send("DOM.getDocument")
+            node = await cdp.send(
+                "DOM.querySelector",
+                {"nodeId": root["root"]["nodeId"], "selector": 'input[name="images"]'},
+            )
+            await cdp.send(
+                "DOM.setFileInputFiles",
+                {"nodeId": node["nodeId"], "files": [files[key] for key in keys]},
+            )
+            # The change event is queued as a task: wait for the kept files plus the pick.
+            await page.wait_for_function(
+                "(n) => document.querySelector('input[name=\"images\"]').files.length === n",
+                arg=before + len(keys),
+            )
+            return await page.evaluate(
+                """async () => Promise.all(Array.from(
+                    document.querySelector('input[name="images"]').files,
+                    async f => f.name + ':' + (await f.text()).slice(0, 4)
+                ))"""
+            )
+
+        picked = [await pick("a/notes.pdf"), await pick("b/notes.pdf", "a/more.pdf")]
+        picked.append(
+            await page.evaluate(
+                """() => {
+                const input = document.querySelector('input[name="images"]');
+                input.value = '';
+                input.dispatchEvent(new Event('change', {bubbles: true}));
+                return [input.files.length, document.querySelectorAll('.paste-preview').length];
+            }"""
+            )
+        )
         await browser.close()
 
     assert result == {
@@ -4331,6 +4389,192 @@ async def test_clipboard_screenshot_attaches_to_chat_composer(tmp_path):
         "previews": 1,
         "count": "1 file attached",
     }
+    png = "\ufffdPNG"  # the 0x89 byte is not UTF-8
+    assert picked == [
+        [f"screenshot.png:{png}", "notes.pdf:%PDF"],
+        [f"screenshot.png:{png}", "notes.pdf:%PDF", "notes.pdf:%PDX", "more.pdf:%PDF"],
+        [0, 0],
+    ]
+
+    # 📋 reads the clipboard in one tap (#4345): an image is added to what is already
+    # attached, text alone says there is no image, and a refusal says access is blocked.
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch()
+        page = await browser.new_page()
+        await page.set_content(
+            '<form><textarea name="message"></textarea>'
+            '<button type="button" data-clipboard-image>📋</button>'
+            '<input type="file" name="images" multiple></form>'
+        )
+        await page.evaluate(
+            """() => {
+                window.clipboardReads = [];
+                Object.defineProperty(navigator, 'clipboard', {configurable: true, value: {
+                    read: () => window.clipboardReads.shift()(),
+                }});
+            }"""
+        )
+        await page.add_script_tag(content=script)
+        clip = await page.evaluate(
+            """async () => {
+                const png = new Blob([new Uint8Array([137, 80, 78, 71])], {type: 'image/png'});
+                const item = (types) => ({types, getType: async () => png});
+                const input = document.querySelector('input[name="images"]');
+                const button = document.querySelector('[data-clipboard-image]');
+                const tap = async (read) => {
+                    window.clipboardReads.push(read);
+                    document.querySelector('.clipboard-image-note')?.remove();
+                    button.click();
+                    for (let i = 0; i < 20; i++) await new Promise(r => setTimeout(r, 5));
+                    return {
+                        files: input.files.length,
+                        note: document.querySelector('.clipboard-image-note')?.textContent
+                          || null,
+                    };
+                };
+                const shown = document.documentElement.classList
+                  .contains('can-read-clipboard');
+                const text = await tap(async () => [item(['text/plain'])]);
+                const image = await tap(async () => [item(['text/html', 'image/png'])]);
+                const last = input.files[input.files.length - 1];
+                const refused = await tap(async () => {
+                    throw new DOMException('no', 'NotAllowedError');
+                });
+                return {
+                    shown, text, image, refused,
+                    type: last.type,
+                    named: /^clipboard-\\d+\\.png$/.test(last.name),
+                    previews: document.querySelectorAll('.paste-preview').length,
+                };
+            }"""
+        )
+        await browser.close()
+
+    assert clip == {
+        "shown": False,  # set_content pages are not a secure context
+        "text": {"files": 0, "note": "No image in the clipboard"},
+        "image": {"files": 1, "note": None},
+        "refused": {"files": 1, "note": "Clipboard access is blocked for this site"},
+        "type": "image/png",
+        "named": True,
+        "previews": 1,
+    }
+
+    # Where Chrome reports what was copied (clipboardchange), 📋 hides until an image was
+    # copied, and again after text. Chrome reports only once the page may read the
+    # clipboard or a report came, so before that 📋 stays shown (#4345 follow-up).
+    css = (Path(__file__).parents[1] / "src/agentdeck/web/static/app.css").read_text()
+    watch = {}
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch()
+        for permission in ("prompt", "granted"):
+            page = await browser.new_page()
+            await page.set_content(
+                f"<style>{css}</style>"
+                '<form><textarea name="message"></textarea>'
+                '<button type="button" class="clipboard-image-button" data-clipboard-image>'
+                '📋</button><input type="file" name="images" multiple></form>'
+            )
+            await page.evaluate(
+                """(permission) => {
+                    Object.defineProperty(window, 'isSecureContext', {value: true});
+                    window.ClipboardChangeEvent = function () {};
+                    const clipboard = new EventTarget();
+                    clipboard.read = async () => [];
+                    Object.defineProperty(navigator, 'clipboard', {value: clipboard});
+                    Object.defineProperty(navigator, 'permissions', {value: {
+                        query: async () => ({state: permission}),
+                    }});
+                }""",
+                permission,
+            )
+            await page.add_script_tag(content=script)
+            watch[permission] = await page.evaluate(
+                """async () => {
+                    await new Promise(r => setTimeout(r, 20));
+                    const button = document.querySelector('[data-clipboard-image]');
+                    const shown = () => getComputedStyle(button).display !== 'none';
+                    const copy = (types) => {
+                        const event = new Event('clipboardchange');
+                        event.types = types;
+                        navigator.clipboard.dispatchEvent(event);
+                        return shown();
+                    };
+                    return [shown(), copy(['text/plain']), copy(['image/png']),
+                            copy(['text/plain']), copy(['text/html', 'image/png'])];
+                }"""
+            )
+            await page.close()
+        await browser.close()
+
+    # Not yet allowed: shown until the first report, then it follows the reports.
+    assert watch["prompt"] == [True, False, True, False, True]
+    # Allowed before: hidden from the start until an image is copied.
+    assert watch["granted"] == [False, False, True, False, True]
+
+
+@pytest.mark.browser
+async def test_clipboard_button_follows_real_clipboard_reports(tmp_path):
+    """On a real chat page with Chrome's own clipboardchange events (#4345): a fresh page
+    that may not read the clipboard keeps 📋 shown, since no report can arrive yet, even
+    after an image is copied in another tab, and one tap attaches it once the person allows
+    the read; once reading is allowed 📋 hides until an image is copied, and hides again
+    after text."""
+    from test_inject import _live_server, _web_app
+
+    app = _web_app(tmp_path)
+    image_copy = """(async () => {
+        const c = document.createElement('canvas'); c.width = 8; c.height = 8;
+        const blob = await new Promise(r => c.toBlob(r, 'image/png'));
+        await navigator.clipboard.write([new ClipboardItem({'image/png': blob})]);
+    })()"""
+    seen = {}
+    async with _live_server(app) as base_url, async_playwright() as playwright:
+        browser = await playwright.chromium.launch()
+        for name, permissions in (
+            ("fresh", ["clipboard-write"]),
+            ("allowed", ["clipboard-read", "clipboard-write"]),
+        ):
+            context = await browser.new_context(service_workers="block")
+            await context.grant_permissions(permissions)
+            page = await context.new_page()
+            await page.goto(f"{base_url}/sessions/codex:test:sid")
+            button = page.locator("form.inject-form [data-clipboard-image]")
+            await page.locator("form.inject-form").wait_for()
+            if not await page.evaluate("!!window.ClipboardChangeEvent"):
+                pytest.skip("this Chromium has no clipboardchange event")
+            await page.wait_for_timeout(100)
+            states = [await button.is_visible()]
+            for copy in (
+                "navigator.clipboard.writeText('hello')",
+                image_copy,
+                "navigator.clipboard.writeText('again')",
+            ):
+                if name == "allowed":
+                    await page.evaluate(copy)
+                    await page.wait_for_timeout(200)
+                    states.append(await button.is_visible())
+            if name == "fresh":
+                # The screenshot is copied elsewhere while the deck page was never touched.
+                writer_context = await browser.new_context()
+                await writer_context.grant_permissions(["clipboard-write"])
+                writer = await writer_context.new_page()
+                await writer.goto(f"{base_url}/healthz")
+                await writer.evaluate(image_copy)
+                await page.bring_to_front()
+                await page.wait_for_timeout(200)
+                states.append(await button.is_visible())
+                # Chrome's one-time prompt, answered yes, then the one tap.
+                await context.grant_permissions(["clipboard-read", "clipboard-write"])
+                await button.click()
+                await page.get_by_text("1 file attached").wait_for()
+                states.append(await button.is_visible())
+                await writer_context.close()
+            seen[name] = states
+            await context.close()
+        await browser.close()
+
+    assert seen == {"fresh": [True, True, True], "allowed": [False, False, True, False]}
 
 
 @pytest.mark.browser
@@ -4913,14 +5157,14 @@ async def test_mobile_session_composer_is_compact():
       <style>{css}</style>
       <body class="session-page"><main><section>
         <form id="message-form" class="inject-form">
-          <label for="inject-message">Message</label>
-          <div class="composer-input">
-            <textarea id="inject-message" rows="3"></textarea>
+          <label for="inject-message" class="composer-label">Message</label>
+          <div class="composer-input composer-box">
+            <label class="image-picker">
+              ＋ Attach file <span class="paste-hint">or paste screenshot</span>
+            </label>
+            <textarea id="inject-message" rows="1"></textarea>
             <div class="composer-suggestions" hidden></div>
           </div>
-          <label class="image-picker">
-            ＋ Attach file <span class="paste-hint">or paste screenshot</span>
-          </label>
           <input class="image-input" type="file">
           <div class="composer-actions">
             <span class="composer-hint">Enter to send</span>
@@ -4976,9 +5220,10 @@ async def test_mobile_session_composer_is_compact():
                     closedByDefault,
                     panelVisible,
                     textareaHeight: textarea.getBoundingClientRect().height,
-                    controlsAligned: Math.abs(
-                        picker.getBoundingClientRect().top - actions.getBoundingClientRect().top
-                    ) < 2,
+                    // ＋ sits inside the box, and the tools row runs under it (#4313).
+                    pickerInBox: picker.parentElement.classList.contains('composer-box')
+                      && picker.getBoundingClientRect().bottom
+                        <= actions.getBoundingClientRect().top,
                     hintHidden: getComputedStyle(actions.querySelector('.composer-hint')).display,
                     pasteHintHidden: getComputedStyle(form.querySelector('.paste-hint')).display,
                     indicatorPosition: getComputedStyle(indicator).position,
@@ -4997,8 +5242,8 @@ async def test_mobile_session_composer_is_compact():
     assert metrics["formHeight"] == metrics["noEffortHeight"] == metrics["openHeight"]
     assert metrics["closedByDefault"]
     assert metrics["panelVisible"]
-    assert metrics["textareaHeight"] == 58
-    assert metrics["controlsAligned"]
+    assert metrics["textareaHeight"] == 38
+    assert metrics["pickerInBox"]
     assert metrics["hintHidden"] == "none"
     assert metrics["pasteHintHidden"] == "none"
     assert metrics["indicatorPosition"] == "absolute"
@@ -9175,7 +9420,10 @@ async def test_mobile_keyboard_hides_the_action_bar_and_keeps_the_chat_at_its_en
                 '<div class="ev" style="min-height:2000px">older</div>');
               // This read-only chat draws no composer; an owned one's box is all it needs.
               document.querySelector('.session-detail').insertAdjacentHTML('beforeend',
-                '<form class="inject-form"><textarea id="inject-message"></textarea></form>');
+                '<form class="inject-form"><textarea id="inject-message"></textarea>' +
+                '<div class="composer-actions"><span class="mic-tool">mic</span>' +
+                '<div class="composer-controls"><button type="submit">Send</button>' +
+                '</div></div></form>');
             }"""
         )
         state = """() => {
@@ -9185,6 +9433,8 @@ async def test_mobile_keyboard_hides_the_action_bar_and_keeps_the_chat_at_its_en
             up: detail.classList.contains('keyboard-up'),
             bar: getComputedStyle(bar).display !== 'none',
             atEnd: detail.scrollHeight - detail.scrollTop - detail.clientHeight <= 1,
+            tools: getComputedStyle(document.querySelector('.mic-tool')).display !== 'none',
+            focused: document.activeElement.id === 'inject-message',
           };
         }"""
         scroll_up = "() => { document.querySelector('.session-detail').scrollTop = 0; }"
@@ -9211,9 +9461,16 @@ async def test_mobile_keyboard_hides_the_action_bar_and_keeps_the_chat_at_its_en
         keyboard_closed = await page.evaluate(state)
         await browser.close()
 
-    assert (focused_only["up"], focused_only["bar"]) == (False, True)
-    assert keyboard_up == {"up": True, "bar": False, "atEnd": True}
-    assert keyboard_closed == {"up": False, "bar": True, "atEnd": True}
+    assert (focused_only["up"], focused_only["bar"], focused_only["tools"]) == (False, True, True)
+    # Up, the tools row steps out too; Back lets go of the box so one tap reopens it (#4313).
+    assert keyboard_up == {"up": True, "bar": False, "atEnd": True, "tools": False, "focused": True}
+    assert keyboard_closed == {
+        "up": False,
+        "bar": True,
+        "atEnd": True,
+        "tools": True,
+        "focused": False,
+    }
 
 
 async def test_subagent_count_renders_on_card_and_detail_header(tmp_path):
@@ -11069,7 +11326,10 @@ async def test_session_sse_refreshes_related_links_after_live_registration(
     async def next_until(expected, *, limit=16):
         seen = []
         for _ in range(limit):
-            event = await asyncio.wait_for(gen.__anext__(), timeout=5.0)
+            # 20 s, not 5: in job 0b845e62ae1d the stream sat 5 s awaiting a tail read
+            # that does no I/O here (no transcript), so the whole loop had stalled on a
+            # busy host, as in #3669. A pass normally takes milliseconds (#4373).
+            event = await asyncio.wait_for(gen.__anext__(), timeout=20.0)
             seen.append((topic(event), event))
             if expected.issubset({name for name, _ in seen}):
                 return seen

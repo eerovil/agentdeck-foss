@@ -27,7 +27,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any
 
-from .work_derived import is_mac_pause_link
+from .work_derived import PARKED, is_mac_pause_link
 from .work_overview import (
     HANDOFF_STATES,
     RECENT_WORK,
@@ -74,7 +74,10 @@ MERGE_BLOCKED = "merge_blocked"
 # What an automatic wait is on (#2573). Nothing needs a person, but the front page lists these
 # Works under Waiting rather than Working now: a job a chat queued, or the deck's own wait.
 WAITING_JOB = "waiting_job"
-_WAITS = frozenset({WAITING_JOB})
+#: A Work a person parked until they write (#4305): it waits, but on them, so the front page
+#: lists it under Parked, not Waiting. Its row's status says so, which a folded parent keeps.
+PARKED_WAIT = "parked_wait"
+_WAITS = frozenset({WAITING_JOB, PARKED_WAIT})
 # Merged, and the agent checks it live before the Work finishes (#3578): its own front-page
 # group.
 LIVE_CHECKING = "live_checking"
@@ -291,9 +294,8 @@ _DERIVED_TONES = {
     "asked_in_chat": ATTENTION,  # the agent's reply asks the person something (#3887)
     "try_wait": ACTIVE,  # a person tries it when they can; it is not in Needs you (#4210)
 }
-_DERIVED_WAITS = frozenset(
-    {"review", "review_queued", "waiting", "queued", "scheduled", "parked", "reviving"}
-)
+# A review in progress is not one (#4311): its Work is listed under Working now, not Waiting.
+_DERIVED_WAITS = frozenset({"waiting", "queued", "scheduled", "parked", "reviving"})
 _DERIVED_HEADLINES = {
     "question": "Needs you",
     "working": "Working",
@@ -367,7 +369,7 @@ def derived_story(card: WorkCard) -> WorkStatus:
         "unfinished": "Read its last message and tell it what to do next",
         "pr_held": "Lift the hold, merge it by hand, or finish the Work",
         "pr_stuck": "Open the pull request and see why nothing moved it",
-        "live_failed": "Read what failed live, then reopen the issue or finish the Work",
+        "live_failed": "Read what failed live, then tell the agent what to do or finish the Work",
         "not_live": (
             "Deploy what is not running yet and tell the agent to check it again,"
             " or finish the Work"
@@ -390,6 +392,8 @@ def derived_story(card: WorkCard) -> WorkStatus:
             if live
             else AWAITING_TRY
             if derived.kind == "try_wait"
+            else PARKED_WAIT
+            if derived.kind == PARKED
             else WAITING_JOB
             if derived.kind in _DERIVED_WAITS
             else ""
@@ -852,8 +856,16 @@ class FrontRow:
 
     @property
     def waits(self) -> bool:
-        """Listed under Waiting: an automatic wait such as a job (#2573)."""
+        """Waits on something: an automatic wait such as a job (#2573), or a parked Work. The
+        maps count it as not working; ``front_sections`` lists a parked one under Parked (#4305)."""
         return self.section == IN_PROGRESS and self.status.kind in _WAITS
+
+    @property
+    def parked(self) -> bool:
+        """Listed under Parked (#4305): a person asked it to wait for their message (#3560),
+        so it waits on nothing automatic and is kept out of Waiting. Read from the row's
+        status, not its card: a folded parent shows its leading child's status on its own card."""
+        return self.section == IN_PROGRESS and self.status.kind == PARKED_WAIT
 
     @property
     def trying(self) -> bool:
@@ -1026,6 +1038,8 @@ class FrontSections:
     live: tuple[FrontRow, ...] = ()
     # Starred Works with nothing current and nothing finished (#4121): quiet, but still listed.
     idle: tuple[FrontRow, ...] = ()
+    # Current Works a person parked until they write (#4305), kept out of ``waiting``.
+    parked: tuple[FrontRow, ...] = ()
     # Current Works only a person can check live (#4210), kept out of Needs you and Working.
     trying: tuple[FrontRow, ...] = ()
 
@@ -1034,7 +1048,7 @@ class FrontSections:
         """Every row the sections hold, each once; Recently stopped only repeats Needs you."""
         return (
             *self.needs_you, *self.hidden, *self.active, *self.waiting, *self.live, *self.trying,
-            *self.idle, *self.finished, *self.paused,
+            *self.idle, *self.finished, *self.paused, *self.parked,
         )
 
     @property
@@ -1048,7 +1062,7 @@ class FrontSections:
             row
             for section in (
                 self.needs_you, self.active, self.waiting, self.live, self.trying, self.idle,
-                self.finished, self.paused,
+                self.finished, self.paused, self.parked,
             )
             for row in section
             if row.starred
@@ -1230,6 +1244,8 @@ def front_sections(
     active = [row for row in active if not row.live]
     trying = [row for row in active if row.trying]
     active = [row for row in active if not row.trying]
+    parked = [row for row in active if row.parked]
+    active = [row for row in active if not row.parked]
     waiting = [row for row in active if row.waits]
     active = [row for row in active if not row.waits]
     # Starred leads both lists, so each bound below counts only the rows its group lists.
@@ -1264,7 +1280,7 @@ def front_sections(
     paused = sorted(by[PAUSED], key=lambda row: (-stamp(row), row.card.work_id))
     shown = (
         *needs, *put_away, *active[:active_limit], *waiting, *live, *trying, *idle,
-        *finished[:finished_limit], *paused,
+        *finished[:finished_limit], *paused, *parked,
     )
     repositories = {row.card.source_label.rpartition("#")[0].casefold() for row in shown}
     return FrontSections(
@@ -1282,6 +1298,7 @@ def front_sections(
         idle=tuple(idle),
         stopped=tuple(stopped),
         paused=tuple(paused),
+        parked=tuple(parked),
     )
 
 

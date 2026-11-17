@@ -449,6 +449,14 @@ class SessionProvider(ABC):
         """
         return None
 
+    def fork_copy_end(self, account: Account, session: Session, cut: str) -> int:
+        """The line of side chat ``session`` where history copied up to ``cut`` ends (#4313).
+
+        0 when the provider copies nothing into the new chat's own transcript, as Codex
+        does, or the cut is not found: then every line is the side chat's own.
+        """
+        return 0
+
     def newest_fork(self, account: Account, session: Session) -> tuple[int, str] | None:
         """``(line, cut)`` for a Work's side chat of ``session`` (#4199), or None.
 
@@ -522,6 +530,7 @@ class SessionProvider(ABC):
         session_token: str | None = None,
         fork_from: ForkFrom | None = None,
         role: str | None = None,
+        web_only: bool = False,
     ) -> InjectResult:
         """Start one persisted session with its first turn.
 
@@ -531,6 +540,10 @@ class SessionProvider(ABC):
 
         ``fork_from`` starts it as a copy of another session's history up to a
         cut, never as an empty chat: a provider that cannot honour it refuses.
+
+        ``web_only`` starts a chat that can only search and read the web, locked by
+        the provider's own configuration (#4381); a provider that cannot lock one
+        refuses rather than start an open chat.
         """
         return InjectResult(False, "this provider cannot start sessions")
 

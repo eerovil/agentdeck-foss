@@ -895,13 +895,24 @@ class AppState:
         return pending(source_session_key) if pending is not None else None
 
     def reserve_chat_fork(
-        self, token: str, source_session_key: str, source_seq: int, action_id: str | None
+        self,
+        token: str,
+        source_session_key: str,
+        source_seq: int,
+        action_id: str | None,
+        *,
+        kind: str | None = None,
+        cut_ref: str | None = None,
     ) -> str | None:
         """Record a side chat's source (#2485); the token that owns this press, or None."""
         reserve = getattr(self.budget_db, "reserve_chat_fork", None)
         if reserve is None:
             return None
-        return reserve(token, source_session_key, source_seq, action_id)
+        if kind is None and cut_ref is None:
+            return reserve(token, source_session_key, source_seq, action_id)
+        return reserve(
+            token, source_session_key, source_seq, action_id, kind=kind, cut_ref=cut_ref
+        )
 
     def release_chat_fork(self, token: str) -> None:
         """Drop a side chat's reservation that no session ever claimed (#2485)."""
@@ -917,6 +928,22 @@ class AppState:
         HIDDEN.add(session_key, first_seq, last_seq)
         self.sessions_changed([session_key])
         return True
+
+    def side_chat_forks(self, source_session_keys) -> list:
+        """The message-box side chats cut from any of these legs, newest first (#4313)."""
+        reader = getattr(self.budget_db, "side_chat_forks", None)
+        return reader(tuple(source_session_keys)) if reader is not None else []
+
+    def chat_fork_by_action(self, action_id: str) -> str | None:
+        """The token of the side chat this press started, or None (#4313)."""
+        reader = getattr(self.budget_db, "chat_fork_by_action", None)
+        return reader(action_id) if reader is not None else None
+
+    def note_side_chat_seen(self, token: str, session_key: str, seq: int) -> None:
+        """Record what of the main chat a side chat has now heard of (#4313)."""
+        write = getattr(self.budget_db, "note_side_chat_seen", None)
+        if write is not None:
+            write(token, session_key, seq)
 
     def chat_fork_source(self, session_key: str) -> tuple[str, int] | None:
         """The session and transcript line a side chat was cut from, or None."""
@@ -1442,15 +1469,19 @@ class AppState:
         target_repo: str,
         target_number: int,
         head_sha: str,
+        round_id: str = "",
     ) -> None:
         """Remember the commit the review chat just opened covers for one pull request: a
-        ``chat`` row in that head's review history. Every opening path comes through here."""
+        ``chat`` row in that head's review history. Every opening path comes through here.
+        ``round_id`` is the round id written into the chat's body, which its reviewer stamps
+        its comments with (#4386); "" for a chat from before it."""
         if self.db is None or not chat_repository or not head_sha:
             return
         chat = f"{chat_repository}#{chat_number}".lower()
         pull = f"{target_repo}#{target_number}".lower()
         key = f"chat:{chat}:{pull}@{head_sha.lower()}"
-        self.record_review_event(pull, head_sha, review_history.CHAT, key, data={"chat": chat})
+        data = {"chat": chat, **({"round": round_id.lower()} if round_id else {})}
+        self.record_review_event(pull, head_sha, review_history.CHAT, key, data=data)
 
     def record_review_event(
         self,

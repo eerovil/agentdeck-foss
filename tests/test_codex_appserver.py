@@ -277,6 +277,9 @@ bearer_token_env_var = "ABACUS_MCP_TOKEN"
     assert "--property=StandardOutput=null" in command
     assert "--property=StandardError=null" in command
     assert "--property=LimitNOFILE=65536" in command
+    assert "--property=UnsetEnvironment=SSH_ASKPASS SUDO_ASKPASS GIT_ASKPASS" in command
+    assert "--setenv=GIT_TERMINAL_PROMPT=0" in command
+    assert "--setenv=SSH_ASKPASS_REQUIRE=never" in command
     assert "--property=RuntimeDirectory=agentdeck-app-server-test" in command
     assert "--setenv=CODEX_HOME=" + str(tmp_path) in command
     assert "--setenv=AGENTDECK_GH_CONSUMER=codex:test" in command
@@ -2077,6 +2080,8 @@ async def test_persistent_backend_below_the_file_limit_is_stale(tmp_path, monkey
         return Process(args)
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", create_subprocess_exec)
+    # The askpass read takes the faked answer as a PID: give it no such process.
+    monkeypatch.setattr("agentdeck.providers.codex.appserver._PROC_ROOT", tmp_path / "proc")
 
     assert await server._ensure_persistent_backend({}) == socket
     assert server._backend_env_stale is True
@@ -2101,6 +2106,62 @@ async def test_persistent_backend_below_the_file_limit_is_stale(tmp_path, monkey
     assert server._backend_env_stale is False
 
 
+@pytest.mark.parametrize(
+    ("environ", "stale"),
+    [
+        (b"HOME=/h\0SSH_ASKPASS=/usr/bin/ksshaskpass\0SSH_ASKPASS_REQUIRE=never\0", True),
+        (b"HOME=/h\0GIT_ASKPASS=/x\0SSH_ASKPASS_REQUIRE=never\0", True),
+        # With DISPLAY set, ssh runs its built-in askpass unless told never to.
+        (b"HOME=/h\0DISPLAY=:0\0", True),
+        (b"HOME=/h\0NOT_SSH_ASKPASS=1\0SSH_ASKPASS_REQUIRE=never\0", False),
+        (None, False),  # gone or unreadable: keep a working backend
+    ],
+)
+async def test_a_backend_with_an_askpass_variable_is_replaced_when_idle(
+    tmp_path, monkeypatch, environ, stale
+):
+    """The host guard never restarts it: only its owner knows its threads are idle (#4340)."""
+    socket = tmp_path / "control.sock"
+    socket.touch()
+    server = CodexAppServer(Account("codex:test", "codex", "test", tmp_path))
+    monkeypatch.setattr(server, "_backend_identity", lambda: ("backend.service", socket))
+    monkeypatch.setattr("agentdeck.providers.codex.appserver._PROC_ROOT", tmp_path / "proc")
+    if environ is not None:
+        (tmp_path / "proc" / "4242").mkdir(parents=True)
+        (tmp_path / "proc" / "4242" / "environ").write_bytes(environ)
+    shown = []
+
+    class Process:
+        returncode = 0
+
+        def __init__(self, args):
+            self.args = args
+
+        async def wait(self):
+            return 0
+
+        async def communicate(self):
+            if "--property=MainPID" in self.args:
+                return b"4242\n", b""
+            return b"", b""
+
+    async def create_subprocess_exec(*args, **kwargs):
+        shown.append(args)
+        return Process(args)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_subprocess_exec)
+    for check in ("_persistent_backend_nofile_stale", "_persistent_backend_args_stale"):
+        monkeypatch.setattr(server, check, AsyncMock(return_value=False))
+
+    assert await server._ensure_persistent_backend({}) == socket
+    assert server._backend_env_stale is stale
+    assert (
+        "systemctl", "--user", "show", "--property=MainPID", "--value", "backend.service"
+    ) in shown
+    # A stale backend is then replaced only through the idle-only refresh, which
+    # test_stale_persistent_backend_refreshes_only_after_threads_are_idle pins.
+
+
 async def test_a_thread_list_page_of_large_first_messages_fits_on_one_line():
     """Chats opened with 400 KB prompts made a 38 MB reply that stopped the runtime."""
     preview = "x" * 425_000
@@ -2112,3 +2173,202 @@ async def test_a_thread_list_page_of_large_first_messages_fits_on_one_line():
 
     assert await reader.readline() == reply + b"\n"
     assert len(reply) * 8 < STDOUT_LINE_LIMIT
+
+
+# --- Web-only research chats (#4381) ------------------------------------------------
+
+
+def _web_only_server(tmp_path: Path, web_only=lambda _thread_id: False):
+    (tmp_path / "config.toml").write_text(
+        '[mcp_servers.from-file]\ncommand = "true"\n', encoding="utf-8"
+    )
+    server = CodexAppServer(
+        Account("codex:test", "codex", "test", tmp_path),
+        persistent_backend=False,
+        web_only=web_only,
+    )
+    server.start = AsyncMock()
+    calls: list[tuple[str, dict]] = []
+
+    async def request(method, params, **kwargs):
+        calls.append((method, params))
+        if method == "config/read":
+            return {"config": {"mcp_servers": {"from-process": {"url": "http://x"}}}}
+        if method == "thread/start":
+            return {"thread": {"id": "thread-1", "status": {"type": "idle"}}}
+        if method == "turn/start":
+            return {"turn": {"id": "turn-1", "status": "inProgress"}}
+        return {}
+
+    server._request = request
+    research = tmp_path / "research"
+    research.mkdir()
+    return server, calls, research
+
+
+async def test_a_web_only_chat_starts_locked_and_takes_only_its_first_turn(tmp_path):
+    from agentdeck.models import ForkFrom
+    from agentdeck.providers.codex.web_only import (
+        WEB_ONLY_CUT_OFF,
+        WEB_ONLY_FORK_REFUSAL,
+        WEB_ONLY_INSTRUCTIONS,
+        WEB_ONLY_RELOAD_REFUSAL,
+        WEB_ONLY_SWITCH_REFUSAL,
+        WEB_ONLY_TURN_REFUSAL,
+        web_only_config,
+    )
+
+    server, calls, research = _web_only_server(tmp_path)
+
+    result = await server.start_thread(
+        research, "Ask Reddit", sandbox="workspace-write", approval_policy="on-request",
+        session_token="secret-token-4381", web_only=True,
+    )  # fmt: skip
+
+    assert result.accepted
+    assert calls[0] == ("config/read", {"cwd": str(research)})
+    method, params = calls[1]
+    assert method == "thread/start"
+    # Both the account file's server and the long-lived process's are switched off.
+    assert params["config"] == web_only_config({"from-file", "from-process"})
+    assert params["config"]["mcp_servers"] == {
+        "from-file": {"enabled": False},
+        "from-process": {"enabled": False},
+    }
+    assert params["config"]["features"]["shell_tool"] is False
+    assert params["config"]["features"]["unified_exec"] is False
+    assert params["config"]["agents"] == {"enabled": False, "max_depth": 0}
+    assert (params["sandbox"], params["approvalPolicy"]) == ("read-only", "never")
+    # No session token or deck guide reaches an untrusted question's model.
+    assert params["developerInstructions"] == WEB_ONLY_INSTRUCTIONS
+    assert "secret-token-4381" not in json.dumps(calls)
+    assert calls[2][0] == "turn/start"
+    sent = len(calls)
+
+    for later in (
+        lambda: server.start_turn("thread-1", "and one more", wait=False),
+        lambda: server.queue_turn("thread-1", "and one more"),
+        lambda: server.steer("thread-1", "and one more"),
+        lambda: server.compact("thread-1"),
+    ):
+        refused = await later()
+        assert (refused.accepted, refused.reason) == (False, WEB_ONLY_TURN_REFUSAL)
+    for switch in (
+        lambda: server.set_permission_prompts("thread-1", True),
+        lambda: server.set_bypass_permissions("thread-1", True),
+    ):
+        refused = await switch()
+        assert (refused.accepted, refused.reason) == (False, WEB_ONLY_SWITCH_REFUSAL)
+    forked = await server.start_thread(
+        tmp_path, "side chat", fork_from=ForkFrom("thread-1", "turn-1")
+    )
+    assert (forked.accepted, forked.reason) == (False, WEB_ONLY_FORK_REFUSAL)
+    assert len(calls) == sent
+
+    server._loaded.discard("thread-1")
+    with pytest.raises(AppServerError, match=WEB_ONLY_RELOAD_REFUSAL):
+        await server._ensure_loaded("thread-1")
+    waited = await server.wait_for_thread("thread-1")
+    assert (waited.accepted, waited.reason) == (False, WEB_ONLY_CUT_OFF)
+    assert not any(method == "thread/resume" for method, _ in calls)
+
+
+async def test_a_web_only_chat_starts_nothing_without_codexs_own_config(tmp_path):
+    server, calls, research = _web_only_server(tmp_path)
+
+    async def no_config(method, params, **kwargs):
+        calls.append((method, params))
+        return {}
+
+    server._request = no_config
+
+    result = await server.start_thread(research, "Ask Reddit", web_only=True)
+
+    assert not result.accepted
+    assert [method for method, _ in calls] == ["config/read"]
+
+
+async def test_a_web_only_chat_refuses_a_folder_with_files_in_it(tmp_path):
+    server, calls, research = _web_only_server(tmp_path)
+    (research / "secret.env").write_text("TOKEN=1")
+
+    result = await server.start_thread(research, "Ask Reddit", web_only=True)
+
+    assert not result.accepted
+    assert "not empty" in result.reason
+    assert calls == []
+
+
+@pytest.mark.parametrize("web_only_read", ["locked", "broken"])
+async def test_recovery_cuts_off_a_running_web_only_chat_instead_of_resuming_it(
+    tmp_path, monkeypatch, web_only_read
+):
+    from agentdeck.providers.codex.web_only import WEB_ONLY_CUT_OFF
+
+    def web_only(thread_id):
+        if web_only_read == "broken":
+            if thread_id == "research":
+                raise RuntimeError("database is locked")
+            return False
+        return thread_id == "research"
+
+    server = CodexAppServer(
+        Account("codex:test", "codex", "test", tmp_path),
+        persistent_backend=False,
+        web_only=web_only,
+    )
+    calls: list[tuple[str, dict]] = []
+    rollouts = tmp_path / "sessions" / "2026" / "11" / "14"
+    rollouts.mkdir(parents=True)
+    for thread_id in ("ordinary", "research"):
+        (rollouts / f"{thread_id}.jsonl").write_text(
+            json.dumps({"type": "session_meta", "payload": {"originator": "agentdeck"}})
+            + "\n"
+        )
+
+    async def request(method, params, **kwargs):
+        calls.append((method, params))
+        if method == "thread/resume":
+            return {"thread": {"id": params["threadId"], "status": {"type": "active"}}}
+        if method == "thread/list":
+            return {
+                "data": [
+                    {
+                        "id": thread_id,
+                        "path": str(rollouts / f"{thread_id}.jsonl"),
+                        "status": {"type": "active"},
+                        "turns": [{"id": f"{thread_id}-turn", "status": "inProgress"}],
+                    }
+                    for thread_id in ("ordinary", "research")
+                ]
+            }
+        return {}
+
+    server._request = request
+
+    await server._recover_owned()
+
+    resumed = [params["threadId"] for method, params in calls if method == "thread/resume"]
+    assert resumed == ["ordinary"]
+    assert ("turn/interrupt", {"threadId": "research", "turnId": "research-turn"}) in calls
+    assert "research" not in server._loaded
+    assert server.thread_status("research") == "notLoaded"
+    waited = await server.wait_for_thread("research")
+    assert (waited.accepted, waited.reason) == (False, WEB_ONLY_CUT_OFF)
+    assert server.last_result("research")[1:] == ("failed", WEB_ONLY_CUT_OFF)
+    # Its stale `active` no longer holds back a credential refresh of the backend.
+    server._persistent_backend = True
+    server._backend_env_stale = True
+    server._owned.discard("ordinary")
+    server.stop = AsyncMock()
+    server.start = AsyncMock()
+
+    class _Stopped:
+        async def wait(self):
+            return 0
+
+    async def fake_exec(*_args, **_kwargs):
+        return _Stopped()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    assert await server._refresh_persistent_backend_if_idle()

@@ -187,13 +187,16 @@ def _needs_order(row: FrontRow) -> tuple[int, int, float]:
 
 
 # D5: where a parent row stands, by the most urgent of itself and its children after Needs you.
-_PLACE = {"active": 0, "waiting": 1, "live": 2, FINISHED: 3}
+_PLACE = {"active": 0, "waiting": 1, "live": 2, "parked": 3, FINISHED: 4}
 
 
 def _place(row: FrontRow) -> str:
     """The front-page list a row would be in on its own (``front_sections``)."""
     if row.section == IN_PROGRESS:
-        return "live" if row.live else "waiting" if row.waits else "active"
+        if row.live:
+            return "live"
+        # Parked first: a parked row also ``waits``, but is listed under Parked (#4305).
+        return "parked" if row.parked else "waiting" if row.waits else "active"
     return row.section
 
 

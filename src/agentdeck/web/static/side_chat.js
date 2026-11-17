@@ -50,7 +50,10 @@
     var legs = forkLegs(form);
     var events = Array.prototype.slice.call(
       document.querySelectorAll('.session-detail [data-event-seq]')
-    );
+    ).filter(function (event) {
+      // The box's side chat (#4313) is another chat shown in this one's place.
+      return !event.closest('[data-side-view]');
+    });
     var sideChat = !!document.querySelector('[data-side-chat-origin]');
     events.forEach(function (event, index) {
       var fork = event.querySelector('[data-fork-toggle]');
@@ -135,12 +138,15 @@
     return text ? text.innerText.trim() : '';
   }
 
+  function summaryText(title, text) {
+    return SEND_BACK_PREFIX + ' “' + title + '” (for information):\n\n' + text;
+  }
+
   function sendBack(text) {
     var origin = document.querySelector('[data-side-chat-origin]');
     if (!origin || !origin.dataset.targetUrl || !text) return;
     var status = origin.querySelector('[data-send-back-status]');
-    var title = origin.dataset.sideChatTitle || 'this side chat';
-    var summary = SEND_BACK_PREFIX + ' “' + title + '” (for information):\n\n' + text;
+    var summary = summaryText(origin.dataset.sideChatTitle || 'this side chat', text);
     // Asked now rather than when this page loaded: the original may have moved on
     // to a new leg since, and only that leg's composer restores the draft.
     fetch(origin.dataset.targetUrl, { headers: { Accept: 'application/json' }, cache: 'no-store' })
@@ -181,7 +187,9 @@
     }
     if (event.target.closest('[data-send-back-latest]')) {
       event.preventDefault();
-      var replies = document.querySelectorAll('.session-detail .ev.assistant[data-event-seq]');
+      var replies = document.querySelectorAll(
+        '.session-detail .transcript .ev.assistant[data-event-seq]'
+      );
       sendBack(messageText(replies[replies.length - 1]));
     }
   });
@@ -190,6 +198,6 @@
   document.body.addEventListener('htmx:afterSettle', refresh);
   // A chat the front page opens in its column is inserted without `htmx:load`.
   document.addEventListener('agentdeck:session-navigation', refresh);
-  window.agentdeckSideChat = { refresh: refresh };
+  window.agentdeckSideChat = { refresh: refresh, summary: summaryText };
   refresh();
 })();

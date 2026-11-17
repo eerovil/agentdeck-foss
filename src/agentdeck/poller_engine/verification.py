@@ -98,7 +98,12 @@ def _proven_head(job: dict, jobs: Iterable[object]) -> str:
 
 def proves_commit(job: dict) -> bool:
     """Whether this job passed on its own, on a clean tree that held still (#4080)."""
-    return _passed(job) and bool(_proven_head(job, ()))
+    return bool(proven_commit(job))
+
+
+def proven_commit(job: dict) -> str:
+    """The commit this job proves by passing on its own on a clean, held tree, or ""."""
+    return _proven_head(job, ()) if _passed(job) else ""
 
 
 def _passed(job: dict) -> bool:
@@ -154,6 +159,42 @@ def credited_head_for_work_alone(job: object, *, work_id: str, jobs: Iterable[ob
     if not wanted or named != wanted or str(job.get("purpose") or "") != PURPOSE:
         return ""
     return _proven_head(job, jobs)
+
+
+SCRIPT_COMMAND = ("bin/test.sh",)
+
+
+def _runs_script(job: object) -> bool:
+    return isinstance(job, dict) and tuple(str(part) for part in job.get("command") or []) == (
+        SCRIPT_COMMAND
+    )
+
+
+def script_green_head_for_work_alone(job: object, *, work_id: str) -> str:
+    """The commit a verification of exactly ``bin/test.sh`` proves green (#4399), or "".
+
+    The lighter review merges on the script passing on its own: unlike a full suite, a failed
+    script is never forgiven by flaky follow-ups (#4401 review), so no other row is read.
+    """
+    return credited_head_for_work_alone(job, work_id=work_id) if _runs_script(job) else ""
+
+
+def script_failed_head_for_work_alone(
+    job: object, *, work_id: str, jobs: Iterable[object] = ()
+) -> str:
+    """The commit a verification of exactly ``bin/test.sh`` failed at, settled (#4401 review).
+
+    Only unfinished rows are read: they keep a failure unsettled, while finished follow-ups
+    forgive nothing, as ``script_green_head_for_work_alone`` credits no forgiven failure.
+    """
+    if not _runs_script(job):
+        return ""
+    unfinished = [
+        row
+        for row in jobs
+        if isinstance(row, dict) and str(row.get("state") or "") in {"queued", "running"}
+    ]
+    return failed_head_for_work_alone(job, work_id=work_id, jobs=unfinished)
 
 
 def moved_head_for_work_alone(job: object, *, work_id: str) -> str:

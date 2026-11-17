@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
@@ -39,6 +40,8 @@ class _Deck:
         self.git_calls.append(args)
         if args[:2] == ("remote", "get-url"):
             return (0, self.origins[cwd]) if cwd in self.origins else (2, "no such remote")
+        if args[0] == "ls-remote":
+            return 0, "ref: refs/heads/main\tHEAD\n" + HEAD + "\tHEAD"
         if args[0] == "rev-parse":
             return 0, str(cwd.parent.parent / ".git") if ".worktrees" in str(cwd) else str(
                 cwd / ".git"
@@ -137,6 +140,116 @@ async def test_the_cap_holds_and_a_stopped_reviewer_frees_its_place_and_checkout
 
 
 @pytest.mark.asyncio
+async def test_a_design_review_reads_the_default_branch_once_per_design(tmp_path):
+    """#4332: one reviewer per design comment, on a checkout of the default branch."""
+    deck = _Deck(tmp_path)
+    reviewer = deck.reviewer(tmp_path)
+    design = "https://github.com/owner/repo/issues/3#issuecomment-55"
+
+    started = await reviewer.start_design("owner/repo#3", design)
+
+    assert "started on the design" in started.summary
+    ((kind, cwd, text, token),) = deck.started
+    assert cwd.parent == deck.root / ".worktrees" and cwd.name.startswith("design-3-")
+    assert ("fetch", "-q", "origin", "+refs/heads/main:refs/remotes/origin/main") in deck.git_calls
+    assert ("worktree", "add", "--detach", str(cwd), "origin/main") in deck.git_calls
+    assert agent_review.is_reviewer_prompt(text)
+    assert "/claude Design review of owner/repo#3: pass 55" in text
+    # Only this reviewer gives the verdict on this design (#4332 review); its brief carries
+    # its token, for a Codex shell that has no variable for it.
+    ledger = tmp_path / "agent-reviews.json"
+    assert agent_review.reviews_design(ledger, token, "Owner/Repo#3", "55")
+    assert f"--session-token {token} " in text
+    for other in ((token, "owner/repo#3", "56"), ("x", "owner/repo#3", "55"), ("", "o/r#3", "")):
+        assert not agent_review.reviews_design(ledger, *other)
+    deck.alive[token] = True
+    again = await reviewer.start_design("owner/repo#3", design)
+    assert "already reviews" in again.summary and len(deck.started) == 1
+    # A newer design waits for a place like any review.
+    with pytest.raises(ReviewBusy):
+        await reviewer.start_design("owner/repo#3", design.replace("55", "56"))
+    with pytest.raises(ReviewError):
+        await reviewer.start_design("owner/repo#3", "https://github.com/owner/repo/issues/3")
+
+
+@pytest.mark.asyncio
+async def test_a_design_review_holds_its_place_through_a_slow_checkout(tmp_path):
+    """#4337 review: the place is taken before the checkout, so a reader sees the reviewer
+    starting and a second ask waits for it and starts no other; a failed checkout gives the
+    place back; a reviewer that stopped with no verdict is replaced on the next ask."""
+    deck = _Deck(tmp_path)
+    reviewer = deck.reviewer(tmp_path)
+    ledger = tmp_path / "agent-reviews.json"
+    design = "https://github.com/owner/repo/issues/3#issuecomment-55"
+    slow, plain = asyncio.Event(), deck.git
+
+    async def git(*args: str, cwd: Path) -> tuple[int, str]:
+        if args[0] == "ls-remote":
+            await slow.wait()
+        return await plain(*args, cwd=cwd)
+
+    reviewer._git = git
+    first = asyncio.create_task(reviewer.start_design("owner/repo#3", design))
+    second = asyncio.create_task(reviewer.start_design("owner/repo#3", design))
+    for _ in range(20):
+        await asyncio.sleep(0)
+    line = agent_review.design_reviewer(ledger, "owner/repo#3", "55")
+    assert line["starting"] and not line["path"] and deck.started == []
+    later = deck.now + agent_review.SPAWN_GRACE_S + 1
+    assert agent_review.running(line, later, lambda token: None)
+    gone = {**line, "pid": 2**22 + 12345}
+    assert not agent_review.running(gone, deck.now, lambda token: None)
+    slow.set()
+    await first
+    assert "already reviews" in (await second).summary and len(deck.started) == 1
+    (line,) = json.loads(ledger.read_text())
+    assert "starting" not in line and line["path"] == str(deck.started[0][1])
+
+    # Stopped with no verdict: the next ask starts a new reviewer on the same comment.
+    deck.alive[line["token"]] = False
+    deck.now += agent_review.START_FLOOR_S
+    await reviewer.start_design("owner/repo#3", design)
+    assert len(deck.started) == 2
+
+    async def broken(*args: str, cwd: Path) -> tuple[int, str]:
+        return (128, "no remote") if args[0] == "ls-remote" else await plain(*args, cwd=cwd)
+
+    reviewer._git = broken
+    deck.alive[deck.started[1][3]] = False
+    deck.now += agent_review.START_FLOOR_S
+    with pytest.raises(ReviewError, match="default branch"):
+        await reviewer.start_design("owner/repo#3", design)
+    assert json.loads(ledger.read_text()) == []
+
+
+@pytest.mark.asyncio
+async def test_a_design_review_starts_from_the_asking_chats_checkout(tmp_path):
+    """#4332 review: the design's code is the repository the asking chat's own checkout
+    works in, even when the card lives in another, issues-only repository; with no
+    readable checkout it is the issue's repository."""
+    deck = _Deck(tmp_path)
+    store = tmp_path / "store"
+    (store / ".worktrees" / "issue-3").mkdir(parents=True)
+    own = store / ".worktrees" / "issue-3"
+    deck.origins[own] = "git@github.com:Acme/store.git"
+    reviewer = deck.reviewer(tmp_path)
+    design = "https://github.com/acme/issues/issues/3#issuecomment-55"
+
+    await reviewer.start_design("acme/issues#3", design, checkout=str(own))
+    ((_kind, cwd, text, _token),) = deck.started
+    assert cwd.parent == store / ".worktrees", "the code's own main checkout"
+    assert "/claude Design review of acme/issues#3: pass 55" in text, "verdicts stay on the card"
+
+    for n, checkout in enumerate((str(tmp_path / "gone"), str(tmp_path))):  # gone, no origin
+        other = _Deck(tmp_path / f"b{n}")
+        await other.reviewer(tmp_path / f"b{n}").start_design(
+            "owner/repo#3", design.replace("acme/issues", "owner/repo"), checkout=checkout
+        )
+        ((_kind, cwd, _text, _token),) = other.started
+        assert cwd.parent == other.root / ".worktrees"
+
+
+@pytest.mark.asyncio
 async def test_a_start_that_cannot_happen_leaves_the_head_pending(tmp_path):
     """Every refusal is a ``ReviewError``, which the router keeps pending and asks again."""
     deck = _Deck(tmp_path)
@@ -230,3 +343,46 @@ def test_a_reviewer_idle_on_its_own_turn_runs_while_its_sub_agents_work():
     assert hooks["alive"]("tok") is True
     state.update_session(replace(reviewer, subagent_count=0, subagents=()))
     assert hooks["alive"]("tok") is False
+
+
+@pytest.mark.asyncio
+async def test_git_never_opens_a_password_box(tmp_path, monkeypatch):
+    """#4337: the services process inherits the desktop's ``SSH_ASKPASS``; git ran it, a
+    password box waited for nobody, and every design review hung. Git now speaks to GitHub
+    through the deck's helper only, never asking, and a timeout kills its whole group."""
+    seen = {}
+
+    class _Proc:
+        pid = 4337
+        returncode = 0
+
+        async def communicate(self):
+            await asyncio.sleep(1)
+            return b"", b""
+
+        async def wait(self):
+            return 0
+
+    async def spawn(*args, **kwargs):
+        seen.update(kwargs)
+        return _Proc()
+
+    killed = []
+    monkeypatch.setenv("SSH_ASKPASS", "/usr/bin/ksshaskpass")
+    monkeypatch.setenv("GIT_ASKPASS", "/usr/bin/ksshaskpass")
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    monkeypatch.setattr(agent_review.os, "killpg", lambda pid, sig: killed.append(pid))
+    monkeypatch.setattr(agent_review, "GIT_TIMEOUT_S", 0.01)
+
+    assert await agent_review.git("ls-remote", "origin", cwd=tmp_path) == (124, "timed out")
+
+    env = seen["env"]
+    assert "SSH_ASKPASS" not in env and "GIT_ASKPASS" not in env
+    assert env["GIT_TERMINAL_PROMPT"] == "0"
+    config = {
+        env[f"GIT_CONFIG_KEY_{n}"]: env[f"GIT_CONFIG_VALUE_{n}"]
+        for n in range(int(env["GIT_CONFIG_COUNT"]))
+    }
+    assert config["credential.interactive"] == "false"
+    assert "agentdeck.git_credential" in config["credential.https://github.com.helper"]
+    assert seen["start_new_session"] and killed == [4337]

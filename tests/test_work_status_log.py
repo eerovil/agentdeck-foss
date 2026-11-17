@@ -347,7 +347,7 @@ async def test_no_overview_is_built_before_every_accounts_first_scan(monkeypatch
 
     async def load(app, **kwargs):
         built.append(scanned)
-        return WorkOverview(archived=len(built) - 1)
+        return WorkOverview(hidden=len(built) - 1)
 
     bus = SimpleNamespace(publish=lambda topic: None)
     state = SimpleNamespace(
@@ -366,7 +366,7 @@ async def test_no_overview_is_built_before_every_accounts_first_scan(monkeypatch
     # #3108: a page load waits briefly for a stale overview's rebuild, rather than painting
     # the old cards and swapping in the new ones a moment later.
     service._stale = True
-    assert (await service.current(wait=2.0)).archived == 1 and built == [True, True]
+    assert (await service.current(wait=2.0)).hidden == 1 and built == [True, True]
 
 
 # --- through the deck ----------------------------------------------------------------------------

@@ -224,6 +224,33 @@
   </div>
 
   <div id="tool-activity" sse-swap="tools">{{ session_fragments["tools"] | safe }}</div>
+
+  {% if can_inject and side_chat_box %}
+  {#- The chat's one side chat (#4313), shown in the chat's place while the box's switch is
+      on Side chat. It comes after the chat's own transcript, so anything that looks a
+      message up by its id finds the chat's own first. side_chat_panel.js drives it. #}
+  <section class="side-view" data-side-view data-main-key="{{ session.key }}"
+           data-side-post="/sessions/{{ session.key }}/side-chat" aria-label="Side chat" hidden>
+    <div class="side-view-head">
+      <button type="button" class="side-view-back" data-side-back>← Main chat</button>
+      <span class="side-view-title">Side chat · main keeps working</span>
+      <a class="side-view-open" data-side-open href="#" target="_blank" rel="noopener" hidden
+         aria-label="Open the side chat on its own page" title="Open the side chat on its own page">⤢</a>
+    </div>
+    {%- if side_chat_state != "none" %}
+    <div class="side-view-body" data-side-view-body data-side-state="loading"
+         hx-get="/partials/sessions/{{ session.key }}/side-chat" hx-trigger="load"
+         hx-swap="outerHTML"></div>
+    {%- else %}
+    {% with side_state = "none", main_key = session.key %}{% include "partials/side_chat_view.html" %}{% endwith %}
+    {%- endif %}
+    <p class="side-view-error" data-side-error role="alert" hidden></p>
+    <div class="side-view-foot" data-side-foot hidden>
+      <button type="button" class="chip" data-side-send-back
+              title="Put the side chat's latest reply in the main chat's message box">↩ Send summary to main</button>
+    </div>
+  </section>
+  {% endif %}
 </div>
 
 <div id="subagent-activity" sse-swap="subagents">{{ session_fragments["subagents"] | safe }}</div>
@@ -304,19 +331,30 @@
   {#- Floats just above the pinned composer, so the composer never covers it (#2416). #}
   {% with notice = issue_post_notice, notice_oob = false %}{% include "partials/issue_post_notice.html" %}{% endwith %}
   {% endif %}
-  <label for="inject-message" data-cold-label>Message</label>
-  <div class="composer-input" data-composer-autocomplete>
-    <textarea id="inject-message" class="send-on-enter" name="message" rows="3"{% if inject_max_chars %} maxlength="{{ inject_max_chars }}"{% endif %}
+  <label for="inject-message" class="composer-label" data-cold-label>Message</label>
+  {#- One box: ＋ sits inside it, and the text starts one line high and grows (#4313). #}
+  <div class="composer-input composer-box" data-composer-autocomplete>
+    <label class="image-picker" for="inject-images">＋ Attach file <span class="paste-hint">or paste screenshot</span></label>
+    {% include "partials/clipboard_image_button.html" %}
+    <textarea id="inject-message" class="send-on-enter" name="message" rows="1"{% if inject_max_chars %} maxlength="{{ inject_max_chars }}"{% endif %}
               placeholder="Send a follow-up…" autocomplete="off" aria-autocomplete="list"
               aria-controls="composer-suggestions" aria-expanded="false"></textarea>
     <div id="composer-suggestions" class="composer-suggestions" role="listbox"
          aria-label="Commands and skills" data-composer-suggestions hidden></div>
     <script type="application/json">{{ composer_suggestions | tojson }}</script>
   </div>
-  <label class="image-picker" for="inject-images">＋ Attach file <span class="paste-hint">or paste screenshot</span></label>
   <input id="inject-images" class="image-input" type="file" name="images" multiple>
   <div class="composer-actions">
+    {% if side_chat_box %}
+    {#- Where the box's message goes (#4313): the chat, or its one side chat. #}
+    <div class="side-switch" role="tablist" aria-label="Where this message goes" data-side-switch>
+      <button type="button" role="tab" aria-selected="true" data-side-mode="main">Main<span class="side-switch-more"> chat</span></button>
+      <button type="button" role="tab" aria-selected="false" data-side-mode="side">↗ Side<span class="side-switch-more"> chat</span><span
+              class="side-switch-dot" data-side-dot hidden aria-label="new reply"></span></button>
+    </div>
+    {% else %}
     <span class="composer-hint">Enter to send · Shift+Enter for newline</span>
+    {% endif %}
     {#- With the host's speech service, 🎤 is voice mode's microphone too (#3540). #}
     {% with voice_mic = host_speech %}{% include "partials/speech_button.html" %}{% endwith %}
     {#- Voice mode (#3401) needs the host's speech service (#3409, #3470); CSS keeps it
@@ -328,6 +366,7 @@
           {%- if host_speech and speech_language == "fi" %} data-voice-language="fi"{% endif %}
           {%- if host_speech %} data-host-speech{% endif %}
           {%- if voice_idle_seconds %} data-voice-idle-seconds="{{ voice_idle_seconds }}"{% endif %}
+          {%- if voice_tick_seconds %} data-voice-tick-seconds="{{ voice_tick_seconds }}"{% endif %}
           {%- if host_speech %} data-voice-wake="{{ voice_wake }}"{% endif %}>
       <button type="button" class="speech-button voice-button" data-voice-button aria-pressed="false"
               aria-label="Read replies aloud" title="Read replies aloud">🎧</button>

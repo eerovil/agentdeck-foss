@@ -26,10 +26,12 @@ which the router keeps pending and asks again after its back-off.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
 import re
+import signal
 import time
 import uuid
 from collections.abc import Awaitable, Callable
@@ -60,6 +62,9 @@ MAX_AGE_S = 3 * 3600.0
 MAX_CANDIDATES = 40
 DECK_REQUEST = "~/agentdeck/.venv/bin/agentdeck deck-request"
 GIT_TIMEOUT_S = 300.0
+#: The longest a design reviewer can be starting: its checkout's five git calls, each up to
+#: ``GIT_TIMEOUT_S``, and a minute for the spawn (#4337 review).
+STARTING_MAX_S = 5 * GIT_TIMEOUT_S + 60.0
 
 # How every reviewer's brief opens, and so how the chat list knows a reviewer's chat to leave
 # out (#3101). The stand-in reviewer's briefs open the same way.
@@ -126,6 +131,9 @@ commit, made for you; the deck removes it when you stop.
 `git diff origin/{base}...{head}`. Follow the repository's root guide (`AGENTS.md`, or \
 `CLAUDE.md` where there is none). This review is read-only: do not edit, commit or push, do \
 not merge or deploy, and do not comment on GitHub.
+- If the Work's issue has a comment opening with `**Design:**` that a design review passed, \
+check the code against that design (#4332): a design finding names the line of the design it \
+breaks, or says the design missed the case.
 {lanes}- Then report through the deck, which hands it to the Work's agent and to its release. \
 Write each message to a file under `/var/tmp` and send it with
     `{DECK_REQUEST} {issue} --body-file <file>`
@@ -173,19 +181,30 @@ async def read_pull(repository: str, number: int) -> dict | None:
 
 
 async def git(*args: str, cwd: Path) -> tuple[int, str]:
-    """Run git; ``(exit code, output)``. Never raises for a failing command."""
+    """Run git; ``(exit code, output)``. Never raises for a failing command.
+
+    GitHub is reached the way a worker reaches it: through the deck's own credential helper,
+    never a prompt (``github_identity.github_git_environment``). The services process
+    inherits the desktop's ``SSH_ASKPASS``, and with only ``GIT_TERMINAL_PROMPT=0`` git
+    opened a password box nobody answered: every design review hung (#4337). A timeout
+    kills git's whole process group, so no remote helper or prompt is left behind.
+    """
+    from .github_identity import github_git_environment
+
     proc = await asyncio.create_subprocess_exec(
         "git",
         *args,
         cwd=str(cwd),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
-        env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+        env=github_git_environment(),
+        start_new_session=True,
     )
     try:
         out, _ = await asyncio.wait_for(proc.communicate(), GIT_TIMEOUT_S)
     except TimeoutError:
-        proc.kill()
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(proc.pid, signal.SIGKILL)
         await proc.wait()
         return 124, "timed out"
     return proc.returncode or 0, out.decode(errors="replace").strip()
@@ -241,15 +260,7 @@ class AgentReviewer:
         temporary.replace(self._ledger)
 
     def _running(self, line: dict, now: float) -> bool:
-        age = now - float(line.get("started") or 0)
-        if age > MAX_AGE_S:
-            return False
-        if age < START_FLOOR_S:
-            return True
-        alive = self._alive(str(line.get("token") or ""))
-        if alive is None:
-            return age < SPAWN_GRACE_S
-        return alive
+        return running(line, now, self._alive)
 
     async def sweep(self) -> list[dict]:
         """Drop every reviewer that stopped, removing its checkout; the ones still running."""
@@ -321,6 +332,102 @@ class AgentReviewer:
         log.info("agent review: a %s reviewer started on %s at %s", name, pull, head[:12])
         return Started(((pull, head),), f"a {name} reviewer started on {pull} at {head[:7]}")
 
+    async def start_design(self, issue: str, design_url: str, *, checkout: str = "") -> Started:
+        """Start the design review of ``issue``'s design comment ``design_url`` (#4332).
+
+        One per design comment: asked again while it runs, it answers that one. It takes one
+        of the same places as code reviews. The reviewer reads a throwaway checkout of the
+        repository's default branch, made from ``checkout`` (the asking chat's directory) when
+        that is one of the repository. Raises ``ReviewBusy`` and ``ReviewError`` as ``start``
+        does.
+        """
+        from .design_review import brief as design_brief
+        from .design_review import comment_id
+
+        repository, _, number = issue.partition("#")
+        number_id = comment_id(design_url)
+        if not repository or not number.isdigit() or not number_id:
+            raise ReviewError(f"cannot review the design {design_url!r} of {issue!r}")
+        key, head = f"design:{issue.lower()}", f"comment-{number_id}"
+        async with self._lock:
+            running = await self.sweep()
+            if any(line.get("pull") == key and line.get("head") == head for line in running):
+                return Started((), f"a reviewer already reviews the design {design_url}")
+            if len(running) >= self._max:
+                raise ReviewBusy(f"{len(running)} agent reviews already run (the cap)")
+            token = uuid.uuid4().hex
+            # The place is taken before the checkout, which can be slow (#4337 review): until
+            # the reviewer spawns, ``GET …/design-review`` reads this line as starting.
+            starting = {**_line(token, key, head, "", "", self._clock()), "starting": True}
+            self._write([*self._read(), {**starting, "pid": os.getpid()}])
+            try:
+                path, root, base = await self._checkout_default(repository, number, token, checkout)
+            except BaseException:
+                self._write([line for line in self._read() if line.get("token") != token])
+                raise
+            started = _line(token, key, head, path, root, self._clock())
+            self._write([started if line.get("token") == token else line for line in self._read()])
+            name = NAMES[self.kind]
+            text = design_brief(
+                name=name,
+                issue=issue,
+                design_url=design_url,
+                base=base,
+                request=DECK_REQUEST,
+                token=token,
+            )
+            try:
+                accepted, refusal = await self._start(self.kind, path, text, token)
+            except Exception as exc:  # noqa: BLE001 - nothing started: give the place back
+                accepted, refusal = False, str(exc) or type(exc).__name__
+            if not accepted:
+                await self._remove({"path": str(path), "root": str(root)})
+                self._write([line for line in self._read() if line.get("token") != token])
+                raise ReviewError(f"the {name} design reviewer did not start: {refusal}")
+        log.info("agent review: a %s design reviewer started on %s", name, design_url)
+        return Started((), f"a {name} reviewer started on the design {design_url}")
+
+    async def _checkout_default(
+        self, repository: str, number: str, token: str, checkout: str
+    ) -> tuple[Path, Path, str]:
+        """A detached checkout of the default branch's tip, and that branch's name (#4332)."""
+        root, repository = await self._code_root(repository, checkout)
+        code, out = await self._git("ls-remote", "--symref", "origin", "HEAD", cwd=root)
+        found = re.search(r"^ref:\s+refs/heads/(\S+)\s+HEAD", out, re.M) if not code else None
+        if found is None:
+            raise ReviewError(f"could not read the default branch of {repository}: {out}")
+        base = found.group(1)
+        code, out = await self._git(
+            "fetch", "-q", "origin", f"+refs/heads/{base}:refs/remotes/origin/{base}", cwd=root
+        )
+        if code:
+            raise ReviewError(f"could not fetch {repository} {base}: {out}")
+        path = root / ".worktrees" / f"design-{number}-{token[:6]}"
+        code, out = await self._git(
+            "worktree", "add", "--detach", str(path), f"origin/{base}", cwd=root
+        )
+        if code:
+            raise ReviewError(f"could not check out {repository} {base}: {out}")
+        return path, root, base
+
+    async def _code_root(self, issue_repository: str, checkout: str) -> tuple[Path, str]:
+        """The main checkout of the code a design is for, and its repository (#4332 review).
+
+        The one rule: the code is the repository the asking chat's own ``checkout`` works in,
+        whatever repository holds the issue (a card in an issues-only repository whose code
+        lives in another one). Only with no readable checkout is it the issue's repository.
+        """
+        if checkout and Path(checkout).is_dir():
+            code, url = await self._git("remote", "get-url", "origin", cwd=Path(checkout))
+            named = origin_repository(url) if not code else ""
+            if named:
+                code, common = await self._git(
+                    "rev-parse", "--path-format=absolute", "--git-common-dir", cwd=Path(checkout)
+                )
+                if not code:
+                    return Path(common).parent, named
+        return await self._root_of(issue_repository), issue_repository
+
     async def _root_of(self, repository: str, pull: str = "") -> Path:
         """The main checkout of ``repository``: the first candidate whose ``origin`` is it.
 
@@ -374,6 +481,72 @@ def origin_repository(url: str) -> str:
     """``owner/repo`` (lower case) of a GitHub remote URL, or ``""`` for anything else."""
     found = _ORIGIN_RE.search((url or "").strip())
     return found.group("repository").lower() if found else ""
+
+
+def reviews_design(ledger: Path, token: str, issue: str, comment: str) -> bool:
+    """Whether ``token`` is the reviewer the deck started on ``issue``'s design comment
+    ``comment`` (#4332): a design verdict counts only from it. Read from the ledger, which
+    every deck reviewer shares, so a restart in between changes nothing."""
+    if not token or not comment:
+        return False
+    try:
+        lines = json.loads(ledger.read_text())
+    except (OSError, ValueError):
+        return False
+    key, head = f"design:{issue.lower()}", f"comment-{comment}"
+    return any(
+        isinstance(line, dict)
+        and line.get("token") == token
+        and line.get("pull") == key
+        and line.get("head") == head
+        for line in (lines if isinstance(lines, list) else ())
+    )
+
+
+def running(line: dict, now: float, alive: Alive) -> bool:
+    """Whether the reviewer of ledger ``line`` still runs; ``alive`` reads its chat.
+
+    A design reviewer still ``starting`` (its checkout under way, no chat yet) runs while the
+    process making it lives, up to ``STARTING_MAX_S`` (#4337 review)."""
+    age = now - float(line.get("started") or 0)
+    if line.get("starting"):
+        return age < STARTING_MAX_S and _process_alive(line.get("pid"))
+    if age > MAX_AGE_S:
+        return False
+    if age < START_FLOOR_S:
+        return True
+    found = alive(str(line.get("token") or ""))
+    if found is None:
+        return age < SPAWN_GRACE_S
+    return found
+
+
+def _process_alive(pid) -> bool:
+    try:
+        os.kill(int(pid), 0)
+    except (TypeError, ValueError, ProcessLookupError):
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def design_reviewer(ledger: Path, issue: str, comment: str) -> dict | None:
+    """The ledger line of the reviewer the deck started on ``issue``'s design comment
+    ``comment``, or ``None`` (#4337): read by the web for ``GET …/design-review``. A line
+    stays until the next start sweeps it, so whether the reviewer still runs is
+    ``running``'s to say."""
+    try:
+        lines = json.loads(ledger.read_text())
+    except (OSError, ValueError):
+        return None
+    key, head = f"design:{issue.lower()}", f"comment-{comment}"
+    found = [
+        line
+        for line in (lines if isinstance(lines, list) else ())
+        if isinstance(line, dict) and line.get("pull") == key and line.get("head") == head
+    ]
+    return found[-1] if found else None
 
 
 def _line(token: str, pull: str, head: str, path: Path, root: Path, now: float) -> dict:

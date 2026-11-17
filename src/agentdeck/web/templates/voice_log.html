@@ -14,6 +14,28 @@
   <p class="voice-log-hint">What voice mode's fast helper heard, said and fixed, and what
     the page then sent to this chat, newest first. "Sent" is saved when the page presses
     Send; a send that then failed still shows here.</p>
+  {% if summary %}
+  {# Where a voice turn's time goes (#4360): from the end of speech to the chat's answer
+     starting to play, part by part, over the recent timed phrases. #}
+  <section class="voice-log-timing-summary">
+    <h2>Response time</h2>
+    <p class="voice-log-hint">From when you stop talking to when the chat's answer starts
+      playing, or reaches the page when it is not read aloud, over the last
+      {{ summary_of }} timed phrases of this chat.</p>
+    <table>
+      <thead><tr><th>Part</th><th>Median</th><th>Slowest</th></tr></thead>
+      <tbody>
+      {% for row in summary %}
+      <tr{% if row.label == "Total" %} class="voice-log-timing-total"{% endif %}>
+        <td>{{ row.label }}</td>
+        <td>{{ "%.1f" | format(row.median / 1000) }} s</td>
+        <td>{{ "%.1f" | format(row.slowest / 1000) }} s</td>
+      </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </section>
+  {% endif %}
   {% for phrase in phrases %}
   {% if phrase.narrated is defined %}
   {# The agent was quiet, so the helper said what it was doing (#3799). #}
@@ -32,13 +54,17 @@
   <section class="voice-log-phrase" data-outcome="{{ phrase.outcome }}">
     <div class="voice-log-when">{{ phrase.when }} · {{ phrase.ms }} ms
       {%- if phrase.fresh %} · new helper{% endif %}
-      {%- if phrase.timing and phrase.timing.voice is defined %} · first voice {{ phrase.timing.voice }} ms after speech{% endif %}
+      {%- if phrase.timing and phrase.timing.voice is defined %} · answer heard {{ "%.1f" | format(phrase.timing.voice / 1000) }} s after speech{% endif %}
       {%- if phrase.replaces %} · after more words{% endif %}
       {%- if phrase.outcome != answered %} · <strong>{{ phrase.outcome }}</strong>{% endif %}</div>
     {% for line in phrase.aloud or [] %}
     <p class="voice-log-aloud">🔊 {{ line }}</p>
     {% endfor %}
     <p><span class="voice-log-label">Heard</span> {{ phrase.heard }}</p>
+    {% if phrase.parts %}
+    <p class="voice-log-timing"><span class="voice-log-label">Time</span>
+      {%- for label, ms in phrase.parts %}{% if not loop.first %} ·{% endif %} <span class="voice-log-timing-part">{{ label }} {{ "%.1f" | format(ms / 1000) }} s</span>{% endfor %}</p>
+    {% endif %}
     {% if phrase.held %}
     {# The page holds its line until the chat stays quiet (#3799): often never said. #}
     {% if phrase.say %}<p><span class="voice-log-label">Proposed</span> {{ phrase.say }}</p>{% endif %}

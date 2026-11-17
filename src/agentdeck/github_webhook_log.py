@@ -64,9 +64,11 @@ MAX_BODY_BYTES = 25 * 1024 * 1024
 # kept before the oldest is dropped. Two deliveries at GitHub's ceiling already exceed the
 # threshold, so a rotation always holds at least one whole delivery. The bound a host can
 # actually plan around is ROTATE_BYTES plus the compressed rotations — JSON of this shape
-# compresses roughly ten to one, so the tail costs a few megabytes rather than 150.
+# compresses roughly ten to one, so the tail costs tens of megabytes rather than 600.
 ROTATE_BYTES = 50 * 1024 * 1024
-KEEP_ROTATIONS = 3
+# Twelve, not three (#4430): the review chats' stream fills a rotation about every 1.5 days,
+# and counting review rounds needs a week of it; twelve hold about 18 days.
+KEEP_ROTATIONS = 12
 
 # Transport metadata worth keeping for diagnostics. The signature header is deliberately
 # not among them: it is derived from the shared secret, and an event stream is not the

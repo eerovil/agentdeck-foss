@@ -74,6 +74,10 @@ has a page open on it, and the chat page closes its stream once hidden unless vo
 on, so that is "open in front of them, or talking to it". A stop met while nobody is there
 is marked told without a message: nobody reads it, and the deck already lists that Work.
 Its timeout ends it silently too while nobody is there.
+
+A Work a message told of that later leaves Needs you, in a complete pass, leaves the chat a
+pending note (#4358): it wakes nothing and rides on the chat's next message, saying the Work
+no longer needs the person and where it is now, so the chat stops telling them it waits.
 """
 
 from __future__ import annotations
@@ -264,6 +268,10 @@ class WakeRequest:
     only: str = ""
     #: A needs-you wait's stops already told (``NeedsYouStop.key``), so a pass repeats none.
     told: tuple[str, ...] = ()
+    #: The told stops a message really reached (#4358), each with the words that name it:
+    #: when one leaves Needs you, the chat is left a note that it no longer needs the owner.
+    #: A stop marked told while the owner was away is not here: the chat never heard of it.
+    reported: tuple[tuple[str, str], ...] = ()
     #: The one more round a patient wait still has (``PATIENT_KINDS``), in seconds; 0 once it
     #: is spent, on any other wait, and on a wait stored before #4080.
     extra_s: float = 0.0
@@ -1400,6 +1408,30 @@ def needs_you_message(request: WakeRequest, stop: NeedsYouStop) -> str:
     )
 
 
+def _stop_time(key: str) -> float:
+    """When a ``NeedsYouStop.key`` entered its category; 0 for a key that does not say."""
+    try:
+        return float(key.rpartition("@")[2].partition(":")[0])
+    except ValueError:
+        return 0.0
+
+
+def needs_you_words(stop: NeedsYouStop) -> str:
+    """How a gone note names a stop the chat was told of: its issue, category and title."""
+    return f"{stop.issue} ({stop.label}: {_quote(stop.title)})"
+
+
+def needs_you_gone_note(words: str, where: str) -> str:
+    """The note a needs-you wait's chat is left when a Work it was told of no longer needs
+    the owner (#4358). It rides on the chat's next message and wakes nothing."""
+    now = f" Where it is now: {where}." if where else ""
+    return (
+        f"{words} no longer needs the person: it left that category, so it was answered"
+        f" elsewhere, its agent moved on, or it merged or closed.{now} If you told the person"
+        " it waits on them, correct that."
+    )
+
+
 def _how_to_answer(stop: NeedsYouStop) -> str:
     """Where the person's answer goes (#3481): a message leaves a question box open."""
     if stop.category != NEEDS_YOU_CATEGORIES["answer"]:
@@ -1843,16 +1875,24 @@ class WakeOnRegistry:
                     return current[index]
         return None
 
-    def tell(self, request_id: str, told: tuple[str, ...]) -> None:
-        """Record a needs-you wait's told stops on the wait as it is held now, so a renewal
-        written in between keeps its deadline."""
+    def tell(
+        self,
+        request_id: str,
+        told: tuple[str, ...],
+        reported: tuple[tuple[str, str], ...] | None = None,
+    ) -> None:
+        """Record a needs-you wait's told (and reported, #4358) stops on the wait as it is
+        held now, so a renewal written in between keeps its deadline."""
         with self._file.locked():
             current = list(self.all())
             for index, held in enumerate(current):
-                if held.id == request_id and tuple(held.told) != told:
-                    current[index] = replace(held, told=told)
+                if held.id != request_id:
+                    continue
+                kept = held.reported if reported is None else reported
+                if tuple(held.told) != told or tuple(held.reported) != kept:
+                    current[index] = replace(held, told=told, reported=kept)
                     self._save(current)
-                    return
+                return
 
     def answered(self, chat_id: str, pull: str) -> float:
         """When a verdict on ``pull`` (or on the chat's whole Work) last reached ``chat_id``;
@@ -1885,8 +1925,14 @@ class WakeOnRegistry:
             try:
                 known = {key: value for key, value in item.items() if key in _FIELDS}
                 request = WakeRequest(**known)
-                loaded.append(replace(request, told=tuple(request.told)))
-            except (TypeError, AttributeError):
+                loaded.append(
+                    replace(
+                        request,
+                        told=tuple(request.told),
+                        reported=tuple((str(key), str(words)) for key, words in request.reported),
+                    )
+                )
+            except (TypeError, AttributeError, ValueError):
                 log.warning("wake-on: skipping malformed registration %r", item)
                 continue
             if len(known) < len(item):
@@ -2038,8 +2084,12 @@ class WakeOnService:
         ready_head: Callable[[WakeRequest], bool] = lambda request: False,
         release_notices: Callable[[str, datetime], Iterable[str]] = lambda chat_id, since: (),
         check_env: Callable[[str], dict[str, str]] = lambda session_key: {},
+        note: Callable[[str, str, str], bool] | None = None,
     ) -> None:
         self._enabled = bool(enabled)
+        # (chat id, note id, text): a pending note for the chat's next message, waking nothing
+        # (#4306). The routine ends below that wake nobody leave one, so the agent still hears.
+        self._note = note
         # The routine wakes the deck settles itself (#4253). ``live_read`` reads a timed-out
         # merge or CI wait from GitHub (``read_live``); ``ask_review`` asks for a fresh review
         # of a pull request whose review chat closed with no verdict, answering "" when asked
@@ -2101,7 +2151,9 @@ class WakeOnService:
         self._retry_at: dict[str, float] = {}
         # A needs-you pass whose save failed (#3446 review): its list, retried at the time
         # beside it, so a lone question is not left to the next change of any Work.
-        self._needs_you_retry: tuple[list[NeedsYouStop], bool, float] | None = None
+        self._needs_you_retry: (
+            tuple[list[NeedsYouStop], bool, float, Callable[[str], str] | None] | None
+        ) = None
         self._task: asyncio.Task | None = None
         self._deadline_task: asyncio.Task | None = None
         # Time-wait checks running now (#4256), by wait id.
@@ -2417,8 +2469,8 @@ class WakeOnService:
         then tell each chat whose wait timed out, once."""
         now = self._clock()
         if self._needs_you_retry is not None and self._needs_you_retry[2] <= now:
-            stops, complete, _ = self._needs_you_retry
-            self.needs_you(stops, complete=complete)
+            stops, complete, _, where = self._needs_you_retry
+            self.needs_you(stops, complete=complete, where=where)
         for request in self.registry.all():
             if request.id in self._settling:
                 continue
@@ -2535,6 +2587,14 @@ class WakeOnService:
         deadline = min(now + LIVE_READ_AGAIN_S, cap)
         log.info("wake-on: %s still running; reading again at %s", request.target, deadline)
         self.registry.revise(held.id, now, deadline=deadline)
+        # One note per wait (#4306), however many times it is read again.
+        self._keep_note(
+            held,
+            f"wake-on:still-running:{held.id}",
+            f"AgentDeck: your wait on {held.target} timed out while it was still running. The"
+            " deck read it from GitHub and is waiting again, reading it every 30 minutes up to"
+            " a day from when you registered it; you will be woken by its result.",
+        )
 
     async def _ask_again(self, request: WakeRequest) -> None:
         """B2 of #4253: a review chat closed with no verdict, so ask for a fresh review the way
@@ -2573,6 +2633,16 @@ class WakeOnService:
         self.registry.revise(
             held.id, now, deadline=deadline, stopped="", cut_from=0.0, asked_at=now
         )
+        # Once per stop (#4306): the cut deadline names it, and a later stop is news again.
+        self._keep_note(
+            held,
+            f"wake-on:reask:{held.id}:{int(held.deadline)}",
+            (
+                f"AgentDeck: the review of {held.repository}#{held.number} ended with no verdict,"
+                " so the deck asked for a fresh review itself, and your wait on it continues."
+                f" {held.stopped}"
+            )[:1800],
+        )
 
     def _deliver(self, request: WakeRequest, outcome: Outcome, *, read: bool = False) -> None:
         """Wake the chat with a result, unless the deck already settles it (#4253): green CI
@@ -2599,10 +2669,30 @@ class WakeOnService:
             log.info(
                 "wake-on: ended %s's wait on %s: %s", request.session_key, request.target, quiet
             )
+            if request.kind == KIND_COMMIT:
+                # Green CI at a ready head is news the agent need not act on (#4306): once
+                # per chat and commit, however many of its waits it ends.
+                self._keep_note(
+                    request,
+                    f"wake-on:ci-green:{request.chat_id}:{request.repository}@{request.sha}",
+                    f"AgentDeck: CI passed at {request.sha[:12]} in {request.repository}, the"
+                    " head of a ready pull request the deck merges; your wait on it ended.",
+                )
             self._retry_at.pop(request.id, None)
             self.registry.remove([request.id])
             return
         self._fire(request, fired_message(request, outcome, read=read))
+
+    def _keep_note(self, request: WakeRequest, note_id: str, text: str) -> bool:
+        """Keep ``text`` for ``request``'s chat's next message, waking nothing (#4306). A note
+        not kept is the silence of before."""
+        if self._note is None or not request.chat_id:
+            return False
+        try:
+            return bool(self._note(request.chat_id, note_id, text))
+        except Exception:  # noqa: BLE001 - a note lost is the silence of before
+            log.warning("wake-on: could not keep a note for %s", request.id, exc_info=True)
+            return False
 
     def due_checks(self) -> list[WakeRequest]:
         """Claim every time-wait check due now that is not already running here."""
@@ -2667,7 +2757,13 @@ class WakeOnService:
         every change, as for a page that shows it."""
         return any(request.kind == KIND_NEEDS_YOU for request in self.registry.all())
 
-    def needs_you(self, stops: Iterable[NeedsYouStop], *, complete: bool = True) -> int:
+    def needs_you(
+        self,
+        stops: Iterable[NeedsYouStop],
+        *,
+        complete: bool = True,
+        where: Callable[[str], str] | None = None,
+    ) -> int:
         """Tell each needs-you wait about every wanted Work that moved in since it was
         registered and was not told yet; how many messages were saved.
 
@@ -2678,6 +2774,12 @@ class WakeOnService:
         so a replay the store already holds is not written twice. A wait keeps only the stops
         still in the list, which bounds it; ``complete`` False (a degraded pass that may have
         dropped Works) forgets none, so one coming back is not news.
+
+        A stop a message reached that a complete pass no longer lists, its Work not in any
+        stop the wait still wants, leaves the chat a pending note (#4358) instead: it wakes
+        nothing, and rides on the chat's next message, so the chat stops telling the person
+        that Work waits on them. ``where`` says where a Work is now, by Work id ("" unknown).
+        A note the store could not keep stays reported, and the next pass tries it again.
         """
         waits = [request for request in self.registry.all() if request.kind == KIND_NEEDS_YOU]
         unsent = self._needs_you_retry[0] if self._needs_you_retry is not None else []
@@ -2694,6 +2796,7 @@ class WakeOnService:
         failed = False
         for request in waits:
             told = set(request.told)
+            reported = dict(request.reported)
             here: bool | None = None  # asked once, and only when a stop is owed
             for stop in stops:
                 if (
@@ -2732,16 +2835,69 @@ class WakeOnService:
                     "wake-on: waking %s: %s is %s", request.session_key, stop.issue, stop.label
                 )
                 told.add(stop.key)
+                reported[stop.key] = needs_you_words(stop)
                 saved += 1
+            if complete:
+                reported, unkept = self._needs_you_gone(request, stops, reported, where)
+                failed = failed or unkept
             kept = tuple(sorted(told & current if complete else told))
-            if kept != tuple(request.told):
-                self.registry.tell(request.id, kept)
+            kept_reported = tuple(sorted(reported.items()))
+            if kept != tuple(request.told) or kept_reported != tuple(request.reported):
+                self.registry.tell(request.id, kept, kept_reported)
         if failed:
             # The overview passes again only when some Work changes, so the deadline task
             # retries this list itself; a restart's first pass covers a lost retry.
-            self._needs_you_retry = (stops, complete, self._clock() + PENDING_RETRY_S)
+            self._needs_you_retry = (stops, complete, self._clock() + PENDING_RETRY_S, where)
             self._changed.set()
         return saved
+
+    def _needs_you_gone(
+        self,
+        request: WakeRequest,
+        stops: list[NeedsYouStop],
+        reported: dict[str, str],
+        where: Callable[[str], str] | None,
+    ) -> tuple[dict[str, str], bool]:
+        """Leave a note for each reported stop a complete pass no longer lists (#4358); the
+        reported stops still kept, and whether a note the store refused is owed (the caller
+        then retries the pass on the deadline timer, as for a wake it could not save).
+
+        A Work still in either Needs you category (a new question, or Ready for merge after
+        an answer) still needs the person, even when this wait's ``only`` leaves that
+        category out, so its old stops are kept without a note (#4361 review); once it
+        leaves, one note goes for the Work, in the words of its newest told stop. The
+        note's id comes from the wait and the stop, and the store keeps one note per id, so
+        a pass that saved it and crashed before recording that leaves no second note."""
+        current = {stop.key for stop in stops}
+        needing = {stop.work_id for stop in stops if stop.category in NEEDS_YOU_CATEGORIES.values()}
+        owed: dict[str, str] = {}
+        unkept = False
+        gone: dict[str, list[str]] = {}
+        for key, words in reported.items():
+            work_id = key.rpartition("@")[0]
+            if key in current or work_id in needing:
+                # Still needing the person: kept, so the note goes once it leaves.
+                owed[key] = words
+            else:
+                gone.setdefault(work_id, []).append(key)
+        for work_id, keys in gone.items():
+            # One note per Work, in the words of the newest stop it was told of.
+            key = max(keys, key=_stop_time)
+            try:
+                now = where(work_id) if where is not None else ""
+            except Exception:  # noqa: BLE001 - the note goes without where it is now
+                log.warning("wake-on: could not say where %s is now", work_id, exc_info=True)
+                now = ""
+            digest = hashlib.sha256(key.encode()).hexdigest()[:12]
+            note_id = f"wake-on:{request.id}:{digest}:gone"
+            if self._note is None or self._keep_note(
+                request, note_id, needs_you_gone_note(reported[key], now)
+            ):
+                log.info("wake-on: noted for %s: %s left Needs you", request.session_key, key)
+                continue
+            owed.update({each: reported[each] for each in keys})  # retried on the timer
+            unkept = True
+        return owed, unkept
 
     def _deck_includes(self, sha: str) -> bool:
         """Whether the deck now serves code that includes ``sha``, its skills installed.

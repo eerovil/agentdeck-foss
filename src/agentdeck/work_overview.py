@@ -541,6 +541,9 @@ class WorkCard:
     # The one status line of a Work the deck runs itself (``work_derived``, #2895 step 3): a
     # project's Work. ``None`` keeps today's status.
     derived: Any = None
+    # GitHub says the open issue was reopened (``state_reason``): it never counts as deployed
+    # for the issues it blocks, however its live check reads (#4384).
+    reopened: bool = False
 
     @property
     def diffstat(self) -> DiffStat | None:
@@ -661,6 +664,16 @@ def build_work_card(
         parked_label=carries_label(facts.record, PARKED_LABEL),
         labels=_labels(facts.record),
         issue_title=_issue_title(facts.record),
+        reopened=_reopened(facts.record),
+    )
+
+
+def _reopened(record: Any) -> bool:
+    """The cached issue is open again after a close (GitHub's ``state_reason``)."""
+    return (
+        isinstance(record, dict)
+        and str(record.get("state") or "").lower() == "open"
+        and str(record.get("state_reason") or "").lower() == "reopened"
     )
 
 
@@ -1147,24 +1160,6 @@ def work_project(repository: str, board: Any) -> str:
 
 
 # --- the archive: the durable inventory, read only where it is asked for ---------------------
-
-
-def archived_count(buckets: WorkBuckets, db: Any) -> int:
-    """How many Works are Archived, without reading the inventory's rows (#2201).
-
-    Every Work the deck knows is in the ``works`` table or among the candidates, and every
-    Active or Recent Work is a candidate. So the archive is the table's row count, plus the
-    candidates the table lacks, minus the Active and Recent ones: one ``COUNT(*)`` and one
-    lookup bounded by the candidates. A store that cannot answer counts the candidates only.
-    """
-    candidates = [*buckets.active, *buckets.recent, *buckets.archived]
-    try:
-        total = int(db.count_works())
-        known = db.known_work_ids(item.ref.work_id for item in candidates)
-    except Exception:  # noqa: BLE001 -- an unreadable inventory must not hide the live Works
-        return len(buckets.archived)
-    total += sum(1 for item in candidates if item.ref.work_id not in known)
-    return max(len(buckets.archived), total - len(buckets.active) - len(buckets.recent))
 
 
 def work_inventory(db: Any) -> tuple[WorkRef, ...]:

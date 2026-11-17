@@ -3,6 +3,12 @@ Description=agentdeck persistent Codex runtime
 After=network-online.target
 
 [Service]
+# Never a desktop password box (#4340): the KDE session hands the user manager
+# SSH_ASKPASS, and git runs it before it reads GIT_TERMINAL_PROMPT, so a git or
+# ssh call from here would open a box nobody sees and hang until its timeout.
+# With DISPLAY set, ssh runs its built-in askpass even then, unless told never to.
+UnsetEnvironment=SSH_ASKPASS SUDO_ASKPASS GIT_ASKPASS
+Environment=GIT_TERMINAL_PROMPT=0 SSH_ASKPASS_REQUIRE=never
 WorkingDirectory=%h/agentdeck
 ExecStart=%h/agentdeck/.venv/bin/agentdeck codex-runtime
 Restart=on-failure

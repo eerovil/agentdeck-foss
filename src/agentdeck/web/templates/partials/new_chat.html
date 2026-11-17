@@ -84,7 +84,11 @@
     <label for="new-chat-message">First message</label>
     <textarea id="new-chat-message" class="send-on-enter" name="message" rows="3"
               required placeholder="What should Codex work on?"></textarea>
-    <label class="image-picker" for="new-chat-images">＋ Attach file <span class="paste-hint">or paste screenshot</span></label>
+    {#- One grid row, so 📋 sits beside ＋ rather than on a line of its own (#4345). #}
+    <div class="attach-row">
+      <label class="image-picker" for="new-chat-images">＋ Attach file <span class="paste-hint">or paste screenshot</span></label>
+      {% include "partials/clipboard_image_button.html" %}
+    </div>
     <input id="new-chat-images" class="image-input" type="file" name="images" multiple>
     <div class="composer-actions">
       <span>Enter to send · Shift+Enter for newline</span>

@@ -113,6 +113,7 @@ async def test_a_timeout_or_an_error_status_is_not_retried(tmp_path, outcome):
     result = await client.deliver("key-1", "hello", delivery_id="act-1")
 
     assert not result.accepted
+    assert result.write_uncertain, "the runtime may hold it (#4303)"
     assert len(posted) == 1
     await client.stop()
 
@@ -125,6 +126,7 @@ async def test_a_second_broken_connection_fails_the_send(tmp_path):
 
     assert not result.accepted
     assert "Server disconnected" in result.reason
+    assert result.runtime_unreachable and result.write_uncertain  # #4303
     assert len(posted) == 2
     await client.stop()
 
@@ -162,7 +164,18 @@ async def test_a_fenced_send_waits_for_a_restarting_runtime_to_listen(tmp_path, 
 
     assert not result.accepted
     assert "No such file or directory" in result.reason
+    # It never connected, so nothing was written: a send known to be refused (#4303).
+    assert result.runtime_unreachable and not result.write_uncertain
     assert len(posted) == 4
+    await client.stop()
+
+    # A connection lost after the request left, then a runtime that is gone: unknown.
+    transport, posted = _flaky([_dropped(), gone])
+    client = ClaudeWorkerClient(_account(tmp_path), transport=transport)
+    client._RESTART_POLL_S = 0
+    client.RUNTIME_RESTART_WAIT_S = 0
+    result = await client.deliver("key-1", "hello", delivery_id="act-1")
+    assert not result.accepted and result.write_uncertain
     await client.stop()
 
 

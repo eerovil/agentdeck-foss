@@ -781,6 +781,15 @@ async def test_the_deck_runs_a_works_last_verification_again_at_a_new_head(
     assert third.cwd == str(repo / ".worktrees" / f"verify-head-{second[:12]}")
     assert real_git("rev-parse", "HEAD", cwd=third.cwd) == second
 
+    # #4399: a light pull request's head runs ``bin/test.sh`` in place of the last command;
+    # no other command is taken.
+    queue._jobs[third.id] = replace(third, state=jobs.DONE, tested_workspace=_tested(second))
+    with pytest.raises(jobs.JobError, match="only bin/test.sh"):
+        await queue.rerun_verification(WORK, REPO, second, command=["rm", "-rf", "/"])
+    jobs._remove_pinned_checkout(third.cwd)
+    script = await queue.rerun_verification(WORK, REPO, second, command=["bin/test.sh"])
+    assert script is not None and script.command == ["bin/test.sh"]
+
 
 def test_only_what_a_fresh_checkout_can_run_is_run_again_there():
     from agentdeck import jobs

@@ -46,7 +46,9 @@ from ..models import (
     PullRequestRef,
     Session,
 )
+from ..pending_events import refused_before_write, with_notes
 from ..providers import PROVIDERS, pending_interaction_for
+from ..providers.codex.web_only import ensure_research_cwd
 from ..providers.delivery import DeliveryCorrelation, DeliveryReceipts, delivery_participated
 from ..providers.instructions import SessionRole, stored_session_role
 from ..public_origin import public_origin
@@ -124,6 +126,23 @@ class DelegationRequest(BaseModel):
     # deck-minted session token, resolved here — it is the only self-identity a
     # Codex chat has, since Codex threads share one process and cannot carry
     # per-thread environment.
+    parent_session_id: str | None = None
+    parent_session_token: str | None = None
+
+
+class WebOnlyDelegationRequest(BaseModel):
+    """A Codex chat that can only search and read the web (#4381): no shell, files, MCP
+    servers or sub-agents, in an empty folder the deck picks.
+
+    Its own route rather than a field on ``DelegationRequest``: a web process that
+    predates the lock would ignore an unknown field and start an open chat, while an
+    unknown route answers 404 or 405 and starts nothing.
+    """
+
+    message: str
+    account_key: str | None = None
+    model: str | None = None
+    effort: str | None = None
     parent_session_id: str | None = None
     parent_session_token: str | None = None
 
@@ -1458,7 +1477,8 @@ async def delete_session_restart_nudge(request: Request, session_key: str) -> di
 # one message when the event lands, or when the wait times out. A time wait (#2968)
 # has no event: it wakes the chat at the time it names, for long local work.
 # A needs-you wait (#3446) wakes the chat once per Work that moves into Needs answer or
-# Ready for merge, and stays registered until it is cancelled or its week runs out.
+# Ready for merge, and stays registered until it is cancelled or its week runs out. A Work it
+# told of that no longer needs the owner leaves the chat a pending note, waking nothing (#4358).
 
 
 class WakeOnRequest(BaseModel):
@@ -1844,6 +1864,97 @@ async def post_session_pre_review_done(
     except AgainRefused as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return {"session_key": session_key, **done}
+
+
+@router.post("/sessions/{session_key}/design-review")
+async def post_session_design_review(request: Request, session_key: str) -> dict:
+    """Review the design of this chat's Work before its code (#4332): a deck reviewer reads
+    the issue's newest ``**Design:**`` comment, and its verdict comes to this chat."""
+    from .. import issue_post
+    from ..services_link import ServicesUncertain
+
+    session_key, session = resolve_chat_key(request, session_key)
+    work = issue_post.issue_post_target(get_state(request), session_key)
+    if work is None:
+        raise HTTPException(status_code=409, detail="this chat is in no Work, or in several")
+    router_service = getattr(request.app.state, "work_router", None)
+    if router_service is None or not router_service.enabled:
+        raise HTTPException(status_code=409, detail="this deck does not route Work events")
+    checkout = str(session.cwd) if session is not None and session.cwd else ""
+    try:
+        answer = await router_service.design_review(f"{work.repository}#{work.number}", checkout)
+    except ServicesUncertain as exc:
+        # The services process may still start it: say how to find out, not "the Work page",
+        # which an agent cannot read (#4337).
+        raise HTTPException(status_code=504, detail=DESIGN_UNCERTAIN_TEXT) from exc
+    if "refused" in answer:
+        raise HTTPException(status_code=int(answer.get("status") or 409), detail=answer["refused"])
+    return {"session_key": session_key, **answer}
+
+
+DESIGN_UNCERTAIN_TEXT = (
+    "Not confirmed: the merge service took the design-review request but did not answer in"
+    " time, and may still start the reviewer. Read `GET` on this same path: its `state` says"
+    " whether a reviewer is on your design or still starting (`reviewing`), whether it waits for a"
+    " reviewer place (`queued`: it starts by itself, so end the turn and wait for the"
+    " verdict, which comes to this chat as a message), or neither (`unreviewed`). Only on"
+    " `unreviewed` ask again; asking again is safe anyway: while a reviewer is starting or"
+    " running on the same design comment, or the request waits for a place, it starts no second."
+)
+
+
+@router.get("/sessions/{session_key}/design-review")
+async def get_session_design_review(request: Request, session_key: str) -> dict:
+    """Where this chat's Work's design review stands (#4337): ``state`` is ``none``,
+    ``unreviewed``, ``queued`` (waiting for a reviewer place, #4342), ``reviewing``, ``pass``
+    or ``gap``, with the design comment, its reviewer
+    and what to do ``next``. Read here, never asked of the merge service, so it answers even
+    while a request to it hangs."""
+    import time
+
+    from .. import agent_review, design_review, issue_post, work_router
+    from ..work_services import work_reviewer
+
+    session_key, _session = resolve_chat_key(request, session_key)
+    state = get_state(request)
+    work = issue_post.issue_post_target(state, session_key)
+    if work is None:
+        raise HTTPException(status_code=409, detail="this chat is in no Work, or in several")
+    config = get_config(request)
+    if work_reviewer(config) == agent_review.OFF:
+        raise HTTPException(status_code=409, detail="reviews are off on this deck")
+    issue = f"{work.repository}#{work.number}"
+    ledger = config.review.ledger_path
+
+    def alive(token: str) -> bool | None:
+        key = state.session_key_for_token(token)
+        found = state.sessions.get(key) if key else None
+        if found is None:
+            return None
+        return bool(state.session_presentation().display(found).thinking)
+
+    def reviewer(comment: str) -> dict | None:
+        line = agent_review.design_reviewer(ledger, issue, comment)
+        if line is None:
+            return None
+        started = float(line.get("started") or 0)
+        return {
+            "running": agent_review.running(line, time.time(), alive),
+            "starting": bool(line.get("starting")),
+            "session_key": state.session_key_for_token(str(line.get("token") or "")) or "",
+            "started_at": datetime.fromtimestamp(started, UTC).isoformat() if started else "",
+        }
+
+    verdicts = design_review.Verdicts.beside(ledger)
+    # Waiting in the merge service's retry list for a reviewer place (#4342), read from its file.
+    queued = work_router.design_queue(work_router.pending_path(config.github_webhook.path), issue)
+    try:
+        found = await design_review.status(
+            issue, verdicts, reviewer, design_review.read_comments, queued
+        )
+    except design_review.Refused as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+    return {"session_key": session_key, **found}
 
 
 # --- deck-owned Claude workers -------------------------------------------
@@ -2259,6 +2370,28 @@ async def _keyed_deliver(
             provider_write_state="not_started",
         )
         return _context_refusal("successor_reservation_conflict")
+    # A follow-up that continues a chat carries the chat's pending notes (#4303), kept under
+    # the delivery's own id: the poller's retry of this delivery takes the same ones back, so
+    # the runtime's delivery fence sees the same text and replays it. New notes only once
+    # the chat is bound: a delivery whose successor could not be reserved runs as a chat of
+    # its own, and takes back only what an earlier, bound try of it took (its link already
+    # made, a retry with a fresh token reads as a conflict).
+    # An app with no injector (a bare test app) has no notes: the message goes out bare.
+    notes_key = None
+    injector = getattr(request.app.state, "injector", None)
+    if (
+        injector is not None
+        and source
+        and (reserved or body.delivery_id)
+        and isinstance(payload.get("message"), str)
+    ):
+        notes_key = f"worker:{body.delivery_id or uuid.uuid4().hex}"
+        notes = injector.claim_notes(
+            source, notes_key, payload["message"], (), retry_only=not reserved
+        )
+        payload["message"] = with_notes(notes, payload["message"])
+        if not notes:
+            notes_key = None
     try:
         artifact_mode = str((body.command_artifacts or {}).get("mode") or "off")
         runtime_operation = (
@@ -2275,8 +2408,11 @@ async def _keyed_deliver(
     except HTTPException as exc:
         if reserved and context_row is None:
             state.release_chat_successor(token)
+        never_seen = runtime_operation == "deliver-command-artifacts-v1" and exc.status_code == 404
+        if notes_key and never_seen:  # a runtime without that route wrote nothing
+            injector.release_notes(notes_key)
         if context_row is not None:
-            if runtime_operation == "deliver-command-artifacts-v1" and exc.status_code == 404:
+            if never_seen:
                 # The runtime predates this route, so it never saw the delivery at
                 # all. That is a clean refusal, not an uncertain provider write.
                 state.budget_db.mark_clean_failed(
@@ -2303,6 +2439,8 @@ async def _keyed_deliver(
     if not session_id:
         write_state = str(result.get("provider_write_state") or "not_started")
         successor_created = bool(result.get("successor_created"))
+        if notes_key and refused_before_write(result):
+            injector.release_notes(notes_key)
         if reserved and (
             context_row is None
             or (not successor_created and write_state == "not_started")
@@ -3368,16 +3506,44 @@ async def _read_only_delegation_context(request: Request, parent_session: str | 
     )
 
 
+@router.post("/delegations/web-only", status_code=202)
+async def start_web_only_delegation(request: Request, body: WebOnlyDelegationRequest) -> dict:
+    return await _start_delegation(
+        request,
+        DelegationRequest(
+            cwd="",
+            sandbox="read-only",
+            approval_policy="never",
+            **body.model_dump(),
+        ),
+        web_only=True,
+    )
+
+
 @router.post("/delegations", status_code=202)
 async def start_delegation(request: Request, body: DelegationRequest) -> dict:
+    return await _start_delegation(request, body, web_only=False)
+
+
+async def _start_delegation(request: Request, body: DelegationRequest, *, web_only: bool) -> dict:
     account = delegation_account(request, body.account_key)
     provider = PROVIDERS[account.provider_id]
     if body.effort is not None and not provider.is_valid_effort(body.effort):
         raise HTTPException(status_code=422, detail="invalid effort")
-    try:
-        cwd = Path(body.cwd).expanduser().resolve()
-    except (OSError, RuntimeError):
-        raise HTTPException(status_code=422, detail="invalid working directory") from None
+    if web_only:
+        if account.provider_id != "codex":
+            raise HTTPException(status_code=422, detail="a web-only chat needs a Codex account")
+        try:
+            cwd = ensure_research_cwd()
+        except OSError as exc:
+            raise HTTPException(
+                status_code=422, detail=f"could not make the research folder: {exc}"
+            ) from None
+    else:
+        try:
+            cwd = Path(body.cwd).expanduser().resolve()
+        except (OSError, RuntimeError):
+            raise HTTPException(status_code=422, detail="invalid working directory") from None
     undeliverable = provider.user_message_refusal(body.message)
     if undeliverable is not None:
         # A brief the delegate's CLI would swallow starts a chat that answers a
@@ -3385,7 +3551,8 @@ async def start_delegation(request: Request, body: DelegationRequest) -> dict:
         raise HTTPException(status_code=422, detail=undeliverable)
     parent_session = _delegation_parent_session(request, body)
     message = body.message
-    if body.sandbox == "read-only" and account.provider_id == "codex":
+    if body.sandbox == "read-only" and account.provider_id == "codex" and not web_only:
+        # Not for a web-only chat: its question may come from anyone (#4381).
         # Claude's read-only mapping (plan mode) keeps its network, so only a Codex
         # delegate needs the referenced text handed over (#787). The caller's message is
         # validated at its own length: the prepended context is trimmed to what fits
@@ -3404,11 +3571,12 @@ async def start_delegation(request: Request, body: DelegationRequest) -> dict:
         provider,
         cwd,
         message,
-        sandbox=body.sandbox,
+        sandbox="read-only" if web_only else body.sandbox,
         model=body.model,
         effort=body.effort,
-        approval_policy=body.approval_policy,
+        approval_policy="never" if web_only else body.approval_policy,
         parent_session_id=parent_session,
+        web_only=web_only,
     )
     if not result.accepted or delegation_id is None:
         raise HTTPException(status_code=422, detail=result.reason)

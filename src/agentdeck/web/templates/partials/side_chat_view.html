@@ -1,0 +1,31 @@
+{#- The chat's side chat (#4313), shown in the main chat's place while the box's switch is
+    on Side chat. Only its own talk: the history it was copied from is the main chat above.
+    side_chat_panel.js swaps this whole body after a send; the live tail arrives on the side
+    chat's own stream, into a log that is deliberately not `.transcript`, so nothing on the
+    page mistakes it for the main chat's. #}
+<div class="side-view-body" data-side-view-body data-side-state="{{ side_state }}"
+     {%- if side_key %} data-side-session-key="{{ side_key }}"{% endif %}
+     {%- if side_url %} data-side-url="{{ side_url }}"{% endif %}>
+  {%- if side_state == "live" %}
+  <div class="side-view-stream" sse-connect="/events/sessions/{{ side_key }}?after_seq={{ after_seq }}">
+    <div class="side-view-log" data-side-view-log sse-swap="transcript" hx-swap="beforeend">{{ rendered | safe }}</div>
+    {#- The side chat's own status, unseen: voice mode reads from it whether the side chat
+        is working (#4349). The stream's first status replaces this first guess. #}
+    <div data-side-status sse-swap="status" hidden><span class="status-tag {{ side_display_state }}"></span></div>
+  </div>
+  {%- elif side_state == "starting" %}
+  <div class="side-view-log" data-side-view-log>
+    {%- if start_message %}
+    <div class="ev user side-view-pending"><div class="ev-text">{{ start_message }}</div></div>
+    {%- endif %}
+    {#- Watches the start where it was made, as the start strip does (#1799): it asks again
+        until the side chat is up, then this body is replaced by its live one. #}
+    <p class="side-view-note" role="status"
+       hx-get="/partials/sessions/{{ main_key }}/side-chat" hx-trigger="load delay:1s"
+       hx-target="closest [data-side-view-body]" hx-swap="outerHTML">Starting the side chat…</p>
+  </div>
+  {%- endif %}
+  {%- if side_state == "none" or (side_state == "live" and not own_events) %}
+  <p class="side-view-empty" data-side-view-empty>Ask something on the side. Nothing you write here reaches the main chat until you send it back.</p>
+  {%- endif %}
+</div>

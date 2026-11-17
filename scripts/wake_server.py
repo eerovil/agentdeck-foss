@@ -5,6 +5,9 @@ first, and Whisper runs only on a phrase this hears "Hey Jarvis" in. It is
 openWakeWord's ready-made ``hey_jarvis`` model on the CPU: a 2 s phrase takes about
 0.1 s, and the graphics card stays idle. The wake word is "Hey Jarvis" by the
 owner's choice; a custom "Hey deck" would have needed a model trained for it.
+A page may ask for "Alexa" instead (``?word=alexa``), openWakeWord's ready-made
+``alexa`` model, so a second device in the same house does not wake on the first
+one's word. Both models are in openwakeword 0.4.0's wheel.
 
 It runs in the speech service's virtualenv (``scripts/speech_setup.sh`` adds
 ``openwakeword``), but in a process of its own, so Whisper's service can still exit
@@ -12,6 +15,7 @@ when idle and give back its graphics memory while voice mode waits.
 
     POST /wake    body: 16-bit mono WAV   -> {"woken", "score", "speech_after"}
                   ?threshold=0.5  the score that wakes (``[speech] wake_threshold``)
+                  &word=jarvis    which wake word: ``jarvis`` (default) or ``alexa``
     GET  /status                          -> {"model"}
 
 ``speech_after`` says whether speech follows the wake word in the same phrase
@@ -45,6 +49,9 @@ from speech_server import SAMPLE_RATE, listening_socket, read_wav
 log = logging.getLogger("agentdeck-wake")
 
 MODEL = "hey_jarvis_v0.1"
+# The wake words a page may ask for, by the name it asks with: each a model
+# openwakeword 0.4.0 ships in its wheel.
+MODELS = {"jarvis": MODEL, "alexa": "alexa_v0.1"}
 # openWakeWord scores 80 ms frames; a second of silence after the phrase lets the
 # score of a wake word said at its very end rise.
 FRAME = 1280
@@ -57,25 +64,29 @@ VAD_SILENCE_MS = 300
 MAX_BODY = 30 * 1024 * 1024
 
 
-def model_path() -> str:
-    """The ``hey_jarvis`` model openwakeword 0.4.0 ships in its wheel."""
+def model_path(model: str = MODEL) -> str:
+    """A model openwakeword 0.4.0 ships in its wheel."""
     from pathlib import Path
 
     import openwakeword
 
-    return str(Path(openwakeword.__file__).parent / "resources" / "models" / f"{MODEL}.onnx")
+    return str(Path(openwakeword.__file__).parent / "resources" / "models" / f"{model}.onnx")
 
 
 class Detector:
     def __init__(self) -> None:
         from openwakeword.model import Model
 
-        self.model = Model(wakeword_model_paths=[model_path()])
-        self.name = next(iter(self.model.models))
+        self.model = Model(wakeword_model_paths=[model_path(m) for m in MODELS.values()])
+        # The model's own name for each word's scores (the file name without ".onnx").
+        self.names = {word: model for word, model in MODELS.items()}
+        missing = set(self.names.values()) - set(self.model.models)
+        if missing:
+            raise RuntimeError(f"wake word models not loaded: {sorted(missing)}")
         # One phrase at a time: the model keeps its audio buffer between frames.
         self.lock = threading.Lock()
 
-    def scores(self, samples) -> list[float]:
+    def scores(self, samples, word: str = "jarvis") -> list[float]:
         import numpy as np
 
         pcm = (np.clip(samples, -1.0, 1.0) * 32767).astype(np.int16)
@@ -83,20 +94,21 @@ class Detector:
         with self.lock:
             self.model.reset()
             return [
-                float(self.model.predict(pcm[start : start + FRAME])[self.name])
+                float(self.model.predict(pcm[start : start + FRAME])[self.names[word]])
                 for start in range(0, len(pcm) - FRAME + 1, FRAME)
             ]
 
-    def wake(self, data: bytes, threshold: float) -> dict:
+    def wake(self, data: bytes, threshold: float, word: str = "jarvis") -> dict:
         started = time.monotonic()
         samples = read_wav(data)
-        scores = self.scores(samples) or [0.0]
+        scores = self.scores(samples, word) or [0.0]
         peak = max(range(len(scores)), key=scores.__getitem__)
         woken = scores[peak] >= threshold
         after = woken and speech_after(samples[(peak + 1) * FRAME :])
         log.info(
-            "%.1fs phrase: score %.3f%s in %.0f ms",
+            "%.1fs phrase: %s score %.3f%s in %.0f ms",
             len(samples) / SAMPLE_RATE,
+            word,
             scores[peak],
             " (woken, speech after)" if after else " (woken)" if woken else "",
             (time.monotonic() - started) * 1000,
@@ -105,7 +117,8 @@ class Detector:
 
     def warm(self) -> None:
         """Runs both models once, so the first phrase never waits for them to load:
-        Silero's import alone took 12 to 15 s on the first wake of a new process."""
+        Silero's import alone took 12 to 15 s on the first wake of a new process. One
+        ``predict`` runs every loaded wake word, so one pass warms them all."""
         import numpy as np
 
         started = time.monotonic()
@@ -146,7 +159,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802 - stdlib name
         self.server.touch()
         if self.path == "/status":
-            self._json(200, {"model": MODEL})
+            self._json(200, {"model": MODEL, "models": MODELS})
         else:
             self._json(404, {"error": "not found"})
 
@@ -160,10 +173,14 @@ class Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length") or 0)
             if length > MAX_BODY:
                 raise ValueError("body too large")
-            threshold = float(parse_qs(query).get("threshold", ["0.5"])[0])
+            params = parse_qs(query)
+            threshold = float(params.get("threshold", ["0.5"])[0])
             if not 0 < threshold < 1:
                 raise ValueError("threshold must be between 0 and 1")
-            self._json(200, self.server.detector.wake(self.rfile.read(length), threshold))
+            word = params.get("word", ["jarvis"])[0]
+            if word not in MODELS:
+                raise ValueError(f"unknown wake word {word!r}")
+            self._json(200, self.server.detector.wake(self.rfile.read(length), threshold, word))
         except (ValueError, wave.Error, EOFError) as exc:
             self._json(400, {"error": str(exc)})
         except Exception as exc:  # noqa: BLE001 - one bad request must not end the service

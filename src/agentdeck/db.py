@@ -353,7 +353,15 @@ CREATE TABLE IF NOT EXISTS chat_forks (
     source_session_key TEXT NOT NULL,
     source_seq INTEGER NOT NULL,
     action_id TEXT UNIQUE,
-    reserved_at TEXT NOT NULL
+    reserved_at TEXT NOT NULL,
+    -- 'side' marks the chat's one side chat in its message box (#4313); a fork
+    -- started from a reply's button leaves it NULL. cut_ref is the provider's name
+    -- for the cut, and seen_* the main chat's leg and newest finished line the
+    -- side chat last heard of.
+    kind TEXT,
+    cut_ref TEXT,
+    seen_session_key TEXT,
+    seen_seq INTEGER
 );
 -- Transcript lines a person rolled out of a chat (#3474), first to last inclusive. The
 -- provider's file keeps them (Claude branches the same file), so the deck leaves
@@ -438,6 +446,12 @@ CREATE TABLE IF NOT EXISTS session_bypass_permissions (
 CREATE TABLE IF NOT EXISTS session_roles (
     session_key TEXT PRIMARY KEY,
     role TEXT NOT NULL
+);
+-- A Codex chat locked to web search (#4381): one turn, never resumed, forked or given
+-- a permission switch. Written before its first turn and never cleared.
+CREATE TABLE IF NOT EXISTS session_web_only (
+    session_key TEXT PRIMARY KEY,
+    started_at TEXT NOT NULL
 );
 -- A handoff callback is an agent-authored write that may outlive the web
 -- request which asked for it. Reserve its pre-minted destination token before
@@ -866,6 +880,45 @@ CREATE TABLE IF NOT EXISTS push_needs_you_showing (
     payload TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+-- The Works that are deployed and wait only for a person to try them (#4384): ``set`` holds
+-- the Work ids the deck shows as Waiting for a try, written only by the Work overview's pass,
+-- and ``noted`` the ``<work_id>@<live_check_at>`` keys whose blocked issues the router was
+-- already asked to start, written only by the web's note task. One writer per row.
+CREATE TABLE IF NOT EXISTS work_try_waits (
+    name TEXT PRIMARY KEY,
+    payload TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+-- The pull requests registered to a Work that merged into their repository's default branch
+-- (#4398): a blocker whose Work has one counts as done for the issues it blocks. ``pull`` is
+-- the pull request's ``owner/repo#n`` (its repository may differ from the Work's issue),
+-- ``base`` the branch it merged into. Written only by the Work router: a merge adds a row, a
+-- reopen of the Work's issue removes its rows.
+CREATE TABLE IF NOT EXISTS work_merged_pulls (
+    work_id TEXT NOT NULL,
+    pull TEXT NOT NULL,
+    base TEXT NOT NULL,
+    merged_at TEXT NOT NULL,
+    PRIMARY KEY (work_id, pull)
+);
+-- Lighter review of robot pull requests outside their guarded code (#4399): one row per pull
+-- request (``owner/repo#n``, lowercased). ``record`` is the JSON the light-review service keeps
+-- (decisions and bench answers per head, each written once, and owed messages);
+-- ``merged_light`` is 1 once the deck merged it light. Written only by the services process.
+CREATE TABLE IF NOT EXISTS light_review (
+    pull TEXT PRIMARY KEY,
+    repository TEXT NOT NULL,
+    record TEXT NOT NULL,
+    merged_light INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL
+);
+-- The review point issue filed once per repository and limit (#4399).
+CREATE TABLE IF NOT EXISTS light_review_points (
+    repository TEXT NOT NULL,
+    review_limit INTEGER NOT NULL,
+    issue TEXT NOT NULL,
+    PRIMARY KEY (repository, review_limit)
+);
 -- Nothing reads this since #2886 removed the finished-notification setting; it stays so
 -- an existing database needs no migration.
 CREATE TABLE IF NOT EXISTS push_preferences (
@@ -1029,6 +1082,29 @@ CREATE TABLE IF NOT EXISTS start_spare_claims (
     worker_key TEXT NOT NULL,
     claimed_at TEXT NOT NULL
 );
+-- Pending events (#4303): notes the deck keeps for a chat without waking it. Each goes in
+-- front of the next message delivered to that chat, by any send path, once, in ``seq``
+-- order. ``action_id`` is the delivery that took it, set before the provider is written
+-- to: a retry under that id carries the same notes again (so the delivery fence still
+-- sees the same text), and no other delivery ever takes them. A clean refusal clears it.
+CREATE TABLE IF NOT EXISTS pending_events (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    id TEXT NOT NULL UNIQUE,
+    chat_id TEXT NOT NULL,
+    text TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    action_id TEXT,
+    claimed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_pending_events_chat ON pending_events(chat_id, action_id);
+CREATE INDEX IF NOT EXISTS idx_pending_events_action ON pending_events(action_id);
+-- Every delivery that asked for notes, including one that took none: its snapshot is frozen
+-- at the first ask, so a retry under the same id carries exactly the same notes (none too)
+-- and the delivery fence sees the same text. A clean refusal clears it with its notes.
+CREATE TABLE IF NOT EXISTS pending_event_claims (
+    action_id TEXT PRIMARY KEY,
+    claimed_at TEXT NOT NULL
+);
 """
 
 
@@ -1067,6 +1143,24 @@ def _is_schema_error(exc: sqlite3.Error) -> bool:
         or "no such table" in message
         or "has no column named" in message
     )
+
+
+@dataclass(frozen=True)
+class SideChatFork:
+    """A chat's side chat in its message box (#4313), as ``chat_forks`` records it.
+
+    ``session_key`` is None until the provider names the started chat.
+    """
+
+    token: str
+    source_session_key: str
+    source_seq: int
+    action_id: str | None
+    reserved_at: str
+    cut_ref: str | None
+    seen_session_key: str | None
+    seen_seq: int | None
+    session_key: str | None
 
 
 @dataclass
@@ -2202,19 +2296,28 @@ class Db:
         )
 
     def reserve_chat_fork(
-        self, token: str, source_session_key: str, source_seq: int, action_id: str | None
+        self,
+        token: str,
+        source_session_key: str,
+        source_seq: int,
+        action_id: str | None,
+        *,
+        kind: str | None = None,
+        cut_ref: str | None = None,
     ) -> str | None:
         """Record a side chat's source before provider I/O; answer the token that owns it.
 
         A resend of the same press (same ``action_id``) gets the token its first
         attempt reserved, so the caller can send the browser to that start instead of
-        starting a second side chat.
+        starting a second side chat. ``kind='side'`` marks the chat's one side chat in
+        its message box (#4313), which starts having heard of the main chat up to its cut.
         """
         try:
             with self._lock, self._conn:
                 self._conn.execute(
                     "INSERT INTO chat_forks(token, source_session_key, source_seq,"
-                    " action_id, reserved_at) VALUES (?, ?, ?, ?, ?)"
+                    " action_id, reserved_at, kind, cut_ref, seen_session_key, seen_seq)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
                     " ON CONFLICT DO NOTHING",
                     (
                         token,
@@ -2222,6 +2325,10 @@ class Db:
                         source_seq,
                         action_id,
                         datetime.now(UTC).isoformat(),
+                        kind,
+                        cut_ref,
+                        source_session_key if kind else None,
+                        source_seq if kind else None,
                     ),
                 )
                 if action_id is None:
@@ -2303,6 +2410,47 @@ class Db:
                 "SELECT session_key, first_seq, last_seq FROM transcript_rollbacks"
             )
         ]
+
+    def side_chat_forks(self, source_session_keys: Sequence[str]) -> list[SideChatFork]:
+        """The message-box side chats cut from any of these legs, newest first (#4313)."""
+        keys = [key for key in source_session_keys if key]
+        if not keys:
+            return []
+        marks = ", ".join("?" for _ in keys)
+        rows = self._query(
+            "SELECT f.token, f.source_session_key, f.source_seq, f.action_id, f.reserved_at,"
+            " f.cut_ref, f.seen_session_key, f.seen_seq, t.session_key FROM chat_forks f"
+            " LEFT JOIN session_tokens t ON t.token = f.token"
+            f" WHERE f.kind = 'side' AND f.source_session_key IN ({marks})"
+            " ORDER BY f.reserved_at DESC, f.rowid DESC",
+            tuple(keys),
+        )
+        return [
+            SideChatFork(
+                token=str(token),
+                source_session_key=str(source),
+                source_seq=int(seq),
+                action_id=str(action) if action else None,
+                reserved_at=str(reserved),
+                cut_ref=str(cut) if cut else None,
+                seen_session_key=str(seen_key) if seen_key else None,
+                seen_seq=int(seen_seq) if seen_seq is not None else None,
+                session_key=str(key) if key else None,
+            )
+            for token, source, seq, action, reserved, cut, seen_key, seen_seq, key in rows
+        ]
+
+    def chat_fork_by_action(self, action_id: str) -> str | None:
+        """The token of the side chat this press started, or None (#4313)."""
+        rows = self._query("SELECT token FROM chat_forks WHERE action_id = ?", (action_id,))
+        return str(rows[0][0]) if rows else None
+
+    def note_side_chat_seen(self, token: str, session_key: str, seq: int) -> bool:
+        """Record the main chat's leg and line a side chat has now heard of (#4313)."""
+        return self._write(
+            "UPDATE chat_forks SET seen_session_key = ?, seen_seq = ? WHERE token = ?",
+            (session_key, seq, token),
+        )
 
     def chat_fork_source(self, session_key: str) -> tuple[str, int] | None:
         """The session and line a side chat was cut from, or None for any other chat."""
@@ -2571,6 +2719,23 @@ class Db:
             (session_key, role),
         )
 
+    # --- Codex chats locked to web search (#4381) -----------------------
+
+    def web_only(self, session_key: str) -> bool:
+        """Whether this chat is web-only; raises when the read fails, so callers fail closed."""
+        return bool(
+            self._query_or_raise(
+                "SELECT 1 FROM session_web_only WHERE session_key = ?", (session_key,)
+            )
+        )
+
+    def set_web_only(self, session_key: str) -> bool:
+        return self._write(
+            "INSERT INTO session_web_only(session_key, started_at) VALUES (?, ?)"
+            " ON CONFLICT(session_key) DO NOTHING",
+            (session_key, datetime.now(UTC).isoformat()),
+        )
+
     # --- session pull requests ----------------------------------------
     # Registered by the session's own agent through the local API; the only
     # source of a chat's PRs.
@@ -2720,11 +2885,6 @@ class Db:
         """``work_id`` → (source_kind, source_key, created_at)."""
         rows = self._query("SELECT work_id, source_kind, source_key, created_at FROM works")
         return {str(row[0]): (str(row[1]), str(row[2]), str(row[3])) for row in rows}
-
-    def count_works(self) -> int:
-        """How many Works the inventory holds, without reading them (#2201)."""
-        rows = self._query("SELECT COUNT(*) FROM works")
-        return int(rows[0][0]) if rows else 0
 
     def known_work_ids(self, work_ids: Iterable[str]) -> set[str]:
         """Which of ``work_ids`` the inventory holds: one lookup per id, never the table."""
@@ -3480,6 +3640,116 @@ class Db:
                 )
         except sqlite3.Error as exc:
             log.debug("mac runner callback settle failed: %s", exc)
+
+    # --- pending events (#4303) ----------------------------------------
+
+    def add_pending_event(self, event_id: str, chat_id: str, text: str) -> bool:
+        """Keep ``text`` for ``chat_id``'s next message; whether it is held (new or not).
+
+        Idempotent by ``event_id``: the same notice added twice is one note, and one that
+        was already delivered is not queued again."""
+        try:
+            with self._lock, self._conn:
+                self._conn.execute(
+                    "INSERT OR IGNORE INTO pending_events (id, chat_id, text, created_at)"
+                    " VALUES (?, ?, ?, ?)",
+                    (event_id, chat_id, text, datetime.now(UTC).isoformat()),
+                )
+        except sqlite3.Error as exc:
+            log.warning("pending event %s not stored: %s", event_id, exc)
+            return False
+        return True
+
+    def claim_pending_events(
+        self, chat_ids: Sequence[str], action_id: str, fits: Callable[[list[str]], bool]
+    ) -> list[str]:
+        """The notes delivery ``action_id`` carries, oldest first.
+
+        A delivery that asked before gets the same snapshot back, whatever came since, an
+        empty one included: its retry must send the same text. Otherwise it takes the
+        chat's waiting notes, in order, as many as ``fits`` allows, before anything is
+        written to the provider, and its snapshot is frozen. Any doubt reads as no notes:
+        the message goes out bare and the notes keep waiting.
+        """
+        try:
+            with self._lock, self._conn:
+                now = datetime.now(UTC).isoformat()
+                fresh = self._conn.execute(
+                    "INSERT OR IGNORE INTO pending_event_claims (action_id, claimed_at)"
+                    " VALUES (?, ?)",
+                    (action_id, now),
+                ).rowcount
+                if not fresh or not chat_ids:
+                    return [
+                        str(row[0])
+                        for row in self._conn.execute(
+                            "SELECT text FROM pending_events WHERE action_id = ? ORDER BY seq",
+                            (action_id,),
+                        )
+                    ]
+                marks = ",".join("?" for _ in chat_ids)
+                rows = self._conn.execute(
+                    "SELECT seq, text FROM pending_events"
+                    f" WHERE chat_id IN ({marks}) AND action_id IS NULL ORDER BY seq",
+                    tuple(chat_ids),
+                ).fetchall()
+                chosen: list[tuple[int, str]] = []
+                for seq, text in rows:
+                    if not fits([*(t for _s, t in chosen), str(text)]):
+                        break
+                    chosen.append((int(seq), str(text)))
+                self._conn.executemany(
+                    "UPDATE pending_events SET action_id = ?, claimed_at = ? WHERE seq = ?",
+                    [(action_id, now, seq) for seq, _text in chosen],
+                )
+                return [text for _seq, text in chosen]
+        except sqlite3.Error as exc:
+            log.warning("pending events not read for %s: %s", action_id, exc)
+            return []
+
+    def release_pending_events(self, action_id: str) -> None:
+        """Put back the notes a delivery took when the provider cleanly refused it."""
+        try:
+            with self._lock, self._conn:
+                self._conn.execute(
+                    "UPDATE pending_events SET action_id = NULL, claimed_at = NULL"
+                    " WHERE action_id = ?",
+                    (action_id,),
+                )
+                self._conn.execute(
+                    "DELETE FROM pending_event_claims WHERE action_id = ?", (action_id,)
+                )
+        except sqlite3.Error as exc:
+            log.warning("pending events of %s not released: %s", action_id, exc)
+
+    def pending_events(self, chat_id: str) -> list[dict[str, Any]]:
+        """The notes still waiting for ``chat_id``'s next message, oldest first."""
+        try:
+            with self._lock:
+                rows = self._conn.execute(
+                    "SELECT id, text, created_at FROM pending_events"
+                    " WHERE chat_id = ? AND action_id IS NULL ORDER BY seq",
+                    (chat_id,),
+                ).fetchall()
+        except sqlite3.Error as exc:
+            log.debug("pending events unreadable: %s", exc)
+            return []
+        return [{"id": row[0], "text": row[1], "created_at": row[2]} for row in rows]
+
+    def prune_pending_events(self, delivered_before: datetime) -> None:
+        """Forget delivered notes older than ``delivered_before``; waiting ones stay."""
+        try:
+            with self._lock, self._conn:
+                self._conn.execute(
+                    "DELETE FROM pending_events WHERE claimed_at IS NOT NULL AND claimed_at < ?",
+                    (delivered_before.isoformat(),),
+                )
+                self._conn.execute(
+                    "DELETE FROM pending_event_claims WHERE claimed_at < ?",
+                    (delivered_before.isoformat(),),
+                )
+        except sqlite3.Error as exc:
+            log.debug("pending events not pruned: %s", exc)
 
     def record_dismissed_delivery(self, action_id: str, session_key: str) -> None:
         """Remember that a person threw this action's optimistic row away (#2031).
@@ -4745,6 +5015,149 @@ class Db:
                 json.dumps({tag: sorted(works) for tag, works in sorted(showing.items())}),
                 datetime.now(UTC).isoformat(),
             ),
+        )
+
+    # --- deployed Works waiting for a try (#4384) ---
+
+    def load_try_waits(self) -> frozenset[str]:
+        """The Work ids that are deployed and wait only for a person's try (#4384).
+
+        A blocker in this set counts as done. Unreadable is empty, so every blocker blocks.
+        """
+        items = self._try_wait_row("set")
+        return frozenset(items) if items is not None else frozenset()
+
+    def read_try_waits(self) -> frozenset[str] | None:
+        """``load_try_waits`` for its one writer: ``None`` when unreadable, not empty, so the
+        writer never takes a row it could not read for an empty one it need not rewrite."""
+        items = self._try_wait_row("set")
+        return frozenset(items) if items is not None else None
+
+    def save_try_waits(self, works: Iterable[str]) -> bool:
+        """Replace the set; ``False`` when the write failed (the caller hands nothing on)."""
+        return self._save_try_wait_row("set", works)
+
+    def load_try_waits_noted(self) -> set[str] | None:
+        """The ``<work_id>@<live_check_at>`` keys already sent; ``None`` when unreadable."""
+        items = self._try_wait_row("noted")
+        return set(items) if items is not None else None
+
+    def save_try_waits_noted(self, keys: Iterable[str]) -> bool:
+        return self._save_try_wait_row("noted", keys)
+
+    def _try_wait_row(self, name: str) -> list[str] | None:
+        try:
+            rows = self._query_or_raise(
+                "SELECT payload FROM work_try_waits WHERE name = ?", (name,)
+            )
+        except sqlite3.Error as exc:
+            self._log_failure("query", exc)
+            return None
+        if not rows:
+            return []
+        try:
+            items = json.loads(rows[0][0])
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(items, list):
+            return None
+        return [str(item) for item in items]
+
+    def _save_try_wait_row(self, name: str, items: Iterable[str]) -> bool:
+        return self._write(
+            "INSERT INTO work_try_waits(name, payload, updated_at) VALUES (?, ?, ?)"
+            " ON CONFLICT(name) DO UPDATE SET"
+            " payload=excluded.payload, updated_at=excluded.updated_at",
+            (name, json.dumps(sorted(set(items))), datetime.now(UTC).isoformat()),
+        )
+
+    # --- merged pull requests of Works, for blockers (#4398) ---
+
+    def note_merged_pull(self, work_id: str, pull: str, base: str) -> bool:
+        """Record that ``pull`` (``owner/repo#n``), registered to ``work_id``, merged into
+        ``base``. Whether it committed: the router starts nothing on a row it never wrote."""
+        return self._write(
+            "INSERT INTO work_merged_pulls(work_id, pull, base, merged_at) VALUES (?, ?, ?, ?)"
+            " ON CONFLICT(work_id, pull) DO NOTHING",
+            (work_id, pull, base, datetime.now(UTC).isoformat()),
+        )
+
+    def forget_merged_pulls(self, work_id: str) -> bool:
+        """Drop ``work_id``'s merges: its issue was reopened, so it blocks again."""
+        return self._write("DELETE FROM work_merged_pulls WHERE work_id = ?", (work_id,))
+
+    def load_merged_pulls(
+        self, work_ids: Iterable[str] | None = None
+    ) -> dict[str, list[tuple[str, str]]]:
+        """``work_id`` -> its merged ``(pull, base)`` pairs, oldest first; empty when unread."""
+        wanted = None if work_ids is None else sorted(set(work_ids))
+        if wanted == []:
+            return {}
+        sql = "SELECT work_id, pull, base FROM work_merged_pulls"
+        params: tuple = ()
+        if wanted is not None:
+            sql += f" WHERE work_id IN ({', '.join('?' for _ in wanted)})"
+            params = tuple(wanted)
+        found: dict[str, list[tuple[str, str]]] = {}
+        for work_id, pull, base in self._query(sql + " ORDER BY merged_at, rowid", params):
+            found.setdefault(str(work_id), []).append((str(pull), str(base)))
+        return found
+
+    def load_done_blockers(self) -> frozenset[str]:
+        """The Work ids that count as done for the issues they block: deployed and waiting
+        only for a try (#4384), or with a registered pull request merged (#4398). Unread is
+        empty for either part, so its blockers block."""
+        return self.load_try_waits() | frozenset(self.load_merged_pulls())
+
+    # --- lighter review of robot pull requests (#4399) ---
+
+    def light_review_row(self, pull: str) -> dict | None:
+        """``pull``'s stored record, ``None`` for none; raises when unread."""
+        rows = self._query_or_raise("SELECT record FROM light_review WHERE pull = ?", (pull,))
+        return json.loads(rows[0][0]) if rows else None
+
+    def light_review_rows(self, repository: str | None) -> list[tuple[str, dict, bool]]:
+        """``(pull, record, merged light)`` of one repository, or of all; raises when unread."""
+        sql = "SELECT pull, record, merged_light FROM light_review"
+        params: tuple = ()
+        if repository is not None:
+            sql += " WHERE repository = ?"
+            params = (repository,)
+        return [
+            (str(pull), json.loads(record), bool(merged))
+            for pull, record, merged in self._query_or_raise(sql + " ORDER BY pull", params)
+        ]
+
+    def put_light_review(
+        self, pull: str, repository: str, record: dict, *, merged: bool | None = None
+    ) -> bool:
+        """Write ``pull``'s whole record in one statement; whether it committed."""
+        now = datetime.now(UTC).isoformat()
+        flag = 1 if merged else 0
+        return self._write(
+            "INSERT INTO light_review(pull, repository, record, merged_light, updated_at)"
+            " VALUES (?, ?, ?, ?, ?) ON CONFLICT(pull) DO UPDATE SET"
+            " record=excluded.record, updated_at=excluded.updated_at"
+            + (", merged_light=excluded.merged_light" if merged is not None else ""),
+            (pull, repository, json.dumps(record, sort_keys=True), flag, now),
+        )
+
+    def set_light_review_merged(self, pull: str) -> bool:
+        return self._write("UPDATE light_review SET merged_light = 1 WHERE pull = ?", (pull,))
+
+    def light_review_point(self, repository: str, limit: int) -> str | None:
+        """The review point issue filed for ``repository`` at ``limit``; raises when unread."""
+        rows = self._query_or_raise(
+            "SELECT issue FROM light_review_points WHERE repository = ? AND review_limit = ?",
+            (repository, limit),
+        )
+        return str(rows[0][0]) if rows else None
+
+    def note_light_review_point(self, repository: str, limit: int, issue: str) -> bool:
+        return self._write(
+            "INSERT INTO light_review_points(repository, review_limit, issue) VALUES (?, ?, ?)"
+            " ON CONFLICT(repository, review_limit) DO NOTHING",
+            (repository, limit, issue),
         )
 
     # --- poller review history (#1122) ---

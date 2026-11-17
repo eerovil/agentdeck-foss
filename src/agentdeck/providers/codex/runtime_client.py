@@ -158,7 +158,25 @@ class CodexRuntimeClient(RuntimeSocketClient):
         role: str | None = None,
         session_token: str | None = None,
         fork_from: ForkFrom | None = None,
+        web_only: bool = False,
     ) -> InjectResult:
+        if web_only:
+            # Its own route (#4381): a runtime that predates the lock answers 404 and
+            # starts nothing, rather than ignoring a field and starting an open chat.
+            if images or fork_from is not None:
+                return InjectResult(False, "a web-only research chat takes no images or fork")
+            return await self._post(
+                "start-web-only",
+                {
+                    "cwd": str(cwd),
+                    "message": message,
+                    "model": model,
+                    "effort": effort,
+                    "delegated": delegated,
+                    "role": role,
+                    "session_token": session_token,
+                },
+            )
         payload: dict[str, object] = {
             "cwd": str(cwd),
             "message": message,

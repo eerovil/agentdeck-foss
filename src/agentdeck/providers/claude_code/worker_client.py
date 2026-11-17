@@ -30,6 +30,9 @@ log = logging.getLogger(__name__)
 
 # How often a turn wait re-reads the snapshot when the runtime cannot say it moved (#2865).
 TURN_POLL_S = 0.2
+# A voice-mode wake waits at most this long for the runtime (#4360): the launch it
+# asks for goes on there either way, and nothing waits on the answer.
+WAKE_TIMEOUT_S = 10.0
 
 
 class ClaudeWorkerClient(RuntimeSocketClient):
@@ -475,6 +478,24 @@ class ClaudeWorkerClient(RuntimeSocketClient):
             state = response.json().get("state")
         except (httpx.HTTPError, ValueError, AttributeError) as exc:
             log.debug("could not ask for a spare %s on %s: %s", shape, self.account.key, exc)
+            return ""
+        return state if isinstance(state, str) else ""
+
+    async def wake_worker(self, session_id: str) -> str:
+        """Ask the runtime to start this owned chat's process ahead of a voice-mode
+        phrase (#4360). Answers the runtime's word for what it did, or ``""`` when this
+        is no owned chat or the runtime could not be asked: the send then spawns cold."""
+        key = self._key_for(session_id)
+        if key is None:
+            return ""
+        try:
+            response = await self._client().post(
+                f"{self._base}/wake", json={"key": key}, timeout=WAKE_TIMEOUT_S
+            )
+            response.raise_for_status()
+            state = response.json().get("state")
+        except (httpx.HTTPError, ValueError, AttributeError) as exc:
+            log.debug("could not wake %s on %s: %s", key, self.account.key, exc)
             return ""
         return state if isinstance(state, str) else ""
 

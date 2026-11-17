@@ -22,6 +22,9 @@ _SESSION_NAVIGATION_RE = re.compile(r"^/sessions/(?P<session_key>[^/]+)$")
 # A side chat (#2485) is a start like New chat, but cut from one leg's history, so the
 # client's action ID is what makes a resent press find the start its first one made.
 _SESSION_FORK_RE = re.compile(r"^/sessions/(?P<session_key>[^/]+)/fork$")
+# The message box's side chat (#4313) starts one the same way, or sends to the one it has:
+# either way a resent press must carry the ID its first attempt used.
+_SESSION_SIDE_CHAT_RE = re.compile(r"^/sessions/(?P<session_key>[^/]+)/side-chat$")
 # Message this Work (#2218) is a send like the chat's own: the chat is chosen only once the
 # route runs, and ``inject_message`` binds it, but the client's action ID must be taken here
 # so a retried Work send reaches the queue under the ID its first attempt used.
@@ -54,6 +57,9 @@ def _request_action(request: Request) -> tuple[str | None, str | None]:
     match = _SESSION_FORK_RE.match(request.url.path)
     if match:
         return "fork_session", match.group("session_key")
+    match = _SESSION_SIDE_CHAT_RE.match(request.url.path)
+    if match:
+        return "side_chat", match.group("session_key")
     # The scope's own path: a Work id carries a ``#``, which ``request.url`` reads as the
     # start of a fragment and cuts off.
     if _WORK_MESSAGE_RE.match(request.scope.get("path", "")):

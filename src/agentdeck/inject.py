@@ -23,6 +23,7 @@ from .config import InjectConfig
 from .deployment import is_deploy_checkout
 from .images import media_type_for_suffix
 from .models import Account, Capability, ForkFrom, InjectResult, Session, TranscriptEvent
+from .pending_events import PendingEvents, carries_notes, refused_before_write, with_notes
 from .providers.base import SessionProvider
 
 log = logging.getLogger(__name__)
@@ -258,6 +259,11 @@ class QueuedMessage:
     attempts: int = 0
     # Where `confirm_from_transcript` stopped, as (byte offset, seq).
     confirm_cursor: tuple[int, int] = (0, 0)
+    # The text as queued, before any pending notes went in front of it (#4303), and the id
+    # those notes are kept under: the action id when there is one, so a durable retry takes
+    # the same notes back. ``None`` until the first send attempt.
+    base_text: str | None = None
+    notes_key: str | None = None
 
     @property
     def image_media_types(self) -> tuple[str, ...]:
@@ -466,8 +472,12 @@ class InjectionService:
         # takeover uses for a child whose start was cut off (#2582).
         delegation_store: DelegationStore | None = None,
         session_key_for_token: Callable[[str], str | None] | None = None,
+        # Notes the deck keeps for a chat without waking it (#4303): every send below
+        # carries the waiting ones in front of its message.
+        pending_events: PendingEvents | None = None,
     ):
         self.config = config
+        self.pending_events = pending_events
         # Why the deck sends nothing to this session now, or None (#2559): a person paused a
         # Work it belongs to. Set by the app once its Work overview exists; consulted before a
         # message is queued and again before one is taken off the queue, so a paused Work
@@ -602,6 +612,19 @@ class InjectionService:
         already refuses to resend on the same reasoning.
         """
         return bool(self._session_busy(session_key))
+
+    def awaits_answer(self, session_key: str) -> bool:
+        """Whether the chat still owes an answer to a message sent to it.
+
+        Reads the whole queue, not `status`, which shows only the latest dozen: an
+        older message still queued or in flight counts too. A message the agent took
+        and stayed silent on (`is_unacknowledged`) does not: it never will be
+        answered, and a caller waiting for the chat to go quiet would wait for good.
+        """
+        return any(
+            item.is_pending and not item.is_unacknowledged
+            for item in self._items.get(session_key, ())
+        )
 
     def discard(self, session_key: str, item_id: int) -> bool:
         """Forget one optimistic row the agent took and never wrote down.
@@ -859,6 +882,57 @@ class InjectionService:
         if cancelled:
             raise asyncio.CancelledError
 
+    def claim_notes(
+        self,
+        session_key: str,
+        key: str,
+        message: str,
+        files: Iterable[Path],
+        *,
+        retry_only: bool = False,
+    ) -> list[str]:
+        """The pending notes this send to ``session_key`` carries, kept under ``key`` (#4303).
+
+        Taken before the provider is written to, and only as many as keep the message under
+        the deck's length limit. None for a slash command, or on any doubt: the message then
+        goes out bare and the notes wait for the next one."""
+        if self.pending_events is None or not carries_notes(message):
+            return []
+        files = list(files)
+        try:
+            return self.pending_events.claim(
+                session_key,
+                key,
+                lambda notes: not self.config.too_long(
+                    _submitted_message(with_notes(notes, message), files)
+                ),
+                retry_only=retry_only,
+            )
+        except Exception:  # noqa: BLE001 - a note never stops the message it rides on
+            log.warning("pending notes not read for %s", session_key, exc_info=True)
+            return []
+
+    def release_notes(self, key: str | None) -> None:
+        """The send kept under ``key`` was cleanly refused: its notes wait again (#4303)."""
+        if self.pending_events is None or not key:
+            return
+        try:
+            self.pending_events.release(key)
+        except Exception:  # noqa: BLE001 - kept claimed: at most once, never twice
+            log.warning("pending notes of %s not released", key, exc_info=True)
+
+    def _with_notes(self, session_key: str, item: QueuedMessage) -> str:
+        """``item``'s text with its pending notes in front (#4303), set on the item so its
+        optimistic row matches the transcript line the provider writes. A second attempt of
+        the same item takes the same notes back under the same key."""
+        if item.base_text is None:
+            item.base_text = item.text
+        if item.notes_key is None:
+            item.notes_key = item.client_action_id or f"inject:{uuid.uuid4().hex}"
+        notes = self.claim_notes(session_key, item.notes_key, item.base_text, item.files)
+        item.text = with_notes(notes, item.base_text)
+        return item.text
+
     def _begin_delivery(
         self,
         session_key: str,
@@ -990,8 +1064,12 @@ class InjectionService:
         uploads = [*images, *files]
         item: QueuedMessage | None = None
         handoff_started = False
+        notes_key = client_action_id or f"steer:{uuid.uuid4().hex}"
+        notes: list[str] = []
         try:
             _, after_seq = await provider.transcript_cursor(account, session)
+            notes = self.claim_notes(session.key, notes_key, message, files)
+            message = with_notes(notes, message)
             item = self._begin_delivery(
                 session.key,
                 message,
@@ -1004,16 +1082,24 @@ class InjectionService:
             if allow_over_budget:
                 kwargs["allow_over_budget"] = True
             handoff_started = True
-            result = await provider.steer(account, session, message, **kwargs)
+            # The steer carries its delivery id like a queued send does, so a retry of
+            # an uncertain steer (which takes the same notes back, #4303) is replayed by
+            # the runtime's delivery fence instead of written twice.
+            with client_action_context(client_action_id) if client_action_id else nullcontext():
+                result = await provider.steer(account, session, message, **kwargs)
             handoff_started = False
         except BaseException as exc:  # noqa: BLE001 -- re-raised after compensation
             if item is not None:
                 self._finish_delivery(
                     session.key, item, InjectResult(False, str(exc) or "steering failed")
                 )
+            if notes and not handoff_started:
+                self.release_notes(notes_key)
             cleanup_uploaded_files(images if handoff_started and files else uploads)
             raise
         self._finish_delivery(session.key, item, result)
+        if notes and refused_before_write(result):
+            self.release_notes(notes_key)
         if not result.accepted:
             cleanup_uploaded_files(uploads)
         else:
@@ -1238,17 +1324,24 @@ class InjectionService:
                         if item.client_action_id
                         else nullcontext()
                     )
+                    text = self._with_notes(session.key, item)
                     with action_context:
                         uncertain_files.update(item.files)
                         result = await provider.inject(
                             account,
                             session,
-                            item.text,
+                            text,
                             timeout_s=self.config.timeout_s,
                             **kwargs,
                         )
                     if not result.accepted:
                         uncertain_files.difference_update(item.files)
+                    # Known to have written nothing: the notes wait for the next message,
+                    # and the row shows the message as written (#4303).
+                    if refused_before_write(result) and item.text != item.base_text:
+                        if item.base_text is not None:
+                            self.release_notes(item.notes_key)
+                            item.text = item.base_text
                     if result.accepted and item.images:
                         await self._wait_for_durable_images(
                             account,
@@ -1504,6 +1597,15 @@ class InjectionService:
                     source_session_key=source_session_key,
                 )
             )
+        # A continued leg is the same chat, so it carries the chat's pending notes (#4303),
+        # kept under the start's own identity: a retry of this start takes the same ones.
+        notes_key = None
+        if origin == "continue" and source_session_key:
+            notes_key = client_action_id or session_token or f"start:{uuid.uuid4().hex}"
+            notes = self.claim_notes(source_session_key, notes_key, message, files or [])
+            message = with_notes(notes, message)
+            if not notes:
+                notes_key = None
         action_context = (
             client_action_context(client_action_id) if client_action_id else nullcontext()
         )
@@ -1524,6 +1626,7 @@ class InjectionService:
                     sandbox=sandbox,
                     role=role,
                     worker_key=worker_key,
+                    notes_key=notes_key,
                 ),
                 name=f"new-session:{account.key}",
             )
@@ -1576,9 +1679,14 @@ class InjectionService:
         sandbox: str | None = None,
         role: str | None = None,
         worker_key: str | None = None,
+        notes_key: str | None = None,
     ) -> InjectResult | None:
-        """Spawn the session; return the provider's answer, ``None`` if it raised."""
+        """Spawn the session; return the provider's answer, ``None`` if it raised.
+
+        ``notes_key`` holds the pending notes ``message`` carries (#4303): a clean refusal,
+        or a failure before the provider was asked, puts them back for the next message."""
         result: InjectResult | None = None
+        handed_over = False
         cleanup_images_now = True
         cleanup_files_now = True
         try:
@@ -1611,6 +1719,7 @@ class InjectionService:
             # uncertain, so replay must stay spent rather than duplicate).
             self._on_new_session_dispatch(session_token)
             cleanup_files_now = not bool(files)
+            handed_over = True
             result = await provider.start_session(
                 account,
                 cwd,
@@ -1626,6 +1735,8 @@ class InjectionService:
                 )
             elif not result.accepted and not result.session_id:
                 self._on_new_session_refused(session_token)
+            if refused_before_write(result):
+                self.release_notes(notes_key)
             if images and result.accepted and result.session_id:
                 self._defer_cleanup(
                     account,
@@ -1667,6 +1778,8 @@ class InjectionService:
                 account.key, session_token, InjectionStatus("failed", str(exc))
             )
         finally:
+            if not handed_over:
+                self.release_notes(notes_key)
             cleanup_uploaded_files(
                 [
                     *(images if cleanup_images_now else ()),
@@ -1740,6 +1853,7 @@ class InjectionService:
         approval_policy: str = "on-request",
         parent_session_id: str | None = None,
         session_role: DelegationSessionRole = "delegated",
+        web_only: bool = False,
     ) -> tuple[InjectResult, str | None]:
         """Start tracked work and retain a pollable result.
 
@@ -1804,6 +1918,7 @@ class InjectionService:
                     parent_session_id,
                     session_role,
                     session_token,
+                    web_only,
                 ),
             ),
             name=f"delegation:{delegation_id}",
@@ -1824,6 +1939,7 @@ class InjectionService:
         parent_session_id: str | None = None,
         session_role: DelegationSessionRole = "delegated",
         session_token: str | None = None,
+        web_only: bool = False,
     ) -> None:
         session_token = session_token or uuid.uuid4().hex
         started = await provider.start_session(
@@ -1837,6 +1953,7 @@ class InjectionService:
             approval_policy=approval_policy,
             delegated=session_role == "delegated",
             session_token=session_token,
+            **({"web_only": True} if web_only else {}),
         )
         if not started.accepted or not started.session_id:
             self._remember_delegation(

@@ -282,6 +282,11 @@ class RouterLink:
     def wake_sweep(self) -> None:
         self._later.send("services", "wake_sweep")
 
+    async def note_deployed(self, repository: str, number: int) -> dict:
+        """Start what ``repository#number`` blocks, now it is deployed (#4384): awaited, so the
+        web notes the record only once the router saw it in the saved set."""
+        return await self._transport.call("router", "note_deployed", (repository, number), {})
+
     async def ask_again(self, *args: Any, **kwargs: Any) -> dict:
         return await self._transport.call("router", "ask_again", args, kwargs)
 
@@ -293,6 +298,15 @@ class RouterLink:
 
     async def pre_review_done(self, *args: Any, **kwargs: Any) -> dict:
         return await self._transport.call("router", "pre_review_done", args, kwargs)
+
+    async def design_review(self, *args: Any, **kwargs: Any) -> dict:
+        return await self._transport.call("router", "design_review", args, kwargs)
+
+    async def design_accept(self, *args: Any, **kwargs: Any) -> dict:
+        return await self._transport.call("router", "design_accept", args, kwargs)
+
+    async def design_record(self, *args: Any, **kwargs: Any) -> dict:
+        return await self._transport.call("router", "design_record", args, kwargs)
 
     async def check_request(self, *args: Any, **kwargs: Any) -> dict | None:
         return await self._transport.call("router", "check_request", args, kwargs)
@@ -388,6 +402,9 @@ class ReleaseLink:
 
     async def on_findings(self, *args: Any, **kwargs: Any) -> bool:
         return await self._call("on_findings", args, kwargs)
+
+    async def on_design_review(self, *args: Any, **kwargs: Any) -> bool:
+        return await self._call("on_design_review", args, kwargs)
 
     async def stale_findings(self, *args: Any, **kwargs: Any) -> str:
         return await self._call("stale_findings", args, kwargs)

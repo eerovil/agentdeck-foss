@@ -302,9 +302,15 @@ def test_inject_result_wire_round_trip_drops_web_only_field():
 
 
 def test_inject_result_from_wire_tolerates_malformed_replies():
+    # A reply it cannot read says nothing about whether the provider was written to.
     assert InjectResult.from_wire("nope", source="Codex runtime") == InjectResult(
-        False, "invalid response from Codex runtime"
+        False, "invalid response from Codex runtime", write_uncertain=True
     )
+    assert InjectResult.from_wire({"accepted": False, "action": "uncertain"}).write_uncertain
+    assert InjectResult.from_wire({"provider_write_state": "started"}).write_uncertain
+    assert not InjectResult.from_wire(
+        {"accepted": False, "action": "rejected", "provider_write_state": "not_started"}
+    ).write_uncertain
     # Non-string reason/session_id degrade to None rather than leaking through.
     assert InjectResult.from_wire({"accepted": 1, "reason": 7, "session_id": []}) == InjectResult(
         True, None, None

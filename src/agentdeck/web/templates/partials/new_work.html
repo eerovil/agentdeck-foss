@@ -77,6 +77,7 @@
     </label>
     <div class="new-work-attach">
       <label class="image-picker" for="{{ nw_id }}-images">＋ Attach file <span class="paste-hint">or paste screenshot</span></label>
+      {% include "partials/clipboard_image_button.html" %}
       <input id="{{ nw_id }}-images" class="image-input" type="file" name="images" multiple>
       <p class="new-work-note">Files stay on this deck; the issue lists only their links and paths. Don't attach secrets. At most {{ new_work.max_files }}.</p>
     </div>

@@ -2,7 +2,8 @@
 # Build voice mode's speech service on this host (#3409): its own virtualenv, the
 # Piper voices and the Whisper model, then the systemd socket that starts it. The
 # wake word detector (#3476, openWakeWord's "hey jarvis" on the CPU) shares the
-# virtualenv and gets a socket of its own.
+# virtualenv and gets a socket of its own. Its "alexa" model, which a page can ask for
+# instead, ships inside the openwakeword wheel too, so nothing more is downloaded.
 #
 # The versions are pinned to what a GTX 970 (Maxwell, compute 5.2) still runs.
 # CTranslate2 4.x wheels ship no kernels for it ("no kernel image is available"),

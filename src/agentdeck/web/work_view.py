@@ -14,6 +14,7 @@ that leaves every Work card as it was sends nothing at all.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import functools
 import json
 import logging
@@ -114,7 +115,6 @@ from ..work_overview import (
     WorkCandidate,
     WorkCard,
     WorkChat,
-    archived_count,
     attribute_insights,
     build_work_card,
     chat_legs,
@@ -153,6 +153,7 @@ from ..work_story import (
     work_status,
     workspace_rows,
 )
+from ..work_try_waits import TryWaits
 from ..work_workspace import (
     WorkPullRequest,
     WorkWorkspace,
@@ -213,17 +214,44 @@ _RUNTIME_READ_TIMEOUT_S = 5.0
 
 
 async def _runtime_rows(
-    client: httpx.AsyncClient, path: str, key: str, params: dict | None = None
+    client: httpx.AsyncClient,
+    path: str,
+    key: str,
+    params: dict | None = None,
+    *,
+    strict: bool = False,
 ) -> list[dict]:
+    """The rows under ``key`` of the Runtime's ``path``; none when unread, or with
+    ``strict`` an error, so a caller can tell an unread list from an empty one (#4326)."""
     try:
         response = await client.get(path, params=params, timeout=_RUNTIME_READ_TIMEOUT_S)
         response.raise_for_status()
         payload = response.json()
     except (httpx.HTTPError, ValueError):
         _degraded(f"runtime{path}")
+        if strict:
+            raise
         return []
     found = payload.get(key) if isinstance(payload, dict) else None
+    if strict and not isinstance(found, list):
+        raise ValueError(f"runtime{path} answered no {key} list")
     return [row for row in found if isinstance(row, dict)] if isinstance(found, list) else []
+
+
+async def runtime_work_jobs(app: Any, work_id: str) -> list[dict]:
+    """One Work's jobs, its retained evidence plus the live queue, for a check that must not
+    take an unread list for an empty one (#4326): raises when the Runtime cannot be read."""
+    client: httpx.AsyncClient | None = getattr(app.state, "runtime_http", None)
+    if client is None:
+        raise RuntimeError("no Runtime client")
+    params = {"work_id": work_id}
+    evidence = await _runtime_rows(client, "/job-evidence", "evidence", params, strict=True)
+    queue = await _runtime_rows(client, "/jobs", "jobs", params, strict=True)
+    rows: dict[str, dict] = {}
+    for row in [*evidence, *rows_for_work(queue, work_id)]:  # the queue's copy wins
+        if row.get("id"):
+            rows[str(row["id"])] = row
+    return list(rows.values())
 
 
 async def runtime_queue(app: Any, *, work_id: str = "") -> list[dict]:
@@ -1574,8 +1602,15 @@ def _pr_hold(
         # "Its pull request" names none of several (#4089).
         pressed = "Merge pressed; " if words.startswith("Merge pressed; ") else ""
         words = pressed + hold_line(hold)
+    light = _light_line(app, answers)
+    if hold and light and words:
+        # Beside the hold, not only in its place (#4401 review): which review a held light
+        # pull request takes is what the person reads it for.
+        words = f"{words}. {light}"
     if not hold and entry.get("needs_verify"):
         words = "no test run started"
+    elif not hold and light:
+        words = light
     elif not hold and any(
         not output.draft and output.head and not found.passed
         for output, found in answers
@@ -1597,6 +1632,37 @@ def _pr_hold(
         findings_told=bool(found_at is not None and findings.findings_told),
         passed_at=passed_at,
     )
+
+
+def _light_line(app: Any, answers: Sequence[tuple[Any, review_history.HeadReview]]) -> str:
+    """The lighter-review line of an open pull request at its head (#4399), "" for none.
+
+    Rows exist only in repositories whose manifest entry says ``light_review``, so nowhere
+    else shows it. A light head has no reviewer, so "not reviewed" would mislead there.
+    """
+    from ..light_review import STICKY_KINDS, line_for
+
+    db = getattr(app.state, "db", None)
+    if db is None:
+        return ""
+    events = getattr(getattr(app.state, "app_state", None), "review_events", None)
+    for output, _found in answers:
+        if output.draft or not output.head:
+            continue
+        pull = f"{output.repository}#{output.number}".lower()
+        try:
+            row = db.light_review_row(pull)
+        except Exception:  # noqa: BLE001 -- unread: the line stands without it
+            continue
+        # As ``LightReview.view`` reads it: a review asked or answered makes it full.
+        reviewed = False
+        if row and events is not None:
+            with contextlib.suppress(Exception):
+                reviewed = any(event.kind in STICKY_KINDS for event in events(pull))
+        line = line_for(row, output.head, reviewed) if row else None
+        if line:
+            return str(line["text"])
+    return ""
 
 
 def _stamp(value: Any) -> datetime | None:
@@ -2756,7 +2822,6 @@ def _report_bugs(
 class WorkOverview:
     cards: tuple[WorkCard, ...] = ()
     hidden: int = 0  # unused since #2219: sections bound themselves (``FrontSections``)
-    archived: int = 0  # Works on the Archived Works view (#2201)
     other: tuple[OtherChat, ...] = ()
     other_hidden: int = 0
     # Issues another deck works, listed read only in their own folded group (#3834).
@@ -3181,6 +3246,30 @@ def needs_you_stops(
     return stops
 
 
+def needs_you_where(overview: WorkOverview) -> Callable[[str], str]:
+    """Where each Work is now, by Work id, in a few words (#4358): its status line and its
+    pull requests, for the note that tells a needs-you wait's chat a Work no longer needs the
+    owner. "" for a Work the overview does not hold."""
+    cards = {card.work_id: card for card in overview.cards}
+
+    def where(work_id: str) -> str:
+        card = cards.get(work_id)
+        if card is None:
+            return ""
+        status = work_status(card)
+        words = status.headline.strip()
+        if status.summary.strip():
+            words = f"{words} — {status.summary.strip()}" if words else status.summary.strip()
+        pulls = ", ".join(
+            f"#{output.number} {output.state or 'state unknown'}"
+            + (" draft" if output.draft and output.is_open else "")
+            for output in card.outputs
+        )
+        return f"{words}; pull requests {pulls}" if pulls else words
+
+    return where
+
+
 def needs_you_clears(
     overview: WorkOverview, showing: dict[str, set[str]], sent: Iterable[NeedsYouPush] = ()
 ) -> tuple[list[str], dict[str, set[str]]]:
@@ -3215,6 +3304,7 @@ POPULATION_SECTIONS = {
     "idle": "Starred, quiet",
     "finished": "Recently finished",
     "paused": "Paused",
+    "parked": "Parked",
     "folded": "Under its parent",
     "unlisted": "Not listed",
 }
@@ -3274,6 +3364,7 @@ def population_rows(overview: WorkOverview) -> list[dict[str, Any]]:
         ("idle", front.idle),
         ("finished", front.finished),
         ("paused", front.paused),
+        ("parked", front.parked),
     ):
         for item in items:
             op = item.attention
@@ -3399,7 +3490,10 @@ def _merge_watched(card: WorkCard, output: Any) -> bool:
     # none of its pull requests ever had a row.
     from ..work_derived import READY
 
-    return getattr(card.derived, "kind", "") == READY and bool(output.head)
+    # A question over a ready pull request offers that Merge too (#4294).
+    derived = card.derived
+    offered = getattr(derived, "kind", "") == READY or getattr(derived, "ready_pr", None)
+    return bool(offered) and bool(output.head)
 
 
 def unresolved_issues(
@@ -3960,8 +4054,7 @@ async def _load_work_overview(
         if item.awaiting_finish or item.starred or (item.deck_paused and item.finished_at is None)
     )
     selection = front_page_works(candidates, now=now, finished_at=finished_at, awaiting=awaiting)
-    shown, buckets = selection.shown, selection.buckets
-    archived = archived_count(buckets, snapshot.state.db)
+    shown = selection.shown
     # The parent issues the shown Works fold into (#3622): each is built too, and the ones
     # listed only for their children (``tree_only``) are kept out of everything per-Work.
     parents, tree_only = await _tree_parents(app, snapshot, shown, candidates, facts)
@@ -4116,7 +4209,6 @@ async def _load_work_overview(
     return WorkOverview(
         tuple(cards),
         0,
-        archived,
         other,
         other_hidden,
         other_decks=other_decks,
@@ -4190,6 +4282,8 @@ class WorkOverviewService:
         self.overview: WorkOverview | None = None
         self._lock = asyncio.Lock()
         self._task: asyncio.Task | None = None
+        # Deployed Works waiting for a try, which unblock what they block (#4384).
+        self.try_waits = TryWaits(app, self._lock)
         self._backfilled_at: float | None = None
         # ``("issue" | "pull", (repository, number))`` -> when it was last tried.
         self._backfill_tried: dict[tuple[str, tuple[str, int]], float] = {}
@@ -4229,6 +4323,7 @@ class WorkOverviewService:
             self._task = asyncio.create_task(self._run(), name="work-overview")
 
     async def stop(self) -> None:
+        await self.try_waits.close()
         task, self._task = self._task, None
         if task is not None:
             task.cancel()
@@ -4331,6 +4426,7 @@ class WorkOverviewService:
             wake_on.needs_you(
                 needs_you_stops(overview, state.chat_identity_key),
                 complete=not overview.degraded,
+                where=needs_you_where(overview),
             )
         except Exception:  # noqa: BLE001 -- a wake is never worth a failed pass
             logger.exception("Needs you wake-on failed")
@@ -4436,6 +4532,11 @@ class WorkOverviewService:
             changed = overview != self.overview
             if changed:
                 self.overview = overview
+            # Under the lock (#4384): an older pass never saves its set over a newer one.
+            try:
+                await self.try_waits.keep(overview.cards, degraded=overview.degraded)
+            except Exception:  # noqa: BLE001 -- the next pass saves it again
+                logger.exception("Deployed Works were not saved")
         # Only once the snapshot is current: delivery holds a paused Work's chats by it
         # (``paused_hold``), and a request sent while it still showed a just-resumed Work as
         # paused was refused, yet recorded as asked (#3103). On the loop: it schedules a
@@ -4506,6 +4607,11 @@ class WorkOverviewService:
         bus = self._app.state.app_state.bus
         loop = asyncio.get_running_loop()
         built_at = loop.time()
+        # Every start owes one complete pass, watched or not (#4384 review): the deployed
+        # Works it saves unblock what they block, and a quiet restart has no event to wait
+        # for. Owed again, with a growing wait, until ``try_waits`` says one was handed over.
+        sweep = watch_retry.Backoff(first=self.RETRY_MIN_S, cap=self.RETRY_MAX_S)
+        sweep_at: datetime | None = None if self.try_waits.swept else datetime.now(UTC)
         with bus.subscribe(*self.TOPICS) as sub:
             while True:
                 # Sleep until a change, or until a card's clock-derived state falls due.
@@ -4517,6 +4623,8 @@ class WorkOverviewService:
                 phone_at = None if watched else self._phone_deadline(built_at, loop)
                 if phone_at is not None:
                     due_at = phone_at if due_at is None else min(due_at, phone_at)
+                if sweep_at is not None:
+                    due_at = sweep_at if due_at is None else min(due_at, sweep_at)
                 if due_at is not None:
                     timeout = max(0.0, (due_at - datetime.now(UTC)).total_seconds())
                 changed = await self._wait_for_change(sub, timeout)
@@ -4535,6 +4643,10 @@ class WorkOverviewService:
                 owed = fell_due or (
                     changed and (WORK_INPUTS_TOPIC in topics or self._turn_ended())
                 ) or (phone_at is not None and datetime.now(UTC) >= phone_at)
+                if sweep_at is not None and datetime.now(UTC) >= sweep_at:
+                    owed = True
+                    self._stale = True
+                    sweep_at = None  # set again below while the sweep is still owed
                 if fell_due:
                     # Spent: the pass sets the next one, and a failed pass must not spin here.
                     self._work_deadline = None
@@ -4560,6 +4672,8 @@ class WorkOverviewService:
                 except Exception:  # noqa: BLE001 -- one bad pass must not stop the refresher
                     logger.exception("work overview refresh failed")
                     self.refresh_soon(delay=self.RETRY_MIN_S)
+                if not self.try_waits.swept:
+                    sweep_at = datetime.now(UTC) + timedelta(seconds=sweep.failed())
 
     def _phone_deadline(self, built_at: float, loop: Any) -> datetime | None:
         """When a card's clock-derived state is due for a phone, not before
@@ -5581,12 +5695,12 @@ def render_changed_sections(
 FRONT_ROW_PARTS = frozenset(
     {
         "starred", "needs", "active", "stuck", "waiting", "release", "live", "try", "cleanup",
-        "finished", "paused", "stopped", "hidden",
+        "finished", "paused", "parked", "stopped", "hidden",
     }
 )
 FRONT_PARTS = (
     "summary", "starred", "needs", "release", "stuck", "active", "cleanup", "waiting", "live",
-    "try", "finished", "paused", "stopped", "board",
+    "try", "finished", "paused", "parked", "stopped", "board",
 )
 # The ``/events?view=`` values that show Works: the front page, ``/works?view=hidden`` and the
 # default ``/works`` list. Every other page's stream neither subscribes to ``works`` nor sends it.

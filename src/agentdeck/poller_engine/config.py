@@ -767,6 +767,13 @@ def _parse_extension_hooks(name: str, value: object, report: Report) -> tuple[st
 # controls are off, is drift somebody has to find at activation rather than while wondering why
 # nothing ships.
 AUTO_RELEASE = "auto_release"
+#: A ``[[repos]]`` switch the deck's router alone reads (#4326): pre-review-done there also
+#: refuses a head with no test run, or Python code changed with no test.
+CHECK_TESTS = "check_tests"
+#: ``[[repos]]`` keys the deck's light review alone reads (#4399): the guarded list's path
+#: (a non-empty string) and the review point's limit (a positive integer, beside it only).
+LIGHT_REVIEW = "light_review"
+LIGHT_REVIEW_LIMIT = "light_review_limit"
 _AUTO_RELEASE_CAPABILITIES = ("guarded_release", "merge_review")
 
 
@@ -1319,6 +1326,36 @@ def _parse_repos(raw: object, report: Report) -> tuple[Repo, ...]:
                 "must be true or false, and true only on a repository that holds code",
                 "set it only where this repository's reviewed, tested pull requests should "
                 "merge with nobody pressing Merge",
+            )
+        # Read by the deck's router alone (#4326), as ``auto_release`` is: its
+        # pre-review-done also asks for a test run and a changed test here.
+        checks_tests = entry.get(CHECK_TESTS, False)
+        if not isinstance(checks_tests, bool) or (checks_tests and not flags["holds_code"]):
+            report.add(
+                f"{location}.{CHECK_TESTS}",
+                "must be true or false, and true only on a repository that holds code",
+                "set it only where a pull request's review should wait for a test run and a "
+                "changed test",
+            )
+        # Read by the deck alone (#4399), as ``check_tests`` is: a pull request that stays
+        # outside the guarded list merges on its tests and bench verdict, with no reviewer.
+        light = entry.get(LIGHT_REVIEW)
+        if light is not None and (
+            not isinstance(light, str) or not light.strip() or not flags["holds_code"]
+        ):
+            report.add(
+                f"{location}.{LIGHT_REVIEW}",
+                "must be the guarded list's path, and only on a repository that holds code",
+                'set it to the repository\'s guarded list, for example "guarded.json"',
+            )
+        limit = entry.get(LIGHT_REVIEW_LIMIT)
+        if limit is not None and (
+            isinstance(limit, bool) or not isinstance(limit, int) or limit < 1 or light is None
+        ):
+            report.add(
+                f"{location}.{LIGHT_REVIEW_LIMIT}",
+                "must be a positive whole number, and only beside light_review",
+                "set it to how many light merges come before the review point (default 15)",
             )
         repo = Repo(
             id=repo_id,

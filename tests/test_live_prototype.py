@@ -137,6 +137,8 @@ async def test_agent_registers_link_records_steps_and_page_shows_them(tmp_path):
         assert '"picked": "B"' in page.text
         assert page.status_code == 200
         assert "live_prototype.js" in page.text
+        # Android Chrome resizes the page for the keyboard, so the frame sees it (#4316).
+        assert "interactive-widget=resizes-content" in page.text
         # Enter sends; on a phone the panel's button counts the changes (#3831).
         assert 'class="send-on-enter"' in page.text
         assert 'aria-label="Send suggestion"' in page.text

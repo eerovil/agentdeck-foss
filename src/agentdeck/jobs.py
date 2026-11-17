@@ -81,7 +81,7 @@ from .host_slots import mac_slot_paths as default_mac_slot_paths
 from .job_scratch import JOB_SCRATCH_ENV, scratch_problem, scratch_root
 from .poller_engine import baseline, flaky
 from .poller_engine.baseline import extract_failures, extract_passed
-from .poller_engine.verification import proves_commit
+from .poller_engine.verification import proven_commit, proves_commit
 from .poller_engine.workspace import (
     WorkspaceSnapshot,
     collect_workspace_snapshot,
@@ -714,6 +714,8 @@ class NotifyOutcome:
 Notifier = Callable[[Job, str], Awaitable[bool | NotifyOutcome]]
 # A running job's progress message, numbered from 1 so each has its own delivery id (#3038).
 ProgressNotifier = Callable[[Job, str, int], Awaitable[bool | NotifyOutcome]]
+#: (job, note id, text): keep a pending note for the job's chat, waking nothing (#4306).
+NoteKeeper = Callable[[Job, str, str], bool]
 
 
 def _notify_outcome(value: bool | NotifyOutcome) -> NotifyOutcome:
@@ -770,8 +772,12 @@ class JobQueue:
         survive_restart: bool = False,
         memory_gate: MemoryGate | None = None,
         configure_slice: Callable[[], Awaitable[bool]] | None = None,
+        keep_note: NoteKeeper | None = None,
     ) -> None:
         self._dir = Path(state_dir)
+        # A green verification that proves its commit wakes nobody (#4080); its chat hears
+        # of it as a pending note with its next message (#4306).
+        self._keep_note = keep_note
         # Whether this host has the memory for one more local job (#3614), shared with the
         # slot leases, and how many local jobs the last sweep held back for lack of it, which
         # the job panel says.
@@ -1161,7 +1167,9 @@ class JobQueue:
         self._wake.set()
         return job
 
-    async def rerun_verification(self, work_id: str, repository: str, head: str) -> Job | None:
+    async def rerun_verification(
+        self, work_id: str, repository: str, head: str, *, command: list[str] | None = None
+    ) -> Job | None:
         """Run this Work's last verification of ``repository`` again at ``head`` (#4253).
 
         The deck asks for it where it would otherwise wake the Work's chat only to do this:
@@ -1172,7 +1180,12 @@ class JobQueue:
         run again: no verification of this Work and repository the queue still holds, one of
         those already queued or running, or a command a fresh checkout cannot run (only
         ``pytest`` and ``uv run``, which bring their own environment there).
+
+        ``command`` runs that command instead of the last one's: only ``bin/test.sh``, the
+        green run a light pull request merges on (#4399).
         """
+        if command is not None and list(command) != LIGHT_TEST_COMMAND:
+            raise JobError("only bin/test.sh is run again in place of the last command")
         wanted_work = work_id.strip().casefold()
         wanted_repo = repository.strip().casefold()
         head = head.strip().lower()
@@ -1194,7 +1207,7 @@ class JobQueue:
         if not mine:
             return None
         last = max(mine, key=lambda job: job.submitted_at)
-        command = _fresh_checkout_command(last.command)
+        command = list(command) if command is not None else _fresh_checkout_command(last.command)
         if command is None or last.workspaces:
             # Another checkout it tested is not pinned with it, so its result would not prove
             # that pull request's head either.
@@ -2063,6 +2076,9 @@ class JobQueue:
         ):
             return
         if _result_speaks_for_itself(current):
+            # Its chat hears of it with its next message (#4306); a note not kept is the
+            # silence of before.
+            self._note_proof(current)
             # Done with it as a delivery would be, so the row prunes and nothing waits on it.
             self._jobs[job.id] = replace(current, notified=True)
             self._save()
@@ -2089,6 +2105,20 @@ class JobQueue:
             self._defer_or_give_up(job.id, "the delivery raised", host_busy=False)
         finally:
             self._announcing.discard(job.id)
+
+    def _note_proof(self, job: Job) -> None:
+        """Keep a pending note that ``job`` proved its commit, once per job and commit."""
+        head = proven_commit(job.to_dict())
+        if self._keep_note is None or not head:
+            return
+        text = (
+            f"AgentDeck: verification job {job.id} of {job.work_id} passed at {head[:12]}:"
+            " the deck credits that commit as tested."
+        )
+        try:
+            self._keep_note(job, f"job-proved:{job.id}@{head[:12]}", text)
+        except Exception:  # noqa: BLE001 - a note lost is the silence of before
+            log.warning("jobs: could not keep a note for job %s", job.id, exc_info=True)
 
     def _defer_or_give_up(self, job_id: str, why: str, *, host_busy: bool) -> None:
         """Retry a refused completion for a while, then stop for good.
@@ -2436,7 +2466,17 @@ RERUN_CHECKOUT_PREFIX = "verify-rerun-"
 #: or once a review passed a head nothing tests, it runs the Work's last verification again
 #: there instead of waking the Work's chat to do it.
 HEAD_CHECKOUT_PREFIX = "verify-head-"
-PINNED_CHECKOUT_PREFIXES = (BASE_CHECKOUT_PREFIX, RERUN_CHECKOUT_PREFIX, HEAD_CHECKOUT_PREFIX)
+#: The base tip the deck runs a robot pull request's bench verdict from (#4399).
+BENCH_CHECKOUT_PREFIX = "bench-base-"
+PINNED_CHECKOUT_PREFIXES = (
+    BASE_CHECKOUT_PREFIX,
+    RERUN_CHECKOUT_PREFIX,
+    HEAD_CHECKOUT_PREFIX,
+    BENCH_CHECKOUT_PREFIX,
+)
+#: The one command the deck runs again itself for a light pull request (#4399): it needs no
+#: environment a fresh checkout lacks, since it runs the tests in its own container.
+LIGHT_TEST_COMMAND = ["bin/test.sh"]
 
 
 def _fresh_checkout_command(command: list[str]) -> list[str] | None:
@@ -2456,10 +2496,19 @@ def _fresh_checkout_command(command: list[str]) -> list[str] | None:
 
 
 def _git(*args: str, cwd: str) -> str:
+    """Run git in ``cwd``. A fetch reaches GitHub through the deck's own credential helper:
+    the runtime has no ``gh`` login, so an https fetch could not authenticate (#4438)."""
     import subprocess
 
+    from .github_identity import github_git_environment
+
     done = subprocess.run(
-        ["git", "-C", cwd, *args], capture_output=True, text=True, timeout=120, check=True
+        ["git", "-C", cwd, *args],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=True,
+        env=github_git_environment(),
     )
     return done.stdout.strip()
 

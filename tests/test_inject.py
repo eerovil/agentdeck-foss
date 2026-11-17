@@ -5983,7 +5983,7 @@ async def test_a_read_only_codex_delegation_gets_the_referenced_issue_text_prepe
     captured = {}
 
     async def fake_start(account, cwd, message, **kwargs):
-        captured["message"] = message
+        captured.update(message=message, cwd=cwd, **kwargs)
         return InjectResult(True, session_id="delegated-thread")
 
     from types import SimpleNamespace
@@ -6027,6 +6027,30 @@ async def test_a_read_only_codex_delegation_gets_the_referenced_issue_text_prepe
     assert "The ticket" in message and "Fix the thing." in message
     assert "**@eero commented:**" in message and "Please also X." in message
     assert message.endswith("answer from the issue text")
+
+    # A web-only research chat (#4381) gets none of it: its question may come from
+    # anyone. It runs in the deck's empty folder, locked, whatever the caller sent.
+    research = tmp_path / "research-cwd"
+    monkeypatch.setattr(routes_api, "ensure_research_cwd", lambda: research.mkdir() or research)
+    captured.clear()
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/api/delegations/web-only",
+            json={
+                "account_key": "codex:test",
+                "cwd": str(tmp_path),
+                "message": "what does reddit say",
+                "sandbox": "workspace-write",
+                "approval_policy": "on-request",
+                "parent_session_id": "codex:test:parent",
+            },
+        )
+        assert response.status_code == 202
+    await asyncio.sleep(0)
+    assert captured["message"] == "what does reddit say"
+    assert captured["cwd"] == research
+    assert captured["web_only"] is True
+    assert (captured["sandbox"], captured["approval_policy"]) == ("read-only", "never")
     await app.state.injector.stop()
 
 
@@ -8022,6 +8046,26 @@ async def test_composer_buttons_keep_textarea_focus(tmp_path):
 
         assert await press_and_check_focus(page, "Send") == "inject-message"
         assert await press_and_check_focus(page, "Stop") == "inject-message"
+
+        # #4354: a send made for the person (voice mode presses Send itself) brings
+        # the caret back to the box only with voice mode off; with it on, the
+        # phone keyboard must stay shut.
+        sent_for_them = """(voiceOn) => new Promise(resolve => {
+          document.documentElement.classList.toggle('voice-on', voiceOn);
+          const box = document.getElementById('inject-message');
+          box.value = 'said aloud';
+          box.blur();
+          const done = (event) => {
+            if (event.detail.elt !== box.form) return;
+            document.body.removeEventListener('htmx:afterRequest', done);
+            setTimeout(() => resolve(document.activeElement.id), 0);
+          };
+          document.body.addEventListener('htmx:afterRequest', done);
+          document.querySelector(
+            '#composer-controls button[type="submit"]:not(.stop-button)').click();
+        })"""
+        assert await page.evaluate(sent_for_them, True) != "inject-message"
+        assert await page.evaluate(sent_for_them, False) == "inject-message"
         await browser.close()
 
 
@@ -9050,9 +9094,9 @@ async def test_composer_controls_survive_repeated_sse_updates_on_desktop_and_mob
             })"""
         )
 
-        # Stop coming and going must not move what sits left of it, such as 🎤
-        # and 🎧 on the right-aligned phone row, and the row must not run over the
-        # ＋ button however wide Stop's spot is (#3545).
+        # Stop coming and going must not move the tools, such as 🎤 and 🎧, which sit
+        # on the left of the row since #4313, and nothing in the row may run over
+        # another however wide Stop is (#3545).
         await page.evaluate(
             "document.documentElement.classList.add('speech-recordable', 'voice-recordable')"
         )
@@ -9074,8 +9118,9 @@ async def test_composer_controls_survive_repeated_sse_updates_on_desktop_and_mob
                     )
                 lefts.append(
                     await page.evaluate(
-                        "document.querySelector('#composer-controls')"
-                        ".getBoundingClientRect().left"
+                        """() => [...document.querySelectorAll(
+                            'form.inject-form .composer-actions > :not(.composer-controls)')]
+                            .map(el => el.getBoundingClientRect().left)"""
                     )
                 )
                 # At 320 px this full row overlaps ＋ mid-turn, as it did before #3545;
@@ -9084,7 +9129,7 @@ async def test_composer_controls_survive_repeated_sse_updates_on_desktop_and_mob
                     [] if width < 360 else await page.evaluate(
                         """() => {
                           const form = document.querySelector('form.inject-form');
-                          const row = [form.querySelector('.image-picker'),
+                          const row = [
                             ...form.querySelectorAll('.composer-actions > :not(.composer-hint)')]
                             .map(el => [el.className, el.getBoundingClientRect()])
                             .filter(([, box]) => box.width > 0);
@@ -9098,11 +9143,53 @@ async def test_composer_controls_survive_repeated_sse_updates_on_desktop_and_mob
                         }"""
                     )
                 )
-            shifts.append([left - lefts[0] for left in lefts[1:]])
+            shifts.append([left == lefts[0] for left in lefts[1:]])
+        # While typing on a phone mid-turn, only Send sits inside the box, clear of its text;
+        # Stop waits in the tools row (#4313, #4336). An empty attachment row left after a
+        # send with a file must not push Send off the box, and Send's tap area reaches past
+        # its visible edge.
+        await resized(page, 390, 800)
+        await emit_controls(live_controls)
+        typing_clear = await page.evaluate(
+            """() => {
+              const detail = document.querySelector('.session-detail');
+              const form = document.querySelector('form.inject-form');
+              const box = document.querySelector('#inject-message');
+              const frame = document.querySelector('.composer-box');
+              const send = document.querySelector('#composer-controls button:not(.stop-button)');
+              const measure = () => {
+                const text = box.getBoundingClientRect().right
+                  - parseFloat(getComputedStyle(box).paddingRight);
+                const outer = frame.getBoundingClientRect();
+                const buttons = [...document.querySelectorAll('#composer-controls button')]
+                  .map(el => el.getBoundingClientRect()).filter(r => r.width > 0);
+                const r = send.getBoundingClientRect();
+                const beside = document.elementFromPoint(r.right + 4, r.top + r.height / 2);
+                return [buttons.length,
+                  buttons.every(b => b.left >= text && b.top >= outer.top
+                    && b.bottom <= outer.bottom && b.right <= outer.right),
+                  send.contains(beside), Math.round(form.getBoundingClientRect().height)];
+              };
+              detail.classList.add('keyboard-up');
+              const plain = measure();
+              const row = document.createElement('div');
+              row.className = 'paste-previews';
+              document.querySelector('#inject-images').insertAdjacentElement('afterend', row);
+              const emptied = measure();
+              row.remove();
+              detail.classList.remove('keyboard-up');
+              return [plain, emptied];
+            }"""
+        )
+        # Stop draws ■ and Send ↑, though both are submit buttons (#4336).
+        glyphs = await page.evaluate(
+            """() => ['.stop-button', 'button:not(.stop-button)'].map(sel => getComputedStyle(
+                document.querySelector('#composer-controls ' + sel), '::after').content)"""
+        )
         await emit_controls(idle_controls)
+        # No blank spot holds Stop's place any more (#4313).
         placeholder = await page.evaluate(
-            """() => { const p = document.querySelector('#composer-controls .stop-placeholder');
-                return [getComputedStyle(p).visibility, p.type, p.tabIndex]; }"""
+            "document.querySelectorAll('#composer-controls button').length"
         )
 
         await emit_controls(live_controls)
@@ -9127,6 +9214,7 @@ async def test_composer_controls_survive_repeated_sse_updates_on_desktop_and_mob
                         horizontalOverflow:
                           document.documentElement.scrollWidth >
                           document.documentElement.clientWidth,
+
                       };
                     }"""
                 )
@@ -9142,10 +9230,13 @@ async def test_composer_controls_survive_repeated_sse_updates_on_desktop_and_mob
         "injectForms": 1,
         "interruptForms": 1,
     }
-    assert shifts == [[0, 0]] * 4
+    assert shifts == [[True, True]] * 4
+    assert typing_clear[0][:3] == [1, True, True]
+    assert typing_clear[1] == typing_clear[0]
+    assert glyphs == ['"■"', '"↑"']
     assert fits == [True] * 4
     assert overlaps == []
-    assert placeholder == ["hidden", "button", -1]
+    assert placeholder == 1
     assert layouts == [
         {
             "targets": 1,

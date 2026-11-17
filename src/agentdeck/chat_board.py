@@ -8,6 +8,7 @@ and reports the board as switched off, a state the deck already handles.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 
 PUBLIC_STUB = True
 TOPIC = "chat_board"
@@ -22,6 +23,27 @@ class ChatRow:
     state: str = "open"
     labels: tuple[str, ...] = ()
     url: str = ""
+    created_at: str = ""
+    updated_at: str = ""
+    closed_at: str = ""
+    claimed_at: str = ""
+
+    def closed_seconds_ago(self, *, now: float) -> float | None:
+        at = _moment(self.closed_at or self.updated_at)
+        return None if at is None else max(0.0, now - at.timestamp())
+
+    def idle_for(self, *, now: float) -> float | None:
+        at = _moment(self.updated_at)
+        return None if at is None else max(0.0, now - at.timestamp())
+
+
+def _moment(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
 
 
 def verdict_lines(body: str) -> list[str]:

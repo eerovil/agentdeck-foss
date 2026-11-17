@@ -430,6 +430,12 @@ class _ManifestFacts:
     # The repositories that merge on their own in a project that does not (``[[repos]]
     # auto_release = true``, #4172), as the manifest names them.
     releasing_repos: tuple[str, ...] = ()
+    # The repositories whose pre-review-done also checks the tests (``[[repos]] check_tests =
+    # true``, #4326), as the manifest names them.
+    tests_checked_repos: tuple[str, ...] = ()
+    # The repositories with lighter review outside their guarded code (``[[repos]]
+    # light_review = "guarded.json"``, ``light_review_limit``, #4399): ``(id, path, limit)``.
+    light_review_repos: tuple[tuple[str, str, int], ...] = ()
     # The repositories whose GitHub checks are the verification (``verification =
     # "github_checks"``, #2364), as the manifest names them.
     ci_repos: tuple[str, ...] = ()
@@ -555,6 +561,23 @@ def _manifest(path: Path) -> _ManifestFacts:
             str(entry.get("id")).strip()
             for entry in (repos if isinstance(repos, list) else [])
             if isinstance(entry, dict) and entry.get("auto_release") is True and entry.get("id")
+        ),
+        tests_checked_repos=tuple(
+            str(entry.get("id")).strip()
+            for entry in (repos if isinstance(repos, list) else [])
+            if isinstance(entry, dict) and entry.get("check_tests") is True and entry.get("id")
+        ),
+        light_review_repos=tuple(
+            (
+                str(entry.get("id")).strip(),
+                entry["light_review"].strip(),
+                _light_limit(entry.get("light_review_limit")),
+            )
+            for entry in (repos if isinstance(repos, list) else [])
+            if isinstance(entry, dict)
+            and entry.get("id")
+            and isinstance(entry.get("light_review"), str)
+            and entry["light_review"].strip()
         ),
         borrowed=tuple(
             (str(entry.get("id")).strip(), entry["workspace"].strip())
@@ -720,6 +743,29 @@ def work_evidence_repositories(root: str | Path) -> dict[str, str]:
     return found
 
 
+def _light_limit(value: object) -> int:
+    """``light_review_limit``: a positive integer, else the default of 15 (#4399)."""
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return value
+    return 15
+
+
+def _overlay_checkouts(instance_dir: Path) -> dict[str, str]:
+    """The overlay's ``[checkouts]``, by lowercased repository id; empty when unread."""
+    try:
+        with (instance_dir / "overlay.toml").open("rb") as handle:
+            checkouts = tomllib.load(handle).get("checkouts")
+    except (OSError, tomllib.TOMLDecodeError):
+        return {}
+    if not isinstance(checkouts, dict):
+        return {}
+    return {
+        str(key).lower(): value.strip()
+        for key, value in checkouts.items()
+        if isinstance(value, str) and value.strip()
+    }
+
+
 def work_code_checkouts(root: str | Path) -> dict[str, tuple[str, ...]]:
     """Each project's code checkouts on this host, by lowercased issue repository (#4233).
 
@@ -883,6 +929,18 @@ def release_policies(root: str | Path) -> dict[str, object]:
             ),
             auto_release_repos=frozenset(
                 _qualified(facts.org, repo).lower() for repo in facts.releasing_repos
+            ),
+            tests_checked=frozenset(
+                _qualified(facts.org, repo).lower() for repo in facts.tests_checked_repos
+            ),
+            light_review=tuple(
+                (
+                    _qualified(facts.org, repo).lower(),
+                    path,
+                    limit,
+                    _overlay_checkouts(base_root / instance).get(repo.lower(), ""),
+                )
+                for repo, path, limit in facts.light_review_repos
             ),
         )
         for repo in facts.repos:

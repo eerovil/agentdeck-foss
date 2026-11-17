@@ -40,6 +40,7 @@ const ASSETS = [
   '/static/chat_notes.js',
   '/static/message_collapse.js',
   '/static/side_chat.js',
+  '/static/side_chat_panel.js',
   '/static/rollback.js',
   '/static/session_navigation.js',
   '/static/session_panels.js',

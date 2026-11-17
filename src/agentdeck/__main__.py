@@ -76,6 +76,14 @@ def main() -> None:
     if len(sys.argv) > 1 and sys.argv[1] == "delegate":
         _delegate(sys.argv[2:])
         return
+    if len(sys.argv) > 1 and sys.argv[1] == "pre-review-helpers":
+        from .pre_review_helpers import main as pre_review_helpers
+
+        raise SystemExit(pre_review_helpers(sys.argv[2:]))
+    if len(sys.argv) > 1 and sys.argv[1] == "research":
+        raise SystemExit(_research(sys.argv[2:]))
+    if len(sys.argv) > 1 and sys.argv[1] == "read":
+        raise SystemExit(_read(sys.argv[2:]))
     if len(sys.argv) > 1 and sys.argv[1] == "codex-runtime":
         _codex_runtime(sys.argv[2:])
         return
@@ -430,8 +438,16 @@ def _deck_request(argv: list[str]) -> int:
     )
     parser.add_argument("issue", help="the card, as owner/repo#123")
     parser.add_argument("--body-file", help="read the command from this file")
+    parser.add_argument(
+        "--session-token",
+        default=os.environ.get("AGENTDECK_SESSION_TOKEN", ""),
+        help="the sending chat's session token (default: $AGENTDECK_SESSION_TOKEN)",
+    )
     parser.add_argument("command", nargs="*", help="the command, when no --body-file is given")
-    args = parser.parse_args(argv)
+    # Intermixed, so an option between the card and the words still parses: before Python
+    # 3.12.7, ``parse_args`` filled ``command`` empty along with the card and refused the
+    # words after an option as unrecognized (#4334).
+    args = parser.parse_intermixed_args(argv)
     if args.body_file:
         try:
             command = Path(args.body_file).read_text()
@@ -462,7 +478,14 @@ def _deck_request(argv: list[str]) -> int:
         try:
             response = httpx.post(
                 urljoin(base + "/", "api/deck-request"),
-                json={"issue": args.issue.strip(), "command": command, "id": request_id},
+                json={
+                    "issue": args.issue.strip(),
+                    "command": command,
+                    "id": request_id,
+                    # Who sends it: a design verdict counts only from the reviewer the deck
+                    # started for that design (#4332).
+                    "session_token": args.session_token.strip(),
+                },
                 # A verdict on a Work the deck releases does its GitHub reads before it
                 # answers; 30 s cut off the slow ones (#2963).
                 timeout=DECK_REQUEST_TIMEOUT_S,
@@ -1541,7 +1564,7 @@ def _delegate(argv: list[str]) -> None:
         prog="agentdeck delegate",
         description="Delegate a stdin prompt to an AgentDeck-owned Codex chat.",
     )
-    parser.add_argument("--cwd", default=os.getcwd(), help="Codex working directory")
+    parser.add_argument("--cwd", help="Codex working directory (default: this one)")
     parser.add_argument("--account", help="AgentDeck account key; auto-selected if unique")
     parser.add_argument(
         "--sandbox",
@@ -1585,6 +1608,13 @@ def _delegate(argv: list[str]) -> None:
         type=float,
         help="wall-clock wait budget in seconds (defaults to the server's delegation budget)",
     )
+    parser.add_argument(
+        "--web-only",
+        action="store_true",
+        help="a Codex chat that can only search and read the web: no shell, no files, no MCP"
+        " servers, in an empty folder the deck picks; it answers once and takes no follow-up"
+        " (--cwd, --sandbox and --approval-policy are then ignored)",
+    )
     args = parser.parse_args(argv)
     if args.timeout is not None and args.timeout <= 0:
         parser.error("--timeout must be positive")
@@ -1592,20 +1622,26 @@ def _delegate(argv: list[str]) -> None:
     message = sys.stdin.read()
     if not message.strip():
         parser.error("a prompt must be supplied on stdin")
-    try:
-        cwd = str(Path(args.cwd).expanduser().resolve(strict=True))
-    except (OSError, RuntimeError) as exc:
-        parser.error(f"invalid working directory: {exc}")
-
     base_url = args.url.rstrip("/") + "/"
-    payload = {"cwd": cwd, "message": message, "sandbox": args.sandbox}
+    if args.web_only:
+        # The deck picks the folder, sandbox and approvals (#4381). Its own route: a deck
+        # too old to lock the chat answers 404 instead of starting an open one.
+        payload: dict = {"message": message}
+        start_path = "api/delegations/web-only"
+    else:
+        try:
+            cwd = str(Path(args.cwd or os.getcwd()).expanduser().resolve(strict=True))
+        except (OSError, RuntimeError) as exc:
+            parser.error(f"invalid working directory: {exc}")
+        payload = {"cwd": cwd, "message": message, "sandbox": args.sandbox}
+        start_path = "api/delegations"
     if args.account:
         payload["account_key"] = args.account
     if args.model:
         payload["model"] = args.model
     if args.effort:
         payload["effort"] = args.effort
-    if args.approval_policy:
+    if args.approval_policy and not args.web_only:
         payload["approval_policy"] = args.approval_policy
     parent = _delegation_parent(args)
     if parent is None:
@@ -1626,7 +1662,7 @@ def _delegate(argv: list[str]) -> None:
     try:
         with httpx.Client() as client:
             response = client.post(
-                urljoin(base_url, "api/delegations"),
+                urljoin(base_url, start_path),
                 json=payload,
                 timeout=post_timeout,
             )
@@ -1736,6 +1772,120 @@ def _delegate(argv: list[str]) -> None:
                 )
     except (httpx.HTTPError, KeyError, ValueError) as exc:
         parser.exit(1, f"AgentDeck delegation request failed: {exc}\n")
+
+
+def _research(argv: list[str]) -> int:
+    """Ask a Codex chat to research the web and print its answer with its sources (#4290)."""
+    import io
+
+    from .command_artifacts import SESSION_TOKEN_ENV
+    from .web_research import build_prompt, research_account
+
+    parser = argparse.ArgumentParser(
+        prog="agentdeck research",
+        description=(
+            "Research a question on the web through an AgentDeck-owned Codex chat, whose web"
+            " search reaches sites Claude's cannot (Reddit). The question comes on stdin; the"
+            " answer is printed as Codex wrote it, with the URL and a verbatim quote for each"
+            " source. The chat is always web-only: Codex's own configuration leaves it no"
+            " shell, no file tools, no MCP servers or sub-agents, and it runs in an empty"
+            " folder, so a question from anyone cannot read this host's files (#4381)."
+        ),
+    )
+    parser.add_argument(
+        "--web-only",
+        action="store_true",
+        help="ask for the web-only chat explicitly. It is already the only mode; pass it"
+        " from a script that must not run on an older agentdeck, which refuses the flag"
+        " instead of starting a chat that can read files",
+    )
+    parser.add_argument("--account", help="Codex account key; default: the least-used one")
+    parser.add_argument("--effort", choices=("low", "medium", "high", "xhigh"), default="medium")
+    parser.add_argument(
+        "--parent-session-token",
+        default=os.environ.get(SESSION_TOKEN_ENV) or None,
+        help=f"the calling chat's AgentDeck session token (default: ${SESSION_TOKEN_ENV})",
+    )
+    parser.add_argument(
+        "--url",
+        default=os.environ.get("AGENTDECK_URL", "http://127.0.0.1:8756"),
+        help="running AgentDeck base URL",
+    )
+    args = parser.parse_args(argv)
+    question = sys.stdin.read()
+    if not question.strip():
+        parser.error("the question must be supplied on stdin")
+    account = args.account
+    if account is not None and not account.startswith("codex:"):
+        # Only Codex's web search reaches Reddit, and research is meant to spend Codex quota.
+        parser.error(f"--account must be a Codex account (codex:...), not {account}")
+    if account is None:
+        try:
+            usage = httpx.get(urljoin(args.url.rstrip("/") + "/", "api/usage"), timeout=10.0)
+            usage.raise_for_status()
+            account = research_account(usage.json().get("usage") or [])
+        except (httpx.HTTPError, ValueError, AttributeError) as exc:
+            parser.exit(1, f"agentdeck research: could not read the deck's accounts: {exc}\n")
+        if account is None:
+            parser.exit(1, "agentdeck research: no Codex account has quota left\n")
+    delegate_argv = [
+        "--account", account,
+        "--web-only",
+        "--sandbox", "read-only",
+        "--effort", args.effort,
+        "--approval-policy", "never",
+        "--url", args.url,
+    ]  # fmt: skip
+    if args.parent_session_token:
+        delegate_argv += ["--parent-session-token", args.parent_session_token]
+    captured = io.StringIO()
+    stdin = sys.stdin
+    sys.stdin = io.StringIO(build_prompt(question))
+    try:
+        with contextlib.redirect_stdout(captured):
+            _delegate(delegate_argv)
+    except SystemExit as exc:
+        # The delegation's own refusal or failure is already on stderr.
+        return exc.code if isinstance(exc.code, int) and exc.code else 1
+    finally:
+        sys.stdin = stdin
+    answer = captured.getvalue()
+    if not answer.strip():
+        print("agentdeck research: the Codex chat returned no answer", file=sys.stderr)
+        return 1
+    print(answer.rstrip("\n"))
+    return 0
+
+
+def _read(argv: list[str]) -> int:
+    """Print a web page's text, read through the site's own feed or API where it has one."""
+    from .web_read import EXIT_CODES, read_url
+
+    parser = argparse.ArgumentParser(
+        prog="agentdeck read",
+        description=(
+            "Print a web page's text: Reddit through the Arctic Shift archive, anything"
+            " else with one plain request."
+            " Exit 0 read (a part it could not read is named on stderr), 1 error, 2 the site"
+            " refused this host, 3 the site rate-limited it."
+        ),
+    )
+    parser.add_argument("url")
+    args = parser.parse_args(argv)
+    result = read_url(args.url)
+    if result.status == "ok":
+        if result.partial:
+            print(f"[read via {result.source}; partial: {result.partial}]")
+            print(f"agentdeck read: partial read: {result.partial}", file=sys.stderr)
+        else:
+            print(f"[read via {result.source}]")
+        print(result.text)
+    else:
+        print(
+            f"agentdeck read: {result.status} via {result.source}: {result.detail}",
+            file=sys.stderr,
+        )
+    return EXIT_CODES[result.status]
 
 
 def _unknown_delegation(response: httpx.Response) -> bool:

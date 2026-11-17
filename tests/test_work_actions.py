@@ -168,6 +168,12 @@ def test_merge_when_ready_and_withdraw_follow_the_releases_press():
     with pytest.raises(Refused, match="Merge is offered instead"):
         plan("approve_merge", ready, operator_attention(ready, work_status(ready)),
              approval="offered")
+    # #4294: a question over a ready pull request keeps its Merge, so the press is planned.
+    asked = _work_of(derived=_derived("asked_in_chat", "Needs you", ready_pr=7))
+    attention = operator_attention(asked, work_status(asked))
+    assert plan("merge", asked, attention, deck_release=True).kind == "deck_merge"
+    with pytest.raises(Refused, match="Merge is offered instead"):
+        plan("approve_merge", asked, attention, approval="offered")
 
 
 @pytest.mark.parametrize(

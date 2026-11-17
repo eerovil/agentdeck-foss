@@ -1,16 +1,14 @@
-from typing import get_args
-
 import pytest
 
 from agentdeck.command_artifacts import SESSION_TOKEN_ENV
 from agentdeck.providers.instructions import (
+    GUIDED_ROLES,
     LOOK_CHECK_LINE,
     PRE_REVIEW_HOW,
     SESSION_GUIDE_OPEN,
     USE_CASE_WALKTHROUGH_LINE,
     USE_CASE_WALKTHROUGH_NOT_APPLICABLE,
     WORK_SESSION_ROLE_INSTRUCTIONS,
-    SessionRole,
     agentdeck_session_instructions,
     resolve_session_role,
     session_guide_fingerprint,
@@ -84,7 +82,7 @@ def test_session_guide_lets_every_session_question_an_outdated_rule():
     """#2444: agents treated every rule as fixed, even one whose reason had gone stale
     and was making the task much harder. Every provider and role gets the same text."""
     for provider in ("claude_code", "codex"):
-        for role in get_args(SessionRole):
+        for role in GUIDED_ROLES:
             guide = agentdeck_session_instructions(provider=provider, role=role)
             flat = " ".join(guide.split())
 
@@ -118,7 +116,7 @@ def test_session_guide_lets_every_session_question_an_outdated_rule():
 
 
 def test_session_guide_requires_concise_updates_and_handoffs_for_every_role():
-    for role in get_args(SessionRole):
+    for role in GUIDED_ROLES:
         guide = agentdeck_session_instructions(provider="claude_code", role=role)
         flat = " ".join(guide.split())
 
@@ -176,7 +174,7 @@ def test_no_session_guide_asks_an_agent_to_report_attention(provider):
 
 
 def test_session_guide_forbids_polling_github_to_wait_for_every_role():
-    for role in get_args(SessionRole):
+    for role in GUIDED_ROLES:
         guide = agentdeck_session_instructions(provider="claude_code", role=role)
         flat = " ".join(guide.split())
 
@@ -206,7 +204,7 @@ def test_session_guide_forbids_polling_github_to_wait_for_every_role():
 def test_session_guide_checks_host_credentials_before_handing_the_owner_a_step(provider):
     # #2776: agents told the owner "no Cloudflare credentials" after checking only the
     # environment, while the owner's token sat in a file on the host.
-    for role in get_args(SessionRole):
+    for role in GUIDED_ROLES:
         guide = agentdeck_session_instructions(provider=provider, role=role)
         flat = " ".join(guide.split())
 
@@ -218,7 +216,7 @@ def test_session_guide_checks_host_credentials_before_handing_the_owner_a_step(p
 
 def test_session_guide_forbids_a_timer_that_wakes_the_chat_for_every_role():
     """#1798: a worker's leftover `sleep` countdowns spent five turns waking a finished chat."""
-    for role in get_args(SessionRole):
+    for role in GUIDED_ROLES:
         guide = agentdeck_session_instructions(provider="claude_code", role=role)
         flat = " ".join(guide.split())
 
@@ -233,7 +231,7 @@ def test_session_guide_forbids_a_timer_that_wakes_the_chat_for_every_role():
 
 def test_session_guide_names_the_sandbox_envelope_for_every_codex_role():
     # Both walls travel together: an agent told about one walks into the other (#709).
-    for role in get_args(SessionRole):
+    for role in GUIDED_ROLES:
         flat = " ".join(agentdeck_session_instructions(provider="codex", role=role).split())
 
         # The network wall, stated as the socket-level fact it is.
@@ -267,7 +265,7 @@ def test_session_guide_names_the_sandbox_envelope_for_every_codex_role():
 def test_sandbox_envelope_reaches_no_claude_session():
     """#1548: the bullet says it is Codex only, so only Codex sessions get it."""
     for provider in ("claude_code",):
-        for role in get_args(SessionRole):
+        for role in GUIDED_ROLES:
             guide = agentdeck_session_instructions(provider=provider, role=role)
             assert "Know your sandbox envelope" not in guide
             assert "Read-only file system" not in guide
@@ -277,7 +275,7 @@ def test_subagent_rule_reaches_every_claude_role():
     """#1572 lands #1570's rule. The threshold and the reason travel together:
     an agent that thinks the reason is context size spawns anyway on a large
     parent, which is the call the rule exists to change."""
-    for role in get_args(SessionRole):
+    for role in GUIDED_ROLES:
         flat = " ".join(agentdeck_session_instructions(provider="claude_code", role=role).split())
 
         # The default, stated as a default rather than as a discouragement.
@@ -302,7 +300,7 @@ def test_subagent_rule_reaches_no_codex_session():
     only through the cross-account bridge, so the arithmetic would be false
     for it."""
     for provider in ("codex",):
-        for role in get_args(SessionRole):
+        for role in GUIDED_ROLES:
             guide = agentdeck_session_instructions(provider=provider, role=role)
             assert "Doing the work yourself is the default" not in guide
             assert "1% of a five-hour window" not in guide
@@ -522,6 +520,9 @@ def test_work_session_guide_says_what_the_deck_reads_and_names_no_poller():
         # The live check and the close are in the merge message (#4252).
         assert "close the issue yourself; the merge message says when to keep it open" in flat
         assert "check the change live and record it as that message says" in flat
+        # #4320: make the change run, not wait for a later deploy or a job's schedule.
+        assert "redeploy a merge that only a later deploy would apply" in flat
+        assert "offer to run a changed scheduled job now" in flat
         # No poller duties: nothing dispatches this chat, so nothing is owed to one.
         assert "There is no control command and no terminal report to file" in flat
         assert "worker-control" not in flat
@@ -553,7 +554,25 @@ def test_the_pre_review_checklist_says_how_to_do_each_point():
     # The reviewer's walkthrough line (#3338), in the very form the poller brief asks for.
     assert f"opening with the line {USE_CASE_WALKTHROUGH_LINE}" in flat
     assert USE_CASE_WALKTHROUGH_NOT_APPLICABLE in flat
+    # Each step's variants, each with its test (#4407, #4430).
+    assert "Fix a gap or name it. Under each step, list its variants:" in flat
+    assert "`no test: <why>`" in flat and "Write the missing tests before you post" in flat
     # The deck's checklist carries it.
     from agentdeck.work_router import PRE_REVIEW_TEXT
 
     assert "{how}" in PRE_REVIEW_TEXT
+
+
+def test_web_research_reaches_claude_and_the_page_reader_reaches_both():
+    """#4290: Claude's search cannot reach Reddit, Codex's can, so only Claude is sent to
+    `agentdeck research`; both get the page reader."""
+    for role in GUIDED_ROLES:
+        claude = " ".join(agentdeck_session_instructions(provider="claude_code", role=role).split())
+        codex = " ".join(agentdeck_session_instructions(provider="codex", role=role).split())
+        assert "~/agentdeck/.venv/bin/agentdeck research` with the question on stdin" in claude
+        assert "you are not yourself a delegated chat" in claude
+        assert "answers it with links and verbatim quotes" in claude
+        assert "agentdeck research" not in codex
+        for guide in (claude, codex):
+            assert "~/agentdeck/.venv/bin/agentdeck read <url>" in guide
+            assert "do not retry a 3 at once" in guide

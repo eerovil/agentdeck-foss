@@ -1094,8 +1094,13 @@ async def test_a_timed_out_wait_is_read_from_github_and_waits_again_while_runnin
             raise answer
         return answer
 
+    notes: dict[str, tuple[str, str]] = {}
     service = settling_service(
-        root, scheduled, clock, live_read=lambda request: read_live(request, fetch)
+        root,
+        scheduled,
+        clock,
+        live_read=lambda request: read_live(request, fetch),
+        note=lambda chat, note_id, text: notes.setdefault(note_id, (chat, text)) is not None,
     )
     pull = register(service, pull_request="eerovil/agentdeck#12", timeout_minutes=5)
     clock.now += 5 * 60
@@ -1111,6 +1116,15 @@ async def test_a_timed_out_wait_is_read_from_github_and_waits_again_while_runnin
     assert held.deadline == clock.now + LIVE_READ_AGAIN_S
     await settle(service)
     assert len(reads) == 1
+    # #4306: its chat hears it with its next message, once per wait however often it is read.
+    assert list(notes) == [f"wake-on:still-running:{pull.id}"]
+    assert notes[f"wake-on:still-running:{pull.id}"][0] == pull.chat_id
+    assert "is waiting again" in notes[f"wake-on:still-running:{pull.id}"][1]
+    clock.now = held.deadline
+    answers.append({"state": "open"})
+    await settle(service)
+    assert scheduled == [] and len(notes) == 1
+    (held,) = service.registry.all()
 
     # Merged: a routine wake that says the deck read it.
     clock.now = held.deadline
@@ -1121,6 +1135,19 @@ async def test_a_timed_out_wait_is_read_from_github_and_waits_again_while_runnin
     assert text.startswith(ROUTINE_LINE) and "was merged as abcdef123456" in text
     assert "the deck read it from GitHub itself" in text
     assert service.registry.all() == ()
+
+    # A note the deck could not keep leaves the wait as before: waiting again, silently.
+    scheduled.clear()
+    service._note = lambda chat, note_id, text: (_ for _ in ()).throw(OSError("disk"))
+    still = register(service, pull_request="eerovil/agentdeck#13", timeout_minutes=5)
+    clock.now += 5 * 60
+    service.expire_due()  # the extra round
+    clock.now += 5 * 60
+    answers.append({"state": "open"})
+    await settle(service)
+    assert [item.id for item in service.registry.all()] == [still.id] and scheduled == []
+    service.registry.remove([still.id])
+    service._note = None
 
     # A failed read falls back to the timeout message, saying what the deck tried.
     scheduled.clear()
@@ -1239,8 +1266,14 @@ async def test_a_review_chat_closing_with_no_verdict_is_asked_again_by_the_deck(
         asks.append((repository, number, note))
         return refusals.pop(0) if refusals else ""
 
+    notes: dict[str, tuple[str, str]] = {}
     service = settling_service(
-        root, scheduled, clock, ask_review=ask_review, reviewer_down=lambda: down[0]
+        root,
+        scheduled,
+        clock,
+        ask_review=ask_review,
+        reviewer_down=lambda: down[0],
+        note=lambda chat, note_id, text: notes.setdefault(note_id, (chat, text)) is not None,
     )
     stopped = "the review chat https://x/9 closed its review, saying:\n\nno verdict"
 
@@ -1261,6 +1294,13 @@ async def test_a_review_chat_closing_with_no_verdict_is_asked_again_by_the_deck(
     assert held[review.id].stopped == "" and held[review.id].asked_at == clock.now
     assert held[review.id].deadline == clock.now + REVIEW_TIMEOUT_MINUTES * 60
     assert (held[merge.id].stopped, held[merge.id].deadline) == ("", merge.deadline)
+    # #4306: each accepted re-ask is a pending note saying why, never a wake.
+    assert sorted(note_id.rsplit(":", 1)[0] for note_id in notes) == sorted(
+        f"wake-on:reask:{item.id}" for item in (review, merge)
+    )
+    assert all("asked for a fresh review itself" in text for _, text in notes.values())
+    assert all("no verdict" in text and chat == review.chat_id for chat, text in notes.values())
+    notes.clear()
 
     # Refused: the chat hears the refusal and is told not to ask again.
     service.registry.update(replace(held[review.id], stopped=stopped, deadline=clock.now))
@@ -1269,6 +1309,7 @@ async def test_a_review_chat_closing_with_no_verdict_is_asked_again_by_the_deck(
     assert len(scheduled) == 1
     assert "it was refused: this head was already asked again twice" in scheduled[0].text
     assert "Do not ask again" in scheduled[0].text
+    assert notes == {}, "a refusal wakes the chat instead"
 
     # The reviewer is down: no ask, and the chat is told why.
     scheduled.clear()
@@ -1348,12 +1389,14 @@ def test_green_ci_on_a_ready_head_and_an_already_told_merge_end_without_a_messag
     told the chat of a merge; a draft's, a failing or a deploy's result still wakes the chat."""
     ready: list[bool] = [True]
     notices: list[str] = []
+    notes: dict[str, tuple[str, str]] = {}
     service = settling_service(
         root,
         scheduled,
         clock,
         ready_head=lambda request: ready[0],
         release_notices=lambda chat_id, since: list(notices),
+        note=lambda chat, note_id, text: notes.setdefault(note_id, (chat, text)) is not None,
     )
 
     def status(delivery, state):
@@ -1366,8 +1409,19 @@ def test_green_ci_on_a_ready_head_and_an_already_told_merge_end_without_a_messag
         )
         drain(service)
 
-    register(service, commit=f"eerovil/agentdeck@{SHA}")
+    first = register(service, commit=f"eerovil/agentdeck@{SHA}")
     status("g1", "success")
+    assert scheduled == [] and service.registry.all() == ()
+    # #4306: a pending note instead, once per chat and commit.
+    note_id = f"wake-on:ci-green:{first.chat_id}:eerovil/agentdeck@{SHA}"
+    assert list(notes) == [note_id] and f"CI passed at {SHA[:12]}" in notes[note_id][1]
+    register(service, commit=f"eerovil/agentdeck@{SHA}")
+    status("g1b", "success")
+    assert scheduled == [] and len(notes) == 1
+    # A note not kept is the silence of before.
+    service._note = lambda chat, note_id, text: False
+    register(service, commit=f"eerovil/agentdeck@{SHA}")
+    status("g1c", "success")
     assert scheduled == [] and service.registry.all() == ()
     register(service, commit=f"eerovil/agentdeck@{SHA}")
     status("r1", "failure")
@@ -2111,6 +2165,78 @@ def test_a_needs_you_wake_whose_save_failed_is_retried_on_a_timer(root, clock):
     clock.now += 10
     service.expire_due()
     assert len(saved) == 1 and service.registry.all()[0].told == (away.key,)
+
+
+def test_a_needs_you_wait_notes_a_told_work_that_no_longer_needs_the_owner(root, clock):
+    """#4358: a Work the chat was woken for that leaves Needs you leaves a note that wakes
+    nothing, so the chat stops saying it waits on the person. Only for Works it was told of."""
+    scheduled, notes, keeping, here = [], {}, [True], [True]
+
+    def note(chat, note_id, text):
+        if not keeping[0]:
+            return False
+        notes.setdefault(note_id, (chat, text))
+        return True
+
+    service = WakeOnService(
+        root,
+        schedule=lambda message: scheduled.append(message) or message,
+        message_exists=lambda message_id: any(m.id == message_id for m in scheduled),
+        clock=clock,
+        present=lambda request: here[0],
+        note=note,
+    )
+    request = register(service, "claude_code:alt:deck", needs_you="all")
+    later = clock.now + 5
+    asked, ready = needs_you_stop(1, at=later), needs_you_stop(2, at=later)
+    assert service.needs_you([asked, ready]) == 2
+    here[0] = False
+    away = needs_you_stop(3, at=later)  # marked told, never reported
+    assert service.needs_you([asked, ready, away]) == 0
+    here[0] = True
+    # A degraded pass that dropped them says nothing.
+    service.needs_you([], complete=False)
+    assert notes == {}
+    # Work 1 asks a new question: it still needs the owner, so no note, only the new wake.
+    again = needs_you_stop(1, at=later + 60)
+    where = {"github_issue:eerovil/agentdeck#2": "Working; pull requests #9 open"}.get
+    assert service.needs_you([again, ready], where=where) == 1 and notes == {}
+    # Work 2 moved on, Work 3 (never told) too: one note, for Work 2, and no wake.
+    keeping[0] = False  # the store fails once: kept owed, retried on the deadline timer
+    service.needs_you([again], where=where)
+    assert notes == {} and len(scheduled) == 3
+    assert service.next_due() == clock.now + 10
+    keeping[0] = True
+    clock.now += 10
+    service.expire_due()  # no further overview pass needed (#4361 review)
+    [(note_id, (chat, text))] = notes.items()
+    assert chat == "claude_code:alt:deck" and note_id.startswith(f"wake-on:{request.id}:")
+    assert text.startswith('eerovil/agentdeck#2 (Needs answer: Work 2) no longer needs')
+    assert "Where it is now: Working; pull requests #9 open." in text
+    assert len(scheduled) == 3
+    service.needs_you([again])  # noted once
+    [held] = service.registry.all()
+    # Work 1's first stop stays until the Work leaves: then one note, for the newest.
+    assert [key for key, _ in held.reported] == [asked.key, again.key] and len(notes) == 1
+    # The reported stops survive a reload from disk.
+    reloaded = WakeOnService(
+        root, schedule=lambda m: m, message_exists=lambda _id: False, clock=clock
+    )
+    assert reloaded.registry.all()[0].reported == held.reported
+    # Out of Needs you altogether, with nowhere known: the note still goes.
+    service.needs_you([])
+    assert len(notes) == 2 and "Where it is now" not in list(notes.values())[-1][1]
+    assert service.registry.all()[0].reported == ()
+    # #4361 review: an answer-only wait whose Work moves on to Ready for merge gets no note,
+    # since the Work still needs the person; once it leaves Needs you, it does.
+    service.registry.remove([request.id])
+    register(service, "claude_code:alt:deck", needs_you="all", only="answer")
+    asked = needs_you_stop(8, at=clock.now + 5)
+    assert service.needs_you([asked]) == 1
+    merge = needs_you_stop(8, category="ready_for_merge", at=clock.now + 6)
+    assert service.needs_you([merge]) == 0 and len(notes) == 2
+    service.needs_you([])
+    assert len(notes) == 3 and list(notes.values())[-1][1].startswith("eerovil/agentdeck#8")
 
 
 def test_a_time_wait_check_stays_silent_until_it_says_it_happened(root, service, scheduled, clock):

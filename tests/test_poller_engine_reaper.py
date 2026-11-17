@@ -664,7 +664,7 @@ def test_new_bytes_in_an_already_untracked_file_keep_the_worktree(tmp_path, chec
     assert note.read_text() == "second, not in the save\n"
 
 
-def test_paths_in_use_reads_open_files_and_maps_not_only_folders(tmp_path):
+def test_paths_in_use_reads_open_files_and_maps_not_only_folders(tmp_path, monkeypatch):
     proc = tmp_path / "proc"
     (proc / "12" / "fd").mkdir(parents=True)
     (proc / "12" / "cwd").symlink_to("/elsewhere")
@@ -675,12 +675,18 @@ def test_paths_in_use_reads_open_files_and_maps_not_only_folders(tmp_path):
     (proc / "13").mkdir()  # ended mid-scan: its links are gone
     (proc / "14" / "fd").mkdir(parents=True)  # alive, but not ours to read
     (proc / "14" / "cwd").symlink_to("/w/issue-4")
-    (proc / "14" / "fd").chmod(0)
+    # Refused the way /proc refuses another user's fds; chmod(0) would not refuse root.
+    locked = proc / "14" / "fd"
+    listing = Path.iterdir
 
-    try:
-        use = reaper.paths_in_use(proc)
-    finally:
-        (proc / "14" / "fd").chmod(0o700)
+    def refusing(self):
+        if self == locked:
+            raise PermissionError(13, "Permission denied", str(self))
+        return listing(self)
+
+    monkeypatch.setattr(Path, "iterdir", refusing)
+    use = reaper.paths_in_use(proc)
+    monkeypatch.undo()
 
     assert reaper.in_use("/w/issue-1", use.paths) and reaper.in_use("/w/issue-2", use.paths)
     assert not reaper.in_use("/w/issue-3", use.paths)

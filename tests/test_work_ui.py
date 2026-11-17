@@ -821,6 +821,7 @@ def test_the_front_page_is_work_first(tmp_path):
         'id="front-live"',
         'id="front-finished"',
         'id="front-paused"',
+        'id="front-parked"',
         'id="front-stopped"',
         'id="work-other"',
         'id="front-board"',
@@ -1344,6 +1345,38 @@ async def test_a_work_change_streams_without_rendering_the_chat_list(tmp_path, m
     active = chunk.split("event: works-active", 1)[1].split("event: ", 1)[0]
     # The working chat is named (#2487), not counted.
     assert f'data-work-id="{WORK.work_id}"' in active and "worker is working" in active
+
+    def part(chunk: str, name: str) -> str:
+        return chunk.split(f"event: works-{name}\n", 1)[1].split("event: ", 1)[0]
+
+    # #4305: a person parks it and its turn ends. This deck lists only Works with a running
+    # chat, so the pass's built card gets the status a ``parked`` label gives it: the Parked
+    # part's own event carries it, and the active and waiting parts no longer do.
+    from agentdeck import work_story
+    from agentdeck.web import work_view
+    from agentdeck.work_derived import PARKED, DerivedStatus
+
+    built = work_view.load_work_overview
+
+    async def parked(app, **kwargs):
+        overview = await built(app, **kwargs)
+        cards = tuple(
+            replace(card, derived=DerivedStatus(PARKED, "Parked — waits for your message"))
+            for card in overview.cards
+        )
+        rows = [work_story.front_row(card, current=True) for card in cards]
+        return replace(overview, cards=cards, front=work_story.front_sections(rows))
+
+    monkeypatch.setattr(work_view, "load_work_overview", parked)
+    _add(app, "claude_code:test:worker", WORK)
+    await app.state.work_overview.refresh()
+    chunk = await asyncio.wait_for(anext(stream), 5)
+    while not chunk.startswith("event: works"):
+        chunk = await asyncio.wait_for(anext(stream), 5)
+    assert f'data-work-id="{WORK.work_id}"' in part(chunk, "parked")
+    assert 'data-front-group="parked"' in part(chunk, "parked")
+    for other in ("active", "waiting"):
+        assert f'data-work-id="{WORK.work_id}"' not in part(chunk, other), other
     await stream.aclose()
 
 
@@ -1471,6 +1504,7 @@ def test_the_older_slices_routes_are_the_work_page_now(tmp_path):
     paths = _route_paths(_app(tmp_path).routes)
     assert {p for p in paths if "works" in p} == {
         "/works",
+        "/works/finished",
         "/works/{work_id:path}",
         "/works/{work_id:path}/message",
         "/works/{work_id:path}/action",  # the one Work action route (#2237)
@@ -1633,8 +1667,9 @@ def test_the_works_index_shows_active_and_recent_and_counts_the_archive(tmp_path
     assert f'data-work-id="{recent.work_id}"' in recent_part
     assert "Issue 3" in recent_part
     assert f'data-work-id="{OTHER.work_id}"' not in html
-    assert "Archived Works (2)" in html
-    assert f"Issue {OTHER.number}" in _client(app).get("/works?view=archived").text
+    # The older Works are under the front page's Recently finished now (#4289).
+    assert 'href="/#front-finished" data-older-link' in html
+    assert f"Issue {OTHER.number}" in _client(app).get("/works/finished").text
 
 
 @pytest.mark.asyncio
@@ -1684,13 +1719,12 @@ def test_the_works_index_filters_by_project(tmp_path):
     assert re.findall(r'data-works-project="([^"]+)"', everything) == [
         "eerovil/agentdeck", "eerovil/trailhead"
     ]
-    assert "All projects" in everything and "Archived Works (1)" in everything
+    assert "All projects" in everything
 
     # Any spelling of the repository picks its Works in both buckets, and says so while shut.
     only = client.get("/works?repo=EEROVIL/Trailhead").text
     assert _archived_ids(only) == [trailhead.work_id]
     assert 'data-works-project-summary>eerovil/trailhead<' in only
-    assert 'href="/works?view=archived&amp;repo=eerovil%2Ftrailhead"' in only
     assert "No other Work moved this week." not in only
     agentdeck = client.get("/works?repo=eerovil/agentdeck").text
     assert set(_archived_ids(agentdeck)) == {WORK.work_id, recent.work_id}
@@ -1733,6 +1767,18 @@ def _archived_ids(html: str) -> list[str]:
     return re.findall(r'<li class="wd-row" data-work-id="([^"]+)"', html)
 
 
+def _older_ids(html: str) -> list[str]:
+    """The Works one Show older page lists (#4289), in order."""
+    return re.findall(r'<article [^>]*data-work-id="([^"]+)"[^>]*data-front-in="older"', html)
+
+
+def _older_next(html: str) -> str:
+    """The address the page's Show older button asks next, "" when it is hidden at the end."""
+    button = re.search(r'<button [^>]*id="front-older-more"[^>]*>', html).group(0)
+    found = re.search(r'hx-get="([^"]+)"', button)
+    return found.group(1).replace("&amp;", "&") if found and "hidden" not in button else ""
+
+
 def _backfilled_inventory(app, monkeypatch, tmp_path, *works: WorkRef):
     """A deck upgraded from before the ``works`` table: the Works exist only as old
     ``session_issues`` rows of chats no scan loads any more, and startup backfills the
@@ -1763,7 +1809,7 @@ def _backfilled_inventory(app, monkeypatch, tmp_path, *works: WorkRef):
         datetime.fromisoformat(row[2]) >= NOW - timedelta(minutes=5)
         for row in backfilled.values()
     )
-    for name in ("load_works", "count_works", "known_work_ids"):
+    for name in ("load_works", "known_work_ids"):
         monkeypatch.setattr(app.state.app_state.db, name, getattr(db, name), raising=False)
     return db
 
@@ -1783,17 +1829,15 @@ async def test_a_backfilled_work_only_the_inventory_remembers_is_archived_and_fo
     # Backfilled today, but nothing current or recent names it: Archived, not Recent.
     assert f'data-work-id="{remembered.work_id}"' not in index
     assert f'data-work-id="{WORK.work_id}"' in index
-    assert "Archived Works (1)" in index
-    archive = client.get("/works?view=archived&q=trailhead%23412").text
-    assert _archived_ids(archive) == [remembered.work_id]
-    assert _archived_ids(client.get("/works?view=archived&repo=eerovil/trailhead").text) == [
+    found = client.get("/works/finished?search=1&q=trailhead%23412").text
+    assert _older_ids(found) == [remembered.work_id]
+    assert _older_ids(client.get("/works/finished?project=eerovil/trailhead").text) == [
         remembered.work_id
     ]
     page = client.get(work_href(remembered.work_id))
     assert page.status_code == 200 and f'data-work-id="{remembered.work_id}"' in page.text
     overview = await _overview(app)
     assert [card.work_id for card in overview.cards] == [WORK.work_id]
-    assert overview.archived == 1
 
 
 @pytest.mark.asyncio
@@ -1808,56 +1852,158 @@ async def test_the_recurring_views_never_read_the_whole_inventory(tmp_path, monk
 
     monkeypatch.setattr(app.state.app_state.db, "load_works", forbidden, raising=False)
     overview = await _overview(app)
-    assert overview.archived == 39
-    assert "Archived Works (39)" in _client(app).get("/works").text
+    assert [card.work_id for card in overview.cards] == [WORK.work_id]
+    assert _client(app).get("/works").status_code == 200
     assert _client(app).get(work_href("github_issue:eerovil/old#7")).status_code == 200
 
 
-def test_the_archive_is_paged_so_a_long_history_stays_a_short_page(tmp_path):
-    from agentdeck.web.routes_works import ARCHIVE_PAGE_SIZE
+def test_show_older_pages_by_a_cursor_newest_first(tmp_path):
+    """#4289: Show older lists ten older Works a press, newest first, each once, and hands out
+    the next page as a time and a Work id, so the end of the list has no button."""
+    from agentdeck.web.routes_works import OLDER_PAGE_SIZE
 
-    app = _archive(tmp_path, 120)
+    app = _archive(tmp_path, 25)
     client = _client(app)
 
-    first = client.get("/works?view=archived").text
-    assert "Archived Works" in first and 'data-archived-count>120<' in first
-    assert len(_archived_ids(first)) == ARCHIVE_PAGE_SIZE
-    assert "Page 1 of 3" in first and 'rel="next"' in first and 'rel="prev"' not in first
+    first = client.get("/works/finished").text
+    assert len(_older_ids(first)) == OLDER_PAGE_SIZE
+    assert _older_ids(first)[0] == WorkRef("eerovil/agentdeck", 1).work_id
+    # Same rows as the front page's, without its buttons, and open issues say so.
+    assert 'class="fr fr-' in first and "fr-side" not in first
+    # No cached record says these issues are open, so none is called open (#4289 review).
+    assert "data-older-open" not in first
+    seen = _older_ids(first)
+    href = _older_next(first)
+    while href:
+        page = client.get(href).text
+        seen += _older_ids(page)
+        href = _older_next(page)
+    assert len(seen) == 25 and len(set(seen)) == 25
+    assert 'id="front-older-more" hx-swap-oob="true" hidden' in page
+    # A Work moving newer between presses neither skips nor repeats a row on the next one.
+    second = client.get(_older_next(first)).text
+    _add(
+        app,
+        "claude_code:test:w3",
+        WorkRef("eerovil/agentdeck", 3),
+        title="Task number 3",
+        last_activity=NOW - timedelta(days=8),
+    )
+    again = client.get(_older_next(first)).text
+    assert _older_ids(again) == _older_ids(second)
 
-    last = client.get("/works?view=archived&page=3").text
-    assert len(_archived_ids(last)) == 120 - 2 * ARCHIVE_PAGE_SIZE
-    # Newest first across pages, and no Work on two pages.
-    seen = _archived_ids(first) + _archived_ids(client.get("/works?view=archived&page=2").text)
-    seen += _archived_ids(last)
-    assert len(set(seen)) == 120
-    assert seen[0] == WorkRef("eerovil/agentdeck", 1).work_id
-    # A page past the end shows the last page rather than nothing.
-    assert _archived_ids(client.get("/works?view=archived&page=99").text) == _archived_ids(last)
+
+@pytest.mark.asyncio
+async def test_show_older_lists_closed_works_by_when_they_closed(tmp_path, monkeypatch):
+    """#4289: a finished Work past the front page's newest few is under Show older, by its
+    close time; the live list's own rows are not repeated."""
+    app = _archive(tmp_path, 3)
+    closed = WorkRef("eerovil/agentdeck", 2)
+    recent = [WorkRef("eerovil/agentdeck", n) for n in range(40, 47)]
+    for work in recent:
+        _add(app, f"claude_code:test:r{work.number}", work, last_activity=NOW - timedelta(days=1))
+    _closed(
+        app,
+        {
+            2: NOW - timedelta(days=10),  # closed before the week the front page lists
+            **{work.number: NOW - timedelta(hours=work.number) for work in recent},
+        },
+    )
+    # #1 is still open and was last active after #2 closed; #3 has no record at all.
+    _add(app, "claude_code:test:w1", WorkRef("eerovil/agentdeck", 1),
+         title="Task number 1", last_activity=NOW - timedelta(days=9))
+    # #50 is closed, but its record has no `closedAt` yet: the live list cannot place it, so
+    # it is listed here, among the closed ones by its last activity.
+    untimed = WorkRef("eerovil/agentdeck", 50)
+    _add(app, "claude_code:test:w50", untimed, last_activity=NOW - timedelta(days=2))
+    closed_lookup = app.state.issues.cached_issues
+
+    def lookup(refs):
+        records = closed_lookup(refs)
+        if ("eerovil/agentdeck", 1) in refs:
+            records[("eerovil/agentdeck", 1)] = {"title": "Issue 1", "state": "OPEN"}
+        if ("eerovil/agentdeck", 50) in refs:
+            records[("eerovil/agentdeck", 50)] = {
+                "title": "Issue 50", "state": "CLOSED", "is_pr": False
+            }
+        return records
+
+    app.state.issues.cached_issues = lookup
+    # #45 closed hours ago but still counts as Active (its chat ran on, say): past the live
+    # list's five, it is listed here all the same.
+    from agentdeck import work_overview
+
+    classify = work_overview.classify_work
+
+    def still_active(candidate, *, now):
+        if candidate.ref == recent[5]:
+            return work_overview.ACTIVE
+        return classify(candidate, now=now)
+
+    monkeypatch.setattr(work_overview, "classify_work", still_active)
+    await app.state.work_overview.refresh()
+
+    html = _client(app).get("/works/finished").text
+
+    # The live list draws the newest five; the rest by close time, then the open ones by
+    # activity, however recent; a Work whose issue state is unknown is not called open.
+    ids = _older_ids(html)
+    assert ids == [
+        *(work.work_id for work in recent[5:]),
+        untimed.work_id,
+        closed.work_id,
+        WorkRef("eerovil/agentdeck", 1).work_id,
+        WorkRef("eerovil/agentdeck", 3).work_id,
+    ]
+    assert html.count("data-older-open") == 1
+    first_open = html.split('data-work-id="github_issue:eerovil/agentdeck#1"', 1)[1]
+    assert "data-older-open" in first_open.split("</article>", 1)[0]
+    # An older row opens its Work page on a phone too, never its chat.
+    assert "data-chat-href" not in html
+    # Page by page, the order is the same: a cursor across the closed/open line goes on.
+    monkeypatch.setattr("agentdeck.web.routes_works.OLDER_PAGE_SIZE", 1)
+    paged, url = [], "/works/finished"
+    client = _client(app)
+    for _ in range(len(ids)):
+        page_html = client.get(url).text
+        paged += _older_ids(page_html)
+        url = _older_next(page_html)
+        if not url:
+            break
+    assert paged == ids
 
 
-def test_the_archive_searches_and_filters_by_repository(tmp_path):
+def test_show_older_searches_and_filters_by_project(tmp_path):
     app = _archive(tmp_path, 30)
     client = _client(app)
 
     # Every word must appear, in any case.
-    found = _archived_ids(client.get("/works?view=archived&q=TASK number 7").text)
+    found = _older_ids(client.get("/works/finished?search=1&q=TASK number 7").text)
     assert set(found) == {WorkRef("eerovil/agentdeck", n).work_id for n in (7, 17, 27)}
-
-    trailhead = client.get("/works?view=archived&repo=EEROVIL/Trailhead")
-    assert set(_archived_ids(trailhead.text)) == {
-        WorkRef("eerovil/trailhead", n).work_id for n in (10, 20, 30)
-    }
-    assert "3 of 3 matching" in trailhead.text.replace("1–", "")
+    trailhead = _older_ids(client.get("/works/finished?project=EEROVIL/Trailhead").text)
+    assert set(trailhead) == {WorkRef("eerovil/trailhead", n).work_id for n in (10, 20, 30)}
     # The issue spelling finds the Work too.
-    assert _archived_ids(client.get("/works?view=archived&q=trailhead%2310").text) == [
+    assert _older_ids(client.get("/works/finished?search=1&q=trailhead%2310").text) == [
         WorkRef("eerovil/trailhead", 10).work_id
     ]
-    empty = client.get("/works?view=archived&q=nothing-like-this").text
-    assert _archived_ids(empty) == [] and "No Archived Work matches." in empty
+    empty = client.get("/works/finished?search=1&q=nothing-like-this").text
+    assert _older_ids(empty) == [] and "No finished Work matches." in empty
+    # An emptied box lists nothing and puts the first page's button back.
+    cleared = client.get("/works/finished?search=1&q=").text
+    assert _older_ids(cleared) == [] and "data-older-none" not in cleared
+    assert _older_next(cleared) == "/works/finished"
+
+
+def test_the_archived_view_lands_on_recently_finished(tmp_path):
+    app = _archive(tmp_path, 2)
+    moved = _client(app).get("/works?view=archived&q=x", follow_redirects=False)
+    assert moved.status_code == 302 and moved.headers["location"] == "/#front-finished"
 
 
 @pytest.mark.asyncio
-async def test_the_dashboard_links_the_archive_with_its_count(tmp_path):
+async def test_recently_finished_always_shows_with_show_older(tmp_path):
+    """#4289: with nothing finished this week the header still shows, and Show older under it
+    is how the archive is reached; the footer no longer links an Archived view."""
     app = _app(tmp_path)
     _add(app, "claude_code:test:worker", WORK)
     _old(app, "claude_code:test:old", OTHER)
@@ -1866,12 +2012,16 @@ async def test_the_dashboard_links_the_archive_with_its_count(tmp_path):
     overview = await _overview(app)
 
     assert [card.work_id for card in overview.cards] == [WORK.work_id]
-    assert (overview.hidden, overview.archived) == (0, 2)
+    assert overview.hidden == 0
     from agentdeck.web.work_view import render_work_front
 
-    html = render_work_front(app.state.templates, overview, "board")
-    assert 'href="/works?view=archived"' in html and "Archived (2)" in html
-    assert "older Works" not in html
+    finished = render_work_front(app.state.templates, overview, "finished")
+    assert 'data-front-group="finished" data-front-keep' in finished
+    assert "Nothing finished in the last week" in finished
+    assert "Archived" not in render_work_front(app.state.templates, overview, "board")
+    page = _client(app).get("/").text
+    section = page.split('id="front-finished"', 1)[1].split("</section>", 1)[0]
+    assert 'id="front-older-rows"' in section and 'hx-get="/works/finished"' in section
 
 
 def test_viewing_and_classifying_works_writes_nothing(tmp_path):
@@ -1891,7 +2041,7 @@ def test_viewing_and_classifying_works_writes_nothing(tmp_path):
 
     before = files()
     client = _client(app)
-    for path in ("/works", "/works?view=archived&q=task", work_href(OTHER.work_id)):
+    for path in ("/works", "/works/finished?search=1&q=task", work_href(OTHER.work_id)):
         client.get(path)
     assert files() == before
 
@@ -3962,4 +4112,58 @@ async def test_back_from_a_sub_issues_work_is_its_parents_work(tmp_path):
         )
         await page.go_back()
         await page.wait_for_function("location.pathname === '/'")
+        await browser.close()
+
+
+@pytest.mark.browser
+@pytest.mark.asyncio
+async def test_show_older_rows_survive_a_push_and_follow_the_project_tab(tmp_path):
+    """#4289: the rows Show older brought stay through a live push, the next press goes on
+    after them, and picking a project tab starts the list again on that project."""
+    from conftest import async_playwright
+    from test_web import _live_server
+
+    app = _app(tmp_path)
+    # Something current, so the push below has a reason to redraw the front page.
+    _add(app, "claude_code:test:now", WorkRef("eerovil/agentdeck", 900), thinking=True)
+    _add(app, "claude_code:test:trail", WorkRef("eerovil/trailhead", 950), thinking=True)
+    deck = [WorkRef("eerovil/agentdeck", n) for n in range(1, 13)]
+    trail = [WorkRef("eerovil/trailhead", n) for n in range(51, 53)]
+    for work in (*deck, *trail):
+        _old(app, f"claude_code:test:o{work.number}", work)
+    _closed(app, {work.number: NOW - timedelta(days=8, hours=work.number)
+                  for work in (*deck, *trail)})
+    await app.state.work_overview.refresh()
+    older = "#front-older-rows [data-work-id]"
+    async with _live_server(app) as base, async_playwright() as playwright:
+        browser = await playwright.chromium.launch()
+        page = await browser.new_page(viewport={"width": 390, "height": 844},
+                                      service_workers="block", has_touch=True)
+        await page.add_init_script(
+            "document.addEventListener('htmx:sseOpen', () => { window.__sseOpen = true; }, true)"
+        )
+        await page.goto(base + "/")
+        await page.wait_for_function("() => window.__sseOpen === true")
+        more = page.locator("#front-older-more")
+        await more.click()
+        await page.wait_for_function(f"() => document.querySelectorAll('{older}').length === 10")
+        await page.evaluate(f"() => document.querySelector('{older}').__kept = 1")
+
+        # A push redraws Recently finished; the older rows are not part of it.
+        _add(app, "claude_code:test:new", WorkRef("eerovil/agentdeck", 901), thinking=True)
+        await app.state.work_overview.refresh()
+        await page.locator('#works [data-work-id$="#901"]').wait_for(state="attached")
+        assert await page.evaluate(f"() => document.querySelector('{older}').__kept") == 1
+
+        await more.click()
+        await page.wait_for_function(f"() => document.querySelectorAll('{older}').length === 14")
+        await more.wait_for(state="hidden")
+
+        # One project: the list empties, and the next press asks for that project only.
+        await page.locator('[data-project-tab="trailhead"]').click()
+        await page.wait_for_function(f"() => document.querySelectorAll('{older}').length === 0")
+        await more.click()
+        await page.wait_for_function(f"() => document.querySelectorAll('{older}').length === 2")
+        ids = await page.locator(older).evaluate_all("els => els.map(e => e.dataset.workId)")
+        assert ids == [work.work_id for work in trail]
         await browser.close()

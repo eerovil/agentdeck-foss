@@ -41,6 +41,7 @@ from .providers.base import unknown_account_detail
 from .providers.claude_code.worker import ClaudeWorkerHost
 from .providers.codex.appserver import CodexAppServer
 from .providers.codex.runtime_client import runtime_socket_path
+from .providers.codex.web_only import WEB_ONLY_FORK_REFUSAL, WEB_ONLY_SWITCH_REFUSAL
 from .providers.codex.worker import CodexWorkerHost
 from .providers.delivery import (
     DeliverResult,
@@ -195,6 +196,9 @@ class VerificationRerunRequest(BaseModel):
     work_id: str
     repository: str
     head: str
+    #: Run this instead of the last verification's command: only ``["bin/test.sh"]``, the
+    #: green run a light pull request merges on (#4399).
+    command: list[str] | None = None
 
 
 class JobSubmitRequest(BaseModel):
@@ -657,6 +661,9 @@ class CodexRuntime:
                             f"{account.key}:{thread_id}"
                         )
                     ),
+                    web_only=lambda thread_id, account=account: (
+                        self._budget_db.web_only(f"{account.key}:{thread_id}")
+                    ),
                     artifact_root=self._artifact_root,
                 )
                 await client.start()
@@ -738,6 +745,8 @@ class CodexRuntime:
         session_key = f"{account.key}:{thread_id}"
         client = self.client(label)
         async with self._permission_locks[session_key]:
+            if (refused := self.web_only_refusal(session_key)) is not None:
+                return refused
             if self._budget_db.bypass_permissions_on(session_key):
                 # Bypass holds the approval policy at "never"; this switch would move it.
                 return InjectResult(False, "switch off Bypass permissions first")
@@ -773,6 +782,8 @@ class CodexRuntime:
         session_key = f"{self.accounts[label].key}:{thread_id}"
         client = self.client(label)
         async with self._permission_locks[session_key]:
+            if (refused := self.web_only_refusal(session_key)) is not None:
+                return refused
             was_enabled = self._budget_db.bypass_permissions_on(session_key)
             if enabled == was_enabled:
                 return InjectResult(True)
@@ -805,15 +816,30 @@ class CodexRuntime:
         *,
         role: SessionRole | None,
         bypass: bool,
+        web_only: bool = False,
     ) -> InjectResult:
         """What a new thread needs in place before its first message is sent (#4092)."""
-        if role and not self._budget_db.set_session_role(
-            f"{self.accounts[label].key}:{thread_id}", role
-        ):
+        session_key = f"{self.accounts[label].key}:{thread_id}"
+        if web_only:
+            # Written before its one turn, so every later path finds the lock (#4381).
+            if not self._budget_db.set_web_only(session_key):
+                return InjectResult(False, "could not save that the chat is web-only")
+            if bypass:
+                return InjectResult(False, WEB_ONLY_SWITCH_REFUSAL)
+        if role and not self._budget_db.set_session_role(session_key, role):
             return InjectResult(False, "could not save the chat's role")
         if bypass:
             return await self.set_bypass_permissions(label, thread_id, True)
         return InjectResult(True)
+
+    def web_only_refusal(self, session_key: str) -> InjectResult | None:
+        """A refusal when this chat is locked to web search; a failed read refuses (#4381)."""
+        try:
+            locked = self._budget_db.web_only(session_key)
+        except Exception:
+            log.warning("could not read whether %s is web-only", session_key, exc_info=True)
+            locked = True
+        return InjectResult(False, WEB_ONLY_SWITCH_REFUSAL) if locked else None
 
     def starts_bypassed(self, label: str, body: StartRequest) -> bool:
         """Whether a new chat starts with the switch on, as Claude's do (#2319).
@@ -2005,6 +2031,13 @@ def create_runtime_app(config: AppConfig) -> FastAPI:
         )
         return NotifyOutcome(outcome.accepted, outcome.reason or "")
 
+    def _keep_job_note(job: Job, note_id: str, text: str) -> bool:
+        # A pending note for the job's chat (#4306), in the control database the web's send
+        # paths read: under its chat's id, or its session key while no chat row names it.
+        chat = budget_db.chat_for_session(job.session_key or "")
+        chat_id = chat.chat_id if chat is not None else (job.session_key or "")
+        return bool(chat_id) and budget_db.add_pending_event(note_id, chat_id, text)
+
     def _ownership_label(repository: str) -> str:
         """The label that hands an issue in ``repository`` to a worker, from the manifests."""
         from .poller_ops import issue_label_targets
@@ -2034,6 +2067,8 @@ def create_runtime_app(config: AppConfig) -> FastAPI:
         # Local jobs run at low priority with a memory cap (#3614).
         configure_slice=configure_jobs_slice,
         memory_gate=memory_gate,
+        # A green verification that proves its commit is a pending note (#4306).
+        keep_note=_keep_job_note,
     )
 
     # Not gated on config.jobs.enabled: the slot pool is the host's, and a
@@ -2192,7 +2227,11 @@ def create_runtime_app(config: AppConfig) -> FastAPI:
         ``{"job": null}`` when there is nothing it can run again, so the caller tells the
         Work's chat to run it instead.
         """
-        job = await _require_jobs().rerun_verification(body.work_id, body.repository, body.head)
+        if body.command is not None and body.command != ["bin/test.sh"]:
+            raise HTTPException(status_code=400, detail="only bin/test.sh is run again")
+        job = await _require_jobs().rerun_verification(
+            body.work_id, body.repository, body.head, command=body.command
+        )
         return {"job": job.to_dict() if job is not None else None}
 
     @app.get("/jobs")
@@ -2722,6 +2761,22 @@ def create_runtime_app(config: AppConfig) -> FastAPI:
         )
         return {"state": state}
 
+    # Voice-mode wakes in flight (#4360). Each runs as its own task, so a web request
+    # that times out or drops cannot cancel a launch half way.
+    wakes: set[asyncio.Task] = set()
+
+    def _wake_done(task: asyncio.Task) -> None:
+        wakes.discard(task)
+        if not task.cancelled() and task.exception() is not None:
+            log.warning("voice-mode wake failed", exc_info=task.exception())
+
+    @app.post("/claude/accounts/{label}/wake")
+    async def claude_wake_worker(label: str, body: WorkerKeyRequest) -> dict[str, Any]:
+        task = asyncio.create_task(claude_workers.host(label).wake(body.key))
+        wakes.add(task)
+        task.add_done_callback(_wake_done)
+        return {"state": await asyncio.shield(task)}
+
     @app.delete("/claude/accounts/{label}/spare")
     async def claude_drop_spare(label: str, shape: str) -> dict[str, Any]:
         return {"state": await claude_workers.host(label).drop_spare(shape)}
@@ -2852,6 +2907,40 @@ def create_runtime_app(config: AppConfig) -> FastAPI:
                         thread_id,
                         role=body.role,
                         bypass=runtime.starts_bypassed(label, body),
+                    ),
+                ),
+            )
+        )
+
+    @app.post("/accounts/{label}/start-web-only")
+    async def start_web_only(label: str, body: StartRequest) -> dict[str, Any]:
+        """Start a chat locked to web search (#4381).
+
+        Its own route, so a web process newer than this runtime gets a 404 from an old
+        one instead of an unlocked chat. The sandbox and approval are the lock's.
+        """
+        client = runtime.client(label)
+        if body.fork_thread_id:
+            return _result(InjectResult(False, WEB_ONLY_FORK_REFUSAL))
+        if body.images:
+            # An attached image is a host file handed to the model.
+            return _result(InjectResult(False, "a web-only research chat takes no images"))
+        return _result(
+            await _timed_action(
+                "new_session",
+                label,
+                body.client_action_id,
+                lambda: client.start_thread(
+                    Path(body.cwd),
+                    body.message,
+                    model=body.model,
+                    effort=body.effort,
+                    delegated=body.delegated,
+                    role=body.role,
+                    session_token=body.session_token,
+                    web_only=True,
+                    before_first_turn=lambda thread_id: runtime.prepare_new_thread(
+                        label, thread_id, role=body.role, bypass=False, web_only=True
                     ),
                 ),
             )

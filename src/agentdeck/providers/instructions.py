@@ -8,13 +8,29 @@ from typing import Literal, get_args
 from ..mac_runner import session_instructions as mac_runner_instructions
 from ..public_origin import public_origin
 
-SessionRole = Literal["primary", "delegated", "work"]
+# ``locked``: a chat limited to web search, public pages and its folder's own MCP
+# servers, started without this guide (``providers/claude_code/locked.py``). Claude only.
+SessionRole = Literal["primary", "delegated", "work", "locked"]
 SESSION_ROLES: frozenset[str] = frozenset(get_args(SessionRole))
+# The roles that get AgentDeck's session guide: every one but ``locked``, whose whole
+# prompt is ``LOCKED_SYSTEM_PROMPT`` so it learns nothing about the deck.
+GUIDED_ROLES: tuple[str, ...] = tuple(role for role in get_args(SessionRole) if role != "locked")
 # The provider a guide is assembled for (#1548). The conventions block is built
 # per provider so a provider-specific paragraph reaches only the sessions it is
 # true for — the Codex sandbox envelope used to be sent to every Claude
 # session too.
 ProviderId = Literal["claude_code", "codex"]
+
+# The whole system prompt of a ``locked`` chat, in place of AgentDeck's session guide.
+LOCKED_SYSTEM_PROMPT = """
+You answer people through a limited chat. You can search the web, read public web
+pages, and use the tools of the folder you run in; nothing else. You cannot read or
+change files, run commands, or reach anything on the local network.
+
+How to answer is in the CLAUDE.md of your folder: follow it. Never say you did
+something a tool did not confirm. If someone asks for something your tools cannot do,
+say so briefly.
+""".strip()
 
 
 WORKFLOW_COMPLETION_INSTRUCTIONS = """
@@ -196,6 +212,30 @@ SUBAGENT_COST_BULLET = """
 """.strip()
 
 
+# Web research (#4290). Claude's web search refuses reddit.com and its fetch cannot open it;
+# Codex's live web search reads Reddit, so Claude hands such research to Codex. A Codex chat
+# has that search itself and gets only the reader. A delegated chat must not delegate; the
+# bullet says so itself, as the conventions are assembled per provider, not per role.
+WEB_RESEARCH_CLAUDE_BULLET = """
+- When your own web search or fetch cannot reach what you need (Reddit refuses
+  them outright; other forums often block them) and you are not yourself a
+  delegated chat, run `~/agentdeck/.venv/bin/agentdeck research` with the
+  question on stdin. A Codex chat with live web search answers it with links and
+  verbatim quotes; it spends Codex quota (roughly 50k tokens), so use it for
+  research, not a lookup your own search answers.
+""".strip()
+
+WEB_READ_BULLET = """
+- To read a page your own fetch is refused, run
+  `~/agentdeck/.venv/bin/agentdeck read <url>`: Reddit through an open archive
+  of it, anything else with one plain request.
+  A first line saying `partial` means part of the discussion was not read, so
+  text missing from it may still be on the page. Exit 2 means the site refused
+  this host and 3 that it rate-limited it; do not retry a 3 at once, which only
+  lengthens the block.
+""".strip()
+
+
 # Conventions bullets that are true for a subset of providers, each declaring
 # its audience (#1548). Assembly filters on the provider id, so the next
 # provider-specific paragraph is added here with its audience rather than being
@@ -212,6 +252,8 @@ SUBAGENT_COST_BULLET = """
 _PROVIDER_CONVENTIONS_BULLETS: tuple[tuple[frozenset[str], str], ...] = (
     (frozenset({"codex"}), SANDBOX_ENVELOPE_BULLET),
     (frozenset({"claude_code"}), SUBAGENT_COST_BULLET),
+    (frozenset({"claude_code"}), WEB_RESEARCH_CLAUDE_BULLET),
+    (frozenset({"claude_code", "codex"}), WEB_READ_BULLET),
 )
 
 
@@ -559,6 +601,17 @@ terminal report to file.
   checks or next step, add the `parked` label to its issue (`gh label create
   parked` first if the repository has none). The Work then rests as Parked
   until their next message. Take the label off once they ask for work again.
+- Before coding a big or risky change (several processes, robots, requests or
+  timers sharing a row, lock or file; a crash, timeout or retry path; many parts),
+  mark it: post a comment on the issue opening with `**Design:**` that says what
+  runs at the same time, which row, lock or file decides, and what a crash, a
+  timeout or a retry does; for a large change, its parts and what each owns.
+  Then call `POST $AGENTDECK_URL/api/sessions/<session-key>/design-review` and end
+  the turn: a deck reviewer reads the design (when every place is taken, the
+  deck keeps the request and starts it by itself), and its verdict comes here and on
+  the issue. On a gap, fix the design (not code), post it again as a new
+  `**Design:**` comment and call it again. Write no code until one passes; the
+  deck refuses `pre-review-done` until then.
 - Open each pull request as a draft (`gh pr create --draft`) and register it for
   this chat at once. Mark it ready (`gh pr ready`) when it is done: the deck
   then sends you a short pre-review checklist, and the review of its head starts
@@ -605,7 +658,10 @@ terminal report to file.
   message says which this project is. A merge the deck could not make comes
   back to this chat as a message.
 - When the deck tells you your pull request merged, check the change live and
-  record it as that message says; the Work's Finish waits on that result.
+  record it as that message says; the Work's Finish waits on that result. Make
+  the change run rather than wait for it: redeploy a merge that only a later
+  deploy would apply, and offer to run a changed scheduled job now instead of
+  waiting for its schedule, each through the route that message gives.
 - A merge does not finish the Work, so write `Refs #<issue>`, not `Closes`, in
   a pull request body, unless the issue itself asks for `Closes`. Once you
   record the live check as `verified`, close the issue yourself; the merge
@@ -623,7 +679,23 @@ description; use one only when the issue or a person names it.
 # a chat marking a pull request ready needs them, and the guide goes out with every call.
 PRE_REVIEW_HOW = (
     """
-How to do points 1, 2 and the test run:
+How to do the helper checks, points 1, 2 and the test run:
+
+- Helper checks, before a pull request's first review (#4437): the command
+  starts three Haiku helpers at once each on its own copy of the pull request's
+  pushed head, each with one list (every path and input; the rest of the repository;
+  libraries and other services), plus the issue and its use cases. It takes
+  up to about 9 minutes, so give the call room: in Claude, a Bash call with
+  `timeout: 600000`; in Codex, run it escalated (`sandbox_permissions:
+  "require_escalated"`, as the sandbox makes the git directory read-only and
+  may cut the network) and keep reading its running session until it exits,
+  never starting it again. It prints each helper's findings and the comment
+  to post. Judge each find against the code: fix the real ones (with a test),
+  drop the rest with a one-line reason. Do not drop a find only because you
+  could not confirm it quickly: that threw out real bugs (#4433). When it
+  prints `did not run (<why>)`, post that line as it is; it never holds the
+  review back. The comment's `Helper checks:` line names the pull request, as
+  the command prints it: each pull request of a Work needs its own.
 
 - Diagram, only when this Work adds a new feature, or when the owner asked
   for one (#4254): write
@@ -665,8 +737,14 @@ How to do points 1, 2 and the test run:
   another program uses (a page, control, command, API route, notification):
   walk through it as that person, starting from what they want done, following
   each step through the code you wrote, and going past the confirmation to
-  their goal. Fix a gap or name it. Post the numbered steps on the issue (in the
-  screenshots comment when there is one), opening with the line
+  their goal. Fix a gap or name it. Under each step, list its variants: the
+  states and inputs that reach it (a setting off or on, empty, one-word or
+  quoted input, the first time or a repeat, an idle or off state, an older or
+  newer record, a second item or repository), each with the test that covers
+  it, or `no test: <why>` when only a browser, a device or a live service could
+  check it. Write the missing tests before you post the steps. Post the numbered
+  steps on the issue (in the screenshots comment when there is one), opening
+  with the line
   <walkthrough-line>. For a refactor, docs or tests only, write
   <walkthrough-not-applicable> instead.
 - Test run: prove the head with `~/agentdeck/.venv/bin/agentdeck job submit
@@ -726,6 +804,11 @@ def agentdeck_session_instructions(
     because the address can be observed after this module loads; pass a string
     to state it, or an empty string for the no-known-address wording.
     """
+    if role == "locked":
+        if provider != "claude_code":
+            # Only the Claude worker knows how to start a chat with these limits.
+            raise ValueError("a locked chat runs only on Claude")
+        return LOCKED_SYSTEM_PROMPT
     role_instructions = {
         "primary": _primary_role_instructions(provider),
         "delegated": DELEGATED_SESSION_ROLE_INSTRUCTIONS,

@@ -29,6 +29,7 @@ from agentdeck.models import (
 from agentdeck.providers import account_health
 from agentdeck.providers.claude_code.held import HolderInfo, kill_holder
 from agentdeck.providers.claude_code.worker import (
+    CLOUDFLARE_BLOCK_RETRY_DELAY_S,
     IDLE_RECLAIM_GRACE_S,
     LOGIN_REFRESH_RETRY_DELAY_S,
     NETWORK_RETRY_DELAY_S,
@@ -2890,8 +2891,24 @@ async def test_a_lost_connection_or_sign_in_schedules_a_continuation_but_trips_n
     await _settle()
     row = host.snapshot()["workers"]["issue-1"]
     assert row["last_result_limit_reset_at"] == row["last_result_at"] + LOGIN_REFRESH_RETRY_DELAY_S
+    # Cloudflare's block page answering in the API's place during an outage (#4324), with the
+    # exact line and shape the CLI wrote to a production transcript.
+    emit({
+        "type": "result",
+        "subtype": "success",
+        "is_error": True,
+        "result": "Failed to authenticate. API Error: 403 Attention Required! | Cloudflare",
+    })
+    await _settle()
+    row = host.snapshot()["workers"]["issue-1"]
+    assert account_health.open_circuit(cache, "claude_code:test") is None
+    due = row["last_result_at"] + CLOUDFLARE_BLOCK_RETRY_DELAY_S
+    assert row["last_result_limit_reset_at"] == due
     for answer in (
         "API Error: 529 Overloaded",
+        "Failed to authenticate. API Error: 401 {\"type\":\"error\",\"error\":"
+        "{\"type\":\"authentication_error\",\"message\":\"invalid x-api-key\"}}",
+        "The proxy answered API Error: 403 Attention Required! | Cloudflare",
         "I saw `API Error: Connection refused (ECONNREFUSED)` in the log and fixed the proxy.",
         "I fixed it. Failed to refresh OAuth token: was the old log line.",
         "Failed to refresh OAuth token: invalid_grant. Please run /login",

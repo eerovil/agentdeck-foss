@@ -16,6 +16,7 @@ from agentdeck.review_history import (
     CHECKLIST_DONE,
     ESCALATED,
     FINDINGS,
+    NO_CODE,
     PASS,
     UNSTARTED,
     VERDICTS,
@@ -24,11 +25,16 @@ from agentdeck.review_history import (
     answered,
     at_head,
     checklist_waits,
+    clip_findings,
     head_review,
     last_digest,
     newest_verdict,
     passed,
+    replaced_round,
+    round_stamp,
     same_change,
+    settled_round,
+    strip_round_stamps,
 )
 from agentdeck.work_release import note_escalation
 
@@ -149,6 +155,25 @@ def test_the_router_reads_its_checklist_digest_carry_and_answer_from_the_history
     copied = [*round_, at(new, ESCALATED, 5), at(old, FINDINGS, 6)]
     assert head_review(at_head(copied, new)).passed and passed(newest_verdict(at_head(copied, new)))
     assert newest_verdict(copied).kind == FINDINGS, "another head's findings still count"
+    # So does the reviewer's own changes or no-code line on that round (#4386).
+    for kind in (CHANGES, NO_CODE):
+        late = at_head([*round_, at(new, kind, 5)], new)
+        assert head_review(late).passed and settled_round(late, new) == ACCEPTED
+        assert settled_round([*late, at(new, ASKED, 6)], new) == ""
+    # A verdict answers the newest round at the head it names, wherever the branch is now
+    # (#4386 review): accepted there it is settled, even once carried on; a review asked at
+    # the carried head after the named head's own newest ask settles it too; a new ask at
+    # the named head opens a round it answers.
+    third = "4" * 40
+    carried = [*round_, at(third, PASS, 5, carried_from=new)]
+    assert settled_round(carried, new, third) == ACCEPTED
+    assert settled_round([*carried, at(third, ASKED, 6)], new, third) == ACCEPTED
+    assert settled_round([*carried, at(new, ASKED, 6)], new, third) == ""
+    findings = [at(new, ASKED, 1), at(new, FINDINGS, 2), at(third, CHANGES, 3, carried_from=new)]
+    assert settled_round(findings, new, third) == "" and settled_round(findings, new, new) == ""
+    asked = [*findings, at(third, ASKED, 4)]
+    assert settled_round(asked, new, third) == ASKED and settled_round(asked, new) == ""
+    assert settled_round([*asked, at(new, ASKED, 5)], new, third[:7]) == ""
     again = [*copied, at(new, ASKED, 7), at(new, ESCALATED, 8)]
     assert head_review(at_head(again, new)).verdict == ESCALATED
     # Accepted while a newer review was out: what that review finds still stands.
@@ -156,6 +181,53 @@ def test_the_router_reads_its_checklist_digest_carry_and_answer_from_the_history
     assert head_review(newer).passed
     assert head_review([*newer, at(new, FINDINGS, 5)]).verdict == CHANGES
     assert head_review([*newer, at(new, ESCALATED, 5)]).verdict == ESCALATED
+
+
+def test_a_round_stamp_names_the_review_chat_a_newer_review_replaced():
+    """#4386: a review answer names a commit, not the review that wrote it, so the deck's own
+    round id in each chat's body is the reviewer's stamp. A ``chat`` row of another chat,
+    newer than the stamped chat's, at any head of the pull request, means it was replaced."""
+    rx, ry = "r-" + "1" * 12, "r-" + "2" * 12
+    stamp = f"/reviewed no-code {HEAD[:12]}\n<!-- review-round: {rx.upper()} -->"
+    assert round_stamp(stamp) == rx and round_stamp("no stamp") == "" and round_stamp(None) == ""
+    # The last one counts, as typed or escaped as a quote shows it.
+    assert round_stamp(f"&lt;!-- review-round: {rx} -->\n<!--review-round:{ry}-->") == ry
+    assert "review-round" not in strip_round_stamps(stamp) + clip_findings(stamp)
+    assert "review-round" not in strip_round_stamps(f"&lt;!-- review-round: {rx} -->")
+    other = "b" * 40
+
+    def chat(head, name, round_id, seq, at=None):
+        data = {"chat": f"{CHATS}#{name}", **({"round": round_id} if round_id else {})}
+        key = f"chat:{CHATS}#{name}:{PR}@{head}"
+        return ReviewEvent(PR, head, float(at if at is not None else seq), CHAT, key, data, seq)
+
+    asked = ReviewEvent(PR, HEAD, 1.0, ASKED, f"asked:{PR}@{HEAD}", {}, 0)
+    x = chat(HEAD, 3, rx, 1)
+    # The newest chat, or one that covered a second pull request in the same breath, is not.
+    assert replaced_round([asked, x], rx) == ""
+    assert replaced_round([asked, x, chat(other, 3, rx, 2)], rx) == ""
+    # A newer chat at the same head, or at a head the branch moved to, replaced it.
+    assert replaced_round([asked, x, chat(HEAD, 4, ry, 2)], rx.upper()) == f"{CHATS}#3"
+    assert replaced_round([asked, x, chat(other, 4, "", 2)], rx) == f"{CHATS}#3"
+    # The same time breaks by the row's order; the newer chat's own stamp is not replaced.
+    assert replaced_round([x, chat(other, 4, ry, 2, at=1)], rx) == f"{CHATS}#3"
+    assert replaced_round([x, chat(other, 4, ry, 2)], ry) == ""
+    # A stamp no row holds, or none, says nothing: today's rules decide.
+    assert replaced_round([x, chat(HEAD, 4, ry, 2)], "r-" + "9" * 12) == ""
+    assert replaced_round([x, chat(HEAD, 4, ry, 2)], "") == ""
+    # Every opening path writes its ``chat`` rows through one call, which keeps the round.
+    from types import SimpleNamespace
+
+    from agentdeck.state import AppState
+
+    written = []
+    owner = SimpleNamespace(db=object(), record_review_event=lambda *a, **k: written.append(k))
+    AppState.record_chat_review_head(owner, CHATS, 3, "eerovil/agentdeck", 9, HEAD, rx.upper())
+    AppState.record_chat_review_head(owner, CHATS, 4, "eerovil/agentdeck", 9, HEAD)
+    assert [k["data"] for k in written] == [
+        {"chat": f"{CHATS}#3", "round": rx},
+        {"chat": f"{CHATS}#4"},
+    ]
 
 
 def test_the_table_keeps_each_event_once_and_forgets_a_closed_pull_request(tmp_path):

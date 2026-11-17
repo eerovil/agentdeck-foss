@@ -12,7 +12,7 @@ import os
 import re
 import tomllib
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -764,6 +764,9 @@ class SpeechConfig(BaseModel):
     ``idle_listen_seconds`` is how long voice mode listens with no words heard
     before it waits for "Hey Jarvis" (#3424, #3425, #3476).
 
+    ``working_tick_seconds`` is how often voice mode plays its soft tick while the
+    agent works and nothing is said (#4364); ``0`` turns the tick off.
+
     ``wake_socket`` is the wake word detector's socket (``agentdeck-wake.socket``,
     #3476): openWakeWord's "hey jarvis" on the CPU. ``wake`` says who decides a
     waiting phrase woke voice mode: ``"detector"`` asks it first and runs Whisper
@@ -771,7 +774,14 @@ class SpeechConfig(BaseModel):
     compared, lets Whisper decide as before and logs the detector's answer beside
     it in ``wake_log_dir`` (``scripts/wake_report.py`` reads it); ``"whisper"`` never
     asks the detector. With no ``wake_socket`` it is always ``"whisper"``.
-    ``wake_threshold`` is the detector score that wakes.
+    ``wake_threshold`` is the detector score that wakes; ``wake_thresholds`` sets
+    another for one wake word, such as ``{alexa = 0.9}`` where "Alexa" woke on speech
+    that scored about 0.7 (#4343). ``wake_confirm`` names the wake words a detector
+    wake counts for only once speech recognition hears the word in the clip too
+    (#4372): "Alexa" woke on kitchen noise at 0.94, where Whisper heard no words, and
+    every real wake came back as "Alexa." in about 0.55 s. "Hey Jarvis" is left out:
+    Whisper writes it "Hey Charvis" or "Hey Tarvis" in about a third of real wakes
+    (#4368), so the check would turn those away.
 
     ``voice_en`` and ``voice_fi`` are the Piper voices the host reads replies with
     (#3455); ``scripts/speech_setup.sh`` downloads the ones named here, so a new
@@ -805,9 +815,14 @@ class SpeechConfig(BaseModel):
     socket: str = ""
     language: Literal["en", "fi", "auto"] = "auto"
     idle_listen_seconds: int = Field(default=15, ge=3, le=600)
+    working_tick_seconds: int = Field(default=5, ge=0, le=600)
     wake_socket: str = ""
     wake: Literal["shadow", "detector", "whisper"] = "shadow"
     wake_threshold: float = Field(default=0.5, gt=0, lt=1)
+    wake_thresholds: dict[
+        Annotated[str, Field(pattern=r"^[a-z]+$")], Annotated[float, Field(gt=0, lt=1)]
+    ] = Field(default_factory=dict)
+    wake_confirm: list[Literal["jarvis", "alexa"]] = Field(default_factory=lambda: ["alexa"])
     wake_log_dir: str = "~/.local/share/agentdeck/speech/wake"
     voice_en: str = Field(default="en_US-ryan-high", pattern=r"^[A-Za-z0-9_-]+$")
     voice_fi: str = Field(default="fi_FI-harri-medium", pattern=r"^[A-Za-z0-9_-]+$")

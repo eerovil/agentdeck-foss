@@ -271,6 +271,8 @@ async def test_only_the_listed_calls_run_and_a_router_call_reads_the_registratio
     # A pull request registered a moment ago is known to the call it caused (#4016).
     await services.call("router", "note_registered", ["eerovil/agentdeck", 9], {})
     assert seen == ["reloaded", ("registered", "eerovil/agentdeck", 9)]
+    # The web's note of a deployed Work is a listed call too (#4384).
+    assert "note_deployed" in work_services.CALLS["router"]
 
 
 class _NoState:
@@ -376,6 +378,40 @@ async def test_one_commit_status_walks_the_deck_once_however_many_works(web, tmp
     with work_counter.counting() as spent:
         await services.release.look_at_reviewed()
     assert spent[work_counter.PULL_WALK] == 1
+
+
+async def test_the_design_review_takes_the_code_reviewers_places(web, tmp_path, monkeypatch):
+    """#4332 review: the design reviewer is the code reviewer, or, when ChatGPT reviews code,
+    one Claude reviewer on the same ledger and cap, made at the first design review."""
+    made = []
+
+    class Reviewer:
+        def __init__(self, **kwargs):
+            made.append(kwargs)
+            self.kind = kwargs["kind"]
+
+        async def start_design(self, issue, url, *, checkout=""):
+            return (self.kind, issue, checkout)
+
+    monkeypatch.setattr(work_services.agent_review, "AgentReviewer", Reviewer)
+    for kind, makes in (("claude", 1), ("chatgpt", 0)):
+        made.clear()
+        config = work_services_config(tmp_path)
+        monkeypatch.setattr(work_services, "work_reviewer", lambda config, kind=kind: kind)
+        services = work_services.build(
+            config, state=web, db=web.db, issues=_Issues(), hooks=_hooks(tmp_path)
+        )
+        assert len(made) == makes
+        start = services.router._design._start
+        assert await start("o/r#7", "u", checkout="/c") == ("claude", "o/r#7", "/c")
+        await start("o/r#7", "u")
+        assert len(made) == 1 and made[0]["ledger"] == config.review.ledger_path
+        assert made[0]["max_reviewers"] == config.review.max_reviewers
+    monkeypatch.setattr(work_services, "work_reviewer", lambda config: "off")
+    services = work_services.build(
+        config, state=web, db=web.db, issues=_Issues(), hooks=_hooks(tmp_path)
+    )
+    assert (await services.router.design_review("o/r#7"))["status"] == 409
 
 
 # --- the services process reads the web's copy through the internal route (#4013) -------

@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import logging
 import shutil
+from collections.abc import Callable, Collection
 
 from . import gh_cli
 
@@ -134,6 +135,27 @@ async def latest_comment(repository: str, number: int, since: str, login: str) -
         and str(item["user"].get("login") or "").casefold() == wanted
     ]
     return max(found, key=lambda item: str(item.get("created_at") or ""), default=None)
+
+
+async def newest_comment(repository: str, number: int, count: int) -> dict | None:
+    """The issue's ``count``-th comment, its newest when it had ``count`` (#4422): one page of
+    one, so the read names that comment whoever wrote it and whatever came after. ``None`` when
+    there is none or it is unread."""
+    gh = shutil.which("gh")
+    if gh is None or count < 1:
+        return None
+    path = f"repos/{repository}/issues/{number}/comments?per_page=1&page={int(count)}"
+    try:
+        code, out, _err = await gh_cli.run_once(
+            [gh, "api", path], timeout=GH_TIMEOUT_S, repo=repository
+        )
+        comments = json.loads(out) if code == 0 else None
+    except Exception:  # noqa: BLE001 - the stop is still shown, without its reason
+        log.warning("work signal: comments of %s#%s unread", repository, number, exc_info=True)
+        return None
+    if not isinstance(comments, list) or not comments or not isinstance(comments[0], dict):
+        return None
+    return comments[0]
 
 
 async def read_comment(repository: str, comment_id: int) -> dict | None:
@@ -282,17 +304,51 @@ async def read_dependencies(repository: str, number: int, kind: str) -> list[dic
     return [row for row in found if isinstance(row, dict)]
 
 
-async def open_blockers(repository: str, number: int) -> list[str] | None:
+def blocker_done(row: dict, deployed: Collection[str] = ()) -> bool:
+    """Whether one ``blocked_by`` row no longer holds the issue it blocks (#3764, #4384).
+
+    Closed, or its Work is in ``deployed``: the Work ids the deck shows as Waiting for a try,
+    deployed and waiting only for a person, and those with a registered pull request merged
+    into its default branch (``db.load_done_blockers``, #4398). The one rule every
+    blocker check shares: the router's, every start's (``start_unless_blocked``) and the
+    Start button's."""
+    if str(row.get("state") or "").lower() == "closed":
+        return True
+    number = row.get("number")
+    repository = str(row.get("repository") or "")
+    if not deployed or not repository or not isinstance(number, int):
+        return False
+    # ``WorkRef(...).work_id``, spelled out: the tests' conftest loads this module, and
+    # importing ``work.py`` here would put it under every test, so the suite selector would run
+    # them all for any change to it. A test pins the two as equal.
+    return f"github_issue:{repository.lower()}#{number}" in deployed
+
+
+def _deployed_now(deployed: Callable[[], Collection[str]] | None) -> Collection[str]:
+    """``deployed()``, or nothing when it is unset or fails: then every open blocker blocks."""
+    if deployed is None:
+        return ()
+    try:
+        return deployed()
+    except Exception:  # noqa: BLE001 - unread: nothing counts as deployed
+        log.warning("work signal: deployed Works unread", exc_info=True)
+        return ()
+
+
+async def open_blockers(
+    repository: str, number: int, *, deployed: Callable[[], Collection[str]] | None = None
+) -> list[str] | None:
     """The issues still blocking ``repository#number`` (``owner/repo#n``), read live;
     ``None`` if unread. An issue with any waits for them: it starts when the last closes
-    (#4216)."""
+    (#4216), or is deployed and waits only for a person's try (``deployed``, #4384)."""
     rows = await read_dependencies(repository, number, "blocked_by")
     if rows is None:
         return None
+    done = _deployed_now(deployed)
     return [
         f"{row.get('repository')}#{row.get('number')}"
         for row in rows
-        if str(row.get("state") or "").lower() != "closed"
+        if not blocker_done(row, done)
     ]
 
 

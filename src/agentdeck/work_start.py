@@ -809,6 +809,7 @@ async def start_work_agent(
     timing = StartTiming(time.monotonic(), warm=taken is not None)
     # Read while the worktree is claimed: the issue goes in the first message (#4254).
     issue = asyncio.ensure_future(_issue_text(repository, number))
+    merged = asyncio.ensure_future(_merged_blockers_text(app, repository, number))
     main = folder
     if taken is not None:
         folder, where = await adopt_spare_worktree(app, ref, folder, taken[2])
@@ -818,6 +819,8 @@ async def start_work_agent(
     # After the worktree claim, which fetches in the same main checkout.
     _refresh_checkouts_in_background(app, repository, main)
     brief = _brief(app, ref, FIRST_TEXT, labels, where, main)
+    if merged_text := await merged:
+        brief = f"{brief} {merged_text}"
     pasted = await issue
     if pasted and provider.user_message_refusal(pasted) is not None:
         # The CLI would drop the whole first message for a word in the issue ("Stuck?"):
@@ -867,6 +870,55 @@ async def start_work_agent(
     )
     log.info("work start: %s started in %s on %s", work_id, folder, account.key)
     return "started"
+
+
+#: What a Work started while a blocker is still open is told (#4398): the blocker counts as done
+#: because its pull request merged, so the agent fetches and builds on that branch, not on
+#: what a checkout last saw: the shared checkouts' refresh runs in the background. The pull
+#: request's own repository: a blocker's code can live elsewhere.
+MERGED_BLOCKER_TEXT = (
+    "Its blocker {blocker} is still open, but its pull request {pull} merged into `{base}`: "
+    "fetch {repository} (`git fetch origin`) and build on its `origin/{base}`."
+)
+
+
+async def _merged_blockers_text(app: Any, repository: str, number: int) -> str:
+    """One line per merged pull request of each still-open blocker, for the first message;
+    "" when there is none or the blockers could not be read (#4398)."""
+    from .work_signals import read_dependencies
+
+    db = getattr(app.state, "control_db", None)
+    if db is None or not hasattr(db, "load_merged_pulls"):
+        return ""
+    try:
+        rows = await read_dependencies(repository, number, "blocked_by")
+        if not rows:
+            return ""
+        open_ids = {
+            WorkRef(str(row.get("repository") or "").lower(), row["number"]).work_id: (
+                f"{row.get('repository')}#{row['number']}"
+            )
+            for row in rows
+            if str(row.get("state") or "").lower() != "closed"
+            and isinstance(row.get("number"), int)
+            and row.get("repository")
+        }
+        if not open_ids:
+            return ""
+        merged = await asyncio.to_thread(db.load_merged_pulls, open_ids)
+    except Exception:  # noqa: BLE001 - the line is a courtesy; the start goes on
+        log.warning(
+            "work start: merged blockers of %s#%s unread", repository, number, exc_info=True
+        )
+        return ""
+    lines = [
+        MERGED_BLOCKER_TEXT.format(
+            blocker=blocker, pull=pull, base=base, repository=pull.rpartition("#")[0]
+        )
+        for work_id, blocker in open_ids.items()
+        for pull, base in merged.get(work_id, ())
+    ]
+    return " ".join(lines)
 
 
 async def _issue_text(repository: str, number: int) -> str:

@@ -62,8 +62,16 @@ Work's own facts. Nothing here is stored and nothing here asks the agent to call
    **In merge queue — first of 5 · re-testing after master moved, round 2**. First in
    line with nothing running is not a rest: the agent owes that re-test, so the rules below
    apply;
-7. a wake-on or a queued test run is open: **Waiting on …, until 14:20**; a wake-on for
-   the Work's own pull request merging is left out once rule 8 holds, since that merge is
+7. every open pull request is reviewed and tested and only a person's Merge is missing (the
+   deck's release says so): **Ready for merge — reviewed clean 13:26
+   (review-chats#5166)** (#2960, #2992), linking that review chat. No line names a pull
+   request (#3720): the Work page lists them. It comes before any wait (#4294): the merge
+   step never waits on the agent's waits, so a wait must not hide the Merge. The wait it
+   stands over is named after it: **… · also waiting on a deployment, until 14:20**. A
+   question in rules 1 and 3 keeps the headline over it but carries its Merge
+   (``DerivedStatus.ready_pr``), offered beside the Answer;
+8. a wake-on or a queued test run is open: **Waiting on …, until 14:20**; a wake-on for
+   the Work's own pull request merging is left out once rule 7 holds, since that merge is
    what Ready for merge asks a person for (#3003). When the agent's only wait is its own pull
    request merging, the line says what that pull request waits for, from the release's last
    answer (#3097): **Waiting on its pull request — no test run started, until 14:20**,
@@ -71,10 +79,6 @@ Work's own facts. Nothing here is stored and nothing here asks the agent to call
    it**. A hold only a person lifts (the spec-only label) is **Needs you — its pull
    request held: spec-only label** at once; any other that nothing moved for ``PR_STALE`` (no
    push, no review, no turn) is **Needs you — … · nothing since 13:02**, Needs retry;
-8. every open pull request is reviewed and tested and only a person's Merge is missing (the
-   deck's release says so): **Ready for merge — reviewed clean 13:26
-   (review-chats#5166)** (#2960, #2992), linking that review chat. No line names a pull
-   request (#3720): the Work page lists them;
 9. otherwise the agent ended its turn without a next step: no question, no wait, no review,
    no closed issue. Its pull requests all merged with the issue still open is one of these:
    the agent decides whether work is left and closes the issue if not. That is never a
@@ -348,6 +352,9 @@ class DerivedStatus:
     #: the Work has a status and a front-page group of its own. ``kind`` stays the rule that
     #: matched, so the nudge and the bug report read the same Work as before.
     live_checking: bool = False
+    #: A question's Work whose pull request is also Ready for merge (#4294): the question keeps
+    #: the headline, and the Merge it would otherwise hide is offered beside its Answer.
+    ready_pr: int | None = None
 
 
 def is_mac_pause_link(href: str) -> bool:
@@ -446,11 +453,33 @@ def _checking_live(inputs: DerivedInputs) -> bool:
     """Merged, no pull request open and no live check recorded for it yet (#3578).
 
     The deck's ask is the sure sign; a merge with no result is one too while the issue is
-    open. A merge the agent never registered is unknown here, so it does not count.
+    open. A merge the agent never registered is unknown here, so it does not count. A
+    ``not_live`` result on an open issue is a check still under way (#4305): it is deployed
+    and the agent waits for the proof, so it is not a plain wait. A closed one has its own
+    rules in ``_first_rule``.
+    """
+    return bool(_live_over(inputs))
+
+
+def _live_over(inputs: DerivedInputs) -> frozenset[str]:
+    """The statuses a live check still under way speaks over, as **Live checking — …**: the
+    one rule for which outranks which (#3578, #4305).
+
+    None with a pull request open: a fix's pull request leads. While the check is what the
+    agent was asked to do (the deck's ask, or a merge with no result on an open issue), its
+    turn is that check, so a running turn reads Live checking too. After a ``not_live`` result
+    on an open issue the check waits on its proof: a wait, an ending the deck asks about or a
+    nudge reads Live checking, but a new turn is new work, a fix, and reads Working. An ending
+    nothing will wake (``UNFINISHED``) is never Live checking: ``derived_status`` makes it
+    Needs you, told why.
     """
     if inputs.pr_open:
-        return False
-    return inputs.live_pending or (inputs.merged and not inputs.live_result and not inputs.closed)
+        return frozenset()
+    if inputs.live_pending or (inputs.merged and not inputs.live_result and not inputs.closed):
+        return _LIVE_WORKING
+    if not inputs.closed and inputs.live_result == "not_live":
+        return _LIVE_WORKING - {WORKING}
+    return frozenset()
 
 
 def derived_status(
@@ -478,7 +507,7 @@ def derived_status(
         )
     if status.live_checking:
         return status
-    if _checking_live(inputs) and status.kind in _LIVE_WORKING:
+    if status.kind in _live_over(inputs):
         rest = _live_rest(status.line)
         return replace(
             status,
@@ -486,10 +515,16 @@ def derived_status(
             summary=rest,
             live_checking=True,
         )
-    if not (inputs.closed and inputs.live_pending):
-        return status
-    if status.kind == UNFINISHED:
-        summary = "no live check recorded · " + status.summary
+    if status.kind == UNFINISHED and (inputs.live_pending or _checking_live(inputs)):
+        # Its live check is not done, and nothing will wake the agent for it: no wait, and
+        # the deck asked already or does not ask (#4305). A person picks it up, told why: the
+        # deploy it found not live yet, or the check nobody recorded.
+        head = (
+            inputs.live_line
+            if inputs.live_result == "not_live" and inputs.live_line and not inputs.live_pending
+            else "no live check recorded"
+        )
+        summary = f"{head} · {status.summary}"
         return replace(status, line=f"Needs you — {summary}", summary=summary)
     return status
 
@@ -505,10 +540,14 @@ def _first_rule(
     href = inputs.chat_href
     # A closed issue with a pull request still open follows the pull request (#3187).
     closed = inputs.closed and not inputs.pr_open
+    # A question keeps the headline over Ready for merge, but not its Merge (#4294); a question
+    # asked while a turn runs or stalls offers none, as the release holds a running turn.
+    ready_pr = None if inputs.running else inputs.ready_pr
     if inputs.question:
         summary = question_sentence(inputs.question)
         return DerivedStatus(
-            QUESTION, f"Needs you — {summary}", summary=summary, chat_href=href
+            QUESTION, f"Needs you — {summary}", summary=summary, chat_href=href,
+            ready_pr=ready_pr,
         )
     if inputs.running and inputs.stalled:
         since = clock(inputs.last_progress)
@@ -570,12 +609,13 @@ def _first_rule(
         )
         return DerivedStatus(
             QUESTION, f"Needs you — {summary}", summary=summary, chat_href=href,
-            approval_href=inputs.approval_href,
+            approval_href=inputs.approval_href, ready_pr=ready_pr,
         )
     if inputs.waiting_on_you:
         summary = question_sentence(inputs.waiting_on_you)
         return DerivedStatus(
-            QUESTION, f"Needs you — {summary}", summary=summary, chat_href=href
+            QUESTION, f"Needs you — {summary}", summary=summary, chat_href=href,
+            ready_pr=ready_pr,
         )
     asked = asked_in_last_paragraph(inputs.last_text)
     if asked:
@@ -585,10 +625,16 @@ def _first_rule(
         summary = f'answer in the chat: "{asked}"'
         return DerivedStatus(
             ASKED_IN_CHAT, f"Needs you — {summary}", at=inputs.ended_at, summary=summary,
-            chat_href=href,
+            chat_href=href, ready_pr=ready_pr,
         )
-    if closed and inputs.live_result == "failed":
+    if (
+        inputs.live_result == "failed"
+        and not inputs.pr_open
+        and (inputs.closed or not inputs.live_pending)
+    ):
         # The agent reopens the issue and fixes it; still closed, a person decides (#3141).
+        # Open, it is the person's too (#4305): their change does not work live. A fix's pull
+        # request leads once open, and a new merge's live check once the deck asks for it.
         summary = inputs.live_line
         return DerivedStatus(LIVE_FAILED, f"Needs you — {summary}", summary=summary, chat_href=href)
     if closed and (inputs.live_pending or inputs.live_result == "not_live") and inputs.waits:
@@ -706,26 +752,36 @@ def _first_rule(
             QUEUED, f"In merge queue — {summary}", summary=summary, pr=inputs.queue_pr,
             chat_href=href,
         )
+    if inputs.ready_pr is not None:
+        # Ahead of every wait (#4294): only a person's Merge is missing, and the merge step
+        # never waits on the agent's own waits, so a wait must not hide that Merge.
+        parts = []
+        if inputs.ready_reviewed_at is not None or inputs.ready_review_chat:
+            # What made it ready, so a reviewed Ready reads apart from any other (#2992).
+            when = clock(inputs.ready_reviewed_at)
+            reviewed = "reviewed clean" + (f" {when}" if when else "")
+            if inputs.ready_review_chat:
+                reviewed += f" ({inputs.ready_review_chat.rpartition('/')[2]})"
+            parts.append(reviewed)
+        deadline = None
+        if inputs.waits:
+            # The wait it now stands over still says why the agent is not idle (#4294).
+            what, deadline = _soonest(inputs.waits)
+            parts.append(
+                f"also waiting on {what}" + (f", until {clock(deadline)}" if deadline else "")
+            )
+        summary = " · ".join(parts)
+        return DerivedStatus(
+            READY, _headed("Ready for merge", summary), summary=summary, pr=inputs.ready_pr,
+            chat_href=href, review_ref=inputs.ready_review_chat, deadline=deadline,
+        )
     if inputs.waits:
-        timed = [(what, until) for what, until in inputs.waits if until is not None]
-        what, until = min(timed, key=lambda item: item[1]) if timed else inputs.waits[0]
+        what, until = _soonest(inputs.waits)
         # A wait keeps its whole line as its summary ("Waiting on its tests").
         line = f"Waiting on {what}" + (f", until {clock(until)}" if until else "")
         return DerivedStatus(WAITING, line, deadline=until, summary=line)
     if inputs.pr_waits:
         return _pr_wait(inputs, now=now, clock=clock)
-    if inputs.ready_pr is not None:
-        summary = ""
-        if inputs.ready_reviewed_at is not None or inputs.ready_review_chat:
-            # What made it ready, so a reviewed Ready reads apart from any other (#2992).
-            when = clock(inputs.ready_reviewed_at)
-            summary = "reviewed clean" + (f" {when}" if when else "")
-            if inputs.ready_review_chat:
-                summary += f" ({inputs.ready_review_chat.rpartition('/')[2]})"
-        return DerivedStatus(
-            READY, _headed("Ready for merge", summary), summary=summary, pr=inputs.ready_pr,
-            chat_href=href, review_ref=inputs.ready_review_chat,
-        )
     if inputs.spec_posted_at is not None:
         when = clock(inputs.spec_posted_at)
         summary = "approve the spec" + (f" · posted {when}" if when else "")
@@ -739,6 +795,14 @@ def _first_rule(
             SCHEDULED, f"Scheduled — {summary}", summary=summary, chat_href=href
         )
     return _ended(inputs, now=now, clock=clock)
+
+
+def _soonest(
+    waits: tuple[tuple[str, datetime | None], ...],
+) -> tuple[str, datetime | None]:
+    """The wait a line names: the soonest timed one, else the first."""
+    timed = [(what, until) for what, until in waits if until is not None]
+    return min(timed, key=lambda item: item[1]) if timed else waits[0]
 
 
 def _pr_wait(

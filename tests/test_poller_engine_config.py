@@ -947,16 +947,45 @@ def test_checks_required_only_beside_a_verification_job(tmp_path, verification, 
     ("repo", "value", "ok"),
     [("fork", "true", True), ("fork", '"yes"', False), ("issues", "true", False)],
 )
-def test_a_repository_may_merge_on_its_own_only_with_code(tmp_path, repo, value, ok):
+@pytest.mark.parametrize("key", ["auto_release", "check_tests"])
+def test_a_repository_may_merge_on_its_own_only_with_code(tmp_path, repo, value, ok, key):
     """#4172: the deck's release reads ``auto_release`` per repository; the engine keeps no
-    field for it and refuses only what the deck could misread or a repo with no pull requests."""
+    field for it and refuses only what the deck could misread or a repo with no pull requests.
+    The router's ``check_tests`` (#4326) is held to the same."""
     manifest, overlay = _with_fork()
-    manifest = manifest.replace(f'id = "{repo}"\n', f'id = "{repo}"\nauto_release = {value}\n', 1)
-    assert f"auto_release = {value}" in manifest
+    manifest = manifest.replace(f'id = "{repo}"\n', f'id = "{repo}"\n{key} = {value}\n', 1)
+    assert f"{key} = {value}" in manifest
     draft = _inspect(tmp_path, manifest=manifest, overlay=overlay)
     assert draft.ok is ok, draft.report.render()
     if not ok:
-        assert any(p.location.endswith(".auto_release") for p in draft.report.problems)
+        assert any(p.location.endswith(f".{key}") for p in draft.report.problems)
+
+
+@pytest.mark.parametrize(
+    ("repo", "keys", "bad"),
+    [
+        ("fork", 'light_review = "guarded.json"\nlight_review_limit = 15\n', ""),
+        ("fork", 'light_review = "guarded.json"\n', ""),
+        ("fork", 'light_review = ""\n', "light_review"),
+        ("fork", "light_review = true\n", "light_review"),
+        ("issues", 'light_review = "guarded.json"\n', "light_review"),
+        ("fork", 'light_review = "guarded.json"\nlight_review_limit = 0\n', "light_review_limit"),
+        (
+            "fork",
+            'light_review = "guarded.json"\nlight_review_limit = true\n',
+            "light_review_limit",
+        ),
+        ("fork", "light_review_limit = 15\n", "light_review_limit"),
+    ],
+)
+def test_light_review_takes_a_path_on_a_code_repo_and_a_positive_limit(tmp_path, repo, keys, bad):
+    """#4399: the deck alone reads them; the engine refuses only what it could misread."""
+    manifest, overlay = _with_fork()
+    manifest = manifest.replace(f'id = "{repo}"\n', f'id = "{repo}"\n{keys}', 1)
+    draft = _inspect(tmp_path, manifest=manifest, overlay=overlay)
+    assert draft.ok is (not bad), draft.report.render()
+    if bad:
+        assert any(p.location.endswith(f".{bad}") for p in draft.report.problems)
 
 
 def test_a_code_only_repo_is_named_to_the_worker_but_never_worked_in(tmp_path):

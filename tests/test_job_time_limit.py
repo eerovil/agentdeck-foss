@@ -3,15 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import shlex
 import signal
 import sys
 
-from test_jobs import _queue, _settle
+from test_jobs import _queue, _settle, _wait_for
 
 from agentdeck import __main__ as cli
 from agentdeck import job_durations
 from agentdeck.job_durations import DurationLedger, limit_for
-from agentdeck.jobs import DONE, FAILED, Job, quiet_output_hint
+from agentdeck.jobs import DONE, FAILED, RUNNING, Job, quiet_output_hint
 
 
 def _limit(by_lane, lane="desktop", max_minutes=None):
@@ -155,27 +156,53 @@ async def test_a_running_job_s_chat_hears_how_it_goes(tmp_path):
         progress.append((job.id, message, number))
         return True
 
-    queue = _queue(tmp_path)
+    queue = _queue(tmp_path, slots=3)
     queue._notify_progress = notify_progress
     queue._progress_interval_s = 0.04
     await queue.start()
-    script = "echo 'collected 3 items'; sleep 0.2"
-    job = queue.submit(
-        command=["sh", "-c", script],
-        cwd=str(tmp_path),
-        session_key="claude_code:a:b",
-        progress=True,
-    )
-    # Beside it, a job with no chat to tell and one that did not ask each run through
-    # several intervals of their own.
-    quiet = queue.submit(command=["sleep", "0.2"], cwd=str(tmp_path), progress=True)
-    unasked = queue.submit(
-        command=["sleep", "0.2"], cwd=str(tmp_path), session_key="claude_code:a:b"
-    )
-    final = await _settle(queue, job.id)
-    await _settle(queue, quiet.id)
-    await _settle(queue, unasked.id)
-    await queue.stop()
+    # Each job runs until the test lets it go, not for a fixed time: on a loaded host a
+    # fixed sleep could end before the event loop woke for the first interval (#4287).
+    release = tmp_path / "release"
+    hold = f"while [ ! -e {shlex.quote(str(release))} ]; do sleep 0.01; done"
+    # A red test must not leave its jobs running: release and stop them whatever happens.
+    try:
+        job = queue.submit(
+            command=["sh", "-c", f"echo 'collected 3 items'; {hold}"],
+            cwd=str(tmp_path),
+            session_key="claude_code:a:b",
+            progress=True,
+        )
+        # Beside it, a job with no chat to tell and one that did not ask each run through
+        # several intervals of their own.
+        quiet = queue.submit(command=["sh", "-c", hold], cwd=str(tmp_path), progress=True)
+        unasked = queue.submit(
+            command=["sh", "-c", hold], cwd=str(tmp_path), session_key="claude_code:a:b"
+        )
+        jobs = (job, quiet, unasked)
+        await _wait_for(
+            lambda: all(queue.get(each.id).state == RUNNING for each in jobs),
+            what="all three jobs to run",
+        )
+
+        # Only the message's "Last output:" part shows the job's output; its "Command:" line
+        # names the script, echo and all, before the job printed anything.
+        def output(message: str) -> str:
+            return message.partition("\nLast output:\n")[2]
+
+        seen = len(progress)
+        await _wait_for(
+            lambda: (
+                len(progress) >= max(2, seen + 2) and "collected 3 items" in output(progress[-1][1])
+            ),
+            what="two progress messages while all three ran",
+        )
+        release.touch()
+        final = await _settle(queue, job.id)
+        await _settle(queue, quiet.id)
+        await _settle(queue, unasked.id)
+    finally:
+        release.touch()
+        await queue.stop()
 
     assert final.state == DONE
     assert len(progress) >= 2
@@ -185,7 +212,7 @@ async def test_a_running_job_s_chat_hears_how_it_goes(tmp_path):
     assert f"Your queued job {job.id} is still running" in message
     assert "time limit" in message
     assert f"agentdeck job cancel {job.id}" in message
-    assert "collected 3 items" in progress[-1][1]
+    assert "collected 3 items" in output(progress[-1][1])
 
 
 async def test_progress_messages_stop_when_the_job_ends(tmp_path):

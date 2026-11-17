@@ -898,10 +898,54 @@ async def test_a_side_chat_that_cannot_start_says_why_and_starts_nothing(tmp_pat
     refused = await _side(app, "side-ask-0010")
     assert refused.status_code == 409 and "Claude workers are not running" in refused.text
 
-    _side_chattable(monkeypatch, seq=None)
-    unfinished = await _side(app, "side-ask-0011")
-    assert unfinished.status_code == 409 and "no finished reply yet" in unfinished.text
     assert (await _side(app, "short")).status_code == 422
     assert starts == []
     # Nothing was reserved, so the same press may go again.
-    assert app.state.control_db.work_action("side-ask-0011") is None
+    assert app.state.control_db.work_action("side-ask-0010") is None
+
+
+@pytest.mark.asyncio
+async def test_a_side_chat_with_no_reply_to_copy_starts_empty_and_reads_the_agent(
+    tmp_path, monkeypatch
+):
+    """At a Work's start its chat has no reply to copy yet: the side chat starts empty in the
+    same folder, told to read the agent's chat first, and is carried on like a copy (#4314)."""
+    from agentdeck.providers import PROVIDERS
+
+    checkout = _repo(tmp_path / "checkout")
+    starts: list = []
+    app = _app(tmp_path, monkeypatch, cwd=checkout, starts=starts)
+    forks: list = []
+
+    async def start_session(account, cwd, message, *, timeout_s, session_token=None, **kw):
+        starts.append((str(cwd), message, session_token, kw.get("model")))
+        forks.append(kw.get("fork_from"))
+        return InjectResult(True, session_id=f"side{len(starts)}")
+
+    monkeypatch.setattr(PROVIDERS["claude_code"], "start_session", start_session)
+    _side_chattable(monkeypatch, seq=None)
+    state = app.state.app_state
+    worker = f"{ACCOUNT}:worker"
+    page = await asyncio.to_thread(_page, app)
+    button = page.split("data-work-side-chat", 1)[1].split("</button>", 1)[0]
+    assert "aria-disabled" not in button
+
+    assert (await _side(app, "side-ask-0011")).status_code == 202
+    assert (await _side(app, "side-ask-0011")).status_code == 202  # the same press
+    assert forks == [None]
+    cwd, message, token, model = starts[0]
+    assert (cwd, token, model) == (str(checkout), "side-ask-0011", "claude-x")
+    assert "You start with no copy of it" in message
+    assert f"before your first answer, read `$AGENTDECK_URL/sessions/{worker}/transcript.json`" in (
+        message
+    )
+    assert "/api/works/eerovil/agentdeck/2388/message" in message
+    assert "after this copy" not in message
+    side = _scanned(app, "side1", cwd=checkout)
+    state.bind_session_token("side-ask-0011", side)
+    # Nothing was copied, so no source line is recorded for it.
+    assert state.chat_fork_source(side) is None
+    opened = await _side(app, "side-ask-0012")
+    assert opened.headers["HX-Redirect"] == state.chat_path_for_session(side)
+    assert len(starts) == 1
+    await app.state.injector.stop()

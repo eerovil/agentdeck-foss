@@ -14,6 +14,7 @@ that waits, the ask-again caps and the base-merge carry.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 
@@ -42,6 +43,11 @@ UNSTARTED = "unstarted"
 SEEN = "seen"
 HANDLED = "handled"
 RERUN_REFUSED = "rerun-refused"
+#: A review chat at the head was labelled ``blocked`` or ``needs-more-info`` while open: its
+#: reviewer stopped with no verdict (``data``: ``chat``, ``label``, ``said``, the chat's newest
+#: comment), and ``resumed`` when the label came off again. Only the check reads them (#4422).
+STOPPED = "stopped"
+RESUMED = "resumed"
 #: A check run takes 65,535 characters of text; findings are kept up to here.
 FINDINGS_LIMIT = 60_000
 
@@ -168,9 +174,51 @@ def chat_heads(
     return found
 
 
+#: The stamp a review chat's reviewer ends each verdict, findings or escalation comment with
+#: (#4386): the round id the deck wrote into that chat's body (``chat_review.ROUND_NOTE``),
+#: as typed or with its ``<`` escaped, as a quoted copy shows it.
+ROUND_STAMP_RE = re.compile(r"(?:<|&lt;)!--\s*review-round:\s*(r-[0-9a-f]{12})\s*-->", re.I)
+
+
+def round_stamp(text: str | None) -> str:
+    """The round id a comment is stamped with, its last stamp, or "" (#4386)."""
+    found = ROUND_STAMP_RE.findall(text or "")
+    return found[-1].lower() if found else ""
+
+
+def strip_round_stamps(text: str) -> str:
+    """``text`` with every round stamp taken out, so a quote of an older round's comment never
+    shows its id for a newer chat's reviewer to copy (#4386)."""
+    return ROUND_STAMP_RE.sub("", text or "")
+
+
+def replaced_round(events: Iterable[ReviewEvent], stamp: str) -> str:
+    """The review chat (``owner/repo#n``) a comment stamped ``stamp`` came from, when a newer
+    review chat replaced it, else "" (#4386). One review chat is open per Work at a time and a
+    new one replaces the old, so a ``chat`` row naming another chat, newer than the stamped
+    chat's own, at any head of the pull request (a carry may take several steps, and a base
+    merge with nothing to carry links no heads), means the comment answers an old round.
+    A stamp no ``chat`` row holds says nothing: the caller keeps its rules by head and time."""
+    stamp = (stamp or "").lower()
+    if not stamp:
+        return ""
+    chats = [event for event in events if event.kind == CHAT]
+    own = [event for event in chats if str(event.data.get("round") or "").lower() == stamp]
+    if not own:
+        return ""
+    chat = str(own[0].data.get("chat") or "").lower()
+    since = min((event.at, event.seq) for event in own)
+    newer = any(
+        str(event.data.get("chat") or "").lower() != chat and (event.at, event.seq) > since
+        for event in chats
+    )
+    return chat or stamp if newer else ""
+
+
 def clip_findings(text: str) -> str:
-    """Findings as kept on their event, for the GitHub check (#4152), saying when cut."""
-    text = (text or "").strip()
+    """Findings as kept on their event, for the GitHub check (#4152), saying when cut. A round
+    stamp is taken out (#4386): a later chat quotes this text as an earlier round's."""
+    text = strip_round_stamps(text or "").strip()
     if len(text) <= FINDINGS_LIMIT:
         return text
     return text[:FINDINGS_LIMIT].rstrip() + "\n\n(Cut here: the findings are longer than this.)"
@@ -191,11 +239,18 @@ def full_head(events: Iterable[ReviewEvent], sha: str) -> str:
     return found.pop() if len(found) == 1 else ""
 
 
+#: What a review round answers short of a pass. One dated after the owner accepted that round,
+#: with no ask between, is the same round's late word, never a new hold (#4069, #4386).
+ROUND_ANSWERS = frozenset({FINDINGS, ESCALATED, CHANGES, NO_CODE})
+
+
 def _unaccepted(events: Iterable[ReviewEvent]) -> list[ReviewEvent]:
-    """``events`` in time order, less the findings and escalations of a round the owner
-    already accepted: one dated after an ``accepted`` row with no ask between (#4069). The
-    owner may accept on the escalation's own comment, minutes before the chat board writes
-    the same escalation from its chat's closing line, and that copy must not undo the pass.
+    """``events`` in time order, less the findings, escalations and ``changes`` or ``no-code``
+    verdicts of a round the owner already accepted: one dated after an ``accepted`` row with
+    no ask between (#4069). The owner may accept on the escalation's own comment, minutes
+    before the chat board writes the same escalation from its chat's closing line, and that
+    copy must not undo the pass. Nor may the reviewer's own ``/reviewed no-code`` line, which
+    lands seconds after its findings comment the owner accepted (#4386).
     An acceptance made while a newer review is out ends no round: that review's findings
     count."""
     kept: list[ReviewEvent] = []
@@ -208,7 +263,7 @@ def _unaccepted(events: Iterable[ReviewEvent]) -> list[ReviewEvent]:
         elif event.kind == ACCEPTED:
             if event.head not in waiting:
                 accepted.add(event.head)
-        elif event.head in accepted and event.kind in (FINDINGS, ESCALATED):
+        elif event.head in accepted and event.kind in ROUND_ANSWERS:
             continue
         elif event.kind in VERDICTS:
             waiting.discard(event.head)
@@ -236,6 +291,29 @@ def standing_verdict(events: Iterable[ReviewEvent]) -> ReviewEvent | None:
     ):
         return None
     return verdict
+
+
+def settled_round(events: Iterable[ReviewEvent], reviewed: str, live: str = "") -> str:
+    """Why a ``changes`` or ``no-code`` verdict naming ``reviewed`` moves nothing (#4386):
+    ``ACCEPTED`` or ``ASKED``, else "". A verdict answers the newest review asked at the head
+    it names, never a round at another head. That round is settled when the owner accepted it
+    (no review asked at ``reviewed`` since), or when a review was asked at ``live``, the head a
+    base merge or doc-only push carried ``reviewed`` to, after ``reviewed``'s own newest ask:
+    that review's own verdict then decides."""
+    events = list(events)
+    own = at_head(events, reviewed)
+    verdict = standing_verdict(own)
+    if verdict is not None and verdict.kind == ACCEPTED:
+        return ACCEPTED
+    if len(live or "") < 7 or not own or own[0].head.startswith(live.lower()):
+        return ""
+
+    def newest_ask(rows: list[ReviewEvent]) -> tuple[float, int] | None:
+        return max(((e.at, e.seq) for e in rows if e.kind == ASKED), default=None)
+
+    carried = newest_ask(at_head(events, live))
+    mine = newest_ask(own)
+    return ASKED if carried is not None and (mine is None or carried > mine) else ""
 
 
 def answered(events: Iterable[ReviewEvent], head: str) -> bool:

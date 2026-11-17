@@ -3,9 +3,10 @@
 ``/works/{work_id}`` is a Work's page. The id is the canonical ``github_issue:<owner/repo>#<n>``
 (#2140); its ``/`` and ``#`` travel escaped. A plain issue spelling (``owner/repo#n``, an issue
 URL, ``owner/repo/n``) is accepted only as a lookup and redirected to the canonical id, so
-there is exactly one Work URL. ``/works`` lists the Active and Recent Works, and
-``/works?view=archived`` pages through the rest, searchable and filterable by repository
-(#2201). Archiving is presentation only: an Archived Work keeps its page and all its history.
+there is exactly one Work URL. ``/works`` lists the Active and Recent Works. The rest are
+paged and searched under the front page's Recently finished (``/works/finished``, #4289),
+which replaced the Archived Works view (#2201); its old address lands there. Archiving is
+presentation only: an Archived Work keeps its page and all its history.
 """
 
 from __future__ import annotations
@@ -32,7 +33,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Stre
 from markupsafe import Markup
 from pydantic import BaseModel, Field
 
-from .. import wayfinder_map, work_actions, work_counter
+from .. import review_history, wayfinder_map, work_actions, work_counter
 from ..board_watch import BOARD_TOPIC
 from ..models import IssueRef
 from ..state import REVIEWS_TOPIC
@@ -43,7 +44,6 @@ from ..work_claims import assignee_of, own_assignee, run_gh_write, start_issue, 
 from ..work_hidden import UNHIDE
 from ..work_overview import (
     WorkCandidate,
-    archived_count,
     archived_works,
     bucket_works,
     work_chats,
@@ -109,8 +109,9 @@ router = APIRouter(dependencies=[Depends(require_access)])
 SLOW_WORK_PAGE_MS = 1000.0
 logger = logging.getLogger(__name__)
 
-# Archived Works per page. The archive grows for years; a page never does.
-ARCHIVE_PAGE_SIZE = 50
+# Older finished Works per Show older press (#4289): only these rows are built, so a press
+# stays cheap however long the history is.
+OLDER_PAGE_SIZE = 10
 
 
 def _resolve(work_id: str) -> tuple[WorkRef | None, bool]:
@@ -293,7 +294,6 @@ async def works_index_context(
         )
 
     context = {
-        "archived_count": archived_count(buckets, snapshot.state.db),
         "active": [row for row in active if kept(row)],
         "recent": [row for row in recent if kept(row)],
         "repo": chosen,
@@ -347,12 +347,7 @@ def render_works_index(
 
 @router.get("/works", response_class=HTMLResponse)
 async def works_index(
-    request: Request,
-    view: str = "",
-    q: str = "",
-    repo: str = "",
-    page: int = 1,
-    project: str = "",
+    request: Request, view: str = "", repo: str = "", project: str = ""
 ) -> HTMLResponse:
     if view == "paused":
         # Paused Works are a group on the front page now (#2566); an old link lands there.
@@ -366,54 +361,198 @@ async def works_index(
         )
         response.headers["Cache-Control"] = "no-cache"
         return response
-    if view != "archived":
-        # The default list, which its stream keeps current row by row (#3228).
-        context = {
-            "view": view,
-            **await works_index_context(request.app, repo, project=project, fresh=True),
-        }
-        response = get_templates(request).TemplateResponse(request, "works.html", context)
-        response.headers["Cache-Control"] = "no-cache"
-        return response
-    snapshot = gather_pass(request.app)
-    # The front page's own candidates, so a recently finished Work whose chats the live
-    # window let go stays under Recent here too (#3229).
-    candidates = await _work_candidates(request.app, snapshot, await runtime_queue(request.app))
-    buckets = bucket_works(candidates, now=datetime.now(UTC))
-    context: dict = {"view": view}
-    # Only this view reads the whole inventory: it is what the operator asked to see.
-    archived = archived_works(buckets, work_inventory(snapshot.state.db))
-    context["archived_count"] = len(archived)
-    rows = _index_rows(snapshot, archived, records=_cached_issues(request.app, archived))
-    repositories = sorted({row.repository for row in rows}, key=str.casefold)
-    wanted = repo.strip().casefold()
-    matched = [
-        row
-        for row in rows
-        if (not wanted or row.repository.casefold() == wanted)
-        and (not q.strip() or _matches(row, q))
-    ]
-    pages = max(1, -(-len(matched) // ARCHIVE_PAGE_SIZE))
-    page = min(max(1, page), pages)
-    first = (page - 1) * ARCHIVE_PAGE_SIZE
-
-    def link(number: int) -> str:
-        params = {"view": "archived", "q": q.strip(), "repo": repo.strip(), "page": number}
-        return "/works?" + urlencode({k: v for k, v in params.items() if v})
-
-    context.update(
-        rows=matched[first : first + ARCHIVE_PAGE_SIZE],
-        matched=len(matched),
-        first=first,
-        page=page,
-        pages=pages,
-        prev_href=link(page - 1) if page > 1 else "",
-        next_href=link(page + 1) if page < pages else "",
-        q=q.strip(),
-        repo=repo.strip(),
-        repositories=repositories,
-    )
+    if view == "archived":
+        # The Archived Works view became Recently finished's Show older (#4289): an old link
+        # or bookmark lands on that section.
+        return RedirectResponse("/#front-finished", status_code=302)
+    # The default list, which its stream keeps current row by row (#3228).
+    context = {
+        "view": view,
+        **await works_index_context(request.app, repo, project=project, fresh=True),
+    }
     response = get_templates(request).TemplateResponse(request, "works.html", context)
+    response.headers["Cache-Control"] = "no-cache"
+    return response
+
+
+def _older_key(
+    closed: datetime | None, active: datetime | None, work_id: str, *, done: bool = False
+):
+    """A Work's place in the older list, sorted descending: every closed Work first by its
+    close time (one whose close time is not known yet by its last activity), then the rest by
+    their last activity, then by id. The cursor carries all three, so a later page goes on in
+    the same order."""
+    when = closed or active
+    stamp = when.timestamp() if when is not None else float("-inf")
+    return (int(closed is not None or done), stamp, work_id)
+
+
+def _older_cursor(key: tuple[int, float, str]) -> str:
+    stamp = "" if key[1] == float("-inf") else repr(key[1])
+    return f"{key[0]}:{stamp}|{key[2]}"
+
+
+def _parse_older_cursor(text: str) -> tuple[int, float, str] | None:
+    head, sep, work_id = text.partition("|")
+    rank, colon, stamp = head.partition(":")
+    if not sep or not colon or rank not in ("0", "1"):
+        return None
+    try:
+        return (int(rank), float(stamp) if stamp else float("-inf"), work_id)
+    except ValueError:
+        return None
+
+
+@dataclass(frozen=True)
+class OlderPage:
+    rows: tuple  # FrontRow, newest first
+    next_href: str  # the next page's address, "" at the end
+    # The Works whose cached record says the issue is open. A Work with no record is not
+    # known to be open, so it gets no "issue open" note.
+    open_ids: frozenset = frozenset()
+
+
+async def older_finished(
+    app, *, before: str = "", project: str = "", q: str = "", limit: int | None = None
+) -> OlderPage:
+    """One page of the Works under Recently finished's Show older (#4289).
+
+    Every Work the Archived Works view held (nothing current and no activity for a week, the
+    durable inventory's included), plus every finished Work the front page does not draw: the
+    live list keeps only its newest few. Closed Works first, newest close first; then the
+    rest by last activity; a Work with neither time goes last. ``before`` is the cursor the
+    last page handed out, a time and a Work id rather than a position, so a Work finishing between
+    presses neither skips nor repeats a row. ``project`` is the front page's project tab and
+    ``q`` the section's search. Only the page's own rows are built, through the front page's
+    own card and row path, so they look exactly like the live ones.
+    """
+    from ..jobs import WorkRows
+    from ..work_facts import work_finished_at
+    from ..work_story import front_row
+    from .work_view import _card, gather_facts
+
+    limit = OLDER_PAGE_SIZE if limit is None else limit
+    snapshot = gather_pass(app)
+    queue = await runtime_queue(app)
+    candidates = await _work_candidates(app, snapshot, queue)
+    buckets = bucket_works(candidates, now=datetime.now(UTC))
+    # The overview already built, never a build of its own: a press is a read, and the rows
+    # it leaves out are the ones the live list draws.
+    overview = getattr(getattr(app.state, "work_overview", None), "overview", None)
+    front = overview.front if overview is not None else None
+    drawn: set[str] = set()
+    if front is not None:
+        hidden = {row.card.work_id for row in front.hidden}
+        for row in front.rows:
+            for one in (row, *row.children):
+                if one.card.work_id not in hidden:
+                    drawn.add(one.card.work_id)
+    archived = archived_works(buckets, work_inventory(snapshot.state.db))
+    archived_ids = {item.ref.work_id for item in archived}
+    # Active Works too: a Work just closed can still count as Active (its chat ran on), and
+    # the live list draws only its newest few finished ones.
+    pool = [
+        item
+        for item in (*buckets.active, *buckets.recent, *archived)
+        if item.ref.work_id not in drawn
+    ]
+    records = _cached_issues(app, pool)
+    wanted = project.strip().casefold()
+    timed = []
+    for item in pool:
+        work_id = item.ref.work_id
+        record = records.get(work_id)
+        finished = work_finished_at(record)
+        # One rule: every finished Work the live list does not draw. A closed issue counts
+        # even before its record carries `closedAt`; the live list counts it finished too,
+        # but cannot place it in time, so it never draws it (``front_sections``).
+        closed = (
+            bool(record)
+            and not record.get("is_pr")
+            and str(record.get("state") or "").casefold() == "closed"
+        )
+        if not closed and work_id not in archived_ids:
+            continue  # a quiet recent Work that never finished: `/works` lists it
+        # The front page's tab names the project; a repository's own name is taken too.
+        if wanted and wanted not in {
+            work_project(item.ref.repository, snapshot.board).casefold(),
+            item.ref.repository.casefold(),
+        }:
+            continue
+        timed.append((_older_key(finished, item.last_activity, work_id, done=closed), item))
+    if q.strip():
+        rows = _index_rows(snapshot, tuple(item for _, item in timed), records=records)
+        matched = {row.work_id for row in rows if _matches(row, q)}
+        timed = [entry for entry in timed if entry[1].ref.work_id in matched]
+    timed.sort(key=lambda entry: entry[0], reverse=True)
+    cursor = _parse_older_cursor(before) if before else None
+    if cursor is not None:
+        timed = [entry for entry in timed if entry[0] < cursor]
+    page = timed[:limit]
+    if not page:
+        return OlderPage((), "")
+
+    def build() -> tuple:
+        items = [item for _, item in page]
+        facts = gather_facts(app, snapshot, items)
+        queue_rows = WorkRows(queue)
+        built = []
+        for item in items:
+            card, _ = _card(
+                app,
+                snapshot,
+                item.ref,
+                item.work,
+                jobs=queue_rows.for_work(item.ref.work_id),
+                claims=(),
+                facts=facts[item.ref.work_id],
+            )
+            built.append(front_row(card, current=item.live))
+        return tuple(built)
+
+    rows = await asyncio.to_thread(build)
+    open_ids = frozenset(
+        row.card.work_id
+        for row, (_, item) in zip(rows, page, strict=True)
+        if str((records.get(item.ref.work_id) or {}).get("state", "")).lower() == "open"
+    )
+    next_href = ""
+    if len(timed) > limit:
+        params = {"before": _older_cursor(page[-1][0]), "project": project.strip(), "q": q.strip()}
+        next_href = "/works/finished?" + urlencode({k: v for k, v in params.items() if v})
+    return OlderPage(rows, next_href, open_ids)
+
+
+@router.get("/works/finished", response_class=HTMLResponse)
+async def works_finished(
+    request: Request, before: str = "", project: str = "", q: str = "", search: str = ""
+) -> HTMLResponse:
+    """Recently finished's Show older and search (#4289): a fragment of rows to append, and
+    the button for the next page. A search (``search=1``) replaces the loaded rows; an
+    emptied search box brings the section back to its live rows and a fresh button."""
+    searching = bool(search)
+    if searching and not q.strip():
+        # The button starts over; `front_filters.js` adds the project tab to its request.
+        older = OlderPage((), "/works/finished")
+        cleared = True
+    else:
+        older = await older_finished(request.app, before=before, project=project, q=q)
+        cleared = False
+    overview = getattr(getattr(request.app.state, "work_overview", None), "overview", None)
+    response = get_templates(request).TemplateResponse(
+        request,
+        "partials/work_front.html",
+        {
+            "part": "older",
+            "work_overview": overview or WorkOverview(),
+            "older": older.rows,
+            "older_open": older.open_ids,
+            "older_next": older.next_href,
+            "older_cleared": cleared,
+            "older_first": not before,
+            "older_query": q.strip(),
+        },
+    )
     response.headers["Cache-Control"] = "no-cache"
     return response
 
@@ -1159,6 +1298,7 @@ async def _deck_released_verdict(
                     verdict.digest,
                     verdict.targets,
                     source=f"request:{action_id}" if action_id else "",
+                    stamp=review_history.round_stamp(command),
                 )
             )
         return answers
@@ -1172,7 +1312,7 @@ async def _deck_released_verdict(
 
 
 async def _deck_run_request(
-    request: Request, repository: str, number: int, command: str, action_id: str
+    request: Request, repository: str, number: int, command: str, action_id: str, sender: str = ""
 ) -> JSONResponse | None:
     """The deck reviewer's findings or plain comment on a Work the deck runs itself (#3004).
 
@@ -1180,6 +1320,8 @@ async def _deck_run_request(
     ...``) are posted on the card, quoted, and handed to the Work's chat once; a plain comment is
     posted on the card. Any other command is refused, never answered with "no Poller tracks", which
     would send the reviewer to post it on GitHub where the deck's own account is not heard.
+    ``sender`` is the sending chat's session token: a design verdict counts only from the
+    reviewer the deck started on that design (#4332).
     """
     from ..poller_engine.intake import CommandKind, parse_control
 
@@ -1189,8 +1331,10 @@ async def _deck_run_request(
     if release is None or not release.handles(work_id):
         return None
     issue = f"{repository}#{number}"
+    # A design review's verdict (#4332) is findings about the issue, not a commit.
+    design = _design_verdict(command, issue)
     parsed = parse_control(command, bot_marker="")
-    findings = parsed is not None and parsed.kind == CommandKind.CLAUDE
+    findings = design is not None or (parsed is not None and parsed.kind == CommandKind.CLAUDE)
     if command.startswith("/") and not findings:
         raise HTTPException(
             status_code=400,
@@ -1201,7 +1345,7 @@ async def _deck_run_request(
         )
     stale = (
         await release.stale_findings(work_id, parsed.instruction, repository, action_id)
-        if findings
+        if findings and design is None
         else ""
     )
     if stale:
@@ -1213,7 +1357,28 @@ async def _deck_run_request(
             " review of its own; stop this one."
         )
         return JSONResponse({"outcome": "done", "detail": detail}, status_code=202)
+    if design is not None:
+        dropped = await _design_accept(request, issue, design, sender)
+        if dropped is not None:
+            return dropped
     outcome, receipt = await _post_reviewer_comment(request, ref, command, action_id)
+    if design is not None:
+        if outcome != "done":
+            # The owner must see a verdict before it counts: none is recorded or told unposted.
+            if outcome == "failed":
+                raise HTTPException(status_code=400, detail=receipt)
+            detail = (
+                f"The design verdict was not posted on {issue}; send the same request again."
+                f" {receipt}"
+            )
+            return JSONResponse({"outcome": "retry", "detail": detail}, status_code=503)
+        recorded = await request.app.state.work_router.design_record(
+            issue, design.comment, design.verdict, sender
+        )
+        if not recorded.get("recorded"):
+            # Posted, but the deck would not count it: the agent hears nothing it cannot use.
+            detail = f"The design verdict was posted but not recorded: {recorded.get('refused')}"
+            raise HTTPException(status_code=int(recorded.get("status") or 409), detail=detail)
     if not findings:
         if outcome == "failed":
             raise HTTPException(status_code=400, detail=receipt)
@@ -1221,7 +1386,13 @@ async def _deck_run_request(
         return JSONResponse({"outcome": outcome, "detail": receipt}, status_code=status)
     posted = re.search(r"https://\S+", receipt) if outcome == "done" else None
     url = posted.group(0) if posted else f"https://github.com/{repository}/issues/{number}"
-    told = await release.on_findings(work_id, action_id, parsed.instruction, url)
+    told = (
+        await release.on_design_review(
+            work_id, action_id, command, url, gap=design.verdict == "gap"
+        )
+        if design is not None
+        else await release.on_findings(work_id, action_id, parsed.instruction, url)
+    )
     logger.info("deck-request: findings for %s: told=%s, %s", issue, told, receipt)
     if told:
         detail = (
@@ -1245,6 +1416,48 @@ async def _deck_run_request(
     return JSONResponse(
         {"outcome": outcome, "detail": detail}, status_code=202 if outcome == "done" else 503
     )
+
+
+async def _design_accept(request: Request, issue: str, design, sender: str) -> JSONResponse | None:
+    """The answer to a design verdict the deck does not take (#4332), or ``None`` when it takes
+    it: refused when its sender is not the reviewer the deck started on that design, dropped
+    when it is about a design the agent has since replaced."""
+    router_service = getattr(request.app.state, "work_router", None)
+    if router_service is None or not router_service.enabled:
+        raise HTTPException(status_code=409, detail="this deck does not route Work events")
+    answer = await router_service.design_accept(issue, design.comment, design.verdict, sender)
+    if answer.get("status") == 403:
+        raise HTTPException(status_code=403, detail=answer["refused"])
+    if "refused" in answer:
+        detail = f"{answer['refused']}; send the same request again"
+        return JSONResponse({"outcome": "retry", "detail": detail}, status_code=503)
+    if not answer.get("stale"):
+        return None
+    logger.info("deck-request: design verdict for %s dropped: %s", issue, answer["stale"])
+    detail = (
+        f"This design verdict was not posted or handed on: {answer['stale']}. The newer design"
+        " has a review of its own; stop this one."
+    )
+    return JSONResponse({"outcome": "done", "detail": detail}, status_code=202)
+
+
+def _design_verdict(command: str, issue: str):
+    """The design review's verdict ``command`` opens with (#4332), or ``None``. One about
+    another issue is refused: it would post on the wrong card."""
+    from ..design_review import verdict_of
+
+    verdict = verdict_of(command)
+    if verdict is not None and verdict.issue != issue.lower():
+        raise HTTPException(
+            status_code=400,
+            detail=f"this design verdict names {verdict.issue}, not {issue}: send it there",
+        )
+    if verdict is not None and not verdict.comment:
+        raise HTTPException(
+            status_code=400,
+            detail="a design verdict names the design comment it reviewed: `…: pass <number>`",
+        )
+    return verdict
 
 
 @router.post("/api/deck-request", dependencies=[Depends(require_access)])
@@ -1281,7 +1494,8 @@ async def deck_request_api(request: Request) -> JSONResponse:
     released = await _deck_released_verdict(request, repository, number, command, action_id)
     if released is not None:
         return JSONResponse({"outcome": "done", "detail": released})
-    taken = await _deck_run_request(request, repository, number, command, action_id)
+    sender = str(body.get("session_token") or "")
+    taken = await _deck_run_request(request, repository, number, command, action_id, sender)
     if taken is not None:
         return taken
     raise HTTPException(
@@ -2623,12 +2837,14 @@ def _side_chat_button(request: Request, ref: WorkRef, detail) -> dict | None:
 
 @router.post("/works/{work_id:path}/side-chat", response_class=HTMLResponse)
 async def work_side_chat(request: Request, work_id: str) -> HTMLResponse:
-    """Open the Work's side chat (#4199): a copy of its working chat to ask questions in.
+    """Open the Work's side chat (#4199): a chat to ask questions in beside its working chat.
 
     The Work keeps one while it is fresh (``work_side_chat.SIDE_CHAT_FRESH``): a press then
-    opens that one. Otherwise the working chat is cut at its newest finished reply and a new
-    chat starts from there on the same account, folder, model and effort, as a chat page's
-    side chat does (#2485), with a first message that says what it is for. The press's action
+    opens that one. Otherwise a new chat starts on the same account, folder, model and effort,
+    as a copy of the working chat cut at its newest reply (``provider.newest_fork``), as a chat
+    page's side chat does (#2485); when that chat has no reply to cut at yet, as at a Work's
+    start, it starts empty instead (#4314). Its first message says what it is for and, for an
+    empty one, to read the agent's chat before answering. The press's action
     id is reserved first and is also the new chat's session token, so a replay of the same id
     answers with that start and never spawns another.
     """
@@ -2703,17 +2919,12 @@ async def _open_side_chat(request: Request, ref: WorkRef, action_id: str) -> Any
     refusal = provider.fork_refusal(account, session)
     if refusal is not None:
         return _message_receipt(request, text=refusal, state="refused", status_code=409)
+    # At a Work's start its chat may have no reply yet to copy (a Codex first turn still
+    # running, a Claude one with no text so far): the side chat then starts empty in the same
+    # folder and reads the agent's chat itself (#4314).
     fork = await asyncio.to_thread(provider.newest_fork, account, session)
-    if fork is None:
-        return _message_receipt(
-            request,
-            text="Its chat has no finished reply yet, so no side chat was opened.",
-            state="refused",
-            status_code=409,
-        )
-    seq, cut = fork
     issue = IssueRef.parse(detail.card.source_label) or IssueRef(ref.repository, ref.number)
-    message = side_chat_message(issue, session.key)
+    message = side_chat_message(issue, session.key, copied=fork is not None)
     model, effort = provider.fork_settings(account, session)
     reserved = db.reserve_work_action(action_id, ref.work_id, work_actions.SIDE_CHAT)
     if not reserved:
@@ -2727,8 +2938,11 @@ async def _open_side_chat(request: Request, ref: WorkRef, action_id: str) -> Any
             status_code=409,
         )
     state = get_state(request)
-    owner = state.reserve_chat_fork(action_id, session.key, seq, action_id)
-    if owner is None:
+    # Only a copy has a source line to record; an empty side chat shows no "cut from" link.
+    if (
+        fork is not None
+        and state.reserve_chat_fork(action_id, session.key, fork[0], action_id) is None
+    ):
         db.settle_work_action(action_id, "failed", "the deck could not record its source")
         return _message_receipt(
             request,
@@ -2747,9 +2961,9 @@ async def _open_side_chat(request: Request, ref: WorkRef, action_id: str) -> Any
             client_action_id=action_id,
             session_token=action_id,
             allow_over_budget=True,
-            origin="fork",
+            origin="fork" if fork is not None else "new",
             source_session_key=session.key,
-            fork_from=routes_actions.ForkFrom(session.session_id, cut),
+            fork_from=routes_actions.ForkFrom(session.session_id, fork[1]) if fork else None,
         )
     except Exception as exc:  # noqa: BLE001 - the spawn may have begun; never repeat it
         logger.exception("side chat of %s did not report its start", ref.work_id)
@@ -2767,7 +2981,12 @@ async def _open_side_chat(request: Request, ref: WorkRef, action_id: str) -> Any
             request, text=f"Not opened: {reason}", state="refused", status_code=409
         )
     db.settle_work_action(action_id, "done", "Started a side chat")
-    logger.info("side chat of %s started from %s line %s", ref.work_id, session.key, seq)
+    logger.info(
+        "side chat of %s started from %s %s",
+        ref.work_id,
+        session.key,
+        f"line {fork[0]}" if fork else "empty",
+    )
     return await accepted(action_id)
 
 

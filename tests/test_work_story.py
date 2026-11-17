@@ -244,6 +244,14 @@ def test_a_needs_you_wake_on_tells_the_question_and_knows_the_work_s_own_chats()
     [stop] = needs_you_stops(overview, identity=lambda key: f"chat-of:{key.rsplit(':', 1)[-1]}")
     assert stop.reason == "Which colour?" and stop.issue == row.card.source_label
     assert stop.chats == ("chat-of:leg2",) and stop.stopped_at == 0.0
+    # #4358: where a Work is now, for the note once it no longer needs the owner.
+    from agentdeck.web.work_view import needs_you_where
+
+    where = needs_you_where(SimpleNamespace(cards=(row.card,)))
+    status = work_status(row.card)
+    assert where(row.card.work_id).startswith(f"{status.headline} — {status.summary}")
+    assert where(row.card.work_id).endswith("; pull requests #2300 state unknown")
+    assert where("github_issue:nobody/else#1") == ""
 
 
 def test_the_front_page_answers_only_a_real_question():

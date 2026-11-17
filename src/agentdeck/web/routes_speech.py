@@ -92,6 +92,8 @@ KEEP_AUDIO_S = 30 * 86400
 RECENT_PHRASES = 20
 _recent_audio: OrderedDict[str, bytes] = OrderedDict()
 MAX_ID_CHARS = 40
+# A chat's session key, as the page names the side chat a phrase went to (#4360).
+MAX_KEY_CHARS = 200
 # Phrases kept for comparing speech-to-text models (#3499, #3934), and where each
 # came from: 🎧 voice mode or 🎤 dictation.
 KEPT_LOG = "kept.jsonl"
@@ -99,10 +101,26 @@ KEPT_LOG = "kept.jsonl"
 MIC_CHARS = 80
 SOURCES = ("voice", "dictation")
 ENGINES = ("whisper", "parakeet")
+# The wake words a page may ask the detector for (``scripts/wake_server.py``); the
+# first is every page's own.
+WAKE_WORDS = ("jarvis", "alexa")
+# How speech recognition writes each wake word, as ``voice_mode.js``'s ``WAKE_WORDS``
+# do: a detector wake on a word in ``[speech] wake_confirm`` counts only when the
+# words heard in its clip match (#4372).
+WAKE_SPOKEN = {
+    "jarvis": re.compile(
+        r"\b(?:hey|hei|hay|hi|hai|a)[\s,.!-]*(?:jarvis|jarvi|javis|jarves|jarvus)\b", re.I
+    ),
+    "alexa": re.compile(r"\b(?:alexa|aleksa|alexia|alexis|alekza|elexa)\b", re.I),
+}
 _kept_lock = threading.Lock()
 # The speech service's warm-ups (#3766), held so none is collected before it ends;
 # nothing awaits them.
 _stt_warming: set[asyncio.Task] = set()
+# Chats whose Claude process voice mode is asking the runtime to start (#4360), one
+# ask at a time each, and the tasks asking.
+_waking: set[str] = set()
+_wakes: set[asyncio.Task] = set()
 
 
 async def _forward(
@@ -155,11 +173,18 @@ async def status(request: Request) -> JSONResponse:
 
 @router.post("/api/speech/transcribe")
 async def transcribe(request: Request) -> JSONResponse:
-    """A recorded phrase (16-bit WAV) as ``{"text", "language", "speech_s", "segments"}``:
+    """A recorded phrase (16-bit WAV) as ``{"text", "language", "speech_s", "ms", "segments"}``:
     ``segments`` are the text's parts in order, each ``{"text", "unsure"}``, and voice
     mode marks the ones Whisper doubted for the agent (#3817)."""
     _require_same_origin(request)
     audio = await _audio(request)
+    source = request.query_params.get("source", "")
+    return JSONResponse(await _hear(request, audio, source))
+
+
+async def _hear(request: Request, audio: bytes, source: str | None) -> dict:
+    """The host's words for ``audio``, as ``/api/speech/transcribe`` answers them, and
+    the phrase kept for the bench as ``source`` (#3934); ``None`` keeps nothing."""
     pinned = get_config(request).speech.language
     # The language heard last: a phrase too short to tell keeps it.
     previous = request.query_params.get("language")
@@ -171,33 +196,34 @@ async def transcribe(request: Request) -> JSONResponse:
         path = "/transcribe"
     started = time.monotonic()
     reply = await _forward(request, path, content=audio, headers={"Content-Type": "audio/wav"})
+    took = time.monotonic() - started
     heard = reply.json()
     language = pinned if pinned in LANGUAGES else heard.get("language")
-    await _keep_phrase(request, audio, heard, pinned, time.monotonic() - started)
+    if source is not None:
+        await _keep_phrase(request, audio, heard, pinned, took, source)
     parts = heard.get("segments") if isinstance(heard.get("segments"), list) else []
     speech_s = heard.get("speech_s")
-    return JSONResponse(
-        {
-            "text": str(heard.get("text") or ""),
-            "language": language if language in LANGUAGES else "en",
-            # Seconds of speech in it: voice mode drops a fragment of junk (#3934).
-            "speech_s": speech_s if type(speech_s) in (int, float) else None,
-            "segments": [
-                {"text": part["text"], "unsure": part.get("unsure") is True}
-                for part in parts
-                if isinstance(part, dict) and isinstance(part.get("text"), str)
-            ],
-        }
-    )
+    return {
+        "text": str(heard.get("text") or ""),
+        "language": language if language in LANGUAGES else "en",
+        # Seconds of speech in it: voice mode drops a fragment of junk (#3934).
+        "speech_s": speech_s if type(speech_s) in (int, float) else None,
+        # How long the speech service took over it, for voice mode's timings (#4360).
+        "ms": round(took * 1000),
+        "segments": [
+            {"text": part["text"], "unsure": part.get("unsure") is True}
+            for part in parts
+            if isinstance(part, dict) and isinstance(part.get("text"), str)
+        ],
+    }
 
 
 async def _keep_phrase(
-    request: Request, audio: bytes, heard: dict, pinned: str, took_s: float
+    request: Request, audio: bytes, heard: dict, pinned: str, took_s: float, source: str
 ) -> None:
     """Keep the phrase for the bench when ``[speech] keep_audio_days`` asks; a write
     that fails is logged and never costs the phrase its words."""
     speech = get_config(request).speech
-    source = request.query_params.get("source", "")
     if speech.keep_audio_days <= 0 or source == "probe":
         return
     snr = heard.get("snr_db")
@@ -322,8 +348,18 @@ async def wake(request: Request) -> JSONResponse:
     ``{"woken", "score", "speech_after"}`` (#3476). ``?id=`` names the phrase in the
     wake log. ``?window=1`` marks the last moments of microphone sound sent every
     0.4 s while a reply is read (#3842): a few a second, so only one that woke or
-    nearly did is logged."""
+    nearly did is logged. ``?word=alexa`` asks for that wake word instead of "Hey
+    Jarvis", for a page whose voice control names it, at that word's own
+    ``[speech] wake_thresholds`` score when one is set.
+
+    A wake on a word in ``[speech] wake_confirm`` ("Alexa") also needs speech
+    recognition to hear the word in the clip, or it is answered as not woken
+    (#4372); when the phrase goes on after the name, the reply carries its words as
+    ``heard``, so confirming costs the page no second wait."""
     _require_same_origin(request)
+    word = request.query_params.get("word") or WAKE_WORDS[0]
+    if word not in WAKE_WORDS:
+        raise HTTPException(status_code=400, detail="unknown wake word")
     audio = await _audio(request)
     speech = get_config(request).speech
     if not speech.wake_socket:
@@ -332,7 +368,8 @@ async def wake(request: Request) -> JSONResponse:
     started = time.monotonic()
     reply = await _forward(
         request,
-        f"/wake?threshold={speech.wake_threshold}",
+        f"/wake?threshold={speech.wake_thresholds.get(word, speech.wake_threshold)}"
+        + ("" if word == WAKE_WORDS[0] else f"&word={word}"),
         socket=speech.wake_socket,
         content=audio,
         headers={"Content-Type": "audio/wav"},
@@ -343,27 +380,70 @@ async def wake(request: Request) -> JSONResponse:
         "score": float(found.get("score") or 0.0),
         "speech_after": bool(found.get("speech_after")),
     }
+    window = request.query_params.get("window") == "1"
+    confirm: dict = {}
+    if result["woken"] and word in speech.wake_confirm:
+        confirm, heard = await _confirm_wake(request, word, audio, result, window)
+        if confirm["confirmed"] is False:
+            result["woken"] = False
+        elif heard is not None:
+            # The words after the name are heard already: the page sends them on
+            # rather than asking for them again.
+            result["heard"] = heard
     if phrase:
         _recent_audio[phrase] = audio
         while len(_recent_audio) > RECENT_PHRASES:
             _recent_audio.popitem(last=False)
     keep = result["woken"] or result["score"] > NEAR_MISS
-    window = request.query_params.get("window") == "1"
     if window and not keep:
         return JSONResponse(result)
     line = {
         "id": phrase,
         "check": "window" if window else "detector",
         "mode": speech.wake,
+        "word": word,
         "seconds": _seconds(audio),
         "ms": round((time.monotonic() - started) * 1000),
         "mic": _mic(request),
-        **result,
+        **{key: value for key, value in result.items() if key != "heard"},
+        **confirm,
     }
     await asyncio.to_thread(
         _write_wake_log, Path(speech.wake_log_dir).expanduser(), line, audio if keep else None
     )
     return JSONResponse(result)
+
+
+async def _confirm_wake(
+    request: Request, word: str, audio: bytes, result: dict, window: bool
+) -> tuple[dict, dict | None]:
+    """Whether speech recognition hears ``word`` in a clip the detector woke on
+    (#4372): the kitchen's "Alexa" woke on noise at 0.94, where Whisper heard no
+    words at all, while every real wake came back as "Alexa." in about 0.55 s.
+
+    Returns the wake log's fields, ``{"confirmed", "heard", "confirm_ms"}``, and the
+    words in ``/api/speech/transcribe``'s shape when the page would ask for them next
+    (a phrase that goes on after the name), else ``None``. With no speech service, or
+    one that fails, nothing heard the name, so the wake does not count (``confirmed``
+    false, ``heard`` null): voice mode could not hear the words after it either."""
+    started = time.monotonic()
+    speech = get_config(request).speech
+    goes_on = result["speech_after"] and not window
+    try:
+        if not speech.socket:
+            raise HTTPException(status_code=503, detail="no speech service configured")
+        heard = await _hear(request, audio, "voice" if goes_on else None)
+    except HTTPException:
+        took = round((time.monotonic() - started) * 1000)
+        return {"confirmed": False, "heard": None, "confirm_ms": took}, None
+    text = heard["text"].strip()
+    confirmed = bool(WAKE_SPOKEN[word].search(text))
+    line = {
+        "confirmed": confirmed,
+        "heard": text[:MAX_SAY_CHARS],
+        "confirm_ms": round((time.monotonic() - started) * 1000),
+    }
+    return line, heard if confirmed and goes_on else None
 
 
 @router.post("/api/speech/wake-log")
@@ -486,7 +566,11 @@ async def voice_heard(request: Request) -> JSONResponse:
 async def voice_narrate(request: Request) -> Response:
     """``{"session_key", "seconds", "run", "lang"}``: the chat has said nothing aloud for that
     long while it works, so the fast agent says what it is doing (#3799), as
-    ``{"say"}``; 204 when it has nothing to say."""
+    ``{"say"}``; 204 when it has nothing to say.
+
+    ``transcript_key`` (#4349): the chat whose steps are told, when voice mode follows the
+    chat's side chat. The fast agent is still ``session_key``'s; a side chat this deck
+    cannot find has nothing to say."""
     _require_same_origin(request)
     body = await _json_object(request)
     key = str(body.get("session_key") or "").strip()
@@ -498,7 +582,13 @@ async def voice_narrate(request: Request) -> Response:
         seconds = 0
     run = str(body.get("run") or "").strip()[:MAX_ID_CHARS]
     narration_id = str(body.get("id") or "").strip()[:MAX_ID_CHARS]
-    account, session, provider = resolve_current_leg(request, key)
+    told = str(body.get("transcript_key") or "").strip() or key
+    try:
+        account, session, provider = resolve_current_leg(request, told)
+    except HTTPException:
+        if told == key:
+            raise
+        return Response(status_code=204)
     detail = await provider.load_transcript(account, session)
     done = voice_helper.steps(detail.events)
     finnish = body.get("lang") == "fi"
@@ -510,8 +600,9 @@ async def voice_narrate(request: Request) -> Response:
 
 @router.post("/api/voice/sent")
 async def voice_sent(request: Request) -> Response:
-    """``{"session_key", "id", "text", "how"}``: what the page really sent for a phrase
-    (``text`` null: nothing, and ``how`` says why), saved in the voice log (#3475).
+    """``{"session_key", "id", "text", "how", "to"?}``: what the page really sent for a
+    phrase (``text`` null: nothing, and ``how`` says why), saved in the voice log
+    (#3475); ``to``, the side chat it went to (#4360).
     ``{"session_key", "id", "timing"}`` instead saves the phrase's measured waits
     (#3765), and ``{"session_key", "id", "spoken"}`` the fast agent's line the page
     really said for it, which it holds back until the chat stays quiet (#3799)."""
@@ -522,7 +613,8 @@ async def voice_sent(request: Request) -> Response:
     if not key or not phrase_id:
         raise HTTPException(status_code=400, detail="a session key and a phrase id are needed")
     if isinstance(body.get("timing"), dict):
-        await voice_helper.timed(key, phrase_id, body["timing"])
+        host = await _host_waits(request, key, phrase_id)
+        await voice_helper.timed(key, phrase_id, body["timing"], host)
         return Response(status_code=204)
     if isinstance(body.get("spoken"), str):
         await voice_helper.spoken(key, phrase_id, body["spoken"][:MAX_SAY_CHARS])
@@ -530,8 +622,27 @@ async def voice_sent(request: Request) -> Response:
     text = body.get("text")
     text = str(text)[: voice_helper.MAX_HEARD_CHARS * 2] if isinstance(text, str) else None
     how = str(body.get("how") or "")[:MAX_SAY_CHARS]
-    await voice_helper.sent(key, phrase_id, text, how)
+    # The chat it went to, when voice mode follows the side chat (#4349, #4360).
+    to = str(body.get("to") or "").strip()[:MAX_KEY_CHARS]
+    await voice_helper.sent(key, phrase_id, text, how, to)
     return Response(status_code=204)
+
+
+async def _host_waits(request: Request, key: str, phrase_id: str) -> dict:
+    """The chat's own part of a timed phrase, from its transcript (#4360); nothing
+    when the send was not reported or the chat cannot be read."""
+    reports = await asyncio.to_thread(voice_helper.sent_reports, key, phrase_id)
+    if not reports or not isinstance(reports[-1].get("sent"), str):
+        return {}
+    report = reports[-1]
+    try:
+        # The side chat's own transcript, for a phrase sent there (#4349).
+        account, session, provider = resolve_current_leg(request, report.get("to") or key)
+        detail = await provider.load_transcript(account, session)
+    except Exception as exc:  # only measured: the page's own waits are saved anyway
+        log.info("voice timing: no transcript for %s: %s", key, exc)
+        return {}
+    return voice_helper.host_waits(detail.events, reports, phrase_id)
 
 
 @router.post("/api/voice/warm")
@@ -546,8 +657,35 @@ async def voice_warm(request: Request) -> Response:
     if speech.socket:
         _background(_stt_warming, _warm_speech(speech.socket))
     if key:
+        _wake_chat(request, key)
         await voice_helper.warm(request.app, key, run)
     return Response(status_code=204)
+
+
+def _wake_chat(request: Request, key: str) -> None:
+    """Start the chat's own Claude process too, while the phrase is still being heard
+    (#4360), so its send does not wait for a cold start. In the background: neither
+    this reply nor a send waits on it, and a chat whose provider cannot is skipped."""
+    try:
+        account, session, provider = resolve_current_leg(request, key)
+    except Exception as exc:  # noqa: BLE001 -- a warm never fails over its head start
+        log.debug("voice mode will not wake %s: %s", key, exc)
+        return
+    wake = getattr(provider, "wake_worker", None)
+    if wake is None or session.key in _waking:
+        return
+    _waking.add(session.key)
+
+    async def run() -> None:
+        try:
+            state = await wake(account, session.session_id)
+            log.debug("voice mode woke %s: %s", session.key, state or "not asked")
+        except Exception as exc:  # noqa: BLE001 -- only a head start: the send spawns anyway
+            log.info("voice mode could not wake %s: %s", session.key, exc)
+        finally:
+            _waking.discard(session.key)
+
+    _background(_wakes, run())
 
 
 @router.post("/api/voice/end")
@@ -569,8 +707,15 @@ async def voice_log(request: Request, session_key: str) -> HTMLResponse:
     phrases = voice_helper.saved(dict.fromkeys((*keys, session_key)))
     for phrase in phrases:
         phrase["when"] = datetime.fromtimestamp(phrase["at"]).strftime("%Y-%m-%d %H:%M:%S")
+        phrase["parts"] = voice_helper.timing_parts(phrase.get("timing"))
     return get_templates(request).TemplateResponse(
         request,
         "voice_log.html",
-        {"session_key": session_key, "phrases": phrases, "answered": voice_helper.ANSWERED},
+        {
+            "session_key": session_key,
+            "phrases": phrases,
+            "answered": voice_helper.ANSWERED,
+            "summary": voice_helper.timing_summary(phrases),
+            "summary_of": voice_helper.TIMED_SUMMARY,
+        },
     )

@@ -123,10 +123,13 @@ class RuntimeSocketClient:
         client_action_id = current_client_action_id()
         if client_action_id:
             payload = {**payload, "client_action_id": client_action_id}
+        # Only a request that never connected is known to have reached nothing (#4303).
+        maybe_sent = False
         try:
             try:
                 response = await self._client().post(path, json=payload)
             except _CONNECTION_LOST as exc:
+                maybe_sent = not isinstance(exc, httpx.ConnectError)
                 if not (fence and payload.get(fence)):
                     raise
                 log.warning(
@@ -154,6 +157,7 @@ class RuntimeSocketClient:
                 False,
                 f"{self._runtime_label} unavailable: {exc}",
                 runtime_unreachable=isinstance(exc, _CONNECTION_LOST),
+                write_uncertain=maybe_sent or not isinstance(exc, httpx.ConnectError),
             )
 
     async def _post_when_listening(self, path: str, payload: dict) -> httpx.Response:

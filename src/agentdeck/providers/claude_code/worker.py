@@ -52,6 +52,7 @@ from ...models import (
     SNAPSHOT_RELOCATE_V1,
     SNAPSHOT_REWIND_V1,
     SNAPSHOT_SPARE_V1,
+    SNAPSHOT_WAKE_V1,
     WORKER_SNAPSHOT_CAPABILITIES,
     Account,
     ForkFrom,
@@ -75,7 +76,7 @@ from ..instructions import (
     stored_session_role,
 )
 from ..usage import read_shared_cache
-from . import permission_rules, registry
+from . import locked, permission_rules, registry
 from . import transcripts as transcripts_mod
 from .held import (
     OFFSET_SAVE_INTERVAL_S,
@@ -159,6 +160,10 @@ BACKGROUND_AGENT_MAX_AGE_S = 2 * 3600.0
 # write, which reads as idle while the message it was just given is still in its
 # queue: a person's message was killed two seconds after it landed that way.
 IDLE_RECLAIM_GRACE_S = 60.0
+# How long after voice mode last woke a chat (#4360) its idle process is reclaimed
+# only after every other idle one. Voice mode turning off does not end it: a hold
+# left behind runs out by itself.
+VOICE_HOLD_S = 600.0
 
 # How many messages queued behind one running turn a chat's record keeps for
 # revival (#2898). A person sends a handful; the newest are the ones that matter.
@@ -285,12 +290,24 @@ _LOGIN_REFRESH_FAILURE = re.compile(
 )
 # The CLI's own advice is a minute; two leave the other refresh time to land.
 LOGIN_REFRESH_RETRY_DELAY_S = 120.0
+# A turn the CLI ended because Cloudflare, in front of Anthropic's API, answered with its own
+# block page instead of the API (#4324). It happens during a Claude outage, to every chat on
+# every account at once, and the CLI reports it as "Failed to authenticate. API Error: 403
+# Attention Required! | Cloudflare". The sign-in is fine: a real sign-in failure is the API's
+# own 401 or 403 with a JSON body, never Cloudflare's page title, so only that title counts.
+_CLOUDFLARE_BLOCK_FAILURE = re.compile(
+    r"^(?:failed to authenticate\. )?api error: \d{3}\b.*\|\s*cloudflare\s*$",
+    re.IGNORECASE,
+)
+# An outage lasts minutes, not seconds; wait as long as for a lost connection.
+CLOUDFLARE_BLOCK_RETRY_DELAY_S = NETWORK_RETRY_DELAY_S
 
 
 def _transient_failure_retry_delay(event: dict[str, Any]) -> float | None:
     """How long to wait before continuing a turn the CLI ended on a passing failure.
 
-    Two failures count: its own "API Error" line for a connection it never made, and its
+    Three failures count: its own "API Error" line for a connection it never made, the same
+    line for Cloudflare's block page answering in the API's place during an outage, and its
     sign-in refresh losing a race with another process. Like the quota refusal, the line has
     to *be* the answer: one short line opening with the CLI's own words. A worker's prose
     that quotes such a line is not the failure. ``None`` when the result is neither.
@@ -310,6 +327,8 @@ def _transient_failure_retry_delay(event: dict[str, Any]) -> float | None:
         return None
     if text.startswith("API Error:") and _NETWORK_FAILURE_MARKERS.search(text):
         return NETWORK_RETRY_DELAY_S
+    if _CLOUDFLARE_BLOCK_FAILURE.search(text):
+        return CLOUDFLARE_BLOCK_RETRY_DELAY_S
     return None
 
 
@@ -488,6 +507,11 @@ class _LiveWorker:
     read_offset: int = 0
     offset_saved_at: float = 0.0
     detached: bool = False
+    # When voice mode started this process ahead of a phrase (#4360), or 0. Kept in
+    # memory only, and set once, at that spawn: it gives the process the grace a
+    # delivery would, so it is not reclaimed before the phrase arrives, while
+    # ``last_delivery_at`` keeps meaning a real message went in.
+    woken_at: float = 0.0
 
 
 # Where held workers' sockets live, beside -- never inside -- the runtime's own directory.
@@ -869,6 +893,9 @@ class ClaudeWorkerHost:
         self._holders: dict[str, HolderInfo] = self._holder_store.load()
         # Booted CLIs waiting for a new chat, one per kind of start (#3420).
         self._spares: dict[str, _Spare] = {}
+        # Chats voice mode woke, and until when their idle process is reclaimed last
+        # (#4360). In memory only: a restart loses it with the processes.
+        self._voice_until: dict[str, float] = {}
         self._load_state()
         for record in self._records.values():
             if record.session_token and record.session_id:
@@ -1084,20 +1111,25 @@ class ClaudeWorkerHost:
         )
 
     def _is_reclaimable_idle(self, key: str, live: _LiveWorker, now: float) -> bool:
-        """Idle, and not handed a message within ``IDLE_RECLAIM_GRACE_S`` (#3009)."""
+        """Idle, and not handed a message within ``IDLE_RECLAIM_GRACE_S`` (#3009), nor
+        started by voice mode within it ahead of a phrase (#4360)."""
         rec = self._records.get(key)
-        delivered_at = rec.last_delivery_at if rec else 0.0
+        delivered_at = max(rec.last_delivery_at if rec else 0.0, live.woken_at)
         return self._is_idle(key, live, now) and now - delivered_at > IDLE_RECLAIM_GRACE_S
 
     def _idle_victims(self, admit_key: str, now: float) -> list[tuple[str, _LiveWorker]]:
-        """Live workers with no active turn, least recently used first."""
+        """Live workers with no active turn, least recently used first; a chat voice
+        mode is in use on comes last, but still comes (#4360)."""
         return sorted(
             (
                 (key, live)
                 for key, live in self._live.items()
                 if key != admit_key and self._is_reclaimable_idle(key, live, now)
             ),
-            key=lambda item: -self._quiet_for(item[0], item[1], now),
+            key=lambda item: (
+                self._voice_until.get(item[0], 0.0) > now,
+                -self._quiet_for(item[0], item[1], now),
+            ),
         )
 
     def _stalled_victims(self, admit_key: str, now: float) -> list[tuple[str, _LiveWorker]]:
@@ -1876,6 +1908,7 @@ class ClaudeWorkerHost:
                 SNAPSHOT_RELOCATE_V1,
                 SNAPSHOT_REWIND_V1,
                 SNAPSHOT_SPARE_V1,
+                SNAPSHOT_WAKE_V1,
                         ],
             "live_count": sum(
                 1 for w in self._live.values() if w.process.returncode is None
@@ -2371,21 +2404,25 @@ class ClaudeWorkerHost:
             # escalate a manual "default" chat to bypassPermissions); a fresh spawn
             # records its mode for future revives.
             if resumed and rec.permission_mode is not None:
-                spawn_permission_mode = rec.permission_mode
-            elif context_rollover:
-                spawn_permission_mode = rec.permission_mode
+                # The same settings a voice-mode wake spawns with (#4360).
+                spawn_permission_mode, spawn_effort, spawn_model = self._resume_spawn_settings(
+                    rec, model
+                )
             else:
-                spawn_permission_mode = permission_mode
-                rec.permission_mode = permission_mode
-            if rec.bypass_permissions:
-                # The switch is on; the recorded mode is what switching off restores.
-                spawn_permission_mode = BYPASS_PERMISSIONS_MODE
-            if resumed:
-                spawn_effort = rec.effort
-            else:
-                spawn_effort = rec.effort if effort is None else effort
-                rec.effort = spawn_effort
-            spawn_model = rec.model if model is None else model
+                if context_rollover:
+                    spawn_permission_mode = rec.permission_mode
+                else:
+                    spawn_permission_mode = permission_mode
+                    rec.permission_mode = permission_mode
+                if rec.bypass_permissions:
+                    # The switch is on; the recorded mode is what switching off restores.
+                    spawn_permission_mode = BYPASS_PERMISSIONS_MODE
+                if resumed:
+                    spawn_effort = rec.effort
+                else:
+                    spawn_effort = rec.effort if effort is None else effort
+                    rec.effort = spawn_effort
+                spawn_model = rec.model if model is None else model
             rec.model = spawn_model
             rec.receipts.prepare(
                 delivery_id,
@@ -2667,6 +2704,10 @@ class ClaudeWorkerHost:
             if self._base_permission_mode(rec) == BYPASS_PERMISSIONS_MODE:
                 return DeliverResult(
                     False, "rejected", reason="this chat already bypasses permissions"
+                )
+            if rec.role == locked.LOCKED_ROLE:
+                return DeliverResult(
+                    False, "rejected", reason="a locked chat never bypasses permissions"
                 )
             if enabled == rec.bypass_permissions:
                 return DeliverResult(True, "unchanged", session_id=rec.session_id)
@@ -3374,6 +3415,97 @@ class ClaudeWorkerHost:
 
     # --- spares: CLIs booted ahead of a new chat (#3420) ---------------------
 
+    @staticmethod
+    def _resume_spawn_settings(
+        rec: WorkerRecord, model: str | None = None
+    ) -> tuple[str | None, str | None, str | None]:
+        """The ``(permission_mode, effort, model)`` a chat with a recorded mode resumes
+        with: its recorded mode, or ``BYPASS_PERMISSIONS_MODE`` while the switch is on
+        (the recorded one is what switching off restores), its recorded effort, and
+        ``model`` when a delivery names one, else its recorded model. Shared by a revive
+        in ``deliver`` and a voice-mode wake, so the two spawn alike (#4360)."""
+        mode = BYPASS_PERMISSIONS_MODE if rec.bypass_permissions else rec.permission_mode
+        return mode, rec.effort, rec.model if model is None else model
+
+    def _plain_resume(self, rec: WorkerRecord) -> bool:
+        """Whether a delivery's spawn of this chat would only launch its CLI, with
+        nothing of its own to do around that: no rollback point to clear, no context
+        operation, no turn open or cut off (a restart may still owe it a revival), and
+        its directory where it was (#4360).
+
+        The rest depends on the chat's role, the one rule both kinds wake by. An
+        ordinary chat also needs a recorded mode to resume with and a session token (an
+        older record without one is repaired by a delivery's own spawn). A locked chat
+        needs neither: its spawn takes no mode, token or deck setup, only the limits
+        ``_locked_command`` checks again on that very spawn, so a wake starts it exactly
+        as its send would and a missing limit refuses the wake as it would the send."""
+        if rec.role != locked.LOCKED_ROLE and (
+            rec.permission_mode is None or not rec.session_token
+        ):
+            return False
+        return not (
+            rec.resume_at
+            or rec.resume_at_session
+            or rec.pending_context_delivery_id
+            or rec.pending_context_operation
+            or rec.turn_open_at
+            or rec.unread_messages
+            or not self._publish_artifact_context(rec)
+            or self._relocation_target(rec, None, fresh=False, cwd=None) is not None
+        )
+
+    async def wake(self, key: str) -> str:
+        """Start this chat's Claude process ahead of a message voice mode is about to
+        send (#4360), so the send does not wait for a cold start.
+
+        Answers ``live`` when the process already runs, ``no_record`` for a chat with
+        nothing to resume, ``not_plain`` when a delivery's spawn has
+        more to do than launch (it then spawns cold, as before), ``at_capacity`` when
+        the account's cap refuses a slot, ``spawn_failed``, or ``spawned``. Every wake
+        of a chat with a record renews its hold, which only orders idle reclaim.
+
+        Holds the chat's key lock, as a delivery does, so the two start one process
+        between them. Writes nothing to the process and nothing to the record: a
+        resumed CLI makes no API call until a message comes. The launch is never
+        cancelled; ``_launch`` bounds it and cleans up after a failure.
+        """
+        async with self._key_lock(key):
+            rec = self._records.get(key)
+            if rec is None or not rec.session_id:
+                return "no_record"
+            now = time.time()
+            for held_key, until in list(self._voice_until.items()):
+                if until <= now:
+                    del self._voice_until[held_key]
+            self._voice_until[key] = now + VOICE_HOLD_S
+            live = self._live.get(key)
+            if live is not None and live.process.returncode is None:
+                return "live"
+            if live is not None or not self._plain_resume(rec):
+                return "not_plain"
+            role = resolve_session_role(delegated=rec.delegated, role=rec.role)
+            if not await self._admit_interactive(key, role, automated=True):
+                return "at_capacity"
+            mode, effort, model = self._resume_spawn_settings(rec)
+            if rec.role == locked.LOCKED_ROLE:
+                # Its own limits decide; the host's mode and bypass switch never apply.
+                mode = effort = None
+            try:
+                live = await self._spawn(
+                    key,
+                    rec,
+                    resume_id=rec.session_id,
+                    model=model,
+                    effort=effort,
+                    permission_mode=mode,
+                )
+            except (WorkerError, OSError) as exc:
+                log.info("could not wake %s:%s for voice mode: %s", self.account.key, key, exc)
+                return "spawn_failed"
+            live.woken_at = time.time()
+            log.info("woke %s:%s for voice mode", self.account.key, key)
+            return "spawned"
+
     async def prepare_spare(
         self,
         shape: str,
@@ -3392,6 +3524,9 @@ class ClaudeWorkerHost:
         The fields are the ones a fresh interactive chat is spawned from; anything a
         start sends differently spawns cold and replaces the spare instead.
         """
+        if role == locked.LOCKED_ROLE:
+            # A locked chat always spawns cold, from limits checked on that spawn.
+            return "locked_chat"
         async with self._key_lock(key):
             if key in self._records or key in self._live:
                 return "key_in_use"
@@ -3641,6 +3776,18 @@ class ClaudeWorkerHost:
         env.pop("AGENTDECK_URL", None)
         env.pop("AGENTDECK_SESSION_KEY", None)
         claude_env.point_at(env, self.account.root)  # macOS keeps ~/.claude unset
+        point_chat_temp_files(env)
+        if rec.role == locked.LOCKED_ROLE:
+            # A locked chat gets none of the deck setup below: no identity, no gh
+            # shim, no git credential helper (#4343).
+            env = locked.lock_env(env)
+            scope_unit, scope_prefix = await self._memory_scope(key)
+            return (
+                env,
+                scope_unit,
+                scope_prefix,
+                self._locked_command(rec, resume_id=resume_id, model=model),
+            )
         env["AGENTDECK_GH_CONSUMER"] = f"{self.account.key}:{key}"
         env[CONTEXT_DIR_ENV] = str(self._artifact_root)
         env[ACCOUNT_KEY_ENV] = self.account.key
@@ -3654,7 +3801,6 @@ class ClaudeWorkerHost:
         # GitHub, so a worker cannot spend the reserve the poller holds for its
         # own wakes (#814). Writes still reach the real binary untouched.
         env["PATH"] = gh_shim.worker_path(env)
-        point_chat_temp_files(env)
         # Every GitHub push and fetch goes through AgentDeck's credential helper,
         # which answers per repository owner with a non-human authority and
         # refuses everything else; no inherited token survives (#2289).
@@ -3689,6 +3835,32 @@ class ClaudeWorkerHost:
             cut=cut,
         )
         return env, scope_unit, scope_prefix, command
+
+    def _locked_command(
+        self, rec: WorkerRecord, *, resume_id: str | None, model: str | None
+    ) -> list[str]:
+        """A locked chat's argv, from limits checked again on this very spawn.
+
+        The host's mode, bypass switch, deck guide and hook settings never apply. The
+        page reader's MCP config is rewritten and read back and the folder's
+        ``.mcp.json`` read each time, so a cleaned-up artifact directory or a missing
+        file refuses the spawn instead of starting the chat without its limits.
+        """
+        try:
+            fetch = locked.write_fetch_config(self._artifact_root)
+            servers = locked.mcp_servers(rec.cwd)
+        except locked.LockedChatRefused as exc:
+            raise WorkerError(f"locked chat refused: {exc}") from exc
+        return locked.command(
+            rec.cwd,
+            fetch,
+            servers,
+            model=model or rec.model,
+            resume_id=resume_id,
+            resume_at=(
+                rec.resume_at if resume_id and resume_id == rec.resume_at_session else None
+            ),
+        )
 
     async def _launch(
         self,
@@ -4172,7 +4344,8 @@ class ClaudeWorkerHost:
                 retry_delay = _transient_failure_retry_delay(event)
                 if not rec.last_result_limit_reset_at and retry_delay is not None:
                     # Not a quota, but the same remedy: the deck continues the chat once
-                    # the network or the sign-in has had time to come back (#3086, #3165).
+                    # the network, the sign-in or the API has had time to come back (#3086,
+                    # #3165, #4324).
                     rec.last_result_limit_reset_at = rec.last_result_at + retry_delay
                 if subtype != RESULT_ABORTED:
                     # The turn really ended, so this chat owes nothing. An aborted

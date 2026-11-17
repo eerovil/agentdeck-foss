@@ -184,6 +184,11 @@
     // unsent text, a typed amount, an attached screenshot, a ticked answer, an
     // open panel, the caret itself, or the place they scrolled to.
     function workInProgress() {
+      // A page may hold its reload for a while of its own: the kiosk page holds it at
+      // night (kiosk.js, #4417), and it goes ahead once the hold ends.
+      try {
+        if (window.AgentDeckHoldReload && window.AgentDeckHoldReload()) return true;
+      } catch (_) {}
       if (composingMessage() || editingControl() || openEditingPanel() ||
           changedField() || readingHistory()) return true;
       // Extra desktop chats live in same-origin frames so their forms and live
@@ -259,6 +264,7 @@
   <script src="/static/chat_notes.js?v={{ asset_ver }}" defer></script>
   <script src="/static/message_collapse.js?v={{ asset_ver }}" defer></script>
   <script src="/static/side_chat.js?v={{ asset_ver }}" defer></script>
+  <script src="/static/side_chat_panel.js?v={{ asset_ver }}" defer></script>
   <script src="/static/rollback.js?v={{ asset_ver }}" defer></script>
   <script src="/static/session_navigation.js?v={{ asset_ver }}" defer></script>
   <script src="/static/session_panels.js?v={{ asset_ver }}" defer></script>
@@ -865,8 +871,100 @@
       setFiles(input, Array.from(input.files || []).concat(pasted));
       textarea.focus();
     });
+    // The browser's file picker replaces the field's files with its own pick, so a pasted
+    // screenshot or an earlier pick vanished when a file was picked next (#4425). What the
+    // field held when the picker opened is kept and the pick added to it. Only the
+    // person's own pick (a trusted change) adds; a change this page makes, such as
+    // clearing the field after a send, stays as it is. Nothing is dropped as a duplicate:
+    // a browser cannot tell two same-named files apart, so a repeat shows twice and × takes
+    // one away.
+    var beforePick = new WeakMap();
+    document.addEventListener('click', function (event) {
+      var input = event.target;
+      if (input.matches && input.matches('input[type="file"][name="images"]')) {
+        beforePick.set(input, Array.from(input.files || []));
+      }
+    }, true);
+    document.addEventListener('cancel', function (event) {
+      if (event.target.matches && event.target.matches('input[type="file"][name="images"]')) {
+        beforePick.delete(event.target);
+      }
+    }, true);
     document.addEventListener('change', function (event) {
-      if (event.target.matches('input[type="file"][name="images"]')) renderAttachments(event.target);
+      var input = event.target;
+      if (!input.matches('input[type="file"][name="images"]')) return;
+      var kept = beforePick.get(input);
+      beforePick.delete(input);
+      if (event.isTrusted && kept && kept.length) {
+        setFiles(input, kept.concat(Array.from(input.files || [])));
+        return; // setFiles' own change event draws the previews
+      }
+      renderAttachments(input);
+    });
+
+    // 📋 reads an image straight from the clipboard in one tap (#4345). Chrome asks once
+    // for clipboard access; a browser that cannot read it never shows the button.
+    if (window.isSecureContext && navigator.clipboard && navigator.clipboard.read) {
+      document.documentElement.classList.add('can-read-clipboard');
+      // Where Chrome says what was copied without reading it (the clipboardchange event),
+      // 📋 shows only once an image was copied. Chrome sends that event only once the page
+      // may read the clipboard or the person has touched it, so 📋 stays shown until a
+      // report can arrive: the clipboard-read permission is granted, or a report came.
+      // A copy made before then goes unseen; nothing reads the clipboard to find out,
+      // because Android notes every such read.
+      if (window.ClipboardChangeEvent && navigator.clipboard.addEventListener) {
+        var root = document.documentElement;
+        navigator.clipboard.addEventListener('clipboardchange', function (event) {
+          var types = Array.from(event.types || []);
+          root.classList.add('clipboard-watch');
+          root.classList.toggle('clipboard-has-image',
+            types.some(function (t) { return imageTypes.test(t); }));
+        });
+        if (navigator.permissions && navigator.permissions.query) {
+          navigator.permissions.query({ name: 'clipboard-read' }).then(function (status) {
+            if (status.state === 'granted') root.classList.add('clipboard-watch');
+          }).catch(function () {});
+        }
+      }
+    }
+    function clipboardNote(button, text) {
+      var old = document.querySelector('.clipboard-image-note');
+      if (old) old.remove();
+      var note = document.createElement('span');
+      note.className = 'clipboard-image-note';
+      note.setAttribute('role', 'status');
+      note.textContent = text;
+      var rect = button.getBoundingClientRect();
+      note.style.left = Math.max(8, Math.min(rect.left, window.innerWidth - 220)) + 'px';
+      note.style.top = Math.max(8, rect.top - 36) + 'px';
+      document.body.appendChild(note);
+      setTimeout(function () { note.remove(); }, 2500);
+    }
+    document.addEventListener('click', function (event) {
+      var button = event.target.closest('[data-clipboard-image]');
+      var input = button && imageInput(button.form);
+      if (!input) return;
+      event.preventDefault();
+      navigator.clipboard.read().then(function (items) {
+        return Promise.all(items.map(function (item) {
+          var type = item.types.find(function (t) { return imageTypes.test(t); });
+          return type && item.getType(type).then(function (blob) {
+            var ext = type.split('/')[1].replace('jpeg', 'jpg');
+            return new File([blob], 'clipboard-' + Date.now() + '.' + ext, { type: type });
+          });
+        }));
+      }).then(function (files) {
+        files = files.filter(Boolean);
+        if (!files.length) { clipboardNote(button, 'No image in the clipboard'); return; }
+        setFiles(input, Array.from(input.files || []).concat(files));
+        // The read was allowed, so later copies are reported; the image is still there.
+        if (window.ClipboardChangeEvent) {
+          document.documentElement.classList.add('clipboard-watch', 'clipboard-has-image');
+        }
+      }).catch(function (error) {
+        clipboardNote(button, error && error.name === 'NotAllowedError'
+          ? 'Clipboard access is blocked for this site' : 'Could not read the clipboard');
+      });
     });
   })();
 
@@ -879,6 +977,8 @@
       return form && form.querySelector('textarea[name="message"]');
     }
     function draftKey(input) {
+      // A box that sends somewhere else for now names its own draft (the side chat, #4313).
+      if (input.dataset.draftKey) return DRAFT_PREFIX + input.dataset.draftKey;
       var action = input.form && input.form.getAttribute('hx-post');
       return DRAFT_PREFIX + (action || location.pathname);
     }
@@ -1024,7 +1124,11 @@
         // Focus belongs to the turn the person is in. Only their own send moves
         // it; a background status poll landing seconds later must not pull the
         // caret (and the mobile keyboard) back to a composer they left.
-        if (keepFocus) input.focus();
+        // Voice mode sends by pressing Send for the person: moving the caret
+        // into the box then would open the phone keyboard over the page
+        // (#4354). A caret the person put there themselves stays, since
+        // emptying the box does not blur it.
+        if (keepFocus && !document.documentElement.classList.contains('voice-on')) input.focus();
       }
       var images = form.querySelector('input[type="file"][name="images"]');
       var currentImages = Array.from((images && images.files) || []);

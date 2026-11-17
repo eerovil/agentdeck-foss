@@ -304,6 +304,16 @@ MIGRATIONS = (
         (("scheduled_messages", "interaction_answer", "TEXT"),),
     ),
     Migration(21, "drop shipped_follow_ups", (), _drop_shipped_follow_ups),
+    Migration(
+        22,
+        "a chat's one side chat in its message box",
+        (
+            ("chat_forks", "kind", "TEXT"),
+            ("chat_forks", "cut_ref", "TEXT"),
+            ("chat_forks", "seen_session_key", "TEXT"),
+            ("chat_forks", "seen_seq", "INTEGER"),
+        ),
+    ),
 )
 
 

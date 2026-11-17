@@ -143,6 +143,82 @@ async def test_a_work_with_an_open_or_unread_blocker_is_not_started(blockers, ou
     assert asked == ([(ISSUE, 7, {"labels": ["agent"]})] if outcome == "started" else [])
 
 
+async def test_a_deployed_blocker_is_done_and_an_unread_set_blocks(monkeypatch):
+    """#4384: a blocker whose Work is deployed and waits for a try counts as done for every
+    start the deck makes and the Start button; an unread set keeps every blocker blocking."""
+    rows = [
+        {"repository": "Acme/X", "number": 5, "state": "open"},
+        {"repository": "acme/x", "number": 6, "state": "closed"},
+    ]
+
+    async def read(repository, number, kind):
+        assert kind == "blocked_by"
+        return rows
+
+    monkeypatch.setattr(work_signals, "read_dependencies", read)
+    deployed = lambda: {"github_issue:acme/x#5"}  # noqa: E731
+
+    def unread():
+        raise OSError("database is locked")
+
+    # The id ``blocker_done`` builds is a Work's own (it spells it out, #4384).
+    assert work_signals.blocker_done(rows[0], {WorkRef("Acme/X", 5).work_id})
+    assert await work_signals.open_blockers("acme/x", 7) == ["Acme/X#5"]
+    assert await work_signals.open_blockers("acme/x", 7, deployed=deployed) == []
+    assert await work_signals.open_blockers("acme/x", 7, deployed=unread) == ["Acme/X#5"]
+    assert await work_signals.open_blockers("acme/x", 7, deployed=lambda: ()) == ["Acme/X#5"]
+    asked = []
+
+    async def runtime(repository, number, **kwargs):
+        asked.append(number)
+        return "started"
+
+    blockers = lambda repository, number: work_signals.open_blockers(  # noqa: E731
+        repository, number, deployed=deployed
+    )
+    assert await start_unless_blocked(runtime, "acme/x", 7, blockers=blockers) == "started"
+    blockers = lambda repository, number: work_signals.open_blockers(  # noqa: E731
+        repository, number, deployed=unread
+    )
+    assert await start_unless_blocked(runtime, "acme/x", 7, blockers=blockers) == (
+        "waits on a blocker"
+    )
+    assert asked == [7]
+
+
+async def test_the_start_names_each_open_blockers_merged_pull_request(monkeypatch, tmp_path):
+    """#4398: a Work started while a blocker is open, because the blocker's pull request
+    merged, is told which merge and to build on that pull request's own repository and
+    branch, which need not be its own; nothing is said with none, or when unread."""
+    from agentdeck.db import Db
+
+    db = Db(tmp_path / "control.db")
+    app = SimpleNamespace(state=SimpleNamespace(control_db=db))
+    rows = [
+        {"repository": "Acme/Issues", "number": 2, "state": "open"},
+        {"repository": "acme/issues", "number": 3, "state": "closed"},
+        {"repository": "acme/issues", "number": 4, "state": "open"},
+    ]
+
+    async def read(repository, number, kind):
+        assert (repository, number, kind) == ("acme/issues", 8, "blocked_by")
+        if rows is None:
+            raise RuntimeError("gh is down")
+        return rows
+
+    monkeypatch.setattr(work_signals, "read_dependencies", read)
+    assert await work_start._merged_blockers_text(app, "acme/issues", 8) == ""
+    assert db.note_merged_pull("github_issue:acme/issues#2", "acme/robot#68", "main")
+    # A closed blocker's merge is not news: it counts as done by its close.
+    assert db.note_merged_pull("github_issue:acme/issues#3", "acme/robot#60", "main")
+    assert await work_start._merged_blockers_text(app, "acme/issues", 8) == (
+        "Its blocker Acme/Issues#2 is still open, but its pull request acme/robot#68 merged "
+        "into `main`: fetch acme/robot (`git fetch origin`) and build on its `origin/main`."
+    )
+    rows = None
+    assert await work_start._merged_blockers_text(app, "acme/issues", 8) == ""
+
+
 async def test_a_retry_after_a_refusal_waits_on_a_blocker_added_since(root):
     """#4216 review: the first start was refused, a blocker was added before the retry, and
     the retry must not start the agent; it is dropped, as the last blocker closing starts it.
@@ -1701,3 +1777,14 @@ async def test_the_start_sign_is_a_rocket_and_one_marked_comment(monkeypatch):
     found = await work_signals.latest_comment(ISSUE, 7, "2026-10-16T09:50:48Z", "eerovil")
     assert found["body"] == "mine"
     assert calls[-1][0][-1].endswith("issues/7/comments?since=2026-10-16T09:50:48Z&per_page=100")
+
+    # #4422: a stopped review chat's reason is the comment its count names, whoever wrote it.
+    async def page(argv, *, timeout, stdin=None, repo=None, owner=None):
+        calls.append((list(argv[1:]), stdin))
+        return 0, json.dumps(comments[1:2]).encode(), b""  # GitHub's one-comment page 2
+
+    monkeypatch.setattr(work_signals.gh_cli, "run_once", page)
+    found = await work_signals.newest_comment(ISSUE, 7, 2)
+    assert found["body"] == "theirs"
+    assert calls[-1][0][-1].endswith("issues/7/comments?per_page=1&page=2")
+    assert await work_signals.newest_comment(ISSUE, 7, 0) is None

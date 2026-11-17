@@ -2349,7 +2349,17 @@ async def test_the_runtime_accepts_lists_and_refuses_unknown_jobs(tmp_path):
         refused = await client.post(
             "/jobs", json={"command": [], "cwd": str(tmp_path), "session_key": None, "label": ""}
         )
+        # #4399: a rerun takes no command but a light pull request's ``bin/test.sh``.
+        rerun = {"work_id": "github_issue:o/r#1", "repository": "o/r", "head": "a" * 40}
+        other = await client.post(
+            "/jobs/rerun-verification", json={**rerun, "command": ["sh", "-c", "x"]}
+        )
+        script = await client.post(
+            "/jobs/rerun-verification", json={**rerun, "command": ["bin/test.sh"]}
+        )
 
+    assert other.status_code == 400
+    assert script.status_code == 200 and script.json() == {"job": None}
     assert submitted.status_code == 200
     assert submitted.json()["state"] == QUEUED
     assert [job["id"] for job in listed.json()["jobs"]] == [submitted.json()["id"]]
