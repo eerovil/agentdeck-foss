@@ -3761,7 +3761,7 @@ async def test_voice_mode_listens_and_speaks_through_the_host(tmp_path):
         await context.add_init_script(_FAKE_MICROPHONE)
         page = await context.new_page()
         await page.clock.install()
-        sent, said, phrases = [], [], []
+        sent, said, phrases, seconds = [], [], [], []
         host = {"up": True, "fail": 0}
         heard = [{"text": "lisää testi", "language": "fi"}]
 
@@ -3779,6 +3779,9 @@ async def test_voice_mode_listens_and_speaks_through_the_host(tmp_path):
         async def transcribe(route):
             query = route.request.url.partition("?")[2]
             phrases.append((query, route.request.post_data_buffer[:4]))
+            # Each phrase's length of audio, at the WAV's 16-bit mono byte rate.
+            body = route.request.post_data_buffer
+            seconds.append((len(body) - 44) / int.from_bytes(body[28:32], "little"))
             if not host["up"] or host["fail"]:
                 host["fail"] = max(0, host["fail"] - 1)
                 await route.fulfill(status=503, body="{}", content_type="application/json")
@@ -3977,6 +3980,10 @@ async def test_voice_mode_listens_and_speaks_through_the_host(tmp_path):
                 break
             await page.wait_for_timeout(100)
         long_posts = len(phrases) - long_asked
+        # Sound back inside a pause drops the pass asked early in it (#3765): a dip
+        # in the fake microphone's audio on a loaded host can post one of those
+        # before the last, which still holds the whole sentence (#4448).
+        long_seconds = seconds[long_asked:]
         await after_ack(acked)
         acked = len(said)
         # Louder noise after a short phrase (0.5 then 0.2) ends it too; the noise
@@ -4112,8 +4119,13 @@ async def test_voice_mode_listens_and_speaks_through_the_host(tmp_path):
         ("source=voice&language=fi&mic=" + mic, b"RIFF"),
         ("source=voice&language=en&mic=" + mic, b"RIFF"),
     ]
-    # The crashed phrase is sent twice; the last one once and three retries.
-    assert [long_asked - before_crash, long_posts, noisy_posts] == [2, 1, 1]
+    # The crashed phrase is sent twice; the long one is not cut: the phrase that ends
+    # it holds all its 6 s, and any early pass before it is only a start of it, never
+    # the sentence again; the last one once and three retries.
+    assert long_asked - before_crash == 2
+    assert long_posts >= 1 and long_seconds[-1] >= 6, long_seconds
+    assert all(early < long_seconds[-1] - 1 for early in long_seconds[:-1]), long_seconds
+    assert noisy_posts == 1
     assert len(phrases) - before_down == 4
     assert noise_sends == [True, True, True]
     assert len(sent) == 10

@@ -774,6 +774,11 @@ CHECK_TESTS = "check_tests"
 #: (a non-empty string) and the review point's limit (a positive integer, beside it only).
 LIGHT_REVIEW = "light_review"
 LIGHT_REVIEW_LIMIT = "light_review_limit"
+#: A ``[[repos]]`` key the deck's release alone reads (#4445): the words of the commit status or
+#: deployment environment that is this repository's production deploy, such as Drone's
+#: ``promote/production``. The deploy wait the deck registers on a merge is named by it, so it
+#: reads commit statuses and counts a later deploy that contains the merge.
+DEPLOY_NAME = "deploy_name"
 _AUTO_RELEASE_CAPABILITIES = ("guarded_release", "merge_review")
 
 
@@ -1356,6 +1361,20 @@ def _parse_repos(raw: object, report: Report) -> tuple[Repo, ...]:
                 f"{location}.{LIGHT_REVIEW_LIMIT}",
                 "must be a positive whole number, and only beside light_review",
                 "set it to how many light merges come before the review point (default 15)",
+            )
+        # Read by the deck's release alone (#4445), as ``check_tests`` is.
+        deploy_name = entry.get(DEPLOY_NAME)
+        if deploy_name is not None and (
+            not isinstance(deploy_name, str)
+            or not re.search(r"\w", deploy_name)
+            or not flags["auto_deploys"]
+        ):
+            report.add(
+                f"{location}.{DEPLOY_NAME}",
+                "must be the production deploy's status or environment name, and only beside"
+                " auto_deploys",
+                'set it to the words of the deploy\'s commit status, for example'
+                ' "promote/production"',
             )
         repo = Repo(
             id=repo_id,

@@ -130,9 +130,10 @@ def test_a_run_stops_at_a_persons_step_with_what_to_ask_and_what_to_run(monkeypa
     )
 
 
-def test_on_macos_the_services_are_launchd_agents(tmp_path):
-    """macOS has no systemd: the web supervisor, the runtime and the poller instance become
-    launchd agents with the PATH Homebrew's tools need, loaded fresh on a rerun."""
+def test_on_macos_the_services_are_launchd_agents(tmp_path, monkeypatch):
+    """macOS has no systemd: the web supervisor, the runtime, the Work services (#4454) and
+    the poller instance become launchd agents with the PATH Homebrew's tools need, loaded
+    fresh on a rerun; the repair adds only a job launchd is not running."""
     import plistlib
     import subprocess
 
@@ -140,8 +141,7 @@ def test_on_macos_the_services_are_launchd_agents(tmp_path):
 
     repo, root = Path("/opt/agentdeck"), tmp_path / "poller"
     jobs = [
-        launchd.runtime_job(repo, tmp_path),
-        launchd.web_job(repo, tmp_path),
+        *launchd.deck_jobs(repo, tmp_path),
         launchd.poller_job(repo, tmp_path, root, "agent-tasks"),
     ]
     calls: list[list[str]] = []
@@ -171,8 +171,43 @@ def test_on_macos_the_services_are_launchd_agents(tmp_path):
         "agent-tasks",
     ]
     assert poller["StartInterval"] == 120
-    assert [c[1] for c in calls] == ["bootout", "bootstrap"] * 3
+    services = plistlib.loads((agents / "com.agentdeck.services.plist").read_bytes())
+    assert services["ProgramArguments"] == ["/opt/agentdeck/.venv/bin/agentdeck", "services"]
+    assert services["KeepAlive"] is True
+    assert services["ExitTimeOut"] == 90
+    assert services["EnvironmentVariables"]["GIT_TERMINAL_PROMPT"] == "0"
+    assert services["StandardOutPath"] == str(tmp_path / "Library/Logs/agentdeck/services.log")
+    assert "XDG_RUNTIME_DIR" not in services["EnvironmentVariables"]  # the web's socket path
+    assert [c[1] for c in calls] == ["bootout", "bootstrap"] * 4
     assert len(failures) == 1 and "poller.agent-tasks" in failures[0]
+
+    # A Mac set up before the services job: only that one is installed, nothing is unloaded.
+    (agents / "com.agentdeck.services.plist").unlink()
+    calls.clear()
+
+    def running(command):
+        calls.append(command)
+        missing = command[1] == "print" and command[-1].endswith("com.agentdeck.services")
+        return subprocess.CompletedProcess(command, 113 if missing else 0, "", "")
+
+    installed, failures = launchd.install_missing(
+        launchd.deck_jobs(repo, tmp_path), tmp_path, run=running
+    )
+    assert installed == ["com.agentdeck.services"] and failures == []
+    assert [c[1] for c in calls] == ["print"] * 3 + ["bootout", "bootstrap"]
+    assert calls[-2][-1].endswith("/com.agentdeck.services")
+    assert (agents / "com.agentdeck.services.plist").exists()
+    # An unknown answer is not "missing": nothing is unloaded, the failure is said.
+    calls.clear()
+    installed, failures = launchd.install_missing(
+        launchd.deck_jobs(repo, tmp_path),
+        tmp_path,
+        run=lambda c: calls.append(c) or subprocess.CompletedProcess(c, 5, "", "I/O error"),
+    )
+    assert installed == [] and len(failures) == 3 and {c[1] for c in calls} == {"print"}
+    # The command itself refuses off a Mac, naming the systemd unit instead.
+    monkeypatch.setattr("sys.platform", "linux")
+    assert launchd.main([]) == 2
 
 
 def test_an_app_that_reaches_too_far_is_sent_back_to_the_person():

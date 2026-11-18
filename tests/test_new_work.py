@@ -222,7 +222,9 @@ def _router(filed: list | None = None, filing: list | None = None):
     return SimpleNamespace(
         starts_on=lambda repository, labels: "agent" if "agent" in labels else "",
         filing=held,
-        note_filed=lambda *args: filed.append(args) or True if filed is not None else True,
+        note_filed=lambda *args, assignee="": (
+            filed.append((*args, assignee)) or True if filed is not None else True
+        ),
     )
 
 
@@ -351,6 +353,7 @@ async def test_the_agent_starts_before_github_answers_and_the_receipt_links_its_
 async def test_with_no_early_start_the_work_starts_once_the_issue_exists(tmp_path, monkeypatch):
     """No account or spare could start early: the usual start, as #3371 made it."""
     from agentdeck import work_start
+    from agentdeck.web import routes_works
 
     app, _gh = _app(tmp_path, monkeypatch)
     filed: list = []
@@ -360,11 +363,13 @@ async def test_with_no_early_start_the_work_starts_once_the_issue_exists(tmp_pat
         return None
 
     monkeypatch.setattr(work_start, "start_before_issue", start_before_issue)
+    # Filed to this deck's person, which the router's start is told too (#4455).
+    monkeypatch.setattr(routes_works, "own_assignee", lambda repository, claims: "me")
 
     response, _replay = await _post_and_settle(app)
 
     assert "its Work is starting" in response.text and "data-new-work-chat" in response.text
-    assert filed == [("eerovil/agentdeck", 77, ["agent", "spec-only"])]
+    assert filed == [("eerovil/agentdeck", 77, ["agent", "spec-only"], "me")]
 
 
 def _startable(app, monkeypatch):
@@ -609,11 +614,18 @@ def test_an_issue_the_shim_filed_starts_only_on_its_labels_read_back_from_github
     app.state.work_router = SimpleNamespace(
         switched=lambda repository: repository == "eerovil/agentdeck",
         # As the real router: only the start label starts anything.
-        note_filed=lambda *args: "agent" in args[2] and (filed.append(args) or True),
+        note_filed=lambda *args, assignee="": "agent" in args[2]
+        and (filed.append((*args, assignee)) or True),
     )
     now = datetime.now(UTC)
     records = {
-        78: {"state": "OPEN", "is_pr": False, "labels": ["agent"], "updatedAt": now.isoformat()},
+        78: {
+            "state": "OPEN",
+            "is_pr": False,
+            "labels": ["agent"],
+            "updatedAt": now.isoformat(),
+            "assignee": "Me",
+        },
         79: {"state": "OPEN", "is_pr": False, "labels": [], "updatedAt": now.isoformat()},
         80: {
             "state": "OPEN",
@@ -644,7 +656,8 @@ def test_an_issue_the_shim_filed_starts_only_on_its_labels_read_back_from_github
         "issue": "https://github.com/eerovil/agentdeck/issues/78",
         "starting": True,
     }
-    assert filed == [("eerovil/agentdeck", 78, ["agent"])]
+    # With its assignee read back, so the router starts it only where it is this deck's (#4455).
+    assert filed == [("eerovil/agentdeck", 78, ["agent"], "me")]
     # Unlabelled on GitHub, old, or closed: nothing starts, whatever the caller claimed.
     for number in (79, 80, 81):
         assert post(f"eerovil/agentdeck#{number}")["starting"] is False

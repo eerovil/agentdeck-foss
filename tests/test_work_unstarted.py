@@ -8,6 +8,7 @@ as on any labelled issue.
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 from test_work_actions import _Gh
@@ -206,6 +207,44 @@ def test_a_chat_starts_an_issue_with_its_projects_own_label(tmp_path, monkeypatc
     gh = _Gh((0, b"", b""), (0, b"", b""))
     monkeypatch.setattr(gh_cli, "run_once", gh)
     assert client.post("/api/works/acme/tickets/7/start").status_code == 200
+
+    # Where the deck's Work router runs it, the router is asked to start it, with its labels
+    # and first assignee: GitHub sends no event for a label or an assignee already there, so
+    # nothing else would before the backstop (#4455). "started" is the router's answer.
+    asked: list = []
+    taken = [True]
+    before = getattr(app.state, "work_router", None)
+    app.state.work_router = SimpleNamespace(
+        switched=lambda repository: repository == "acme/tickets",
+        note_filed=lambda *args, assignee="": asked.append((*args, assignee)) or taken[0],
+    )
+    records[7] = {"state": "OPEN", "assignee": "ME", "labels": ["claude", "bug"]}
+    gh = _Gh((0, b"", b""), (0, b"", b""))
+    monkeypatch.setattr(gh_cli, "run_once", gh)
+    again = client.post("/api/works/acme/tickets/7/start").json()
+    assert again["started"] is True
+    assert asked == [("acme/tickets", 7, ["claude", "bug"], "me")]
+    # Labelled but nobody's yet: the label is added and the assignee is this deck's.
+    records[7] = {"state": "OPEN", "assignee": "", "labels": []}
+    gh = _Gh((0, b"", b""), (0, b"", b""))
+    monkeypatch.setattr(gh_cli, "run_once", gh)
+    assert client.post("/api/works/acme/tickets/7/start").json()["started"] is True
+    assert asked[-1] == ("acme/tickets", 7, ["claude"], "me")
+    # The router starts nothing: never a quiet "started".
+    taken[0] = False
+    gh = _Gh((0, b"", b""), (0, b"", b""))
+    monkeypatch.setattr(gh_cli, "run_once", gh)
+    refused = client.post("/api/works/acme/tickets/7/start").json()
+    assert refused["started"] is False and "did not take its start" in refused["detail"]
+    # An open blocker: the router is not asked; the last blocker's close starts it.
+    app.state.open_blockers = blocked
+    gh = _Gh((0, b"", b""), (0, b"", b""))
+    monkeypatch.setattr(gh_cli, "run_once", gh)
+    calls = len(asked)
+    assert client.post("/api/works/acme/tickets/7/start").json()["started"] is False
+    assert len(asked) == calls
+    app.state.open_blockers = _no_blockers
+    app.state.work_router = before
 
     # Not this deck's to start: refused before any write, never a quiet "started" (#4142).
     gh = _Gh()

@@ -405,6 +405,11 @@ class Policy:
     #: The repositories whose merges deploy by themselves (``auto_deploys``), lowercased
     #: ``owner/repo``: the message after a merge says how to wait for that deploy (#3141).
     deploys: frozenset[str] = frozenset()
+    #: The production deploy's name in each of ``deploys`` that gives one (``[[repos]]
+    #: deploy_name``, #4445), by lowercased ``owner/repo``: the deck's deploy wait on a merge
+    #: there is named by it, so it reads commit statuses and counts a later deploy containing
+    #: the merge.
+    deploy_names: tuple[tuple[str, str], ...] = ()
     #: The manifest's ``[staging]`` (#3180): its branch copies (``StagingSite``), and the
     #: repositories, lowercased ``owner/repo``, that deploy into them.
     staging: object | None = None
@@ -3962,7 +3967,11 @@ class WorkReleaseService:
             if repository == DECK_REPOSITORY:
                 bodies.append({"deck_deploy": sha})
             else:
-                bodies.append({"deployment": f"{repository}@{sha}"})
+                body = {"deployment": f"{repository}@{sha}"}
+                name = dict(policy.deploy_names).get(repository, "")
+                if name:
+                    body["name"] = name
+                bodies.append(body)
         text = _live_check_text(policy, refs, shipped, waited=True)
         try:
             stored = self.ports.wait_deploy(chat, refs, bodies, text)

@@ -113,6 +113,11 @@ holds_issues = true
 holds_code = true
 verification = "agentdeck_job"  # required on every code repository; see below (#2832)
 auto_deploys = true
+# Optional beside `auto_deploys` (#4445): part of the name of the status or deployment that
+# deploys it to production, such as "promote/production". The deck's deploy wait after a merge
+# then waits for that name, and a success of it on a later commit that contains the merge counts
+# too: a merge whose own build was killed still wakes the chat when the next one ships it.
+# deploy_name = "promote/production"
 
 # Where this project's screenshot evidence is committed (#1791). This change proposes a fourth
 # role: `holds_artifacts = true` on exactly one repository sends every worker's screenshots

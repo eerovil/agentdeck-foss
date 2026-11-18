@@ -770,11 +770,7 @@ def step_services(instance_id: str) -> None:
         home = Path.home()
         root = Path(poller_host.DEFAULT_ROOT).expanduser()
         failures = launchd.install(
-            [
-                launchd.runtime_job(REPO, home),
-                launchd.web_job(REPO, home),
-                launchd.poller_job(REPO, home, root, instance_id),
-            ],
+            [*launchd.deck_jobs(REPO, home), launchd.poller_job(REPO, home, root, instance_id)],
             home,
         )
         if failures:

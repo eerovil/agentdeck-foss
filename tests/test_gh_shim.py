@@ -716,6 +716,76 @@ def test_an_issue_filed_in_a_managed_repository_gains_its_ownership_label(
     assert "AGENTDECK_NO_OWNER_LABEL=1" in captured.err
 
 
+def test_an_issue_filed_where_another_deck_takes_unassigned_ones_is_filed_to_this_deck(
+    shim, tmp_path, capsys
+):
+    """#4455: filed to nobody, the other deck would start it; filed to this deck's person."""
+    _managed(tmp_path)
+    accounts = tmp_path / "github-authority.toml"
+    accounts.write_text('[owners]\no = "agent"\n\n[deck]\nperson = "me"\n', encoding="utf-8")
+    overlay = tmp_path / "poller" / "instances" / "proj" / "overlay.toml"
+    overlay.write_text("[claims]\nunassigned = false\n", encoding="utf-8")
+    shim.answer = "https://github.com/o/r/issues/9\n"
+
+    assert main.main(["issue", "create", "--title", "t"]) == 0
+    assert shim.reads[-1] == [
+        "issue", "create", "--title", "t", "--label", "agent", "--assignee", "me",
+    ]
+    assert "assigned it to me" in capsys.readouterr().err
+
+    # The filer's own assignee stands, in any spelling.
+    for given in (["--assignee", "you"], ["-a", "you"], ["--assignee=you"], ["-ayou"]):
+        assert main.main(["issue", "create", "--title", "t", *given]) == 0
+        assert shim.reads[-1] == ["issue", "create", "--title", "t", *given, "--label", "agent"]
+    # A title that only starts with `-a` names no assignee.
+    assert main.main(["issue", "create", "--title", "-a b"]) == 0
+    assert shim.reads[-1][-2:] == ["--assignee", "me"]
+    # Filed with no start label it is still this deck's: whoever labels it later, the other
+    # deck would start it.
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv("AGENTDECK_NO_OWNER_LABEL", "1")
+        assert main.main(["issue", "create", "--title", "t"]) == 0
+        assert shim.reads[-1] == ["issue", "create", "--title", "t", "--assignee", "me"]
+
+    # GitHub refuses the assignee before creating anything: filed again without it.
+    calls = len(shim.calls)
+    original = shim.__class__.__call__
+
+    def refuse_assignee(self, argv, environment, *, stderr_seen=None, kind="", quiet=False):
+        if "--assignee" in argv and not (self.refuse_labels and "--label" in argv):
+            if stderr_seen is not None:
+                stderr_seen.append("could not assign user: 'me' not found\n")
+            self.calls.append(list(argv))
+            return (1, "")
+        return original(self, argv, environment, stderr_seen=stderr_seen, kind=kind)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(shim.__class__, "__call__", refuse_assignee)
+        assert main.main(["issue", "create", "--title", "t"]) == 0
+    assert [call[-2:] for call in shim.calls[calls:]] == [
+        ["--assignee", "me"],
+        ["--label", "agent"],
+    ]
+    assert "filing again without assignee me" in capsys.readouterr().err
+    # Both refused, the label reported first: each is dropped once and the issue filed.
+    calls = len(shim.calls)
+    shim.refuse_labels = True
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(shim.__class__, "__call__", refuse_assignee)
+        assert main.main(["issue", "create", "--title", "t"]) == 0
+    shim.refuse_labels = False
+    assert [call[4:] for call in shim.calls[calls:]] == [
+        ["--label", "agent", "--assignee", "me"],
+        ["--assignee", "me"],
+        [],
+    ]
+
+    # A deck that takes unassigned issues here assigns nobody.
+    overlay.write_text("[claims]\nunassigned = true\n", encoding="utf-8")
+    assert main.main(["issue", "create", "--title", "t"]) == 0
+    assert shim.reads[-1] == ["issue", "create", "--title", "t", "--label", "agent"]
+
+
 def test_a_filed_issue_is_told_to_the_deck_so_its_work_starts_now(
     shim, tmp_path, monkeypatch, capsys
 ):

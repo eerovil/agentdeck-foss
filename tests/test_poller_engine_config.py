@@ -807,6 +807,30 @@ def test_auto_deploy_without_code_is_refused(tmp_path):
     assert "manifest.repos[1].auto_deploys" in _locations(draft)
 
 
+@pytest.mark.parametrize(
+    ("extra", "refused"),
+    [
+        ('deploy_name = "promote/production"', False),
+        ('deploy_name = " "', True),
+        ('deploy_name = "/"', True),  # no words: the wait would refuse it
+        ("deploy_name = 3", True),
+    ],
+)
+def test_a_deploy_name_is_a_name_beside_auto_deploys(tmp_path, extra, refused):
+    """#4445: the production deploy's status name, read by the deck's release alone."""
+    draft = _inspect(tmp_path, manifest=_MANIFEST.replace(
+        'verification = "agentdeck_job"\n',
+        f'verification = "agentdeck_job"\n{extra}\n',
+        1,
+    ))
+    assert ("manifest.repos[0].deploy_name" in _locations(draft)) is refused
+    alone = _inspect(tmp_path, manifest=_MANIFEST.replace(
+        'holds_issues = true\nworkspace = "store"', 'holds_issues = true\nworkspace = "store"\n'
+        'deploy_name = "promote/production"', 1
+    ))
+    assert "manifest.repos[1].deploy_name" in _locations(alone), "only beside auto_deploys"
+
+
 def test_a_missing_repo_list_is_reported(tmp_path):
     bare = f"contract = {CONTRACT}\n[board]\norg = 'x'\nproject_number = 1\n"
     draft = _inspect(tmp_path, manifest=bare)

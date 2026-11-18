@@ -41,6 +41,7 @@ from .classify import (
     is_terminal,
     label_values,
     misplaced_start_label,
+    names_assignee,
     ownership_label_to_add,
     repo_identity,
     target_owner,
@@ -81,6 +82,8 @@ NO_OWNER_LABEL_ENV = "AGENTDECK_NO_OWNER_LABEL"
 # `gh issue create` refuses a label the repository lacks before it creates anything, so
 # this one refusal is safe to answer by filing again without the label (#2505).
 _LABEL_REFUSED = re.compile(r"could not add label", re.IGNORECASE)
+#: ``gh``'s answer when an assignee cannot be resolved, before anything is created.
+_ASSIGNEE_REFUSED = re.compile(r"could not assign user", re.IGNORECASE)
 
 # Every failed call, one JSON line each: which authority, installation and token spoke, and
 # what GitHub answered (#2714). Beside the metadata cache, so a test's cache is its log too.
@@ -358,31 +361,78 @@ def _warn_misplaced_label(argv: list[str], remote: str | None) -> None:
         )
 
 
+def _own_assignee(argv: list[str], remote: str | None) -> str:
+    """Who this ``gh issue create`` should be assigned to, or ``""`` for nobody (#4455).
+
+    Where another deck takes this project's unassigned issues, one filed here to nobody is
+    that deck's (once labelled, by anyone), so it is filed to this deck's person, as the
+    deck's own New work does (``work_claims.own_assignee``, #3731), unless the filer named
+    an assignee. Like the label, a failure here files the issue as written.
+    """
+    if names_assignee(argv):
+        return ""
+    try:
+        from .. import github_accounts, poller_ops, work_claims
+
+        root = github_accounts.poller_root()
+        repository = target_repo(argv, remote=remote)
+        person = github_authority.deck_person()
+        wanted = (github_authority.repository_of(repository) or "").lower()
+        if not person or not wanted:
+            return ""
+        elsewhere = poller_ops.work_unassigned_elsewhere(root)
+        if work_claims.mine("", person=person, takes_unassigned=wanted not in elsewhere):
+            return ""
+        return person
+    except Exception as exc:  # noqa: BLE001 — the assignee is a default, never a gate
+        _note(f"could not read whose deck takes unassigned issues ({exc}); filing as written")
+        return ""
+
+
 def _issue_create(
     argv: list[str],
     environment: dict[str, str],
     cache: GitHubMetadataCache,
     remote: str | None,
 ) -> int:
-    """File an issue, with the project's ownership label unless it opted out (#2505)."""
+    """File an issue, with the project's ownership label unless it opted out (#2505), and
+    to this deck's person where another deck takes unassigned issues (#4455).
+
+    Either addition GitHub refuses before creating anything is dropped and the issue filed
+    again without it, so a default never stops a filing."""
     label = _ownership_label(argv, environment, remote)
-    _record(cache, environment, "write")
-    if label is None:
-        code, stdout = _run_real(argv, environment, kind="write")
-    else:
+    assignee = _own_assignee(argv, remote)
+
+    def file() -> tuple[int, str, str]:
+        extra = ["--label", label] if label is not None else []
+        extra += ["--assignee", assignee] if assignee else []
         seen: list[str] = []
-        code, stdout = _run_real(
-            [*argv, "--label", label], environment, stderr_seen=seen, kind="write"
-        )
-        if code != 0 and not stdout.strip() and _LABEL_REFUSED.search("".join(seen)):
+        _record(cache, environment, "write")
+        code, stdout = _run_real([*argv, *extra], environment, stderr_seen=seen, kind="write")
+        return code, stdout, "".join(seen)
+
+    code, stdout, seen = file()
+    # Each refusal drops its own addition once, in whichever order GitHub reports them.
+    while code != 0 and not stdout.strip():
+        if assignee and _ASSIGNEE_REFUSED.search(seen):
+            _note(f"filing again without assignee {assignee}, which GitHub refused")
+            assignee = ""
+        elif label is not None and _LABEL_REFUSED.search(seen):
             _note(f"filing again without '{label}', which GitHub refused before creating anything")
-            _record(cache, environment, "write")
-            code, stdout = _run_real(argv, environment, kind="write")
-        elif code == 0:
-            _note(
-                f"added label '{label}' so the deck starts a Work on this issue; "
-                f"set {NO_OWNER_LABEL_ENV}=1 to file it without one"
-            )
+            label = None
+        else:
+            break
+        code, stdout, seen = file()
+    if label is not None and code == 0:
+        _note(
+            f"added label '{label}' so the deck starts a Work on this issue; "
+            f"set {NO_OWNER_LABEL_ENV}=1 to file it without one"
+        )
+    if assignee and code == 0:
+        _note(
+            f"assigned it to {assignee}: another deck takes this project's unassigned issues, "
+            "so this deck keeps it"
+        )
     sys.stdout.write(stdout)
     if code == 0:
         _tell_deck_filed(stdout, environment)

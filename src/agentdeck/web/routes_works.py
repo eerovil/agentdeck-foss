@@ -2193,6 +2193,7 @@ async def _settle_early_start(
     labels: list[str],
     reserved: bool,
     filed_at: float,
+    assignee: str = "",
 ) -> None:
     """After GitHub answered: bind the early start to its Work, or stop it (#3590).
 
@@ -2209,7 +2210,7 @@ async def _settle_early_start(
 
         def start_usual() -> None:
             if router_service is not None and number.isdigit():
-                router_service.note_filed(target.repository, int(number), labels)
+                router_service.note_filed(target.repository, int(number), labels, assignee=assignee)
 
         if early is None:
             if reserved:
@@ -2263,6 +2264,7 @@ def _settle_later(
     labels: list[str],
     guard: contextlib.AbstractContextManager,
     choice: Any = None,
+    assignee: str = "",
 ) -> None:
     """Hold the router no longer than the create (D19), then settle an early start off the
     request, so its receipt is not held up.
@@ -2296,7 +2298,9 @@ def _settle_later(
     if early_task is None:
         return
     settling = asyncio.create_task(
-        _settle_early_start(app, target, early_task, outcome, labels, reserved, filed_at)
+        _settle_early_start(
+            app, target, early_task, outcome, labels, reserved, filed_at, assignee=assignee
+        )
     )
     _EARLY_STARTS.add(settling)
     settling.add_done_callback(_EARLY_STARTS.discard)
@@ -2429,6 +2433,8 @@ async def file_new_work(request: Request) -> HTMLResponse:
             return _new_work_replay(request, pressed, labels)
         return refuse("that press was already made.", 409)
     router_service = getattr(request.app.state, "work_router", None)
+    # Filed to this deck's person where another deck takes unassigned issues (#3731).
+    assignee = own_assignee(target.repository, getattr(request.app.state, "deck_claims", None))
     early_task: asyncio.Task | None = None
     early = bool(router_service is not None and router_service.starts_on(target.repository, labels))
     # The agent starts while GitHub creates the issue (#3590); the router waits for it.
@@ -2457,16 +2463,18 @@ async def file_new_work(request: Request) -> HTMLResponse:
             attachments=attachments,
             chat_url=_new_work_chat_url(request, request.query_params.get("from", "")),
             on_body=start_early,
-            assignee=own_assignee(
-                target.repository, getattr(request.app.state, "deck_claims", None)
-            ),
+            assignee=assignee,
         )
     except BaseException:
         # Cut short (a deploy, a crash in the filing): an early agent only waits.
         cut = new_work.Outcome("uncertain", "the filing was cut short")
-        _settle_later(request.app, target, early_task, cut, labels, guard, choice)
+        _settle_later(
+            request.app, target, early_task, cut, labels, guard, choice, assignee=assignee
+        )
         raise
-    _settle_later(request.app, target, early_task, outcome, labels, guard, choice)
+    _settle_later(
+        request.app, target, early_task, outcome, labels, guard, choice, assignee=assignee
+    )
     issues_url = f"https://github.com/{target.repository}/issues"
     if outcome.state == "uncertain":
         # Left unsettled, as a Work action's uncertain write is: the table holds only
@@ -3204,8 +3212,11 @@ def _waiting_text(text: str, waits: list[str]) -> str:
     return text.replace("so an agent starts on it", f"so an agent starts on it {when}")
 
 
-async def _start_refusal(request: Request, ref: WorkRef, claims) -> tuple[int, str] | None:
-    """Why this issue must not be started here, as ``(status, reason)``, read from GitHub."""
+async def _start_refusal(
+    request: Request, ref: WorkRef, claims
+) -> tuple[tuple[int, str] | None, dict]:
+    """Why this issue must not be started here, as ``(status, reason)``, read from GitHub,
+    and the record read, ``{}`` when unread."""
     issue = f"{ref.repository}#{ref.number}"
     key = (ref.repository, ref.number)
     issues = request.app.state.issues
@@ -3218,22 +3229,53 @@ async def _start_refusal(request: Request, ref: WorkRef, claims) -> tuple[int, s
         logger.warning("issue %s could not be read before its start", issue, exc_info=True)
         record = None
     if not record:
-        return 503, f"{issue} could not be read, so nothing changed; try again"
+        return (503, f"{issue} could not be read, so nothing changed; try again"), {}
     if str(record.get("state") or "").lower() != "open" or record.get("is_pr"):
-        return 409, f"{issue} is not an open issue, so nothing changed"
+        return (409, f"{issue} is not an open issue, so nothing changed"), record
     assignee = assignee_of(record)
     if assignee and claims is not None and not claims(ref.repository, assignee):
-        return 409, (
+        why = (
             f"{issue} is assigned to {assignee}, so another deck works it and nothing changed; "
             "Take over on its Work page moves it here"
         )
-    return None
+        return (409, why), record
+    return None, record
 
 
 @router.post("/api/work-worktrees/release-closed")
 async def post_release_closed_worktrees(request: Request) -> JSONResponse:
     """Host-janitor's daily ask: give back closed Works' idle worktrees (#4148)."""
     return JSONResponse(await release_closed_work_worktrees(request.app))
+
+
+def _ask_router_start(
+    request: Request, ref: WorkRef, label: str, record: dict, claims
+) -> bool:
+    """Ask the Work router to start an issue just labelled (and assigned), and whether it
+    took the start (#4455).
+
+    An issue that already had both gets no ``labeled`` or ``assigned`` event from GitHub, so
+    only the 15-minute backstop would start it. ``start_work`` spends a Work's start once, so
+    asking as well as the webhook starts one agent. In a repository the router does not run,
+    the poller starts it on the label, as before.
+    """
+    from .. import work_claims
+
+    router_service = getattr(request.app.state, "work_router", None)
+    if router_service is None or not router_service.switched(ref.repository):
+        return True
+    names = [str(name) for name in record.get("labels") or () if isinstance(name, str)]
+    if label.lower() not in {name.lower() for name in names}:
+        names.append(label)
+    # The first assignee stands: start_issue adds this deck's person after it.
+    assignee = assignee_of(record) or work_claims.own_assignee(ref.repository, claims)
+    try:
+        return bool(
+            router_service.note_filed(ref.repository, ref.number, names, assignee=assignee)
+        )
+    except Exception:  # noqa: BLE001 - labelled all the same; the backstop starts it
+        logger.warning("the router was not asked to start %s", ref.work_id, exc_info=True)
+        return False
 
 
 @router.post("/api/works/{work_id:path}/start")
@@ -3265,7 +3307,7 @@ async def post_work_start(request: Request, work_id: str) -> JSONResponse:
     if gh is None:
         raise HTTPException(status_code=503, detail="gh is not available on this host")
     claims = getattr(request.app.state, "deck_claims", None)
-    refusal = await _start_refusal(request, ref, claims)
+    refusal, record = await _start_refusal(request, ref, claims)
     if refusal is not None:
         raise HTTPException(status_code=refusal[0], detail=refusal[1])
     waits = await _waits_on(request, ref.repository, ref.number)
@@ -3275,10 +3317,15 @@ async def post_work_start(request: Request, work_id: str) -> JSONResponse:
     if outcome != "done":
         # "uncertain" may have landed: repeating this call is safe, as above.
         raise HTTPException(status_code=409 if outcome == "failed" else 502, detail=text)
+    started = not waits
+    if started:
+        started = _ask_router_start(request, ref, labels[0], record, claims)
+        if not started:
+            text += "; the deck's Work router did not take its start, so nothing starts yet"
     return JSONResponse(
         {
             "work_id": ref.work_id,
-            "started": not waits,
+            "started": started,
             "waits_on": [] if waits == UNREAD_BLOCKERS else waits,
             "blockers_read": waits != UNREAD_BLOCKERS,
             "label": labels[0],

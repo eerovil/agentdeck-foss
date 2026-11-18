@@ -3095,29 +3095,33 @@ class WorkRouterService:
             else:
                 self._filing.pop(repository, None)
 
-    def note_filed(self, repository: str, number: int, labels: Iterable[str]) -> bool:
-        """The deck just filed this issue with these labels: start its Work now (#3371).
+    def note_filed(
+        self, repository: str, number: int, labels: Iterable[str], assignee: str = ""
+    ) -> bool:
+        """The deck just filed or labelled this issue: start its Work now (#3371).
 
         GitHub can hold its webhook deliveries back for many minutes, and the backstop only
         looks every 15. This feeds ``_maybe_start`` the "label added" delivery GitHub would
-        have sent, in the background so the filer is not held up by the start. When GitHub's
-        own delivery arrives later, ``start_work`` has already spent the Work's one start.
-        ``False``: nothing to start here (not switched, or no start label).
+        have sent, with the issue's first ``assignee`` (#4455: without it a deck that leaves
+        unassigned issues to another refused the start), in the background so the filer is
+        not held up by the start. When GitHub's own delivery arrives later, ``start_work``
+        has already spent the Work's one start. ``False``: nothing to start here (not
+        switched, no start label, or another deck's issue).
         """
         repository = repository.lower()
         names = [str(name).strip() for name in labels if str(name).strip()]
         label = self.starts_on(repository, names)
-        if not label:
+        assignee = str(assignee or "").strip().lower()
+        if not label or not self._mine(repository, assignee):
             return False
-        payload = {
-            "action": "labeled",
-            "issue": {
-                "number": number,
-                "state": "open",
-                "labels": [{"name": name} for name in names],
-            },
-            "label": {"name": label},
+        issue: dict[str, object] = {
+            "number": number,
+            "state": "open",
+            "labels": [{"name": name} for name in names],
         }
+        if assignee:
+            issue["assignee"] = {"login": assignee}
+        payload = {"action": "labeled", "issue": issue, "label": {"name": label}}
         delivery = Delivery(
             stream=repository,
             delivery_id=f"deck-filed:{repository}#{number}",

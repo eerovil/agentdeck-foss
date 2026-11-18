@@ -209,6 +209,29 @@ async def test_an_act_reaches_the_services_and_its_refusal_comes_back_by_name(tm
     )
 
 
+def test_the_web_says_a_filed_issue_starts_only_when_it_is_this_decks(tmp_path):
+    """#4455: `starting` came from the label alone; an issue filed to nobody, where another
+    deck takes those, was said to start and never did."""
+    from types import SimpleNamespace
+
+    sent: list = []
+    router = services_link.RouterLink(
+        work_services_config(tmp_path),
+        services_link.SocketTransport(lambda: tmp_path / "x"),
+        _NoState(),
+        later=SimpleNamespace(send=lambda *args, **kwargs: sent.append((args, kwargs))),
+    )
+    router.starts_on = lambda repository, labels: "agent" if "agent" in labels else ""
+    router.claims = lambda repository, assignee: assignee == "me"
+
+    assert router.note_filed("o/r", 7, ["agent"]) is False
+    assert router.note_filed("o/r", 8, ["agent"], assignee="them") is False
+    assert router.note_filed("o/r", 9, ["bug"], assignee="me") is False
+    assert sent == []
+    assert router.note_filed("o/r", 10, ["agent"], assignee="Me") is True
+    assert sent == [(("router", "note_filed", "o/r", 10, ["agent"]), {"assignee": "me"})]
+
+
 async def test_an_act_with_the_service_down_says_it_is_restarting(tmp_path, monkeypatch):
     monkeypatch.setattr(services_link, "CONNECT_WAIT_S", 0.0)
     release = services_link.ReleaseLink(
@@ -644,3 +667,109 @@ def test_a_services_change_or_reconnect_is_republished_on_the_webs_bus():
     follower.moved(services_link.KINDS)
     assert woken == [1, 1] and reread == [1]
     assert bus.revision(WORK_INPUTS_TOPIC, REVIEWS_TOPIC) == (1, 1)
+
+
+async def test_a_services_process_out_of_reach_shows_in_the_top_bar_and_healthz(tmp_path):
+    """A deck whose services socket never answers (a Mac with no services job, #4454) says so
+    after a minute, in the top bar and in /healthz; a short restart shows nothing, and the
+    pill goes once the feed answers, even with a 404. Each change republishes the top-bar
+    fragment. A deck with the services switched off says nothing."""
+    from types import SimpleNamespace
+
+    from fastapi.templating import Jinja2Templates
+
+    from agentdeck import runtime_feed
+    from agentdeck.web.render import render_deployment_status
+    from agentdeck.web.routes_pages import _services_health
+
+    now = [1000.0]
+    published = []
+    follower = services_link.ServicesFollower(
+        lambda: tmp_path / "services.sock",
+        state=SimpleNamespace(deployment_changed=lambda: published.append(1)),
+        scheduled_messages=None,
+        wake_on=None,
+        clock=lambda: now[0],
+    )
+    templates = Jinja2Templates(
+        directory=str(Path(services_link.__file__).parent / "web" / "templates")
+    )
+    templates.env.globals.update(
+        deployment_status=lambda: SimpleNamespace(available=False),
+        github_suspensions=lambda: [],
+        services_unreachable=follower.unreachable,
+    )
+    app_state = SimpleNamespace(services_follower=follower)
+    request = SimpleNamespace(app=SimpleNamespace(state=app_state))
+
+    follower.start()  # the real wiring: the feed's mode listener and the one-minute timer
+    timer = follower._timer
+    assert timer is not None and timer.when() - asyncio.get_running_loop().time() > 60
+    now[0] += 59
+    assert follower.unreachable() is None
+    assert "services down" not in render_deployment_status(templates)
+    now[0] += 2 * 60 + 1
+    timer._run()  # the timer falling due, without the minute's wait
+    bar = " ".join(render_deployment_status(templates).split())
+    assert "services down" in bar and f"at {tmp_path / 'services.sock'} for 3 min" in bar
+    assert "agentdeck-launchd" in bar
+    assert _services_health(request) == {
+        "state": "unreachable",
+        "minutes": 3,
+        "socket": str(tmp_path / "services.sock"),
+    }
+    assert published == [1]
+
+    follower.feed._set_mode(runtime_feed.LEGACY)  # a 404 on /changes: it answered
+    assert "services down" not in render_deployment_status(templates)
+    assert _services_health(request) == {"state": "ok"} and published == [1, 1]
+    assert follower._timer is None
+    # Lost again: the minute starts over.
+    follower.feed._set_mode(runtime_feed.DOWN)
+    now[0] += 30
+    follower._publish_if_moved()
+    assert follower.unreachable() is None and published == [1, 1]
+    now[0] += 31
+    follower.enabled = False  # `[services] enabled = false`: nothing is expected there
+    assert follower.unreachable() is None and _services_health(request) == {"state": "off"}
+    follower.stop()
+    assert follower._timer is None
+    app_state.services_follower = None
+    assert _services_health(request) == {"state": "in_web"}
+
+
+def test_a_second_services_process_sees_the_first_and_a_stale_socket_is_not_one():
+    """`agentdeck services` refuses to start beside one already serving its socket (#4454: a
+    hand-run one beside the new launchd job); a socket file nobody listens on is taken. Two
+    starting together are decided by a lock held for the process's life, never by the probe
+    alone, and the lock goes with its holder."""
+    import os
+    import socket as sockets
+    import subprocess
+    import sys
+    import tempfile
+
+    from agentdeck.services_process import _answering, _hold_lock
+
+    with tempfile.TemporaryDirectory() as folder:
+        sock = Path(folder) / "s.sock"
+        held = _hold_lock(sock)
+        assert held is not None and _hold_lock(sock) is None  # the second start loses
+        # Another process too, not only another descriptor of this one.
+        take = "import fcntl, os, sys; fcntl.flock(os.open(sys.argv[1], os.O_RDWR), 6)"
+        other = subprocess.run([sys.executable, "-c", take, f"{sock}.lock"], capture_output=True)
+        assert other.returncode != 0 and b"BlockingIOError" in other.stderr
+        os.close(held)  # what the holder's exit does
+        again = _hold_lock(sock)
+        assert again is not None
+        os.close(again)
+
+    with tempfile.TemporaryDirectory() as folder:  # short: a Unix socket path is capped
+        path = Path(folder) / "s.sock"
+        assert not _answering(path)
+        server = sockets.socket(sockets.AF_UNIX, sockets.SOCK_STREAM)
+        server.bind(str(path))
+        server.listen(1)
+        assert _answering(path)
+        server.close()
+        assert path.exists() and not _answering(path)

@@ -289,12 +289,58 @@ def _preview_root(request: Request, token: str) -> tuple[Path, tuple[str, int, i
     return root, root_identity
 
 
-def _fd_chunks(fd: int) -> Iterator[bytes]:
+def _fd_chunks(fd: int, start: int = 0, length: int | None = None) -> Iterator[bytes]:
+    """Read ``length`` bytes (all, when ``None``) of ``fd`` from ``start``, then close it."""
     try:
-        while chunk := os.read(fd, 64 * 1024):
+        if start:
+            os.lseek(fd, start, os.SEEK_SET)
+        remaining = length
+        while remaining is None or remaining > 0:
+            size = 64 * 1024 if remaining is None else min(64 * 1024, remaining)
+            chunk = os.read(fd, size)
+            if not chunk:
+                break
+            if remaining is not None:
+                remaining -= len(chunk)
             yield chunk
     finally:
         os.close(fd)
+
+
+# At most 18 ASCII digits: a longer number is malformed and ignored, never an
+# int() past Python's digit limit or a non-ASCII digit read as a byte offset.
+_BYTE_RANGE = re.compile(r"^\s*bytes\s*=\s*(\d{0,18})\s*-\s*(\d{0,18})\s*$", re.I | re.A)
+
+
+def _single_byte_range(header: str | None, size: int) -> tuple[int, int] | None | bool:
+    """The ``(start, end)`` bytes, end exclusive, one ``Range`` header asks for.
+
+    ``None`` means serve the whole file: no header, or one this route does not
+    honour (several ranges, another unit, a malformed value), which a server may
+    ignore. ``False`` means the range lies past the file's end, a 416 (#4452).
+    """
+    if not header:
+        return None
+    match = _BYTE_RANGE.match(header)
+    if match is None:
+        return None
+    if size == 0:
+        return False
+    first, last = match.groups()
+    if not first:
+        if not last:
+            return None
+        suffix = int(last)
+        if suffix == 0:
+            return False
+        return max(size - suffix, 0), size
+    start = int(first)
+    end = size if not last else int(last) + 1
+    if last and end <= start:
+        return None
+    if start >= size:
+        return False
+    return start, min(end, size)
 
 
 def _preview_entry(path: Path) -> Path | None:
@@ -362,19 +408,32 @@ async def session_preview(
 @router.get("/file-previews/{token}/{asset_path:path}", name="preview_asset")
 async def preview_asset(
     request: Request, token: str, asset_path: str
-) -> StreamingResponse:
+) -> Response:
     """Serve one allowlisted file from the selected preview bundle directory."""
     root, root_identity = _preview_root(request, token)
     asset_parts = _preview_parts(asset_path)
+    # A preview of a page in the temp directory must not reach the private
+    # upload spool the plain file route already hides (#4452 helper check).
+    if is_private_upload_path(root.joinpath(*asset_parts)):
+        raise _preview_not_found()
     media_type = _PREVIEW_MEDIA_TYPES.get(Path(asset_parts[-1]).suffix.lower())
     if media_type is None:
         raise _preview_not_found()
     file_fd, file_stat, _actual_root = _open_preview_file(
         root, asset_parts, expected_root=root_identity
     )
+    size = file_stat.st_size
+    # Browsers seek inside <audio> and <video> only once a range answers 206.
+    # With no validators to compare, an If-Range never matches: send it all.
+    byte_range = (
+        None
+        if request.headers.get("if-range")
+        else _single_byte_range(request.headers.get("range"), size)
+    )
     headers = {
+        "Accept-Ranges": "bytes",
         "Cache-Control": "private, no-store",
-        "Content-Length": str(file_stat.st_size),
+        "Content-Length": str(size),
         "X-Content-Type-Options": "nosniff",
         "Access-Control-Allow-Origin": "null",
         "Cross-Origin-Resource-Policy": "cross-origin",
@@ -385,7 +444,22 @@ async def preview_asset(
             "camera=(), microphone=(), geolocation=(), payment=(), usb=()"
         ),
     }
-    return StreamingResponse(_fd_chunks(file_fd), media_type=media_type, headers=headers)
+    if byte_range is False:
+        os.close(file_fd)
+        headers["Content-Range"] = f"bytes */{size}"
+        headers["Content-Length"] = "0"
+        return Response(status_code=416, media_type=media_type, headers=headers)
+    if byte_range is None:
+        return StreamingResponse(_fd_chunks(file_fd), media_type=media_type, headers=headers)
+    start, end = byte_range
+    headers["Content-Range"] = f"bytes {start}-{end - 1}/{size}"
+    headers["Content-Length"] = str(end - start)
+    return StreamingResponse(
+        _fd_chunks(file_fd, start, end - start),
+        status_code=206,
+        media_type=media_type,
+        headers=headers,
+    )
 
 
 _MERMAID_BLOCK = re.compile(r"^```mermaid[ \t]*\n(.*?)\n```", re.S | re.M)

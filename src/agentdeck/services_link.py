@@ -41,7 +41,7 @@ import httpx
 
 from . import review_history, runtime_feed, work_release
 from .work_router import SwitchedRepositories
-from .work_services import ERRORS, services_enabled, work_reviewer
+from .work_services import ERRORS, make_deck_claims, services_enabled, work_reviewer
 
 log = logging.getLogger(__name__)
 
@@ -229,6 +229,9 @@ class RouterLink:
         self._later = later or Later(transport)
         self._enabled = services_enabled(config)
         self.switched = SwitchedRepositories(config.poller.root)
+        # Whether an issue assigned to a login ("" for nobody) is this deck's (#3731), as the
+        # router's own ``mine``: settable, as a test sets it.
+        self.claims: Callable[[str, str], bool] = make_deck_claims(config)
         # Settable, as a test sets the router's own: the review routes read it (#3849).
         self.reviewer_off = work_reviewer(config) == "off"
         self.pre_review_on = True
@@ -269,11 +272,16 @@ class RouterLink:
         finally:
             self._later.send("services", "release_filing", key)
 
-    def note_filed(self, repository: str, number: int, labels: Iterable[str]) -> bool:
+    def note_filed(
+        self, repository: str, number: int, labels: Iterable[str], assignee: str = ""
+    ) -> bool:
+        """``WorkRouterService.note_filed``: ``True`` only when the router starts it, so an
+        issue assigned to nobody on a deck that leaves those to another is not (#4455)."""
         labels = [str(name) for name in labels]
-        if not self.starts_on(repository, labels):
+        assignee = str(assignee or "").strip().lower()
+        if not self.starts_on(repository, labels) or not self.claims(repository, assignee):
             return False
-        self._later.send("router", "note_filed", repository, number, labels)
+        self._later.send("router", "note_filed", repository, number, labels, assignee=assignee)
         return True
 
     def note_registered(self, repository: str, number: int) -> None:
@@ -419,25 +427,102 @@ class ReleaseLink:
 # --- the changes the services process announces ---
 
 
-class ServicesFollower:
-    """The web's held ``GET /changes`` on the services process, republished on its bus."""
+#: How long the services socket may be unreachable before the top bar says so (#4454): longer
+#: than a deploy's stop-then-start of the services process, so a restart shows nothing.
+UNREACHABLE_AFTER_S = 60.0
 
-    def __init__(self, socket_path: Callable[[], Path], *, state, scheduled_messages, wake_on):
+
+class ServicesFollower:
+    """The web's held ``GET /changes`` on the services process, republished on its bus.
+
+    It also knows how long the services process has been out of reach (#4454): a deck with no
+    services process (a Mac set up before its launchd job existed) routes no Work and merges
+    nothing, and said so only as ``services call … not made`` in ``web.log``.
+    """
+
+    def __init__(
+        self,
+        socket_path: Callable[[], Path],
+        *,
+        state,
+        scheduled_messages,
+        wake_on,
+        enabled: bool = True,
+        clock: Callable[[], float] = time.monotonic,
+    ):
         self._state = state
         self._scheduled = scheduled_messages
         self._wake_on = wake_on
+        self._socket_path = socket_path
+        # ``[services] enabled = false``: nothing is expected on the socket, so nothing is said.
+        self.enabled = enabled
+        self._clock = clock
         self.feed = runtime_feed.RuntimeFeedClient(
             socket_path=socket_path, kinds=KINDS, name="services-change-feed"
         )
         self._remove: Callable[[], None] | None = None
+        self._remove_mode: Callable[[], None] | None = None
         self._sub: runtime_feed.FeedSubscription | None = None
+        # Out of reach from the start until the first answer.
+        self._down_since: float | None = clock()
+        self._shown = False
+        self._timer: asyncio.TimerHandle | None = None
 
     def start(self) -> None:
         self._remove = self.feed.add_listener(self.moved)
+        self._remove_mode = self.feed.add_mode_listener(self.mode_moved)
         # Held only so the feed runs; the listener does the work.
         self._sub = self.feed.subscribe(lambda item: True)
+        self._down_since = self._clock()
+        self._arm()
+
+    def unreachable(self) -> dict[str, Any] | None:
+        """``{"minutes", "socket"}`` once the socket has not answered for a while, else None."""
+        if not self.enabled or self._down_since is None:
+            return None
+        down_s = self._clock() - self._down_since
+        if down_s < UNREACHABLE_AFTER_S:
+            return None
+        return {"minutes": max(1, int(down_s // 60)), "socket": str(self._socket_path())}
+
+    def mode_moved(self, mode: str) -> None:
+        if mode != runtime_feed.DOWN:  # a 404 on /changes (LEGACY) still answered
+            self._down_since = None
+            self._disarm()
+        elif self._down_since is None:
+            self._down_since = self._clock()
+            self._arm()
+        self._publish_if_moved()
+
+    def _arm(self) -> None:
+        self._disarm()
+        with contextlib.suppress(RuntimeError):  # no running loop: a page read still sees it
+            self._timer = asyncio.get_running_loop().call_later(
+                UNREACHABLE_AFTER_S + 1, self._publish_if_moved
+            )
+
+    def _disarm(self) -> None:
+        if self._timer is not None:
+            self._timer.cancel()
+            self._timer = None
+
+    def _publish_if_moved(self) -> None:
+        shown = self.unreachable() is not None
+        if shown != self._shown:
+            self._shown = shown
+            if shown:
+                log.warning(
+                    "the Work services process is unreachable at %s: no Work routing, merge"
+                    " or backstop until it runs",
+                    self._socket_path(),
+                )
+            self._state.deployment_changed()
 
     def stop(self) -> None:
+        self._disarm()
+        if self._remove_mode is not None:
+            self._remove_mode()
+            self._remove_mode = None
         if self._sub is not None:
             self._sub.close()
             self._sub = None

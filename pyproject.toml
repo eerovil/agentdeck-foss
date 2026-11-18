@@ -40,6 +40,8 @@ agentdeck = "agentdeck.__main__:main"
 # Its own command: setup runs the poller engine, which the deck itself never reaches (#3623).
 agentdeck-init = "agentdeck.setup_init:main"
 agentdeck-project = "agentdeck.project_join:run"
+# Its own command too: the launchd jobs name the poller's wake script (#4454).
+agentdeck-launchd = "agentdeck.launchd:main"
 
 [dependency-groups]
 dev = [

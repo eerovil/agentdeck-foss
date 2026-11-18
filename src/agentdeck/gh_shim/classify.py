@@ -260,6 +260,18 @@ def ownership_label_to_add(
     return matches[0].ownership_labels[0]
 
 
+def names_assignee(argv: list[str]) -> bool:
+    """Whether a ``gh issue create`` names any assignee: ``--assignee X``, ``-a X``, ``-aX``,
+    ``--assignee=X`` (#4455). A value that only starts with ``-a`` (a title such as
+    ``"-a b"``) is not a flag: a flag name holds no space."""
+    _positionals, flags = _split_flags(argv)
+    return any(
+        name in ("--assignee", "-a")
+        or (name.startswith("-a") and not name.startswith("--") and " " not in name)
+        for name, _value in flags
+    )
+
+
 def misplaced_start_label(
     argv: list[str], repository: str, targets: object
 ) -> tuple[str, str] | None:

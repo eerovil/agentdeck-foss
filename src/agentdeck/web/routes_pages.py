@@ -229,6 +229,16 @@ def _github_health() -> dict[str, object]:
     }
 
 
+def _services_health(request: Request) -> dict[str, object]:
+    follower = getattr(request.app.state, "services_follower", None)
+    if follower is None:
+        return {"state": "in_web"}
+    if not follower.enabled:
+        return {"state": "off"}
+    down = follower.unreachable()
+    return {"state": "unreachable", **down} if down else {"state": "ok"}
+
+
 @router.get("/healthz")
 async def healthz(request: Request) -> JSONResponse:
     state = get_state(request)
@@ -242,6 +252,9 @@ async def healthz(request: Request) -> JSONResponse:
             # reads `status` as exactly that. This says whether GitHub still lets the
             # deck speak (#2682).
             "github": _github_health(),
+            # Whether the Work services process answers on its socket (#4454): without it no
+            # Work is routed, nothing merges and the backstop does not run.
+            "services": _services_health(request),
         }
     )
 

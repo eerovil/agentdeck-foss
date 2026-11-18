@@ -214,6 +214,28 @@ SUCCESS_STATES = frozenset({"success", "merged"})
 #: answers by asking for a fresh review itself (#4253); a label stop still wakes the chat.
 CLOSED_REVIEW = "closed its review"
 
+#: A deployment wait on a commit whose own check failed (#4445) tells its chat this long after
+#: the failure, unless a deploy containing the commit came first: a newer merge often replaces
+#: a killed build, and its deploy comes some minutes later.
+FAILED_GRACE_S = 30 * 60.0
+#: How long a deployment wait's scan whose GitHub read failed waits before it reads again, and
+#: how many failed runs on one due time it takes before that due time takes its old path.
+READ_RETRY_S = 60.0
+READ_TRIES = 3
+#: How many compare answers are kept: ancestry between two fixed commits never changes.
+MAX_COMPARED = 2000
+#: The conclusions that say a check on a deployment wait's commit failed (#4445).
+_FAILED_STATES = frozenset({"failure", "error", "cancelled", "timed_out", "startup_failure"})
+#: The deliveries that report a check on a commit, finished or not, other than a deploy.
+_CHECK_EVENTS = frozenset({"status", "check_run", "check_suite", "workflow_run"})
+_LABEL = {
+    "check_suite": "check suite",
+    "check_run": "check run",
+    "workflow_run": "workflow",
+    "status": "commit status",
+    "deployment_status": "deployment to",
+}
+
 #: A commit status or deployment status in one of these states is a result; anything
 #: else (``pending``, ``queued``, ``in_progress``) is a run still going.
 _TERMINAL_STATUS = frozenset({"success", "failure", "error"})
@@ -279,6 +301,13 @@ class WakeRequest:
     #: behalf (#4253): the live check after a merge, carried by the deploy wait the deck
     #: registered instead of asking the chat to. "" on a wait the chat registered itself.
     then: str = ""
+    #: A finished non-success check on a deployment wait's own commit (#4445): its words, the
+    #: check (``event:name``), its own time, and whether the chat was told. A check that
+    #: passes again later clears it (``WakeOnRegistry.note_failed``).
+    failed: str = ""
+    failed_check: str = ""
+    failed_at: float = 0.0
+    failed_told: bool = False
     #: The Work this wait is for (#4272), a ``github_issue:`` Work id; "" when the chat did
     #: not name one. A chat directly in several Works names it, or only the one Work its
     #: wait points at stays current (``waiting_work_ids`` in ``web/work_view``).
@@ -703,13 +732,7 @@ def match(request: WakeRequest, delivery: Delivery) -> Outcome | None:
         return None
     if request.kind == KIND_COMMIT and not request.name and conclusion.lower() in _NO_RESULT:
         return None
-    label = {
-        "check_suite": "check suite",
-        "check_run": "check run",
-        "workflow_run": "workflow",
-        "status": "commit status",
-        "deployment_status": "deployment to",
-    }[delivery.event]
+    label = _LABEL[delivery.event]
     summary = (
         f"{label} {name or '(unnamed)'} on {request.repository}@{sha[:12]} finished: {conclusion}"
     )
@@ -1230,15 +1253,7 @@ def _newest_outcome(
     #: Per check: (its newest state's time, that state's outcome); None once unknowable.
     newest: dict[tuple[str, str], tuple[datetime, Outcome | None] | None] = {}
     for record in _tail_records(streams_root, request.repository, tail_bytes, events):
-        delivery = Delivery(
-            stream=request.repository,
-            delivery_id=str(record.get("delivery_id") or ""),
-            event=str(record.get("event") or ""),
-            received_at=str(record.get("received_at") or ""),
-            headers={},
-            raw_body=_raw(record),
-            offset=0,
-        )
+        delivery = _record_delivery(request.repository, record)
         sha, name, when = _subject(delivery.event, delivery.payload)
         if not sha.lower().startswith(request.sha) or (
             request.name and not _name_matches(request.name, name)
@@ -1261,6 +1276,183 @@ def _newest_outcome(
             newest[key] = (when, outcome)
     done = [held for held in newest.values() if held is not None and held[1] is not None]
     return max(done, key=lambda held: held[0])[1] if done else None
+
+
+def _record_delivery(repository: str, record: dict) -> Delivery:
+    """A stored stream record as the delivery the tailer would have handed ``apply``."""
+    return Delivery(
+        stream=repository,
+        delivery_id=str(record.get("delivery_id") or ""),
+        event=str(record.get("event") or ""),
+        received_at=str(record.get("received_at") or ""),
+        headers={},
+        raw_body=_raw(record),
+        offset=0,
+    )
+
+
+def tracks_build(request: WakeRequest) -> bool:
+    """Whether a wait follows its commit's own checks and later deploys (#4445): a deployment
+    wait on a commit."""
+    return request.kind == KIND_DEPLOYMENT and bool(request.sha)
+
+
+def other_success(request: WakeRequest, delivery: Delivery) -> tuple[str, Outcome] | None:
+    """``(deployed sha, outcome)`` when ``delivery`` is a successful deploy of the name a
+    deployment wait gives, on another commit than the wait's (#4445), else ``None``.
+
+    Only a named wait takes one: an unnamed wait would take a staging deploy of a branch head
+    that merged the base in, and nothing in the payload marks that deploy as staging.
+    """
+    if not tracks_build(request) or not request.name:
+        return None
+    outcome = match(replace(request, sha=""), delivery)
+    if outcome is None or outcome.state != "success":
+        return None
+    result = _result(delivery.event, delivery.payload)
+    deployed = result[0].lower() if result is not None else ""
+    if not _SHA_RE.match(deployed) or deployed.startswith(request.sha):
+        return None
+    return deployed, outcome
+
+
+def _when_received(delivery: Delivery) -> datetime | None:
+    stamp = _received_at(delivery)
+    return datetime.fromtimestamp(stamp, UTC) if stamp is not None else None
+
+
+def check_state(
+    request: WakeRequest, delivery: Delivery
+) -> tuple[str, str, datetime | None] | None:
+    """``(check, state, when)`` for a check on a deployment wait's own commit other than its
+    deploy (#4445): ``check`` is ``event:name``, ``state`` the finished conclusion lowercased
+    or ``running``, ``when`` the source's time of it (else when the deck received it)."""
+    if not tracks_build(request) or delivery.event not in _CHECK_EVENTS:
+        return None
+    sha, name, when = _subject(delivery.event, delivery.payload)
+    if not sha or not sha.lower().startswith(request.sha):
+        return None
+    if request.name and _name_matches(request.name, name):
+        return None  # the deploy itself: ``match`` takes its result
+    result = _result(delivery.event, delivery.payload)
+    state = result[2].lower() if result is not None else "running"
+    return f"{delivery.event}:{name.lower()}", state, when or _when_received(delivery)
+
+
+def failure_summary(request: WakeRequest, delivery: Delivery) -> str:
+    """A failed check on the wait's commit in words, with its link."""
+    result = _result(delivery.event, delivery.payload)
+    if result is None:
+        return ""
+    _sha, name, conclusion, url = result
+    summary = (
+        f"{_LABEL[delivery.event]} {name or '(unnamed)'} on"
+        f" {request.repository}@{request.sha[:12]} finished: {conclusion}"
+    )
+    return summary + (f" ({url})" if url else "")
+
+
+@dataclass(frozen=True)
+class DeployScan:
+    """What the end of a repository's stream says to a deployment wait on a commit (#4445)."""
+
+    #: The newest successful deploy of the wait's name on another commit, if any.
+    candidate: tuple[str, Outcome] | None = None
+    #: The newest check on the commit whose newest state failed: ``(check, words, when)``.
+    failure: tuple[str, str, float] | None = None
+    #: The checks on the commit whose newest state is a success.
+    passed: frozenset[str] = frozenset()
+
+
+def scan_deploy(
+    streams_root: Path | str, request: WakeRequest, *, tail_bytes: int = DEPLOY_TAIL_BYTES
+) -> DeployScan:
+    """Read the end of the stream for a deployment wait on a commit (#4445): the newest deploy
+    of its name on another commit, which may contain it, and its commit's own failed check.
+
+    Each check's newest state by the source's own time decides, as in ``seen_result``, so a
+    killed build run again and passed is no failure. Deliveries from before the wait was
+    registered count: a merge build killed at once fails before the deck registers its wait.
+    """
+    events = set(_CHECK_EVENTS) | {"deployment_status"}
+    candidate: tuple[datetime, str, Outcome] | None = None
+    newest: dict[str, tuple[datetime, str, str]] = {}
+    for record in _tail_records(streams_root, request.repository, tail_bytes, events):
+        delivery = _record_delivery(request.repository, record)
+        other = other_success(request, delivery)
+        if other is not None:
+            when = _subject(delivery.event, delivery.payload)[2] or _when_received(delivery)
+            if when is not None and (candidate is None or when >= candidate[0]):
+                candidate = (when, *other)
+            continue
+        seen = check_state(request, delivery)
+        if seen is None or seen[2] is None:
+            continue
+        check, state, when = seen
+        held = newest.get(check)
+        if held is None or when >= held[0]:
+            words = failure_summary(request, delivery) if state in _FAILED_STATES else ""
+            newest[check] = (when, state, words)
+    failed = [
+        (when, check, words)
+        for check, (when, state, words) in newest.items()
+        if state in _FAILED_STATES and words
+    ]
+    newest_failed = max(failed) if failed else None
+    return DeployScan(
+        candidate=(candidate[1], candidate[2]) if candidate is not None else None,
+        failure=(
+            (newest_failed[1], newest_failed[2], newest_failed[0].timestamp())
+            if newest_failed is not None
+            else None
+        ),
+        passed=frozenset(check for check, held in newest.items() if held[1] == "success"),
+    )
+
+
+def contained_outcome(request: WakeRequest, deployed: str, outcome: Outcome) -> Outcome:
+    """A deploy of a later commit that contains the wait's, in words for the woken chat."""
+    return Outcome(
+        f"{outcome.summary}. That commit contains {request.sha[:12]} (GitHub's compare"
+        f" {request.sha[:12]}...{deployed[:12]}), so it is deployed",
+        outcome.state,
+    )
+
+
+def failed_message(request: WakeRequest, note: str = "") -> str:
+    """The one message a deployment wait sends when a check on its commit failed and no
+    deploy containing the commit came in ``FAILED_GRACE_S`` (#4445). The wait goes on."""
+    seen = (
+        f"no deploy of {request.name} since contains {request.repository}@{request.sha[:12]}"
+        if request.name
+        else f"no deploy of {request.repository}@{request.sha[:12]} has been seen"
+    )
+    text = (
+        f"AgentDeck wake-on: a check on the commit your deployment wait is on failed:"
+        f" {request.failed}, and {seen}. The deck keeps waiting for {request.target}"
+        + (" or a later deploy that contains it" if request.name else "")
+        + ", up to the wait's timeout, and wakes you then. If nothing else will deploy it"
+        " (no later merge is coming), re-run that check, or ask the person to. Webhooks are a"
+        " hint, so confirm it with one read first."
+    )
+    if request.then:
+        text += (
+            " The deck registered this wait when it merged your pull request; its live-check"
+            " request comes with the deploy."
+        )
+    return text + note
+
+
+def _why(exc: BaseException) -> str:
+    return str(exc).strip()[:200] or type(exc).__name__
+
+
+def read_failed_note(failed: str) -> str:
+    """What a step the deck could not read for says, after ``READ_TRIES`` tries (#4445)."""
+    return (
+        f" The deck tried {READ_TRIES} times to tell whether a later deploy contains the commit,"
+        f" and could not: {failed}."
+    )
 
 
 @dataclass(frozen=True)
@@ -1554,6 +1746,12 @@ def timeout_message(request: WakeRequest, review_chats: str = "", reviewer_down:
         " minutes. A webhook can be dropped, so check its state once yourself, then carry"
         " on, or register the wait again if it is still running."
     )
+    if request.kind == KIND_DEPLOYMENT and request.failed:
+        # #4445: what the deck saw on the commit is the likeliest reason nothing came.
+        text += (
+            f" A check on that commit failed ({request.failed}), and no deploy that contains"
+            " the commit was seen."
+        )
     if request.then:
         # The deck registered it when it merged (#4253): what the chat was to do once the
         # deploy landed is still to do, whether or not it did.
@@ -1875,6 +2073,46 @@ class WakeOnRegistry:
                     return current[index]
         return None
 
+    def note_failed(
+        self, request_id: str, summary: str, check: str, at: float
+    ) -> WakeRequest | None:
+        """Record a failed check on a deployment wait's commit (#4445), on the wait as it is
+        held now, only when none is recorded; ``summary`` empty clears the one recorded for
+        ``check``, which has since passed (at ``at``, not before it failed). Writes nothing
+        else, so a renewal keeps its own. The wait as written, else None."""
+        with self._file.locked():
+            current = list(self.all())
+            for index, held in enumerate(current):
+                if held.id != request_id or held.pending_text:
+                    continue
+                if summary and not held.failed:
+                    changed = replace(held, failed=summary, failed_check=check, failed_at=at)
+                elif (
+                    not summary
+                    and held.failed
+                    and held.failed_check == check
+                    and at >= held.failed_at
+                ):
+                    changed = replace(
+                        held, failed="", failed_check="", failed_at=0.0, failed_told=False
+                    )
+                else:
+                    return None
+                current[index] = changed
+                self._save(current)
+                return changed
+        return None
+
+    def mark_failed_told(self, request_id: str, failed_at: float) -> None:
+        """The chat heard of the failure recorded at ``failed_at`` (#4445)."""
+        with self._file.locked():
+            current = list(self.all())
+            for index, held in enumerate(current):
+                if held.id == request_id and held.failed and held.failed_at == failed_at:
+                    current[index] = replace(held, failed_told=True)
+                    self._save(current)
+                    return
+
     def tell(
         self,
         request_id: str,
@@ -2085,8 +2323,22 @@ class WakeOnService:
         release_notices: Callable[[str, datetime], Iterable[str]] = lambda chat_id, since: (),
         check_env: Callable[[str], dict[str, str]] = lambda session_key: {},
         note: Callable[[str, str, str], bool] | None = None,
+        compare: Callable[[str, str, str], Awaitable[bool]] | None = None,
     ) -> None:
         self._enabled = bool(enabled)
+        # A deployment wait on a commit follows its commit (#4445). ``compare(repository,
+        # base, head)`` says whether ``head`` contains ``base`` (GitHub's compare), raising
+        # when it cannot tell, off the event loop; without it no later deploy counts.
+        self._compare = compare
+        # Deploys of a wait's name on later commits still to be compared, by wait id.
+        self._slot: dict[str, list[tuple[str, Outcome]]] = {}
+        # Compare answers, yes and no alike; a failed read is not kept.
+        self._compared: dict[tuple[str, str, str], bool] = {}
+        # Waits whose stream this process has scanned once.
+        self._first_done: set[str] = set()
+        # Failed read runs counted per due step, by wait id, and when the next may run.
+        self._read_tries: dict[str, dict[tuple, int]] = {}
+        self._read_retry_at: dict[str, float] = {}
         # (chat id, note id, text): a pending note for the chat's next message, waking nothing
         # (#4306). The routine ends below that wake nobody leave one, so the agent still hears.
         self._note = note
@@ -2260,6 +2512,9 @@ class WakeOnService:
             if request.pending_text:
                 due.append(self._retry_at.get(request.id, now))
                 continue
+            if tracks_build(request):
+                due.extend(self._build_due(request, now))
+                continue
             due.append(request.deadline)
             if request.check_command and request.id not in self._checks:
                 due.append(request.check_at)
@@ -2358,6 +2613,8 @@ class WakeOnService:
                 outcome = match(request, delivery)
                 if outcome is not None:
                     self._deliver(request, outcome)
+                elif tracks_build(request):
+                    self._follow_build(request, delivery)
         self.expire_due()
 
     def _cut_short(
@@ -2481,6 +2738,12 @@ class WakeOnService:
                     request,
                     deck_deploy_message(request, self._revision() or "", self._skills_marker or ""),
                 )
+            elif tracks_build(request):
+                keys = self._due_keys(request, now)
+                if (keys or self._slot.get(request.id)) and now >= self._read_retry_at.get(
+                    request.id, 0.0
+                ):
+                    self._start_build_run(request, keys)
             elif request.deadline <= now:
                 if request.kind == KIND_NEEDS_YOU and not self._present(request):
                     # Its week is up with nobody in the chat: end it without a word (#3464).
@@ -2520,6 +2783,8 @@ class WakeOnService:
     def _settle(self, request: WakeRequest, work: Callable[[WakeRequest], Awaitable[None]]) -> bool:
         """Start ``work`` on a due wait off the deadline pass, once; False with no event loop,
         when the wait takes today's path instead."""
+        if request.id in self._settling:
+            return False
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -2644,6 +2909,209 @@ class WakeOnService:
             )[:1800],
         )
 
+    # A deployment wait on a commit follows the commit (#4445) ---------------------------
+
+    def _held(self, request_id: str) -> WakeRequest | None:
+        return next((item for item in self.registry.all() if item.id == request_id), None)
+
+    def _forget(self, request_id: str) -> None:
+        self._slot.pop(request_id, None)
+        self._first_done.discard(request_id)
+        self._read_tries.pop(request_id, None)
+        self._read_retry_at.pop(request_id, None)
+
+    def _due_keys(self, request: WakeRequest, now: float) -> tuple[tuple, ...]:
+        """The steps due on a deployment wait on a commit, in the order they are acted on:
+        its first scan in this process, the failure message, its deadline."""
+        keys: list[tuple] = []
+        if request.id not in self._first_done:
+            keys.append(("first",))
+        if request.failed and not request.failed_told and now >= request.failed_at + FAILED_GRACE_S:
+            keys.append(("failed", request.failed_at))
+        if request.deadline <= now:
+            keys.append(("deadline", request.deadline))
+        return tuple(keys)
+
+    def _build_due(self, request: WakeRequest, now: float) -> list[float]:
+        retry = self._read_retry_at.get(request.id, 0.0)
+        due = [max(request.deadline, retry)]
+        if request.id not in self._first_done or self._slot.get(request.id):
+            due.append(max(now, retry))
+        if request.failed and not request.failed_told:
+            due.append(max(request.failed_at + FAILED_GRACE_S, retry))
+        return due
+
+    def _add_candidate(self, request_id: str, found: tuple[str, Outcome], *, first: bool) -> None:
+        slot = self._slot.setdefault(request_id, [])
+        if any(sha == found[0] for sha, _ in slot):
+            return
+        if first:
+            slot.insert(0, found)
+        else:
+            slot.append(found)
+
+    def _note_check(self, request: WakeRequest, check: str, words: str, at: float) -> bool:
+        """Record or clear a failed check; whether the wait changed."""
+        try:
+            return self.registry.note_failed(request.id, words, check, at) is not None
+        except Exception:  # noqa: BLE001 - a lost note is found by the next scan
+            log.warning("wake-on: could not note a check on %s", request.target, exc_info=True)
+            return False
+
+    def _follow_build(self, request: WakeRequest, delivery: Delivery) -> None:
+        """A delivery the wait's exact match passed over: a deploy of a later commit that
+        may contain the wait's, or a check on its commit that failed or passed."""
+        other = other_success(request, delivery) if self._compare is not None else None
+        if other is not None:
+            self._add_candidate(request.id, other, first=False)
+            self._start_build_run(request, ())
+            return
+        seen = check_state(request, delivery)
+        if seen is None:
+            return
+        check, state, when = seen
+        at = when.timestamp() if when is not None else self._clock()
+        if state in _FAILED_STATES:
+            self._note_check(request, check, failure_summary(request, delivery), at)
+        elif state == "success" and self._note_check(request, check, "", at):
+            # Another check may still be failing, which the one recorded kept out: scan.
+            self._start_build_run(request, ())
+
+    def _start_build_run(self, request: WakeRequest, keys: tuple[tuple, ...]) -> bool:
+        """One run for every step due on the wait; False when one is running already, which
+        reads anything added to the wait's slot before it ends."""
+        if request.id in self._settling:
+            return False
+        if self._settle(request, lambda held: self._build_run(held, keys)):
+            return True
+        # No event loop (tools and tests): the same run, here.
+        asyncio.run(self._build_run(request, keys))
+        return True
+
+    def _scan_step(self, request: WakeRequest) -> None:
+        scan = scan_deploy(self._streams_root, request)
+        if scan.candidate is not None and self._compare is not None:
+            self._add_candidate(request.id, scan.candidate, first=True)
+        held = self._held(request.id) or request
+        if held.failed and held.failed_check in scan.passed:
+            # Its newest state, by the source's time, is a pass.
+            self._note_check(held, held.failed_check, "", float("inf"))
+            held = self._held(request.id) or held
+        if scan.failure is not None:
+            self._note_check(held, *scan.failure)
+
+    async def _contained(self, repository: str, base: str, head: str) -> bool:
+        key = (repository, base, head)
+        if key not in self._compared:
+            answer = bool(await self._compare(repository, base, head))  # type: ignore[misc]
+            if len(self._compared) >= MAX_COMPARED:
+                self._compared.clear()
+            self._compared[key] = answer
+        return self._compared[key]
+
+    async def _build_run(self, request: WakeRequest, keys: tuple[tuple, ...]) -> None:
+        """Scan the stream, compare each deploy waiting in the slot, then act on ``keys``."""
+        if self._held(request.id) is None:
+            self._forget(request.id)
+            return
+        failed = ""
+        try:
+            self._scan_step(request)
+        except Exception as exc:  # noqa: BLE001 - a scan that failed is tried again
+            log.warning("wake-on: scanning for %s failed", request.target, exc_info=True)
+            failed = f"reading the deck's webhook log failed ({_why(exc)})"
+        unread: list[tuple[str, Outcome]] = []
+        slot = self._slot.setdefault(request.id, [])
+        while slot:
+            sha, outcome = slot.pop(0)
+            try:
+                contained = await self._contained(request.repository, request.sha, sha)
+            except Exception as exc:  # noqa: BLE001 - an unread compare is not a "no"
+                log.warning("wake-on: comparing %s with %s failed", request.target, sha)
+                failed = f"GitHub's compare with {sha[:12]} failed ({_why(exc)})"
+                unread.append((sha, outcome))
+                continue
+            if contained:
+                held = self._held(request.id)
+                if held is None or held.pending_text:
+                    return
+                self._slot.pop(request.id, None)
+                log.info("wake-on: %s is in deployed %s", request.target, sha[:12])
+                self._deliver(held, contained_outcome(held, sha, outcome))
+                return
+        self._after(request.id, keys, unread, failed)
+
+    def _after(self, request_id: str, keys: tuple[tuple, ...], unread: list, failed: str) -> None:
+        held = self._held(request_id)
+        if held is None:
+            self._forget(request_id)
+            return
+        now = self._clock()
+        tries = self._read_tries.setdefault(request_id, {})
+        due = set(self._due_keys(held, now))
+        for key in list(tries):
+            if key not in due and key != ("slot",):
+                tries.pop(key)  # acted on, or no longer due: a new deadline is a new step
+        if not failed:
+            tries.clear()
+            self._read_retry_at.pop(request_id, None)
+            for key in keys:
+                self._act(request_id, key)
+            return
+        self._slot[request_id] = unread + self._slot.get(request_id, [])
+        self._read_retry_at[request_id] = now + READ_RETRY_S
+        given_up = []
+        for key in keys or (("slot",),):
+            tries[key] = tries.get(key, 0) + 1
+            if tries[key] >= READ_TRIES:
+                given_up.append(key)
+                tries.pop(key)
+        for key in given_up:
+            if key == ("slot",):
+                self._slot.pop(request_id, None)
+            else:
+                self._act(request_id, key, read_failed_note(failed))
+
+    def _act(self, request_id: str, key: tuple, note: str = "") -> None:
+        held = self._held(request_id)
+        if held is None or held.pending_text:
+            return
+        now = self._clock()
+        if key == ("first",):
+            self._first_done.add(request_id)
+        elif key[0] == "failed":
+            if held.failed and not held.failed_told and held.failed_at == key[1]:
+                self._tell_failed(held, note)
+        elif key[0] == "deadline" and held.deadline == key[1] and held.deadline <= now:
+            outcome = self._seen_at_timeout(held)
+            if outcome is not None:
+                self._deliver(held, outcome)
+            elif held.extra_s:
+                self.registry.extend(held.id, now)
+            else:
+                self._fire(held, timeout_message(held) + note)
+
+    def _tell_failed(self, request: WakeRequest, note: str = "") -> None:
+        """Send the wait's one failure message; the wait goes on (#4445)."""
+        now = datetime.now(UTC)
+        # One per recorded failure: a re-run that fails again is news again.
+        message_id = f"wake-on:build-failed:{request.id}:{int(request.failed_at)}"
+        scheduled = self._schedule(
+            ScheduledMessage(
+                id=message_id,
+                chat_id=request.chat_id,
+                text=failed_message(request, note),
+                due_at=now,
+                created_at=now,
+            )
+        )
+        if scheduled is None and not self._message_exists(message_id):
+            log.warning("wake-on: could not save the failure note for %s", request.id)
+            self._read_retry_at[request.id] = self._clock() + PENDING_RETRY_S
+            return
+        log.info("wake-on: told %s a check failed on %s", request.session_key, request.target)
+        self.registry.mark_failed_told(request.id, request.failed_at)
+
     def _deliver(self, request: WakeRequest, outcome: Outcome, *, read: bool = False) -> None:
         """Wake the chat with a result, unless the deck already settles it (#4253): green CI
         on the head of a ready pull request the release merges or merged (a deploy's result
@@ -2680,6 +3148,7 @@ class WakeOnService:
                 )
             self._retry_at.pop(request.id, None)
             self.registry.remove([request.id])
+            self._forget(request.id)
             return
         self._fire(request, fired_message(request, outcome, read=read))
 
@@ -2985,3 +3454,4 @@ class WakeOnService:
         log.info("wake-on: waking %s for %s", request.session_key, request.target)
         self._retry_at.pop(request.id, None)
         self.registry.remove([request.id])
+        self._forget(request.id)

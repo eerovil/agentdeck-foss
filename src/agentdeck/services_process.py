@@ -541,6 +541,38 @@ def create_services_app(
     return app
 
 
+def _hold_lock(socket: Path) -> int | None:
+    """Take ``<socket>.lock`` for this process's life; None when another process holds it.
+
+    The kernel lets go of it when the process ends, however it ends, so a crash leaves no
+    stale lock. The descriptor is returned so nothing closes it before then.
+    """
+    import fcntl
+
+    fd = os.open(f"{socket}.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def _answering(path: Path) -> bool:
+    """Whether a process accepts connections on this Unix socket; a stale file does not."""
+    import socket as sockets
+
+    probe = sockets.socket(sockets.AF_UNIX, sockets.SOCK_STREAM)
+    probe.settimeout(1.0)
+    try:
+        probe.connect(str(path))
+    except OSError:
+        return False
+    finally:
+        probe.close()
+    return True
+
+
 def main(argv: list[str]) -> None:
     """``agentdeck services``: serve the moved services on their socket until stopped."""
     import argparse
@@ -564,6 +596,17 @@ def main(argv: list[str]) -> None:
     config = load_config(config_path())
     socket = services_socket_path(config)
     socket.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # A second process would unlink the first one's socket and both would route, merge and run
+    # the backstop (#4454: a hand-run one beside a launchd job). The lock, held until this
+    # process ends, decides between two starting together; the probe catches one from before
+    # the lock existed. Either way this one exits, and a supervisor starting it tries again and
+    # takes over once the first has stopped.
+    lock = _hold_lock(socket)
+    if lock is None or _answering(socket):
+        logging.getLogger(__name__).error(
+            "another agentdeck services is already serving %s; not starting a second", socket
+        )
+        raise SystemExit(4)
     socket.unlink(missing_ok=True)
     os.umask(0o077)
     app = create_services_app(config)

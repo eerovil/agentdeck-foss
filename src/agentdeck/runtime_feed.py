@@ -387,6 +387,7 @@ class RuntimeFeedClient:
         self.mode = DOWN
         self._subs: set[FeedSubscription] = set()
         self._listeners: list[Callable[[frozenset[str]], None]] = []
+        self._mode_listeners: list[Callable[[str], None]] = []
         self._task: asyncio.Task | None = None
 
     def subscribe(self, items: str | Iterable[str] | Callable[[str], bool]) -> FeedSubscription:
@@ -414,6 +415,16 @@ class RuntimeFeedClient:
 
         return remove
 
+    def add_mode_listener(self, listener: Callable[[str], None]) -> Callable[[], None]:
+        """Call ``listener(mode)`` each time the connection's mode changes; returns its remover."""
+        self._mode_listeners.append(listener)
+
+        def remove() -> None:
+            with contextlib.suppress(ValueError):
+                self._mode_listeners.remove(listener)
+
+        return remove
+
     def _unsubscribe(self, sub: FeedSubscription) -> None:
         self._subs.discard(sub)
         if not self._subs and self._task is not None:
@@ -433,6 +444,11 @@ class RuntimeFeedClient:
             # A waiter parked under the old rule has to re-decide under the new one.
             for sub in list(self._subs):
                 sub.notify()
+            for listener in list(self._mode_listeners):
+                try:
+                    listener(mode)
+                except Exception:  # noqa: BLE001 -- a listener never stops the feed
+                    log.exception("runtime feed mode listener failed")
 
     def _deliver(self, items: Iterable[str] | None) -> None:
         """Wake the subscriptions these items concern (``None``: every one)."""

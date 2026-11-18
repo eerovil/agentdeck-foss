@@ -60,3 +60,21 @@
   </div>
 </details>
 {% endif %}
+{# The Work services process the web cannot reach (#4454), in the same slot: without it no
+   Work is routed, a Merge press fails and the missed-start backstop does not run. Shown
+   only after a minute, so a deploy's restart of it shows nothing; the services follower
+   republishes this fragment when it appears or clears. #}
+{% set services_down = services_unreachable() %}
+{% if services_down %}
+<details class="deployment-status deployment-status-blocked services-status">
+  <summary aria-label="Work services down" title="Work services down">
+    <span class="deployment-status-dot" aria-hidden="true"></span>
+    <span>services down</span>
+  </summary>
+  <div class="deployment-status-panel">
+    <strong>Work services down</strong>
+    <p class="deployment-status-note">The Work services process has not answered at {{ services_down.socket }} for {{ services_down.minutes }} min, so new issues get no Work, Merge presses fail and missed starts are not caught.</p>
+    <p class="deployment-status-note services-status-fix">On a Mac run <code>~/agentdeck/.venv/bin/agentdeck-launchd</code>; on Linux <code>systemctl --user enable --now agentdeck-services</code>. Its log is <code>~/Library/Logs/agentdeck/services.log</code> on a Mac, <code>journalctl --user -u agentdeck-services</code> on Linux.</p>
+  </div>
+</details>
+{% endif %}

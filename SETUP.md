@@ -82,6 +82,23 @@ Tell the person, in a few lines:
 - that the agent opens a pull request, and they press **Merge** on the Work page when they
   are happy with it.
 
+## Updating an existing Mac deck
+
+A Mac deck set up before the Work services had a launchd job of their own (#4454) has no
+`com.agentdeck.services` job, so no new issue becomes a Work, **Merge** fails and the
+missed-start backstop never runs; the dashboard's top bar shows a red **services down** pill.
+After pulling the new code (`git -C ~/agentdeck pull && cd ~/agentdeck && uv sync`), run
+
+```sh
+~/agentdeck/.venv/bin/agentdeck-launchd
+```
+
+It adds only the deck's launchd jobs launchd does not know and leaves the loaded ones alone, so
+it stops no chat. Its log is `~/Library/Logs/agentdeck/services.log`. If you started
+`agentdeck services` by hand in a terminal meanwhile, stop it: the new job waits, retrying,
+until that one is gone. Rerunning `agentdeck-init` also installs the job, but restarts the
+runtime and every chat it holds.
+
 ## Do not
 
 - Do not edit the files the command wrote to make a step pass; run the command again, or

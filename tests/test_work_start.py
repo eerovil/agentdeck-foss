@@ -433,6 +433,17 @@ async def test_an_issue_the_deck_filed_starts_its_work_without_the_webhook(root)
     assert unswitched.starts_on(ISSUE, ["agent"]) == ""
 
 
+async def test_an_issue_the_deck_filed_starts_here_only_when_its_assignee_is_this_decks(root):
+    """#4455: the filed delivery carries the assignee; one filed to nobody, on a deck that
+    leaves those to another, starts nothing and says so."""
+    service, started = router(root, mine=coworkers_deck)
+    assert service.note_filed(ISSUE, 7, ["agent"]) is False
+    assert service.note_filed(ISSUE, 8, ["agent"], assignee="someone") is False
+    assert service.note_filed(ISSUE, 9, ["agent"], assignee="EeroVil") is True
+    await asyncio.gather(*service._checks)
+    assert started == [(ISSUE, 9)]
+
+
 async def test_a_label_delivery_waits_while_the_deck_files_in_its_repository(root):
     """#3590: the deck's early agent may be this very issue's; the router retries later."""
     service, started = router(root)

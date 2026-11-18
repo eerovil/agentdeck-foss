@@ -393,6 +393,24 @@ async def test_a_merge_in_an_auto_deploying_repository_waits_on_that_deploy(fake
     assert bodies == [{"deployment": f"eerovil/site@{MERGE_SHA}"}]
 
 
+async def test_a_named_production_deploy_names_the_deploy_wait(fake):
+    """#4445: ``deploy_name`` names the wait, which then counts a later deploy containing it."""
+    site = "eerovil/site#4"
+    waits = waiting_deploys(fake)
+    fake.policy = Policy(
+        auto_release=False,
+        deploys=frozenset({"eerovil/site"}),
+        deploy_names=(("eerovil/site", "promote/production"),),
+    )
+    fake.pulls = {site: Pull(site, "OPEN", False, HEAD, "MERGEABLE", "CLEAN", "green")}
+    await fake.service.evaluate(WORK)
+    fake.set(site, state="MERGED", merge_commit=MERGE_SHA)
+    await fake.service.on_pull_event(WORK, site, "closed", True)
+    await fake.service.evaluate(WORK)
+    [(_chat, bodies, _then)] = waits
+    assert bodies == [{"deployment": f"eerovil/site@{MERGE_SHA}", "name": "promote/production"}]
+
+
 async def test_a_merge_github_refuses_is_told_once_and_tried_again(fake):
     fake.merge_answer = FAILED
     await passed(fake)
@@ -598,6 +616,7 @@ def test_release_policies_come_from_switched_manifests(tmp_path):
         '[[repos]]\nid = "agentdeck"\nholds_issues = true\n'
         '[[repos]]\nid = "review-chats"\nverification = "review_only"\n'
         '[[repos]]\nid = "site"\nauto_deploys = true\ngithub_checks_required = true\n'
+        'deploy_name = "promote/production"\n'
         '[staging]\nenvironment_prefix = "staging-"\nrepos = ["site"]\n'
         'links = [{label = "Site", url = "https://{slug}.example/"},'
         ' {label = "Bad", url = "http://{slug}.example/"}]\n'
@@ -611,6 +630,7 @@ def test_release_policies_come_from_switched_manifests(tmp_path):
     assert policy.authorization.allows(Tier.RELEASE, "review-bot[bot]")
     assert policy.spec_only_label == "spec-only"
     assert policy.deploys == {"eerovil/site"}
+    assert policy.deploy_names == (("eerovil/site", "promote/production"),)
     assert policy.checks_required == {"eerovil/site"} and policy.github_checks == set()
     # [staging] (#3180): plain-http links are dropped.
     assert policy.staging_repos == {"eerovil/site"}

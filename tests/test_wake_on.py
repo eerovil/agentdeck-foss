@@ -1575,8 +1575,13 @@ def test_a_timeout_finds_a_named_status_deploy_and_only_for_a_named_wait(
     drain(service)
     clock.now += 5 * 60
     service.expire_due()
-    assert len(scheduled) == 1 and "commit status Vercel" in scheduled[0].text
+    woken = [m for m in scheduled if not m.id.startswith("wake-on:build-failed:")]
+    assert len(woken) == 1 and "commit status Vercel" in woken[0].text
     assert [held.id for held in service.registry.all()] == [unnamed.id]
+    # To the unnamed wait the status is a check on its commit that failed (#4445): told once,
+    # and the wait goes on.
+    told = [m.id.rsplit(":", 1)[0] for m in scheduled if m not in woken]
+    assert told == [f"wake-on:build-failed:{unnamed.id}"]
 
 
 def test_a_timeout_reads_a_named_deploy_across_both_kinds_of_report(
@@ -2952,3 +2957,290 @@ async def test_a_failing_deadline_pass_backs_off_instead_of_spinning(service, mo
     finally:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+
+
+# A deployment wait follows its commit (#4445) -------------------------------------------
+
+LATER = "1234567890abcdef1234567890abcdef12345678"
+PROMOTE = "continuous-integration/drone/promote/production"
+
+
+def _at(clock, offset_s: float = 0.0) -> str:
+    return datetime.fromtimestamp(clock.now + offset_s, UTC).isoformat()
+
+
+def drone_status(root, delivery, sha, context, state, at):
+    deliver(root, event="status", delivery=delivery, sha=sha, context=context, state=state,
+            updated_at=at)
+
+
+@pytest.fixture
+def compared():
+    """What the fake compare answers, by deployed sha (an exception raises), and its calls."""
+    return {"answers": {}, "calls": []}
+
+
+@pytest.fixture
+def following(root, scheduled, clock, compared):
+    async def compare(repository, base, head):
+        compared["calls"].append((repository, base, head))
+        answer = compared["answers"].get(head, False)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    def schedule(message):
+        scheduled.append(message)
+        return message
+
+    return WakeOnService(
+        root,
+        schedule=schedule,
+        message_exists=lambda message_id: any(m.id == message_id for m in scheduled),
+        clock=clock,
+        compare=compare,
+    )
+
+
+def _wait(service, **extra):
+    return register(
+        service,
+        deployment=f"eerovil/agentdeck@{SHA}",
+        name="promote/production",
+        timeout_minutes=120,
+        **extra,
+    )
+
+
+def test_a_later_deploy_that_contains_a_killed_merge_wakes_its_wait(
+    root, following, scheduled, clock, compared
+):
+    request = _wait(following)
+    drone_status(root, "d1", SHA, "continuous-integration/drone/push", "error", _at(clock))
+    drain(following)
+    assert scheduled == [] and following.registry.all()[0].failed
+    compared["answers"][LATER] = True
+    drone_status(root, "d2", LATER, PROMOTE, "success", _at(clock, 60))
+    drain(following)
+    assert compared["calls"] == [("eerovil/agentdeck", SHA, LATER)]
+    assert [m.id for m in scheduled] == [f"wake-on:{request.id}"]
+    assert f"contains {SHA[:12]}" in scheduled[0].text and "success" in scheduled[0].text
+    assert following.registry.all() == ()
+
+
+def test_a_deploy_from_before_the_wait_is_found_by_its_first_scan(
+    root, following, scheduled, clock, compared
+):
+    drone_status(root, "d1", LATER, PROMOTE, "success", _at(clock, -600))
+    drain(following)
+    compared["answers"][LATER] = True
+    request = _wait(following)
+    following.expire_due()
+    assert [m.id for m in scheduled] == [f"wake-on:{request.id}"]
+
+
+def test_a_later_deploy_without_the_commit_and_an_unnamed_wait_do_not_count(
+    root, following, scheduled, clock, compared
+):
+    named = _wait(following)
+    unnamed = register(following, deployment=f"eerovil/agentdeck@{SHA}", timeout_minutes=120)
+    drone_status(root, "d1", LATER, PROMOTE, "success", _at(clock, 60))
+    deploy_state(root, "d2", "success", _at(clock, 60), sha=LATER)
+    drain(following)
+    # Only the named wait asked, and the "no" is kept: a second deploy asks nothing.
+    assert compared["calls"] == [("eerovil/agentdeck", SHA, LATER)]
+    drone_status(root, "d3", LATER, PROMOTE, "success", _at(clock, 90))
+    drain(following)
+    assert len(compared["calls"]) == 1
+    assert scheduled == [] and {r.id for r in following.registry.all()} == {named.id, unnamed.id}
+
+
+def test_a_failed_check_is_told_once_after_the_grace_and_the_wait_goes_on(
+    root, following, scheduled, clock
+):
+    request = _wait(following)
+    drone_status(root, "d1", SHA, "continuous-integration/drone/push", "error", _at(clock))
+    drain(following)
+    held = following.registry.all()[0]
+    assert following.next_due() == pytest.approx(held.failed_at + 30 * 60)
+    clock.now += 29 * 60
+    following.expire_due()
+    assert scheduled == []
+    clock.now += 2 * 60
+    following.expire_due()
+    following.expire_due()
+    assert [m.id.rsplit(":", 1)[0] for m in scheduled] == [f"wake-on:build-failed:{request.id}"]
+    assert "continuous-integration/drone/push" in scheduled[0].text
+    assert "finished: error" in scheduled[0].text
+    assert following.registry.all()[0].failed_told
+    # At the timeout the wait has its one more round, then names the failure.
+    clock.now = request.deadline + 1
+    following.expire_due()
+    assert len(scheduled) == 1
+    clock.now = following.registry.all()[0].deadline + 1
+    following.expire_due()
+    assert scheduled[-1].id == f"wake-on:{request.id}"
+    assert "A check on that commit failed" in scheduled[-1].text
+    assert following.registry.all() == ()
+
+
+def test_a_check_that_passed_on_a_rerun_is_no_failure(root, following, scheduled, clock):
+    _wait(following)
+    push = "continuous-integration/drone/push"
+    drone_status(root, "d1", SHA, push, "error", _at(clock))
+    drain(following)
+    drone_status(root, "d2", SHA, push, "success", _at(clock, 60))
+    drain(following)
+    assert not following.registry.all()[0].failed
+    clock.now += 31 * 60
+    following.expire_due()
+    assert scheduled == []
+
+
+def test_an_old_failure_is_found_by_the_first_scan(root, following, scheduled, clock):
+    push = "continuous-integration/drone/push"
+    drone_status(root, "d1", SHA, push, "error", _at(clock, -3600))
+    drain(following)
+    request = _wait(following)
+    following.expire_due()
+    following.expire_due()
+    assert [m.id.rsplit(":", 1)[0] for m in scheduled] == [f"wake-on:build-failed:{request.id}"]
+
+
+def test_an_unread_compare_is_tried_again_and_then_given_up_at_the_deadline(
+    root, following, scheduled, clock, compared
+):
+    request = _wait(following)
+    compared["answers"][LATER] = RuntimeError("HTTP 502")
+    drone_status(root, "d1", LATER, PROMOTE, "success", _at(clock, 60))
+    drain(following)
+    assert len(compared["calls"]) == 1 and scheduled == []
+    # Paced: not again before a minute is up.
+    following.expire_due()
+    assert len(compared["calls"]) == 1
+    assert following.next_due() == pytest.approx(clock.now + 60)
+    clock.now += 61
+    following.expire_due()
+    assert len(compared["calls"]) == 2
+    # The compare answers at last: woken.
+    compared["answers"][LATER] = True
+    clock.now += 61
+    following.expire_due()
+    assert [m.id for m in scheduled] == [f"wake-on:{request.id}"]
+
+
+def test_a_deadline_whose_reads_keep_failing_says_so(root, following, scheduled, clock, compared):
+    request = _wait(following)
+    following.expire_due()  # its first scan, with nothing to compare
+    compared["answers"][LATER] = RuntimeError("HTTP 502")
+    drone_status(root, "d1", LATER, PROMOTE, "success", _at(clock, 60))
+    clock.now = request.deadline + 1
+    held = following.registry.all()[0]
+    following.registry.update(replace(held, extra_s=0.0))
+    drain(following)
+    for _ in range(3):
+        clock.now += 61
+        following.expire_due()
+    assert [m.id for m in scheduled] == [f"wake-on:{request.id}"]
+    assert "could not" in scheduled[0].text and "HTTP 502" in scheduled[0].text
+
+
+def test_a_refused_failure_message_is_retried(root, clock, compared):
+    stored = []
+    refuse = [True]
+
+    def schedule(message):
+        if refuse[0]:
+            return None
+        stored.append(message)
+        return message
+
+    service = WakeOnService(
+        root,
+        schedule=schedule,
+        message_exists=lambda message_id: any(m.id == message_id for m in stored),
+        clock=clock,
+    )
+    request = _wait(service)
+    drone_status(root, "d1", SHA, "continuous-integration/drone/push", "error", _at(clock, -3600))
+    drain(service)
+    service.expire_due()
+    assert stored == [] and not service.registry.all()[0].failed_told
+    assert service.next_due() == pytest.approx(clock.now + 60)
+    refuse[0] = False
+    clock.now += 61
+    service.expire_due()
+    assert [m.id.rsplit(":", 1)[0] for m in stored] == [f"wake-on:build-failed:{request.id}"]
+
+
+def test_a_deploy_that_lands_while_a_compare_runs_is_read_by_the_same_run(
+    root, scheduled, clock
+):
+    other = "fedcba0987654321fedcba0987654321fedcba09"
+    calls = []
+
+    async def scenario():
+        gate = asyncio.Event()
+
+        async def compare(repository, base, head):
+            calls.append(head)
+            if head == LATER:
+                await gate.wait()
+                return False
+            return True
+
+        service = WakeOnService(
+            root,
+            schedule=lambda message: scheduled.append(message) or message,
+            message_exists=lambda message_id: any(m.id == message_id for m in scheduled),
+            clock=clock,
+            compare=compare,
+        )
+        request = _wait(service)
+        service.expire_due()
+        await asyncio.gather(*service._side_tasks)
+        drone_status(root, "d1", LATER, PROMOTE, "success", _at(clock, 60))
+        drain(service)
+        await asyncio.sleep(0)
+        assert calls == [LATER] and request.id in service._settling
+        drone_status(root, "d2", other, PROMOTE, "success", _at(clock, 90))
+        drain(service)  # busy: the sha waits in the slot for the running run
+        gate.set()
+        await asyncio.gather(*service._side_tasks)
+        return request
+
+    request = asyncio.run(scenario())
+    assert calls == [LATER, other]
+    assert [m.id for m in scheduled] == [f"wake-on:{request.id}"]
+
+
+def test_a_rerun_that_fails_again_and_a_second_failing_check_are_told(
+    root, following, scheduled, clock
+):
+    """Helper checks on #4446: one message per recorded failure, and a failure the first
+    one kept out is found once the first passes; an older pass clears nothing."""
+    request = _wait(following)
+    push, lint = "continuous-integration/drone/push", "lint"
+    drone_status(root, "d1", SHA, push, "error", _at(clock))
+    drone_status(root, "d2", SHA, lint, "failure", _at(clock, 10))
+    drone_status(root, "d3", SHA, push, "success", _at(clock, -10))  # late, and older
+    drain(following)
+    assert following.registry.all()[0].failed_check == f"status:{push}"
+    clock.now += 31 * 60
+    following.expire_due()
+    following.expire_due()
+    assert len(scheduled) == 1 and push in scheduled[0].text
+    # The push passes on its re-run: the lint failure, kept out until now, is recorded.
+    drone_status(root, "d4", SHA, push, "success", _at(clock))
+    drain(following)
+    # It failed over 30 minutes ago, so it is told at once.
+    assert following.registry.all()[0].failed_check == f"status:{lint}"
+    assert len(scheduled) == 2 and "lint" in scheduled[1].text
+    # Lint passes, then the push fails again: told again, under its own id.
+    drone_status(root, "d5", SHA, lint, "success", _at(clock, 60))
+    drone_status(root, "d6", SHA, push, "error", _at(clock, 120))
+    drain(following)
+    clock.now += 33 * 60
+    following.expire_due()
+    assert len(scheduled) == 3 and len({m.id for m in scheduled}) == 3
+    assert all(m.id.startswith(f"wake-on:build-failed:{request.id}:") for m in scheduled)

@@ -239,6 +239,8 @@ def create_app(config: AppConfig) -> FastAPI:
     # Beside it in the same topbar slot: an identity GitHub has suspended (#2682).
     templates.env.globals["github_suspensions"] = github_suspension.suspensions
     templates.env.globals["github_suspension_sentence"] = github_suspension.sentence
+    # And a services process the web cannot reach (#4454); set once its follower exists.
+    templates.env.globals["services_unreachable"] = lambda: None
     # Same shape for the job-queue pill (#1301): the collector keeps the last
     # read of the runtime's queue on AppState and the template asks for it, so
     # one partial serves both the page load and the SSE push.
@@ -434,6 +436,17 @@ def create_app(config: AppConfig) -> FastAPI:
             raise RuntimeError(f"gh api {path} exited {code}")
         return json.loads(stdout or b"null")
 
+    async def wake_compare(repository: str, base: str, head: str) -> bool:
+        # Whether a deployed commit contains a deploy wait's commit (#4445): GitHub's
+        # compare says ``ahead`` or ``identical``. Anything else unread raises.
+        found = await wake_fetch(f"repos/{repository}/compare/{base}...{head}?per_page=1")
+        status = found.get("status") if isinstance(found, dict) else None
+        if status in ("ahead", "identical"):
+            return True
+        if status in ("behind", "diverged"):
+            return False
+        raise RuntimeError(f"compare {base[:12]}...{head[:12]} said {status!r}")
+
     async def wake_ask_review(repository: str, number: int, note: str) -> str:
         # The deck's own ``review-request`` with ``no_verdict`` (#4253): "" when asked.
         from .review_refs import REVIEWER_OFF_TEXT
@@ -489,6 +502,7 @@ def create_app(config: AppConfig) -> FastAPI:
         reviewer_down=lambda: review_reviewer_down(config, config.build_accounts()),
         # The routine wakes the deck settles itself (#4253).
         live_read=lambda request: read_live(request, wake_fetch),
+        compare=wake_compare,
         ask_review=wake_ask_review,
         ready_head=wake_ready_head,
         release_notices=lambda chat_id, since: scheduled_messages.ids_since(
@@ -536,8 +550,11 @@ def create_app(config: AppConfig) -> FastAPI:
             state=state,
             scheduled_messages=scheduled_messages,
             wake_on=wake_on,
+            enabled=work_services.services_enabled(config),
         )
     )
+    if services_follower is not None:
+        templates.env.globals["services_unreachable"] = services_follower.unreachable
 
     def work_starred(work_id: str) -> bool:
         # A person's star (#3116). Unreadable is unstarred; case-blind, as a webhook may spell
@@ -815,6 +832,7 @@ def create_app(config: AppConfig) -> FastAPI:
     app.state.poller_wake = poller_wake
     app.state.wake_on = wake_on
     app.state.work_router = work_router
+    app.state.services_follower = services_follower
     # The Work list leaves out an unlabelled issue another deck would work (#3731).
     app.state.deck_claims = deck_claims
     # The Start button says when an open blocker holds the agent back (#4216); a blocker

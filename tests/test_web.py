@@ -3952,13 +3952,76 @@ async def test_local_file_route_hides_private_turn_uploads(tmp_path, monkeypatch
     attachment = private_root / "lease" / "1-deadbeef.upload"
     attachment.parent.mkdir(parents=True)
     attachment.write_bytes(b"private")
+    (private_root / "lease" / "photo.png").write_bytes(b"private image")
+    (tmp_path / "page.html").write_text("<img src=private-uploads/lease/photo.png>")
+    (tmp_path / "public.png").write_bytes(b"public image")
     app = _app_with_state(tmp_path)
 
     async with _client(app) as client:
         response = await client.get(str(attachment))
+        # A page previewed from the spool's parent cannot reach into it either.
+        wrapper = await client.get(str(tmp_path / "page.html"))
+        base = re.search(r'<iframe src="([^"]+)"', wrapper.text).group(1).rsplit("/", 1)[0]
+        spooled = await client.get(f"{base}/private-uploads/lease/photo.png")
+        public = await client.get(f"{base}/public.png")
 
     assert response.status_code == 404
     assert response.json() == {"detail": "local file not found"}
+    assert spooled.status_code == 404
+    assert (public.status_code, public.content) == (200, b"public image")
+
+
+async def test_preview_asset_answers_byte_ranges_so_media_can_seek(tmp_path):
+    """Audio and video in a preview seek only when its assets answer 206 (#4452)."""
+    app = _app_with_state(tmp_path)
+    page = tmp_path / "compare"
+    page.mkdir()
+    (page / "index.html").write_text("<audio controls src=take.mp3></audio>")
+    audio = bytes(range(256)) * 4
+    (page / "take.mp3").write_bytes(audio)
+    (page / "empty.mp3").write_bytes(b"")
+
+    async with _client(app) as client:
+        wrapper = await client.get(str(page / "index.html"))
+        base = re.search(r'<iframe src="([^"]+)"', wrapper.text).group(1).rsplit("/", 1)[0]
+
+        async def get(name, range_=None, **extra):
+            headers = {"Range": range_, **extra} if range_ else extra
+            return await client.get(f"{base}/{name}", headers=headers)
+
+        whole = await get("take.mp3")
+        middle = await get("take.mp3", "bytes=100-200")
+        open_end = await get("take.mp3", "bytes=1000-")
+        past_end = await get("take.mp3", "bytes=1000-5000")
+        suffix = await get("take.mp3", "bytes=-24")
+        too_far = await get("take.mp3", "bytes=1024-")
+        several = await get("take.mp3", "bytes=0-1,5-6")
+        malformed = await get("take.mp3", "bytes=9-3")
+        if_range = await get("take.mp3", "bytes=0-1", **{"If-Range": '"v1"'})
+        empty = await get("empty.mp3", "bytes=0-")
+        huge = await get("take.mp3", "bytes=" + "9" * 5000 + "-")
+
+    assert whole.status_code == 200
+    assert whole.content == audio
+    assert whole.headers["accept-ranges"] == "bytes"
+    assert middle.status_code == 206
+    assert middle.content == audio[100:201]
+    assert middle.headers["content-range"] == "bytes 100-200/1024"
+    assert middle.headers["content-length"] == "101"
+    assert middle.headers["content-type"] == "audio/mpeg"
+    assert "sandbox allow-scripts" in middle.headers["content-security-policy"]
+    assert (open_end.status_code, open_end.content) == (206, audio[1000:])
+    assert past_end.headers["content-range"] == "bytes 1000-1023/1024"
+    assert (suffix.status_code, suffix.content) == (206, audio[-24:])
+    assert suffix.headers["content-range"] == "bytes 1000-1023/1024"
+    for unsatisfiable in (too_far, empty):
+        assert unsatisfiable.status_code == 416
+        assert unsatisfiable.content == b""
+    assert too_far.headers["content-range"] == "bytes */1024"
+    assert empty.headers["content-range"] == "bytes */0"
+    # A range this route does not honour is ignored, as HTTP allows: the whole file.
+    for ignored in (several, malformed, if_range, huge):
+        assert (ignored.status_code, ignored.content) == (200, audio)
 
 
 @pytest.mark.browser

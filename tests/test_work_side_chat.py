@@ -41,6 +41,7 @@ from agentdeck.work_workspace import (
     RepositoryRole,
     WorkPullRequest,
     WorkRepositoryContext,
+    WorkspaceProbe,
     WorktreeObservation,
     WorkWorkspace,
 )
@@ -141,6 +142,18 @@ def test_a_local_checkout_is_a_main_checkout_of_the_works_repository(tmp_path):
     candidates = [str(other), "", str(ours / "src"), str(tmp_path / "missing"), str(ours)]
     assert local_repository_checkout(WORK, candidates) == str(ours.resolve())
     assert local_repository_checkout(WORK, [str(other)]) == ""
+
+
+def test_the_works_own_checkout_is_found_past_the_probes_folder_limit(tmp_path):
+    # #4443: the overlays list 40 folders, the wanted one 33rd, and the probe inspects only 24.
+    others = [_repo(tmp_path / f"o{n}", f"https://github.com/eerovil/o{n}.git") for n in range(3)]
+    # A longer name that starts with the Work's is not its repository, so it is not tried first.
+    others.append(_repo(tmp_path / "fork", "https://github.com/eerovil/agentdeck-fork.git"))
+    ours = _repo(tmp_path / "agentdeck", "git@github.com:EeroVil/AgentDeck.git")
+    candidates = [str(others[-1]), *map(str, others[:-1]), str(ours)]
+    assert local_repository_checkout(WORK, candidates, WorkspaceProbe(limit=1)) == str(
+        ours.resolve()
+    )
 
 
 class _Chat:

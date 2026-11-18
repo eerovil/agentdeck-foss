@@ -64,6 +64,7 @@ from ..wake_on import (
     parse_request,
 )
 from ..work import work_id_for
+from ..work_claims import assignee_of
 from .chat_successor import reserve_chat_successor
 from .deps import (
     delegation_account,
@@ -670,7 +671,11 @@ async def note_filed_issue(request: Request, body: FiledIssueRequest) -> dict:
         or not _changed_lately(record.get("updatedAt"))
     ):
         return answer
-    answer["starting"] = router_service.note_filed(ref.repository, ref.number, labels)
+    # Its assignee too: where another deck takes unassigned issues, one filed to nobody is
+    # that deck's, and ``starting`` must not say this one starts it (#4455).
+    answer["starting"] = router_service.note_filed(
+        ref.repository, ref.number, labels, assignee=assignee_of(record)
+    )
     return answer
 
 

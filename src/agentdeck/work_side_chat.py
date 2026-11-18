@@ -9,6 +9,7 @@ read; the route in ``web/routes_works.py`` makes the one write.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -54,10 +55,17 @@ def local_repository_checkout(
     Only a directory holding a ``.git`` directory (not a linked worktree) whose ``origin``
     is that repository and which is its own top level counts. This runs git, so a caller
     keeps it off the event loop.
+
+    The probe inspects only so many folders (``DEFAULT_PATH_LIMIT``), and every project's
+    overlay checkouts come before the one asked for, so a folder whose ``.git/config`` names
+    the repository is tried first (#4443): with 40 overlay folders, one project's own came 33rd
+    and was never inspected, so none of its Works could start. Git still confirms each match.
     """
     repository = (work if isinstance(work, str) else work.repository).lower()
     probe = probe or WorkspaceProbe()
     seen: set[str] = set()
+    named: list[Path] = []
+    rest: list[Path] = []
     for raw in candidates:
         if not raw or raw in seen:
             continue
@@ -68,10 +76,24 @@ def local_repository_checkout(
                 continue
         except (OSError, RuntimeError):
             continue
+        (named if _config_names(path, repository) else rest).append(path)
+    for path in (*named, *rest):
         found = probe.observe(str(path))
         if found.readable and found.repository == repository and (found.toplevel == str(path)):
             return str(path)
     return ""
+
+
+def _config_names(path: Path, repository: str) -> bool:
+    """Whether ``path``'s ``.git/config`` mentions ``owner/repo``: a hint for the order only."""
+    try:
+        text = (path / ".git" / "config").read_text(errors="replace").lower()
+    except OSError:
+        return False
+    # The whole name, so ``owner/repo-fork`` never counts as ``owner/repo``.
+    return (
+        re.search(rf"[/:]{re.escape(repository)}(?:\.git)?/?\s*$", text, re.MULTILINE) is not None
+    )
 
 
 def prefilled_account(chats: Sequence[Any], sessions: Any, candidates: Sequence[str]) -> str:

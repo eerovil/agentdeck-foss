@@ -447,6 +447,9 @@ class _ManifestFacts:
     review_only_repos: tuple[str, ...] = ()
     # The repositories that deploy what merges (``auto_deploys``, #2760).
     deploy_repos: tuple[str, ...] = ()
+    # ``(repo id, deploy_name)`` of the deploying repositories that name their production
+    # deploy (#4445): the deck's deploy wait on a merge there is named by it.
+    deploy_names: tuple[tuple[str, str], ...] = ()
     # Every ``[[repos]]`` id, issue repository or not, as the manifest names it.
     repos: tuple[str, ...] = ()
     # The ``[[repos]]`` ids that hold code (``holds_code = true``, #4233).
@@ -556,6 +559,15 @@ def _manifest(path: Path) -> _ManifestFacts:
             str(entry.get("id")).strip()
             for entry in (repos if isinstance(repos, list) else [])
             if isinstance(entry, dict) and entry.get("auto_deploys") is True and entry.get("id")
+        ),
+        deploy_names=tuple(
+            (str(entry.get("id")).strip(), entry["deploy_name"].strip())
+            for entry in (repos if isinstance(repos, list) else [])
+            if isinstance(entry, dict)
+            and entry.get("id")
+            and entry.get("auto_deploys") is True
+            and isinstance(entry.get("deploy_name"), str)
+            and entry["deploy_name"].strip()
         ),
         releasing_repos=tuple(
             str(entry.get("id")).strip()
@@ -922,6 +934,9 @@ def release_policies(root: str | Path) -> dict[str, object]:
             paused_label=facts.paused_label,
             deploys=frozenset(
                 _qualified(facts.org, repo).lower() for repo in facts.deploy_repos
+            ),
+            deploy_names=tuple(
+                (_qualified(facts.org, repo).lower(), name) for repo, name in facts.deploy_names
             ),
             staging=facts.staging,
             staging_repos=frozenset(
