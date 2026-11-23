@@ -221,6 +221,28 @@ class ClaudeWorkerClient(RuntimeSocketClient):
             self._on_change()
         return changed
 
+    async def read_drafts(self) -> dict[str, dict] | None:
+        """The 🔊 replies being written, by chat session id (#4543); None when unread.
+
+        A runtime from before drafts answers 404, which reads as none.
+        """
+        try:
+            response = await self._client().get(f"{self._base}/drafts")
+        except httpx.HTTPError:
+            return None
+        if response.status_code == 404:
+            return {}
+        if response.status_code != 200:
+            return None
+        drafts = response.json().get("drafts")
+        if not isinstance(drafts, dict):
+            return {}
+        return {
+            str(session_id): draft
+            for session_id, draft in drafts.items()
+            if isinstance(draft, dict)
+        }
+
     def owns(self, session_id: str) -> bool:
         return session_id in self._owned
 

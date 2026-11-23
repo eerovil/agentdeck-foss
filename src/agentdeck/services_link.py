@@ -40,7 +40,7 @@ from typing import Any
 import httpx
 
 from . import review_history, runtime_feed, work_release
-from .work_router import SwitchedRepositories
+from .work_router import KeyFile, SwitchedRepositories, handed_over_path
 from .work_services import ERRORS, make_deck_claims, services_enabled, work_reviewer
 
 log = logging.getLogger(__name__)
@@ -229,6 +229,9 @@ class RouterLink:
         self._later = later or Later(transport)
         self._enabled = services_enabled(config)
         self.switched = SwitchedRepositories(config.poller.root)
+        # The router's own file of Works handed to another deck, which the Works' status reads
+        # (#4450): the router in the services process writes it.
+        self.handed_over = KeyFile(handed_over_path(config.github_webhook.path))
         # Whether an issue assigned to a login ("" for nobody) is this deck's (#3731), as the
         # router's own ``mine``: settable, as a test sets it.
         self.claims: Callable[[str, str], bool] = make_deck_claims(config)
@@ -297,6 +300,10 @@ class RouterLink:
 
     async def ask_again(self, *args: Any, **kwargs: Any) -> dict:
         return await self._transport.call("router", "ask_again", args, kwargs)
+
+    async def recover_review(self, *args: Any, **kwargs: Any) -> str:
+        """The router's ``recover_review`` (#4478): a missed verdict taken in, or ``""``."""
+        return await self._transport.call("router", "recover_review", args, kwargs)
 
     async def accept(self, *args: Any, **kwargs: Any) -> dict:
         return await self._transport.call("router", "accept", args, kwargs)

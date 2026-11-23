@@ -328,6 +328,14 @@ async def test_start_agent_assigns_this_decks_person_where_another_deck_takes_un
     page = client.get(work_href(WORK.work_id)).text
     assert "data-other-deck" in page and "Take over" in page and 'id="work-result"' in page
     assert 'id="work-message"' not in page and 'value="start"' not in page
+    # #4450: one this deck ran before its issue went there, its stopped chat still here, is
+    # listed there too rather than in this deck's own sections, where it could be neither
+    # answered nor hidden.
+    _add(app, "claude_code:test:handed", WORK, last_text="Stopped: it is theirs now.")
+    await app.state.work_overview.refresh()
+    overview = await app.state.work_overview.current()
+    assert [item.work_id for item in overview.other_decks] == [WORK.work_id]
+    assert WORK.work_id not in {row.card.work_id for row in overview.front.rows}
 
     # Its row read and the reviewer's pass at its head seen in the webhook log: Reviewed,
     # sized like your own, and still never merge-watched.

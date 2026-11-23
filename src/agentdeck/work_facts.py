@@ -128,6 +128,8 @@ class OutputFact:
     # "" when the row has none. They are read by nothing that decides a Work's status.
     title: str = ""
     body: str = ""
+    # When it merged, from the cached row's ``mergedAt`` (#4585); None while open or unknown.
+    merged_at: datetime | None = None
 
     @property
     def conflicting(self) -> bool:
@@ -337,6 +339,13 @@ class WorkFacts:
     ref: WorkRef | None = None
     record: Mapping[str, Any] | None = None  # the issue's cached record
     outputs: tuple[OutputFact, ...] = ()
+    # The pull requests of the Work's earlier rounds (``work_rounds``, #4585): merged or
+    # closed before its issue was reopened or a person followed up. ``outputs`` leaves them
+    # out, so nothing that decides the Work's status, size or merge reads them; the page
+    # lists them under "Earlier rounds".
+    earlier_outputs: tuple[OutputFact, ...] = ()
+    # When the current round started; None for a Work never reopened.
+    round_started_at: datetime | None = None
     finished_at: datetime | None = None
     # The issue closed and no person has finished the Work since (#2510, ``awaiting_finish``).
     awaiting_finish: bool = False
@@ -503,6 +512,7 @@ def work_facts(
     registered: Sequence[Registration] = (),
     checks: Mapping[str, Mapping[str, Any]] | None = None,
     homes: Mapping[str, str] | None = None,
+    round_: Any = None,
 ) -> WorkFacts:
     """One Work's facts. Pure: every input is a local read the caller made once per pass.
 
@@ -511,7 +521,8 @@ def work_facts(
     ``registered`` the pull requests the Work's chats registered; and ``checks`` the cached
     ``merge_checks`` row of each armed or mergeable-candidate pull request, by lowercased URL;
     ``homes`` the Work the release places each pull request in, both as lowercased
-    ``owner/repo#n``.
+    ``owner/repo#n``. ``round_`` is the Work's current round (``work_rounds``, #4585): its
+    earlier pull requests go to ``earlier_outputs``.
     """
     rows = rows or {}
     checks = checks or {}
@@ -562,11 +573,20 @@ def work_facts(
                 ),
                 title=str(row.get("title") or ""),
                 body=page_text(row.get("body")),
+                merged_at=_stamp(row.get("mergedAt")) if state == MERGED else None,
             )
         )
+    earlier = frozenset(getattr(round_, "earlier", None) or ())
     return WorkFacts(
         ref=ref,
         record=record,
-        outputs=tuple(outputs),
+        outputs=tuple(output for output in outputs if round_key(output) not in earlier),
+        earlier_outputs=tuple(output for output in outputs if round_key(output) in earlier),
+        round_started_at=getattr(round_, "started_at", None),
         finished_at=finished_at,
     )
+
+
+def round_key(output: OutputFact) -> str:
+    """How ``work_rounds`` names an output: lowercased ``owner/repo#n``."""
+    return f"{output.repository}#{output.number}".lower()

@@ -195,6 +195,22 @@ def _recent(fork: SideChatFork) -> bool:
     return datetime.now(UTC) - reserved < _START_WAIT
 
 
+def side_brief(main_key: str) -> str:
+    """The line a message-box side chat's first message opens with (#4556).
+
+    The copy holds the main chat's whole history and the same role brief, so without this a
+    Work chat's side chat took itself for the Work agent: it pushed, marked pull requests
+    ready and answered the main chat's notices while the main chat did the same.
+    """
+    return (
+        f"(From the deck: you are the side chat of chat {main_key}, a copy of it up to its"
+        " newest finished reply. That chat keeps working in this folder and still owns its"
+        " tasks: answer the person, and do not carry on its work, push, change its pull"
+        " requests or issues, or act on its notices unless the person asks you to. Read its"
+        f" newer turns with `~/agentdeck/.venv/bin/agentdeck chat-read {main_key}`.)\n\n"
+    )
+
+
 def moved_on(
     request: Request, fork: SideChatFork, main_key: str, newest: tuple[int, str] | None
 ) -> str:

@@ -59,7 +59,7 @@ class _Deck:
     async def digest(self, repository: str, number: int, head: str) -> tuple[str, str]:
         return DIGEST, ""
 
-    def reviewer(self, tmp_path: Path, *, kind: str = "claude", cap: int = 1):
+    def reviewer(self, tmp_path: Path, *, kind: str = "claude", cap: int = 1, on_stopped=None):
         return agent_review.AgentReviewer(
             kind=kind,
             max_reviewers=cap,
@@ -71,6 +71,7 @@ class _Deck:
             read_pull=self.read_pull,
             git=self.git,
             clock=lambda: self.now,
+            on_stopped=on_stopped,
         )
 
 
@@ -106,6 +107,13 @@ async def test_a_ready_head_starts_one_reviewer_in_its_own_checkout(tmp_path):
         assert line in text
     (verdict,) = parse_verdicts(pass_line)
     assert (verdict.kind, verdict.verdict, verdict.digest) == (CommandKind.REVIEWED, "pass", DIGEST)
+    # #4474: the minor verdict, with its digest; the Poller's own intake reads it as findings.
+    minor_line = f"/reviewed minor {HEAD} {DIGEST} {PULL}"
+    assert minor_line in text
+    (verdict,) = parse_verdicts(minor_line)
+    assert (verdict.verdict, verdict.digest) == ("minor", DIGEST)
+    assert parse_verdicts(f"/reviewed minor {HEAD} {PULL}")[0].kind == CommandKind.INVALID_REVIEWED
+    assert parse_control(minor_line, bot_marker="").verdict == "changes-needed"
     assert parse_control(findings + "\n- a finding", bot_marker="").kind == CommandKind.CLAUDE
     assert findings_target(findings, "owner/repo") == (PULL, HEAD)
     (line,) = json.loads((tmp_path / "agent-reviews.json").read_text())
@@ -155,6 +163,7 @@ async def test_a_design_review_reads_the_default_branch_once_per_design(tmp_path
     assert ("worktree", "add", "--detach", str(cwd), "origin/main") in deck.git_calls
     assert agent_review.is_reviewer_prompt(text)
     assert "/claude Design review of owner/repo#3: pass 55" in text
+    assert "last round" not in text  # round 1 opens a series (#4463)
     # Only this reviewer gives the verdict on this design (#4332 review); its brief carries
     # its token, for a Codex shell that has no variable for it.
     ledger = tmp_path / "agent-reviews.json"
@@ -170,6 +179,38 @@ async def test_a_design_review_reads_the_default_branch_once_per_design(tmp_path
         await reviewer.start_design("owner/repo#3", design.replace("55", "56"))
     with pytest.raises(ReviewError):
         await reviewer.start_design("owner/repo#3", "https://github.com/owner/repo/issues/3")
+
+
+@pytest.mark.asyncio
+async def test_a_stopped_design_reviewer_is_handed_over_by_a_sweep_with_no_start(tmp_path):
+    """#4458: the tick's sweep drops a design reviewer whose chat ended and hands its line
+    over, with the ones still running; a failing hand-over stops no sweep."""
+    deck = _Deck(tmp_path)
+    stopped: list[tuple[dict, list[dict], list[dict]]] = []
+
+    async def on_stopped(line, running, dropped):
+        stopped.append((line, running, dropped))
+        raise RuntimeError("the store is gone")
+
+    reviewer = deck.reviewer(tmp_path, cap=2, on_stopped=on_stopped)
+    earlier = "https://github.com/owner/repo/issues/3#issuecomment-54"
+    await reviewer.start_design(
+        "owner/repo#3", "https://github.com/owner/repo/issues/3#issuecomment-55", earlier=earlier
+    )
+    # The last round's reviewer is handed the design whose gaps it rechecks (#4463).
+    assert "This is the last round" in deck.started[0][2] and earlier in deck.started[0][2]
+    await reviewer.start(PULL, WORK)
+    design, code = (started[3] for started in deck.started)
+    deck.alive.update({design: True, code: False})
+    deck.now += agent_review.START_FLOOR_S + 1
+    assert [line["token"] for line in await reviewer.sweep_now()] == [design]
+    assert stopped == [], "a code reviewer is not a design one"
+    deck.alive[design] = False
+    assert await reviewer.sweep_now() == []
+    ((line, running, dropped),) = stopped
+    assert (line["token"], line["head"], running) == (design, "comment-55", [])
+    assert dropped == [line], "every line the sweep dropped, for the newest-design rule"
+    assert json.loads((tmp_path / "agent-reviews.json").read_text()) == []
 
 
 @pytest.mark.asyncio
@@ -263,6 +304,8 @@ async def test_a_start_that_cannot_happen_leaves_the_head_pending(tmp_path):
 
     # The Codex brief carries the three-at-once rule (#3602); a Claude one does not.
     assert agent_review.CODEX_LANES in deck.started[0][2]
+    # Its message files carry its own token (#4468), so no reviewer sends another's.
+    assert f"/var/tmp/review-{deck.started[0][3][:12]}-1.md" in deck.started[0][2]
     assert agent_review.CODEX_LANES not in agent_review.brief(
         name="Claude", pull=PULL, issue="owner/repo#3", head=HEAD, base="main", digest=DIGEST
     )

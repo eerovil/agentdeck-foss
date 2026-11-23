@@ -177,6 +177,24 @@ def _different_commit(one: str, other: str) -> bool:
     return size >= 7 and one[:size] != other[:size]
 
 
+def _this_round_runs(
+    verifications: Sequence[RunVerification], earlier: Sequence[OutputFact]
+) -> list[RunVerification]:
+    """The runs that may speak for the current round (#4585): one that tested only the heads
+    of the Work's earlier-round pull requests is history, never its Verified line."""
+    heads = [output.head for output in earlier if output.head]
+    if not heads:
+        return list(verifications)
+
+    def earlier_run(check: RunVerification) -> bool:
+        tested = [snapshot.head for _name, snapshot in check.tested if snapshot.head]
+        return bool(tested) and all(
+            any(head.startswith(sha) or sha.startswith(head) for head in heads) for sha in tested
+        )
+
+    return [check for check in verifications if not earlier_run(check)]
+
+
 def summarize_verification(
     verifications: Sequence[RunVerification],
     current_run_id: str,
@@ -349,6 +367,9 @@ class WorkJob:
     state: str  # ``queued`` or ``running``
     label: str  # the job's own label, else its command
     since: datetime | None  # when it was queued, or when it started running
+    # When it was queued, whatever its state (#4562): a job queued before a person's message
+    # is not the work that message asked for, even once it starts running.
+    queued: datetime | None = None
 
 
 # The queue's states for a job that has not finished yet.
@@ -369,18 +390,22 @@ def work_jobs(queue: Sequence[Mapping[str, Any]], chats: Sequence[WorkChat]) -> 
             continue
         if str(job.get("purpose") or ""):
             continue
-        stamp = job.get("started_at") if state == "running" else job.get("submitted_at")
-        try:
-            since = datetime.fromtimestamp(float(stamp), UTC) if stamp else None
-        except (TypeError, ValueError, OverflowError):
-            since = None
+        since = _job_time(job.get("started_at") if state == "running" else job.get("submitted_at"))
         command = job.get("command") or ()
         label = str(job.get("label") or "") or (
             " ".join(str(part) for part in command) if isinstance(command, list) else ""
         )
         rank = (_PENDING_JOBS.index(state), since.timestamp() if since else 0.0)
-        found.append((*rank, WorkJob(state, label or "a job", since)))
+        queued = _job_time(job.get("submitted_at"))
+        found.append((*rank, WorkJob(state, label or "a job", since, queued)))
     return tuple(job for _, _, job in sorted(found, key=lambda item: item[:2]))
+
+
+def _job_time(stamp: Any) -> datetime | None:
+    try:
+        return datetime.fromtimestamp(float(stamp), UTC) if stamp else None
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 
 def _last_word(chats: Sequence[WorkChat]) -> str:
@@ -544,6 +569,10 @@ class WorkCard:
     # GitHub says the open issue was reopened (``state_reason``): it never counts as deployed
     # for the issues it blocks, however its live check reads (#4384).
     reopened: bool = False
+    # The pull requests of its earlier rounds and when the current one started
+    # (``WorkFacts``, #4585): shown as history, never read for its status.
+    earlier_outputs: tuple[OutputFact, ...] = ()
+    round_started_at: datetime | None = None
 
     @property
     def diffstat(self) -> DiffStat | None:
@@ -606,7 +635,9 @@ def build_work_card(
     facts = facts or WorkFacts(ref)
     finished_at = facts.finished_at
     work_id = ref.work_id
-    verification = summarize_verification(verifications, "", workspace, facts.outputs)
+    verification = summarize_verification(
+        _this_round_runs(verifications, facts.earlier_outputs), "", workspace, facts.outputs
+    )
     workspace_lines, workspace_note = compact_workspace(claims)
     issue_url = (
         issue.url
@@ -639,6 +670,8 @@ def build_work_card(
         workspace_note=workspace_note,
         verification=verification,
         outputs=facts.outputs,
+        earlier_outputs=facts.earlier_outputs,
+        round_started_at=facts.round_started_at,
         chat_count=len(chats),
         working_count=sum(1 for chat in chats if chat.working),
         last_activity=latest,

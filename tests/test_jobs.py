@@ -1668,7 +1668,7 @@ def _baseline_repo(path: Path) -> str:
     return head
 
 
-def _summary_command(*failures: str) -> list[str]:
+def _summary_command(*failures: str, status: int | None = None) -> list[str]:
     """A command whose output is shaped the way pytest's really is.
 
     An all-pass run prints **no** summary section — pytest emits one only when it has
@@ -1678,11 +1678,58 @@ def _summary_command(*failures: str) -> list[str]:
     if failures:
         lines = "\\n".join(f"FAILED {name} - AssertionError" for name in failures)
         printed = f"=== short test summary info ===\\n{lines}\\n{len(failures)} failed in 1.20s"
-        status = 1
+        status = 1 if status is None else status
     else:
         printed = "........ [100%]\\n12 passed in 1.20s"
-        status = 0
+        status = 0 if status is None else status
     return [sys.executable, "-c", f"import sys;print('{printed}');sys.exit({status})"]
+
+
+async def test_a_zero_exit_whose_log_reports_failures_is_a_failed_run(tmp_path, monkeypatch):
+    """A piped pytest (`pytest … | tail`) exits zero on failures and setup errors (#4565):
+    the run is recorded, compared and announced as failed, and the notice says the exit code
+    hid them. An all-pass zero exit stays a success."""
+    repo = tmp_path / "repo"
+    _baseline_repo(repo)
+    monkeypatch.setattr(jobs_module, "_failures_present_on_base", lambda job: ())
+    queue = _queue(tmp_path, slots=1)
+    await queue.start()
+
+    piped = queue.submit(
+        command=_summary_command("tests/test_a.py::test_one", status=0),
+        cwd=str(repo),
+        purpose="verification",
+        run_id="run-1",
+    )
+    # A plain pytest run (named so) whose pipe kept only the closing count of its setup errors.
+    errors_only = queue.submit(
+        command=[sys.executable, "-c", "print('....E\\n75 passed, 2 errors in 3.10s')", "pytest"],
+        cwd=str(repo),
+    )
+    clean = queue.submit(command=_summary_command(), cwd=str(repo))
+    # Not a test run: reading an old failing log back is not a failure of its own.
+    shown = queue.submit(
+        command=[sys.executable, "-c", "print('=== 1 failed, 3 passed in 0.50s ===')"],
+        cwd=str(repo),
+    )
+    failed = await _settle(queue, piped.id)
+    erred = await _settle(queue, errors_only.id)
+    passed = await _settle(queue, clean.id)
+    read_back = await _settle(queue, shown.id)
+    await queue.stop()
+
+    # The verification is compared with its base, as a non-zero failed one is.
+    assert failed.base_present == ()
+    assert read_back.state == DONE
+
+    assert (failed.state, failed.exit_code, failed.result_class) == (FAILED, 0, "failure")
+    assert failed.failures == ("tests/test_a.py::test_one",)
+    assert failed.failures_complete is True
+    assert "exit code 0 hid" in job_message(failed)
+    assert jobs_module.HIDDEN_FAILURES_NOTE in job_message(failed)
+    assert (erred.state, erred.result_class) == (FAILED, "failure")
+    assert erred.failures_complete is False
+    assert (passed.state, passed.result_class, passed.note) == (DONE, "success", "")
 
 
 async def test_a_finished_run_records_what_it_failed(tmp_path):
@@ -1716,6 +1763,12 @@ def test_a_failure_list_reads_a_parametrized_id_whole_from_the_per_test_record(t
 
     assert jobs_module._read_failures(job) == ((test,), True)
     assert jobs_module._read_failures(job, succeeded=True) == ((), True)
+    # A summary of only skips beside a count of failures names none of them: not whole.
+    log.write_text(
+        "=== short test summary info ===\nSKIPPED [1] tests/a.py:4: no\n"
+        "=== 1 failed, 2 passed, 1 skipped in 0.30s ===\n"
+    )
+    assert jobs_module._read_failures(job) == ((), False)
 
 
 async def test_a_clean_run_becomes_the_baseline_a_later_branch_run_finds(tmp_path):
@@ -2322,6 +2375,89 @@ def test_the_message_says_what_happened_without_needing_the_log(tmp_path):
     assert "Exit code: 1" in message
     assert "42s" in message
     assert "1 failed, 11 passed" in message
+    # Its log has no summary of failures, so the notice says it could not name them (#4566).
+    assert "Failing tests: could not be read." in message
+    assert "full set once, on your final commit" in message
+
+
+def test_a_failed_test_job_names_its_failing_tests_and_asks_for_a_focused_rerun(tmp_path):
+    log = tmp_path / "out.log"
+    log.write_text(
+        "============ test session starts ============\n"
+        "collected 32 items\n"
+        "========= short test summary info ==========\n"
+        "FAILED tests/test_ui.py::test_menu[mobile] - AssertionError: hidden\n"
+        "FAILED tests/test_ui.py::test_cart - TimeoutError\n"
+        "======= 2 failed, 30 passed in 210.00s =======\n"
+    )
+    job = Job(
+        id="abc123",
+        command=["uv", "run", "pytest", "-c", "ci.ini", "tests/test_ui.py"],
+        cwd=str(tmp_path),
+        log_path=str(log),
+        submitted_at=100.0,
+        state=FAILED,
+        started_at=100.0,
+        finished_at=310.0,
+        exit_code=1,
+    )
+    failures, complete = jobs_module._read_failures(job)
+    job = replace(job, failures=failures, failures_complete=complete)
+    message = job_message(job)
+
+    listed = "Failing tests:\n- tests/test_ui.py::test_cart\n- tests/test_ui.py::test_menu[mobile]"
+    assert listed in message
+    # The rerun is the job's own command with its options kept: a bare ``pytest``, or one
+    # stripped of ``-c``/``-p``, may not collect the test the same way.
+    assert (
+        "run the job's own command, `uv run pytest -c ci.ini tests/test_ui.py`, keeping its "
+        "options and replacing its test paths with the node ids"
+    ) in message
+    assert "not the whole file or suite" in message
+    assert "full set once, on your final commit, as the verification" in message
+    assert "could not be read" not in message
+
+    # Cut off before the summary header: the ids that remain are not called the whole list.
+    cut = replace(job, failures=("tests/test_ui.py::test_cart",), failures_complete=False)
+    assert "the list may be incomplete" in job_message(cut)
+
+    # A long list is cut to what a notice can hold, and says how many more there are.
+    many = replace(job, failures=tuple(f"tests/t.py::test_{n:02}" for n in range(25)))
+    assert "- tests/t.py::test_19\n- and 5 more in the full output" in job_message(many)
+    assert "test_20" not in job_message(many)
+    # Past the read's own cap the true count is unknown, so it is not given as exact.
+    capped = replace(
+        job, failures=tuple(f"t.py::test_{n:03}" for n in range(200)), failures_complete=False
+    )
+    assert "- and at least 180 more in the full output" in job_message(capped)
+
+    # A script that runs pytest is rechecked through itself, never through a bare pytest.
+    script = replace(job, command=["bin/test.sh", "tests/test_ui.py"])
+    assert "`bin/test.sh tests/test_ui.py`, keeping its options" in job_message(script)
+    assert "`pytest" not in job_message(script)
+    # A list that could not be read is rechecked the same way once found.
+    unread = replace(job, failures=(), failures_complete=False)
+    assert "`uv run pytest -c ci.ini tests/test_ui.py`, keeping its options" in (
+        job_message(unread)
+    )
+
+    # When the queue already reruns or resubmits its failures, or the job is that rerun, its
+    # note speaks for them and the notice adds no advice of its own.
+    assert "Failing tests" not in job_message(job, followed_up=True)
+    assert "Failing tests" not in job_message(replace(job, follows="v1", follow_kind="rerun"))
+
+    # A read summary naming no test says so, and names none.
+    unnamed = replace(job, failures=(), failures_complete=True)
+    assert "The pytest summary names no failing test" in job_message(unnamed)
+
+    # A command that ran no tests gets no word about tests, even when a path in it holds the
+    # word (a pytest temporary directory), and a passed one none either.
+    lint = replace(job, command=["ruff", "check"], failures=(), failures_complete=False)
+    log.write_text("src/x.py:1:1: F401 unused import\n")
+    assert "Failing tests" not in job_message(lint)
+    tmp = replace(lint, command=["python", "-c", "open('/tmp/pytest-of-me/x/pytest.ini')"])
+    assert "Failing tests" not in job_message(tmp)
+    assert "Failing tests" not in job_message(replace(job, state=DONE, exit_code=0))
 
 
 # ---- the runtime's own routes ----------------------------------------------

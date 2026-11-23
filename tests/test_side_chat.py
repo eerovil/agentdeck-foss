@@ -1038,7 +1038,12 @@ async def test_box_side_chat_starts_once_then_takes_every_later_message(tmp_path
         assert len(starts) == 1
         start = starts[0]
         assert start["fork_from"] == ForkFrom("sid", "turn-3")
-        assert start["message"] == "what about X?"
+        # Told it is the side chat, so it does not take over the chat's work (#4556).
+        brief, words = start["message"].split("\n\n", 1)
+        assert words == "what about X?"
+        assert "side chat of chat codex:test:sid" in brief
+        assert "do not carry on its work" in brief
+        assert "chat-read codex:test:sid" in brief
         [fork] = state.side_chat_forks(["codex:test:sid"])
         assert (fork.cut_ref, fork.seen_seq) == ("turn-3", 7)
         # Until the side chat is up, another message waits rather than starting a second.
@@ -1060,6 +1065,18 @@ async def test_box_side_chat_starts_once_then_takes_every_later_message(tmp_path
         # Having said so once, it does not repeat it.
         assert (await post(client, "side-0005", "ok")).status_code == 202
         assert sends[2]["message"] == "ok"
+        # #4562: the page's own send counts as the person writing to the side chat.
+        side_chat = state.chat_identity_key("codex:test:side")
+        assert state.person_message_at([side_chat]) is None
+        marked = await client.post(
+            "/sessions/codex:test:sid/side-chat",
+            data={"message": "one more"},
+            headers={
+                "origin": "http://test", "x-agentdeck-action-id": "side-0006", "hx-request": "true"
+            },
+        )
+        assert marked.status_code == 202
+        assert state.person_message_at([side_chat]) is not None
         # A send that may have written answers 5xx, so the page keeps its action id for a
         # resend; one known to have written nothing is a plain refusal.
         for outcome, status in (

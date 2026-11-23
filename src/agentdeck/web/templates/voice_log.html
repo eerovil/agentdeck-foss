@@ -34,6 +34,17 @@
       {% endfor %}
       </tbody>
     </table>
+    {% if early_summary %}
+    {# How the words were made, or why there was no early pass (#4540). #}
+    <table class="voice-log-early-summary">
+      <thead><tr><th>How the words were made</th><th>Phrases</th><th>Median</th></tr></thead>
+      <tbody>
+      {% for row in early_summary %}
+      <tr><td>{{ row.label }}</td><td>{{ row.count }}</td><td>{{ "%.1f" | format(row.median / 1000) }} s</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% endif %}
   </section>
   {% endif %}
   {% for phrase in phrases %}
@@ -63,7 +74,8 @@
     <p><span class="voice-log-label">Heard</span> {{ phrase.heard }}</p>
     {% if phrase.parts %}
     <p class="voice-log-timing"><span class="voice-log-label">Time</span>
-      {%- for label, ms in phrase.parts %}{% if not loop.first %} ·{% endif %} <span class="voice-log-timing-part">{{ label }} {{ "%.1f" | format(ms / 1000) }} s</span>{% endfor %}</p>
+      {%- for label, ms in phrase.parts %}{% if not loop.first %} ·{% endif %} <span class="voice-log-timing-part">{{ label }} {{ "%.1f" | format(ms / 1000) }} s</span>{% endfor %}
+      {%- if phrase.early %} · <span class="voice-log-timing-early">{{ phrase.early }}</span>{% endif %}</p>
     {% endif %}
     {% if phrase.held %}
     {# The page holds its line until the chat stays quiet (#3799): often never said. #}

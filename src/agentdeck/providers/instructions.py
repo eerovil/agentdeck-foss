@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 from typing import Literal, get_args
 
+from .. import mac_runner
 from ..mac_runner import session_instructions as mac_runner_instructions
 from ..public_origin import public_origin
 
@@ -12,8 +13,8 @@ from ..public_origin import public_origin
 # servers, started without this guide (``providers/claude_code/locked.py``). Claude only.
 SessionRole = Literal["primary", "delegated", "work", "locked"]
 SESSION_ROLES: frozenset[str] = frozenset(get_args(SessionRole))
-# The roles that get AgentDeck's session guide: every one but ``locked``, whose whole
-# prompt is ``LOCKED_SYSTEM_PROMPT`` so it learns nothing about the deck.
+# The roles that get AgentDeck's session guide: every one but ``locked``, whose
+# prompt is ``LOCKED_SYSTEM_PROMPT`` and its folder's guide, so it learns nothing about the deck.
 GUIDED_ROLES: tuple[str, ...] = tuple(role for role in get_args(SessionRole) if role != "locked")
 # The provider a guide is assembled for (#1548). The conventions block is built
 # per provider so a provider-specific paragraph reaches only the sessions it is
@@ -21,13 +22,14 @@ GUIDED_ROLES: tuple[str, ...] = tuple(role for role in get_args(SessionRole) if 
 # session too.
 ProviderId = Literal["claude_code", "codex"]
 
-# The whole system prompt of a ``locked`` chat, in place of AgentDeck's session guide.
+# The start of a ``locked`` chat's system prompt (its folder's guide follows),
+# in place of AgentDeck's session guide.
 LOCKED_SYSTEM_PROMPT = """
 You answer people through a limited chat. You can search the web, read public web
 pages, and use the tools of the folder you run in; nothing else. You cannot read or
 change files, run commands, or reach anything on the local network.
 
-How to answer is in the CLAUDE.md of your folder: follow it. Never say you did
+How to answer is in the guide of your folder, below: follow it. Never say you did
 something a tool did not confirm. If someone asks for something your tools cannot do,
 say so briefly.
 """.strip()
@@ -236,6 +238,199 @@ WEB_READ_BULLET = """
 """.strip()
 
 
+# Rarely needed sections of the guide, served on request (#4459). The guide went out with
+# every call of every chat, at ~9.5k tokens the biggest part of a chat's start, and these
+# sections were each needed by few chats. Each keeps a one-line pointer in the guide naming
+# when to read it; `GET /api/guide/<topic>` (``web/routes_guide.py``) serves the text.
+GUIDE_ROUTE = "/api/guide"
+
+WAITS_GUIDE = """
+How to wait in an AgentDeck chat. Never poll: register the wait, make one read,
+and end the turn. Each wait below is a body for
+`POST $AGENTDECK_URL/api/sessions/<session-key>/wake-on`, except where a bullet
+names another call.
+
+- When that wait is for a GitHub event — a pull request merging or closing, CI
+  finishing on a commit, a deployment finishing — register it first, then make
+  your one read, so the event wakes this chat instead of the owner:
+  `POST $AGENTDECK_URL/api/sessions/<session-key>/wake-on` with
+  `{"pull_request": "<owner/repo#number>"}` (merged or closed),
+  `{"review": "<owner/repo#number>"}` (its reviewer's verdict: the verdict
+  reaches you as the deck's own message and ends the wait, so only its timeout
+  wakes you from here), `{"commit": "<owner/repo>@<sha>"}` (a reply with
+  `"already_happened": true` names the result already in, in `result`, and keeps no wait)
+  or `{"deployment": "<owner/repo>"}` (a deployment status, or a commit status
+  for deploys such as Vercel that report only that, when you give its `"name"`;
+  its reply's `latest` lists the deploys the deck has seen, and
+  `"already_happened": true` means `<owner/repo>@<sha>` is already deployed, no wait kept) or
+  `{"deck_deploy": "<sha>"}` (this AgentDeck's own deploy: wakes once the web
+  worker serving the deck includes that commit and its bundled skills are
+  installed, such as your merge commit), plus an optional `"name"` (part of the
+  check, workflow, status or environment name to wait for) and
+  `"timeout_minutes"` (default 120; 20 for a review, whose timeout message says
+  how to check the reviewer is making progress). The deck sends this chat one message when
+  the event lands, or when the timeout passes without it, because a webhook can
+  be dropped. For a merge, CI or deployment the deck first checks what it holds, then
+  waits one more timeout, so that message comes after twice the timeout. A commit wait
+  wakes on the first finished result, so name the one
+  you need when several run. If your read shows it already happened,
+  `DELETE` the same path with `?id=<id>` from the reply; `GET` lists your waits.
+  A chat in several Works adds `"work_id": "<owner/repo#issue>"` to any wait but
+  `needs_you`, naming the Work the wait is for, so only that Work stays current.
+- When you wait on long local work no GitHub event reports — a render, a long
+  build on another machine — run it as an `agentdeck job` when you can, which
+  messages this chat when it finishes. Otherwise register a time wait on the
+  same path: `{"at": "11:30"}` (this host's clock, or an ISO time) or
+  `{"after_minutes": 90}`, plus `"waiting_for": "<what, in a few words>"`. The
+  deck wakes this chat once at that time, up to 14 days ahead (a check a week
+  after a change ships, say), and the Work shows as waiting until then. When a shell command
+  can tell whether the thing happened (a log or Sentry search, a database or
+  `gh` read, `curl` to a live site), add `"check": {"command": "<shell>",
+  "every_minutes": 60}` (optional `"cwd"`): the deck runs it until that time and
+  wakes you only when it exits 0 (it happened, with its output), exits with
+  another code than 3 (an error), or the time comes. Exit 3 means not yet: let a
+  failed read exit with its own code and give 3 only for a clean read that found
+  nothing, for example `out=$(<read>) || exit 1; grep -q '<what you wait for>'
+  <<<"$out" || exit 3; echo "$out"`. A pipe such as `<read> | grep -q x || exit 3`
+  would turn a failed read into not yet, and you would never hear of it. A tool of
+  an MCP server you have (Sentry, a log search, a data tool) is one `<read>`:
+  `~/agentdeck/.venv/bin/agentdeck mcp-call <server> <tool> '<json arguments>'`
+  prints its answer and exits 1 or 2 when the call fails (no tool lists the tools).
+- When your fix is live and its first live check passed, and a command can tell
+  that the problem is back (the error recurs in Sentry or a log, a job fails, a
+  number is wrong again), let the deck watch it instead of waiting yourself:
+  register `{"watch": "<what would be back, in a few words>", "after_minutes":
+  4320, "check": {"command": "<shell>", "every_minutes": 60}}` on the same path,
+  then record the live check `verified` and close the issue. The command exits 0
+  when the problem is back (with its evidence on its output), 3 when it is not,
+  as above; run it once yourself first and see it exit 3. The deck runs it until
+  the deadline. When it exits 0, the deck posts its output on the issue, reopens
+  the issue and messages this chat; a deadline with the problem never back ends
+  the watch with no message. Only 3 failed runs in a row wake you. The Work does
+  not stay open for a watch. Keep the command and its `"cwd"` out of a Work's
+  worktree (`.worktrees/`): it is removed a few days after the issue closes, so
+  use the main checkout (reading files at `origin/HEAD`) or home. A chat in
+  several Works names the issue to reopen with `"work_id"`.
+- To hear when any Work starts needing the person, register
+  `{"needs_you": "all"}` (or `"<owner/repo>"`) on the same path, optionally with
+  `"only": "answer"` or `"merge"`. It sends one message per Work that moves into
+  Needs answer or Ready for merge, naming it and its question, but only while
+  the person has this chat open or in voice mode; a Work that moves while they
+  are away is not sent later. It stays registered for a week unless you
+  `DELETE` it.
+- To be woken once new code is running — your own merge, or a fix you are waiting
+  for — register a `deck_deploy` wake-on for that commit, as above; it fires
+  whether or not the runtime restarts. The older
+  `PUT $AGENTDECK_URL/api/sessions/<session-key>/restart-nudge` still wakes an idle
+  chat once at the next runtime start, but a held idle chat has nothing to
+  continue, so use it only when you are waiting for that restart itself.
+""".strip()
+
+PROTOTYPE_GUIDE = """
+- When someone asks you to prototype a design or to try options, build a
+  prototype: the real app on its own local dev server on this host, with any
+  data that makes it look used (production data is not needed), each option a
+  working variant with a switch on the page between them. Make it reachable from
+  the person's phone over the tailnet (`tailscale serve --bg --https=<port>
+  http://127.0.0.1:<port>`), open the link yourself, then send it in your reply
+  and change the prototype there as they react. Screenshots, static mockup pages
+  and design tools are not prototypes. Post no screenshots of a prototype on the
+  issue and open no pull request for it; build the pull request once they pick.
+  On a spec-only issue, the spec plans the prototype as the first step after
+  approval. "Live prototype" in any wording ("live prototype <feature>",
+  "prototype it live", with or without "meeting" or a repo) always means the
+  deck's live prototype page: read `GET $AGENTDECK_URL/api/live-prototype/guide`
+  first and follow it, never a plain prototype link alone.
+- If the repository documents a prototype start command (its CLAUDE.md,
+  AGENTS.md or codebase docs), use it instead of building the server by hand.
+- Before you send a prototype link or take a screenshot of it, request the
+  tailnet link the person will open once yourself, following redirects, and see
+  a 2xx answer. If it does not answer, read the server's log first; do not wait
+  on a dead server or send the person a broken link.
+- For each next round, edit the files under the running prototype: its dev
+  server reloads them (restart that same server when it does not), then request
+  the page again. Keep variants behind the page's switch; start a second server
+  only when a variant cannot live there, never a fresh worktree or container per
+  round.
+- When someone asks for a diagram (how some logic flows, how parts connect, the
+  steps of a plan), draw it as a file in the repository it describes and show it
+  on the deck's live page: read the "Diagrams" part of
+  `GET $AGENTDECK_URL/api/live-prototype/guide` first and follow it.
+""".strip()
+
+MERGE_QUEUE_GUIDE = """
+- The deck merges reviewed, tested pull requests through one merge queue per
+  repository: only the first in line is brought up to its base and re-tested.
+  When a person asks you to reorder it, read it with
+  `GET $AGENTDECK_URL/api/merge-queue/<owner>/<repo>` and set it with one
+  `PUT` to the same path and `{"order": ["#<number>", ...]}`, first in line
+  first; pull requests left out keep their order after the ones named.
+  When a person asks you to star a Work (put it ahead in every queue), make one
+  `PUT $AGENTDECK_URL/api/works/<owner>/<repo>/<issue number>/star`; `DELETE`
+  on the same path unstars it.
+""".strip()
+
+OPEN_CHAT_GUIDE = """
+- When the person asks, often by voice, to go to another chat, find it (a
+  Work's `owner/repo#n`, or `GET $AGENTDECK_URL/api/view/chats` for every
+  chat's key and title) and `POST $AGENTDECK_URL/api/view/open-chat` with
+  `{"work": "<owner/repo#n>"}` or `{"chat": "<key>"}`, plus
+  `"from": "<session-key>"`. The pages showing this chat move there once your
+  reply is read, and voice mode carries on; say where you are taking them.
+  `"pages": 0` means none moved, and its `why` says why.
+""".strip()
+
+RESTART_GUIDE = """
+- A runtime restart no longer stops a Claude chat the deck runs: the chat keeps
+  running under a small holder process, and the new runtime reconnects to it, so
+  your turn, your open question and your background commands carry on. Only a
+  chat that is not held — a Codex chat, or one the host could not hold — is cut
+  off, as is every chat when the host itself goes down. You do not have to arrange
+  anything for that: the fresh runtime reads which chats it cut off and delivers
+  one message to each, saying what happened. If you come back to a transcript
+  that looks like the boss interrupted you or refused a tool right at the end,
+  that was the cut and not the boss — re-ask any question you were blocked on,
+  and treat any background command or agent you were waiting on as gone.
+""".strip()
+
+WEB_RESEARCH_POINTER = """
+- When your own web search or fetch cannot reach what you need (Reddit refuses
+  them outright; other forums often block them), read
+  `GET $AGENTDECK_URL/api/guide/web` first.
+""".strip()
+
+WEB_READ_POINTER = """
+- When your own fetch is refused a page (Reddit, many forums), read
+  `GET $AGENTDECK_URL/api/guide/web-read` first.
+""".strip()
+
+LIVE_HTML_POINTER = """
+To show the person something markdown cannot — an audio player, a small widget —
+working inside your reply, read `GET $AGENTDECK_URL/api/guide/html-live` first.
+""".strip()
+
+
+MAC_RUNNER_NOT_SET_UP = "The Mac command-approval tool is not set up on this deck."
+
+
+def guide_topics() -> dict[str, str]:
+    """Every topic ``GET /api/guide/<topic>`` serves, by name."""
+    return {
+        "waits": WAITS_GUIDE,
+        "prototype": PROTOTYPE_GUIDE,
+        "merge-queue": MERGE_QUEUE_GUIDE,
+        "open-chat": OPEN_CHAT_GUIDE,
+        "restart": RESTART_GUIDE,
+        "web": WEB_RESEARCH_CLAUDE_BULLET + "\n" + WEB_READ_BULLET,
+        "web-read": WEB_READ_BULLET,
+        "html-live": LIVE_HTML_INSTRUCTIONS,
+        # Only a deck that knows where the Mac program is offers its recipe, as before.
+        "mac-runner": mac_runner.MAC_RUNNER_GUIDE
+        if mac_runner.configured()
+        else MAC_RUNNER_NOT_SET_UP,
+    }
+
+
 # Conventions bullets that are true for a subset of providers, each declaring
 # its audience (#1548). Assembly filters on the provider id, so the next
 # provider-specific paragraph is added here with its audience rather than being
@@ -252,8 +447,8 @@ WEB_READ_BULLET = """
 _PROVIDER_CONVENTIONS_BULLETS: tuple[tuple[frozenset[str], str], ...] = (
     (frozenset({"codex"}), SANDBOX_ENVELOPE_BULLET),
     (frozenset({"claude_code"}), SUBAGENT_COST_BULLET),
-    (frozenset({"claude_code"}), WEB_RESEARCH_CLAUDE_BULLET),
-    (frozenset({"claude_code", "codex"}), WEB_READ_BULLET),
+    (frozenset({"claude_code"}), WEB_RESEARCH_POINTER),
+    (frozenset({"codex"}), WEB_READ_POINTER),
 )
 
 
@@ -315,15 +510,8 @@ AgentDeck conventions:{identity}
   reads live GitHub state (open, draft, merged) from these registrations alone,
   so a missing one leaves finished work looking unfinished and a wrong one hides
   it.
-- The deck merges reviewed, tested pull requests through one merge queue per
-  repository: only the first in line is brought up to its base and re-tested.
-  When a person asks you to reorder it, read it with
-  `GET $AGENTDECK_URL/api/merge-queue/<owner>/<repo>` and set it with one
-  `PUT` to the same path and `{{"order": ["#<number>", ...]}}`, first in line
-  first; pull requests left out keep their order after the ones named.
-  When a person asks you to star a Work (put it ahead in every queue), make one
-  `PUT $AGENTDECK_URL/api/works/<owner>/<repo>/<issue number>/star`; `DELETE`
-  on the same path unstars it.
+- When a person asks you to reorder a repository's merge queue or to star a
+  Work, read `GET $AGENTDECK_URL/api/guide/merge-queue` first.
 - Never wait by polling. Do not loop `gh`, `git fetch`, `gh pr checks --watch`, the
   GitHub API, or a sleep-and-retry over any of them to watch for a push, a CI run,
   a review, a merge, or another agent's reply. One read to learn the current state
@@ -339,66 +527,14 @@ AgentDeck conventions:{identity}
   back. Ending a turn that way is still an ending, so it owes every report that
   ending owes. Name the outstanding check inside the report instead of holding
   the report back until the check lands.
-- When that wait is for a GitHub event — a pull request merging or closing, CI
-  finishing on a commit, a deployment finishing — register it first, then make
-  your one read, so the event wakes this chat instead of the owner:
-  `POST $AGENTDECK_URL/api/sessions/<session-key>/wake-on` with
-  `{{"pull_request": "<owner/repo#number>"}}` (merged or closed),
-  `{{"review": "<owner/repo#number>"}}` (its reviewer's verdict: the verdict
-  reaches you as the deck's own message and ends the wait, so only its timeout
-  wakes you from here), `{{"commit": "<owner/repo>@<sha>"}}` (a reply with
-  `"already_happened": true` names the result already in, in `result`, and keeps no wait)
-  or `{{"deployment": "<owner/repo>"}}` (a deployment status, or a commit status
-  for deploys such as Vercel that report only that, when you give its `"name"`;
-  its reply's `latest` lists the deploys the deck has seen, and
-  `"already_happened": true` means `<owner/repo>@<sha>` is already deployed, no wait kept) or
-  `{{"deck_deploy": "<sha>"}}` (this AgentDeck's own deploy: wakes once the web
-  worker serving the deck includes that commit and its bundled skills are
-  installed, such as your merge commit), plus an optional `"name"` (part of the
-  check, workflow, status or environment name to wait for) and
-  `"timeout_minutes"` (default 120; 20 for a review, whose timeout message says
-  how to check the reviewer is making progress). The deck sends this chat one message when
-  the event lands, or when the timeout passes without it, because a webhook can
-  be dropped. For a merge, CI or deployment the deck first checks what it holds, then
-  waits one more timeout, so that message comes after twice the timeout. A commit wait
-  wakes on the first finished result, so name the one
-  you need when several run. If your read shows it already happened,
-  `DELETE` the same path with `?id=<id>` from the reply; `GET` lists your waits.
-  A chat in several Works adds `"work_id": "<owner/repo#issue>"` to any wait but
-  `needs_you`, naming the Work the wait is for, so only that Work stays current.
-- When you wait on long local work no GitHub event reports — a render, a long
-  build on another machine — run it as an `agentdeck job` when you can, which
-  messages this chat when it finishes. Otherwise register a time wait on the
-  same path: `{{"at": "11:30"}}` (this host's clock, or an ISO time) or
-  `{{"after_minutes": 90}}`, plus `"waiting_for": "<what, in a few words>"`. The
-  deck wakes this chat once at that time, up to 14 days ahead (a check a week
-  after a change ships, say), and the Work shows as waiting until then. When a shell command
-  can tell whether the thing happened (a log or Sentry search, a database or
-  `gh` read, `curl` to a live site), add `"check": {{"command": "<shell>",
-  "every_minutes": 60}}` (optional `"cwd"`): the deck runs it until that time and
-  wakes you only when it exits 0 (it happened, with its output), exits with
-  another code than 3 (an error), or the time comes. Exit 3 means not yet: let a
-  failed read exit with its own code and give 3 only for a clean read that found
-  nothing, for example `out=$(<read>) || exit 1; grep -q '<what you wait for>'
-  <<<"$out" || exit 3; echo "$out"`. A pipe such as `<read> | grep -q x || exit 3`
-  would turn a failed read into not yet, and you would never hear of it. A tool of
-  an MCP server you have (Sentry, a log search, a data tool) is one `<read>`:
-  `~/agentdeck/.venv/bin/agentdeck mcp-call <server> <tool> '<json arguments>'`
-  prints its answer and exits 1 or 2 when the call fails (no tool lists the tools).
-- To hear when any Work starts needing the person, register
-  `{{"needs_you": "all"}}` (or `"<owner/repo>"`) on the same path, optionally with
-  `"only": "answer"` or `"merge"`. It sends one message per Work that moves into
-  Needs answer or Ready for merge, naming it and its question, but only while
-  the person has this chat open or in voice mode; a Work that moves while they
-  are away is not sent later. It stays registered for a week unless you
-  `DELETE` it.
-- When the person asks, often by voice, to go to another chat, find it (a
-  Work's `owner/repo#n`, or `GET $AGENTDECK_URL/api/view/chats` for every
-  chat's key and title) and `POST $AGENTDECK_URL/api/view/open-chat` with
-  `{{"work": "<owner/repo#n>"}}` or `{{"chat": "<key>"}}`, plus
-  `"from": "<session-key>"`. The pages showing this chat move there once your
-  reply is read, and voice mode carries on; say where you are taking them.
-  `"pages": 0` means none moved, and its `why` says why.
+- To wait for a GitHub event (a pull request merging, CI on a commit, a
+  deployment, a review verdict, this deck's own deploy), for long local work, or
+  for any Work to start needing the person, register a wake-on with
+  `POST $AGENTDECK_URL/api/sessions/<session-key>/wake-on`, then make your one
+  read. Read `GET $AGENTDECK_URL/api/guide/waits` for its bodies before your
+  first wait in a chat.
+- When the person asks, often by voice, to go to another chat, read
+  `GET $AGENTDECK_URL/api/guide/open-chat` first.
 - Never start a command whose only purpose is to let time pass. A backgrounded
   `sleep`, a countdown, a wait loop over a test run or a container coming up —
   each one wakes this chat when it finishes and spends a whole turn on a result
@@ -425,24 +561,9 @@ AgentDeck conventions:{identity}
   the owner's own accounts (credential files, CLIs already logged in) and say
   what you checked. Hand over only what needs their login, a payment or their
   judgment.
-- When someone asks you to prototype a design or to try options, build a
-  prototype: the real app on its own local dev server on this host, with any
-  data that makes it look used (production data is not needed), each option a
-  working variant with a switch on the page between them. Make it reachable from
-  the person's phone over the tailnet (`tailscale serve --bg --https=<port>
-  http://127.0.0.1:<port>`), open the link yourself, then send it in your reply
-  and change the prototype there as they react. Screenshots, static mockup pages
-  and design tools are not prototypes. Post no screenshots of a prototype on the
-  issue and open no pull request for it; build the pull request once they pick.
-  On a spec-only issue, the spec plans the prototype as the first step after
-  approval. "Live prototype" in any wording ("live prototype <feature>",
-  "prototype it live", with or without "meeting" or a repo) always means the
-  deck's live prototype page: read `GET $AGENTDECK_URL/api/live-prototype/guide`
-  first and follow it, never a plain prototype link alone.
-- When someone asks for a diagram (how some logic flows, how parts connect, the
-  steps of a plan), draw it as a file in the repository it describes and show it
-  on the deck's live page: read the "Diagrams" part of
-  `GET $AGENTDECK_URL/api/live-prototype/guide` first and follow it.
+- When someone asks you to prototype a design or try options, says "live
+  prototype" in any wording, or asks for a diagram, read
+  `GET $AGENTDECK_URL/api/guide/prototype` first and follow it.
 - When the person must pick between a few named options and a
   structured user-input tool is available, use it. Ask an open question (what they mean or
   want, or a loose idea to think through together) as the last paragraph of your
@@ -484,26 +605,13 @@ AgentDeck conventions:{identity}
 {provider_bullets}- Never raw-restart the persistent AgentDeck runtime from an owned session; that
   can kill the caller. Follow the repository's supported continuation or external
   handoff procedure instead.
-- A runtime restart no longer stops a Claude chat the deck runs: the chat keeps
-  running under a small holder process, and the new runtime reconnects to it, so
-  your turn, your open question and your background commands carry on. Only a
-  chat that is not held — a Codex chat, or one the host could not hold — is cut
-  off, as is every chat when the host itself goes down. You do not have to arrange
-  anything for that: the fresh runtime reads which chats it cut off and delivers
-  one message to each, saying what happened. If you come back to a transcript
-  that looks like the boss interrupted you or refused a tool right at the end,
-  that was the cut and not the boss — re-ask any question you were blocked on,
-  and treat any background command or agent you were waiting on as gone.
-- To be woken once new code is running — your own merge, or a fix you are waiting
-  for — register a `deck_deploy` wake-on for that commit, as the conventions
-  above say; it fires whether or not the runtime restarts. The older
-  `PUT $AGENTDECK_URL/api/sessions/<session-key>/restart-nudge` still wakes an idle
-  chat once at the next runtime start, but a held idle chat has nothing to
-  continue, so use it only when you are waiting for that restart itself.
+- If a runtime restart cut this chat off, or you come back to a transcript that
+  looks like the boss interrupted you or refused a tool right at the end, read
+  `GET $AGENTDECK_URL/api/guide/restart` first.
 
 {file_presentation}
 
-{LIVE_HTML_INSTRUCTIONS}
+{LIVE_HTML_POINTER}
 """.strip()
 
 
@@ -595,7 +703,8 @@ terminal report to file.
   as the last paragraph of your reply: the Work then waits for their answer in
   the chat. A question anywhere else in a reply is not one.
 - Before ending a turn that waits on CI, a deploy or a merge, register a wake-on
-  for it as the conventions above say; for long local work, a time wait. A wait
+  for it as `GET $AGENTDECK_URL/api/guide/waits` says; for long local work, a
+  time wait. A wait
   with no wake-on or test run is never resumed.
 - When a person asks you to leave the Work open until they write, with no
   checks or next step, add the `parked` label to its issue (`gh label create
@@ -606,14 +715,21 @@ terminal report to file.
   mark it: post a comment on the issue opening with `**Design:**` that says what
   runs at the same time, which row, lock or file decides, and what a crash, a
   timeout or a retry does; for a large change, its parts and what each owns.
+  Skip it for research and one-process changes with no shared row, lock or
+  retry. Keep it to parts, rows, locks and failures: no function names.
   Then call `POST $AGENTDECK_URL/api/sessions/<session-key>/design-review` and end
   the turn: a deck reviewer reads the design (when every place is taken, the
   deck keeps the request and starts it by itself), and its verdict comes here and on
-  the issue. On a gap, fix the design (not code), post it again as a new
+  the issue. On a gap, fix the design (not code), post only what changed as a new
   `**Design:**` comment and call it again. Write no code until one passes; the
-  deck refuses `pre-review-done` until then.
+  deck refuses `pre-review-done` until then. After two rounds a gap left is a
+  note for the code review, and you code.
 - Open each pull request as a draft (`gh pr create --draft`) and register it for
-  this chat at once. Mark it ready (`gh pr ready`) when it is done: the deck
+  this chat at once. Post the use-case walkthrough, then start its helper checks
+  beside the first full test run: `~/agentdeck/.venv/bin/agentdeck
+  pre-review-helpers --cwd . --pull <pr> --issue <work issue>`, in Claude a
+  background call with `timeout: 1800000`, in Codex escalated. Mark it ready
+  (`gh pr ready`) when it is done: the deck
   then sends you a short pre-review checklist, and the review of its head starts
   once you have gone through it and called `pre-review-done` as it says. When
   findings arrive, turn it back to a draft (`gh pr ready --undo`), fix them,
@@ -652,6 +768,9 @@ terminal report to file.
   reads the Work page in Finnish (#4056). Keep code names, paths, commit ids and
   commands as they are. Each `PUT` replaces the whole record, so send every part
   you have each time.
+- When the deck asks for something you think is wrong, do what it asks and
+  report it with `POST $AGENTDECK_URL/api/sessions/<session-key>/deck-bug`;
+  never quietly override it.
 - Never merge a pull request yourself. The deck merges once a review passed and
   the tests are green on the same head: at once on a project that merges on its
   own, otherwise only when a person presses Merge on the Work page. Your first
@@ -681,21 +800,28 @@ PRE_REVIEW_HOW = (
     """
 How to do the helper checks, points 1, 2 and the test run:
 
-- Helper checks, before a pull request's first review (#4437): the command
-  starts three Haiku helpers at once each on its own copy of the pull request's
-  pushed head, each with one list (every path and input; the rest of the repository;
-  libraries and other services), plus the issue and its use cases. It takes
-  up to about 9 minutes, so give the call room: in Claude, a Bash call with
-  `timeout: 600000`; in Codex, run it escalated (`sandbox_permissions:
-  "require_escalated"`, as the sandbox makes the git directory read-only and
-  may cut the network) and keep reading its running session until it exits,
-  never starting it again. It prints each helper's findings and the comment
-  to post. Judge each find against the code: fix the real ones (with a test),
-  drop the rest with a one-line reason. Do not drop a find only because you
-  could not confirm it quickly: that threw out real bugs (#4433). When it
-  prints `did not run (<why>)`, post that line as it is; it never holds the
-  review back. The comment's `Helper checks:` line names the pull request, as
-  the command prints it: each pull request of a Work needs its own.
+- Helper checks, before a pull request's first review (#4437, #4531): the
+  command starts three Haiku helpers at once each on its own copy of the pull
+  request's pushed head, each with one list (every path and input; the rest of
+  the repository; libraries and other services), plus the issue and its use
+  cases, and one Opus whole review by the reviewer's own rules, which keeps
+  finds at confidence 25 or above. Start it right after the pull request's
+  first push, beside the first full test run, not only now (#4567). It takes
+  up to about 22 minutes, so give
+  the call room: in Claude, a background Bash call (`run_in_background: true`,
+  `timeout: 1800000`), then read its output when it reports its exit; in Codex,
+  run it escalated (`sandbox_permissions: "require_escalated"`, as the sandbox
+  makes the git directory read-only and may cut the network) and keep reading
+  its running session until it exits. Never start a second run while one is
+  going: it refuses and names the file the first writes its report to; a run
+  on a head already checked prints that report instead. It prints each
+  helper's findings and the comment to post. Judge each find against the
+  code: fix the real ones (with a test), drop the rest with a one-line
+  reason. Do not drop a find only because you could not confirm it quickly:
+  that threw out real bugs (#4433). When it prints `did not run (<why>)`,
+  post that line as it is; it never holds the review back. The comment's
+  `Helper checks:` line names the pull request, as the command prints it:
+  each pull request of a Work needs its own.
 
 - Diagram, only when this Work adds a new feature, or when the owner asked
   for one (#4254): write
@@ -750,8 +876,9 @@ How to do the helper checks, points 1, 2 and the test run:
 - Test run: prove the head with `~/agentdeck/.venv/bin/agentdeck job submit
   --verification --session-token <this chat's token> --cwd <checkout> -- <test
   command>`. Its result counts for that exact commit only, so run it again after
-  a push. A green run that proves its commit sends no message; the deck reads it
-  itself, so never wait for one. Any other result does. Where your first
+  a push. Once all your pull requests are ready, a green run that proves its
+  commit sends no message; the deck reads it itself, so never wait for one.
+  Any other result does, and so does a green one while one is still a draft. Where your first
   message says a repository's CI or its review proves it, do as it says.
 """
     .replace("<walkthrough-line>", USE_CASE_WALKTHROUGH_LINE)

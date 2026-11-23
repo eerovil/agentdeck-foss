@@ -24,7 +24,7 @@ from agentdeck.models import (
     SessionStatus,
 )
 from agentdeck.providers.claude_code.worker import DeliverResult
-from agentdeck.runtime import create_runtime_app
+from agentdeck.runtime import ClaudeWorkerRuntime, create_runtime_app
 from agentdeck.state import AppState
 
 
@@ -88,9 +88,17 @@ def test_per_account_overrides_merge_over_base():
     assert alt.state_dir == base.state_dir and alt.enabled is True
 
 
-async def test_runtime_host_applies_account_overrides(tmp_path):
+def test_runtime_host_applies_account_overrides(tmp_path):
+    """Each account's host gets the per-account settings merged over the base.
+
+    Built on ``ClaudeWorkerRuntime`` alone, where the merge happens, not on the whole
+    runtime app: its routes, database and lock scan cost about 0.3 s that a loaded host
+    stretched past the 1 s per-test cap (#4553). The settings files each host writes
+    go under ``tmp_path`` too, not the real home directory.
+    """
     cfg = AppConfig.model_validate(
         {
+            "keyed_workers": {"state_dir": str(tmp_path / "keyed")},
             "claude_workers": {
                 "enabled": True,
                 "state_dir": str(tmp_path),
@@ -109,16 +117,16 @@ async def test_runtime_host_applies_account_overrides(tmp_path):
             ],
         }
     )
-    app = create_runtime_app(cfg)
-    assert app.state.claude_workers.host("alt").permission_mode == "bypassPermissions"
-    assert app.state.claude_workers.host("main").permission_mode == "auto"
+    workers = ClaudeWorkerRuntime(cfg, MagicMock(spec=Db))
+    assert workers.host("alt").permission_mode == "bypassPermissions"
+    assert workers.host("main").permission_mode == "auto"
     # New chats start bypassed only where start_bypassed is on (#3748).
-    assert app.state.claude_workers.host("main").start_bypassed is True
-    assert app.state.claude_workers.host("alt").start_bypassed is False
+    assert workers.host("main").start_bypassed is True
+    assert workers.host("alt").start_bypassed is False
     assert AppConfig().claude_workers.start_bypassed is False
     # Early compaction reaches each account's host, and 0 opts one out (#4058).
-    assert app.state.claude_workers.host("main").auto_compact_window == 200_000
-    assert app.state.claude_workers.host("alt").auto_compact_window == 0
+    assert workers.host("main").auto_compact_window == 200_000
+    assert workers.host("alt").auto_compact_window == 0
 
 
 @pytest.mark.parametrize(

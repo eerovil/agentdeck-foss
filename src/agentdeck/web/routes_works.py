@@ -89,6 +89,7 @@ from .work_view import (
     row_stub,
     runtime_queue,
     start_chat_title,
+    start_follow_up_round,
     tree_revision,
     work_checkouts,
 )
@@ -1218,6 +1219,8 @@ async def work_message(request: Request, work_id: str) -> HTMLResponse:
             state="refused",
             status_code=409,
         )
+    # A follow-up once the round was checked live starts the Work's next round (#4585).
+    await asyncio.to_thread(start_follow_up_round, request.app, detail.card)
     text = "Queued behind the current turn" if action == "queued" else "Sent"
     return _message_receipt(
         request,
@@ -1358,9 +1361,16 @@ async def _deck_run_request(
         )
         return JSONResponse({"outcome": "done", "detail": detail}, status_code=202)
     if design is not None:
-        dropped = await _design_accept(request, issue, design, sender)
+        dropped, kept = await _design_accept(request, issue, design, sender)
         if dropped is not None:
             return dropped
+        if kept and kept != design.verdict:
+            # The issue shows the verdict the deck records (#4463), which the code reviewer
+            # reads: `notes` for a last-round gap, `gap` for notes before the last round.
+            from ..design_review import Verdict, restated
+
+            command = restated(command, kept)
+            design = Verdict(design.issue, kept, design.comment)
     outcome, receipt = await _post_reviewer_comment(request, ref, command, action_id)
     if design is not None:
         if outcome != "done":
@@ -1386,9 +1396,12 @@ async def _deck_run_request(
         return JSONResponse({"outcome": outcome, "detail": receipt}, status_code=status)
     posted = re.search(r"https://\S+", receipt) if outcome == "done" else None
     url = posted.group(0) if posted else f"https://github.com/{repository}/issues/{number}"
+    # What the deck recorded decides, not the reviewer's word (#4463): a gap in the last
+    # round is notes, and notes before it a gap.
+    kept = str(recorded.get("verdict") or design.verdict) if design is not None else ""
     told = (
         await release.on_design_review(
-            work_id, action_id, command, url, gap=design.verdict == "gap"
+            work_id, action_id, command, url, gap=kept == "gap", notes=kept == "notes"
         )
         if design is not None
         else await release.on_findings(work_id, action_id, parsed.instruction, url)
@@ -1418,10 +1431,13 @@ async def _deck_run_request(
     )
 
 
-async def _design_accept(request: Request, issue: str, design, sender: str) -> JSONResponse | None:
+async def _design_accept(
+    request: Request, issue: str, design, sender: str
+) -> tuple[JSONResponse | None, str]:
     """The answer to a design verdict the deck does not take (#4332), or ``None`` when it takes
     it: refused when its sender is not the reviewer the deck started on that design, dropped
-    when it is about a design the agent has since replaced."""
+    when it is about a design the agent has since replaced. With it, the verdict the deck will
+    record (#4463), "" when the merge service did not say."""
     router_service = getattr(request.app.state, "work_router", None)
     if router_service is None or not router_service.enabled:
         raise HTTPException(status_code=409, detail="this deck does not route Work events")
@@ -1430,15 +1446,15 @@ async def _design_accept(request: Request, issue: str, design, sender: str) -> J
         raise HTTPException(status_code=403, detail=answer["refused"])
     if "refused" in answer:
         detail = f"{answer['refused']}; send the same request again"
-        return JSONResponse({"outcome": "retry", "detail": detail}, status_code=503)
+        return JSONResponse({"outcome": "retry", "detail": detail}, status_code=503), ""
     if not answer.get("stale"):
-        return None
+        return None, str(answer.get("verdict") or "")
     logger.info("deck-request: design verdict for %s dropped: %s", issue, answer["stale"])
     detail = (
         f"This design verdict was not posted or handed on: {answer['stale']}. The newer design"
         " has a review of its own; stop this one."
     )
-    return JSONResponse({"outcome": "done", "detail": detail}, status_code=202)
+    return JSONResponse({"outcome": "done", "detail": detail}, status_code=202), ""
 
 
 def _design_verdict(command: str, issue: str):
@@ -1670,10 +1686,10 @@ async def _write(
         if router_service is None or not getattr(router_service, "enabled", True):
             return "failed", "this deck does not route Work events; nothing was sent."
         from ..services_link import ServicesUnavailable
-        from ..work_router import AgainRefused
+        from ..work_router import SHIP_RUNNING, AgainRefused
 
         done: list[str] = []
-        for target in step.pulls:
+        for index, target in enumerate(step.pulls):
             pull, _, head = target.partition("@")
             repository, _, number = pull.rpartition("#")
             try:
@@ -1681,13 +1697,31 @@ async def _write(
             except (AgainRefused, ServicesUnavailable) as refused:
                 if not done:
                     return "failed", str(refused)
-                done.append(f"{pull} not shipped: {refused}")
-                continue
+                # The first refusal stops the rest, as the ship-now API does (#4559 review).
+                rest = [entry.partition("@")[0] for entry in step.pulls[index + 1 :]]
+                done.append(
+                    f"{pull} not shipped: {refused}"
+                    + (f". Not started: {', '.join(rest)}" if rest else "")
+                )
+                break
             except Exception as exc:  # noqa: BLE001 - its pass or issue may have been written
                 logger.exception("work action Ship now for %s failed", pull)
-                return "uncertain", f"{label} did not finish for {pull} ({exc}); it may have run"
+                # A second press joins or finishes the same press, never ships twice (#4558).
+                return "uncertain", (
+                    f"{label} did not finish for {pull} ({exc}); it may still be running."
+                    " Pressing Ship now again is safe"
+                )
             # A fix pushed on top meanwhile: the reviewed commit ships in its own pull request.
             via = str(shipped.get("pull_request") or pull) if isinstance(shipped, dict) else pull
+            if isinstance(shipped, dict) and shipped.get("state") == SHIP_RUNNING:
+                # Still running past the wait (#4558): the rest wait, as it may be refused.
+                rest = [entry.partition("@")[0] for entry in step.pulls[index + 1 :]]
+                later = f". Not started yet: {', '.join(rest)}; press again once it ends"
+                done.append(
+                    f"Ship now of {pull} is under way; the Work's agent hears when it ends"
+                    + (later if rest else "")
+                )
+                break
             done.append(
                 f"{via} ships once its tests are green; this Work then fixes its findings"
                 + (f" in {pull}" if via != pull else "")
@@ -1936,10 +1970,11 @@ async def work_action(request: Request, work_id: str) -> HTMLResponse:
     # Merge when ready and Withdraw are refused above while they would repeat themselves (a
     # press stands, or none does), and the release refuses a second Merge when ready under the
     # Work's lock, so two at once record one. A person may press either again at once after a
-    # change cleared a press or a Withdraw took it back (#3320).
+    # change cleared a press or a Withdraw took it back (#3320). Ship now may be pressed again
+    # at once too: the merge service joins a press still running (#4558).
     recent = (
         None
-        if action in work_actions.APPROVAL_ACTIONS
+        if action in work_actions.REPEAT_SAFE_ACTIONS
         else work_actions.recent_press(db.load_work_actions(ref.work_id), action)
     )
     if recent is not None:
@@ -2760,6 +2795,9 @@ async def work_new_chat(request: Request, work_id: str) -> HTMLResponse:
         return _message_receipt(
             request, text=f"Not started: {reason}", state="refused", status_code=409
         )
+    # A new chat once the round was checked live starts the Work's next round (#4585); only
+    # one that started, so a refused start leaves the round as it was.
+    await asyncio.to_thread(start_follow_up_round, request.app, detail.card)
     db.settle_work_action(action_id, "done", f"Started a side chat in {folder}")
     logger.info("side chat for %s started in %s on %s", ref.work_id, folder, account.key)
     return _started(

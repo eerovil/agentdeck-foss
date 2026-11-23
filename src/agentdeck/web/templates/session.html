@@ -206,6 +206,10 @@
    chat_jump.js opens that chat in place. Never shown. #}
 <span id="chat-jump-slot" sse-swap="chat_jump" hidden></span>
 
+{# The 🔊 reply the agent is writing now (#4543): voice_mode.js starts reading it before
+   the finished line lands. Never shown. #}
+<span id="voice-draft-slot" sse-swap="draft" hidden></span>
+
 <div id="chat-notes" class="chat-notes-source" hidden sse-swap="chat-notes" hx-swap="innerHTML">
   {{ rendered_chat_notes | default('') | safe }}
 </div>
@@ -366,7 +370,6 @@
           {%- if host_speech and speech_language == "fi" %} data-voice-language="fi"{% endif %}
           {%- if host_speech %} data-host-speech{% endif %}
           {%- if voice_idle_seconds %} data-voice-idle-seconds="{{ voice_idle_seconds }}"{% endif %}
-          {%- if voice_tick_seconds %} data-voice-tick-seconds="{{ voice_tick_seconds }}"{% endif %}
           {%- if host_speech %} data-voice-wake="{{ voice_wake }}"{% endif %}>
       <button type="button" class="speech-button voice-button" data-voice-button aria-pressed="false"
               aria-label="Read replies aloud" title="Read replies aloud">🎧</button>

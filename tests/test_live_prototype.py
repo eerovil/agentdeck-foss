@@ -14,7 +14,7 @@ from agentdeck import live_prototype
 from agentdeck.app import create_app
 from agentdeck.config import AccountConfig, AppConfig, HistoryConfig, InjectConfig
 from agentdeck.models import Capability, Session, SessionStatus
-from agentdeck.providers.instructions import AGENTDECK_SESSION_INSTRUCTIONS
+from agentdeck.providers.instructions import AGENTDECK_SESSION_INSTRUCTIONS, guide_topics
 
 pytestmark = pytest.mark.anyio
 
@@ -62,8 +62,25 @@ async def test_agent_registers_link_records_steps_and_page_shows_them(tmp_path):
         assert "Build no backend" in guide.text
         assert "Never make the person log in" in guide.text
         assert "Do not take screenshots" in guide.text
-        # Every chat's guide sends any "live prototype" ask here (#3760).
-        trigger = " ".join(AGENTDECK_SESSION_INSTRUCTIONS.split())
+        # #4560: the live path also starts the repository's documented prototype command.
+        assert "prototype start command when its CLAUDE.md or codebase docs give one" in " ".join(
+            guide.text.split()
+        )
+        # Every chat's guide sends any "live prototype" ask here (#3760), through the
+        # prototype topic it reads on request since #4459.
+        pointer = " ".join(AGENTDECK_SESSION_INSTRUCTIONS.split())
+        assert 'says "live prototype" in any wording' in pointer
+        assert "asks for a diagram" in pointer
+        assert "`GET $AGENTDECK_URL/api/guide/prototype`" in pointer
+        trigger = " ".join((await client.get("/api/guide/prototype")).text.split())
+        # Every topic moved out of the guide is served word for word (#4459).
+        for topic, text in guide_topics().items():
+            served = await client.get(f"/api/guide/{topic}")
+            assert served.status_code == 200 and served.text == text, topic
+        index = await client.get("/api/guide")
+        assert all(f"/api/guide/{topic}" in index.text for topic in guide_topics())
+        missing = await client.get("/api/guide/nope")
+        assert missing.status_code == 404 and "waits" in missing.text
         assert '"Live prototype" in any wording' in trigger
         assert "always means the deck's live prototype page" in trigger
         # A diagram ask is sent to the guide's "Diagrams" part, which uses this page (#3822).
@@ -304,3 +321,14 @@ async def test_live_prototype_stream_says_what_the_agent_is_doing(tmp_path):
     session.thinking, session.activity = False, None
     state.sessions_changed([KEY])
     assert await anext(frames) == "event: activity\ndata: null\n\n"
+
+
+def test_the_prototype_page_marks_its_send_as_a_persons_message():
+    """#4562: the page's own send is a person writing, so it carries the marker the deck's
+    routes read for that, as an HTMX form post does; a script's post does not."""
+    script = (
+        Path(live_prototype.__file__).parent / "web" / "static" / "live_prototype.js"
+    ).read_text()
+    send = script[script.index("/inject") :]
+    send = send[: send.index("});")]
+    assert '"HX-Request": "true"' in send

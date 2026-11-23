@@ -17,8 +17,9 @@ Before the pull request's first review only (no review asked at any head yet, re
 router and passed in as ``helpers``), one more point is checked in every repository (#4437):
 
 - the issue has a comment holding the ``Helper checks:`` line: what the three Haiku helpers
-  of ``agentdeck pre-review-helpers`` found, each find fixed or dropped, or ``did not run
-  (<why>)``. A Work already in a fix round when this shipped is never asked for it.
+  and the Opus whole review (#4531) of ``agentdeck pre-review-helpers`` found, each find fixed
+  or dropped, or ``did not run (<why>)``. A Work already in a fix round when this shipped is
+  never asked for it.
 
 Assumed (#4261): the older rule that a diagram whose ``## Boxes`` names a changed file must
 be edited too is not checked, because #4254 drops that duty (a diagram is drawn only for a

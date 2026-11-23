@@ -25,6 +25,7 @@ DECK_KINDS = frozenset({"wake-on", "work-release", "work-ending", "work-event", 
 #: What the deck's own messages begin with, when no delivery record is found.
 _PREFIX_KINDS = (
     ("AgentDeck wake-on: ", "wake-on"),
+    ("AgentDeck watch: ", "wake-on"),
     ("AgentDeck event: ", "work-event"),
     ("AgentDeck: your last turn on ", "work-ending"),
     ("AgentDeck: ", "work-release"),
@@ -161,6 +162,10 @@ def label(text: str, kind: str) -> str:
             return _clip(f"Check on {m.group(1)}")
         if m := re.match(r"nothing arrived for (.+?) within (\d+) minutes", first):
             return _clip(f"Nothing arrived in {m.group(2)} min · {m.group(1)}")
+        if m := re.match(r"your check for (.+?) says the problem is back", first):
+            return _clip(f"Problem back · {m.group(1)}")
+        if m := re.match(r"your check for (.+?) itself failed", first):
+            return _clip(f"Watch check failing · {m.group(1)}")
     if kind == "work-event":
         if m := re.match(rf"(.+?) (?:commented|posted) on (?:issue|pull request) {_REF}", first):
             return _clip(

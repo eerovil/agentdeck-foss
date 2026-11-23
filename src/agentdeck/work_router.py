@@ -164,6 +164,8 @@ from .work import WorkRef
 from .work_claims import assignee_of
 from .work_release import (
     ACCEPTED_ASK,
+    MINOR,
+    MINOR_LINES,
     NO_CODE,
     OWNER_CALL_ASK,
     SHIP_ASK,
@@ -215,6 +217,16 @@ Fix and push what is missing, keeping it ready, then call `POST\
  pushes or a draft and ready again.{policy}
 
 {how}"""
+#: Above a head's checklist when the push after a ``minor`` or ``no-code`` verdict did not carry
+#: that verdict's pass (#4575): store#4161's agent took the pass as carried and told the owner
+#: to press Merge, while the deck waited nine hours on a ``pre-review-done`` it never sent.
+NOT_SMALL_TEXT = """AgentDeck: your push {short} to {pull} is not the small fix the {verdict}\
+ review at {old} allows: {reason}. So that review does not count as a pass here, and\
+ {pull} will not merge on it. {short} needs a review of its own, which starts only once you\
+ go through {checklist} and call `pre-review-done`. Until then the Work and the review check\
+ show it waiting on you.
+
+"""
 #: The checklist's extra point when review fixes grew the diff past ``GROWTH_PERCENT`` of the
 #: previous round's (#4220, owner's choice: an agent note, not a question or a reviewer brief).
 GROWN_TEXT = """
@@ -222,14 +234,20 @@ GROWN_TEXT = """
  lines (+{percent}%). Before fixing more, post a short note on the issue: is this still the\
  right design, and which remaining findings could be left to a follow-up issue instead?"""
 #: The checklist's first point before a pull request's first review (#4437): three Haiku
-#: helpers check the change and the coder fixes what is real. Shown, and its comment checked
-#: by ``pre-review-done``, only while no review of the pull request was asked for yet.
+#: helpers and one Opus whole review (#4531) check the change and the coder fixes what is
+#: real. Shown, and its comment checked by ``pre-review-done``, only while no review of the
+#: pull request was asked for yet. The Work brief asks to run them at the first push (#4567):
+#: a comment for an earlier head stands when the pushes since only fixed its finds, a
+#: judgement no script makes, so the coder is told when to run them again.
 HELPERS_TEXT = """
 Before these, as this pull request has had no review yet, run the helper checks:\
  `~/agentdeck/.venv/bin/agentdeck pre-review-helpers --cwd <checkout> --pull {pull}{issue}`\
  (how: below). Fix each real find and push; then post one issue\
  comment opening `Helper checks: {pull}` that lists each find as fixed, or dropped with a\
- one-line reason, or the `Helper checks: {pull} did not run (<why>)` line the command prints.
+ one-line reason, or the `Helper checks: {pull} did not run (<why>)` line the command prints.\
+ Already ran them on an earlier head and posted that comment? It stands when every push\
+ since changed only what its finds asked for; otherwise, or when it says `did not run`, run\
+ them again on this head.
 """
 #: Growth over this percent of the previous round's changed lines (added plus removed, the
 #: whole diff) adds ``GROWN_TEXT`` (#4220, owner's choice: 15%, against the previous round).
@@ -252,6 +270,10 @@ MAX_NO_VERDICT = 2
 #: Starts the request id of an ask after no verdict. Request ids are otherwise hex, so this
 #: prefix tells the two kinds of ask apart.
 NO_VERDICT = "nv"
+#: The pull requests a timed-out review wait on a Work's issue reads back, newest ask first, and
+#: how long before a head's first ask a verdict about it may be dated (#4478).
+RECOVER_PULLS = 2
+RECOVER_SLACK_S = 300.0
 
 #: How long a ``gh pr ready`` waits for the checklist it starts, to print it in its reply
 #: (#4253, assumed): well inside the shim's own wait for the deck's answer.
@@ -416,6 +438,12 @@ def is_person(login: str, kind: str, own_logins: frozenset[str]) -> bool:
 def _clip(body: str) -> str:
     body = body.strip()
     return body if len(body) <= MAX_BODY else body[:MAX_BODY].rstrip() + " …"
+
+
+#: Under a reviewer's findings comment (#3314, #4497 review): the sibling sweep and the
+#: shared-cause ask ride with the owner-call rule here too, since a project whose reviewer
+#: posts on GitHub hands its findings to the agent only by this message.
+FINDINGS_REPLY = f"{SIBLING_SWEEP_ASK} {OWNER_CALL_ASK}"
 
 
 def _link(headline: str, url: str) -> str:
@@ -658,13 +686,13 @@ def classify(
         ):
             headline = f"AgentDeck event: the reviewer posted on {where}"
             verdict = findings
-            reply = OWNER_CALL_ASK if findings else ""
+            reply = FINDINGS_REPLY if findings else ""
         elif login.casefold() in own_logins and (
             _DECK_REVIEW_RE.match(body) or _headed_findings(body, repository)
         ):
             headline = f"AgentDeck event: the deck's reviewer posted on {where}"
             verdict = findings
-            reply = OWNER_CALL_ASK if findings else ""
+            reply = FINDINGS_REPLY if findings else ""
         elif person and _CLAUDE_RE.match(body):
             headline = f"AgentDeck event: {login} commented on {where}"
             gh = "gh pr comment" if is_pull else "gh issue comment"
@@ -776,6 +804,79 @@ async def compared_files(repository: str, old: str, new: str) -> set[str] | None
     return set(compared[1:])
 
 
+async def late_read(
+    repository: str, number: int, old: str, live: str
+) -> tuple[bool, set[str] | None]:
+    """For a verdict about ``old`` that came after the fix push to ``live`` (#4474): whether
+    ``live`` descends from ``old``, and the pull request's files at ``old``, renames under both
+    names (``None`` when unread or cut short at 300 files). The files are read from the
+    pull request's base to ``old``, the compare GitHub's own diff makes: the files now already
+    hold the fix push, and a code file it added must not count as reviewed."""
+    if await compared_files(repository, old, live) is None:
+        return False, None
+    base = await _gh_lines(
+        repository, ["gh", "api", f"repos/{repository}/pulls/{number}", "--jq", ".base.sha"]
+    )
+    sha = (base or [""])[0].strip()
+    if not _SHA_RE.fullmatch(sha):
+        return True, None
+    names = "[.files[] | .filename, (.previous_filename // empty)]"
+    compared = await _gh_lines(
+        repository,
+        [
+            "gh",
+            "api",
+            f"repos/{repository}/compare/{sha}...{old}",
+            "--jq",
+            f'"\\(.files | length)", {names}[]',
+        ],
+    )
+    count = (compared or [""])[0]
+    if not count.isdigit() or int(count) >= 300:
+        return True, None
+    return True, set(compared[1:])
+
+
+async def compared_changes(
+    repository: str, old: str, new: str
+) -> tuple[dict[str, int], frozenset[str]] | None:
+    """Lines added plus removed per file the commits from ``old`` to ``new`` touch, and both
+    names of the files they rename; ``None`` when unread, cut short by GitHub (300 files)
+    or ``new`` does not descend: the size of a fix after a ``minor`` verdict (#4474). A pure
+    rename has no lines, so its names are reported apart rather than as a size: the new name
+    too, as a file moved onto a path of the diff brings its whole content (#4594 review)."""
+    rows = (
+        '(.files[] | "\\(.additions + .deletions) \\(.filename)",'
+        ' (select(.previous_filename) | "renamed \\(.previous_filename)", "renamed \\(.filename)"))'
+    )
+    compared = await _gh_lines(
+        repository,
+        [
+            "gh",
+            "api",
+            f"repos/{repository}/compare/{old}...{new}",
+            "--jq",
+            f'"\\(.status) \\(.files | length)", {rows}',
+        ],
+    )
+    status, _, count = (compared or [""])[0].partition(" ")
+    if status != "ahead" or not count.isdigit() or int(count) >= 300:
+        return None
+    changes: dict[str, int] = {}
+    renamed: set[str] = set()
+    for line in compared[1:]:
+        size, _, name = line.partition(" ")
+        if not name:
+            return None
+        if size == "renamed":
+            renamed.add(name)
+        elif size.isdigit():
+            changes[name] = changes.get(name, 0) + int(size)
+        else:
+            return None
+    return changes, frozenset(renamed)
+
+
 async def pull_files(repository: str, number: int) -> set[str] | None:
     """The files of a pull request's diff, renames under both names; ``None`` when unread."""
     files = await _gh_lines(
@@ -809,8 +910,135 @@ async def base_only_between(repository: str, number: int, old: str, new: str) ->
     return not touched & files
 
 
+#: How many base merges in a row ``ship_merge_between`` follows back to the shipped head.
+SHIP_MERGE_STEPS = 10
+
+
+async def ship_merge_between(repository: str, number: int, old: str, new: str) -> bool:
+    """Whether ``new`` only merged the base into ``old``, a Ship now pass's head (#4576): the
+    commits from ``new`` back to ``old`` along their first parents are all merge commits, and
+    the lines the pull request contributes to each file that is not a doc are the same at both
+    heads. The base merge that cleared a conflict touches the pull request's own files, so
+    ``base_only_between`` cannot prove it; this proof keeps the owner's Ship now pass across it.
+
+    The diffs are GitHub's comparisons of the pull request's base branch with each head, read
+    with ``_contributed_diff``'s rule, file by file: the lines added and removed, in order,
+    without the context around them or where they sit, the rule a digest carries any pass by.
+    Anything unread, a commit that is not a merge, a chain longer than
+    :data:`SHIP_MERGE_STEPS`, a diff GitHub refuses or cuts at 300 files is ``False``: unproven
+    is reviewed.
+    """
+    old, new = old.lower(), new.lower()
+    if not all(re.fullmatch(r"[0-9a-f]{40}", sha) for sha in (old, new)) or old == new:
+        return False
+    current = new
+    for _ in range(SHIP_MERGE_STEPS):
+        parents = await _gh_lines(
+            repository,
+            # The git object only: ``commits/{sha}`` also builds a merge's whole diff.
+            ["gh", "api", f"repos/{repository}/git/commits/{current}", "--jq", ".parents[].sha"],
+        )
+        if not parents or len(parents) < 2:
+            return False  # unread, or a commit of its own: not only a base merge
+        current = parents[0].strip().lower()
+        if current == old:
+            break
+    else:
+        return False
+    base = await _gh_lines(
+        repository, ["gh", "api", f"repos/{repository}/pulls/{number}", "--jq", ".base.ref"]
+    )
+    ref = (base or [""])[0].strip()
+    if not ref:
+        return False
+    before = await _code_diffs(repository, ref, old)
+    if before is None:
+        return False
+    after = await _code_diffs(repository, ref, new)
+    return after is not None and after == before
+
+
+async def _code_diffs(repository: str, base: str, head: str) -> dict[str, str] | None:
+    """The contributed lines (``_contributed_diff``) per file of ``base...head`` that is not
+    a doc file, keyed by the file's ``diff --git`` line; ``None`` when unread, unreadable, or
+    when the diff's files are not the ones GitHub's comparison lists."""
+    from . import gh_cli
+    from .poller_engine.github import _contributed_diff
+    from .work_release import is_doc_path
+
+    count = await _gh_lines(
+        repository,
+        ["gh", "api", f"repos/{repository}/compare/{base}...{head}", "--jq", ".files | length"],
+    )
+    if not count or not count[0].isdigit() or int(count[0]) >= 300:
+        return None  # unread, or GitHub cut the files short: the diff may be too
+    argv = [
+        "gh",
+        "api",
+        "-H",
+        "Accept: application/vnd.github.diff",
+        f"repos/{repository}/compare/{base}...{head}",
+    ]
+    try:
+        code, out, _err = await gh_cli.run_once(argv, timeout=60, repo=repository)
+    except (OSError, TimeoutError):
+        return None
+    if code != 0:
+        return None
+    text = (out or b"").decode("utf-8", "replace")
+    # Lines gathered per file and joined once: adding to a growing string copies it each time.
+    parts: list[list[str]] = []
+    for line in text.split("\n"):
+        if line.startswith("diff --git ") or not parts:
+            parts.append([])
+        parts[-1].append(line)
+    # Every file GitHub listed has its section, doc files too: a diff cut short or missing a
+    # file would compare equal on the files left and carry a pass to code nobody read.
+    if sum(1 for lines in parts if lines[0].startswith("diff --git ")) != int(count[0]):
+        return None
+    found: dict[str, str] = {}
+    for section in ("\n".join(lines) + "\n" for lines in parts):
+        header = section.split("\n", 1)[0]
+        if not header.startswith("diff --git a/"):
+            if section.strip():
+                return None  # text before the first file: not a diff
+            continue
+        names = header.removeprefix("diff --git a/").split(" b/", 1)
+        if all(is_doc_path(name) for name in names):
+            continue
+        contributed = _contributed_diff(section)
+        if contributed is None or header in found:
+            return None
+        found[header] = contributed
+    return found
+
+
+async def behind_base(repository: str, number: int, head: str) -> bool:
+    """Whether ``head`` lacks commits of pull request ``number``'s base branch (#4576): GitHub
+    compares the base with it as ``behind`` or ``diverged``. Unread is ``False``."""
+    base = await _gh_lines(
+        repository, ["gh", "api", f"repos/{repository}/pulls/{number}", "--jq", ".base.ref"]
+    )
+    ref = (base or [""])[0].strip()
+    if not ref:
+        return False
+    status = await _gh_lines(
+        repository,
+        ["gh", "api", f"repos/{repository}/compare/{ref}...{head}", "--jq", ".behind_by"],
+    )
+    count = (status or [""])[0].strip()
+    return count.isdigit() and int(count) > 0
+
+
 async def no_code_between(
-    repository: str, number: int, old: str, new: str, before: Iterable[str] | None
+    repository: str,
+    number: int,
+    old: str,
+    new: str,
+    before: Iterable[str] | None,
+    *,
+    minor: bool = False,
+    why: list[str] | None = None,
 ) -> bool:
     """Whether ``new`` descends from ``old`` through commits that change only doc files or
     files of neither diff, a base merge (#3322): the fix a ``no-code`` review asked for.
@@ -819,21 +1047,140 @@ async def no_code_between(
     only doc files pass: a commit that reverts a file of the diff drops it from the file list
     now, and would read as a base merge. The same two reads as ``base_only_between``; anything
     unread is ``False``, so it is reviewed.
+
+    ``minor`` (#4474): the fix a ``minor`` review asked for may also change test files and,
+    by ``MINOR_LINES`` lines added plus removed at most, files of ``before``. A new code file
+    of the pull request is reviewed.
+
+    ``why`` (#4575), when given, gets one plain reason appended whenever the answer is
+    ``False``: the agent is told it, so it never believes the earlier verdict carried over.
     """
     from .work_release import is_doc_path
 
+    reasons: list[str] = why if why is not None else []
+    if minor and before is not None:
+        return await _minor_between(repository, number, old, new, frozenset(before), reasons)
     touched = await compared_files(repository, old, new)
     if touched is None:
+        reasons.append(_UNREAD_COMPARISON)
         return False
     if all(is_doc_path(name) for name in touched):
         return True
     if before is None:
+        reasons.append(
+            "the deck has no record of the pull request's files at the reviewed head, so it"
+            " cannot tell a small fix from new code: only doc files could count, and it changes `"
+            + _first(name for name in touched if not is_doc_path(name))
+            + "`"
+        )
         return False
     files = await pull_files(repository, number)
     if not files:
+        reasons.append(_UNREAD_FILES)
         return False
     outside = set(files) | set(before)
-    return all(is_doc_path(name) or name not in outside for name in touched)
+    code = [name for name in sorted(touched) if not is_doc_path(name) and name in outside]
+    if code:
+        reasons.append(
+            f"it changes the code file `{code[0]}`, and the review asked for no code change"
+        )
+        return False
+    return True
+
+
+#: The reasons ``no_code_between`` gives for what it could not read (#4575).
+_UNREAD_COMPARISON = (
+    "the deck could not compare the two commits on GitHub (unread, cut short at 300 files, or"
+    " the new one does not descend from the reviewed one)"
+)
+_UNREAD_FILES = "the deck could not read the pull request's file list"
+
+
+def _first(names: Iterable[str]) -> str:
+    return min(names, default="?")
+
+
+async def _minor_between(
+    repository: str,
+    number: int,
+    old: str,
+    new: str,
+    before: frozenset[str],
+    why: list[str],
+) -> bool:
+    """``no_code_between`` for a ``minor`` verdict's fix (#4474): doc files and test files
+    (``_free_in_minor_fix``) any size, files of neither diff (a base merge) any size, files of
+    ``before`` up to ``MINOR_LINES`` lines in all; a code file of either diff renamed (#4593),
+    anything else, or anything unread, is reviewed, its reason appended to ``why`` (#4575)."""
+    from .work_release import is_doc_path
+
+    compared = await compared_changes(repository, old, new)
+    if compared is None:
+        why.append(_UNREAD_COMPARISON)
+        return False
+    changes, renamed = compared
+
+    code_moved = any(not _free_in_minor_fix(name) for name in renamed)
+    if not code_moved and all(is_doc_path(name) for name in changes):
+        return True
+    files = await pull_files(repository, number)
+    if not files:
+        why.append(_UNREAD_FILES)
+        return False
+    # A code file of either diff moved, from or onto its path, even unchanged, removes or
+    # replaces that code: reviewed. One of neither diff came in with a base merge, as any
+    # other base file does (#4593); ``renamed`` holds both names of each rename.
+    moved = sorted(
+        name
+        for name in renamed
+        if not _free_in_minor_fix(name) and (name in before or name in files)
+    )
+    if moved:
+        why.append(f"it renames or moves the code file `{moved[0]}`")
+        return False
+    lines = 0
+    for name, size in sorted(changes.items()):
+        if _free_in_minor_fix(name):
+            continue
+        if name in before:
+            lines += size
+        elif name in files:
+            # A code file the fix added to the pull request.
+            why.append(
+                f"it adds the code file `{name}` to the pull request (a test file counts as one"
+                " only inside a test folder such as `tests/` or `testing/`, or when named like"
+                " `a.test.ts`)"
+            )
+            return False
+    if lines > MINOR_LINES:
+        why.append(
+            f"it changes {lines} lines of code (added plus removed) in files the pull request"
+            f" already had, over the limit of {MINOR_LINES}"
+        )
+        return False
+    return True
+
+
+def _free_in_minor_fix(name: str) -> bool:
+    """Whether a ``minor`` fix may change ``name`` at any size (#4474): a doc file, or any file
+    inside a test folder, a helper or fixture beside the tests included (#4575), or a file
+    named ``*.test.ts`` (any JavaScript or TypeScript ending) anywhere (#4604). A
+    ``test_*`` module outside a test folder, like ``src/agentdeck/test_timings.py``, is code."""
+    from .work_release import MINOR_TEST_NAME, is_doc_path
+
+    return (
+        is_doc_path(name)
+        or _in_test_dir(name)
+        or MINOR_TEST_NAME.fullmatch(name.rsplit("/", 1)[-1]) is not None
+    )
+
+
+def _in_test_dir(name: str) -> bool:
+    """Whether ``name`` sits in a folder whose test files a ``minor`` fix may change freely
+    (``work_release.MINOR_TEST_DIRS``, #4474, #4575)."""
+    from .work_release import MINOR_TEST_DIRS
+
+    return any(part.lower() in MINOR_TEST_DIRS for part in name.split("/")[:-1])
 
 
 class KeyFile:
@@ -930,6 +1277,21 @@ class PendingActions:
             entry["delay"] = backoff.failed()
             entry["next_at"] = now + entry["delay"]
             self._save({**self.entries, key: entry})
+
+    def hurry(self, prefixes: Iterable[str], now: float) -> list[str]:
+        """Make every entry whose key starts with one of ``prefixes`` due at ``now``; the
+        keys it did."""
+        prefixes = tuple(prefixes)
+        with self._file.locked():
+            hurried = [key for key in self.entries if prefixes and key.startswith(prefixes)]
+            if hurried:
+                self._save(
+                    {
+                        key: {**entry, "next_at": now} if key in hurried else entry
+                        for key, entry in self.entries.items()
+                    }
+                )
+        return hurried
 
     def discard(self, key: str) -> None:
         with self._file.locked():
@@ -1037,6 +1399,8 @@ class WorkRouterService:
     (``""`` unread) and ``base_only(repository, number, old, new)`` whether the commits from
     ``old`` to ``new`` touch no file of the pull request: a new head both call the same is not
     reviewed (#3314).
+    ``ship_merge(repository, number, old, new)`` whether ``new`` only merged the base into a
+    Ship now pass's head ``old``: that pass carries over to it as well (#4576).
     """
 
     def __init__(
@@ -1073,10 +1437,12 @@ class WorkRouterService:
         finished: Callable[[str], bool] = lambda work_id: False,
         latest_comment: Callable[[str, int, str, str], Awaitable[dict | None]] | None = None,
         read_comment: Callable[[str, int], Awaitable[dict | None]] | None = None,
+        read_comments: Callable[[str, int, str], Awaitable[list[dict] | None]] | None = None,
         busy: Callable[[str], bool] = lambda work_id: False,
         on_verdict: Callable[[str, Iterable[str] | None], object] | None = None,
         digest: Callable[[str, str], Awaitable[str]] | None = None,
         base_only: Callable[[str, int, str, str], Awaitable[bool]] | None = None,
+        ship_merge: Callable[[str, int, str, str], Awaitable[bool]] | None = None,
         no_code: Callable[..., Awaitable[bool]] | None = None,
         load_work: Callable[[str, int], Awaitable[object]] | None = None,
         read_issue: Callable[[str, int], Awaitable[dict | None]] | None = None,
@@ -1087,6 +1453,8 @@ class WorkRouterService:
         deployed: Callable[[], Collection[str]] | None = None,
         note_merged: Callable[[str, str, str], bool] | None = None,
         forget_merged: Callable[[str], bool] | None = None,
+        start_round: Callable[[str], bool] | None = None,
+        earlier_pulls: Callable[[str], Collection[str]] = lambda work_id: (),
         read_body: Callable[[str, int], Awaitable[dict | None]] | None = None,
         write_body: Callable[[str, int, str], Awaitable[bool]] | None = None,
         review_chat: Callable[[str, str], tuple[str, object | None] | None] | None = None,
@@ -1106,11 +1474,17 @@ class WorkRouterService:
         verification_rows: Callable[[str], Awaitable[list[dict]]] | None = None,
         tests_checked: Callable[[str], bool] = lambda repository: False,
         ship: ShipPorts | None = None,
+        ship_runs: ShipRuns | None = None,
         pending_note: Callable[[str, str, str], bool] | None = None,
         design: design_review.DesignRound | None = None,
         light: object | None = None,
+        close_review: Callable[..., Awaitable[object]] | None = None,
     ) -> None:
         self._enabled = bool(enabled)
+        # ``(work, pull, head, settled, reason)``: close the Work's review chat once the one
+        # pull request it waits on passed after a late minor verdict (#4474); ``None`` closes
+        # nothing, and that chat's own verdict decides.
+        self._close_review = close_review
         # Lighter review (#4399, ``light_review.LightReview``): a light head starts no review.
         self._light = light
         # A big Work's design review (#4332); ``None`` refuses each ask.
@@ -1120,8 +1494,9 @@ class WorkRouterService:
         self._pending_note = pending_note
         # Ship now, fix later (#4212): ``None`` refuses every press.
         self._ship = ship
-        # ``pull@head`` of each Ship now still running, so a second press waits for the first.
-        self._shipping: set[str] = set()
+        # Each Ship now still running, keyed by the ``pull@head`` its caller sent (#4558): a
+        # second press joins it, and the release reads it for the Work's hold line.
+        self.ship_runs = ship_runs if ship_runs is not None else ShipRuns()
         # The GitHub check (#4152): ``review_check.ReviewCheckPublisher``, ``None`` when off.
         # With it every eligible pull request is reviewed, a Work's or not.
         self._check = check
@@ -1158,6 +1533,8 @@ class WorkRouterService:
         self._finished = finished
         self._latest_comment = latest_comment
         self._read_comment = read_comment
+        # A ``/reviewed`` verdict whose webhook never came is read back (#4478).
+        self._read_comments = read_comments
         self._read_issue = read_issue
         self._read_parent = read_parent
         # An issue whose last blocker closed is started (#3764, #4216): the issues an issue
@@ -1173,6 +1550,8 @@ class WorkRouterService:
         # the issues it blocks, which start; a reopen of the Work's issue undoes it (#4398).
         self._note_merged = note_merged
         self._forget_merged = forget_merged
+        self._start_round = start_round
+        self._earlier_pulls = earlier_pulls
         # A wayfinder map's body read and saved again when a record lands (#3695).
         self._read_body = read_body
         self._write_body = write_body
@@ -1190,6 +1569,9 @@ class WorkRouterService:
         # Whether the commits between two heads touch no file of the pull request
         # (``base_only_between``): the proof a same digest is a base merge, not moved code.
         self._base_only = base_only
+        # Whether a head only merged the base into a Ship now pass's head, its own code
+        # unchanged (``ship_merge_between``): that pass carries over too (#4576).
+        self._ship_merge = ship_merge
         # Whether a push after a ``no-code`` verdict changed only doc files or merged its base
         # (``no_code_between``): then that review counts as a pass, with no new one (#3322).
         self._no_code = no_code
@@ -1235,6 +1617,10 @@ class WorkRouterService:
         self._sweep_wake = asyncio.Event()
         self._swept_at: float | None = None
         self._in_flight: set[str] = set()
+        #: ``owner/repo#n@head`` -> why a push after a ``minor`` or ``no-code`` verdict did not
+        #: carry its pass (``NOT_SMALL_TEXT``), said once at the top of that head's checklist
+        #: (#4575). In memory: a restart loses only the reason, never the checklist.
+        self._not_small: dict[str, str] = {}
         # Starts whose issue closed or lost its label since: a late refusal does not revive
         # them (#3006).
         self._unwanted_starts: set[str] = set()
@@ -1250,7 +1636,7 @@ class WorkRouterService:
         #: ``(head, text)`` of each checklist made for it while it waited (#4253).
         self._printing: dict[str, tuple[str, list[tuple[str, str]]]] = {}
         self.pending = pending or PendingActions(pending_path(streams_root))
-        self.handed_over = KeyFile(Path(streams_root).expanduser().parent / HANDED_OVER_FILENAME)
+        self.handed_over = KeyFile(handed_over_path(streams_root))
         for name in RETIRED_FILENAMES:
             with contextlib.suppress(OSError):
                 (Path(streams_root).expanduser().parent / name).unlink(missing_ok=True)
@@ -1630,7 +2016,11 @@ class WorkRouterService:
                     return
                 head, again = current, ""
                 entry = {}
-        if entry and self._passed_since(f"{repository}#{number}", head, entry.get("since")):
+        if (
+            entry
+            and not self._carry_unfinished(f"{repository}#{number}", head)
+            and self._passed_since(f"{repository}#{number}", head, entry.get("since"))
+        ):
             # Kept while another review of this head ran, which then passed it (#3324): a
             # review now would only re-open a release that already waits for a person's Merge.
             log.info("work-router: %s passed since it was asked for; not reviewed", key)
@@ -1874,12 +2264,18 @@ class WorkRouterService:
     def _chat_heads(self, number: int, issue: dict) -> list[tuple[str, str]]:
         """``(pull, head)`` of each head this chat was opened about: pinned in its body, and
         the history's own record of the chat at that head."""
-        from .chat_review import pinned_heads
+        from .chat_review import background_pulls, pinned_heads
 
         chat = f"{self._chat_repository}#{number}"
         found: list[tuple[str, str]] = []
-        pinned = pinned_heads(_text(issue.get("body")), _text(issue.get("title")))
+        body = _text(issue.get("body"))
+        pinned = pinned_heads(body, _text(issue.get("title")))
+        # A pull request listed only as already passed background is not under review here,
+        # so this chat's label neither stops nor resumes its review (#4599).
+        background = background_pulls(body)
         for (repository, pull_number), head in pinned.items():
+            if (repository.lower(), pull_number) in background:
+                continue
             pull = f"{repository}#{pull_number}".lower()
             heads = {
                 event.head
@@ -2093,11 +2489,14 @@ class WorkRouterService:
             "pass": review_history.PASS,
             "changes-needed": review_history.CHANGES,
             NO_CODE: review_history.NO_CODE,
+            MINOR: review_history.NO_CODE,
         }
         kind = kinds.get(command.verdict)
         if kind is None:
             return f"the verdict {command.verdict} was not understood"
         data = {"by": by, "chat": self._review_chat_name(pull, head)}
+        if command.verdict == MINOR:
+            data["minor"] = True
         if kind != review_history.CHANGES:
             try:
                 digest = (await self._digest(pull, head) if self._digest else "") or ""
@@ -2367,6 +2766,13 @@ class WorkRouterService:
                 ok = False
             if not ok:
                 log.warning("work-router: merges of reopened %s not dropped", work_id)
+            if self._start_round is not None:
+                # A new round (#4585): its earlier pull requests stop counting for the
+                # release, the live check and the page. A repeat adds nothing and keeps it.
+                try:
+                    await asyncio.to_thread(self._start_round, work_id)
+                except Exception:  # noqa: BLE001 - logged; the Work counts everything
+                    log.warning("work-router: round of reopened %s not started", work_id)
             return
         if self._note_merged is None or delivery.event != "pull_request" or action != "closed":
             return
@@ -2394,6 +2800,14 @@ class WorkRouterService:
             return
         work = _work_id(owner)
         ref = f"{repository}#{number}"
+        try:
+            earlier = ref.lower() in self._earlier_pulls(work)
+        except Exception:  # noqa: BLE001 - unread: recorded as before rounds
+            earlier = False
+        if earlier:
+            # A late delivery of an earlier round's merge (#4585): it unblocks nothing now.
+            log.info("work-router: merge of %s is from an earlier round of %s", ref, work)
+            return
         try:
             ok = await asyncio.to_thread(self._note_merged, work, ref, branch)
         except Exception:  # noqa: BLE001 - logged; nothing is started from this merge
@@ -3517,6 +3931,14 @@ class WorkRouterService:
                 f"{pull} is not open and ready for review (a draft, closed, or unreadable now):"
                 " mark it ready with `gh pr ready` instead"
             )
+        if self._spent(pull, head) and not self._has_verdict(pull, head):
+            found = await self._recover_verdict(owner, [(pull, head)])
+            if found:
+                raise AgainRefused(
+                    f"a verdict on {pull} at {head[:12]} was already posted ({found}), and"
+                    " the deck had missed its webhook. It is now taken in and sent to this"
+                    " chat, so no review is missing and none was started: act on it"
+                )
         if no_verdict and not self._has_verdict(pull, head):
             found = await self._recover_findings(owner, pull, head, note)
             if found:
@@ -3753,6 +4175,165 @@ class WorkRouterService:
                 return found.group(0)
         return ""
 
+    async def recover_review(self, repository: str, number: int) -> str:
+        """Take in a verdict posted for a timed-out review wait on ``repository#number`` that
+        its webhook never brought (#4478); the URL of the comment, or ``""``.
+
+        The wait names a pull request, or the Work's issue while one of its pull requests is
+        reviewed (#4476). The head is the one each pull request's review was last asked for,
+        from its own history: a wait stores none, and no GitHub read is needed for it.
+        """
+        repository = repository.lower()
+        ref = f"{repository}#{number}"
+        pulls = [ref] if self._newest_ask(ref) is not None else []
+        owner = self._owner_of_pull(repository, number) if pulls else None
+        if not pulls:
+            owner = self._owner_of_issue(repository, number)
+            if owner is None:
+                return ""
+            pulls = self._work_pulls(owner)
+        asks = [(pull, self._newest_ask(pull)) for pull in pulls]
+        newest = sorted(
+            ((pull, ask) for pull, ask in asks if ask is not None),
+            key=lambda item: item[1].at,
+            reverse=True,
+        )[:RECOVER_PULLS]
+        return await self._recover_verdict(owner, [(pull, ask.head) for pull, ask in newest])
+
+    def _newest_ask(self, pull: str) -> review_history.ReviewEvent | None:
+        asks = [e for e in self._history(pull) if e.kind == review_history.ASKED]
+        return max(asks, key=lambda event: event.at) if asks else None
+
+    def _work_pulls(self, owner: Owner) -> list[str]:
+        """The pull requests ``owner``'s Work registered, lowercased; none when unread."""
+        read = getattr(getattr(self._release, "ports", None), "pulls", None)
+        try:
+            held = read(_work_id(owner)) if read else ()
+            return sorted({str(pull).lower() for pull in held})
+        except Exception:  # noqa: BLE001 - none recovered: today's path runs
+            log.warning("work-router: could not list %s's pulls", owner[1], exc_info=True)
+            return []
+
+    async def _recover_verdict(self, owner: Owner | None, candidates: list[tuple[str, str]]) -> str:
+        """The URL of a ``/reviewed`` comment about one of ``candidates`` (``pull``, ``head``)
+        that the deck never took in, now taken in through ``apply``, as its webhook would have
+        been, with every check that path makes; ``""`` when none (#4478).
+
+        Only the Work's issue and each candidate's own thread are read, once each, from just
+        before the first ask at its head, and only lines from the reviewer's account, the
+        deck's own, or the reviewer's connector are handed on. Who may send it, which pull
+        request, head, diff and round it answers stay the release's call. A read that fails
+        finds nothing, and the caller goes on as it did before.
+        """
+        from .poller_engine.intake import CommandKind, parse_verdicts
+
+        if self._read_comments is None or not candidates:
+            return ""
+        threads: dict[tuple[str, int], bool] = {}
+        if owner is not None and owner[1]:
+            stream, _, issue = owner[1].lower().rpartition("#")
+            if issue.isdigit():
+                threads[(stream, int(issue))] = False
+        for pull, _head in candidates:
+            stream, _, number = pull.rpartition("#")
+            if number.isdigit():
+                threads[(stream, int(number))] = True
+        firsts = [
+            min(event.at for event in asks)
+            for pull, head in candidates
+            if (
+                asks := [
+                    event
+                    for event in review_history.at_head(self._history(pull), head)
+                    if event.kind == review_history.ASKED
+                ]
+            )
+        ]
+        since = ""
+        if firsts:
+            moment = datetime.fromtimestamp(min(firsts) - RECOVER_SLACK_S, UTC)
+            since = moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+        own = self.own_logins()
+        reviewers = reviewer_logins()
+        heads = [head for _pull, head in candidates]
+        found: dict[str, str] = {}  # head -> the URL of the comment about it
+        # A comment the deck already took in is never handed on again: its verdict was told.
+        taken = {
+            event.key.rsplit(":", 1)[0]
+            for pull, _head in candidates
+            for event in self._history(pull)
+            if event.key.startswith("comment:")
+        }
+        seen: set[object] = set()
+        for (stream, number), is_pull in threads.items():
+            try:
+                comments = await self._read_comments(stream, number, since)
+            except Exception:  # noqa: BLE001 - unread recovers nothing: today's path runs
+                log.warning("work-router: %s#%s comments unread", stream, number, exc_info=True)
+                continue
+            for comment in comments or ():
+                if not isinstance(comment, dict) or comment.get("id") in seen:
+                    continue
+                seen.add(comment.get("id"))
+                if f"comment:{comment.get('id')}" in taken:
+                    continue
+                user = comment.get("user")
+                login = _text(user.get("login")) if isinstance(user, dict) else ""
+                app = comment.get("performed_via_github_app")
+                if not (
+                    login.casefold() in reviewers
+                    or login.casefold() in own
+                    or (isinstance(app, dict) and app.get("slug") == REVIEWER_CONNECTOR)
+                ):
+                    continue
+                about = [
+                    head
+                    for command in parse_verdicts(_text(comment.get("body"))) or ()
+                    if command.kind == CommandKind.REVIEWED
+                    for head in heads
+                    if same_commit(head, (command.head or "").lower())
+                ]
+                if not about:
+                    continue
+                issue: dict = {"number": number}
+                if is_pull:
+                    issue["pull_request"] = {}
+                delivery = Delivery(
+                    stream=stream,
+                    delivery_id=f"recovered-verdict:{comment.get('id')}",
+                    event="issue_comment",
+                    received_at=datetime.now(UTC).isoformat(),
+                    headers={},
+                    raw_body=b"",
+                    offset=0,
+                    _payload={
+                        "action": "created",
+                        "issue": issue,
+                        "comment": comment,
+                        "sender": user,
+                        "repository": {"full_name": stream},
+                    },
+                )
+                log.info(
+                    "work-router: taking in %s's missed verdict %s",
+                    stream,
+                    _text(comment.get("html_url")),
+                )
+                await self.apply([delivery])
+                # Only a verdict the release recorded names its comment: a refused one (a
+                # wrong digest, a stale round) is no answer to the wait (#4479 review).
+                key = f"comment:{comment.get('id')}"
+                for pull, head in candidates:
+                    if head in about and any(
+                        event.key.rsplit(":", 1)[0] == key
+                        for event in review_history.at_head(self._history(pull), head)
+                    ):
+                        found[head] = _text(comment.get("html_url")) or f"{stream}#{number}"
+        for pull, head in candidates:
+            if head in found and self._has_verdict(pull, head):
+                return found[head]
+        return ""
+
     async def accept(self, repository: str, number: int, note: str) -> dict:
         """Count the review of the pull request's ready head as a pass, because the owner
         accepted its findings with no code change (#3828).
@@ -3828,8 +4409,16 @@ class WorkRouterService:
         ``head``, when given, is the head whose findings the owner's confirm showed: a live
         head past it ships nothing (#4212 review).
 
-        Raises ``AgainRefused`` with the reason; answers ``pull_request``, ``head`` and
-        ``outcome``.
+        A press can take minutes (#4558: three steps under the Work's lock, each reading every
+        pull request of the Work), longer than the web waits for a call. So the press runs as
+        a task of its own, keyed by the ``pull@head`` the caller sent, and the call waits at
+        most :data:`SHIP_WAIT_S` for it: then it answers ``state`` ``running`` and the task
+        goes on, telling the Work's chat how it ended. A second call for the same key joins
+        the task; one for a head already marked shipped answers ``recorded`` before any
+        GitHub read, so a repeat after the merge is safe too.
+
+        Raises ``AgainRefused`` with the reason; answers ``pull_request``, ``head``, ``state``
+        (``recorded`` or ``running``) and ``outcome``.
         """
         repository = repository.lower()
         pull = f"{repository}#{number}"
@@ -3839,12 +4428,142 @@ class WorkRouterService:
         ship = self._ship
         if not self._switched(repository) or self._release is None or ship is None:
             raise AgainRefused(f"the deck does not release {repository}'s Works")
+        shown = head.lower()
+        recorded = self._recorded_ship(ship, owner, pull, shown)
+        if recorded is not None:
+            return recorded
+        runs = self.ship_runs
+        key = f"{pull}@{shown}"
+        task = runs.tasks.get(key)
+        if task is None:
+            press = self._ship_task(key, ship, owner, repository, number, shown)
+            task = asyncio.ensure_future(press)
+            # Retrieved here, so a task whose every caller left logs no "never retrieved".
+            task.add_done_callback(lambda done: done.cancelled() or done.exception())
+            runs.tasks[key] = task
+        # ``wait`` leaves the task running, and tells its own TimeoutError from the wait's: a
+        # press that ended answers with its end, and one still going is marked left in the
+        # same step, so its end can never miss the chat (#4559 helper checks).
+        await asyncio.wait({task}, timeout=SHIP_WAIT_S)
+        if task.done():
+            return task.result()
+        runs.left.add(key)
+        return {
+            "pull_request": pull,
+            "head": shown,
+            "state": SHIP_RUNNING,
+            "outcome": (
+                f"Ship now of {pull}" + (f" at {shown[:12]}" if shown else "") + " is still"
+                " running in the merge service"
+            ),
+        }
+
+    def _recorded_ship(self, ship: ShipPorts, owner: Owner, pull: str, shown: str) -> dict | None:
+        """The ``recorded`` answer when ``pull`` at ``shown`` is already marked shipped for
+        this Work, read before anything from GitHub (#4558): ``pull`` itself, or the pull
+        request split from it to ship that commit (its ``fix`` is ``pull``). ``None`` else."""
+        if len(shown) != 40 or ship.shipped_by_work is None:
+            return None
+        try:
+            records = ship.shipped_by_work(owner[1].lower())
+        except Exception:  # noqa: BLE001 - unread: the press itself finds what is recorded
+            log.warning("work-router: shipped heads of %s unreadable", owner[1], exc_info=True)
+            return None
+        for record in records:
+            if record.shipped and record.head.lower() == shown:
+                if pull in (record.pull.lower(), (record.fix or "").lower()):
+                    return _recorded(record.pull.lower(), shown)
+        return None
+
+    async def _ship_task(
+        self,
+        key: str,
+        ship: ShipPorts,
+        owner: Owner,
+        repository: str,
+        number: int,
+        shown: str,
+    ) -> dict:
+        """One press, run apart from its callers (#4558). A press its callers stopped waiting
+        for tells the Work's chat when it was refused, decided after the closing look so a
+        caller whose wait ran out during that look hears it too; a finished one already does.
+        Every end takes the task out of the table first and then makes the release's one look,
+        so the Work's hold line no longer says Ship now is under way."""
+        runs = self.ship_runs
+        work_id = _work_id(owner)
+        pull = f"{repository}#{number}"
+        stopped = ""
+        try:
+            return await self._ship_press(key, ship, owner, repository, number, shown)
+        except AgainRefused as refused:
+            stopped = str(refused)
+            raise
+        except Exception as exc:
+            log.exception("work-router: Ship now of %s stopped", key)
+            stopped = f"it failed ({exc})"
+            raise
+        finally:
+            # One rule for every end (#4558 redesign): off the running list first, then the
+            # release's one look, which leaves the Work due again if it raises.
+            held = {pull, runs.resolved.get(key, "").rpartition("@")[0]} - {""}
+            runs.tasks.pop(key, None)
+            runs.resolved.pop(key, None)
+            # Review starts held while it ran (#4576) go now, with its pass written or not: a
+            # pull request no other press holds is reviewed, or its pass carried, at once.
+            free = [name for name in held if not self._ship_holds(name)]
+            if self.pending.hurry((f"review:{name}@" for name in free), self._clock()):
+                log.info("work-router: review starts held by Ship now of %s are due", key)
+            # Test fakes of the release may have only ``evaluate``.
+            look = getattr(self._release, "look_after_ship", None) or self._release.evaluate
+            try:
+                await look(work_id)
+            except Exception:  # noqa: BLE001 - the real look marks its own retry
+                log.warning("work-router: release of %s after Ship now failed", pull)
+            # Decided only after the look: a caller whose wait ran out during the look was
+            # answered ``running`` and must hear the refusal too (#4559 review).
+            if stopped:
+                self._tell_ship_stopped(key, owner, pull, shown, stopped)
+            if key not in runs.tasks:  # a newer press of the same head keeps its own mark
+                runs.left.discard(key)
+
+    def _tell_ship_stopped(self, key: str, owner: Owner, pull: str, shown: str, why: str) -> None:
+        """Tell the Work's chat a press it was told is running ended without shipping."""
+        if key not in self.ship_runs.left:
+            return
+        now = datetime.now(UTC)
+        at = f" at {shown[:12]}" if shown else ""
+        self._deliver(
+            ScheduledMessage(
+                id=f"work-event:ship-stopped:{key}:{int(now.timestamp())}",
+                chat_id=owner[0],
+                text=(
+                    f"AgentDeck: Ship now of {pull}{at}, which ship-now answered as still"
+                    f" running, stopped without shipping: {why}. Nothing more ships by itself."
+                    " Tell the owner; the Work page offers Ship now again, and calling ship-now"
+                    " again with the same pull request and head is safe."
+                ),
+                due_at=now,
+                created_at=now,
+            )
+        )
+
+    async def _ship_press(
+        self,
+        key: str,
+        ship: ShipPorts,
+        owner: Owner,
+        repository: str,
+        number: int,
+        shown: str,
+    ) -> dict:
+        """``ship_now``'s checks and steps, inside its task (``_ship_task``)."""
+        pull = f"{repository}#{number}"
         try:
             live, draft = await ship.open_head(repository, number)
         except Exception:  # noqa: BLE001 - unreadable ships nothing
             log.warning("work-router: %s unreadable for Ship now", pull, exc_info=True)
             live, draft = "", False
-        live, shown = (live or "").lower(), head.lower()
+        live = (live or "").lower()
         if len(live) != 40:
             raise AgainRefused(f"{pull} is not open, or could not be read now")
         split = 0
@@ -3876,10 +4595,7 @@ class WorkRouterService:
         if passed:
             earlier = ship.shipped(pull, passed)
             if earlier is not None and earlier.shipped:
-                raise AgainRefused(
-                    f"{pull} at {passed[:12]} was already shipped: its findings are left to"
-                    " this Work"
-                )
+                return _recorded(pull, passed)
             head, draft = passed, draft and bool(split)
         elif not split and review_history.shippable(history, head) is None:
             raise AgainRefused(
@@ -3887,23 +4603,26 @@ class WorkRouterService:
                 " newer review of it is still running, so there is nothing to ship past yet"
                 + self._closed_review(pull, head)
             )
-        key = f"{pull}@{head}"
-        if key in self._shipping:
-            raise AgainBusy(f"Ship now of {pull} at {head[:12]} is still running")
-        self._shipping.add(key)
-        try:
-            return await self._ship_now(
-                ship,
-                owner,
-                repository,
-                number,
-                head,
-                draft,
-                accepted=bool(passed),
-                source=source if split else "",
-            )
-        finally:
-            self._shipping.discard(key)
+        # The release's hold line names the head the press resolved to, too (#4558). Two
+        # callers' heads can resolve to one (a carried pass, or the original and its split
+        # pull request): the later one waits for the press already shipping it, so no head
+        # is shipped by two presses at once (#4559 helper checks).
+        target = f"{pull}@{head}"
+        runs = self.ship_runs
+        for other, at in list(runs.resolved.items()):
+            if at == target and other != key and other in runs.tasks:
+                return await asyncio.shield(runs.tasks[other])
+        runs.resolved[key] = target
+        return await self._ship_now(
+            ship,
+            owner,
+            repository,
+            number,
+            head,
+            draft,
+            accepted=bool(passed),
+            source=source if split else "",
+        )
 
     async def _ship_now(
         self,
@@ -3968,27 +4687,40 @@ class WorkRouterService:
         if not self._mark_shipped(ship, pull, head):
             raise AgainRefused(f"{pull} at {head[:12]} could not be marked shipped, {unfinished}")
         self.pending.discard(f"review:{pull}@{head}")
-        try:
-            # Marked last, so the release looks again now: the pass held until here.
-            await self._release.evaluate(work_id)
-        except Exception:  # noqa: BLE001 - the release looks again at its next event
-            log.warning("work-router: release of %s after Ship now failed", pull, exc_info=True)
+        # Also in the chat's message: a caller answered ``running`` never sees the outcome.
+        behind = await self._ship_behind(ship, repository, number, head)
+        warning = SHIP_BEHIND_TEXT.format(pull=pull, head=head[:12]) if behind else ""
+        # Marked last; the release looks again once the press left the running list
+        # (``_ship_task``), so that look cannot say it is still under way (#4558 redesign).
         now = datetime.now(UTC)
         self._deliver(
             ScheduledMessage(
                 id=f"work-event:ship-now:{pull}@{head}",
                 chat_id=owner[0],
-                text=_ship_message(pull, head, issue, source),
+                text=_ship_message(pull, head, issue, source) + (f" {warning}." if warning else ""),
                 due_at=now,
                 created_at=now,
             )
         )
         outcome = f"{answer}; its findings are left to this Work"
+        if warning:
+            outcome += f". {warning}"
         return {
             "pull_request": pull,
             "head": head,
+            "state": SHIP_RECORDED,
             "outcome": f"{outcome}; {merge}" if merge else outcome,
         }
+
+    async def _ship_behind(self, ship: ShipPorts, repository: str, number: int, head: str) -> bool:
+        """Whether the shipped ``head`` is behind its base branch; unread is not behind."""
+        if ship.behind is None:
+            return False
+        try:
+            return bool(await ship.behind(repository, number, head))
+        except Exception:  # noqa: BLE001 - only a warning is lost
+            log.warning("work-router: could not compare %s#%s with its base", repository, number)
+            return False
 
     async def _ship_ready(self, ship: ShipPorts, repository: str, number: int, head: str) -> None:
         """Mark the draft ``repository#number`` ready at ``head``, or refuse the press."""
@@ -4167,6 +4899,11 @@ class WorkRouterService:
         written down as reviewed, carried from that head, and the chat is told the earlier
         verdict stands; the release credits that verdict to it (``same_change``). A digest or a
         comparison that could not be read is never called the same.
+
+        A Ship now pass carries further (#4576): to a head that only merged the base in, even
+        one that touched the pull request's files or changed its doc lines, as long as every
+        code file contributes the same lines (``ship_merge_between``). The owner shipped that
+        code; a conflict with the base must not send it back to a review.
         """
         if self._digest is None:
             return ""
@@ -4179,7 +4916,7 @@ class WorkRouterService:
             return ""
         events = self._history(pull)
         before, known = review_history.last_digest(events)
-        if not skip or not known or known != digest or before == head.lower():
+        if not skip or not known or before == head.lower():
             return digest
         # Its standing verdict only: one a review was asked for again after is still awaited.
         verdict = review_history.standing_verdict(review_history.at_head(events, before))
@@ -4191,24 +4928,60 @@ class WorkRouterService:
         # function digest the same (#3314 review): only commits that touch none of the pull
         # request's files prove the change itself is what was reviewed.
         repository, _, number = pull.rpartition("#")
-        try:
-            proven = self._base_only is not None and bool(
-                await self._base_only(repository, int(number), before, head.lower())
-            )
-        except Exception:  # noqa: BLE001 - unproven is reviewed
-            log.warning("work-router: could not compare %s's heads", pull, exc_info=True)
-            proven = False
+        proven = known == digest and await self._proven(
+            self._base_only, repository, int(number), before, head
+        )
+        shipped = not proven and bool(review_history.ship_pass_head(events, before))
+        if shipped:
+            proven = await self._proven(self._ship_merge, repository, int(number), before, head)
         if not proven:
             return digest
         key = f"{pull}@{head}"
+        # Kept pending until the chat is told, so a crash between the row and the telling is
+        # finished by the retry (#4576 design): the row alone spends the head.
+        self.pending.put(
+            f"review:{key}",
+            {"kind": REVIEW, "repository": repository, "number": int(number), "head": head},
+            self._clock(),
+        )
         # Written as the head's own verdict, copied from the one it keeps: so the head needs no
         # review, and a later base merge of it compares with this digest.
         data = {**verdict.data, "digest": digest, "carried_from": before}
         self._note(pull, head, verdict.kind, f"carried:{key}", data=data)
+        self._carried_told(owner, pull, head)
+        return ""
+
+    async def _proven(
+        self,
+        port: Callable[[str, int, str, str], Awaitable[bool]] | None,
+        repository: str,
+        number: int,
+        before: str,
+        head: str,
+    ) -> bool:
+        """``port``'s answer about the commits from ``before`` to ``head``; unread is False."""
+        if port is None:
+            return False
+        try:
+            return bool(await port(repository, number, before, head.lower()))
+        except Exception:  # noqa: BLE001 - unproven is reviewed
+            log.warning("work-router: could not compare %s#%s's heads", repository, number)
+            return False
+
+    def _carried_told(self, owner: Owner, pull: str, head: str) -> None:
+        """Tell the chat the verdict carried to ``head`` (``_unchanged``'s row) stands, end
+        its wait on a verdict, and only then drop the head's pending start: the one hand-off
+        a start that finds the row with its start still pending finishes again (#4576)."""
+        key = f"{pull}@{head}"
+        verdict = review_history.standing_verdict(review_history.at_head(self._history(pull), head))
+        before = str((verdict.data or {}).get("carried_from") or "") if verdict else ""
+        if verdict is None or not before:
+            self.pending.discard(f"review:{key}")
+            return
         if not owner[0]:
             # A pull request no Work owns: only its check says so, and no chat waits.
             self.pending.discard(f"review:{key}")
-            return ""
+            return
         if verdict.kind in (review_history.PASS, review_history.ACCEPTED):
             # A pass (or one the owner accepted) carries over and nothing is left for the chat
             # to do (#4253): its wait on a verdict ends quietly, and the release merges or
@@ -4216,17 +4989,25 @@ class WorkRouterService:
             if self._on_verdict is not None:
                 with contextlib.suppress(Exception):
                     self._on_verdict(owner[0], [pull])
-            self._keep_note(
-                owner[0],
-                f"work-unchanged:{key}",
-                f"AgentDeck: {pull} is now at {head[:12]}, but only its base branch changed since"
-                f" {before[:12]}, whose review passed: the pass carries over and no new review"
-                " started. The deck merges it, or offers Merge, as for any pass; a head that"
-                " still needs its tests run is told on its own.",
-            )
+            shipped = review_history.ship_pass_head(self._history(pull), head)
+            if shipped:
+                text = (
+                    f"AgentDeck: {pull} is now at {head[:12]}, which only merged its base into"
+                    f" {shipped[:12]}, the commit the owner shipped with Ship now; its code"
+                    " changes are the same, so that pass carries over and no new review"
+                    " started. The deck merges it, or offers Merge, as for any pass."
+                )
+            else:
+                text = (
+                    f"AgentDeck: {pull} is now at {head[:12]}, but only its base branch changed"
+                    f" since {before[:12]}, whose review passed: the pass carries over and no"
+                    " new review started. The deck merges it, or offers Merge, as for any pass;"
+                    " a head that still needs its tests run is told on its own."
+                )
+            self._keep_note(owner[0], f"work-unchanged:{key}", text)
             self.pending.discard(f"review:{key}")
             log.info("work-router: %s has %s's passed diff; not reviewed again", key, before[:12])
-            return ""
+            return
         now = datetime.now(UTC)
         delivered = self._deliver(
             ScheduledMessage(
@@ -4251,7 +5032,6 @@ class WorkRouterService:
                 self._on_verdict(owner[0], [pull])
         self.pending.discard(f"review:{key}")
         log.info("work-router: %s has %s's diff; not reviewed again", key, before[:12])
-        return ""
 
     def _keep_note(self, chat_id: str, note_id: str, text: str) -> bool:
         """Keep ``text`` for the chat's next message, waking nothing (#4306). A note not kept
@@ -4289,18 +5069,37 @@ class WorkRouterService:
             return False
         if held is None or len(head) < 7:
             return False
-        old, before = held
+        old, before, *rest = held
+        # A ``minor`` verdict's fix may change a little code too (#4474).
+        minor = {"minor": True} if rest and rest[0] else {}
         if head.startswith(old) or old.startswith(head):
             if not event.explicit:
                 return False
         elif not review_history.same_change(self._history(pull), head, old):
+            why: list[str] = []
             try:
                 proven = self._no_code is not None and bool(
-                    await self._no_code(event.repository, event.number, old, head, before)
+                    await self._no_code(
+                        event.repository, event.number, old, head, before, **minor, why=why
+                    )
                 )
             except Exception:  # noqa: BLE001 - unproven is reviewed
                 log.warning("work-router: could not compare %s's heads", pull, exc_info=True)
                 proven = False
+                why.append("the deck could not compare the two commits")
+            if not proven and (minor or self._no_code_verdict_at(pull, old)):
+                # Said in this head's checklist (#4575): the agent must not believe the
+                # earlier verdict carried over when the deck's record says it did not. A
+                # standing pass a code push leaves behind is the usual next round: unsaid.
+                self._not_small[f"{pull}@{head}"] = NOT_SMALL_TEXT.format(
+                    checklist="{checklist}",
+                    pull=pull,
+                    old=old[:12],
+                    short=head[:12],
+                    verdict="minor-fixes" if minor else "no-code",
+                    reason=why[0] if why else "the deck could not prove it small",
+                )
+                log.info("work-router: %s@%s is no small fix: %s", pull, head[:12], why)
             if not proven:
                 return False
         try:
@@ -4317,6 +5116,13 @@ class WorkRouterService:
         self.pending.discard(f"review:{pull}@{head}")
         return True
 
+    def _no_code_verdict_at(self, pull: str, head: str) -> bool:
+        """Whether the verdict standing at ``head`` is a ``no-code`` one, not a pass a doc-only
+        push would keep (#4257): ``no_code_head`` names either alike (#4575)."""
+        events = review_history.at_head(self._history(pull), head)
+        verdict = review_history.standing_verdict(events)
+        return verdict is not None and verdict.kind == review_history.NO_CODE
+
     async def _review(
         self, owner: Owner, event: Event, *, asked: bool = False, checklist_again: bool = False
     ) -> None:
@@ -4327,7 +5133,17 @@ class WorkRouterService:
         key = f"{pull}@{event.head}" + (f"+{event.again}" if event.again else "")
         pending_key = f"review:{key}"
         if self._spent(pull, event.head, event.again):
+            if not event.again and self._carry_unfinished(pull, event.head):
+                # The carried row was written and the router stopped before the chat heard
+                # (#4576 design): finish that hand-off, with the same ids, never a review.
+                self._carried_told(owner, pull, event.head)
             self.pending.discard(pending_key)
+            return
+        if self._ship_holds(pull):
+            # A Ship now press of this pull request is still running (#4576 design): its pass
+            # may not be written yet, so a base merge pushed meanwhile would be reviewed. The
+            # start waits pending; the press's end makes it due at once.
+            self._hold_review(event, pending_key, asked=asked)
             return
         if not asked and self._is_light(pull, event.head):
             # No reviewer for a light head (#4399): its bench verdict and bin/test.sh decide.
@@ -4343,6 +5159,9 @@ class WorkRouterService:
             return
         if key in self._in_flight:
             return
+        # A pass a late minor or no-code verdict makes while this start runs ends it (#4474);
+        # one that stood before it began, or a review asked again, does not.
+        settle = not event.again and not self._fix_pass(pull, event.head)
         if self.reviewer_off:
             # Nothing pending, nothing reviewed (#3849): kept, it was retried for a day while
             # every later ask heard "already asked, keep waiting".
@@ -4355,6 +5174,7 @@ class WorkRouterService:
         try:
             digest = ""
             if not event.again and not asked and await self._no_code_fixed(owner, event):
+                settle = False  # no chat was opened for this head: nothing to close
                 return
             if not event.again:
                 digest = await self._unchanged(owner, pull, event.head, skip=not asked)
@@ -4376,9 +5196,116 @@ class WorkRouterService:
                 self.pending.discard(pending_key)
                 self._tell_design_gap(owner, pull, event.head, missing)
                 return
-            await self._ask_reviewer(owner, event, pull, key, digest, asked=asked)
+            await self._ask_reviewer(owner, event, pull, key, digest, asked=asked, settle=settle)
         finally:
             self._in_flight.discard(key)
+            # A reason no checklist took (pre-review off, a checklist already waiting) goes.
+            self._not_small.pop(f"{pull.lower()}@{event.head.lower()}", None)
+            if settle and self._fix_pass(pull, event.head):
+                await self._close_settled(owner, pull, event.head)
+
+    def _carry_unfinished(self, pull: str, head: str) -> bool:
+        """Whether ``head``'s standing verdict is a carried one whose hand-off to the chat did
+        not finish: its start is still pending, which the hand-off drops last, and ``head`` is
+        still the newest head of ``pull``'s history, so ending the chat's waits on ``pull``
+        (not kept per head) cannot end a newer head's (#4576 design review)."""
+        if f"review:{pull}@{head}" not in self.pending:
+            return False
+        events = self._history(pull)
+        verdict = review_history.standing_verdict(review_history.at_head(events, head))
+        if verdict is None or not verdict.key.startswith("carried:"):
+            return False
+        # A chat waits on a head once its review is asked for or a pass carried to it; a late
+        # row at an older head (a verdict, an unstarted note) starts no wait.
+        waits = [
+            event
+            for event in events
+            if event.kind == review_history.ASKED or event.key.startswith("carried:")
+        ]
+        newest = max(waits, key=lambda event: (event.at, event.seq))
+        return newest.head.lower() == head.lower()
+
+    def _ship_holds(self, pull: str) -> bool:
+        """Whether a Ship now press of ``pull`` runs in this process now (``ShipRuns``)."""
+        runs = self.ship_runs
+        return bool(runs.tasks or runs.resolved) and bool(runs.head_of(pull))
+
+    def _hold_review(self, event: Event, pending_key: str, *, asked: bool) -> None:
+        """Keep ``event``'s review start pending, untried, until a press lets it go."""
+        retry: dict = {
+            "kind": REVIEW,
+            "repository": event.repository,
+            "number": event.number,
+            "head": event.head,
+        }
+        if asked:
+            retry["asked"] = True
+        if event.again:
+            retry.update(again=event.again, note=event.note)
+        self.pending.put(pending_key, retry, self._clock())
+        log.info("work-router: %s waits for the Ship now press of its pull request", pending_key)
+
+    def _fix_pass(self, pull: str, head: str) -> bool:
+        """Whether the pass standing at ``head`` is one a ``minor`` or ``no-code`` verdict's
+        fix made with no new review (``no_code_fixed``'s ``minor-fixed`` or ``no-code-fixed``
+        row, #4474)."""
+        events = review_history.at_head(self._history(pull), head)
+        verdict = review_history.standing_verdict(events)
+        return (
+            verdict is not None
+            and verdict.kind == review_history.PASS
+            and verdict.key.startswith(("minor-fixed:", "no-code-fixed:"))
+        )
+
+    async def _close_settled(self, owner: Owner, pull: str, head: str) -> None:
+        """Close the Work's review chat that waits only on ``pull`` at ``head``, which passed
+        with no new review after a late minor or no-code verdict (#4474). A chat that still
+        asks about another pull request is left open; a close that fails leaves the chat's
+        own verdict to decide, as before."""
+        if self._close_review is None or not owner[1]:
+            return
+
+        def settled(ref: str, sha: str) -> bool:
+            events = review_history.at_head(self._history(ref.lower()), sha)
+            return review_history.passed(review_history.standing_verdict(events))
+
+        reason = (
+            f"{pull} at {head[:12]} passed without a second review: the review before it asked"
+            " only for minor fixes, and the fix stayed within the limit. Nothing else in this"
+            " chat waits on a review."
+        )
+        try:
+            closed = await self._close_review(owner[1], pull, head, settled, reason)
+        except Exception:  # noqa: BLE001 - left open, its own verdict decides
+            log.warning("work-router: could not close %s's review chat", pull, exc_info=True)
+            return
+        if closed:
+            log.info("work-router: closed review chat %s of %s@%s", closed, pull, head[:12])
+
+    async def late_fixed(self, work_id: str, pull: str) -> None:
+        """Check the fix the agent pushed before a late ``minor`` or ``no-code`` verdict came
+        (#4474), as a ready press does, and close the review chat that push started once it
+        passed. A start still running for that head closes it itself, in its ``finally``."""
+        repository, _, number = pull.lower().rpartition("#")
+        if not number.isdigit():
+            return
+        owner = self._owner_of_pull(repository, int(number))
+        if owner is None or _work_id(owner) != work_id.lower():
+            return
+        head = await self._live_ready_head(repository, int(number))
+        if not head:
+            return
+        event = Event(REVIEW, repository, int(number), True, head=head)
+        if not await self._no_code_fixed(owner, event):
+            # Its checklist went out before the verdict came (#4575 review): say why apart.
+            self._say_not_small(owner, f"{repository}#{number}", head)
+            return
+        key = f"{repository}#{number}@{head}".lower()
+        if any(
+            item.lower() == key or item.lower().startswith(f"{key}+") for item in self._in_flight
+        ):
+            return
+        await self._close_settled(owner, f"{repository}#{number}", head)
 
     def _has_verdict(self, pull: str, head: str) -> bool:
         """Whether a verdict stands at ``head``, so an ask made for want of one has no reason
@@ -4399,11 +5326,13 @@ class WorkRouterService:
         """
         settled = self._checklist_settled(pull, event, again=again)
         if settled is not None:
+            self._say_not_small(owner, pull, event.head)
             return settled
         grown = await self._growth(pull, event)
         # The read let other work run, which may have sent a checklist or cleared this head.
         settled = self._checklist_settled(pull, event, again=again)
         if settled is not None:
+            self._say_not_small(owner, pull, event.head)
             return settled
         now = datetime.now(UTC)
         policy = f" The reviewer's full rules: {self._review_policy}" if self._review_policy else ""
@@ -4411,7 +5340,8 @@ class WorkRouterService:
         if self._first_round(pull):
             issue = f" --issue {owner[1]}" if owner[1] else ""
             helpers = HELPERS_TEXT.format(pull=pull, issue=issue)
-        text = PRE_REVIEW_TEXT.format(
+        not_small = self._not_small.pop(f"{pull.lower()}@{event.head.lower()}", "")
+        text = not_small.replace("{checklist}", "the checklist below") + PRE_REVIEW_TEXT.format(
             pull=pull,
             short=event.head[:12],
             policy=policy,
@@ -4462,6 +5392,27 @@ class WorkRouterService:
         )
         log.info("work-router: %s@%s waits on its pre-review", pull, event.head)
         return True
+
+    def _say_not_small(self, owner: Owner, pull: str, head: str) -> None:
+        """Send the reason ``head`` is no small fix as a message of its own (#4575 review): a
+        push a waiting checklist covers, or a late verdict's, gets no checklist of its own to
+        carry it. Nothing to say, or no chat, is a no-op; the reason is dropped either way."""
+        reason = self._not_small.pop(f"{pull.lower()}@{head.lower()}", "")
+        if not reason or not owner[0]:
+            return
+        if not review_history.checklist_waits(self._history(pull)):
+            return  # cleared, so the review is asked as any other
+        now = datetime.now(UTC)
+        text = reason.replace("{checklist}", "the pre-review checklist the deck already sent")
+        self._deliver(
+            ScheduledMessage(
+                id=f"work-event:not-small:{pull}@{head}",
+                chat_id=owner[0],
+                text=deck_notices.routine(text.strip()),
+                due_at=now,
+                created_at=now,
+            )
+        )
 
     def _checklist_settled(self, pull: str, event: Event, *, again: bool) -> bool | None:
         """Whether ``_held_for_checklist`` is answered without sending a checklist: ``False``
@@ -4653,26 +5604,32 @@ class WorkRouterService:
 
     async def design_accept(self, issue: str, comment: str, verdict: str, token: str) -> dict:
         """Whether the deck takes a design verdict before posting it (#4332,
-        ``DesignRound.accept``): ``{"stale": why}``, "" when taken; ``{"refused": why,
-        "status": n}`` when its sender is not that design's reviewer, or unread."""
+        ``DesignRound.accept``): ``{"stale": why, "verdict": recorded}``, "" when taken, with
+        the verdict the deck will record (#4463: a last-round gap is ``notes``), which the
+        post then shows; ``{"refused": why, "status": n}`` when its sender is not that design's
+        reviewer, or unread."""
         if self._design is None:
             return {"refused": "reviews are off on this deck", "status": 409}
         try:
             taken = design_review.Verdict(issue.lower(), verdict, comment)
-            return {"stale": await self._design.accept(issue, taken, token)}
+            stale = await self._design.accept(issue, taken, token)
+            return {"stale": stale, "verdict": self._design.kept(issue, taken)}
         except design_review.Refused as exc:
             return {"refused": str(exc), "status": exc.status}
 
     async def design_record(self, issue: str, comment: str, verdict: str, token: str) -> dict:
-        """Record the design verdict the deck took and posted (#4332): the gate's evidence."""
-        if self._design is None or verdict not in (design_review.PASS, design_review.GAP):
+        """Record the design verdict the deck took and posted (#4332): the gate's evidence.
+        ``verdict`` in the answer is what it recorded: a gap in the last round is ``notes``
+        (#4463)."""
+        known = (design_review.PASS, design_review.GAP, design_review.NOTES)
+        if self._design is None or verdict not in known:
             return {"recorded": False}
         try:
             taken = design_review.Verdict(issue.lower(), verdict, comment)
-            self._design.record(issue, taken, token)
+            recorded = self._design.record(issue, taken, token)
         except design_review.Refused as exc:
             return {"recorded": False, "refused": str(exc), "status": exc.status}
-        return {"recorded": True}
+        return {"recorded": True, "verdict": recorded}
 
     def _first_round(self, pull: str) -> bool:
         """Whether no review of ``owner/repo#n`` was asked for yet, at any head: the helper
@@ -4743,7 +5700,15 @@ class WorkRouterService:
         return [gap] if gap else []
 
     async def _ask_reviewer(
-        self, owner: Owner, event: Event, pull: str, key: str, digest: str, *, asked: bool
+        self,
+        owner: Owner,
+        event: Event,
+        pull: str,
+        key: str,
+        digest: str,
+        *,
+        asked: bool,
+        settle: bool = False,
     ) -> None:
         pending_key = f"review:{key}"
         _chat, work = owner
@@ -4778,6 +5743,10 @@ class WorkRouterService:
         except Exception:  # noqa: BLE001 - one review that could not start must not stop routing
             # It may have written and pressed: spent, as an uncertain start always is.
             self.pending.discard(pending_key)
+            if settle and self._fix_pass(pull, event.head):
+                # A late minor verdict passed this head meanwhile (#4474): an ``asked`` row
+                # newer than that pass would void it. ``_review`` closes any chat opened.
+                return
             self._note_asked(pull, event, digest, uncertain=True)
             log.warning("work-router: review of %s could not start", key, exc_info=True)
         else:
@@ -4789,6 +5758,10 @@ class WorkRouterService:
                 log.info("work-router: %s left an older chat open; kept pending", key)
                 return
             self.pending.discard(pending_key)
+            if settle and self._fix_pass(pull, event.head):
+                # As above (#4474): no ``asked`` row over the pass; ``_review`` closes the chat.
+                log.info("work-router: %s passed while its review started", key)
+                return
             self._note_asked(pull, event, digest)
             log.info("work-router: review of %s asked for (Work %s)", key, work)
 
@@ -4839,6 +5812,61 @@ class ShipPorts:
     #: ``(repository, n, new)``: register pull request ``new`` with every chat that registered
     #: ``n``, for the same Work; whether it is.
     register: Callable[[str, int, int], Awaitable[bool]] | None = None
+    #: The heads the Work of issue ``owner/repo#n`` shipped (``shipped_heads``, marked shipped
+    #: only), read before GitHub so a repeat press answers ``recorded`` (#4558).
+    shipped_by_work: Callable[[str], list[review_history.ShippedHead]] | None = None
+    #: ``(repository, n, head)``: whether ``head`` lacks commits of ``n``'s base branch
+    #: (``behind_base``), so the answer warns a conflict may come (#4576).
+    behind: Callable[[str, int, str], Awaitable[bool]] | None = None
+
+
+#: How long a ship-now call waits for its press before answering ``running`` (#4558): below
+#: the web's wait for a merge-service call (``services_link.CALL_TIMEOUT_S``, 60 s).
+SHIP_WAIT_S = 40.0
+#: A ship-now answer's ``state``: the head is marked shipped (not yet merged) ...
+SHIP_RECORDED = "recorded"
+#: ... or its press is still running, and the Work's chat hears how it ends.
+SHIP_RUNNING = "running"
+
+
+class ShipRuns:
+    """The Ship now presses running in this process (#4558), shared by the router, which runs
+    them, and the release, whose hold line says a press is under way rather than unfinished.
+
+    ``tasks`` is each press by the ``pull@head`` its caller sent; ``resolved`` the
+    ``pull@head`` that press settled on (a split's new pull request, or the head an earlier
+    press passed); ``left`` the keys whose caller got ``running``, so the chat hears the end.
+    """
+
+    def __init__(self) -> None:
+        self.tasks: dict[str, asyncio.Future] = {}
+        self.resolved: dict[str, str] = {}
+        self.left: set[str] = set()
+
+    def running(self, pull: str, head: str) -> bool:
+        """Whether a press of ``pull`` at ``head`` is running now."""
+        key = f"{pull.lower()}@{head.lower()}"
+        return key in self.tasks or key in self.resolved.values()
+
+    def head_of(self, pull: str) -> str:
+        """The head a press of ``pull`` runs at, as its caller sent it or as it resolved
+        (a split's new pull request, a carried pass), or "" when none runs."""
+        wanted = pull.lower()
+        for key in (*self.tasks, *self.resolved.values()):
+            name, _, head = key.rpartition("@")
+            if name == wanted and head:
+                return head
+        return ""
+
+
+def _recorded(pull: str, head: str) -> dict:
+    """The answer for a head an earlier press already marked shipped (#4558)."""
+    return {
+        "pull_request": pull,
+        "head": head,
+        "state": SHIP_RECORDED,
+        "outcome": f"{pull} at {head[:12]} was already shipped: its findings are left to this Work",
+    }
 
 
 def _ship_message(pull: str, head: str, issue: str, source: str) -> str:
@@ -4851,8 +5879,10 @@ def _ship_message(pull: str, head: str, issue: str, source: str) -> str:
             f" are green, with no new review. Push nothing to {pull}. {source} is now a draft"
             f" holding your fix: keep it a draft until {pull} merges, then merge its base into it"
             f" and mark it ready, and it is reviewed as usual. The findings stay with this Work"
-            f" ({issue}): fix any your fix does not cover in {source}. The live check is asked"
+            f" ({issue}): fix any your fix does not cover in {source}. {SIBLING_SWEEP_ASK}"
+            f" The live check is asked"
             f" for once {source} merges too, and the issue stays open until then."
+            + SHIP_CONFLICT_HOW
         )
     return (
         f"AgentDeck: the owner chose Ship now on {pull} at {head[:12]}:"
@@ -4863,8 +5893,23 @@ def _ship_message(pull: str, head: str, issue: str, source: str) -> str:
         " check is recorded, keep the issue open and fix them in a new pull request"
         " for this same issue. Register that pull request with"
         f' `"fixes": "{pull}"` (POST …/pull-requests), so the deck knows it is the fix'
-        " and keeps the issue open until it merges."
+        " and keeps the issue open until it merges." + SHIP_CONFLICT_HOW
     )
+
+
+#: What a shipped head behind its base is told (#4576): a conflict may hold its merge.
+SHIP_BEHIND_TEXT = (
+    "{pull} at {head} is behind its base branch, so it may conflict before it merges. If it"
+    " does, merge the base in with a merge commit and push nothing else: its Ship now pass"
+    " carries over while its code changes stay the same, and any other change is reviewed"
+    " again"
+)
+#: Said in every ship message: the one push a shipped head may take (#4576).
+SHIP_CONFLICT_HOW = (
+    " The one push it may take: should it conflict with its base, merge the base in with a"
+    " merge commit and push only that, keeping its code changes as they are; the Ship now"
+    " pass carries over to it."
+)
 
 
 #: The owner's note kept on a pass that ships with its findings left to the Work (#4212).
@@ -5148,6 +6193,12 @@ def design_queue(path: Path, issue: str) -> dict | None:
         return datetime.fromtimestamp(float(seconds or 0), UTC).isoformat()
 
     return {"since": at(mine.get("since")), "next_try": at(mine.get("next_at"))}
+
+
+def handed_over_path(streams_root: Path | str) -> Path:
+    """The Works handed to another deck (``KeyFile``, #3731), beside the webhook log root:
+    the router writes it, and the web reads it for the Works' status (#4450)."""
+    return Path(streams_root).expanduser().parent / HANDED_OVER_FILENAME
 
 
 def pending_path(streams_root: Path | str) -> Path:

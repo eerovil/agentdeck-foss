@@ -605,6 +605,13 @@ def _event_from_line(seq: int, data: dict) -> TranscriptEvent | None:
         failed=data.get("isApiErrorMessage") is True,
         image_media_types=image_media_types,
         text_parts=_text_parts(content) if role == "user" else (),
+        message_id=(
+            message_id
+            if role == "assistant"
+            and isinstance(message, dict)
+            and isinstance(message_id := message.get("id"), str)
+            else None
+        ),
     )
 
 

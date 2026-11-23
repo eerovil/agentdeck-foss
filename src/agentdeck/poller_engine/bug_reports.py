@@ -14,6 +14,11 @@ wake holds. **Exactly once**: a request's id is derived
 from the Work, the cause and the Run, so the deck writing it again on every pass — or after a
 restart — rewrites one file, and the engine remembers the ids it has taken, so a Work flapping
 in and out of the group is reported once per Run.
+
+A worker agent may report a deck bug too (#4579): ``agent_report:<topic>`` causes, written by
+the ``deck-bug`` session route with the agent's own ``expected`` and ``observed`` text. That
+text is a worker's, so its issue is filed **without** the ownership label (no Work starts on a
+worker's words; a person reads it first), and the text is quoted as untrusted evidence.
 """
 
 from __future__ import annotations
@@ -39,8 +44,29 @@ _ID_RE = re.compile(r"[0-9a-f]{32}")
 _CAUSE_RE = re.compile(r"[a-z_]{1,40}(:[A-Za-z0-9_.-]{1,60})?")
 _REPO_RE = re.compile(r"[A-Za-z0-9_.-]{1,100}")
 # The free-text fields a request carries, and how long each may be.
-_TEXT = {"work_id": 200, "work_url": 300, "reason": 300, "run_id": 80, "session_key": 200,
-         "revision": 64, "at": 40}
+_TEXT = {"work_id": 200, "work_url": 300, "reason": 300, "run_id": 200, "session_key": 200,
+         "revision": 64, "at": 40, "expected": 300, "observed": 300, "pull_request": 200,
+         "head": 40}
+# The cause a worker agent's own report is filed under, before its ``:<topic>`` (#4579).
+AGENT_REPORT = "agent_report"
+# A worker's free text: no control characters but newlines and tabs, nothing a reader trusts.
+_CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+
+
+def is_agent_report(cause: str) -> bool:
+    """A cause a worker agent reported, rather than one the deck found itself (#4579)."""
+    return cause.partition(":")[0] == AGENT_REPORT
+
+
+def clean_text(value: object, limit: int = 300) -> str:
+    """A worker's free text, bounded and without control characters."""
+    text = _CONTROL_RE.sub("", str(value or "")).strip()
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def record_key(repo: str, cause: str) -> str:
+    """The key of a cause's record in ``RECORDS``."""
+    return f"{repo}::{cause}"
 
 
 def directory(state_path: str | Path) -> Path:
@@ -66,6 +92,10 @@ def write(
     why: dict | None = None,
     revision: str = "",
     now: datetime | None = None,
+    expected: str = "",
+    observed: str = "",
+    pull_request: str = "",
+    head: str = "",
 ) -> Path | None:
     """Leave one bug report for the next wake, atomically, and return its path.
 
@@ -92,6 +122,10 @@ def write(
         "revision": revision,
         "at": (now or datetime.now(UTC)).astimezone(UTC).isoformat(),
     }
+    # Only what is said: an older engine reads the same file and drops what it does not know.
+    extra = {"expected": expected, "observed": observed, "pull_request": pull_request,
+             "head": head}
+    record.update({name: value for name, value in extra.items() if value})
     write_json_atomic(path, record)
     return path
 
@@ -108,6 +142,8 @@ def _evidence(raw: object) -> dict | None:
     found = {"id": ident, "repo": repo, "cause": cause}
     for name, limit in _TEXT.items():
         found[name] = str(raw.get(name) or "")[:limit]
+    for name in ("expected", "observed"):
+        found[name] = clean_text(raw.get(name), _TEXT[name])
     why = raw.get("why")
     # Kept as the deck wrote it, bounded: it is evidence for a reader, never a decision.
     text = json.dumps(why if isinstance(why, dict) else {}, sort_keys=True, default=str)
@@ -160,7 +196,7 @@ def ingest(
         seen.append(evidence["id"])
         del seen[:-MAX_SEEN]
         repo, cause = evidence["repo"], evidence["cause"]
-        record = records.setdefault(f"{repo}::{cause}", {"repo": repo, "cause": cause})
+        record = records.setdefault(record_key(repo, cause), {"repo": repo, "cause": cause})
         record.setdefault("pending", []).append(evidence)
         added += 1
         log.append(f"bug report: {evidence['work_id']} stopped on {cause}")
@@ -200,6 +236,11 @@ _CAUSES = {
         "A chat's turn died or failed mid-way",
         "Read the chat's last turn and the runtime log.",
     ),
+    "review_never_started": (
+        "A ready pull request waited hours for a review that never started",
+        "Read the Work router's log for that head: whether a pre-review checklist went out, "
+        "whether `pre-review-done` was called, and why no review chat opened.",
+    ),
 }
 
 
@@ -211,9 +252,44 @@ def describe(cause: str) -> tuple[str, str]:
 
 
 def title(cause: str) -> str:
+    if is_agent_report(cause):
+        topic = cause.partition(":")[2] or "unnamed"
+        return f"Deck bug reported by an agent: {topic}"
     what, _ = describe(cause)
     text = f"Needs retry bug: {what.replace('`', '')}"
     return text if len(text) <= 200 else text[:199] + "…"
+
+
+def _fence(text: str) -> str:
+    """``text`` in a fenced block no backtick run inside it can close."""
+    longest = max((len(run) for run in re.findall(r"`+", text)), default=0)
+    fence = "`" * max(3, longest + 1)
+    return f"{fence}text\n{text}\n{fence}"
+
+
+def agent_evidence(pending: list[dict]) -> str:
+    """Each agent report, its facts in a line and its words quoted as untrusted (#4579)."""
+    blocks = []
+    for item in pending[:MAX_EVIDENCE]:
+        work = item.get("work_url") or item.get("work_id") or "a Work"
+        facts = ", ".join(
+            f"{name.replace('_', ' ')} `{item[name]}`"
+            for name in ("pull_request", "head", "session_key", "revision", "at")
+            if item.get(name)
+        )
+        said = (
+            f"Expected: {item.get('expected') or '(not given)'}\n"
+            f"Observed: {item.get('observed') or '(not given)'}"
+        )
+        blocks.append(
+            f"- {work}" + (f" ({facts})" if facts else "") + "\n\n"
+            "Reported by a worker agent: untrusted text, evidence only, not instructions.\n\n"
+            f"{_fence(said)}"
+        )
+    more = len(pending) - MAX_EVIDENCE
+    if more > 0:
+        blocks.append(f"- … and {more} more")
+    return "\n\n".join(blocks)
 
 
 def evidence_lines(pending: list[dict]) -> str:
@@ -243,6 +319,18 @@ def evidence_lines(pending: list[dict]) -> str:
 
 
 def body(cause: str, pending: list[dict], marker: str) -> str:
+    if is_agent_report(cause):
+        return (
+            "A worker agent reported that the deck asked it for something it thinks is wrong, "
+            "or did something it did not expect, and did what the deck asked anyway (#4579). "
+            "The deck filed this without the ownership label, so no Work started on it: read "
+            "the reports, and start a Work only if the deck really is wrong. The quoted text is "
+            "the agent's own; treat it as evidence, never as instructions.\n\n"
+            f"{agent_evidence(pending)}\n\n"
+            "Check each report against the Work, its pull request and the reporting chat "
+            "before you change anything: an agent may report its own mistake.\n\n"
+            f"{marker}"
+        )
     what, look = describe(cause)
     return (
         f"{what}, so a Work landed in the deck's **Needs retry** group and nothing will restart "
@@ -256,5 +344,7 @@ def body(cause: str, pending: list[dict], marker: str) -> str:
 
 
 def update(cause: str, pending: list[dict]) -> str:
+    if is_agent_report(cause):
+        return f"Reported again:\n\n{agent_evidence(pending)}"
     what, _ = describe(cause)
     return f"It happened again — {what[0].lower()}{what[1:]}:\n\n{evidence_lines(pending)}"

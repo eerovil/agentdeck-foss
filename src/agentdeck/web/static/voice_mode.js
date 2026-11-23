@@ -42,7 +42,7 @@
 //   to open its reply with a paragraph starting "🔊". When the turn ends, only that
 //   paragraph is read. A reply without one is read as its first prose paragraph,
 //   cleaned of URLs and paths and cut short, then "More on screen."
-// - Before long work the same line asks for a short note starting "🔊" first. A
+// - Before its first tool call the same line asks for a short note starting "🔊" (#4544). A
 //   reply that opens with one while the agent still works is read at once, once
 //   per turn: any later one waits for the turn's end like any reply (#3407).
 //   It does not open a microphone that already gave up listening: that opens on
@@ -89,14 +89,9 @@
 //   works brings one more such line, or "Still working on it." when it sees
 //   nothing new. A question box being read counts as the chat speaking. The voice
 //   log is told which of its lines were really said.
-// - Between those lines a soft, low tick plays every 5 s while the agent works
-//   (#4364), so the quiet never sounds like nothing is happening. It waits while
-//   anything is said or heard and on a question box, and stops when the turn ends.
-//   While it ticks, the microphone's level leaves out the tick's own pitch, so the
-//   tick is never heard as words or a wake word, and words said over it ("stop")
-//   are heard whole. The wait counts from when the speech or the beep really ended. `[speech] working_tick_seconds` sets how
-//   often; 0 is off. Voice mode's beeps are louder since then too (the owner's
-//   ask on #4364).
+// - Voice mode's beeps are loud enough to hear across a kitchen (the owner's ask
+//   on #4364). The soft tick it played every 5 s while the agent worked was taken
+//   out again on the owner's word (#4513).
 // - Sooner after the person stops talking (#3765): a phrase goes to the host after
 //   0.3 s of quiet, while the 0.8 s pause that ends it runs, and that result is
 //   dropped if sound comes back first. Soft words, such as a sentence's quieter
@@ -193,7 +188,9 @@
   // Listening with no words heard for this long rests (#3424); the page's
   // `data-voice-idle-seconds` (`[speech] idle_listen_seconds`) overrides it.
   var IDLE_LISTEN_MS = 15000;
-  // The final reply can land a moment after the status leaves "thinking".
+  // The final reply can land a moment after the status leaves "thinking": a turn
+  // ended with no reply of its own on the page yet waits this long for it. One whose
+  // reply is already there is read at once (#4543).
   var REPLY_SETTLE_MS = 1200;
   var REPLY_WAIT_MAX_MS = 4000;
   var SPOKEN_MAX_CHARS = 600;
@@ -520,14 +517,7 @@
   // How loud voice mode's beeps peak: 0.15 was too quiet to hear across a kitchen,
   // so the owner asked for louder ones everywhere (#4364).
   var BEEP_GAIN = 0.6;
-  // The soft tick while the agent works (#4364): a short, low sine at a tenth of a
-  // beep's loudness, every `data-voice-tick-seconds` (`[speech]
-  // working_tick_seconds`, 5 by default; none or 0 is no tick) with nothing else
-  // heard meanwhile.
-  var PULSE_FREQ = 520;
-  var PULSE_GAIN = 0.06;
-
-  function tone(freq, peak) {
+  function tone(freq) {
     var v = voice;
     var ctx = v && v.audio;
     if (!ctx) return;
@@ -536,83 +526,12 @@
       var gain = ctx.createGain();
       osc.frequency.value = freq;
       gain.gain.setValueAtTime(0.0001, ctx.currentTime);
-      gain.gain.exponentialRampToValueAtTime(peak || BEEP_GAIN, ctx.currentTime + 0.02);
+      gain.gain.exponentialRampToValueAtTime(BEEP_GAIN, ctx.currentTime + 0.02);
       gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.18);
       osc.connect(gain).connect(ctx.destination);
       osc.start();
       osc.stop(ctx.currentTime + 0.2);
-      v.soundAt = Date.now();
     } catch (e) { /* no audio here */ }
-  }
-
-  // The microphone's level without the tick's own pitch (#4364). The phone's
-  // speaker plays the tick into its own microphone, which has no echo cancelling,
-  // and it would start a phrase or be taken for a wake word. Taking the time it
-  // played as deaf also dropped a short "stop" said then (#4367 review), so instead
-  // what is measured is the sound with a band around PULSE_FREQ taken out: the
-  // tick, a pure sine, leaves nearly nothing, and words keep the rest of their
-  // sound, before, under and after it. It is the capture's rumble filter (#4249)
-  // followed by a notch, kept per microphone so each chunk carries on its sound.
-  var TICK_NOTCH_Q = 2;
-  var RUMBLE_HZ = 150;  // composer_speech.js's own
-  function Biquad(b0, b1, b2, a0, a1, a2) {
-    this.b0 = b0 / a0; this.b1 = b1 / a0; this.b2 = b2 / a0;
-    this.a1 = a1 / a0; this.a2 = a2 / a0;
-    this.x1 = this.x2 = this.y1 = this.y2 = 0;
-  }
-  Biquad.prototype.step = function (x) {
-    var y = this.b0 * x + this.b1 * this.x1 + this.b2 * this.x2 - this.a1 * this.y1 - this.a2 * this.y2;
-    this.x2 = this.x1; this.x1 = x; this.y2 = this.y1; this.y1 = y;
-    return y;
-  };
-  function TickNotch(rate) {
-    var w = 2 * Math.PI * RUMBLE_HZ / rate;
-    var alpha = Math.sin(w) / Math.SQRT2;
-    var cos = Math.cos(w);
-    this.high = new Biquad((1 + cos) / 2, -(1 + cos), (1 + cos) / 2, 1 + alpha, -2 * cos, 1 - alpha);
-    w = 2 * Math.PI * PULSE_FREQ / rate;
-    alpha = Math.sin(w) / (2 * TICK_NOTCH_Q);
-    cos = Math.cos(w);
-    this.notch = new Biquad(1, -2 * cos, 1, 1 + alpha, -2 * cos, 1 - alpha);
-  }
-  TickNotch.prototype.level = function (samples) {
-    var sum = 0;
-    for (var i = 0; i < samples.length; i++) {
-      var y = this.notch.step(this.high.step(samples[i]));
-      sum += y * y;
-    }
-    return Math.sqrt(sum / samples.length);
-  };
-
-  // While the agent works, a soft tick every few seconds says it is still going
-  // (#4364): the spoken notes come only every 30 s. It waits while anything is
-  // read or said, while words are being heard or sent, and on a question box, and
-  // ends with the turn, so the reply is never ticked over. With 🎧 off nothing
-  // plays, as nothing is said.
-  function tickEvery(v) {
-    var control = v.form.querySelector('.voice-control');
-    return (Number(control && control.getAttribute('data-voice-tick-seconds')) * 1000) || 0;
-  }
-
-  // It looks every TICK_LOOK_MS, so the quiet it waits for is counted from when the
-  // reading, the words heard or the beep really ended, not from its last look.
-  var TICK_LOOK_MS = 250;
-
-  function watchWork(v) {
-    var every = tickEvery(v);
-    if (v.pulseTimer || !every) return;
-    var quietFrom = Date.now();
-    v.pulseTimer = setTimeout(function tick() {
-      v.pulseTimer = null;
-      every = tickEvery(v);
-      if (current() !== v || !working() || !every) return;
-      var busy = v.speaking || v.noting || v.mode === 'speaking' || v.relaying ||
-        v.hearing || heard(v) || v.question || questionForm();
-      if (busy || !v.reads) quietFrom = Date.now();
-      var last = Math.max(quietFrom, v.soundAt || 0, v.voicedAt || 0, v.wordsAt || 0);
-      if (!busy && v.reads && Date.now() - last >= every) tone(PULSE_FREQ, PULSE_GAIN);
-      v.pulseTimer = setTimeout(tick, TICK_LOOK_MS);
-    }, TICK_LOOK_MS);
   }
 
   // ---- what to speak ------------------------------------------------------
@@ -752,8 +671,8 @@
     return speakable(first.text.slice(MARK.length));
   }
 
-  // The "🔊" paragraph if the agent wrote one; else the first prose paragraph.
-  function spokenPart(textEl) {
+  // The words of the message's "🔊" paragraph, or null when it has none.
+  function markedPart(textEl) {
     var parts = blocks(textEl);
     for (var i = 0; i < parts.length; i++) {
       // Only a prose paragraph: a 🔊 inside a code block is still code.
@@ -761,6 +680,14 @@
         return speakable(parts[i].text.slice(MARK.length));
       }
     }
+    return null;
+  }
+
+  // The "🔊" paragraph if the agent wrote one; else the first prose paragraph.
+  function spokenPart(textEl) {
+    var marked = markedPart(textEl);
+    if (marked !== null) return marked;
+    var parts = blocks(textEl);
     for (var j = 0; j < parts.length; j++) {
       if (!parts[j].prose) continue;
       var text = speakable(parts[j].text);
@@ -791,8 +718,9 @@
     return wakeName(SAID[(v && v.always) || 'en'][key]);
   }
 
-  // `lang` is 'en' or 'fi'; unset, the owner's own language.
-  function speak(text, then, lang) {
+  // `lang` is 'en' or 'fi'; unset, the owner's own language. `open`: more sentences
+  // follow as the agent writes them (`moreDraft`). Returns the reading's token.
+  function speak(text, then, lang, open) {
     var v = current();
     if (!v) return;
     // The phrases this reading is the answer of (`replyRead`), and only this one's.
@@ -811,11 +739,12 @@
     silence(v);
     v.noting = false;
     v.voicedAt = Date.now();
-    var token = { clocks: clocks };
+    var token = { clocks: clocks, open: !!open };
     v.speaking = token;
     setMode('speaking');
     showStatus('Speaking…');
     hostSpeak(v, text, lang || v.always || 'en', token, then);
+    return token;
   }
 
   function spoke(token, then) {
@@ -832,8 +761,9 @@
   // likely the service restarting after a crash, so the same request is sent again
   // a few times, saying so, before the caller is told it failed (#3424). `back`
   // puts the status back once a retried request gets through.
-  function hostRequest(v, url, init, live, back) {
+  function hostRequest(v, url, init, live, back, retries) {
     var tries = 0;
+    var most = retries === undefined ? HOST_RETRY_MS.length : retries;
     function attempt() {
       var stop = window.AbortController ? new AbortController() : null;
       var timer = stop && setTimeout(function () { stop.abort(); }, HOST_ANSWER_MS);
@@ -850,7 +780,7 @@
         return response;
       }).catch(function (error) {
         clearTimeout(timer);
-        if (error.final || tries >= HOST_RETRY_MS.length || !live()) throw error;
+        if (error.final || tries >= most || !live()) throw error;
         var wait = HOST_RETRY_MS[tries++];
         var unanswered = stop && stop.signal.aborted;
         if (voice === v) {
@@ -893,10 +823,13 @@
   // lets it play later without a tap of its own. It is asked for one sentence at a
   // time (#3480): the first plays as soon as it is ready, and the rest are made in
   // turn while it plays, so the wait before speech does not grow with the text.
+  // An open reading (`token.open`, #4543) takes more sentences while it plays
+  // (`played.more`), and at the end of what it has waits for them until closed.
   function hostSpeak(v, text, lang, token, then) {
     var parts = sentences(text);
     var played = { text: text, parts: parts.length ? parts : [text], buffers: [], index: 0,
-      token: token, then: then };
+      token: token, then: then, open: !!token.open, requested: 0, fetching: false };
+    token.played = played;
     v.lastReading = { text: text, at: Date.now() };
     // Hidden, the watch below pauses it if the audio never starts or stops moving.
     progressed(v, played.parts[0].length);
@@ -906,6 +839,8 @@
       if (live()) off(UNREACHABLE);
     }
     function fetchPart(i) {
+      played.requested = i + 1;
+      played.fetching = true;
       hostRequest(v, '/api/speech/say', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ text: played.parts[i], language: lang })
@@ -918,6 +853,7 @@
         v.audio.decodeAudioData(data, function (buffer) {
           if (!live()) return;
           played.buffers[i] = buffer;
+          played.fetching = false;
           if (i + 1 < played.parts.length) fetchPart(i + 1);
           if (!i) {
             play(v, played, 0);
@@ -930,7 +866,32 @@
         }, failed);
       }).catch(failed);
     }
+    played.more = function (more, close) {
+      if (!live()) return;
+      if (more.length) {
+        played.parts = played.parts.concat(more);
+        played.text += ' ' + more.join(' ');
+        v.lastReading = { text: played.text, at: Date.now() };
+        if (!played.fetching && played.requested < played.parts.length) {
+          fetchPart(played.requested);
+        }
+      }
+      if (close) played.open = false;
+      // It had read all it had: what came next plays when made, or the reading ends.
+      if (close && played.waiting && played.index >= played.parts.length) {
+        finishPlayed(v, played);
+      }
+    };
     fetchPart(0);
+  }
+
+  // The last sentence of a reading ended.
+  function finishPlayed(v, played) {
+    var overheard = v.overheard;
+    v.played = null;
+    v.overheard = null;
+    if (overheard) overheard.abort();
+    spoke(played.token, played.then);
   }
 
   // Plays the current sentence of the host's voice from `offset` seconds in,
@@ -954,11 +915,15 @@
         }
         return;
       }
-      var overheard = v.overheard;
-      v.played = null;
-      v.overheard = null;
-      if (overheard) overheard.abort();
-      spoke(played.token, played.then);
+      if (played.open) {
+        // The agent has not written the next sentence yet: it plays once it is made.
+        played.index++;
+        v.source = null;
+        played.waiting = true;
+        progressed(v, 0);
+        return;
+      }
+      finishPlayed(v, played);
     };
     played.from = v.audio.currentTime - offset;
     v.played = played;
@@ -1100,7 +1065,7 @@
         v.interruptedDoubts = doubts;
         // Timed as any phrase heard (#4360), the speech model's part with it.
         v.interruptedClock = { end: rec.endedAt || Date.now(), words: Date.now(),
-          stt: event.results[0].stt };
+          stt: event.results[0].stt, early: event.results[0].early };
       }
       var reading = v.reading;
       spoke(played.token, played.then);
@@ -1188,6 +1153,8 @@
       // Paused while what was said over it is transcribed (#3426): our own silence.
       // A stalled microphone or a failed host ends that listener, which plays on.
       if (!v.source && v.played && v.played.held && v.overheard) progressed(v, 0);
+      // Waiting for the agent to write its next sentence (#4543): `draftStalled` ends it.
+      if (!v.source && v.played && v.played.open && v.played.waiting) progressed(v, 0);
       if (document.hidden && Date.now() - v.progressAt > v.stallMs) background(v, 'speak');
       else watchSpeech(v);
     }, 1000);
@@ -1243,6 +1210,138 @@
   // Which microphone heard a phrase, as its WAV carries it (#4249).
   var micQuery = shared.micQuery;
 
+  // ---- the waiting microphone, streamed (#4539) ----------------------------
+
+  // While it waits for the name, where the detector decides, each phrase also goes
+  // to the deck as it is heard (`/api/speech/wake-stream`), so the beep comes on
+  // the 80 ms frame the name ends in rather than after the 0.8 s pause. Only what the
+  // level gate hears goes, with its 4 chunks before, as for a clip. The deck answers
+  // each phrase once with `done` (and "Hey Jarvis" with an early `woken`); a phrase
+  // with no `done` 2 s after its end, or whose socket closed first, goes as a clip
+  // as before, under the same id. One socket per page load (`PAGE_ID`), open while
+  // the microphone is; a new one from the same page replaces the old at the deck.
+  var PAGE_ID = Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10);
+  var STREAM_PING_MS = 10000;
+  var STREAM_RETRY_MS = [1000, 2000, 5000, 30000];
+  // After the deck said the detector cannot stream (every stream taken, none set up).
+  var STREAM_REFUSED_MS = 30000;
+  // How long an ended phrase waits for its `done` before it goes as a clip, unless
+  // the deck said it is confirming the name with speech recognition.
+  var STREAM_DONE_MS = 2000;
+  // Two seconds of audio the socket has not sent yet: the network is stuck, and the
+  // phrase goes as a clip.
+  var STREAM_BUFFERED_MAX = 64000;
+  // How long the stream's early beep stands for the listen after it: the longest
+  // phrase (28 s) and its transcription.
+  var BEEP_FRESH_MS = 40000;
+
+  function WakeStream(v) {
+    this.v = v;
+    this.ready = false;
+    this.closed = false;
+    this.tries = 0;
+    this.handlers = {};
+    this.connect();
+  }
+
+  WakeStream.prototype.connect = function () {
+    var self = this;
+    if (self.closed || !window.WebSocket) return;
+    var url = (location.protocol === 'https:' ? 'wss:' : 'ws:') + '//' + location.host +
+      '/api/speech/wake-stream?page=' + PAGE_ID + wakeQuery() + langQuery(self.v);
+    var ws;
+    try { ws = new WebSocket(url); } catch (e) { self.retry(0); return; }
+    ws.binaryType = 'arraybuffer';
+    self.ws = ws;
+    var refused = 0;
+    ws.onopen = function () {
+      if (self.ws !== ws) return;
+      self.ready = true;
+      self.ping = setInterval(function () { self.text({ ping: 1 }); }, STREAM_PING_MS);
+    };
+    ws.onmessage = function (event) {
+      if (self.ws !== ws) return;
+      var msg;
+      try { msg = JSON.parse(event.data); } catch (e) { return; }
+      if (msg.fallback) {
+        // Behind or restarted tries again soon; refused waits.
+        refused = /busy|no detector|refused/.test(msg.fallback) ? STREAM_REFUSED_MS : 0;
+        return;
+      }
+      // The deck accepts before it reaches the detector: only an answer proves the
+      // stream, so a detector down for long backs off to 30 s.
+      self.tries = 0;
+      var id = msg.done || msg.woken || msg.confirming;
+      var handler = id && self.handlers[id];
+      if (!handler) return;
+      if (msg.done) { delete self.handlers[id]; handler.done(msg); }
+      else if (msg.woken) handler.woken(msg);
+      else handler.confirming();
+    };
+    ws.onclose = function () {
+      if (self.ws !== ws) return;
+      self.drop();
+      self.retry(refused);
+    };
+  };
+
+  // Every phrase still waiting for its answer goes as a clip.
+  WakeStream.prototype.drop = function () {
+    this.ready = false;
+    this.ws = null;
+    clearInterval(this.ping);
+    var lost = this.handlers;
+    this.handlers = {};
+    Object.keys(lost).forEach(function (id) { lost[id].lost(); });
+  };
+
+  WakeStream.prototype.retry = function (wait) {
+    var self = this;
+    if (self.closed) return;
+    wait = wait || STREAM_RETRY_MS[Math.min(self.tries++, STREAM_RETRY_MS.length - 1)];
+    clearTimeout(self.timer);
+    self.timer = setTimeout(function () { self.connect(); }, wait);
+  };
+
+  WakeStream.prototype.close = function () {
+    this.closed = true;
+    clearTimeout(this.timer);
+    var ws = this.ws;
+    this.drop();
+    if (ws) try { ws.close(); } catch (e) { /* closed */ }
+  };
+
+  WakeStream.prototype.open = function () {
+    return this.ready && !!this.ws && this.ws.readyState === 1 &&
+      this.ws.bufferedAmount < STREAM_BUFFERED_MAX;
+  };
+
+  WakeStream.prototype.text = function (body) {
+    if (!this.open()) return false;
+    try { this.ws.send(JSON.stringify(body)); } catch (e) { return false; }
+    return true;
+  };
+
+  // A phrase starts: its id, the microphone, and who hears its answer.
+  WakeStream.prototype.begin = function (id, mic, handler) {
+    var body = { phrase: id, mic: mic || '' };
+    if (this.v.heardLang) body.language = this.v.heardLang;
+    if (!this.text(body)) return false;
+    this.handlers[id] = handler;
+    return true;
+  };
+
+  // One chunk as 16 kHz 16-bit mono, what the detector scores; false when not sent.
+  WakeStream.prototype.audio = function (samples, rate) {
+    if (!this.open()) return false;
+    try { this.ws.send(wav([samples], rate).slice(44)); } catch (e) { return false; }
+    return true;
+  };
+
+  WakeStream.prototype.end = function (id) {
+    return this.text({ end: id });
+  };
+
   // One phrase, with a speech recognizer's shape (start, abort, onresult, onerror,
   // onend, plus onspeechstart), which `run` drives. It
   // ends after one transcribed phrase, or after 8 s with no speech. `onsound`
@@ -1270,6 +1369,7 @@
     }
     var cap = v.capture;
     var chunkMs = 4096 * 1000 / cap.rate;
+    if (this.streams() && !v.stream) v.stream = new WakeStream(v);
     var before = [];
     var phrase = [];
     var quiet = 0;
@@ -1283,10 +1383,7 @@
       if (self.hushed()) { phrase = []; before = []; waited = 0; self.early = null; return; }
       if (self.onchunk) self.onchunk(samples, cap.rate);
       self.fedAt = Date.now();
-      // While the tick plays, its own pitch is left out of every chunk (#4364).
-      var heard = v.pulseTimer
-        ? (cap.tickNotch || (cap.tickNotch = new TickNotch(cap.rate))).level(samples)
-        : level(samples);
+      var heard = level(samples);
       var loud = gate.loud(heard, phrase.length > 0);
       if (!phrase.length) {
         before.push(samples);
@@ -1297,6 +1394,7 @@
         if (loud) {
           phrase = before.slice();
           before = [];
+          self.streamStart(phrase, cap.rate);
           sound = chunkMs;
           self.heardSound = true;
           if (self.onspeechstart) self.onspeechstart();
@@ -1308,18 +1406,19 @@
         return;
       }
       phrase.push(samples);
+      self.streamChunk(samples, cap.rate);
       // Soft words, such as the end of a sentence said more quietly (#4026), are
       // under half the speaker's level yet no pause: they keep the phrase going, but
       // only for HOST_SOFT_MS after the last full-level chunk, so music or traffic
       // after the words cannot hold it open to its cap. Steady noise is a pause at
-      // once (`flat`). Soft sound past that still is not quiet the early words may
-      // stand for: the whole phrase is heard at its end (`late`).
+      // once (`flat`). Soft sound past that may still hold words the early pass did
+      // not hear (`late`): at the phrase's end the speech service checks (#4540).
       var soft = !loud && gate.sound(heard) && !gate.flat();
       softFor = loud ? 0 : softFor + chunkMs;
       var goesOn = loud || (soft && softFor <= HOST_SOFT_MS);
       quiet = goesOn ? 0 : quiet + chunkMs;
       // Sound came back inside the pause: the early words are not the phrase's.
-      if (goesOn) self.early = null;
+      if (goesOn && self.early) self.early = null;
       if (loud) self.late = false;
       else if (soft && !goesOn) self.late = true;
       if (loud) {
@@ -1329,12 +1428,14 @@
       if (quiet >= HOST_PAUSE_MS || phrase.length * chunkMs >= HOST_PHRASE_MAX_MS) {
         if (quiet >= HOST_PAUSE_MS) gate.paused();
         self.endedAt = Date.now() - quiet;
+        self.capped = quiet < HOST_PAUSE_MS;
         self.finish(phrase);
         return;
       }
-      // Recognized early in the pause (#3765); only quiet joins the phrase after it.
-      if (quiet >= HOST_EARLY_MS && !self.early && !self.late && self.recognizesEarly()) {
-        self.early = self.request(wav(phrase, cap.rate));
+      // Recognized early in the pause (#3765), soft sound or not (#4540); only quiet
+      // and soft sound join the phrase after it.
+      if (quiet >= HOST_EARLY_MS && !self.early && self.recognizesEarly()) {
+        self.early = self.earlyPass(phrase, cap.rate);
       }
     }
     cap.sink = feed;
@@ -1377,17 +1478,32 @@
     var v = this.v;
     // A waiting phrase is now checked for the wake word, until this listener ends.
     if (v.mode === 'waiting') checking(this, true);
-    if (this.woken) { this.afterWindow(wav(phrase, cap.rate)); return; }
-    var wake = this.wake();
-    if (wake === 'whisper' && this.early && !this.late) {
-      this.transcribe(null, null, this.early);
+    var streamed = this.streamed;
+    // Only a phrase streamed whole is ended there: the deck scores and logs no
+    // phrase with a gap, and its clip decides it instead.
+    if (streamed && !(streamed.whole && v.stream && v.stream.end(streamed.id))) {
+      streamed.whole = false;
+    }
+    if (this.woken) {
+      var heardBody = wav(phrase, cap.rate);
+      // Kept, so a socket lost before `done` still logs it with a clip.
+      if (streamed) streamed.body = heardBody;
+      // Woken by the stream, with its answer lost: the clip only logs it (#4539).
+      if (streamed && !streamed.whole) this.clipStreamed(streamed, heardBody);
+      this.afterWindow(heardBody);
       return;
     }
+    var wake = this.wake();
     var body = wav(phrase, cap.rate);
-    if (wake === 'whisper') { this.transcribe(body); return; }
+    if (wake === 'whisper' && this.early) { this.fromEarly(body); return; }
+    if (wake === 'whisper') {
+      this.way = this.noEarly();
+      this.transcribe(body);
+      return;
+    }
     // Waiting (#3476): the phrase is named, so the wake log can join what the
-    // detector and Whisper each made of it.
-    var id = wakeLogId();
+    // detector and Whisper each made of it; a streamed one keeps its stream's name.
+    var id = streamed ? streamed.id : wakeLogId();
     var ended = Date.now();
     var url = '/api/speech/wake?id=' + id + wakeQuery() + langQuery(v) + micQuery(body);
     var init = { method: 'POST', headers: { 'Content-Type': 'audio/wav' }, body: body };
@@ -1396,6 +1512,25 @@
       this.transcribe(body, { id: id, ended: ended });
       return;
     }
+    if (streamed) {
+      streamed.body = body;
+      // Not whole: a clip, which `clipped` keeps any late answer of the stream from.
+      if (!streamed.whole) { this.clipStreamed(streamed); return; }
+      // The stream answers it (#4539): its `done`, or a clip if none comes.
+      if (!streamed.confirming) {
+        streamed.timer = setTimeout(function () { self.clipStreamed(streamed); }, STREAM_DONE_MS);
+      }
+      return;
+    }
+    this.askDetector(body, id, ended);
+  };
+
+  // A waiting phrase sent whole to the wake word detector, as a clip (#3476).
+  HostRecognition.prototype.askDetector = function (body, id, ended) {
+    var self = this;
+    var v = this.v;
+    var url = '/api/speech/wake?id=' + id + wakeQuery() + langQuery(v) + micQuery(body);
+    var init = { method: 'POST', headers: { 'Content-Type': 'audio/wav' }, body: body };
     // Not woken, nothing more happens to the phrase; woken with nothing after it, it
     // is the wake word alone. A detector that cannot answer leaves it to Whisper.
     var stopWatch = this.watchAnswer();
@@ -1439,6 +1574,146 @@
     });
   };
 
+  // The early pass of the phrase so far (#3765): its own id, so the bench line the
+  // whole phrase may later replace is named (#4540), and its clip's length, so the
+  // speech service can tell whether speech came after it. `failed` once it has.
+  HostRecognition.prototype.earlyPass = function (phrase, rate) {
+    var samples = 0;
+    phrase.forEach(function (chunk) { samples += chunk.length; });
+    var id = phraseId(Date.now());
+    // Asked once: a pass with no answer in HOST_ANSWER_MS, or refused, counts as
+    // failed, and the whole phrase is heard instead, with its own retries.
+    var early = this.request(wav(phrase, rate), '&id=' + id, true);
+    early.id = id;
+    early.seconds = samples / rate;
+    early.catch(function (error) { early.failed = error; });
+    return early;
+  };
+
+  // A phrase's words when it had an early pass (#4540). With only quiet after it, the
+  // early words are the phrase's. With soft sound after it, the whole phrase goes to
+  // the speech service once, marked with the early clip: with no new speech in it the
+  // service says to reuse the early words, else it hears the whole phrase. An early
+  // pass that failed, before or after that, has the whole phrase heard once instead,
+  // its bench line replacing the early one. That send is the failed pass's retry, so
+  // a stall or a crash says so as a retried request would (#3424, #3969).
+  HostRecognition.prototype.fromEarly = function (body) {
+    var self = this;
+    var early = this.early;
+    var words = early;
+    this.way = 'early';
+    if (early.failed) {
+      words = Promise.reject(early.failed);
+    } else if (this.late) {
+      this.way = 'checked';
+      words = this.request(body, '&early=' + early.id + '&early_s=' + early.seconds.toFixed(3), true)
+        .then(function (heard) {
+          if (heard.reuse) return early;
+          self.way = 'tail';
+          return heard;
+        });
+    }
+    words.then(function (heard) {
+      if (!self.aborted) self.transcribe(body, null, Promise.resolve(heard));
+    }, function (error) {
+      if (self.aborted) return;
+      self.way = 'failed';
+      if (error && !error.final && voice === self.v) {
+        showStatus(error.name === 'AbortError' ? 'No answer from the deck · trying again…'
+          : 'Speech service restarting · trying again…');
+      }
+      self.transcribe(body, null, null, '&replaces=' + early.id);
+    });
+  };
+
+  // Why a message phrase had no early pass, for the voice log (#4540).
+  HostRecognition.prototype.noEarly = function () {
+    if (!this.recognizesEarly()) return this.v.purpose === 'question' ? 'question' : 'other';
+    // A phrase that ends on its own always has one: sound coming back drops it, and
+    // the next 0.3 s of pause makes another.
+    return this.capped ? 'cap' : 'cut';
+  };
+
+  // Whether this listener streams its phrases (#4539): the wait for the name where
+  // the detector decides, not a reading's overhearing.
+  HostRecognition.prototype.streams = function () {
+    var v = this.v;
+    return !this.waking && v.purpose === 'wake' && v.wake === 'detector' && v.rec === this;
+  };
+
+  // A phrase starts: its chunks so far go to the stream, when it is open.
+  HostRecognition.prototype.streamStart = function (chunks, rate) {
+    var v = this.v;
+    var self = this;
+    this.streamed = null;
+    if (!this.streams() || !v.stream || this.hushed()) return;
+    var s = { id: wakeLogId(), whole: true };
+    var handler = {
+      woken: function () { self.streamWoken(s); },
+      confirming: function () {
+        s.confirming = true;
+        clearTimeout(s.timer);
+      },
+      done: function (msg) {
+        s.answered = true;
+        clearTimeout(s.timer);
+        if (msg.woken) { self.streamWoken(s); return; }
+        if (s.woke || s.clipped || !s.body || self.aborted) return;
+        self.end();
+      },
+      lost: function () {
+        if (s.answered) return;
+        s.whole = false;
+        clearTimeout(s.timer);
+        if (s.body) self.clipStreamed(s);
+      }
+    };
+    var mic = chunks[0] && chunks[0].mic;
+    if (!v.stream.begin(s.id, mic, handler)) return;
+    this.streamed = s;
+    chunks.forEach(function (chunk) { self.streamChunk(chunk, rate); });
+  };
+
+  HostRecognition.prototype.streamChunk = function (samples, rate) {
+    var s = this.streamed;
+    if (!s || !s.whole) return;
+    if (!this.v.stream || !this.v.stream.audio(samples, rate)) s.whole = false;
+  };
+
+  // The stream heard the name: the beep now, before the phrase ends. What follows in
+  // the phrase is the message, heard whole at its end as after a reading's window.
+  HostRecognition.prototype.streamWoken = function (s) {
+    var v = this.v;
+    if (s.woke || s.clipped || this.aborted || this.hushed() || quietNight()) return;
+    s.woke = true;
+    clearTimeout(s.timer);
+    this.woken = true;
+    this.wokeAt = this.waited || 0;
+    v.beeped = Date.now();
+    tone(880);
+    showStatus('Listening…');
+    // The phrase had ended, waiting for this answer: it is heard now.
+    if (s.body) this.afterWindow(s.body);
+  };
+
+  // A streamed phrase with no answer goes as a clip. One the stream already woke on
+  // has beeped and is being heard: its clip only puts it in the wake log, and its
+  // answer is not acted on, so nothing beeps or listens twice.
+  HostRecognition.prototype.clipStreamed = function (s, body) {
+    if (s.clipped || s.answered) return;
+    s.clipped = true;
+    clearTimeout(s.timer);
+    body = body || s.body;
+    if (s.woke) {
+      fetch('/api/speech/wake?id=' + s.id + wakeQuery() + langQuery(this.v) + micQuery(body), {
+        method: 'POST', headers: { 'Content-Type': 'audio/wav' }, body: body
+      }).catch(function () { /* only logged */ });
+      return;
+    }
+    if (this.aborted) return;
+    this.askDetector(body, s.id, Date.now());
+  };
+
   // Only listening for a message recognizes early (#3765): not a question box, the
   // wait for "Hey Jarvis", or talk heard over a reading.
   HostRecognition.prototype.recognizesEarly = function () {
@@ -1475,8 +1750,10 @@
     });
   };
 
-  // The host's answer for a recorded phrase, as a promise of its JSON.
-  HostRecognition.prototype.request = function (body) {
+  // The host's answer for a recorded phrase, as a promise of its JSON. `extra` is more
+  // of the query, starting with `&`.
+  // `once`: no retry, for a pass that has a fallback of its own (#4540).
+  HostRecognition.prototype.request = function (body, extra, once) {
     var self = this;
     var v = this.v;
     warmFast(v);
@@ -1485,19 +1762,17 @@
     var hint = v.heardLang ? '&language=' + v.heardLang : '';
     var stopWatch = this.watchAnswer();
     // `source` keeps the phrase for the speech bench as voice mode's (#3934).
-    var asked = hostRequest(v, '/api/speech/transcribe?source=voice' + hint + micQuery(body), {
+    var asked = hostRequest(v, '/api/speech/transcribe?source=voice' + hint + (extra || '') + micQuery(body), {
       method: 'POST', headers: { 'Content-Type': 'audio/wav' }, body: body
     }, function () { return !self.aborted; }, function () {
       if (v.mode === 'listening') showStatus(v.purpose === 'question' ? 'Listening for your answer…' : 'Listening…');
-    }).then(function (response) {
+    }, once ? 0 : undefined).then(function (response) {
       stopWatch();
       return response.json();
     }, function (error) {
       stopWatch();
       throw error;
     });
-    // Kept, so a phrase asked early can be sent again while the model loads (#3766).
-    asked.body = body;
     // An early pass dropped as sound came back fails unseen.
     asked.catch(function () { /* the phrase's own pass reports it */ });
     return asked;
@@ -1505,13 +1780,13 @@
 
   // The host's words for a phrase. `wake` names a waiting phrase for the wake log,
   // and says whether the detector already woke on it; `asked` is a request already
-  // made early in its pause.
-  HostRecognition.prototype.transcribe = function (body, wake, asked) {
+  // made for it, `body` the whole phrase, sent again if that fails while the model
+  // loads; `extra`, more of the query for the phrase's own request.
+  HostRecognition.prototype.transcribe = function (body, wake, asked, extra) {
     var self = this;
     var v = this.v;
     if (this.hushed()) { this.end(); return; }
-    body = body || asked.body;
-    (asked || this.request(body)).then(function (heard) {
+    (asked || this.request(body, extra)).then(function (heard) {
       if (self.aborted) return;
       var text = (heard.text || '').trim();
       if (wake) logWake(wake, text);
@@ -1531,7 +1806,7 @@
         self.loadingTries = (self.loadingTries || 0) + 1;
         if (loading && self.loadingTries <= LOADING_RETRIES) {
           loadingStatus(v);
-          setTimeout(function () { if (!self.aborted) self.transcribe(body, wake); }, LOADING_RETRY_MS);
+          setTimeout(function () { if (!self.aborted) self.transcribe(body, wake, null, extra); }, LOADING_RETRY_MS);
           return;
         }
         if (self.onerror) self.onerror({ error: 'host-failed' });
@@ -1570,8 +1845,10 @@
     var result = [{ transcript: text }];
     result.isFinal = true;
     result.woke = woke;
-    // How long the host's speech model took over it (#4360), for the voice log.
+    // How long the host's speech model took over it (#4360), for the voice log, and
+    // how its words were made, or why it had no early pass (#4540).
     result.stt = typeof ms === 'number' ? ms : null;
+    result.early = this.way || null;
     result.doubts = doubts || [];
     if (this.onresult) this.onresult({ resultIndex: 0, results: [result] });
   };
@@ -1640,6 +1917,7 @@
 
   function closeMicrophone(v) {
     v.micAsk = (v.micAsk || 0) + 1;
+    if (v.stream) { v.stream.close(); v.stream = null; }
     if (v.capture) v.capture.close();
     v.capture = null;
     v.captureReady = null;
@@ -1767,6 +2045,10 @@
     v.interrupted = '';
     var interruptedClock = v.interruptedClock;
     v.interruptedClock = null;
+    // Only a beep this phrase's listener gave counts: one whose phrase went another
+    // way (aborted, hushed) is stale by the next listen.
+    var beeped = v.beeped && Date.now() - v.beeped < BEEP_FRESH_MS;
+    v.beeped = 0;
     v.doneTap = false;
     // A tap on 🎤, or "Hey Jarvis" alone, listens for one message in any mode (#3540).
     var once = v.once;
@@ -1774,6 +2056,8 @@
     // Woken over a 🔊 note read while it waited, it listens for the message (#3798).
     if (once && purpose === 'wake') purpose = working() ? 'turn' : 'answer';
     stopListening(v);
+    // Words that waited for the fast agent went just now (#4541): its answer listens.
+    if (v.relaying) { v.relayPurpose = purpose; return; }
     if (dictating()) { rest('Dictation is on'); return; }
     if (document.hidden && v.blocked.listen) { background(v, 'listen'); return; }
     // "Hey Jarvis" is waited for only in voice mode proper, while 🎧 reads aloud
@@ -1845,7 +2129,8 @@
     }
     setMode('listening');
     showStatus(purpose === 'question' ? 'Listening for your answer…' : 'Listening…');
-    tone(880);
+    // The stream beeped already when it heard the name (#4539).
+    if (!beeped) tone(880);
     idle(v);
     if (interrupted) v.hearing = false;
     run(v);
@@ -1890,7 +2175,8 @@
       if (unheardNow(v)) v.unheardWords = true;
       // More words joined the phrase: the fast agent's answer so far is not its.
       if (v.early && v.early.text !== heard(v)) dropEarly(v, 'not sent: more words followed');
-      v.clock = { end: rec.endedAt || Date.now(), words: Date.now(), stt: event.results[0].stt };
+      v.clock = { end: rec.endedAt || Date.now(), words: Date.now(), stt: event.results[0].stt,
+        early: event.results[0].early };
       v.hearing = false;
       show(v);
       clearTimeout(v.sendTimer);
@@ -1904,6 +2190,7 @@
     rec.onspeechstart = function () {
       if (current() !== v || v.rec !== rec) return;
       v.hearing = true;
+      v.noiseOnly = false;
       clearTimeout(v.sendTimer);
       clearTimeout(v.holdTimer);
       if (!heard(v)) return;
@@ -1911,6 +2198,8 @@
         if (current() !== v || v.rec !== rec || !v.hearing) return;
         rec.probe(function (words) {
           if (current() !== v || v.rec !== rec || !v.hearing || words) return;
+          // Only sound: the fast agent's answer sends the words through it (#4541).
+          v.noiseOnly = true;
           // Words held for the rest keep their six seconds (#3934 review).
           var left = v.heldFor === heard(v) ? v.wordsAt + HOST_MORE_MS - Date.now() : 0;
           if (left > 0) v.sendTimer = setTimeout(function () { finish(v); }, left);
@@ -1954,7 +2243,7 @@
         // Words held for the rest (#3934) keep their longer wait through a cough.
         var wait = v.heldFor === heard(v) ? HOST_MORE_MS : HOST_SEND_AFTER_MS;
         var due = now ? 0 : v.wordsAt + wait - Date.now();
-        if (now) finish(v);
+        if (now) finish(v, true);
         else if (due > 0) v.sendTimer = setTimeout(function () { sendWhenReady(v); }, due);
         else sendWhenReady(v);
         // Sent, the phrase is with the fast agent: no listener may write a later
@@ -2029,6 +2318,10 @@
   }, true);
 
   function stopListening(v) {
+    // Words waiting for the fast agent (#4541) go now, as they did at the second.
+    var waiting = v.waitingFor;
+    v.waitingFor = null;
+    if (waiting && v.early === waiting && listeningMode(v) && heard(v)) finish(v, true);
     clearTimers(v);
     var rec = v.rec;
     v.rec = null;
@@ -2110,11 +2403,14 @@
     v.sendTimer = setTimeout(function () { finish(v); }, HOST_MORE_MS);
   }
 
-  // Two seconds of silence after speech: act on what was heard.
-  function finish(v) {
+  // A second after the words: act on what was heard. Words for the chat wait, still
+  // listening, until the fast agent answers (#4541); `atOnce` (a tap, or "Alexa,
+  // <message>" in one breath) stops listening and waits for it as before.
+  function finish(v, atOnce) {
     if (voice !== v || !listeningMode(v)) return;
     var text = heard(v);
     if (!text) return;
+    if (!atOnce && untilAnswered(v, text)) return;
     var held = v.heldFor === text;
     v.heldFor = '';
     var said = words(text).join(' ');
@@ -2125,7 +2421,7 @@
     // The fast agent asked early for these very words, with no 🔊 line read since.
     var early = v.early;
     v.early = null;
-    if (early && (early.text !== text || early.aloud !== v.aloud.length || !relayed(v, said))) {
+    if (early && (early.text !== text || early.aloud !== v.aloudSeq || !relayed(v, said))) {
       v.early = early;
       dropEarly(v, 'not sent: the words changed');
       early = null;
@@ -2189,7 +2485,9 @@
     if (early) v.aloud.splice(0);
     var clock = v.clock;
     v.clock = null;
-    if (clock) { clock.id = id; clock.sent = Date.now(); }
+    // `sent` is when the second after the words was over, not when the fast agent
+    // answered (#4541): the voice log splits the wait from the fast agent's time.
+    if (clock) { clock.id = id; clock.sent = clock.due || Date.now(); }
     v.relayPurpose = working() ? 'turn' : 'answer';
     var relayTarget = v.target;
     // What the person had not heard when they stopped speaking (#3520).
@@ -2315,9 +2613,42 @@
     if (!text || (v.early && v.early.text === text)) return;
     dropEarly(v, 'not sent: more words followed');
     if (!relayed(v, words(text).join(' '))) return;
-    var at = Date.now();
-    v.early = startAsk(v, text, phraseId(at), true, markUnsure(text, v.doubts));
-    v.early.at = at;
+    askFor(v, text);
+  }
+
+  // The ask `finish` takes when the words are still `text`; the 🔊 lines it is told
+  // stay for the next ask until then.
+  function askFor(v, text) {
+    var ask = startAsk(v, text, phraseId(Date.now()), true, markUnsure(text, v.doubts));
+    v.early = ask;
+    return ask;
+  }
+
+  // Words for the chat are sent when the fast agent answers, not when the second
+  // after them is over (#4541): listening goes on meanwhile, so more words join the
+  // phrase (`onresult` drops this ask, and the next listener asks again). True while
+  // it waits. The ask times out at FAST_WAIT_MS, and then the words go as heard.
+  function untilAnswered(v, text) {
+    if (v.mode !== 'listening' || v.relaying || !relayed(v, words(text).join(' ')) ||
+        echoOfReading(v, text)) return false;
+    var ask = v.early;
+    if (!ask || ask.text !== text || ask.aloud !== v.aloudSeq) {
+      // No ask yet (sound went on as the words came back), or one for other words.
+      if (ask) dropEarly(v, 'not sent: the words changed');
+      ask = askFor(v, text);
+    }
+    if (v.clock && !v.clock.due) v.clock.due = Date.now();
+    if (ask.done) return false;
+    // Listening stopped meanwhile (`stopListening`: a hidden page, a rest) sends
+    // the words at once rather than leave them in the draft.
+    v.waitingFor = ask;
+    answered(ask, function () {
+      // Sound still going holds the send until its words come back or the check
+      // finds none (`noiseOnly`, #3449); words that joined dropped this ask.
+      if (voice !== v || v.early !== ask || (v.hearing && !v.noiseOnly)) return;
+      finish(v);
+    });
+    return true;
   }
 
   // An early answer not taken: the voice log says why, and the next ask tells the
@@ -2334,7 +2665,7 @@
   // leaves the 🔊 lines it is told for the next ask. `marked` is `text` as the fast
   // agent is told it, its doubted parts marked (#3817).
   function startAsk(v, text, id, keep, marked) {
-    var ask = { text: text, id: id, at: Date.now(), aloud: v.aloud.length, done: false,
+    var ask = { text: text, id: id, at: Date.now(), aloud: v.aloudSeq, done: false,
       answer: null, waiting: [] };
     var aloud = keep ? v.aloud.slice() : v.aloud.splice(0);
     var drop = v.dropped || '';
@@ -2524,7 +2855,10 @@
       pressed: clock.pressed - clock.end, shown: clock.shown - clock.end
     };
     if (clock.voice) timing.voice = clock.voice - clock.end;
+    // Why its reply was not read as it was written (#4543): voice mode held it.
+    if (clock.waited) timing.waited = clock.waited;
     if (typeof clock.stt === 'number') timing.stt = clock.stt;
+    if (typeof clock.early === 'string') timing.early = clock.early;
     try {
       fetch('/api/voice/sent', {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, keepalive: true,
@@ -2577,6 +2911,23 @@
   function readAloud(v, text) {
     v.aloud.push(text);
     if (v.aloud.length > ALOUD_KEPT) v.aloud.shift();
+    v.aloudSeq = (v.aloudSeq || 0) + 1;
+  }
+
+  // A 🔊 paragraph read while it is written grows: its one entry grows with it,
+  // and `aloudSeq` tells an early ask its 🔊 lines changed. An entry an ask took
+  // meanwhile is gone: the words added since are its own entry.
+  function draftAloud(v, draft, text) {
+    if (text === draft.said) return;
+    var at = v.aloud.lastIndexOf(draft.said);
+    if (at >= 0) {
+      v.aloud[at] = text;
+      v.aloudSeq = (v.aloudSeq || 0) + 1;
+    } else {
+      var rest = restAfter(text, draft.said);
+      if (rest) readAloud(v, rest);
+    }
+    draft.said = text;
   }
 
   // A phrase heard while waiting: anything without "Hey Jarvis" is let go of; the
@@ -2586,6 +2937,9 @@
   function woken(v, text, doubts) {
     var woke = v.woke;
     v.woke = false;
+    // Only the name alone listens next; any other way on, an early beep is spent.
+    var beeped = v.beeped;
+    v.beeped = 0;
     var match = wakeWord().re.exec(text);
     if (!match && !woke) return;
     var message = text;
@@ -2598,6 +2952,7 @@
     // spoken line is there for the microphone to hear (#3781).
     if (!message) {
       v.once = true;
+      v.beeped = beeped;
       listen(v.question ? 'question' : working() ? 'turn' : 'answer');
       return;
     }
@@ -2615,7 +2970,7 @@
     v.phrases = [message];
     v.doubts = doubts;
     show(v);
-    finish(v);
+    finish(v, true);
   }
 
   // ---- question boxes -----------------------------------------------------
@@ -2804,7 +3159,8 @@
       clearTimeout(v.replyTimer);
       // Not started by a send from here: what started it was never heard (#3520).
       v.unheardTurn = !v.awaiting;
-      v.noted = false;
+      v.noted = !!v.notedEarly && Date.now() - v.notedEarly < NOTED_EARLY_MS;
+      v.notedEarly = 0;
       // A microphone that already gave up waiting stays that way until the turn
       // ends (#3456), as does one resting; a send from here is acknowledged, and that
       // listens anyway.
@@ -2814,7 +3170,6 @@
         else listen('turn');
       }
       watchQuiet(v);
-      watchWork(v);
     } else if (!now && was) {
       // Its reply is read next; nothing more is said about its work.
       v.quiet = null;
@@ -2824,16 +3179,34 @@
     }
   }
 
-  function waitForReply(v) {
+  // `unseen`: this page never saw the turn working, so the status may simply lag a
+  // line the agent wrote midway, and the reply is not taken as final at once (#4543).
+  function waitForReply(v, unseen) {
     v.awaiting = false;
+    v.replyUnseen = !!unseen;
     v.replyDeadline = Date.now() + REPLY_WAIT_MAX_MS;
     settleReply(v);
   }
 
   function settleReply(v) {
     clearTimeout(v.replyTimer);
-    var wait = Math.min(REPLY_SETTLE_MS, Math.max(0, v.replyDeadline - Date.now()));
+    var wait = finalReply() ? 0
+      : Math.min(REPLY_SETTLE_MS, Math.max(0, v.replyDeadline - Date.now()));
     v.replyTimer = setTimeout(function () { speakReply(v); }, wait);
+  }
+
+  // The ended turn's own reply is on the page, unread (#4543): the agent writes its
+  // last words before the turn ends, so nothing more follows them. Not when a tool
+  // call, a failed line or a message to the agent comes after the newest reply: that
+  // reply was said midway, or answers an earlier message, and the last one is still on
+  // its way. Nor for a turn this page never saw working (`waitForReply`).
+  function finalReply() {
+    if (working() || voice.replyUnseen || !unreadReply(voice)) return false;
+    var log = onSide(voice) ? '[data-side-view-log]' : '.transcript';
+    var lines = document.querySelectorAll(
+      log + ' .ev.assistant:not(.sub), ' + log + ' .ev.tool-call:not(.sub), ' +
+      log + ' .ev.user:not(.sub)');
+    return lines[lines.length - 1] === lastReply();
   }
 
   // A reply to a message sent from here that lands with the page never having seen
@@ -3084,6 +3457,268 @@
     return true;
   }
 
+  // ---- the reply being written (#4543) ----------------------------------------
+
+  // The runtime sends the 🔊 text block the agent is writing, a sentence at a time,
+  // marked `first` (the turn's first one), `later` or `unknown`. A first one is read
+  // as it is written; the others only once the message ended the turn. Holds are
+  // checked once, before the first sentence; after it the paragraph is read to its end,
+  // waiting for each next sentence, and only then is it heard. The finished line
+  // carries the same message id: the reading takes from it what the draft did not
+  // have, or, when they differ or the draft stalls, the line is read whole instead.
+  var DRAFT_STALL_MS = 6000;
+  // How long a first note read while the page still showed idle counts for the
+  // working edge that follows it.
+  var NOTED_EARLY_MS = 30000;
+
+  function draftPayload(slot) {
+    var el = slot.querySelector('[data-draft]');
+    if (!el) return null;
+    try { return JSON.parse(el.getAttribute('data-draft')); } catch (e) { return null; }
+  }
+
+  // The draft's 🔊 paragraph, read as the finished line's would be, and whether it is
+  // whole: a blank line after it, or the block ended.
+  function draftParagraph(d) {
+    var text = String(d.text || '').replace(/^\s+/, '');
+    if (text.indexOf(MARK) !== 0) return null;
+    text = text.slice(MARK.length);
+    // Where the rendered line's paragraph ends (`blocks`): a blank line, or a line
+    // that opens a list, heading, quote, table or code block.
+    var gap = /\n\s*\n|\n(?=[ \t]*(```|~~~|\||#|[-*+] |\d+\. |>))/.exec(text);
+    if (gap) text = text.slice(0, gap.index);
+    // Raw markdown: a link reads as its words, as on the page.
+    text = text.replace(/\[([^\]]*)\]\([^)]*\)/g, '$1');
+    return { text: speakable(text), closed: !!gap || !!d.complete };
+  }
+
+  function bare(text) { return text.replace(/[^\p{L}\p{N}]+/gu, '').toLowerCase(); }
+
+  // What of `full` comes after the words `said`, letters and digits compared, or null
+  // when `full` does not open with them.
+  function restAfter(full, said) {
+    var want = bare(said);
+    if (bare(full).slice(0, want.length) !== want) return null;
+    var count = 0;
+    var i = 0;
+    for (; i < full.length && count < want.length; i++) {
+      if (/[\p{L}\p{N}]/u.test(full[i])) count++;
+    }
+    return full.slice(i).replace(/^[^\p{L}\p{N}"'“‘(]+/u, '').trim();
+  }
+
+  // The finished line of message `id` that holds a 🔊 paragraph.
+  function draftRow(v, id) {
+    var log = chatLog(v.target);
+    if (!log) return null;
+    var rows = log.querySelectorAll('.ev.assistant:not(.sub)[data-message-id]');
+    for (var i = 0; i < rows.length; i++) {
+      if (rows[i].getAttribute('data-message-id') !== id) continue;
+      var text = rows[i].querySelector('.ev-text');
+      if (text && markedPart(text) !== null) return rows[i];
+    }
+    return null;
+  }
+
+  // Why voice mode would not start reading now, as the voice log records it.
+  function draftHold(v) {
+    if (v.speaking || v.mode === 'speaking') return 'speaking';
+    if (v.mode === 'listening' && (heard(v) || v.hearing)) return 'talking';
+    if (v.relaying) return 'relaying';
+    if (v.question || questionForm()) return 'question';
+    if (v.mode === 'resting' && !v.idled) return 'resting';
+    return '';
+  }
+
+  // The phrases a draft answers: on this chat, not voiced yet, and with no user line
+  // of the chat after their own, as `ownReply` has it for a line on the page (#4360).
+  function draftOwn(v) {
+    var log = chatLog(v.target);
+    var users = log
+      ? log.querySelectorAll('.ev.user[data-event-seq]:not(.sub):not([data-queued])') : [];
+    var last = -1;
+    for (var i = 0; i < users.length; i++) {
+      last = Math.max(last, parseInt(users[i].getAttribute('data-event-seq'), 10));
+    }
+    return answerClocks(v).filter(function (clock) {
+      if (clock.target !== v.target || !clock.head || clock.lineSeq == null) return false;
+      return !clock.voice && clock.lineSeq >= last;
+    });
+  }
+
+  // The phrases this reading answers: their answer is on the page from now.
+  function draftClocks(v) {
+    replyArrived(v, v.target);
+    var now = Date.now();
+    return draftOwn(v).map(function (clock) {
+      if (!clock.shown) {
+        clock.shown = now;
+        timed(v, clock);
+      }
+      return clock;
+    });
+  }
+
+  function onDraft(v, d) {
+    if (current() !== v || !v.reads) return;
+    var live = v.draft;
+    // Stopped some other way: talked over, a tap, the page hidden.
+    if (live && v.speaking !== live.token) live = dropDraft(v);
+    if (!d || !d.message_id) return;
+    v.draftSeen = v.draftSeen || {};
+    // Only a message first seen before its finished line: a reconnect's or a
+    // late one is read from that line, as before.
+    if (!(d.message_id in v.draftSeen)) v.draftSeen[d.message_id] = !draftRow(v, d.message_id);
+    if (live) {
+      if (live.id === d.message_id) moreDraft(v, live, d);
+      return;
+    }
+    if (v.draftSeen[d.message_id] !== true) return;
+    if (d.voice !== 'first' && d.stop_reason !== 'end_turn') return;
+    if (d.voice === 'first' && v.noted) return;
+    var para = draftParagraph(d);
+    if (!para || !para.text) return;
+    v.draftSeen[d.message_id] = 'read';
+    var hold = draftHold(v);
+    if (hold) {
+      draftOwn(v).forEach(function (clock) {
+        if (!clock.waited) clock.waited = hold;
+      });
+      return;
+    }
+    var first = d.voice === 'first';
+    var draft = { id: d.message_id, said: para.text, first: first, noted: v.noted,
+      asleep: v.mode === 'waiting', idled: v.mode === 'resting' };
+    v.reading = { before: v.spokenId, note: first, last: v.lastAloud };
+    if (first) v.noted = true;
+    // A turn no send started (a background task's) shows working only after its first
+    // note: that edge must not make the turn's next note look like its first.
+    if (first && !working()) v.notedEarly = Date.now();
+    v.readClocks = draftClocks(v);
+    readAloud(v, para.text);
+    v.draft = draft;
+    var token = speak(para.text, function () { draftEnded(v, draft); },
+      spokenLanguage(v, para.text), true);
+    if (!token || v.speaking !== token) {
+      v.draft = null;
+      return;
+    }
+    draft.token = token;
+    // A reply read now keeps the turn's end from reading it again (`speakReply`).
+    v.noting = true;
+    draftLanded(v);
+    if (v.draft !== draft) return;
+    if (para.closed) closeDraft(v, draft, []);
+    else watchDraft(v, draft);
+  }
+
+  function moreDraft(v, draft, d) {
+    if (draft.closed) return;
+    var para = draftParagraph(d);
+    if (!para) return;
+    var rest = restAfter(para.text, draft.said);
+    if (rest === null) { draftStalled(v, draft); return; }
+    draftAloud(v, draft, para.text);
+    var more = rest ? sentences(rest) : [];
+    if (para.closed) closeDraft(v, draft, more);
+    else if (more.length) {
+      draft.token.played.more(more, false);
+      watchDraft(v, draft);
+    }
+  }
+
+  function closeDraft(v, draft, more) {
+    draft.closed = true;
+    clearTimeout(draft.stall);
+    draft.token.played.more(more, true);
+  }
+
+  // No next sentence for DRAFT_STALL_MS while the reading waits for one: the
+  // paragraph was not heard whole, and its finished line is read from its start.
+  function watchDraft(v, draft) {
+    clearTimeout(draft.stall);
+    draft.stall = setTimeout(function () {
+      if (v.draft !== draft || v.speaking !== draft.token || draft.closed) return;
+      var played = draft.token.played;
+      if (played && played.waiting && played.index >= played.parts.length) {
+        draftStalled(v, draft);
+      } else {
+        watchDraft(v, draft);
+      }
+    }, DRAFT_STALL_MS);
+  }
+
+  function draftStalled(v, draft) {
+    clearTimeout(draft.stall);
+    draft.stalled = true;
+    v.draft = null;
+    v.noting = false;
+    var before = v.reading ? v.reading.before : v.spokenId;
+    stopSpeaking(v);
+    v.spokenId = before;
+    v.noted = draft.noted;
+    setMode('idle');
+    if (!working() && v.replyDeadline) { settleReply(v); return; }
+    if (working()) speakNote(v);
+    if (v.mode !== 'speaking') listen(working() ? 'turn' : 'answer');
+  }
+
+  // The finished line of the message being read reached the page.
+  function draftLanded(v) {
+    var draft = v.draft;
+    if (draft && v.speaking !== draft.token) draft = dropDraft(v);
+    if (!draft) {
+      // Read to its end, or stopped by a tap or talk, before its line came: that line
+      // is the one just read, as a note cut off is today (`speakNote`).
+      var done = v.draftDone;
+      var row = done && draftRow(v, done.id);
+      if (!row) return;
+      v.draftDone = null;
+      var text = markedPart(row.querySelector('.ev-text'));
+      if (text !== null && (done.cut || bare(text) === bare(done.said))) v.spokenId = row.id;
+      return;
+    }
+    if (draft.rowId) return;
+    var landed = draftRow(v, draft.id);
+    if (!landed) return;
+    draft.rowId = landed.id;
+    v.spokenId = landed.id;
+    if (draft.closed) return;
+    var full = markedPart(landed.querySelector('.ev-text'));
+    var rest = full === null ? null : restAfter(full, draft.said);
+    if (rest === null) { draftStalled(v, draft); return; }
+    draftAloud(v, draft, full);
+    closeDraft(v, draft, rest ? sentences(rest) : []);
+  }
+
+  // A draft reading something else stopped (a tap, talk, the page hidden): its line,
+  // when it lands, counts as read. Returns null for the caller's `live`.
+  function dropDraft(v) {
+    var draft = v.draft;
+    v.draft = null;
+    if (!draft) return null;
+    clearTimeout(draft.stall);
+    if (!draft.rowId) v.draftDone = { id: draft.id, said: draft.said, cut: true };
+    return null;
+  }
+
+  function draftEnded(v, draft) {
+    clearTimeout(draft.stall);
+    if (v.draft === draft) v.draft = null;
+    v.noting = false;
+    heardOut(v, draft.said);
+    // Ended while it still waited for sentences: talked over (`spoke` ends it), so
+    // its line counts as read, as after a tap (`dropDraft`).
+    if (!draft.rowId) {
+      v.draftDone = { id: draft.id, said: draft.said, cut: !draft.closed && !draft.stalled };
+    }
+    // The turn ended meanwhile: its reply is read before anything listens (#3456).
+    if (replyIfEnded(v)) return;
+    if (v.question) listen('question');
+    else if (working() && draft.idled) rest('Voice mode on', true);
+    else listen(!working() ? 'answer' : draft.asleep ? 'wake' : 'turn');
+  }
+
   function onSse(event) {
     var target = event.target;
     if (!target || !current()) return;
@@ -3099,9 +3734,13 @@
       // Timed whichever chat it is in, read or not (#4360).
       replyArrived(voice, sideLog ? 'side' : 'main');
       if (sideLog !== side) return;
+      draftLanded(voice);
       if (voice.replyDeadline && Date.now() < voice.replyDeadline) settleReply(voice);
       else if (working()) speakNote(voice);
-      else if (voice.awaiting && unreadReply(voice)) waitForReply(voice);
+      else if (voice.awaiting && unreadReply(voice)) waitForReply(voice, true);
+    } else if (target.id === 'voice-draft-slot' ||
+        (target.hasAttribute && target.hasAttribute('data-side-draft'))) {
+      if ((target.id !== 'voice-draft-slot') === side) onDraft(voice, draftPayload(target));
     } else if (target.id === 'pending-interaction-slot') {
       if (!side) onInteraction();
     }
@@ -3157,7 +3796,6 @@
     v.asked = null;
     v.target = to;
     v.working = working();
-    if (v.working) watchWork(v);
     var kept = v.seen[to];
     if (kept) {
       v.spokenId = kept.spokenId;
@@ -3246,7 +3884,6 @@
     // Only replies that arrive from now on are read, not the one already on screen.
     var shown = lastReply();
     v.spokenId = shown ? shown.id : null;
-    if (v.working) watchWork(v);
     return v;
   }
 
@@ -3685,7 +4322,7 @@
       else if (v.capture) { v.capture.keep = false; v.capture.carry = []; }
       if (cut || heard(v)) showStatus('Sending…');
       if (cut) { v.doneTap = true; showMic(v); return; }
-      if (heard(v)) { finish(v); return; }
+      if (heard(v)) { finish(v, true); return; }
       listen(v.question ? 'question' : working() ? 'turn' : 'answer');
       return;
     }
@@ -3750,6 +4387,18 @@
   // request (#4349), so it asks through `agentdeckVoiceMode.dress` below.
   function dress(v, message) {
     v.sentAt = Date.now();
+    // Sent by hand while heard words wait for the fast agent (#4541): those words
+    // went with this send, so later words start a phrase of their own.
+    if (listeningMode(v) && heard(v)) {
+      v.phrases = [];
+      v.doubts = [];
+      v.heldFor = '';
+      v.unheardWords = false;
+      v.base = '';
+      v.waitingFor = null;
+      clearTimeout(v.sendTimer);
+      dropEarly(v, 'not sent: sent by hand meanwhile');
+    }
     v.awaiting = true;
     // A send of words just heard, with what was unheard when they ended (#3520).
     var spoken = v.spoken && Date.now() - v.spoken.at < 2000 ? v.spoken : null;

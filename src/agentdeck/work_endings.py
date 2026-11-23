@@ -71,6 +71,18 @@ REVIEW_PASSED_NUDGE_TEXT = (
     " head now, as a test run the deck can see; the deck merges once it is green."
 )
 
+#: The request when a pull request's review waits on the agent's own ``pre-review-done``
+#: (#4575): store#4161's agent took a minor verdict's pass as carried, told the owner to press
+#: Merge, and the review nobody started cost nine hours.
+PRE_REVIEW_NUDGE_TEXT = (
+    "AgentDeck: your last turn on {ref} ended, but the review of {pulls} has not started: it"
+    " waits on you. The deck sent its pre-review checklist and no review runs, and nothing"
+    " merges, until you go through it and call `POST"
+    " $AGENTDECK_URL/api/sessions/<key>/pre-review-done` with {bodies} (one call per pull"
+    " request). If an earlier review said minor-fixes or no-code, it does not cover this head:"
+    " the deck's record says it needs its own review. Do it now."
+)
+
 # A review that stopped with no verdict after the deck's own reviewer also ran (#3356). Sent
 # once per review chat; nothing else starts a reviewer on it by itself.
 REVIEW_STUCK_TEXT = (

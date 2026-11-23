@@ -104,6 +104,30 @@ def test_an_all_pass_run_is_a_complete_empty_failure_list():
         "there is nothing in this output to read a failure list out of"
     )
     assert baseline.extract_failures(all_pass, succeeded=True) == ((), True)
+    assert baseline.reports_failures(all_pass) is False
+
+
+def test_a_log_that_reports_failures_says_so_whatever_the_exit_code():
+    """A piped pytest exits zero on failures (#4565); its log still says what failed."""
+    summary = "=== short test summary info ===\nFAILED tests/a.py::test_x - AssertionError\n"
+    assert baseline.reports_failures(summary)
+    assert baseline.reports_failures("....E.\n75 passed, 2 errors in 12.30s")
+    assert baseline.reports_failures("=== 1 failed, 3 passed, 2 rerun in 1.20s (0:00:01) ===")
+    coloured = "\x1b[31m=== \x1b[1m1 failed\x1b[0m\x1b[31m in 0.01s\x1b[0m ==="
+    assert baseline.reports_failures(coloured)
+    # ``pytest | grep FAILED`` drops the header but keeps the line.
+    assert baseline.reports_failures("FAILED tests/a.py::test_x - AssertionError")
+    assert not baseline.reports_failures("=== 12 passed, 1 warning in 0.50s ===")
+    # A test's own output, or a live-log line, is not pytest's report.
+    for line in (
+        "printed: 1 failed attempt to connect",
+        "0 failed",
+        "3 failed",
+        "5 errors in parsing the file",
+        "3 passed in 2 failed attempts",
+        "ERROR    app.worker:worker.py:12 retrying connection",
+    ):
+        assert not baseline.reports_failures(line), line
 
 
 def test_a_green_run_becomes_a_baseline_the_way_a_red_one_does():

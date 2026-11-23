@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import contextlib
+import html
 import json
 import os
 import re
@@ -1647,10 +1648,14 @@ async def test_session_sse_observes_before_rendering_transcript_event(tmp_path, 
     async def fake_last_event(account, session):
         return None
 
+    # The 🔊 reply being written (#4543) follows the lines, as JSON in an attribute.
+    draft = {"message_id": "msg_1", "text": '🔊 Say "hi" & <go>.', "voice": "first"}
+
     provider = PROVIDERS["codex"]
     monkeypatch.setattr(provider, "transcript_cursor", fake_cursor)
     monkeypatch.setattr(provider, "read_transcript", fake_read)
     monkeypatch.setattr(provider, "last_event", fake_last_event)
+    monkeypatch.setattr(provider, "draft", lambda account, session_id: draft)
 
     class FakeRequest:
         def __init__(self, application):
@@ -1666,10 +1671,20 @@ async def test_session_sse_observes_before_rendering_transcript_event(tmp_path, 
         # usage and the chat's Deckhand section, then the transcript: no stream sends
         # the old Deckhand panel (#2256), a chat list (#2603) or the done bar (#2599).
         chunks = [await asyncio.wait_for(stream.__anext__(), timeout=2) for _ in range(3)]
+        sent_draft = ""
+        for _ in range(10):
+            sent_draft = await asyncio.wait_for(stream.__anext__(), timeout=2)
+            if sent_draft.startswith("event: draft\n"):
+                break
     finally:
         await stream.aclose()
 
-    transcript = chunks[-1]
+    assert sent_draft.startswith("event: draft\n")
+    payload = sent_draft.split("data: ", 1)[1].strip()
+    assert "<go>" not in payload and '"hi"' not in payload
+    attribute = payload.split('data-draft="', 1)[1].split('"', 1)[0]
+    assert json.loads(html.unescape(attribute)) == draft
+    transcript = chunks[2]
     assert "event: transcript" in transcript
     assert "id: 10" in transcript
     assert 'data-observed-queue-id="18"' in transcript
@@ -1900,6 +1915,34 @@ def _web_app(
     )
     app.state.app_state.update_session(session)
     return app
+
+
+async def test_only_a_browser_send_records_a_persons_message(tmp_path):
+    """#4562: a person's message from the deck's pages sends ``HX-Request``; an agent or a
+    script posting to the same route does not, and must not count as the person writing."""
+    app = _web_app(tmp_path, max_message_chars=1000)
+    state = app.state.app_state
+
+    async def start(_account, _session, _provider, message, images, **_kwargs):
+        return InjectResult(True)
+
+    app.state.injector.start = start
+    chat_id = state.chat_identity_key("codex:test:sid")
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        scripted = await client.post(
+            "/sessions/codex:test:sid/inject",
+            data={"message": "from a script"},
+            headers={"origin": "http://test"},
+        )
+        assert scripted.status_code == 202
+        assert state.person_message_at([chat_id]) is None
+        typed = await client.post(
+            "/sessions/codex:test:sid/inject",
+            data={"message": "from the page"},
+            headers={"origin": "http://test", "hx-request": "true"},
+        )
+    assert typed.status_code == 202
+    assert state.person_message_at([chat_id]) is not None
 
 
 async def test_secret_command_delivers_only_a_value_free_notice(tmp_path, monkeypatch):
@@ -2828,13 +2871,18 @@ async def test_continue_puts_the_persons_message_first_and_watches_it_in_the_com
             data=form | {"message": "x" * 2000},
             headers={"origin": "http://test"},
         )
+        state = app.state.app_state
+        chat_id = state.chat_identity_key("codex:test:sid")
+        assert state.person_message_at([chat_id]) is None, "refusals record nothing"
         response = await client.post(
             "/sessions/codex:test:sid/continue",
             data=form | {"message": "  Fix the button.  ", "effort": "high"},
-            headers={"origin": "http://test"},
+            headers={"origin": "http://test", "hx-request": "true"},
         )
         for _ in range(10):
             await asyncio.sleep(0)
+    # #4562: the person's words start the chat's next leg, the same chat.
+    assert state.person_message_at([chat_id]) is not None
     assert refused.status_code == 422 and "Not that word." in refused.text
     assert 'id="inject-result"' in refused.text
     assert secret.status_code == 422 and "existing session" in secret.text

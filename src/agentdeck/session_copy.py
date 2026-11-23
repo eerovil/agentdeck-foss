@@ -141,8 +141,9 @@ class SessionCopyFeed:
 
     def __init__(self, state, scanned=lambda: True, *, shown: bool = True) -> None:
         self._state = state
-        # Whether a deck reviewer's ``alive`` reads :data:`SHOWN_THINKING`: only with a Claude
-        # or Codex Work reviewer, and building the display model for it is not free.
+        # Whether a deck reviewer's ``alive`` reads :data:`SHOWN_THINKING`: only while reviews
+        # are on (a ChatGPT code reviewer still has Claude design reviewers, #4458), and
+        # building the display model for it is not free.
         self._shown = shown
         # Whether the web's first scan of every account is done: until then the copy is not
         # yet the deck's chats, and the release's start sweep waits (#2982).

@@ -53,8 +53,9 @@ Do not take screenshots or drive a browser to check a change; the person sees it
 the page and says what is wrong. Check only that the page still loads (one request).
 
 1. Start. Make a worktree of <repo> for the prototype (never edit the live checkout) and
-   start the real app on its own dev server on this host, with data that makes it look
-   used, and set up the no-login access. Serve it over the tailnet:
+   start the real app on its own dev server on this host (with the repository's own
+   prototype start command when its CLAUDE.md or codebase docs give one), with data
+   that makes it look used, and set up the no-login access. Serve it over the tailnet:
    `tailscale serve --bg --https=<port> http://127.0.0.1:<port>`. Open the link yourself
    and check it loads with no login.
 2. Register it: `PUT $AGENTDECK_URL/api/sessions/<session-key>/live-prototype` with

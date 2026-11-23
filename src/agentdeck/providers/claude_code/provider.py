@@ -118,6 +118,9 @@ THINKING_WINDOW_S = 25.0
 # How often the worker snapshot is read when the runtime cannot say it moved: one
 # from before its change feed, or none reachable (#2865).
 WORKER_FALLBACK_S = 1.0
+# Drafts are read only when the feed names them (#4543); without the feed nothing reads
+# them, and this is only how often a draft watcher looks at the feed's mode again.
+DRAFT_FALLBACK_S = 60.0
 
 # How long the liveness sweep trusts "this session id has no transcript file".
 # Resolving a miss walks every project directory twice (#1325), so a session
@@ -540,6 +543,9 @@ class ClaudeCodeProvider(SessionProvider):
         self._workers: dict[str, ClaudeWorkerClient] = {}
         self._states: dict[str, object] = {}
         self._watch_tasks: dict[str, asyncio.Task] = {}
+        # The 🔊 replies being written, by account and chat session id (#4543).
+        self._drafts: dict[str, dict[str, dict]] = {}
+        self._draft_tasks: dict[str, asyncio.Task] = {}
 
     # --- deck-owned workers (optional; runtime-gated) ------------------
 
@@ -556,6 +562,9 @@ class ClaudeCodeProvider(SessionProvider):
         await client.probe()
         self._watch_tasks[account.key] = asyncio.create_task(
             self._watch(account, client), name=f"claude-workers:{account.key}"
+        )
+        self._draft_tasks[account.key] = asyncio.create_task(
+            self._watch_drafts(account, client, state), name=f"claude-drafts:{account.key}"
         )
 
     async def _watch(self, account: Account, client: ClaudeWorkerClient) -> None:
@@ -578,11 +587,55 @@ class ClaudeCodeProvider(SessionProvider):
                     failed = True
                     log.debug("claude worker refresh failed for %s: %s", account.key, exc)
 
+    async def _watch_drafts(self, account: Account, client: ClaudeWorkerClient, state) -> None:
+        """Follow the replies this account's workers are writing (#4543).
+
+        Read only when the runtime's feed names this account's drafts, which it does once
+        a sentence; never on a timer. Each changed or gone draft wakes its chat's open
+        page, which sends it to voice mode.
+        """
+        item = runtime_feed.drafts_item(account.provider_id, account.label)
+        with runtime_feed.shared().subscribe(item) as changes:
+            failed = False
+            while True:
+                # A failed read is tried again on the fallback cadence, or the draft's
+                # last change could be lost until the next one.
+                await changes.wait(DRAFT_FALLBACK_S, retry=failed)
+                if changes.closed or runtime_feed.shared().mode != runtime_feed.FEED:
+                    # With no feed nothing says when a draft moves or ends, so a draft
+                    # kept now could be read as new by a page that connects later.
+                    drafts = {}
+                else:
+                    drafts = await client.read_drafts()
+                    failed = drafts is None
+                    if failed:
+                        continue
+                before = self._drafts.get(account.key, {})
+                self._drafts[account.key] = drafts
+                moved = [
+                    f"{account.key}:{session_id}"
+                    for session_id in set(before) | set(drafts)
+                    if before.get(session_id) != drafts.get(session_id)
+                ]
+                try:
+                    state.wake_chat_pages(moved, only_open=True)
+                except Exception as exc:  # noqa: BLE001 -- the transcript still reads it
+                    log.debug("waking chat pages for drafts failed: %s", exc)
+
+    def draft(self, account: Account, session_id: str) -> dict | None:
+        """The 🔊 reply this chat's worker is writing now, or None (#4543)."""
+        return self._drafts.get(account.key, {}).get(session_id)
+
     async def stop_account(self, account: Account) -> None:
         task = self._watch_tasks.pop(account.key, None)
         if task is not None:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+        drafts_task = self._draft_tasks.pop(account.key, None)
+        if drafts_task is not None:
+            drafts_task.cancel()
+            await asyncio.gather(drafts_task, return_exceptions=True)
+        self._drafts.pop(account.key, None)
         self._states.pop(account.key, None)
         self._sidechain_parents.pop(account.key, None)
         client = self._workers.pop(account.key, None)
@@ -1370,6 +1423,19 @@ class ClaudeCodeProvider(SessionProvider):
     def watch_roots(self, account: Account) -> list[Path]:
         root = account.root
         return [root] if root.is_dir() else []
+
+    def written_chats(self, account: Account, paths: Iterable[Path]) -> list[str]:
+        # A top-level transcript, ``projects/<project>/<session id>.jsonl``. A
+        # subagent's own file lies deeper; a page open on one waits for the scan.
+        keys = []
+        for path in paths:
+            try:
+                parts = path.relative_to(account.root).parts
+            except ValueError:
+                continue
+            if len(parts) == 3 and parts[0] == "projects" and path.suffix == ".jsonl":
+                keys.append(f"{account.key}:{path.stem}")
+        return keys
 
     def watch_root_change(self, account: Account, path: Path) -> bool:
         try:

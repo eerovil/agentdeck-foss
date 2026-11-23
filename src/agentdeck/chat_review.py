@@ -32,5 +32,13 @@ def pinned_heads(body: str, title: str = "") -> dict[tuple[str, int], str]:
     return {}
 
 
+def background_pulls(body: str) -> frozenset[tuple[str, int]]:
+    return frozenset()
+
+
 async def open_review(*args, **kwargs):
     raise ReviewError("this edition has no review chats; press Merge on the Work instead")
+
+
+async def close_settled_review(*args, **kwargs) -> list[int]:
+    return []

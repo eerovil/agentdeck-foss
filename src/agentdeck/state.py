@@ -352,6 +352,15 @@ class AppState:
         self.boss_turn_windows: dict[str, str] = (
             db.load_boss_turn_windows() if db else {}
         )
+        # When a person last wrote to each chat from the deck's own pages (#4562), by chat
+        # id so a new leg keeps it. Never written by deck notices or another agent's message.
+        loaded = getattr(db, "load_person_messages", None) if db else None
+        self.person_messages: dict[str, datetime] = {}
+        for chat_id, at in (loaded() if loaded is not None else {}).items():
+            try:
+                self.person_messages[chat_id] = datetime.fromisoformat(at)
+            except ValueError:
+                continue
         # Chats the deck is currently attending (#823). In-memory on purpose: a
         # restart is one of the uncertainties a mute lease must fail open on, and
         # an empty map is exactly that. See the mute-lease section below.
@@ -2276,17 +2285,25 @@ class AppState:
         self.sessions_changed(s.key for s in moved_sessions)
         return True
 
-    def wake_chat_pages(self, keys: Iterable[str]) -> None:
+    def wake_chat_pages(self, keys: Iterable[str], *, only_open: bool = False) -> None:
         """Wake the pages following these chats without changing any chat's view.
 
         For what an open chat page reads beyond the session itself (#2865): a source
         write that left the normalized session as it was still appended to the
         transcript the page is tailing, and a git context landing moves its chips.
+        ``only_open``: publish only for a chat a page follows right now. The source watch
+        uses it on every transcript write (#4543), so an open page reads the new lines at
+        once rather than after the next liveness sweep, and a chat nobody watches costs
+        no publication.
         """
+        keys = list(keys)
+        if not keys:
+            return
         chats = self.chat_snapshot()
         topics = {chat_topic(self.chat_identity_key(key, chats)) for key in keys}
         for topic in sorted(topics):
-            self.bus.publish(topic)
+            if not only_open or self.bus.subscribers(topic):
+                self.bus.publish(topic)
 
     def _record_moved_sessions(self, moved_sessions: list[Session]) -> None:
         if self.db is not None:
@@ -2785,6 +2802,26 @@ class AppState:
         """
         self._last_boss_turn_digest[session_key] = _text_digest(text)
         return self.open_boss_turn_window(session_key)
+
+    def note_person_message(self, session_key: str) -> datetime:
+        """Record a person's own message to this chat, accepted from the deck's pages (#4562).
+
+        Only the browser's form posts call this, never an agent, a deck notice or a
+        scheduled delivery, so it says a person engaged after anything older.
+        """
+        chat_id = self.chat_identity_key(session_key)
+        at = datetime.now(UTC)
+        held = self.person_messages.get(chat_id)
+        if held is None or held < at:
+            self.person_messages[chat_id] = at
+        if self.db is not None and hasattr(self.db, "note_person_message"):
+            self.db.note_person_message(chat_id, at.isoformat())
+        return at
+
+    def person_message_at(self, chat_ids: Iterable[str]) -> datetime | None:
+        """The latest person message to any of ``chat_ids``, None when none is known."""
+        times = [self.person_messages[c] for c in chat_ids if c in self.person_messages]
+        return max(times, default=None)
 
     def apply_session_changes(
         self,

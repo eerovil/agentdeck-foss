@@ -12,6 +12,8 @@
     {#- The side chat's own status, unseen: voice mode reads from it whether the side chat
         is working (#4349). The stream's first status replaces this first guess. #}
     <div data-side-status sse-swap="status" hidden><span class="status-tag {{ side_display_state }}"></span></div>
+    {#- The 🔊 reply the side chat is writing now, for voice mode's early read (#4543). #}
+    <span data-side-draft sse-swap="draft" hidden></span>
   </div>
   {%- elif side_state == "starting" %}
   <div class="side-view-log" data-side-view-log>

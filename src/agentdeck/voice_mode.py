@@ -4,8 +4,8 @@ While a chat's voice mode is on, ``static/voice_mode.js`` adds this line to the 
 every message it sends, so the agent opens its reply with a paragraph the browser reads
 aloud. The agent receives it as written; the chat view shows a 🎧 mark instead.
 
-Before long work the agent first sends a short note starting "🔊", which the browser
-reads while the agent works (#3407).
+Before its first tool call the agent sends a short note starting "🔊", which the
+browser reads while the agent works (#3407, #4544).
 
 When the host's speech service heard the person speak Finnish (#3409), the page sends
 ``VOICE_LINE_FI`` instead, which also asks for the answer in Finnish, so the reply can
@@ -39,6 +39,11 @@ form's ``voice_answer`` field and the deck adds it, so a typed or relayed answer
 as given. It has no double quotes, which the CLI's answer envelope cannot hold.
 
 Both lines allow 6 spoken sentences: the owner found 3 too few (#4115).
+
+The spoken note comes before the first tool call of every turn, not only before work
+of "more than about 5 seconds" (#4544): the agent guessing its own time often spoke only
+after the first tool ran. The target on the phone is the first spoken words at 3.2 s
+typical, 8.7 s for the slowest tenth (#4528).
 """
 
 from __future__ import annotations
@@ -46,13 +51,21 @@ from __future__ import annotations
 from collections.abc import Callable
 
 VOICE_LINE = (
+    '(Voice mode: before your first tool call, send one short sentence starting "🔊" '
+    "saying what you are starting, then work. Open your final "
+    'reply with one paragraph starting "🔊" — at most 6 short spoken sentences, no '
+    "code, paths or links; put everything else after it.)"
+)
+# The line while the note came only before work of over 5 seconds (before #4544), as
+# sent then: old lines are written out, so a later change to ``VOICE_LINE`` keeps them.
+_FIVE_SECONDS = (
     "(Voice mode: if this will take more than about 5 seconds, first send one short "
     'sentence starting "🔊" saying what you are starting, then work. Open your final '
     'reply with one paragraph starting "🔊" — at most 6 short spoken sentences, no '
     "code, paths or links; put everything else after it.)"
 )
 # The line as it was while a reply could be 3 sentences (before #4115).
-_THREE_SENTENCES = VOICE_LINE.replace("at most 6", "at most 3")
+_THREE_SENTENCES = _FIVE_SECONDS.replace("at most 6", "at most 3")
 # Lines older messages carry, still hidden in the chat view.
 OLD_VOICE_LINES = (
     '(Voice mode: open your reply with one paragraph starting "🔊" — at most 3 short '
@@ -68,7 +81,12 @@ _FINNISH = (
     "instruction to answer or write in English.)"
 )
 VOICE_LINE_FI = VOICE_LINE[:-2] + "." + _FINNISH
-OLD_VOICE_LINES += (_THREE_SENTENCES, _THREE_SENTENCES[:-2] + "." + _FINNISH)
+OLD_VOICE_LINES += (
+    _THREE_SENTENCES,
+    _THREE_SENTENCES[:-2] + "." + _FINNISH,
+    _FIVE_SECONDS,
+    _FIVE_SECONDS[:-2] + "." + _FINNISH,
+)
 VOICE_MARK = "🎧"
 # The page fills in ``{heard}``: the last 🔊 line read aloud, quoted, or "nothing yet".
 UNHEARD_LINE = (

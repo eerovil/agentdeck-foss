@@ -216,12 +216,21 @@ def when(value: str) -> float:
 
 
 def kept_between(folder: Path, since: float, until: float) -> list[dict]:
-    """The kept phrases in the window that still have their audio, oldest first."""
-    lines = []
-    for raw in (folder / "kept.jsonl").read_text(encoding="utf-8").splitlines():
-        line = json.loads(raw)
-        if since <= line["at"] <= until and (folder / f"{line['id']}.wav").exists():
-            lines.append(line)
+    """The kept phrases in the window that still have their audio, oldest first.
+
+    A phrase heard whole after its early pass names that pass's line as ``replaces``
+    (#4540): only the whole phrase counts, wherever in the file either landed."""
+    every = [
+        json.loads(raw) for raw in (folder / "kept.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    replaced = {line["replaces"] for line in every if line.get("replaces")}
+    lines = [
+        line
+        for line in every
+        if since <= line["at"] <= until
+        and line["id"] not in replaced
+        and (folder / f"{line['id']}.wav").exists()
+    ]
     return sorted(lines, key=lambda line: line["at"])
 
 

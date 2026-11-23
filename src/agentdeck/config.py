@@ -764,9 +764,6 @@ class SpeechConfig(BaseModel):
     ``idle_listen_seconds`` is how long voice mode listens with no words heard
     before it waits for "Hey Jarvis" (#3424, #3425, #3476).
 
-    ``working_tick_seconds`` is how often voice mode plays its soft tick while the
-    agent works and nothing is said (#4364); ``0`` turns the tick off.
-
     ``wake_socket`` is the wake word detector's socket (``agentdeck-wake.socket``,
     #3476): openWakeWord's "hey jarvis" on the CPU. ``wake`` says who decides a
     waiting phrase woke voice mode: ``"detector"`` asks it first and runs Whisper
@@ -815,7 +812,6 @@ class SpeechConfig(BaseModel):
     socket: str = ""
     language: Literal["en", "fi", "auto"] = "auto"
     idle_listen_seconds: int = Field(default=15, ge=3, le=600)
-    working_tick_seconds: int = Field(default=5, ge=0, le=600)
     wake_socket: str = ""
     wake: Literal["shadow", "detector", "whisper"] = "shadow"
     wake_threshold: float = Field(default=0.5, gt=0, lt=1)

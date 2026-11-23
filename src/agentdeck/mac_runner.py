@@ -11,6 +11,8 @@ BASE_URL_ENV = "AGENTDECK_MAC_RUNNER_URL"
 TOKEN_ENV = "AGENTDECK_MAC_RUNNER_TOKEN"
 CALLBACK_TOKEN_ENV = "AGENTDECK_MAC_RUNNER_CALLBACK_TOKEN"
 STATE_ENV = "AGENTDECK_MAC_RUNNER_STATE"
+# What `/api/guide/mac-runner` serves here (#4459); no chat is pointed at it.
+MAC_RUNNER_GUIDE = "The Mac command-approval tool is not set up in this edition."
 
 
 def configured() -> bool:

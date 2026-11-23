@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 
 import pytest
 
@@ -395,11 +396,78 @@ def test_a_pending_pr_checks_keeps_exit_8_and_is_cached(shim, capsys):
     assert len(shim.reads) == 1
 
 
-def test_a_shim_launched_gh_never_wraps_itself_again(shim, monkeypatch):
+def test_a_shim_launched_gh_never_wraps_itself_again(shim, monkeypatch, capsys):
     monkeypatch.setenv(install.RECURSION_GUARD, "1")
 
     assert main.main(["issue", "view", "814"]) == 0
-    assert shim.reads == [["issue", "view", "814"]]
+    # Straight through, with no quota probe of its own (#4505).
+    assert shim.calls == [["issue", "view", "814"]]
+
+    # A second nested shim means the `gh` on PATH calls back into the shim: it
+    # refuses, and runs nothing at all.
+    monkeypatch.setenv(install.RECURSION_GUARD, "2")
+    capsys.readouterr()
+
+    assert main.main(["issue", "view", "814"]) == main.EXIT_NO_GH
+    assert shim.calls == [["issue", "view", "814"]]
+    assert "2 shims already run above this one" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("call_back", "wrapper_runs"),
+    # Clearing the variable costs one more pass: the shims are then counted by process.
+    [("", 1), ("env -u AGENTDECK_GH_SHIM_ACTIVE", 2)],
+)
+def test_a_wrapper_that_calls_back_into_the_shim_fails_once(tmp_path, call_back, wrapper_runs):
+    """#4505: a `gh` wrapper ahead of the real binary that `exec`s the shim looped
+    shim -> wrapper -> shim without end. Now the second nested shim refuses, even
+    when the wrapper clears the shim's variable before calling it back."""
+    src = os.path.dirname(os.path.dirname(os.path.dirname(main.__file__)))
+    shim_dir, wrap_dir, real_dir = (tmp_path / name for name in ("shim", "wrap", "real"))
+    for directory in (shim_dir, wrap_dir, real_dir):
+        directory.mkdir()
+    runs = tmp_path / "wrapper-runs"
+    scripts = {
+        shim_dir / "gh": (
+            f"#!/bin/sh\n{install._MARKER}\n"
+            f'exec {sys.executable} -m agentdeck.gh_shim "$@"\n'
+        ),
+        wrap_dir / "gh": (
+            f'#!/bin/sh\necho run >> {runs}\nexec {call_back} {shim_dir / "gh"} "$@"\n'
+        ),
+        real_dir / "gh": "#!/bin/sh\necho REAL\n",
+    }
+    for path, text in scripts.items():
+        path.write_text(text)
+        path.chmod(0o755)
+    environment = {
+        "PATH": os.pathsep.join([str(shim_dir), str(wrap_dir), str(real_dir), "/usr/bin", "/bin"]),
+        "PYTHONPATH": src,
+        "HOME": str(tmp_path),
+        "AGENTDECK_GH_SHIM_DIR": str(shim_dir),
+        "AGENTDECK_GITHUB_CACHE": str(tmp_path / "github.sqlite3"),
+        # A nested shim, as a worker's `gh` call reaches it through the outer one.
+        install.RECURSION_GUARD: "1",
+    }
+
+    done = subprocess.run(
+        [shim_dir / "gh", "issue", "view", "1"],
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert done.returncode == main.EXIT_NO_GH
+    assert "REAL" not in done.stdout
+    assert done.stderr.count("2 shims already run above this one") == 1
+    assert runs.read_text().splitlines() == ["run"] * wrapper_runs
+    logged = [
+        json.loads(line)
+        for line in (tmp_path / main.FAILURE_LOG_NAME).read_text().splitlines()
+    ]
+    assert [entry["kind"] for entry in logged] == ["loop"] + ["recursive"] * wrapper_runs
 
 
 def test_the_shim_installs_itself_first_on_a_workers_path(tmp_path, monkeypatch):

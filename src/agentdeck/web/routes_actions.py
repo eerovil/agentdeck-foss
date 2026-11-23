@@ -236,6 +236,7 @@ async def _hold_for_runtime(
     if held is None:
         cleanup_uploaded_files(uploads.paths)
         raise HTTPException(status_code=409, detail="This message id is already in use.")
+    _note_person_message(request, session.key)
     # A replay of a send already held: the first request's files are the kept ones. A
     # generic file is saved at a path keyed by its action id and content, so a replay can
     # land on the very file the held row keeps; only the replay's other copies go.
@@ -334,10 +335,24 @@ async def _render_start_accepted(
     return response
 
 
+def _note_person_message(request: Request, session_key: str) -> None:
+    """Record a person's own message, sent from one of the deck's pages (#4562).
+
+    Only a page's request counts: HTMX marks it ``HX-Request: true``, and the live-prototype
+    page's Send sets it too. An agent calling the same route, the JSON interaction API, a
+    deck notice and a scheduled delivery send no such header. It is a marker, not a lock:
+    a client that sets it on purpose is taken for a person.
+    """
+    if request.headers.get("hx-request", "").lower() != "true":
+        return
+    get_state(request).note_person_message(session_key)
+
+
 def _note_boss_turn(request: Request, session_key: str, form: FormData, text: str) -> None:
     """Treat an accepted write as the boss engaging with this chat."""
     state = get_state(request)
     state.note_boss_turn(session_key, text)
+    _note_person_message(request, session_key)
     # The accepted write is logically the next user turn even when the provider's
     # transcript has not caught up yet. Retire the old turn's report and owed push
     # now, so neither outlives the reply the boss just gave.
@@ -2459,6 +2474,9 @@ async def _continue_chat(
         return Response(
             starting_chat_path(session_token), status_code=202, media_type="text/plain"
         )
+    if mode != "handoff" and isinstance(form.get("message"), str) and form["message"].strip():
+        # The person's words start the chat's next leg, which is the same chat (#4562).
+        _note_person_message(request, source_session.key)
     destination_url = (
         f"{str(request.base_url).rstrip('/')}{starting_chat_path(session_token)}"
     )

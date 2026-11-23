@@ -20,6 +20,14 @@ Works still open included, by the Works finished in it, so no use is left out an
 shared use is spread evenly. The life cost below it sums each finished Work's own
 chats, subagent legs and review chats over its whole life (``--lookback`` days).
 Baseline, Nov 3-10 2026: see docs/research/token-use-2026-11.md.
+
+Next to it stand the Works started in the window and how fast the finished ones went
+(#4467): from a Work's first turn to its last live check, or its last merge when it has no
+live check (its close, with neither), so a hold before the first turn or an issue filed
+days early is not slowness.
+A Haiku or Sonnet call is priced at its own list price against Opus's (``MODEL_PRICE``),
+and the code-review benchmark's own chats (``BENCH_DIR``) are a row of their own, not "no
+Work".
 """
 
 from __future__ import annotations
@@ -49,6 +57,14 @@ DB = "~/.local/share/agentdeck/agentdeck.db"
 COLD_GAP = 3600  # the cache lives an hour, so a longer pause writes the context again
 AFTER_COMPACT = 62_000  # median context measured right after a compaction
 BIG_CONTEXT = 200_000  # past this a chat should have compacted; #4059 made it so on Nov 3
+# A model's list price against Opus's, the same for every kind of token: Haiku $1/$5 and
+# Sonnet $3/$15 per million against Opus's $5/$25. Assumed to be how the weekly limit counts
+# them (#4467); any other model counts as Opus.
+MODEL_PRICE = {"haiku": 0.2, "sonnet": 0.6}
+# Where the code-review benchmark runs its helper, coder and judge chats (#4428, #4434), as
+# a transcript folder name: research spend no Work's chat made.
+BENCH_DIR = "-agentdeck-review-bench-"
+BENCH_JUDGE = re.compile(r"^You judge one run of a code-review benchmark")  # it runs elsewhere
 
 TRIGGERS = (
     ("reviewer", r"^You are AgentDeck's Claude (fallback )?reviewer"),
@@ -57,7 +73,7 @@ TRIGGERS = (
     ("spec_ok", r"^I approve the spec"),
     ("job", r"^Your queued job"),
     ("ci_wake", r"^AgentDeck wake-on: (commit status|check run|nothing arrived)"),
-    ("wake", r"^AgentDeck wake-on"),
+    ("wake", r"^AgentDeck (wake-on|watch:)"),
     ("review_pass", r"/reviewed pass|^AgentDeck: the review of .*passed clean"),
     (
         "review_result",
@@ -84,9 +100,16 @@ SHELL_KINDS = (
 
 REVIEWED_WORK = re.compile(
     r"^You are AgentDeck's \w+ (?:fallback )?reviewer\..{0,400}?"
-    r"(?:for the Work|asks for a review of) ([\w.-]+/[\w.-]+#\d+)",
+    r"(?:for the Work|asks for a review of|review the design of the Work)"
+    r" ([\w.-]+/[\w.-]+#\d+)",
     re.S,
 )
+# A chat continued from another (an account move, a handoff, the cold-chat bar) names the
+# earlier one by its key in a link or a ``chat-read`` command; a written handoff names only
+# its issue.
+CONTINUED = re.compile(r"Continue the work from")
+EARLIER_CHAT = re.compile(r"\b[a-z_]+:[\w.-]+:([0-9a-f]{8}-[0-9a-f-]{27})\b")
+ISSUE_REF = re.compile(r"\b([\w.-]+/[\w.-]+#\d+)\b")
 
 
 def reviewed_work(text: str) -> str:
@@ -104,6 +127,22 @@ def prompt_work(text: str) -> str:
     inferred = kanban.parse_ref(text)
     url = IssueRef.parse(kanban.issue_url(inferred) or "") if inferred else None
     return f"{url.repository}#{url.number}".lower() if url else reviewed_work(text)
+
+
+def continued_from(text: str) -> tuple[str, str]:
+    """For a chat continued from another, the earlier chat's transcript id and the first
+    issue the message names, each "" when it names none; ("", "") for any other message."""
+    start = CONTINUED.search(text)
+    if not start:
+        return "", ""
+    rest = text[start.start() :]
+    chat, issue = EARLIER_CHAT.search(rest), ISSUE_REF.search(rest)
+    return chat.group(1) if chat else "", issue.group(1).lower() if issue else ""
+
+
+def model_price(model: str | None) -> float:
+    """A model's price against Opus's, by its family's name in the model id."""
+    return next((price for name, price in MODEL_PRICE.items() if name in (model or "")), 1.0)
 
 
 def trigger(text: str) -> str:
@@ -170,14 +209,20 @@ class Call:
     work: str = ""
     leg: str = ""
     sid: str = ""
+    price: float = 1.0  # the model's price against Opus's
 
     @property
     def context(self) -> int:
         return self.fresh + self.write + self.read
 
     @property
+    def scale(self) -> float:
+        """What one token costs here against one on the main account's main model."""
+        return self.weight * self.price
+
+    @property
     def units(self) -> float:
-        return self.weight * (
+        return self.scale * (
             self.fresh * INPUT + self.write * WRITE + self.read * READ + self.output * OUTPUT
         )
 
@@ -246,6 +291,7 @@ def read_transcript(path: Path, weight: int, seen: set) -> tuple[list[Call], lis
                         usage.get("cache_read_input_tokens") or 0,
                         gap=ts - last if last else None,
                         after_compact=compacted,
+                        price=model_price(message.get("model")),
                     )
                     compacted = False
                 call.output = max(call.output, usage.get("output_tokens") or 0)
@@ -302,16 +348,17 @@ def _gh_rows(path: str, query: str) -> list[list[str]]:
     return [line.split("\t") for line in found.stdout.splitlines()]
 
 
-def closed_at_end(events: list[tuple[str, float]], since: float, until: float) -> bool:
-    """Whether an issue stood closed at the window's end by a close inside the window."""
+def closed_at_end(events: list[tuple[str, float]], since: float, until: float) -> float | None:
+    """When an issue closed, if it stood closed at the window's end by a close inside it."""
     last = max(((at, event) for event, at in events if at < until), default=None)
-    return last is not None and last[1] == "closed" and last[0] >= since
+    return last[0] if last is not None and last[1] == "closed" and last[0] >= since else None
 
 
 def github_closes(
     repository: str, since: float, until: float, numbers: set[str] | None = None
-) -> set[str]:
-    """The repository's issues finished in the window, as ``owner/repo#n``, lowercased.
+) -> dict[str, float]:
+    """The repository's issues finished in the window, as ``owner/repo#n``, lowercased, each
+    with when it closed.
 
     Finished means closed at the window's end by a close inside it, as it stood then: a
     reopen after the window does not take a close out of its week. Read from GitHub itself,
@@ -330,16 +377,16 @@ def github_closes(
         ".[] | select(.pull_request | not)"
         ' | [.number, .state, .closed_at // "", .state_reason // ""] | @tsv',
     )
-    finished = set()
+    finished: dict[str, float] = {}
     for row in rows:
         number, state, at, reason = (row + ["", "", "", ""])[:4]
         if not number.isdigit() or (numbers is not None and number not in numbers):
             continue
         when = _stamp(at)
         if state == "closed" and when is not None and when < until:
-            settled = since <= when
+            settled = when if since <= when else None
         elif state == "open" and reason != "reopened":  # never closed, so not in the window
-            settled = False
+            settled = None
         else:  # reopened, or closed after the window: was it closed at the window's end?
             events = _gh_rows(
                 f"repos/{repository}/issues/{number}/events?per_page=100",
@@ -348,15 +395,15 @@ def github_closes(
             )
             stamped = [(e[0], _stamp(e[1])) for e in events if len(e) == 2 and _stamp(e[1])]
             settled = closed_at_end(stamped, since, until)
-        if settled:
-            finished.add(f"{repository.lower()}#{number}")
+        if settled is not None:
+            finished[f"{repository.lower()}#{number}"] = settled
     return finished
 
 
 def finished_works(
     db_path: str, since: float, until: float, closes=github_closes
-) -> tuple[set[str], list[str]]:
-    """Works whose issue closed in the window, from GitHub itself.
+) -> tuple[dict[str, float], list[str]]:
+    """Works whose issue closed in the window, each with when it closed, from GitHub itself.
 
     A Work is a row of the deck's ``works`` inventory, which it writes for every issue a chat
     worked on: registered on a chat, or inferred from a worker's prompt, of any provider. So
@@ -371,11 +418,13 @@ def finished_works(
         key.lower()
         for (key,) in db.execute("select source_key from works where source_kind = 'github_issue'")
     }
-    finished, unread = set(), []
+    finished: dict[str, float] = {}
+    unread: list[str] = []
     for repository in sorted({work.split("#")[0] for work in works}):
         numbers = {work.split("#")[1] for work in works if work.split("#")[0] == repository}
         try:
-            finished |= closes(repository, since, until, numbers) & works
+            closed = closes(repository, since, until, numbers)
+            finished |= {work: at for work, at in closed.items() if work in works}
         except (OSError, subprocess.SubprocessError) as exc:
             detail = getattr(exc, "stderr", "") or exc
             print(f"no closes read for {repository}: {str(detail)[:200]}", file=sys.stderr)
@@ -383,15 +432,66 @@ def finished_works(
     return finished, unread
 
 
+def work_ends(db_path: str) -> dict[str, float]:
+    """When each Work was last done: the later of its last live check and last merge.
+
+    The deck keeps only the newest live check of a Work (``work_metadata``), whatever its
+    result, and each pull request it saw merge for one (``work_merged_pulls``). A merge after
+    a failed check (a reopened Work) is later than it, so the later of the two is taken.
+    """
+    db = sqlite3.connect(f"file:{Path(db_path).expanduser()}?mode=ro", uri=True)
+    ends: dict[str, float] = {}
+    for work, at in db.execute(
+        "select work_id, max(merged_at) from work_merged_pulls group by work_id"
+    ):
+        ends[work.removeprefix("github_issue:").lower()] = _stamp(at) or 0.0
+    for work, at in db.execute(
+        "select work_id, live_check_at from work_metadata where live_check_at is not null"
+    ):
+        key = work.removeprefix("github_issue:").lower()
+        ends[key] = max(ends.get(key, 0.0), _stamp(at) or 0.0)
+    return {work: at for work, at in ends.items() if at}
+
+
+def first_turns(chats: dict[tuple, list[Call]]) -> dict[str, float]:
+    """Each Work's first model call in a chat working on it, its reviews left out."""
+    first: dict[str, float] = {}
+    for calls in chats.values():
+        for c in calls:
+            if c.work and c.stage not in ("review", "benchmark"):
+                first[c.work] = min(first.get(c.work, c.ts), c.ts)
+    return first
+
+
+def _hours(spans: list[float]) -> str:
+    """The median, p75 and p90 of some spans of time, in hours."""
+    if not spans:
+        return "none"
+    # 19 cut points, one each 5 %: the 15th is p75 and the 18th p90
+    cuts = statistics.quantiles(spans, n=20, method="inclusive") if spans[1:] else spans * 19
+    return (
+        f"median {statistics.median(spans) / 3600:.1f} h, p75 {cuts[14] / 3600:.1f} h,"
+        f" p90 {cuts[17] / 3600:.1f} h"
+    )
+
+
 def per_finished_work(
     chats: dict[tuple, list[Call]],
-    finished: set[str],
+    finished: dict[str, float],
     since: float,
     until: float,
     life_since: float | None = None,
     unread: list[str] = (),
+    ends: dict[str, float] | None = None,
 ) -> list[str]:
-    """The headline units per finished Work, and each finished Work's life cost.
+    """The headline units per finished Work, the Works started, the finished Works' speed,
+    and each finished Work's life cost.
+
+    A Work started in the window when its first turn in the lookback fell inside it; one
+    whose chats all ended before ``life_since`` cannot be seen, so a long lookback keeps
+    that rare. Speed runs from a finished Work's first turn to its end in ``ends``
+    (``work_ends``), or to its close in ``finished`` when it has none: a Work done with no
+    pull request and no live check.
 
     The life cost counts calls from ``life_since`` (default: ``since``) on: a transcript is
     read whole once it changed in the lookback, so it holds older calls too. When a
@@ -408,11 +508,16 @@ def per_finished_work(
 
     units = collections.defaultdict(float)
     for c in inside:
-        units["finished" if c.work in finished else "open" if c.work else "none"] += c.units
+        side = "bench" if c.stage == "benchmark" else "none"
+        units["finished" if c.work in finished else "open" if c.work else side] += c.units
+    first = first_turns(chats)
+    started = sum(1 for at in first.values() if since <= at < until)
     lines = [
         f"{len(finished)} Works finished, {total:.1f} units: {per(total)} units per finished Work",
+        f"  Works started {started}, {started * 7 * 86400 / (until - since):.1f} a week",
         f"  of which on them {units['finished']:.1f}u, on Works not finished in the window"
-        f" {units['open']:.1f}u, no Work {units['none']:.1f}u",
+        f" {units['open']:.1f}u, review benchmark {units['bench']:.1f}u,"
+        f" no Work {units['none']:.1f}u",
         f"  as if all on one account: {per(sum(c.units / c.weight for c in inside))}"
         " per finished Work (alt's tokens not doubled, so a shift between accounts is no change)",
         f"  without calls at over {BIG_CONTEXT // 1000}k context"
@@ -424,6 +529,22 @@ def per_finished_work(
         lines.append(f"  n/a: closes not read for {', '.join(unread)}, so the count is short")
         lines.append("  life cost per finished Work: n/a, and no per-repository figures")
         return lines
+    ends = ends or {}
+    timed, closed = {}, 0
+    for work in set(finished) & set(first):
+        # A check or merge after the window, or one from before this run of the Work (a
+        # reopen), is not its end here: it ends at its close then, as with neither.
+        end = ends.get(work, 0.0)
+        fallback = not first[work] < end <= until
+        end = finished[work] if fallback else end
+        if end > first[work]:
+            timed[work] = end - first[work]
+            closed += fallback
+    lines.append(
+        f"  speed, first turn to last live check or merge: {_hours(list(timed.values()))}"
+        f" ({len(timed)} Works, of which {closed} to their close, having neither in time;"
+        f" {len(finished) - len(timed)} with no Claude turn read before it)"
+    )
     life: dict[str, float] = dict.fromkeys(finished, 0.0)
     for calls in chats.values():
         for c in calls:
@@ -454,11 +575,40 @@ def work_at(works: list[tuple[float, str]], ts: float) -> str:
     return works[max(index, 0)][1] if works else ""
 
 
+def infer_works(works: dict[str, list[tuple[float, str]]], turns: dict[str, list[tuple]]) -> None:
+    """Give each chat the database ties to no Work the one its first message points to.
+
+    A chat continued from another takes the Work the earlier chat was on when it moved,
+    through any chain of moves, else the issue the message names; any other takes the Work
+    its first message names (``prompt_work``).
+    """
+    pending: dict[str, tuple[str, str, float]] = {}
+    for sid, messages in turns.items():
+        if sid in works or not messages:
+            continue
+        earlier, issue = continued_from(messages[0][1])
+        if earlier:
+            pending[sid] = earlier, issue, messages[0][0]
+            continue
+        work = issue or prompt_work(messages[0][1])
+        if work:
+            works[sid] = [(0.0, work)]
+    while pending:  # a chain resolves one move a pass, from its oldest end
+        settled = {sid for sid, (earlier, *_) in pending.items() if earlier not in pending}
+        loop = not settled  # chats naming each other: each takes only the issue it names
+        for sid in settled or set(pending):
+            earlier, issue, moved = pending.pop(sid)
+            work = ("" if loop else work_at(works.get(earlier, []), moved)) or issue
+            if work:
+                works[sid] = [(0.0, work)]
+
+
 def load(since: float, until: float, db_path: str = DB) -> dict[tuple, list[Call]]:
     """Every chat and subagent leg active in the window, keyed by (transcript id, leg)."""
     works = work_of_sessions(db_path)
     chats: dict[tuple, list[Call]] = {}
     turns: dict[str, list[tuple]] = {}
+    bench: set[str] = set()
     seen: set = set()
     for root, weight in ACCOUNTS.values():
         for path in Path(root).expanduser().glob("projects/**/*.jsonl"):
@@ -468,14 +618,13 @@ def load(since: float, until: float, db_path: str = DB) -> dict[tuple, list[Call
             sid = path.parts[-3] if leg else path.stem
             calls, messages = read_transcript(path, weight, seen)
             chats[(sid, leg)] = calls
+            if BENCH_DIR in path.relative_to(Path(root).expanduser()).parts[1]:
+                bench.add(sid)
             if not leg:
                 turns[sid] = sorted(messages, key=lambda turn: turn[0])
-    for sid, messages in turns.items():
-        if sid in works or not messages:
-            continue
-        work = prompt_work(messages[0][1])
-        if work:
-            works[sid] = [(0.0, work)]
+                if messages and BENCH_JUDGE.match(turns[sid][0][1]):
+                    bench.add(sid)
+    infer_works(works, turns)
     for (sid, leg), calls in chats.items():
         times = [turn[0] for turn in turns.get(sid, [])]
         stages = stage_turns([turn[1] for turn in turns.get(sid, [])])
@@ -483,7 +632,9 @@ def load(since: float, until: float, db_path: str = DB) -> dict[tuple, list[Call
             index = bisect.bisect_right(times, call.ts) - 1
             call.stage, call.kind = stages[index] if index >= 0 else ("none", "none")
             call.work, call.leg, call.sid = work_at(works.get(sid, []), call.ts), leg, sid
-            if not call.work and call.stage != "review":
+            if sid in bench:
+                call.stage, call.work = "benchmark", ""
+            elif not call.work and call.stage != "review":
                 call.stage = "no-work"
     return chats
 
@@ -521,11 +672,11 @@ def replay_window(chats: dict[tuple, list[Call]], since: float, until: float, wi
             if call.after_compact:  # the real chat just shrank; nothing simulated is left
                 offset = 0
             if call.context - offset > window:
-                saved -= call.weight * (
+                saved -= call.scale * (
                     AFTER_COMPACT * WRITE + 6000 * OUTPUT + (call.context - offset) * READ
                 )
                 offset = call.context - AFTER_COMPACT
-            saved += call.weight * min(offset, call.read) * READ
+            saved += call.scale * min(offset, call.read) * READ
     return saved
 
 
@@ -545,8 +696,8 @@ def ideas(chats: dict[tuple, list[Call]], since: float, until: float) -> list[st
         f"fresh chats and legs {len(first)}: median first call"
         f" {statistics.median(c.context for c in first or [Call(0, 1)]):.0f}."
         f" 10k less standing prompt saves"
-        f" {share(sum(c.weight * 10_000 * READ for c in inside))} reads +"
-        f" {share(sum(c.weight * 10_000 * WRITE for c in first))} writes"
+        f" {share(sum(c.scale * 10_000 * READ for c in inside))} reads +"
+        f" {share(sum(c.scale * 10_000 * WRITE for c in first))} writes"
     )
     cold = [
         c
@@ -554,9 +705,9 @@ def ideas(chats: dict[tuple, list[Call]], since: float, until: float) -> list[st
         if c.gap and c.gap > COLD_GAP and c.write > 0.5 * c.context and c.context > 20_000
     ]
     lines.append(
-        f"cold wakes {len(cold)}: {share(sum(c.weight * c.write * WRITE for c in cold))},"
+        f"cold wakes {len(cold)}: {share(sum(c.scale * c.write * WRITE for c in cold))},"
         f" not started by a person"
-        f" {share(sum(c.weight * c.write * WRITE for c in cold if c.kind != 'person'))}"
+        f" {share(sum(c.scale * c.write * WRITE for c in cold if c.kind != 'person'))}"
     )
     legs = [c for c in inside if c.leg]
     lines.append(f"subagent legs: {share(sum(c.units for c in legs))}")
@@ -567,7 +718,7 @@ def ideas(chats: dict[tuple, list[Call]], since: float, until: float) -> list[st
             if since <= two.ts < until and two.gap and two.gap < 120 and not one.text:
                 if _read_only(one) and _read_only(two):
                     pairs += 1
-                    second += two.weight * two.read * READ
+                    second += two.scale * two.read * READ
     lines.append(f"back-to-back read-only calls {pairs}: {share(second)}")
     lines.append(f"turns the deck woke: {share(sum(c.units for c in inside if c.kind in WOKEN))}")
     return lines
@@ -598,7 +749,8 @@ def main() -> None:
     print(f"{len(inside)} model calls, {sum(tools.values())} tool calls,")
     print(f"{sum(c.units for c in inside):.0f} units\n\nPer finished Work")
     finished, unread = finished_works(args.db, since, until)
-    print("\n".join(per_finished_work(chats, finished, since, until, life_since, unread)))
+    ends = work_ends(args.db)
+    print("\n".join(per_finished_work(chats, finished, since, until, life_since, unread, ends)))
     print("\nBy stage")
     print("\n".join(table(inside, lambda c: c.stage)))
     print("\nBy Work")

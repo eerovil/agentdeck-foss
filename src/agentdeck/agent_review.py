@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import json
 import logging
 import os
@@ -39,6 +40,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .review_refs import ReviewBusy, ReviewError, _read_json
+from .work_release import MINOR_LINES, MINOR_TEST, TEST_FILES_TEXT
 
 log = logging.getLogger(__name__)
 
@@ -105,9 +107,19 @@ class Started:
 
 
 def brief(
-    *, name: str, pull: str, issue: str, head: str, base: str, digest: str, note: str = ""
+    *,
+    name: str,
+    pull: str,
+    issue: str,
+    head: str,
+    base: str,
+    digest: str,
+    note: str = "",
+    token: str = "",
 ) -> str:
-    """The first message of one reviewer's chat."""
+    """The first message of one reviewer's chat. ``token`` names its message files, so two
+    reviewers never send each other's file (#4468); only its first 12 characters, as the
+    full token is a design reviewer's proof of who sends a verdict."""
     again = (
         f"\nThis head was reviewed before; the Work's agent asked for another review: {note}\n"
         if note
@@ -133,9 +145,13 @@ commit, made for you; the deck removes it when you stop.
 not merge or deploy, and do not comment on GitHub.
 - If the Work's issue has a comment opening with `**Design:**` that a design review passed, \
 check the code against that design (#4332): a design finding names the line of the design it \
-breaks, or says the design missed the case.
+breaks, or says the design missed the case. A design passed with notes (#4463) when the \
+deck's comment after it quotes `/claude Design review of <owner/repo#n>: notes <id>`: read \
+that design too, and each line after that verdict line is a gap still open, which the code \
+must answer; check the code for each and send a finding for any it leaves open.
 {lanes}- Then report through the deck, which hands it to the Work's agent and to its release. \
-Write each message to a file under `/var/tmp` and send it with
+Write each message to a new file of its own, `/var/tmp/review-{(token or head)[:12]}-1.md`, \
+`-2.md` and so on, and send it with
     `{DECK_REQUEST} {issue} --body-file <file>`
   with a 10-minute timeout, never in the background. The deck's answer is the delivery. If the \
 command fails or its answer is unclear, run the same command once more: a repeat is the same \
@@ -143,7 +159,11 @@ request.
   - If anything must change before this merges, send the findings first, as one message whose \
 first line is exactly `/claude Review of {pull} at {head}` and whose next lines are the \
 findings, each with its file, line and why. Then send the verdict \
-`/reviewed changes-needed {head} {pull}`.
+`/reviewed changes-needed {head} {pull}`, or, when every finding is minor, \
+`/reviewed minor {head} {digest} {pull}` instead (#4474): the agent's small fix of them then \
+needs no new review. A finding is minor when it is {MINOR_TEST}. A fix counts as small when \
+it changes doc files, {TEST_FILES_TEXT} and at most {MINOR_LINES} lines of code in files the \
+pull request already changes.
   - If nothing must change, send only the verdict `/reviewed pass {head} {digest} {pull}`.
   Send exactly one verdict.
 - Finish by saying in a few sentences what you found and why you gave that verdict.
@@ -152,6 +172,9 @@ findings, each with its file, line and why. Then send the verdict \
 
 # ``start(kind, cwd, text, token) -> (accepted, why)``: launch one reviewer chat.
 Starter = Callable[[str, Path, str, str], Awaitable[tuple[bool, str]]]
+# ``on_stopped(line, running, stopped)``: a design reviewer's ledger line the sweep dropped, the
+# lines still running, and every line this sweep dropped (#4458).
+Stopped = Callable[[dict, list[dict], list[dict]], object]
 # ``alive(token)``: True while it runs, False once it stopped, None while the deck cannot tell.
 Alive = Callable[[str], "bool | None"]
 # ``checkout_of(pull)``: directories on this host that may be checkouts of the pull request's
@@ -229,6 +252,7 @@ class AgentReviewer:
         read_pull: ReadPull = read_pull,
         git: Git = git,
         clock: Callable[[], float] = time.time,
+        on_stopped: Stopped | None = None,
     ) -> None:
         if kind not in PROVIDERS:
             raise ValueError(f"no agent reviewer {kind!r}")
@@ -242,6 +266,7 @@ class AgentReviewer:
         self._read_pull = read_pull
         self._git = git
         self._clock = clock
+        self._on_stopped = on_stopped
         self._lock = asyncio.Lock()
 
     # --- the ledger: one line per reviewer started, until its checkout is removed ---
@@ -263,16 +288,33 @@ class AgentReviewer:
         return running(line, now, self._alive)
 
     async def sweep(self) -> list[dict]:
-        """Drop every reviewer that stopped, removing its checkout; the ones still running."""
+        """Drop every reviewer that stopped, removing its checkout; the ones still running.
+
+        Called with ``self._lock`` held, from a start or from ``sweep_now``. Each dropped design
+        reviewer goes to ``on_stopped`` before the ledger is written (#4458), so a crash in
+        between hands it over again on the next sweep, under the same token."""
         now = self._clock()
         kept, done = [], []
         for line in self._read():
             (kept if self._running(line, now) else done).append(line)
         for line in done:
             await self._remove(line)
+            if self._on_stopped is not None and str(line.get("pull") or "").startswith("design:"):
+                try:
+                    result = self._on_stopped(line, kept, done)
+                    if inspect.isawaitable(result):
+                        await result
+                except Exception:  # noqa: BLE001 - a lost notice must not stop a sweep or a start
+                    log.exception("agent review: telling of stopped %s failed", line.get("pull"))
         if done:
             self._write(kept)
         return kept
+
+    async def sweep_now(self) -> list[dict]:
+        """One sweep with no start (#4458): a reviewer that stopped is dropped, and its Work
+        told, even while no other review starts."""
+        async with self._lock:
+            return await self.sweep()
 
     async def _remove(self, line: dict) -> None:
         path, root = line.get("path"), line.get("root")
@@ -319,7 +361,14 @@ class AgentReviewer:
             self._write([*self._read(), _line(token, pull, head, path, root, self._clock())])
             name = NAMES[self.kind]
             text = brief(
-                name=name, pull=pull, issue=issue, head=head, base=base, digest=digest, note=note
+                name=name,
+                pull=pull,
+                issue=issue,
+                head=head,
+                base=base,
+                digest=digest,
+                note=note,
+                token=token,
             )
             try:
                 accepted, refusal = await self._start(self.kind, path, text, token)
@@ -332,14 +381,16 @@ class AgentReviewer:
         log.info("agent review: a %s reviewer started on %s at %s", name, pull, head[:12])
         return Started(((pull, head),), f"a {name} reviewer started on {pull} at {head[:7]}")
 
-    async def start_design(self, issue: str, design_url: str, *, checkout: str = "") -> Started:
+    async def start_design(
+        self, issue: str, design_url: str, *, checkout: str = "", earlier: str = ""
+    ) -> Started:
         """Start the design review of ``issue``'s design comment ``design_url`` (#4332).
 
         One per design comment: asked again while it runs, it answers that one. It takes one
         of the same places as code reviews. The reviewer reads a throwaway checkout of the
         repository's default branch, made from ``checkout`` (the asking chat's directory) when
         that is one of the repository. Raises ``ReviewBusy`` and ``ReviewError`` as ``start``
-        does.
+        does. ``earlier`` makes it the last round (#4463): the design whose gaps it rechecks.
         """
         from .design_review import brief as design_brief
         from .design_review import comment_id
@@ -375,6 +426,7 @@ class AgentReviewer:
                 base=base,
                 request=DECK_REQUEST,
                 token=token,
+                earlier=earlier,
             )
             try:
                 accepted, refusal = await self._start(self.kind, path, text, token)
@@ -534,8 +586,8 @@ def _process_alive(pid) -> bool:
 def design_reviewer(ledger: Path, issue: str, comment: str) -> dict | None:
     """The ledger line of the reviewer the deck started on ``issue``'s design comment
     ``comment``, or ``None`` (#4337): read by the web for ``GET …/design-review``. A line
-    stays until the next start sweeps it, so whether the reviewer still runs is
-    ``running``'s to say."""
+    stays until a sweep drops it (a start's, or the services' tick every few minutes, which
+    tells the Work, #4458), so whether the reviewer still runs is ``running``'s to say."""
     try:
         lines = json.loads(ledger.read_text())
     except (OSError, ValueError):

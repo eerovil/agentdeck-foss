@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from fastapi import HTTPException, Request
 from fastapi.templating import Jinja2Templates
+from starlette.requests import HTTPConnection
 
 from ..config import AppConfig
 from ..models import Account, Session
@@ -16,8 +17,9 @@ from ..providers import PROVIDERS, SessionProvider
 from ..state import AppState
 
 
-async def require_access(request: Request) -> None:
-    """Placeholder access gate. No-op in v0.x; the seam for future auth."""
+async def require_access(request: HTTPConnection) -> None:
+    """Placeholder access gate. No-op in v0.x; the seam for future auth. It takes any
+    connection, so a router's WebSocket routes pass it too (#4539)."""
     return None
 
 

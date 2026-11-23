@@ -93,7 +93,7 @@ def classify(body: object) -> dict[str, str]:
     found: dict[str, str] = {}
     for verdict in parse_verdicts(body, bot_marker=BOT_MARKER) or ():
         if verdict.is_valid and verdict.head:
-            # ``changes-needed`` and ``no-code`` both say the reviewer found something.
+            # ``changes-needed``, ``no-code`` and ``minor`` all say the reviewer found something.
             found[verdict.head.lower()] = PASSED if verdict.verdict == "pass" else FINDINGS
     if found:
         return found

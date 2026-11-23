@@ -411,10 +411,18 @@ async def test_a_refused_start_is_final_for_its_press_and_a_new_press_may_try(
         calls.append(kwargs["session_token"])
         return InjectResult(False, "a new session is already starting for this account")
 
+    # A New chat starts the Work's next round only once it started (#4585).
+    from agentdeck.web import routes_works
+
+    rounds: list[str] = []
+    monkeypatch.setattr(
+        routes_works, "start_follow_up_round", lambda app, card: rounds.append(card.work_id)
+    )
     monkeypatch.setattr(injector, "start_new", busy)
     refused = await _post(app, _press("side-chat-0006"))
     assert refused.status_code == 409 and "already starting" in refused.text
     assert app.state.control_db.pending_work_side_chats() == []
+    assert rounds == []
     replay = await _post(app, _press("side-chat-0006"))
     assert replay.status_code == 409 and "did not start a chat" in replay.text
     assert calls == ["side-chat-0006"]
@@ -422,6 +430,7 @@ async def test_a_refused_start_is_final_for_its_press_and_a_new_press_may_try(
     monkeypatch.setattr(injector, "start_new", real)
     assert (await _post(app, _press("side-chat-0007"))).status_code == 202
     assert [token for _, _, token in starts] == ["side-chat-0007"]
+    assert rounds == [WORK.work_id]
     await injector.stop()
 
 

@@ -75,7 +75,7 @@
 </div>
 {%- elif e.role == 'tool' or (not e.text and not e.question and not e.tool_name and not e.image_media_types) -%}
 {%- else -%}
-<div id="event-{{ event_id }}" class="ev {{ e.role }}{% if e.failed %} failed{% endif %}{% if e.subagent %} sub{% endif %}"{% if e.queued %} data-queued{% endif %} data-event-seq="{{ e.seq }}" data-event-id="{{ event_id }}" data-event-session-key="{{ session_key }}"{{ observed_attrs }}>
+<div id="event-{{ event_id }}" class="ev {{ e.role }}{% if e.failed %} failed{% endif %}{% if e.subagent %} sub{% endif %}"{% if e.queued %} data-queued{% endif %} data-event-seq="{{ e.seq }}" data-event-id="{{ event_id }}" data-event-session-key="{{ session_key }}"{% if e.message_id %} data-message-id="{{ e.message_id }}"{% endif %}{{ observed_attrs }}>
   <div class="ev-head">
     <span class="ev-role">{{ e.role }}{% if e.subagent %} · {{ e.subagent }}{% endif %}</span>
     <span class="ev-head-meta">

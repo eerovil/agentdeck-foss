@@ -205,7 +205,19 @@
     {%- endif %}
   </ul>
   {%- if not card.outputs and not card.verification %}
-  <p class="rt-note" data-wk-verification="none">No pull request or verification job names this Work yet.</p>
+  <p class="rt-note" data-wk-verification="none">{% if card.earlier_outputs %}No pull request in this round yet.{% else %}No pull request or verification job names this Work yet.{% endif %}</p>
+  {%- endif %}
+  {%- if card.earlier_outputs %}
+  {#- The pull requests of the Work's earlier rounds (#4585): history, shut by default so a
+      long Work's page stays short on a phone. Nothing that decides its status reads them. #}
+  <details class="wd-earlier" data-wd-earlier>
+    <summary>Earlier rounds ({{ card.earlier_outputs | length }})</summary>
+    <ul class="wd-facts">
+      {%- for output in card.earlier_outputs %}
+      <li data-wd-earlier-output="{{ output.url }}"><a href="{{ output.url }}" target="_blank" rel="noopener">PR {{ output.label }}</a>{% if output.state %} · <span class="wo-state">{{ output.state }}</span>{% endif %}</li>
+      {%- endfor %}
+    </ul>
+  </details>
   {%- endif %}
 </section>
 {%- elif section == "issue" %}

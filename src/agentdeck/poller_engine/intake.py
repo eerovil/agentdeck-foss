@@ -39,9 +39,10 @@ _REF_RE = re.compile(r"^(?:[A-Za-z0-9._-]+/)?(?P<repo>[A-Za-z0-9._-]+)#(?P<numbe
 # the three bits that let the poller merge. `changes-needed` needs no digest: it only clears.
 # `no-code` (#3322) is a review whose findings need no code change, and states the digest as a
 # pass does: on a Work the deck merges, fixing them needs no new review. The Poller's own intake
-# (`parse_control`) reads it as `changes-needed`, as it always would have.
+# (`parse_control`) reads it as `changes-needed`, as it always would have. `minor` (#4474) is the
+# same with small code fixes allowed: the deck checks the fix push's size itself.
 _REVIEWED_RE = re.compile(
-    r"^\s*/reviewed\s+(?P<verdict>pass|changes-needed|no-code)\s+(?P<head>[0-9a-fA-F]{7,40})"
+    r"^\s*/reviewed\s+(?P<verdict>pass|changes-needed|no-code|minor)\s+(?P<head>[0-9a-fA-F]{7,40})"
     r"(?:\s+(?P<digest>[0-9a-fA-F]{64}))?"
     r"(?:\s+(?P<ref>\S+))?\s*$",
     re.IGNORECASE,
@@ -136,7 +137,7 @@ def parse_control(
 
     if text.lower().startswith("/reviewed"):
         command = _reviewed(_TRAILING_HTML_COMMENTS_RE.sub("", text))
-        if command.verdict == "no-code":
+        if command.verdict in ("no-code", "minor"):
             return replace(command, verdict="changes-needed")
         return command
 
@@ -180,7 +181,7 @@ def _reviewed(text: str) -> Command:
         return Command(CommandKind.INVALID_REVIEWED)
     verdict = reviewed.group("verdict").lower()
     digest = (reviewed.group("digest") or "").lower()
-    if verdict in ("pass", "no-code") and not digest:
+    if verdict in ("pass", "no-code", "minor") and not digest:
         return Command(CommandKind.INVALID_REVIEWED)
     named = reviewed.group("ref")
     targets: tuple[str, ...] = ()

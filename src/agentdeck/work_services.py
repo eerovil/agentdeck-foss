@@ -16,6 +16,8 @@ its own objects in; the services process hands in calls to the web's internal ro
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import inspect
 import json
 import logging
@@ -23,9 +25,17 @@ import shutil
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
-from . import agent_review, design_review, review_paperwork, review_refs, work_release
+from . import (
+    agent_review,
+    design_review,
+    review_paperwork,
+    review_refs,
+    work_release,
+    work_rounds,
+)
 from .poller_ops import work_hold_labels, work_start_labels, work_unassigned_elsewhere
 from .scheduled_messages import ScheduledMessage
 from .wake_on import (
@@ -39,17 +49,22 @@ from .wake_on import (
 from .work import WorkRef
 from .work_backstop import MissedStartBackstop
 from .work_claims import start_issue
+from .work_facts import pull_state
 from .work_router import (
     REVIEW_POLICY_PATH,
     AgainBusy,
     AgainRefused,
     ShipPorts,
+    ShipRuns,
     SwitchedRepositories,
     WorkRouterService,
     base_only_between,
+    behind_base,
+    late_read,
     no_code_between,
     pull_files,
     pulls_lookup,
+    ship_merge_between,
     work_busy,
     work_pulls,
 )
@@ -61,6 +76,7 @@ from .work_signals import (
     newest_comment,
     open_blockers,
     read_comment,
+    read_comments,
     read_dependencies,
     read_map,
     read_map_body,
@@ -135,6 +151,146 @@ def make_deck_claims(config) -> Callable[[str, str], bool]:
         )
 
     return deck_claims
+
+
+#: How often the reviewers' ledger is swept when no review starts (#4458).
+REVIEWER_SWEEP_S = 300.0
+
+
+async def tell_design_dropped(
+    release, verdicts, line: dict, running: list[dict], newest_stopped: str = ""
+) -> bool | None:
+    """Tell the Work its design reviewer of ``line`` stopped without a verdict (#4458).
+
+    ``None``, nothing to tell, when that design comment is no longer the one to act on
+    (``_still_actionable``). Otherwise whether the Work was told now: ``False`` when its chat
+    could not be reached, or was told already."""
+    from .work import IssueRef, WorkRef
+
+    key = str(line.get("pull") or "")
+    issue = key.removeprefix("design:")
+    comment = _comment_of(line)
+    token = str(line.get("token") or "")
+    ref = IssueRef.parse(issue)
+    if not key.startswith("design:") or ref is None or not comment or not token:
+        return None
+    if not _still_actionable(issue, comment, verdicts, running, newest_stopped):
+        return None
+    return await release.on_design_dropped(WorkRef.from_issue(ref).work_id, comment, token)
+
+
+def _still_actionable(
+    issue: str, comment: str, verdicts, running: list[dict], newest_stopped: str
+) -> bool:
+    """Whether design ``comment`` of ``issue`` is still the one to act on (#4458 review): the
+    newest design comment the deck knows of, from its recorded verdicts, its running reviewers
+    and the newest one it saw stop (``DesignDropped``'s file), and one with neither a verdict
+    nor a reviewer still running on it. Another reviewer that stopped on the same comment hides
+    nothing: each start is told."""
+    key = f"design:{issue}"
+    mine = {_comment_of(other) for other in running if other.get("pull") == key}
+    known = set(verdicts.of(issue)) | mine
+    if comment in known:
+        return False
+    return not any(_newer(other, comment) for other in known | {newest_stopped})
+
+
+def _comment_of(line: dict) -> str:
+    return str(line.get("head") or "").removeprefix("comment-")
+
+
+def _newer(other: str, comment: str) -> bool:
+    try:
+        return int(other) > int(comment)
+    except ValueError:
+        return False
+
+
+#: How long a stopped design reviewer's notice is tried again while the Work's chat cannot be
+#: reached, say mid-move to another account (#4458 helper checks).
+RETELL_S = 3600.0
+
+
+class DesignDropped:
+    """Tells Works their design reviewer stopped with no verdict (#4458): the sweep's
+    ``on_stopped``.
+
+    The sweep removes a stopped reviewer's ledger line, so what is still needed of it is kept
+    in one file beside the ledger (``design-dropped.json``), surviving a services restart
+    (review round 5): per issue the newest design comment whose reviewer was seen stopped,
+    which makes an older design's notice obsolete, and the notices the Work's chat could not
+    take yet, tried again on each tick for ``RETELL_S``. Its calls run one at a time."""
+
+    def __init__(
+        self, release, verdicts, path: Path, clock: Callable[[], float] = time.time
+    ) -> None:
+        self.release = release
+        self._verdicts = verdicts
+        self._path = path
+        self._clock = clock
+        self._lock = asyncio.Lock()
+
+    @classmethod
+    def beside(cls, release, verdicts, ledger: Path) -> DesignDropped:
+        return cls(release, verdicts, ledger.with_name("design-dropped.json"))
+
+    def _read(self) -> dict:
+        try:
+            data = json.loads(self._path.read_text())
+        except (OSError, ValueError):
+            data = {}
+        data = data if isinstance(data, dict) else {}
+        for part in ("newest", "unheard"):
+            if not isinstance(data.get(part), dict):
+                data[part] = {}
+        return data
+
+    def _write(self, data: dict) -> None:
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self._path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(data, indent=1))
+        temporary.replace(self._path)
+
+    @property
+    def unheard(self) -> dict[str, dict]:
+        """The notices waiting for the Work's chat, by reviewer start token."""
+        return self._read()["unheard"]
+
+    async def __call__(self, line: dict, running: list[dict], stopped: list[dict]) -> None:
+        async with self._lock:
+            data = self._read()
+            for other in [*stopped, line]:
+                key = str(other.get("pull") or "")
+                comment = _comment_of(other)
+                if not key.startswith("design:") or not comment:
+                    continue
+                issue = key.removeprefix("design:")
+                if not _newer(data["newest"].get(issue, ""), comment):
+                    data["newest"][issue] = comment
+            self._write(data)
+            await self._tell(data, line, running, self._clock())
+
+    async def retell(self, running: list[dict]) -> None:
+        async with self._lock:
+            data = self._read()
+            for held in list(data["unheard"].values()):
+                if isinstance(held, dict) and isinstance(held.get("line"), dict):
+                    await self._tell(data, held["line"], running, float(held.get("since") or 0))
+
+    async def _tell(self, data: dict, line: dict, running: list[dict], since: float) -> None:
+        token = str(line.get("token") or "")
+        issue = str(line.get("pull") or "").removeprefix("design:")
+        newest = str(data["newest"].get(issue) or "")
+        try:
+            told = await tell_design_dropped(self.release, self._verdicts, line, running, newest)
+        except Exception:  # noqa: BLE001 - the store or chat failing is tried again (review)
+            log.exception("work services: telling %s its reviewer stopped failed", line.get("pull"))
+            told = False
+        if told is False and self._clock() - since < RETELL_S:
+            data["unheard"][token] = {"line": line, "since": since}
+        else:
+            data["unheard"].pop(token, None)
+        self._write(data)
 
 
 def work_reviewer(config) -> str:
@@ -224,6 +380,11 @@ class WorkServices:
     check: Any = None
     #: Lighter review (#4399, ``light_review.LightReview``).
     light: Any = None
+    #: The reviewer whose ledger the sweep tick reads (#4458), ``None`` with reviews off.
+    reviewer: Any = None
+    #: Its ``on_stopped`` (``DesignDropped``), whose unheard notices each tick tries again.
+    design_dropped: Any = None
+    _sweeping: asyncio.Task | None = None
 
     def start(self) -> None:
         self.router.start()
@@ -233,8 +394,33 @@ class WorkServices:
             self.light.start()
         if self.check is not None:
             self.check.start()
+        if self.reviewer is not None and self._sweeping is None:
+            self._sweeping = asyncio.create_task(
+                self._sweep_reviewers(), name="work-reviewer-sweep"
+            )
+
+    async def _sweep_reviewers(self) -> None:
+        """Sweep the reviewers' ledger every ``REVIEWER_SWEEP_S`` (#4458), after the chats are
+        copied: a design reviewer that stopped is dropped and its Work told even while no other
+        review starts, which was the only sweep before."""
+        await self.hooks.scanned()
+        while True:
+            try:
+                running = await self.reviewer.sweep_now()
+                if self.design_dropped is not None:
+                    await self.design_dropped.retell(running)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("work services: reviewer sweep failed")
+            await asyncio.sleep(REVIEWER_SWEEP_S)
 
     async def stop(self) -> None:
+        sweeping, self._sweeping = self._sweeping, None
+        if sweeping is not None:
+            sweeping.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await sweeping
         if self.check is not None:
             await self.check.stop()
         await self.backstop.stop()
@@ -307,6 +493,7 @@ CALLS: dict[str, tuple[str, ...]] = {
         "note_registered",
         "note_deployed",
         "ask_again",
+        "recover_review",
         "accept",
         "ship_now",
         "pre_review_done",
@@ -343,39 +530,46 @@ def build(
     """The router, the release and the backstop over ``state``, ``db`` and ``hooks``."""
     enabled = services_enabled(config)
     reviewer = work_reviewer(config)
-    agent_reviewer = (
-        agent_review.AgentReviewer(
-            kind=reviewer,
+    verdicts = design_review.Verdicts.beside(config.review.ledger_path)
+
+    # Late-bound: the release is made below, and a sweep runs only once the services start.
+    design_stopped = DesignDropped.beside(None, verdicts, config.review.ledger_path)
+
+    def make_reviewer(kind: str) -> agent_review.AgentReviewer:
+        return agent_review.AgentReviewer(
+            kind=kind,
             max_reviewers=config.review.max_reviewers,
             ledger=config.review.ledger_path,
             digest=review_refs.target_digest,
+            on_stopped=design_stopped,
             **hooks.reviewer(),
         )
-        if reviewer in agent_review.PROVIDERS
+
+    agent_reviewer = make_reviewer(reviewer) if reviewer in agent_review.PROVIDERS else None
+    # The design review (#4332) runs on the code reviewer, sharing its places and ledger. When
+    # ChatGPT reviews code, one Claude reviewer on that ledger is the only one writing it. It is
+    # made at start (#4458), so the sweep tick finds a ledger an earlier run left.
+    design_reviewer = (
+        agent_reviewer
+        if agent_reviewer is not None
+        else make_reviewer(agent_review.CLAUDE)
+        if reviewer != agent_review.OFF
         else None
     )
-    # The design review (#4332) runs on the code reviewer, sharing its places and ledger. When
-    # ChatGPT reviews code, one Claude reviewer on that ledger is the only one writing it, made at
-    # the first design review.
-    design_reviewers: list[agent_review.AgentReviewer] = [agent_reviewer] if agent_reviewer else []
 
-    async def start_design(issue: str, design_url: str, *, checkout: str = "") -> object:
-        if not design_reviewers:
-            design_reviewers.append(
-                agent_review.AgentReviewer(
-                    kind=agent_review.CLAUDE,
-                    max_reviewers=config.review.max_reviewers,
-                    ledger=config.review.ledger_path,
-                    digest=review_refs.target_digest,
-                    **hooks.reviewer(),
-                )
-            )
-        return await design_reviewers[0].start_design(issue, design_url, checkout=checkout)
+    async def start_design(
+        issue: str, design_url: str, *, checkout: str = "", earlier: str = ""
+    ) -> object:
+        if design_reviewer is None:
+            raise review_refs.ReviewOff(review_refs.REVIEWER_OFF_TEXT)
+        return await design_reviewer.start_design(
+            issue, design_url, checkout=checkout, earlier=earlier
+        )
 
     design = (
         design_review.DesignRound(
             start_design,
-            design_review.Verdicts.beside(config.review.ledger_path),
+            verdicts,
             reviews=lambda token, issue, comment: agent_review.reviews_design(
                 config.review.ledger_path, token, issue, comment
             ),
@@ -637,9 +831,22 @@ def build(
         add = getattr(db, "add_pending_event", None)
         return bool(add(note_id, chat_id, text)) if add is not None else False
 
+    async def release_late_read(pull: str, old: str, live: str) -> tuple[bool, set[str] | None]:
+        repository, _, number = pull.rpartition("#")
+        if not number.isdigit():
+            return False, None
+        return await late_read(repository, int(number), old, live)
+
     async def release_pull_files(pull: str) -> set[str] | None:
         repository, _, number = pull.rpartition("#")
         return await pull_files(repository, int(number)) if number.isdigit() else None
+
+    async def release_loading(merges: list[tuple[str, set[str]]]) -> frozenset[str] | None:
+        # Which of this deck's processes load a merge, from its merge commit's tree (#4500).
+        from .deployment import deploy_repo_dir
+        from .live_check_scope import loading_processes
+
+        return await loading_processes(deploy_repo_dir(), merges)
 
     def release_wait_deploy(chat_id: str, refs: list[str], bodies: list[dict], then: str) -> bool:
         # The deploy waits the live-check request asked the agent to register (#4253), on the
@@ -709,11 +916,35 @@ def build(
         response.raise_for_status()
         return bool(response.json().get("job"))
 
+    # Rounds of a reopened Work (#4585): the release counts only the current round's pull
+    # requests, and the router starts a round on a reopen and skips an earlier one's merge.
+    def round_of(work_id: str) -> Any:
+        return work_rounds.load(db, [work_id]).get(work_id)
+
+    def round_pulls(work_id: str) -> tuple[str, ...]:
+        return work_rounds.current(work_pulls(state, work_id), round_of(work_id))
+
+    def round_pulls_lookup() -> Callable[[str], tuple[str, ...]]:
+        lookup = pulls_lookup(state)
+        rounds = work_rounds.load(db)
+        return lambda work_id: work_rounds.current(lookup(work_id), rounds.get(work_id))
+
+    def start_reopened_round(work_id: str) -> bool:
+        earlier = work_rounds.settled(work_pulls(state, work_id), issues.cached_pulls, pull_state)
+        return work_rounds.start(db, work_id, earlier, work_rounds.REOPENED)
+
+    def earlier_pulls(work_id: str) -> frozenset[str]:
+        return getattr(round_of(work_id), "earlier", None) or frozenset()
+
+    # The Ship now presses running here (#4558): the router runs them, the release's hold
+    # line reads them.
+    ship_runs = ShipRuns()
     release = work_release.WorkReleaseService(
         work_release.ReleaseStore(config.github_webhook.store_path / work_release.STORE_FILENAME),
         work_release.Ports(
             press_is_review=reviewer == agent_review.OFF,
             ship_unfinished=state.ship_unfinished,
+            ship_running_head=ship_runs.head_of,
             shipped_findings=lambda work_id: [
                 (record.pull, record.fix)
                 for record in state.shipped_by_work(work_id.removeprefix("github_issue:"))
@@ -723,13 +954,15 @@ def build(
             paused=release_paused,
             starred=work_starred,
             policy=work_release.Policies(config.poller.root),
-            pulls=lambda work_id: work_pulls(state, work_id),
-            pulls_lookup=lambda: pulls_lookup(state),
+            pulls=round_pulls,
+            pulls_lookup=round_pulls_lookup,
+            round_of=round_of,
             chat=release_chat,
             read_pull=work_release.read_pull,
             digest=release_digest,
             green_heads=release_green_heads,
             failed_heads=release_failed_heads,
+            replaced_checks=work_release.replaced_checks,
             moved_heads=release_moved_heads,
             unclean_heads=release_unclean_heads,
             merge=work_release.merge,
@@ -748,12 +981,15 @@ def build(
             reviews=state.review_events,
             forget_reviews=state.forget_review_events,
             pull_files=release_pull_files,
+            loading_processes=release_loading,
+            late_read=release_late_read,
             wait_deploy=release_wait_deploy,
             note_evidence=release_note_evidence,
             rerun_verification=release_rerun,
         ),
         enabled=enabled,
     )
+    design_stopped.release = release
     # The release's own record feeds the cards (Ready for merge, #2960): announced, so a merge
     # or a recorded pass rebuilds them.
     from .web.work_view import WORK_INPUTS_TOPIC
@@ -877,7 +1113,9 @@ def build(
         claim=state.claim_shipped,
         note_shipped=state.note_shipped,
         shipped=state.shipped,
+        shipped_by_work=state.shipped_by_work,
         split=ship_split,
+        behind=behind_base,
         register=lambda repository, number, new: register_split(
             state, hooks.register_pull, repository, number, new
         ),
@@ -914,6 +1152,13 @@ def build(
     release.ports.script_green_heads = release_script_green_heads
     release.ports.script_failed_heads = release_script_failed_heads
     release.ports.script_verifying = release_script_verifying
+
+    async def close_review_chat(
+        work: str, pull: str, head: str, settled: Callable[[str, str], bool], reason: str
+    ) -> list[int]:
+        from .chat_review import close_settled_review
+
+        return await close_settled_review(config.chat_board, work, pull, head, settled, reason)
 
     router = WorkRouterService(
         config.github_webhook.path,
@@ -982,6 +1227,8 @@ def build(
         latest_comment=latest_comment,
         # A findings comment a review chat's closing line links is read back (#4279).
         read_comment=read_comment,
+        # A ``/reviewed`` verdict whose webhook never came is read back (#4478).
+        read_comments=read_comments,
         busy=lambda work_id: work_busy(state, work_id),
         # The reviewer's verdict handed to a chat ends its review waits quietly (#3183).
         on_verdict=hooks.wake_registry.answer_reviews,
@@ -990,6 +1237,7 @@ def build(
         # A head whose diff an earlier review read is not reviewed again (#3314).
         digest=release_digest,
         base_only=base_only_between,
+        ship_merge=ship_merge_between,
         # A no-code review's fix that changed only doc files is not reviewed again (#3322).
         no_code=no_code_between,
         # A person's comment on a finished Work's issue reaches its let-go chat (#3405).
@@ -1009,6 +1257,9 @@ def build(
         # router records the merge, and a reopen of the Work's issue drops it (#4398).
         note_merged=getattr(db, "note_merged_pull", None),
         forget_merged=getattr(db, "forget_merged_pulls", None),
+        # ... and a reopen starts a new round, whose earlier merges count for nothing (#4585).
+        start_round=start_reopened_round,
+        earlier_pulls=earlier_pulls,
         hold_labels=lambda repository: work_hold_labels(config.poller.root).get(
             repository.lower(), ()
         ),
@@ -1026,7 +1277,15 @@ def build(
         forget_reviews=state.forget_review_events,
         # Ship now, fix later (#4212).
         ship=ship,
+        ship_runs=ship_runs,
+        # A review chat whose one pull request passed after a late minor verdict (#4474).
+        # Only ChatGPT's chats: a deck reviewer already running ends with its own verdict.
+        close_review=(
+            close_review_chat if agent_reviewer is None and reviewer != agent_review.OFF else None
+        ),
     )
+    # A late minor or no-code verdict's pushed fix is checked by the router (#4474).
+    release.on_late = router.late_fixed
 
     def work_start_spent(work_id: str) -> bool:
         # A start refused before anything ran is settled ``failed`` and is not spent (#2971).
@@ -1061,6 +1320,9 @@ def build(
         state=state,
         check=check,
         light=light,
+        # Swept only where the services run: a deck that runs none starts no reviewer either.
+        reviewer=design_reviewer if enabled else None,
+        design_dropped=design_stopped,
     )
     router.filing_holds = services._filing_now
     return services

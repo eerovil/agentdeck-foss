@@ -249,7 +249,9 @@ def _file_bug_issues(
     """File, or add to, the one labelled issue per Needs retry bug cause (#2888).
 
     Opened through ``open_issue``, which labels it with the ownership label in the same write,
-    so the deck starts its Work like any other. Creating an issue is not idempotent, so this
+    so the deck starts its Work like any other; a worker agent's own report goes through
+    ``open_list_issue`` instead, unlabelled, so a person reads it before any Work starts (#4579).
+    Creating an issue is not idempotent, so this
     follows ``_open_proposal``: the intent is durable before the write, and a wake that finds
     an intent looks for the marked issue before it creates one. An issue already filed and
     still open gets a comment with the new evidence instead; a closed one means the fix did
@@ -301,8 +303,13 @@ def _file_bug_issues(
             if store is not None:
                 store.checkpoint(state)
         if found is None:
-            found = port.open_issue(
-                repo, bug_reports.title(cause), bug_reports.body(cause, pending, mark)
+            title = bug_reports.title(cause)
+            text = bug_reports.body(cause, pending, mark)
+            # A worker's words never start a Work: a person reads its report first (#4579).
+            found = (
+                port.open_list_issue(repo, title, text)
+                if bug_reports.is_agent_report(cause)
+                else port.open_issue(repo, title, text)
             )
         if found is None:
             outcome.log.append(f"bug report: could not open an issue for {ident}")

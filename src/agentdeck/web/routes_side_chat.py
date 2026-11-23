@@ -19,8 +19,8 @@ from fastapi.responses import HTMLResponse
 from ..models import ForkFrom
 from .action_timing import bind_action, supplied_action_id
 from .deps import get_injector, get_state, get_templates, require_access, resolve_current_leg
-from .routes_actions import _require_same_origin, _turn_form
-from .side_chat import SIDE, find_side_chat, moved_on, side_view_context
+from .routes_actions import _note_person_message, _require_same_origin, _turn_form
+from .side_chat import SIDE, find_side_chat, moved_on, side_brief, side_view_context
 from .uploads import cleanup_uploaded_files
 
 logger = logging.getLogger(__name__)
@@ -110,7 +110,11 @@ async def _send(request: Request, session_key: str) -> HTMLResponse:
             raise refuse(result.reason or "The side chat did not take the message.", status)
         if newest is not None:
             state.note_side_chat_seen(side.fork.token, main.key, newest[0])
+        # A person's message to the side chat, which a Work counts as its own (#4562).
+        _note_person_message(request, side_session.key)
         return await _view(request, main.key, status_code=202)
+    # Told it is a side chat, so it does not take itself for the chat it copies (#4556).
+    message = side_brief(main.key) + message
     refusal = provider.fork_refusal(account, main) or provider.user_message_refusal(message)
     if refusal is not None:
         raise refuse(refusal)

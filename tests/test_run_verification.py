@@ -8,6 +8,7 @@ which commit — is covered in ``test_poller_engine_cycle``; this file covers th
 
 from __future__ import annotations
 
+import subprocess
 import sys
 import time
 
@@ -336,7 +337,26 @@ def test_an_older_runtime_that_drops_the_purpose_is_named_at_submission(
 
     cli._job_submit(None, tmp_path / "runtime.sock", args)
 
-    assert "will not count as release evidence" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "will not count as release evidence" in err
+    assert "--workspace checkout needs a verification job of its own" not in err
+    # #4589: a run naming a second checkout says that only --cwd's commit is credited.
+    monkeypatch.setattr(cli, "records_other_workspaces", lambda _socket: True)
+    monkeypatch.setattr(
+        cli,
+        "submit_job",
+        lambda _socket, **kwargs: {
+            "id": "job-2",
+            "log_path": "",
+            "workspaces": kwargs.get("workspaces"),
+        },
+    )
+    args = _Args(
+        verification=True, session_token="tok-1", cwd=str(tmp_path), workspace=[str(tmp_path)]
+    )
+    cli._job_submit(None, tmp_path / "runtime.sock", args)
+    err = capsys.readouterr().err
+    assert f"only the commit in --cwd ({tmp_path}) is credited as tested" in err
 
 
 # --- the queue records the purpose and keeps the evidence --------------------
@@ -558,19 +578,60 @@ async def test_a_tree_edited_while_the_suite_ran_credits_nothing(tmp_path):
 _EDIT = "import pathlib; pathlib.Path('a.txt').write_text('two\\n')"
 
 
+def _never_waits(job):
+    return False
+
+
+def _waits(job):
+    return True
+
+
+def _check_breaks(job):
+    raise OSError("db")
+
+
 @pytest.mark.parametrize(
-    ("code", "fields", "woken"),
+    ("code", "fields", "woken", "waits"),
     [
-        ("print('ok')", {"purpose": VERIFICATION, "work_id": WORK}, False),
-        (_EDIT, {"purpose": VERIFICATION, "work_id": WORK}, True),
-        ("raise SystemExit(1)", {"purpose": VERIFICATION, "work_id": WORK}, True),
+        ("print('ok')", {"purpose": VERIFICATION, "work_id": WORK}, False, _never_waits),
+        # #4589: a second checkout named with --workspace is not credited, and the note says so.
+        (
+            "print('ok')",
+            {"purpose": VERIFICATION, "work_id": WORK, "workspaces": "other"},
+            False,
+            _never_waits,
+        ),
+        # No ``chat_waits`` given: silent, as before #4556.
+        ("print('ok')", {"purpose": VERIFICATION, "work_id": WORK}, False, None),
+        # #4556: its chat has not marked a pull request ready, so it waits on this run.
+        ("print('ok')", {"purpose": VERIFICATION, "work_id": WORK}, True, _waits),
+        ("print('ok')", {"purpose": VERIFICATION, "work_id": WORK}, True, _check_breaks),
+        (_EDIT, {"purpose": VERIFICATION, "work_id": WORK}, True, _never_waits),
+        ("raise SystemExit(1)", {"purpose": VERIFICATION, "work_id": WORK}, True, _never_waits),
         # The poller holds its card until this message is delivered (``awaited_run_job``).
-        ("print('ok')", {"purpose": VERIFICATION, "work_id": WORK, "run_id": "gen-1"}, True),
-        ("print('ok')", {"work_id": WORK}, True),
+        (
+            "print('ok')",
+            {"purpose": VERIFICATION, "work_id": WORK, "run_id": "gen-1"},
+            True,
+            _never_waits,
+        ),
+        ("print('ok')", {"work_id": WORK}, True, _never_waits),
     ],
-    ids=["proved", "tree-moved", "failed", "poller-run", "ordinary"],
+    ids=[
+        "proved",
+        "proved-with-workspace",
+        "proved-no-check",
+        "proved-pull-still-draft",
+        "proved-check-failed",
+        "tree-moved",
+        "failed",
+        "poller-run",
+        "ordinary",
+    ],
 )
-async def test_only_a_green_run_that_proves_its_commit_wakes_nobody(tmp_path, code, fields, woken):
+async def test_only_a_green_run_that_proves_its_commit_wakes_nobody(
+    tmp_path, code, fields, woken, waits
+):
     from test_jobs import _queue as queue_for
     from test_jobs import _settle, _wait_for
 
@@ -582,9 +643,17 @@ async def test_only_a_green_run_that_proves_its_commit_wakes_nobody(tmp_path, co
         return True
 
     repo = _git_repo(tmp_path / "repo")
+    if "workspaces" in fields:
+        # Two repositories prove a commit only when each names its repository (#2148).
+        other = _git_repo(tmp_path / fields["workspaces"])
+        for path, name in ((repo, "one"), (other, "two")):
+            url = f"https://github.com/eerovil/{name}.git"
+            subprocess.run(["git", "-C", str(path), "remote", "add", "origin", url], check=True)
+        fields = {**fields, "workspaces": [str(other)]}
     queue = queue_for(tmp_path, notify=notify)
     # #4306: the run that wakes nobody leaves its chat a pending note, once per job and commit.
     queue._keep_note = lambda job, note_id, text: notes.setdefault(note_id, text) is not None
+    queue._chat_waits = waits
     await queue.start()
     try:
         job = queue.submit(
@@ -603,7 +672,147 @@ async def test_only_a_green_run_that_proves_its_commit_wakes_nobody(tmp_path, co
     if notes:
         head = queue.get(job.id).tested_workspace["head"]
         assert list(notes) == [f"job-proved:{job.id}@{head[:12]}"]
-        assert f"passed at {head[:12]}" in notes[f"job-proved:{job.id}@{head[:12]}"]
+        note = notes[f"job-proved:{job.id}@{head[:12]}"]
+        assert f"passed at {head[:12]}" in note
+        assert ("named with --workspace are not credited" in note) is ("workspaces" in fields)
+
+
+_OPEN = {"state": "open", "isDraft": False}
+_DRAFT = {"state": "OPEN", "isDraft": True}
+
+
+@pytest.mark.parametrize(
+    ("pulls", "unnamed", "waits"),
+    [
+        # The stalled Work of #4556: both of its pull requests still drafts.
+        ([(_DRAFT, True), (_DRAFT, True)], [], True),
+        ([(_OPEN, True)], [], False),
+        # The webhook's spelling and ``gh``'s, an earlier round merged long ago.
+        ([({"state": "MERGED", "isDraft": False}, False), (_OPEN, True)], [], False),
+        ([(_OPEN, True), (_DRAFT, True)], [], True),
+        ([({"state": "MERGED"}, True), ({"state": "CLOSED", "isDraft": True}, True)], [], True),
+        ([], [], True),
+        ([(_OPEN, True), (None, False)], [], True),
+        ([("not a row", True)], [], True),
+        ([(_OPEN, True), ({"isDraft": False}, True)], [], True),
+        # Read ready too long ago: it may have been turned back to a draft since.
+        ([(_OPEN, False)], [], True),
+        # A registration that named no Work may be another Work's: it wakes, never silences.
+        ([], [(_OPEN, True)], True),
+        ([(_OPEN, True)], [(_DRAFT, False)], True),
+        # Unknown, so waiting (#4557 review): an unnamed one stale or never read, and an
+        # open one whose draft flag is missing.
+        ([(_OPEN, True)], [(_OPEN, False)], True),
+        ([(_OPEN, True)], [(None, False)], True),
+        ([({"state": "OPEN"}, True)], [], True),
+        ([(_OPEN, True)], [({"state": "MERGED"}, False), (_OPEN, True)], False),
+    ],
+    ids=[
+        "drafts",
+        "ready",
+        "merged-and-ready",
+        "one-still-draft",
+        "none-open",
+        "none-registered",
+        "one-unread",
+        "odd-row",
+        "no-state",
+        "ready-read-long-ago",
+        "only-unnamed-ready",
+        "unnamed-draft",
+        "unnamed-read-long-ago",
+        "unnamed-unread",
+        "no-draft-flag",
+        "unnamed-merged-and-ready",
+    ],
+)
+def test_a_chat_waits_on_its_proof_until_its_pull_requests_are_ready(pulls, unnamed, waits):
+    from agentdeck.jobs import awaits_ready
+
+    assert awaits_ready(pulls, unnamed) is waits
+
+
+def test_the_runtime_reads_the_chats_own_pulls_of_this_work_from_the_cache(tmp_path):
+    """#4556 with the real stores: the control database's registrations of the job's chat for
+    its Work, under every leg of the chat, and the draft flag the webhooks wrote into the
+    shared GitHub cache."""
+    from agentdeck.db import Db
+    from agentdeck.github_cache import GitHubMetadata, GitHubMetadataCache
+    from agentdeck.jobs import Job
+    from agentdeck.models import PullRequestRef
+    from agentdeck.runtime import chat_waits_on_proof
+
+    db = Db(tmp_path / "control.db")
+    cache = GitHubMetadataCache(tmp_path / "github.sqlite3")
+    old, key = "claude_code:main:old", "claude_code:main:sid"
+    db.append_chat_leg(old, key)
+    other = "github_issue:eerovil/agentdeck#1"
+    # Registered on the chat's earlier leg, with the Work's id in another case.
+    db.record_session_pull_request(old, PullRequestRef("Eerovil/Agentdeck", 7, WORK.upper()))
+    db.record_session_pull_request(key, PullRequestRef("eerovil/agentdeck", 8, other))
+    db.record_session_pull_request("claude_code:main:else", PullRequestRef("eerovil/x", 9, WORK))
+    for number, draft in ((7, True), (8, True), (9, False)):
+        repository = "eerovil/x" if number == 9 else "eerovil/agentdeck"
+        cache.offer(
+            f"pr-ref:v1:{repository}:{number}",
+            GitHubMetadata({"state": "open", "isDraft": draft}),
+        )
+    job = Job(
+        id="j",
+        command=["true"],
+        cwd=str(tmp_path),
+        log_path="",
+        submitted_at=0.0,
+        session_key=key,
+        work_id=WORK,
+        purpose=VERIFICATION,
+    )
+
+    assert chat_waits_on_proof(db, job, cache) is True
+    ready = GitHubMetadata({"state": "open", "isDraft": False})
+    cache.offer("pr-ref:v1:eerovil/agentdeck:7", ready)
+    # Another Work's draft and another chat's pull request say nothing about this one.
+    assert chat_waits_on_proof(db, job, cache) is False
+    # A draft the chat registered with no Work may be this one's: it wakes the chat.
+    db.record_session_pull_request(key, PullRequestRef("eerovil/agentdeck", 10))
+    cache.offer("pr-ref:v1:eerovil/agentdeck:10", GitHubMetadata(_DRAFT))
+    assert chat_waits_on_proof(db, job, cache) is True
+
+
+def test_a_jobs_notice_follows_its_chat_to_a_leg_added_after_it(tmp_path):
+    """#4556 review: a chat continued on a new session after the job was queued hears of it
+    there; a leg that was already there when the job was queued is history (#1501)."""
+    import time
+
+    from agentdeck.db import Db
+    from agentdeck.jobs import Job
+    from agentdeck.runtime import job_chat_leg
+
+    db = Db(tmp_path / "control.db")
+    first, second, third = (f"claude_code:main:{name}" for name in ("a", "b", "c"))
+    db.append_chat_leg(first, second)
+
+    def job(session_key: str | None, at: float) -> Job:
+        return Job(
+            id="j",
+            command=["true"],
+            cwd=str(tmp_path),
+            log_path="",
+            submitted_at=at,
+            session_key=session_key,
+        )
+
+    now = time.time()
+    # Queued after the chat moved to its second leg, from the first one handed back.
+    assert job_chat_leg(db, job(first, now + 60)) == first
+    assert job_chat_leg(db, job(second, now)) == second
+    # Queued before the chat moved on: the notice follows it.
+    assert job_chat_leg(db, job(first, now - 60)) == second
+    db.append_chat_leg(second, third)
+    assert job_chat_leg(db, job(first, now - 60)) == third
+    # A session no chat names, and a job with no chat at all.
+    assert job_chat_leg(db, job("claude_code:main:lone", 0.0)) == "claude_code:main:lone"
+    assert job_chat_leg(db, job(None, 0.0)) == ""
 
 
 async def test_a_green_run_whose_note_cannot_be_kept_is_silent_as_before(tmp_path):

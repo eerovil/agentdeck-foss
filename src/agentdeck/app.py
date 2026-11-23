@@ -21,6 +21,7 @@ from jinja2 import BytecodeCache
 
 from . import (
     agent_review,
+    deck_bug,
     github_suspension,
     live_chats,
     mac_runner,
@@ -34,6 +35,7 @@ from . import (
     work_endings,
     work_release,
     work_services,
+    work_signals,
     work_status_log,
 )
 from .action_context import client_action_context
@@ -91,6 +93,7 @@ from .web.routes_auth import router as auth_router
 from .web.routes_chat_board import router as chat_board_router
 from .web.routes_chat_notes import router as chat_notes_router
 from .web.routes_files import router as files_router
+from .web.routes_guide import router as guide_router
 from .web.routes_live_prototype import router as live_prototype_router
 from .web.routes_mac_runner import router as mac_runner_router
 from .web.routes_meta_chat import router as meta_chat_router
@@ -227,7 +230,6 @@ def create_app(config: AppConfig) -> FastAPI:
     templates.env.globals["host_speech"] = bool(config.speech.socket)
     templates.env.globals["speech_language"] = config.speech.language
     templates.env.globals["voice_idle_seconds"] = config.speech.idle_listen_seconds
-    templates.env.globals["voice_tick_seconds"] = config.speech.working_tick_seconds
     # Who decides a phrase heard while waiting woke voice mode (#3476).
     templates.env.globals["voice_wake"] = (
         config.speech.wake if config.speech.wake_socket else "whisper"
@@ -465,6 +467,14 @@ def create_app(config: AppConfig) -> FastAPI:
             return str(exc) or "refused"
         return ""
 
+    async def wake_recover_review(repository: str, number: int) -> str:
+        # A verdict posted for a timed-out review wait whose webhook never came (#4478): the
+        # comment's URL once taken in, "" when none. ``ServicesUncertain`` is raised on.
+        router_service = getattr(app.state, "work_router", None)
+        if router_service is None or not router_service.enabled:
+            return ""
+        return str(await router_service.recover_review(repository, number) or "")
+
     def wake_ready_head(request) -> bool:
         # A commit wait on the head of a ready or merged pull request this chat registered in a
         # repository the release merges (#4253), from cached rows alone.
@@ -504,6 +514,8 @@ def create_app(config: AppConfig) -> FastAPI:
         live_read=lambda request: read_live(request, wake_fetch),
         compare=wake_compare,
         ask_review=wake_ask_review,
+        # A timed-out review wait reads back a verdict whose webhook never came (#4478).
+        recover_review=wake_recover_review,
         ready_head=wake_ready_head,
         release_notices=lambda chat_id, since: scheduled_messages.ids_since(
             chat_id, "work-release:", since
@@ -512,6 +524,8 @@ def create_app(config: AppConfig) -> FastAPI:
         check_env=lambda session_key: check_account_env(config, session_key),
         # The routine ends that wake nobody leave a pending note for the chat (#4306).
         note=lambda chat_id, note_id, text: pending_events.add(chat_id, note_id, text),
+        # A watch that found its problem back reopens its Work's issue (#4466).
+        reopen=work_signals.reopen_with_comment,
     )
     # A Work hears its own GitHub events (#2895, ADR 0008), and the deck merges a switched
     # Work itself (#2895 step 2): the Work router, the merge release and the missed-start
@@ -538,7 +552,8 @@ def create_app(config: AppConfig) -> FastAPI:
         else session_copy.SessionCopyFeed(
             state,
             scanned=collector.initial_scans_settled,
-            shown=work_services.work_reviewer(config) in agent_review.PROVIDERS,
+            # A design review runs a Claude reviewer even when ChatGPT reviews code (#4458).
+            shown=work_services.work_reviewer(config) != agent_review.OFF,
         )
     )
     # What the services process changed, republished on this bus (#4003).
@@ -813,6 +828,8 @@ def create_app(config: AppConfig) -> FastAPI:
     app.add_middleware(RangeSafeGZipMiddleware, minimum_size=500, compresslevel=5)
     app.state.config = config
     app.state.revision = started_revision
+    # One per process, before any request: its lock caps agents' deck-bug reports (#4579).
+    app.state.deck_bug_limiter = deck_bug.Limiter()
     app.state.app_state = state
     app.state.accounts = config.build_accounts()
     app.state.templates = templates
@@ -1002,6 +1019,7 @@ def create_app(config: AppConfig) -> FastAPI:
     app.include_router(rollback_router)
     app.include_router(side_chat_router)
     app.include_router(live_prototype_router)
+    app.include_router(guide_router)
     app.include_router(services_router)
     # Deliberately last: the local-file route is a catch-all for absolute paths
     # such as /tmp/report.md:12 and must never shadow AgentDeck's own routes.

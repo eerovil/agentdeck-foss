@@ -287,6 +287,25 @@ class SessionProvider(ABC):
         """Stable roots watched non-recursively for source topology changes."""
         return []
 
+    def written_chats(self, account: Account, paths: Iterable[Path]) -> list[str]:
+        """The session keys whose own transcript is among these written paths (#4543).
+
+        The source watch wakes an open chat page straight from a write with these,
+        rather than after the next liveness sweep, which is spaced
+        ``liveness_interval_s`` apart. A key need not be a known chat: only a page
+        already following one is woken. Empty: the page waits for the sweep.
+        """
+        return []
+
+    def draft(self, account: Account, session_id: str) -> dict | None:
+        """The 🔊 reply this chat's agent is writing now, for voice mode (#4543).
+
+        ``message_id``, ``text`` (whole sentences until ``complete``), ``stop_reason``
+        and ``voice`` (``first``, ``later`` or ``unknown``). None: no early read, and
+        voice mode reads the finished transcript line.
+        """
+        return None
+
     def watch_root_change(self, account: Account, path: Path) -> bool:
         """Whether a direct child change requires rebuilding source watches."""
         return True

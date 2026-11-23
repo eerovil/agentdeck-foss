@@ -8,7 +8,7 @@ try. Owner's choice in the Work's chat.
 Two parts, two rows of ``work_try_waits``, one writer each:
 
 - **The set** (:func:`deployed_set`, written by :meth:`TryWaits.keep`): the Work ids the
-  overview pass shows as Waiting for a try, never one whose issue was reopened. Saved under
+  overview pass shows as Waiting for a try, never one reopened with no new round. Saved under
   the pass's own lock, so an older pass never writes over a newer one; a degraded pass only
   takes Works out. Every blocker check reads it (``work_signals.blocker_done``).
 - **The notes** (:class:`TryWaits`'s task): for each Work in the newest complete set, once per
@@ -33,17 +33,22 @@ TRY_WAIT = "try_wait"
 
 
 def deployed_set(cards: Iterable[Any]) -> frozenset[str]:
-    """The Works shown as Waiting for a try whose issue was never reopened (#4384).
+    """The Works shown as Waiting for a try, in a round that began after any reopen (#4384).
 
     ``TRY_WAIT`` already needs ``needs_person``, an open issue, no open pull request, no live
-    check asked after a newer merge and no pending question. A reopened issue is left out
-    whatever its check says: the pass cannot tell a reopen before the check from one after.
+    check asked after a newer merge and no pending question. A reopened issue with no round
+    (``work_rounds``, #4585) is left out whatever its check says: the pass cannot tell a
+    reopen before the check from one after. With a round it can: the status reads only a
+    check recorded after the round began, so its try is the new round's own.
     """
     return frozenset(
         card.work_id
         for card in cards
         if getattr(getattr(card, "derived", None), "kind", "") == TRY_WAIT
-        and not getattr(card, "reopened", False)
+        and (
+            not getattr(card, "reopened", False)
+            or getattr(card, "round_started_at", None) is not None
+        )
     )
 
 

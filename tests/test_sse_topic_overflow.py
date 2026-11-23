@@ -54,7 +54,7 @@ def streams(monkeypatch):
         bus = EventBus(maxsize=maxsize)
         shared = SharedFragments(bus)
         session = SimpleNamespace(
-            key="codex:test:one", account_key="codex:test", last_progress=None,
+            key="codex:test:one", account_key="codex:test", session_id="one", last_progress=None,
             last_activity=None, pull_requests=(), issues=(), status=sse.SessionStatus.IDLE,
             question=None, lifecycle_active=False, capabilities=frozenset(),
         )
@@ -63,6 +63,7 @@ def streams(monkeypatch):
             last_event=AsyncMock(return_value=None),
             tail_transcript=AsyncMock(return_value=([], 0, 0)),
             pending_interaction=lambda *args: None,
+            draft=lambda *args: None,
         )
         presentation = SimpleNamespace(
             display=lambda current: current, active_child_sessions=lambda current: (),

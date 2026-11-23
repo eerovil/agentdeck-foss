@@ -20,6 +20,7 @@ from public_copy import private_feature
 
 from agentdeck import chat_board as _chat_board
 from agentdeck import chat_review as _chat_review
+from agentdeck import wake_on
 from agentdeck.app import create_app
 from agentdeck.config import (
     AccountConfig,
@@ -31,10 +32,12 @@ from agentdeck.config import (
 from agentdeck.deck_notices import ROUTINE_LINE
 from agentdeck.github_webhook_log import Repository, WebhookLog
 from agentdeck.models import PullRequestRef
-from agentdeck.providers.instructions import agentdeck_session_instructions
+from agentdeck.providers.instructions import agentdeck_session_instructions, guide_topics
 from agentdeck.wake_on import (
     LIVE_READ_AGAIN_S,
     LIVE_READ_CAP_S,
+    RECOVER_RETRY_S,
+    RECOVER_UNCERTAIN_NOTE,
     REVIEW_TIMEOUT_MINUTES,
     STOP_SETTLE_S,
     NeedsYouStop,
@@ -1253,6 +1256,88 @@ async def test_a_live_read_says_what_the_commit_checks_finished_with():
     ).state == "success"
 
 
+async def test_a_timed_out_review_wait_first_reads_back_a_verdict_its_webhook_dropped(
+    root, scheduled, clock
+):
+    """#4478: before saying no verdict came, the deck reads the posted verdict back once. Taken
+    in, it ends the wait itself, or a held wait hears where it was; nothing found or a failed
+    read times out as before; an unanswered call is read once more, a renewal earning a fresh
+    retry, then times out saying a late verdict stands. A merge wait reads nothing."""
+    from agentdeck.services_link import ServicesUncertain
+
+    answers: list[object] = []
+    calls: list[tuple[str, int]] = []
+    service = None
+
+    async def recover_review(repository, number):
+        calls.append((repository, number))
+        answer = answers.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        if answer == "ends":  # taken in: the verdict's own delivery ended the wait
+            service.registry.answer_reviews("claude_code:alt:one", [f"{repository}#{number}"])
+            return "https://x/c1"
+        return answer
+
+    service = settling_service(
+        root,
+        scheduled,
+        clock,
+        recover_review=recover_review,
+        reviewer_down=lambda: "the reviewer is paused",
+    )
+
+    def timed_out(answer, number=12, **body):
+        answers.append(answer)
+        request = register(service, **(body or {"review": f"eerovil/agentdeck#{number}"}))
+        service.registry.update(replace(request, deadline=clock.now))
+        return request
+
+    timed_out("ends")
+    await settle(service)
+    assert calls == [("eerovil/agentdeck", 12)] and scheduled == []
+    assert service.registry.all() == ()
+    held = timed_out("https://x/c2", 13)
+    await settle(service)
+    [message] = scheduled
+    assert message.id == f"wake-on:{held.id}" and "posted at https://x/c2" in message.text
+    assert "do not ask for a fresh review" in message.text
+    for answer in ("", RuntimeError("boom")):
+        scheduled.clear()
+        timed_out(answer, 14)
+        await settle(service)
+        [message] = scheduled
+        assert "no verdict reached this chat" in message.text
+        assert "the reviewer is paused" in message.text
+        assert RECOVER_UNCERTAIN_NOTE not in message.text
+    scheduled.clear()
+    unsure = timed_out(ServicesUncertain(), 15)
+    await settle(service)
+    [moved] = service.registry.all()
+    assert scheduled == [] and moved.deadline == clock.now + RECOVER_RETRY_S
+    # A renewal before the retry is a fresh timeout: its own uncertain call is retried too.
+    service.registry.update(replace(moved, deadline=clock.now + 600))
+    clock.now += 600
+    answers.append(ServicesUncertain())
+    await settle(service)
+    [moved] = service.registry.all()
+    assert scheduled == [] and moved.deadline == clock.now + RECOVER_RETRY_S
+    clock.now += RECOVER_RETRY_S
+    answers.append(ServicesUncertain())
+    await settle(service)
+    [message] = scheduled
+    assert message.id == f"wake-on:{unsure.id}" and message.text.endswith(RECOVER_UNCERTAIN_NOTE)
+    assert "no verdict reached this chat" in message.text
+    assert service.registry.all() == () and service._recovery_uncertain == {}
+    calls.clear()
+    timed_out("", pull_request="eerovil/agentdeck#16")
+    service.registry.update(
+        replace(service.registry.all()[0], deadline=clock.now, cut_from=clock.now)
+    )
+    await settle(service)
+    assert calls == [] and answers == [""]
+
+
 async def test_a_review_chat_closing_with_no_verdict_is_asked_again_by_the_deck(
     root, scheduled, clock
 ):
@@ -1350,15 +1435,29 @@ async def test_a_review_chat_closed_on_github_with_no_verdict_is_asked_again(
     )
     waiting = register(service, review="eerovil/agentdeck#12")
     answered = register(service, "claude_code:alt:two", review="eerovil/agentdeck#14")
+    background = register(service, "claude_code:alt:three", review="eerovil/agentdeck#16")
 
-    def chat(number, pull):
+    def chat(number, pull, body=""):
         return {
             "number": number,
             "title": f"Review {pull}",
             "state": "closed",
             "html_url": f"https://github.com/eerovil/review-chats/issues/{number}",
-            "body": f"<!-- agentdeck: review-head {SHA} {pull} -->",
+            "body": body or f"<!-- agentdeck: review-head {SHA} {pull} -->",
         }
+
+    # A chat for #18 that lists #16 only as already passed background posts no verdict on
+    # #16, so its close leaves #16's wait alone (#4599).
+    listing = (
+        f"- `eerovil/agentdeck#18` at commit `{SHA}`\n"
+        f"- `eerovil/agentdeck#16` at commit `{SHA}` — {_chat_review.PASSED_LINE}\n\n"
+        f"<!-- agentdeck: review-head {SHA} eerovil/agentdeck#18 -->\n"
+        f"<!-- agentdeck: review-head {SHA} eerovil/agentdeck#16 -->"
+    )
+    deliver(
+        root, event="issues", delivery="x72", repository=chats, action="closed",
+        issue=chat(72, "eerovil/agentdeck#18", listing),
+    )
 
     clock.now += 1
     deliver(
@@ -1374,6 +1473,21 @@ async def test_a_review_chat_closed_on_github_with_no_verdict_is_asked_again(
     held = {item.id: item for item in service.registry.all()}
     assert "closed its review: it was closed" in held[waiting.id].stopped
     assert "Ran out of time." in held[waiting.id].stopped
+    assert not held[background.id].stopped
+    # A closing line naming only the background one cuts no one's wait, not the reviewed one's.
+    said = SimpleNamespace(
+        stream="eerovil/review-chats",
+        event="issue_comment",
+        payload={
+            "action": "created",
+            "issue": chat(72, "eerovil/agentdeck#18", listing),
+            "comment": {"body": "Reviewed eerovil/agentdeck#16 at abcdef1: clean"},
+        },
+    )
+    assert wake_on.review_stop(said, "eerovil/review-chats") is None
+    said.payload["comment"]["body"] = "Reviewed eerovil/agentdeck#18 at abcdef1: clean"
+    stop = wake_on.review_stop(said, "eerovil/review-chats")
+    assert stop is not None and stop.pulls == ("eerovil/agentdeck#18",)
     service.registry.answer_reviews("claude_code:alt:two", ["eerovil/agentdeck#14"])
     clock.now = datetime.now(UTC).timestamp() + STOP_SETTLE_S + 5  # deliveries: wall clock
     await settle(service)
@@ -2370,6 +2484,211 @@ def test_a_check_result_and_the_other_workers_renewal_never_cross(root, service,
     assert "b found it" in scheduled[0].text
     assert service.registry.all() == ()
 
+def _watch(service, session_key="claude_code:alt:one", **extra):
+    body = {
+        "watch": "the TypeError in the sync job",
+        "after_minutes": 3 * 24 * 60,
+        "work_id": "eerovil/agentdeck#41",
+        "check": {"command": "sentry-search", "every_minutes": 60},
+        **extra,
+    }
+    return register(service, session_key, **body)
+
+
+@pytest.mark.asyncio
+async def test_a_watch_reopens_its_issue_with_the_output_and_only_then_tells_the_chat(
+    root, scheduled, clock
+):
+    """#4466: a watch's not-seen runs and a lone error stay silent; exit 0 owes a reopen and
+    no message, which neither web worker can send early; a failed reopen is tried again a
+    minute on; once it lands, the chat hears once what the deck did. Its Work stays unheld."""
+    from agentdeck.wake_on import CHECK_NOT_YET, REOPEN_RETRY_S, WATCH_MARKER
+
+    reopens = []
+    answers = [False, True]
+
+    async def reopen(repository, number, marker, comment):
+        reopens.append((repository, number, marker, comment))
+        return answers.pop(0)
+
+    def schedule(message):
+        scheduled.append(message)
+        return message
+
+    def make():
+        return WakeOnService(
+            root,
+            schedule=schedule,
+            message_exists=lambda message_id: any(m.id == message_id for m in scheduled),
+            clock=clock,
+            reopen=reopen,
+        )
+
+    service, other = make(), make()
+    request = _watch(service)
+    assert request.kind == "watch" and request.target == "the TypeError in the sync job"
+    assert request.payload()["check"]["errors_in_a_row"] == 0
+    # A finished Work keeps nothing current for its watch.
+    from agentdeck.web.work_view import waiting_work_ids
+    from agentdeck.work import WorkEvidence, WorkMembership, WorkProvenance, WorkRef
+
+    ref = WorkRef("eerovil/agentdeck", 41)
+    membership = WorkMembership(
+        ref, "claude_code:alt:one", (WorkProvenance(evidence=WorkEvidence.REGISTERED_ISSUE),)
+    )
+    projection = SimpleNamespace(
+        works=(SimpleNamespace(work_id=ref.work_id, memberships=(membership,)),)
+    )
+    app = SimpleNamespace(state=SimpleNamespace(wake_on=service))
+    assert waiting_work_ids(app, projection) == frozenset()
+
+    clock.now += 3600
+    (run,) = service.due_checks()
+    service.check_done(run, 1, "HTTP 502", "exit 1")  # one failed read: counted, silent
+    clock.now += 3600
+    (run,) = service.due_checks()
+    service.check_done(run, CHECK_NOT_YET, "0 events", "")  # a clean read clears the count
+    (held,) = service.registry.all()
+    assert held.check_errors == 0 and held.check_runs == 1 and scheduled == []
+
+    clock.now += 3600
+    (run,) = service.due_checks()
+    service.check_done(run, 0, "SENTRY-12 seen again at 14:02", "")
+    (held,) = service.registry.all()
+    assert held.reopen_owed and not held.pending_text and scheduled == []
+    # No more runs while the reopen is owed, and neither worker's pass sends anything yet.
+    clock.now += 3600
+    assert service.due_checks() == [] and other.due_checks() == []
+    # Both workers start a try at once: the claim lets one through, and that one fails.
+    other.expire_due()
+    service.expire_due()
+    assert scheduled == [] and held.id in other._settling and held.id in service._settling
+    await asyncio.gather(*other._side_tasks, *service._side_tasks)
+    assert len(reopens) == 1 and scheduled == []
+    (held,) = service.registry.all()
+    assert held.reopen_owed and held.reopen_tries == 1 and not held.reopen_claimed_at
+    assert service.next_due() == clock.now + REOPEN_RETRY_S
+    await service._reopen_watch(held)  # too soon: not taken
+    assert len(reopens) == 1
+    clock.now += REOPEN_RETRY_S
+    # The other worker claimed it and crashed: this one waits out the claim.
+    assert other.registry.claim_reopen(held.id, clock.now) is not None
+    await service._reopen_watch(held)
+    assert len(reopens) == 1
+    clock.now += 600
+    await service._reopen_watch(held)
+    assert len(reopens) == 2
+    repository, number, marker, comment = reopens[-1]
+    assert (repository, number) == ("eerovil/agentdeck", 41)
+    assert marker == WATCH_MARKER.format(id=request.id) and comment.endswith(marker)
+    assert "SENTRY-12 seen again at 14:02" in comment
+    # Only what was seen: no command (it may hold a secret), no claim the reopen landed.
+    assert "sentry-search" not in comment and "reopened" not in comment
+    [message] = scheduled
+    assert message.id == f"wake-on:{request.id}"
+    assert "says the problem is back" in message.text
+    assert "The deck reopened eerovil/agentdeck#41" in message.text
+    assert "SENTRY-12 seen again" in message.text and "`failed`" in message.text
+    assert service.registry.all() == ()
+
+
+@pytest.mark.asyncio
+async def test_a_watch_ends_quietly_and_only_errors_in_a_row_wake_it(root, scheduled, clock):
+    """#4466: the deadline with the problem never back sends nothing; three failed runs in a
+    row wake the chat without a reopen; a renewal keeps a reopen owed; with no way to reopen,
+    the chat is told to do it; a run started just before the deadline still counts."""
+    from agentdeck.wake_on import CHECK_NOT_YET, CHECK_TIMEOUT_S, WATCH_ERRORS_TO_WAKE
+
+    def schedule(message):
+        scheduled.append(message)
+        return message
+
+    service = WakeOnService(
+        root,
+        schedule=schedule,
+        message_exists=lambda message_id: any(m.id == message_id for m in scheduled),
+        clock=clock,
+    )
+    quiet = _watch(service, after_minutes=150)
+    for _ in range(2):
+        clock.now += 3600
+        (run,) = service.due_checks()
+        service.check_done(run, CHECK_NOT_YET, "", "")
+    clock.now += 30 * 60
+    service.expire_due()  # at its deadline: held while a last run could still be finishing
+    assert service.registry.all() and service.due_checks() == []
+    assert service.next_due() == quiet.deadline + CHECK_TIMEOUT_S
+    clock.now += CHECK_TIMEOUT_S
+    service.expire_due()
+    assert service.registry.all() == () and scheduled == []
+
+    broken = _watch(service)
+    for n in range(WATCH_ERRORS_TO_WAKE):
+        clock.now += 3600
+        (run,) = service.due_checks()
+        service.check_done(run, 2, f"mcp-call: refused {n}", "exit 2")
+        assert len(scheduled) == (1 if n == WATCH_ERRORS_TO_WAKE - 1 else 0)
+    assert scheduled[0].id == f"wake-on:{broken.id}" != f"wake-on:{quiet.id}"
+    assert "failed 3 runs in a row" in scheduled[0].text
+    assert "did not reopen" in scheduled[0].text and "refused 2" in scheduled[0].text
+    assert service.registry.all() == ()
+
+    found = _watch(service)
+    clock.now += 3600
+    (run,) = service.due_checks()
+    service.check_done(run, 0, "back", "")
+    renewed = _watch(service)  # the chat registers it again meanwhile
+    assert renewed.id == found.id and renewed.reopen_owed and renewed.check_gen == 1
+    clock.now += 14 * 24 * 3600  # past its deadline: still owed, never ended quietly
+    service.expire_due()
+    assert service.registry.all()[0].reopen_owed
+    await service._reopen_watch(renewed)  # this service has no way to reopen
+    assert "could not reopen eerovil/agentdeck#41" in scheduled[-1].text
+    assert service.registry.all() == ()
+
+    late = _watch(service, after_minutes=61)
+    clock.now += 3600
+    (run,) = service.due_checks()
+    clock.now += 2 * 60  # the run ends past the deadline, and finds it back
+    service.expire_due()
+    service.check_done(run, 0, "back late", "")
+    (held,) = service.registry.all()
+    assert held.id == late.id and held.reopen_owed and held.fired_output == "back late"
+    clock.now += 4 * 60  # a run that ends after the grace changes nothing
+    service.registry.remove([late.id])
+    late = _watch(service, after_minutes=61)
+    clock.now += 3600
+    (run,) = service.due_checks()
+    clock.now += 60 + CHECK_TIMEOUT_S
+    service.check_done(run, 0, "too late", "")
+    assert not service.registry.all()[0].reopen_owed
+
+
+def test_a_watch_needs_a_deadline_a_check_and_no_worktree():
+    """#4466: what a watch body must hold, and that its check stays out of `.worktrees/`,
+    which is removed a few days after its Work's issue closes."""
+    check = {"command": "sentry-search"}
+    fields = parse_request(watch=" the  error ", after_minutes=4320, check=check)
+    assert fields["kind"] == "watch" and fields["note"] == "the error"
+    for body, words in [
+        ({"after_minutes": 4320}, "needs a check"),
+        ({"check": check}, "needs its deadline"),
+        ({"after_minutes": 60, "at": "11:30", "check": check}, "needs its deadline"),
+        ({"after_minutes": 4320, "check": check, "waiting_for": "x"}, "takes only"),
+        ({"after_minutes": 4320, "check": check, "commit": f"a/b@{SHA}"}, "takes only"),
+        (
+            {"after_minutes": 4320, "check": {"command": "cd ~/x/.worktrees/issue-4 && t"}},
+            "worktree",
+        ),
+    ]:
+        with pytest.raises(WakeRequestError, match=words):
+            parse_request(watch="the error", **body)
+    with pytest.raises(WakeRequestError, match="few words"):
+        parse_request(watch="  ", after_minutes=4320, check=check)
+    with pytest.raises(WakeRequestError, match="watch is at most"):
+        parse_request(watch="x" * 81, after_minutes=4320, check=check)
+
+
 @pytest.mark.asyncio
 async def test_a_check_runs_its_shell_command_and_is_stopped_at_its_time_limit(
     tmp_path, monkeypatch
@@ -2496,15 +2815,24 @@ def test_the_session_guide_offers_the_wait_next_to_the_no_polling_rule():
     for role in ("primary", "delegated", "work"):
         flat = " ".join(agentdeck_session_instructions(provider="claude_code", role=role).split())
         assert "`POST $AGENTDECK_URL/api/sessions/<session-key>/wake-on`" in flat
-        assert '{"pull_request": "<owner/repo#number>"}' in flat
         assert flat.index("Never wait by polling") < flat.index("/wake-on")
-        assert '{"after_minutes": 90}' in flat
-        assert '{"needs_you": "all"}' in flat
-        # #4256: a time wait's check, its "not yet" exit, and the MCP tool command.
-        assert '"check": {"command": "<shell>", "every_minutes": 60}' in flat
-        assert "agentdeck mcp-call <server> <tool>" in flat
-        guide_pattern = "out=$(<read>) || exit 1; grep -q '<what you wait for>' <<<\"$out\""
-        assert guide_pattern + " || exit 3" in flat
+        # The bodies are served on request since #4459.
+        assert "`GET $AGENTDECK_URL/api/guide/waits`" in flat
+    waits = " ".join(guide_topics()["waits"].split())
+    assert "`POST $AGENTDECK_URL/api/sessions/<session-key>/wake-on`" in waits
+    assert '{"pull_request": "<owner/repo#number>"}' in waits
+    assert '{"after_minutes": 90}' in waits
+    assert '{"needs_you": "all"}' in waits
+    assert '{"deck_deploy": "<sha>"}' in waits and "restart-nudge" in waits
+    # #4256: a time wait's check, its "not yet" exit, and the MCP tool command.
+    assert '"check": {"command": "<shell>", "every_minutes": 60}' in waits
+    assert "agentdeck mcp-call <server> <tool>" in waits
+    guide_pattern = "out=$(<read>) || exit 1; grep -q '<what you wait for>' <<<\"$out\""
+    assert guide_pattern + " || exit 3" in waits
+    # #4466: the watch body, and that its check stays out of a Work's worktree.
+    assert '{"watch": "<what would be back, in a few words>", "after_minutes": 4320,' in waits
+    assert "record the live check `verified` and close the issue" in waits
+    assert "Keep the command and its `\"cwd\"` out of a Work's worktree" in waits
 
 
 def test_a_finished_check_is_seen_in_each_ci_shape_until_it_runs_again(root, monkeypatch):
@@ -2658,6 +2986,54 @@ async def test_the_api_registers_lists_and_cancels_a_wait(tmp_path, monkeypatch)
         assert timed.json()["registered"]["work_id"] == "github_issue:eerovil/agentdeck#7"
         # #4256: the check rides the time wait and comes back in the reply.
         assert timed.json()["registered"]["check"]["every_minutes"] == 10
+        # #4466: a watch reopens one Work's issue; this chat is in none, so it must name it.
+        unnamed = await client.post(
+            f"/api/sessions/{key}/wake-on",
+            json={"watch": "the error", "after_minutes": 4320, "check": {"command": "true"}},
+        )
+        assert unnamed.status_code == 422 and "name it with work_id" in unnamed.text
+        watched = await client.post(
+            f"/api/sessions/{key}/wake-on",
+            json={
+                "watch": "the error",
+                "after_minutes": 4320,
+                "work_id": "eerovil/agentdeck#7",
+                "check": {"command": "true"},
+            },
+        )
+        assert watched.json()["registered"]["kind"] == "watch"
+        assert watched.json()["registered"]["work_id"] == "github_issue:eerovil/agentdeck#7"
+        await client.delete(
+            f"/api/sessions/{key}/wake-on", params={"id": watched.json()["registered"]["id"]}
+        )
+        # A chat directly in one Work watches that one; in two, it must say which.
+        works = {"one": ["github_issue:eerovil/agentdeck#9"]}
+        works["two"] = [*works["one"], "github_issue:eerovil/agentdeck#10"]
+        state = app.state.app_state
+        for shape, status in (("one", 200), ("two", 422)):
+            state.work_projection = lambda shape=shape: SimpleNamespace(
+                direct_works_for_chat=lambda chat: (
+                    works[shape] if chat == state.chat_identity_key(key) else ()
+                )
+            )
+            own = await client.post(
+                f"/api/sessions/{key}/wake-on",
+                json={"watch": "the error", "after_minutes": 4320, "check": {"command": "true"}},
+            )
+            assert own.status_code == status, own.text
+        assert "directly in 2 Works" in own.text
+        state.work_projection = lambda: SimpleNamespace(
+            direct_works_for_chat=lambda chat: works["one"]
+        )
+        own = await client.post(
+            f"/api/sessions/{key}/wake-on",
+            json={"watch": "the error", "after_minutes": 4320, "check": {"command": "true"}},
+        )
+        assert own.json()["registered"]["work_id"] == "github_issue:eerovil/agentdeck#9"
+        del state.work_projection
+        await client.delete(
+            f"/api/sessions/{key}/wake-on", params={"id": own.json()["registered"]["id"]}
+        )
         bad_check = await client.post(
             f"/api/sessions/{key}/wake-on",
             json={"after_minutes": 45, "check": {"command": "true", "every_minutes": 50}},
@@ -2723,10 +3099,16 @@ async def test_the_api_registers_lists_and_cancels_a_wait(tmp_path, monkeypatch)
                 raise AgainRefused("no pre-review checklist waits for it")
             return {"pull_request": f"{repository}#{number}", "outcome": "asked"}
 
+        from agentdeck.services_link import ServicesUncertain
+
         ships = []
 
         async def ship_now(repository, number, head=""):
             ships.append((number, head))
+            if number == 10:
+                return {"pull_request": f"{repository}#10", "head": head, "state": "running"}
+            if number == 11:
+                raise ServicesUncertain()
             if number != 9:
                 raise AgainRefused("its review has not come back with findings")
             return {"pull_request": f"{repository}#{number}", "head": head, "outcome": "shipped"}
@@ -2754,6 +3136,64 @@ async def test_the_api_registers_lists_and_cancels_a_wait(tmp_path, monkeypatch)
         )
         assert checked.status_code == 200 and checked.json()["outcome"] == "asked"
         assert checked_other.status_code == 409 and "register it first" in checked_other.text
+        # #4579: the agent reports a deck bug; the deck names its Work, chat and the instance.
+        from agentdeck import issue_post
+        from agentdeck.poller_engine import bug_reports
+        from agentdeck.work import WorkRef
+
+        report = {
+            "topic": "pre_review_wrong",
+            "expected": "the minor verdict carries the pass to this head",
+            "observed": "the deck sent a pre-review checklist and held the merge",
+            "pull_request": "eerovil/agentdeck#9",
+        }
+        monkeypatch.setattr(issue_post, "issue_post_target", lambda state, chat: None)
+        no_work = await client.post(f"/api/sessions/{key}/deck-bug", json=report)
+        monkeypatch.setattr(
+            issue_post, "issue_post_target", lambda state, chat: WorkRef("eerovil/agentdeck", 7)
+        )
+        state_path = tmp_path / "poller" / "state.json"
+        scope = SimpleNamespace(org="eerovil", state_path=str(state_path))
+        app.state.issues = SimpleNamespace(
+            read_board=lambda: SimpleNamespace(managing=lambda repository: (scope,))
+        )
+        unregistered = await client.post(
+            f"/api/sessions/{key}/deck-bug", json={**report, "pull_request": "eerovil/x#1"}
+        )
+        terse = await client.post(f"/api/sessions/{key}/deck-bug", json={**report, "observed": "x"})
+        guessed = await client.post(f"/api/sessions/{key}/deck-bug", json={"bug": "it broke"})
+        # Every malformed report says the whole body (#4579 review): a bad pull request, a
+        # field that is not text, and a body that is no JSON object.
+        path = f"/api/sessions/{key}/deck-bug"
+        malformed = [
+            await client.post(path, json={**report, "pull_request": "x"}),
+            await client.post(path, json={**report, "topic": 5}),
+            await client.post(path, json=["not", "an", "object"]),
+            await client.post(path, content=b"{broken"),
+        ]
+        for answer in malformed:
+            assert answer.status_code == 422 and "GET this path" in answer.json()["detail"]
+        bare = {name: value for name, value in report.items() if name != "pull_request"}
+        unnamed = await client.post(f"/api/sessions/{key}/deck-bug", json=bare)
+        filed = await client.post(f"/api/sessions/{key}/deck-bug", json=report)
+        listed = await client.get(f"/api/sessions/{key}/deck-bug")
+        assert no_work.status_code == 409 and unregistered.status_code == 409
+        assert terse.status_code == 422 and "at least 20" in terse.text
+        # A guessed body learns the whole one, and the GET to try first (#4579 helper checks).
+        told = guessed.json()["detail"]
+        assert guessed.status_code == 422 and '"observed"' in told and "GET this path" in told
+        assert "usage" in listed.json()
+        # A chat with a pull request names it or its head: the report's evidence.
+        assert unnamed.status_code == 422 and "`pull_request` or `head`" in unnamed.text
+        assert filed.status_code == 200 and filed.json()["state"] == "filed"
+        waiting = json.loads(next(bug_reports.directory(state_path).glob("*.json")).read_text())
+        assert (waiting["cause"], waiting["work_id"], waiting["session_key"]) == (
+            "agent_report:pre_review_wrong", "github_issue:eerovil/agentdeck#7", key
+        )
+        assert waiting["pull_request"] == "eerovil/agentdeck#9"
+        assert listed.json()["topics"] == [
+            {"topic": "pre_review_wrong", "issue": None, "waiting": True}
+        ]
         # #4212: the owner picked "Ship now, fix later" in the agent's question, at the head
         # whose findings it showed (review): a head that is not a full commit id ships nothing.
         # What may ship is the chat's Work's pull requests (`_work_pulls_of_chat`, tested in
@@ -2799,7 +3239,55 @@ async def test_the_api_registers_lists_and_cancels_a_wait(tmp_path, monkeypatch)
         assert both.json()["not_shipped"] == ["eerovil/agentdeck#8"]
         assert "findings" in both.json()["refused"]
         assert ships[-2:] == [(9, "d" * 40), (8, "e" * 40)]
-        app.state.app_state.remove_pull_request(key, PullRequestRef.parse("eerovil/agentdeck#8"))
+        assert "same pull request and head is safe" in both.json()["next"]
+        # #4558: a press still running stops the rest, named as not started, and the reply
+        # says what the agent may do next; a merge service past the web's wait says a repeat
+        # is safe. A recorded one says it is not merged yet.
+        assert "not merged yet" in shipped.json()["next"]
+        app.state.app_state.add_pull_request(key, PullRequestRef.parse("eerovil/agentdeck#10"))
+        app.state.app_state.add_pull_request(key, PullRequestRef.parse("eerovil/agentdeck#11"))
+        slow = await client.post(
+            f"/api/sessions/{key}/ship-now",
+            json={
+                "pull_requests": [
+                    {"pull_request": "eerovil/agentdeck#9", "head": "d" * 40},
+                    {"pull_request": "eerovil/agentdeck#10", "head": "d" * 40},
+                    {"pull_request": "eerovil/agentdeck#8", "head": "e" * 40},
+                ]
+            },
+        )
+        assert slow.status_code == 200, slow.text
+        assert slow.json()["state"] == "running" and ships[-1] == (10, "d" * 40)
+        # The top of the reply is the running one, not the first, already shipped (#4559).
+        assert slow.json()["pull_request"] == "eerovil/agentdeck#10"
+        assert len(slow.json()["shipped"]) == 2
+        assert slow.json()["not_started"] == ["eerovil/agentdeck#8"]
+        assert "Do not poll" in slow.json()["next"] and "not_started" in slow.json()["next"]
+        stuck = await client.post(
+            f"/api/sessions/{key}/ship-now",
+            json={"pull_request": "eerovil/agentdeck#11", "head": "d" * 40},
+        )
+        assert stuck.status_code == 504 and "same pull request and head is safe" in stuck.text
+        # Stuck after one shipped: the shipped one is still named (#4559 helper checks).
+        late = await client.post(
+            f"/api/sessions/{key}/ship-now",
+            json={
+                "pull_requests": [
+                    {"pull_request": "eerovil/agentdeck#9", "head": "d" * 40},
+                    {"pull_request": "eerovil/agentdeck#11", "head": "d" * 40},
+                    {"pull_request": "eerovil/agentdeck#8", "head": "e" * 40},
+                ]
+            },
+        )
+        assert late.status_code == 200, late.text
+        assert late.json()["pull_request"] == "eerovil/agentdeck#9"
+        assert late.json()["uncertain"] == "eerovil/agentdeck#11"
+        assert late.json()["not_shipped"] == ["eerovil/agentdeck#11", "eerovil/agentdeck#8"]
+        assert "same pull request and head is safe" in late.json()["next"]
+        for number in (8, 10, 11):
+            app.state.app_state.remove_pull_request(
+                key, PullRequestRef.parse(f"eerovil/agentdeck#{number}")
+            )
         # The fix of a shipped head is named when it is registered (#4212 review), and only for
         # a pull request that shipped for the Work the fix is for.
         monkeypatch.setattr(
@@ -2861,6 +3349,8 @@ async def test_the_api_registers_lists_and_cancels_a_wait(tmp_path, monkeypatch)
         class Services:
             async def call(self, target, method, args, kwargs):
                 crossed.append((target, method))
+                if method == "recover_review":  # #4478: a timed-out wait's read-back
+                    return f"https://x/{args[1]}"
                 return await ask_again(*args, **kwargs)
 
         services_app.state.services = Services()
@@ -2883,6 +3373,7 @@ async def test_the_api_registers_lists_and_cancels_a_wait(tmp_path, monkeypatch)
         await client.delete(
             f"/api/sessions/{key}/wake-on", params={"id": again.json()["registered"]["id"]}
         )
+        recovered = await app.state.wake_on._recover_review("eerovil/agentdeck", 9)
         listed = await client.get(f"/api/sessions/{key}/wake-on")
         cancelled = await client.delete(
             f"/api/sessions/{key}/wake-on", params={"id": made.json()["registered"]["id"]}
@@ -2919,7 +3410,8 @@ async def test_the_api_registers_lists_and_cancels_a_wait(tmp_path, monkeypatch)
     assert [item["kind"] for item in after_accept.json()["waits"]] == ["pull_request", "review"]
     assert again.status_code == 200, again.text
     assert asks == [("eerovil/agentdeck", 9, "no verdict", True)]
-    assert crossed == [("router", "ask_again")]
+    assert crossed == [("router", "ask_again"), ("router", "recover_review")]
+    assert recovered == "https://x/9"
     assert again.json()["registered"]["kind"] == "review"
     assert made.status_code == 200, made.text
     wait = made.json()["registered"]

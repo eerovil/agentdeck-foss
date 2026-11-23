@@ -16,10 +16,26 @@ when idle and give back its graphics memory while voice mode waits.
     POST /wake    body: 16-bit mono WAV   -> {"woken", "score", "speech_after"}
                   ?threshold=0.5  the score that wakes (``[speech] wake_threshold``)
                   &word=jarvis    which wake word: ``jarvis`` (default) or ``alexa``
+    POST /stream  Upgrade: agentdeck-wake-stream  -> 101, then two-way (#4539)
+                  ?threshold=0.5&word=jarvis  as for /wake
     GET  /status                          -> {"model"}
 
 ``speech_after`` says whether speech follows the wake word in the same phrase
 ("Hey Jarvis, run the tests"), so the page knows to have that phrase transcribed.
+
+``/stream`` is the waiting microphone frame by frame (#4539), so the beep need not
+wait for the page's 0.8 s pause: after the ``101`` the deck writes records, each a
+type byte, a 4-byte big-endian length and its payload: ``P`` a phrase starts (its
+id), ``A`` 16 kHz 16-bit mono audio, ``E`` the phrase ended (its id). This writes
+one JSON line per event: ``{"crossed": id, "score", "at"}`` on the first 80 ms frame
+of a phrase at or over the threshold, ``at`` its end in seconds into the phrase, and
+``{"end": id, "score", "at"}`` once every frame of the phrase is scored, ``score``
+its peak and ``at`` the crossing or null. Records are handled in order, so a
+crossing in a phrase's last frames always comes before its ``end``. Each stream has
+an openWakeWord model of its own, holding only its word and reset at each phrase,
+so streams never share a model's buffers and a phrase scores as the same audio
+sent as a clip does. ``STREAMS`` at once; one more is answered 503, and the page
+sends clips as before.
 
 It starts at login (or on the first request to ``agentdeck-wake.socket``), loads
 the model and Silero at once and stays up: by the owner's decision on #3793, as on
@@ -62,6 +78,12 @@ TAIL_FRAMES = 12
 SPEECH_AFTER_MS = 250
 VAD_SILENCE_MS = 300
 MAX_BODY = 30 * 1024 * 1024
+# Pages streaming at once (#4539): the phone, the kitchen phone and the kiosk, and one
+# spare for a page that reconnects before the deck notices its old socket is gone.
+STREAMS = 4
+STREAM_UPGRADE = "agentdeck-wake-stream"
+# A stream's longest record: half a second of audio, more than one page chunk.
+MAX_RECORD = SAMPLE_RATE
 
 
 def model_path(model: str = MODEL) -> str:
@@ -85,6 +107,33 @@ class Detector:
             raise RuntimeError(f"wake word models not loaded: {sorted(missing)}")
         # One phrase at a time: the model keeps its audio buffer between frames.
         self.lock = threading.Lock()
+        # Streams' own models (#4539): those in use, and idle ones kept by word.
+        self.streams = 0
+        self.idle: dict[str, list] = {}
+
+    def stream(self, word: str, threshold: float) -> Stream:
+        """A model of its own for one page's stream, or ``Busy`` past ``STREAMS``."""
+        with self.lock:
+            if self.streams >= STREAMS:
+                raise Busy(f"{STREAMS} wake streams already")
+            self.streams += 1
+            idle = self.idle.get(word) or []
+            model = idle.pop() if idle else None
+        try:
+            if model is None:
+                from openwakeword.model import Model
+
+                model = Model(wakeword_model_paths=[model_path(MODELS[word])])
+        except BaseException:
+            with self.lock:
+                self.streams -= 1
+            raise
+        return Stream(model, MODELS[word], threshold, lambda: self._release(word, model))
+
+    def _release(self, word: str, model) -> None:
+        with self.lock:
+            self.streams -= 1
+            self.idle.setdefault(word, []).append(model)
 
     def scores(self, samples, word: str = "jarvis") -> list[float]:
         import numpy as np
@@ -128,6 +177,101 @@ class Detector:
         log.info("models warm in %.1f s", time.monotonic() - started)
 
 
+class Busy(Exception):
+    """Every stream is taken."""
+
+
+class Stream:
+    """One page's waiting microphone, 80 ms frame by frame (#4539)."""
+
+    def __init__(self, model, name: str, threshold: float, release, decode=None) -> None:
+        self.model = model
+        self.decode = decode or int16_frame
+        self.name = name
+        self.threshold = threshold
+        self.release = release
+        self.phrase = ""
+        self.start("")
+
+    def start(self, phrase: str) -> None:
+        """A new phrase: the model forgets the last one, as a clip's reset does."""
+        self.model.reset()
+        self.phrase = phrase
+        self.pending = b""
+        self.frames = 0
+        self.peak = 0.0
+        self.crossed: float | None = None
+
+    def feed(self, audio: bytes) -> dict | None:
+        """Scores every whole frame in ``audio``; the first crossing of the phrase."""
+        data = self.pending + audio
+        whole = len(data) // (FRAME * 2) * FRAME * 2
+        self.pending = data[whole:]
+        crossing = None
+        for start in range(0, whole, FRAME * 2):
+            frame = self.decode(data[start : start + FRAME * 2])
+            score = float(self.model.predict(frame)[self.name])
+            self.frames += 1
+            self.peak = max(self.peak, score)
+            if self.crossed is None and score >= self.threshold:
+                self.crossed = round(self.frames * FRAME / SAMPLE_RATE, 2)
+                crossing = {"crossed": self.phrase, "score": round(score, 4), "at": self.crossed}
+        return crossing
+
+    def end(self) -> tuple[dict | None, dict]:
+        """The phrase's last frames, as a clip scores them: the part frame and the
+        tail of silence, which a name said at the very end still rises in. Returns a
+        crossing in that tail, if any, and the phrase's end."""
+        crossing = self.feed(bytes(FRAME * 2 * TAIL_FRAMES))
+        return crossing, {"end": self.phrase, "score": round(self.peak, 4), "at": self.crossed}
+
+
+def int16_frame(data: bytes):
+    import numpy as np
+
+    return np.frombuffer(data, "<i2")
+
+
+def serve_stream(stream: Stream, rfile, wfile, touch=lambda: None) -> None:
+    """Records from the deck until it closes the stream; a JSON line per event."""
+
+    def send(event: dict) -> None:
+        wfile.write(json.dumps(event).encode() + b"\n")
+        wfile.flush()
+
+    while True:
+        head = rfile.read(5)
+        if len(head) < 5:
+            return
+        kind, length = head[:1], int.from_bytes(head[1:], "big")
+        if length > MAX_RECORD:
+            raise ValueError("record too long")
+        body = rfile.read(length)
+        if len(body) < length:
+            return
+        touch()
+        if kind == b"P":
+            stream.start(body.decode("ascii", "replace"))
+        elif kind == b"A":
+            crossing = stream.feed(body)
+            if crossing:
+                log.info(
+                    "stream: %s crossed %.3f at %.2fs",
+                    stream.name,
+                    crossing["score"],
+                    crossing["at"],
+                )
+                send(crossing)
+        elif kind == b"E":
+            crossing, end = stream.end()
+            if crossing:
+                send(crossing)
+            send(end)
+            stream.start("")
+        else:
+            raise ValueError(f"unknown record {kind!r}")
+
+
 def speech_after(samples) -> bool:
     """Whether Silero hears ``SPEECH_AFTER_MS`` of speech in ``samples``."""
     if len(samples) < SAMPLE_RATE * SPEECH_AFTER_MS // 1000:
@@ -167,6 +311,9 @@ class Handler(BaseHTTPRequestHandler):
         self.server.touch()
         try:
             path, _, query = self.path.partition("?")
+            if path == "/stream":
+                self._stream(parse_qs(query))
+                return
             if path != "/wake":
                 self._json(404, {"error": "not found"})
                 return
@@ -188,6 +335,37 @@ class Handler(BaseHTTPRequestHandler):
             self._json(500, {"error": str(exc)})
         finally:
             self.server.touch()
+
+    def _stream(self, params: dict) -> None:
+        """The waiting microphone streamed (#4539): ``101``, then records both ways
+        until the deck closes it; a 503 when every stream is taken."""
+        threshold = float(params.get("threshold", ["0.5"])[0])
+        word = params.get("word", ["jarvis"])[0]
+        if not 0 < threshold < 1 or word not in MODELS:
+            raise ValueError("a threshold between 0 and 1 and a known wake word")
+        if self.headers.get("Upgrade", "").lower() != STREAM_UPGRADE:
+            raise ValueError(f"expected Upgrade: {STREAM_UPGRADE}")
+        try:
+            stream = self.server.detector.stream(word, threshold)
+        except Busy as exc:
+            self._json(503, {"error": str(exc)})
+            return
+        self.close_connection = True
+        try:
+            self.send_response(101)
+            self.send_header("Upgrade", STREAM_UPGRADE)
+            self.send_header("Connection", "Upgrade")
+            self.end_headers()
+            self.wfile.flush()
+            log.info("stream open: %s", word)
+            serve_stream(stream, self.rfile, self.wfile, self.server.touch)
+        except (OSError, ValueError) as exc:
+            log.info("stream ended: %s", exc)
+        except Exception:  # noqa: BLE001 - one stream must not end the service
+            log.exception("stream failed")
+        finally:
+            stream.release()
+            log.info("stream closed: %s", word)
 
 
 class WakeServer(socketserver.ThreadingMixIn, HTTPServer):

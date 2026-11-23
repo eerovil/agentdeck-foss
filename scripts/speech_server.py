@@ -136,6 +136,8 @@ VAD_MIN_SPEECH_MS = 100
 # The noise reading needs this much speech and this much of the rest (#3934).
 SNR_MIN_S = 0.2
 MAX_BODY = 30 * 1024 * 1024
+# The page cuts a phrase at 28 s; an early clip length past this is not one (#4540).
+MAX_PHRASE_S = 60.0
 ENGINES = ("whisper", "parakeet")
 CONFIG = "~/.config/agentdeck/config.toml"
 # Keep equal to ``[speech] whisper_model``, ``whisper_beam`` and ``whisper_prompt``'s
@@ -237,6 +239,16 @@ def speech_spans(samples) -> list[dict]:
         speech_pad_ms=VAD_PAD_MS,
     )
     return get_speech_timestamps(samples, options)
+
+
+def new_speech_after(spans: list[dict], early_s: float) -> bool:
+    """Whether Silero hears speech in a phrase past the first ``early_s`` seconds, the
+    clip its early pass heard (#4540). A span reaching past that clip's end is new
+    speech: the early clip ends 0.3 s after the last full-level sound and Silero pads a
+    span by ``VAD_PAD_MS`` (0.2 s), so the early speech's own span ends inside it, and
+    any doubt hears the whole phrase."""
+    end = int(early_s * SAMPLE_RATE)
+    return any(span["end"] > end for span in spans)
 
 
 def snr_db(samples, spans: list[dict]) -> float | None:
@@ -356,11 +368,35 @@ class Speech:
         self.parakeet_lock = threading.Lock()
         self.warming: threading.Thread | None = None
 
-    def transcribe(self, data: bytes, previous: str = "", only: str = "") -> dict:
+    def transcribe(
+        self, data: bytes, previous: str = "", only: str = "", early_s: float | None = None
+    ) -> dict:
+        """The phrase's words. With ``early_s``, the length of a clip of this phrase the
+        page already asked about (its early pass, #4540): a phrase with no new speech
+        past it answers ``{"reuse": true}`` at once, outside the recognition lock, so
+        it never waits for the early pass still on the card; else it is heard whole, and
+        a check that fails is doubt, so heard whole too."""
+        spans = None
+        if early_s is not None:
+            started = time.monotonic()
+            try:
+                samples = read_wav(data)
+                spans = speech_spans(samples)
+            except Exception:  # noqa: BLE001 - any doubt hears the whole phrase
+                log.exception("tail check failed: the whole phrase is heard")
+            if spans is not None and not new_speech_after(spans, early_s):
+                log.info("no speech past the early pass's %.2fs: reuse its words", early_s)
+                return {
+                    "reuse": True,
+                    "text": "",
+                    "language": only or previous or "en",
+                    "seconds": round(time.monotonic() - started, 2),
+                }
         heard = self.recognize(data, previous, only)
         try:
             samples = read_wav(data)
-            heard["snr_db"] = snr_db(samples, speech_spans(samples))
+            # The tail check's spans serve the noise reading too: Silero runs once.
+            heard["snr_db"] = snr_db(samples, speech_spans(samples) if spans is None else spans)
         except Exception:  # noqa: BLE001 - the reading is for the bench, never the words
             log.exception("noise reading failed")
             heard["snr_db"] = None
@@ -607,6 +643,16 @@ class Speech:
         }
 
 
+def early_seconds(value: str) -> float | None:
+    """``?early_s=``: an early clip's length in seconds, or None when absent or not
+    a length a phrase can have (#4540)."""
+    try:
+        seconds = float(value)
+    except ValueError:
+        return None
+    return seconds if 0 < seconds <= MAX_PHRASE_S else None
+
+
 class Handler(BaseHTTPRequestHandler):
     server: SpeechServer
 
@@ -648,7 +694,12 @@ class Handler(BaseHTTPRequestHandler):
                 params = parse_qs(query)
                 previous = params.get("language", [""])[0]
                 only = params.get("only", [""])[0]
-                self._json(200, self.server.speech.transcribe(body, previous, only))
+                early = early_seconds(params.get("early_s", [""])[0])
+                if early is None:
+                    heard = self.server.speech.transcribe(body, previous, only)
+                else:
+                    heard = self.server.speech.transcribe(body, previous, only, early_s=early)
+                self._json(200, heard)
             elif path == "/warm":
                 self.server.speech.warm()
                 self._json(202, {"warming": True})

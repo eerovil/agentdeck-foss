@@ -2805,11 +2805,40 @@ async def test_restarting_screen_replaces_a_gateway_error_on_navigation(tmp_path
                     };
                     const mockCaches = { open: async () => cache, keys: async () => [],
                                          match: async () => null, delete: noop };
-                    const mockFetch = async () => {
+                    const cachedAsset = new Response('CACHED ASSET');
+                    if (opts.url.includes('/static/') && opts.cachedAsset) {
+                        cache.match = async () => cachedAsset;
+                    }
+                    let aborted = false;
+                    const mockFetch = async (req, init) => {
+                        if (init && init.signal) {
+                            init.signal.addEventListener('abort', () => { aborted = true; });
+                        }
                         if (opts.network === 'fail') throw new TypeError('failed to fetch');
+                        // A connection that died while the phone slept (#4591).
+                        if (opts.network === 'hang') return new Promise(() => {});
+                        // Headers well after the limit, from a server that is up.
+                        if (opts.slowHeaders) await new Promise((r) => setTimeout(r, 150));
+                        if (opts.slowBody) {
+                            // Headers now, the body well after the limit: a slow but
+                            // working response the limit must not cut off.
+                            const body = new ReadableStream({ start(c) {
+                                setTimeout(() => {
+                                    c.enqueue(new TextEncoder().encode(opts.body));
+                                    c.close();
+                                }, 150);
+                            } });
+                            return new Response(body, { status: opts.status });
+                        }
                         return new Response(opts.body || 'APP PAGE', { status: opts.status });
                     };
-                    new Function('self', 'caches', 'fetch', swSource)(
+                    // The limits, shortened so a hung request ends in milliseconds.
+                    const source = swSource
+                        .replace('const NAVIGATION_LIMIT_MS = 15000',
+                                 'const NAVIGATION_LIMIT_MS = 50')
+                        .replace('const ASSET_LIMIT_MS = 5000', 'const ASSET_LIMIT_MS = 50');
+                    if (source === swSource) throw new Error('limits not found in sw.js');
+                    new Function('self', 'caches', 'fetch', source)(
                         mockSelf, mockCaches, mockFetch);
                     let promise = null;
                     handlers.fetch({
@@ -2818,7 +2847,8 @@ async def test_restarting_screen_replaces_a_gateway_error_on_navigation(tmp_path
                     });
                     if (!promise) return { intercepted: false };
                     const res = await promise;
-                    return { intercepted: true, status: res.status, body: await res.text() };
+                    const body = await res.text();
+                    return { intercepted: true, status: res.status, body, aborted };
                 }
 
                 const NAV = 'https://deck.example/sessions/claude_code:test:sid1';
@@ -2837,6 +2867,20 @@ async def test_restarting_screen_replaces_a_gateway_error_on_navigation(tmp_path
                                          mode: 'cors', status: 502 }),
                     stream: await run({ url: 'https://deck.example/events',
                                         mode: 'cors', status: 200 }),
+                    hungNavigation: await run({ url: NAV, mode: 'navigate', network: 'hang' }),
+                    slowPage: await run({ url: NAV, mode: 'navigate', status: 200,
+                                         body: 'SLOW PAGE', slowBody: true }),
+                    hungAsset: await run({ url: 'https://deck.example/static/app.css',
+                                          mode: 'no-cors', network: 'hang',
+                                          cachedAsset: true }),
+                    slowAsset: await run({ url: 'https://deck.example/static/htmx.min.js',
+                                           mode: 'no-cors', status: 200, body: 'FULL SCRIPT',
+                                           slowBody: true, cachedAsset: true }),
+                    // No cached copy (a file outside the precache, or the first
+                    // load after a deploy): a late answer is still waited for.
+                    lateUncachedAsset: await run({
+                        url: 'https://deck.example/static/kiosk.js?v=abc', mode: 'no-cors',
+                        status: 200, body: 'LATE SCRIPT', slowHeaders: true }),
                 };
             }""",
             sw_source,
@@ -2860,6 +2904,19 @@ async def test_restarting_screen_replaces_a_gateway_error_on_navigation(tmp_path
     # never wrap them, or the live tail is buffered and dynamic HTML goes stale.
     assert results["partial"]["intercepted"] is False
     assert results["stream"]["intercepted"] is False
+    # #4591: a page load that gets no answer in time shows the screen, which keeps
+    # checking and reloads, instead of leaving the old page on screen for minutes.
+    assert results["hungNavigation"]["body"] == "RESTARTING SCREEN"
+    # Only the wait for the response is limited: a body slower than the limit
+    # still arrives whole.
+    assert results["slowPage"]["body"] == "SLOW PAGE"
+    # A hung static file falls back to the cached copy, and its request is aborted.
+    assert results["hungAsset"]["body"] == "CACHED ASSET"
+    assert results["hungAsset"]["aborted"] is True
+    assert results["slowAsset"]["body"] == "FULL SCRIPT"
+    assert results["slowAsset"]["aborted"] is False
+    assert results["lateUncachedAsset"]["body"] == "LATE SCRIPT"
+    assert results["lateUncachedAsset"]["aborted"] is False
 
 
 @pytest.mark.browser
@@ -2970,6 +3027,51 @@ async def test_restarting_screen_recovers_the_page_when_the_deck_comes_back(tmp_
             await page.locator(".session-detail").wait_for(timeout=25000)
             assert page.url == f"{base}{session_path}"
 
+        await browser.close()
+
+
+@pytest.mark.browser
+async def test_restarting_screen_stops_a_reload_loop_and_says_so(tmp_path):
+    """#4591: the screen shown for a hung page load must not loop for ever.
+
+    /healthz can answer on a fresh connection while the page load hangs again,
+    so the screen would reload, be shown again, and reload. After three reloads
+    in two minutes it stops and says the app needs closing; a tap starts over.
+    """
+    screen = (
+        Path(__file__).parents[1] / "src/agentdeck/web/static/restarting.html"
+    ).read_text()
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch()
+        page = await browser.new_page()
+        loads = []
+
+        async def serve(route):
+            path = route.request.url.split("?", 1)[0].removeprefix("http://agentdeck.test")
+            if path == "/healthz":
+                await route.fulfill(status=200, content_type="application/json", body="{}")
+            else:
+                loads.append(path)
+                await route.fulfill(status=200, content_type="text/html", body=screen)
+
+        await page.route("http://agentdeck.test/**", serve)
+        await page.goto("http://agentdeck.test/works/x")
+        # Three reloads, then it stops.
+        await expect(page.locator("#lead")).to_have_text(
+            "The connection seems stuck — close and reopen the app.", timeout=10000
+        )
+        assert len(loads) == 4
+        await expect(page.locator("#title")).to_have_text("Connection stuck")
+        await expect(page.locator("#spinner")).to_be_hidden()
+        await page.wait_for_timeout(1500)
+        assert len(loads) == 4
+        # A tap is a person asking again: the count starts over and it reloads.
+        await page.locator("#retry").click()
+
+        async def reloaded():
+            assert len(loads) == 5
+
+        await assert_eventually("a reload after the tap", reloaded)
         await browser.close()
 
 
@@ -3304,6 +3406,274 @@ async def test_pwa_focus_replaces_a_stale_stream_without_reloading_or_wiping_sta
         "scrollTop": 37,
         "navigationEntries": 1,
     }
+
+
+@pytest.mark.browser
+async def test_a_resume_that_hears_nothing_marks_the_page_and_reloads_it(tmp_path):
+    """#4591: an app back from sleep whose live updates never arrive recovers.
+
+    The phone can hold a connection that died while it slept; the stream then
+    opens, or seems to, and nothing ever comes. After the short check the reload
+    button turns amber and the streams are replaced; after the long one the page
+    reloads by itself, unless someone is in the middle of something. Hiding the
+    page again cancels both, and the stall is reported on the next load.
+
+    #4601: from a second after the resume until the first message, a notice
+    under the topbar says "Reconnecting…", then turns amber with the button's
+    words at the short check, and a tap on it reloads.
+    """
+    app = _app_with_state(tmp_path)
+    async with _client(app) as client:
+        dashboard = await client.get("/chats")
+
+    static_dir = Path(__file__).parents[1] / "src/agentdeck/web/static"
+    scripts = {
+        f"/static/{name}": (static_dir / name).read_text()
+        for name in ("htmx.min.js", "sse.js", "page_refresh.js", "app.css")
+    }
+
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch()
+        context = await browser.new_context(
+            viewport={"width": 390, "height": 800}, service_workers="block"
+        )
+        page = await context.new_page()
+        await page.add_init_script(
+            """
+            window.AgentDeckResumeTimings = {
+              noticeMs: 60, resumeCheckMs: 150, resumeReloadMs: 400, reloadLimitMs: 300,
+            };
+            window.__hidden = false;
+            Object.defineProperty(document, 'hidden', { get: () => window.__hidden });
+            Object.defineProperty(document, 'visibilityState', {
+              get: () => (window.__hidden ? 'hidden' : 'visible'),
+            });
+            window.setVisible = function (visible) {
+              window.__hidden = !visible;
+              document.dispatchEvent(new Event('visibilitychange'));
+            };
+            // Without a worker in this harness the guard is the page's own
+            // check: the test sets what it answers.
+            window.__busy = false;
+            Object.defineProperty(window, 'AgentDeckWorkInProgress', {
+              get: () => () => window.__busy, set: () => {},
+            });
+            window.__eventSources = [];
+            class FakeEventSource extends EventTarget {
+              static CONNECTING = 0; static OPEN = 1; static CLOSED = 2;
+              constructor(url) {
+                super();
+                this.readyState = FakeEventSource.OPEN;
+                window.__eventSources.push(this);
+                queueMicrotask(() => { if (this.onopen) this.onopen(new Event('open')); });
+              }
+              close() { this.readyState = FakeEventSource.CLOSED; }
+            }
+            window.EventSource = FakeEventSource;
+            """
+        )
+        loads = []
+        reports = []
+        hold_loads = False
+        held = []
+
+        async def serve(route):
+            path = route.request.url.split("?", 1)[0].removeprefix(
+                "http://agentdeck.test"
+            )
+            if path == "/":
+                loads.append(path)
+                if hold_loads:
+                    held.append(route)
+                    return
+                await route.fulfill(
+                    status=200, content_type="text/html", body=dashboard.text
+                )
+            elif path in scripts:
+                kind = "text/css" if path.endswith(".css") else "text/javascript"
+                await route.fulfill(status=200, content_type=kind, body=scripts[path])
+            elif path == "/api/browser-errors":
+                reports.append(json.loads(route.request.post_data))
+                await route.fulfill(status=204, body="")
+            else:
+                await route.fulfill(status=204, body="")
+
+        button = page.locator("[data-page-refresh]").first
+        notice = page.locator("#resume-notice")
+        notice_button = page.locator("[data-resume-notice]")
+        await page.route("http://agentdeck.test/**", serve)
+        await page.goto("http://agentdeck.test/")
+        await page.wait_for_function("window.AgentDeckPageRefresh && window.__eventSources.length")
+
+        # A message after the resume: the page is live, nothing happens.
+        await page.evaluate("setVisible(false); setVisible(true)")
+        await page.evaluate("htmx.trigger(document.body, 'htmx:sseMessage')")
+        await page.wait_for_timeout(600)
+        assert len(loads) == 1
+        assert "is-not-live" not in (await button.get_attribute("class"))
+        # A quick wake never shows the notice.
+        assert await notice.is_hidden()
+
+        # Voice mode keeps the stream open while hidden; it may be quiet for 30 s,
+        # so showing the page again is no reason to call it stuck.
+        await page.evaluate(
+            "document.documentElement.classList.add('voice-on');"
+            " setVisible(false); setVisible(true);"
+            " document.documentElement.classList.remove('voice-on')"
+        )
+        await page.wait_for_timeout(600)
+        assert len(loads) == 1
+        assert "is-not-live" not in (await button.get_attribute("class"))
+
+        # Hidden again before the checks: neither fires on a page nobody sees.
+        await page.evaluate("setVisible(true); setVisible(false)")
+        await page.wait_for_timeout(600)
+        assert len(loads) == 1
+        assert "is-not-live" not in (await button.get_attribute("class"))
+
+        assert await notice.is_hidden()
+
+        # Someone is busy: amber, streams replaced, but no reload by itself. The
+        # notice said Reconnecting… first, untappable, then the button's words.
+        await page.evaluate(
+            "window.__notices = []; const n = document.getElementById('resume-notice');"
+            " new MutationObserver(() => window.__notices.push("
+            "n.hidden ? '' : n.textContent.trim() + '|' + n.querySelector('button').disabled"
+            ")).observe(n, {attributes: true, childList: true, subtree: true,"
+            " characterData: true})"
+        )
+        await page.evaluate("window.__busy = true")
+        sources = await page.evaluate("window.__eventSources.length")
+        await page.evaluate("setVisible(true)")
+        await expect(button).to_have_class(re.compile("is-not-live"))
+        assert await button.get_attribute("aria-label") == "Not live — tap to reload"
+        await expect(notice).to_have_class(re.compile("is-not-live"))
+        await expect(notice_button).to_have_text("Not live — tap to reload")
+        await expect(notice_button).to_be_enabled()
+        seen = [s for s in await page.evaluate("window.__notices") if s]
+        assert seen[0] == "Reconnecting…|true"
+        assert await page.evaluate("window.__eventSources.length") > sources
+        await page.wait_for_timeout(600)
+        assert len(loads) == 1
+        # A message arriving late still clears the mark, and ends the stall: a
+        # later message does not move its first-message time.
+        await page.evaluate("htmx.trigger(document.body, 'htmx:sseMessage')")
+        await expect(button).not_to_have_class(re.compile("is-not-live"))
+        await expect(notice).to_be_hidden()
+        read_stall = "JSON.parse(localStorage.getItem('agentdeck:resume-stall'))"
+        first = (await page.evaluate(read_stall))["first_message_at_ms"]
+        await page.wait_for_timeout(50)
+        await page.evaluate("htmx.trigger(document.body, 'htmx:sseMessage')")
+        assert (await page.evaluate(read_stall))["first_message_at_ms"] == first
+
+        # Hiding the page hides a showing notice with the checks. Until a tap
+        # can help, a tap on it passes through to the page.
+        await page.evaluate("setVisible(false); setVisible(true)")
+        await expect(notice).to_be_visible()
+        assert await notice_button.evaluate("b => getComputedStyle(b).pointerEvents") == "none"
+        await page.evaluate("setVisible(false)")
+        await expect(notice).to_be_hidden()
+
+        # Still busy, so only a tap reloads: the amber notice's tap does, and the
+        # reloaded page reports the stall as the notice's reload.
+        await page.evaluate("setVisible(true)")
+        await expect(notice_button).to_be_enabled()
+        await notice_button.click()
+
+        async def notice_reloaded_and_reported():
+            assert len(loads) == 2
+            assert len(reports) == 1
+
+        await assert_eventually("the notice's reload and its report", notice_reloaded_and_reported)
+        assert json.loads(reports[0]["message"])["reload_by"] == "notice"
+        await page.wait_for_function("window.AgentDeckPageRefresh && window.__eventSources.length")
+
+        # Nobody busy: the page reloads by itself, and the reloaded page reports
+        # the stall once.
+        await page.evaluate("window.__busy = false; setVisible(false); setVisible(true)")
+        async def reloaded_and_reported():
+            assert len(loads) == 3
+            assert len(reports) == 2
+
+        await assert_eventually("the auto-reload and its stall report", reloaded_and_reported)
+        assert reports[1]["kind"] == "resume-stall"
+        stall = json.loads(reports[1]["message"])
+        assert stall["reload_by"] == "auto"
+        assert stall["reconnect_at_ms"] >= 150
+        assert await page.evaluate("localStorage.getItem('agentdeck:resume-stall')") is None
+
+        # The button's reload hangs: it tries once more, then says so. Tapped
+        # while the notice shows, the notice says Reloading… through the short
+        # check rather than offer an amber tap that would do nothing.
+        await page.wait_for_function("window.AgentDeckPageRefresh")
+        await page.evaluate("setVisible(false); setVisible(true)")
+        await expect(notice_button).to_have_text("Reconnecting…")
+        # The click waits on the held reload past both short limits, so the
+        # notice's changes are read from a record of them.
+        await page.evaluate(
+            "window.__notices = []; const n = document.getElementById('resume-notice');"
+            " new MutationObserver(() => window.__notices.push(n.textContent.trim()))"
+            ".observe(n, {childList: true, subtree: true, characterData: true})"
+        )
+        hold_loads = True
+        await button.click()
+        await expect(button).to_have_attribute(
+            "aria-label", "Reload stuck — close and reopen the app", timeout=5000
+        )
+        await expect(notice_button).to_have_text("Reload stuck — close and reopen the app")
+        assert await page.evaluate("window.__notices") == [
+            "Reloading…",
+            "Reload stuck — close and reopen the app",
+        ]
+        # A message ends that wake's not-live mark, as on any page.
+        await page.evaluate("htmx.trigger(document.body, 'htmx:sseMessage')")
+        await expect(notice).to_be_hidden()
+        assert len(loads) == 5
+        assert "is-refreshing" not in (await button.get_attribute("class"))
+        assert await button.is_enabled()
+        # Another tap tries again, without the stuck label on a spinning button.
+        # The click waits on the held reload past both short limits, so the
+        # button's changes are read from a record of them.
+        await page.evaluate(
+            "window.__labels = []; const b = document.querySelector('[data-page-refresh]');"
+            " new MutationObserver(() => window.__labels.push("
+            "b.classList.contains('is-refreshing') + '|' + b.getAttribute('aria-label')"
+            ")).observe(b, {attributes: true})"
+        )
+        await button.click()
+        assert (await page.evaluate("window.__labels"))[0] == "true|Reload page"
+
+        # A page with no live updates (the kiosk with no session) never hears
+        # one, so it is never marked or reloaded for that.
+        await page.evaluate(
+            "document.querySelectorAll('[sse-connect]')"
+            ".forEach((el) => el.removeAttribute('sse-connect'));"
+            " setVisible(false); setVisible(true)"
+        )
+        await page.wait_for_timeout(300)
+        assert "is-not-live" not in (await button.get_attribute("class"))
+        for route in held:
+            with suppress(PlaywrightError):
+                await route.abort()
+        await browser.close()
+
+
+async def test_a_resume_stall_report_is_recorded(tmp_path, caplog):
+    """#4591: the page's stall record reaches the server's log like a failure does."""
+    app = _app_with_state(tmp_path)
+    with caplog.at_level(logging.ERROR):
+        async with _client(app) as client:
+            response = await client.post(
+                "/api/browser-errors",
+                json={
+                    "kind": "resume-stall",
+                    "message": json.dumps({"reconnect_at_ms": 8000, "reload_by": "auto"}),
+                    "page": "/works/x",
+                },
+            )
+    assert response.status_code == 204
+    assert "browser resume-stall on /works/x" in caplog.text
+    assert "reload_by" in caplog.text
 
 
 async def test_push_client_assets_and_bell(tmp_path):

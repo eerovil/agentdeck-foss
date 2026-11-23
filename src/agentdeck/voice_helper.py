@@ -87,6 +87,7 @@ import re
 import shutil
 import statistics
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -121,6 +122,24 @@ TIMINGS = ("words", "stt", "sent", "pressed", "shown", "voice")
 # The host's, from the chat's transcript (#4360): the Send report to the person's
 # message in it, and that to the agent's first words.
 HOST_TIMINGS = ("agent", "answer")
+# Why the page held a reply it could have read while it was being written (#4543):
+# a reading already going, someone talking, a fast-helper line, a question box, or
+# voice mode resting. Such a phrase waited on purpose and stays out of the summary.
+WAITED = ("speaking", "talking", "relaying", "question", "resting")
+# The parts such a wait lengthens, left out of the summary for it.
+WAITED_PARTS = ("Voice made", "Total")
+# How a phrase's words were made, or why it had no early pass, as the page says
+# beside its waits (#4540), and how the voice log names each.
+EARLY_WAYS = {
+    "early": "early pass",
+    "checked": "early pass, tail checked",
+    "tail": "heard whole: speech after the early pass",
+    "failed": "heard whole: early pass or tail check failed",
+    "question": "no early pass: question box",
+    "other": "no early pass: not a message",
+    "cap": "no early pass: phrase too long",
+    "cut": "no early pass: cut short",
+}
 MAX_TIMING_MS = 120_000
 # A transcript line is stamped a moment apart from the deck's clock reading of a send.
 SENT_CLOCK_SLACK_S = 2.0
@@ -233,6 +252,119 @@ MISHEARD_JUU = frozenset({"you", "jo", "yo"})
 UNSURE = re.compile(r"\[unsure: ([^\]]*)\]")
 
 
+# A phrase the fast agent calls noise goes to the chat anyway when it holds a request
+# or a question (#4542, word rule from #4535): a stray message costs less than a lost
+# request, so the check leans to sending.
+_FI_QUESTION = frozenset(
+    "mikä mitä mitkä mikset miksi miten missä mistä mihin milloin kuka kenen keneltä "
+    "kuinka kumpi millainen millaisia montako paljonko entä entäs minkä millä mille "
+    "miltä missäs kenelle ketä".split()
+)
+_FI_ASK = frozenset(
+    "kerro kerropa katso katsopa katopas näytä laita tee avaa lisää tarkista etsi hae "
+    "sammuta soita lue kirjoita poista korjaa vaihda jatka lopeta siirrä mene anna "
+    "voisitko voitaisiin pitäisi pitäis haluan haluaisin tarvitsen".split()
+)
+# The question ending -ko/-kö (+ -han/-hän, -s, -pa): "voitko", "onko", "meneekö".
+_FI_KO = re.compile(r"[^\W\d_]{2,}(?:ko|kö)(?:han|hän|s|pa)?")
+_NOT_KO = frozenset({"jako", "tikko", "mikko", "kakko", "kokko", "sukko", "rako"})
+# The "let's" form: "katsotaan", "tehdään", "jätetään".
+# A doubled-consonant ending takes a short stem: "mennään", "tullaan".
+_FI_LETS = re.compile(
+    r"[^\W\d_]{3,}(?:taan|tään|daan|dään)|[^\W\d_]{2,}(?:llaan|llään|nnaan|nnään|rraan|rrään)"
+)
+# A goodbye, not an ask.
+_NOT_LETS = frozenset({"nähdään"})
+_EN_ASK = re.compile(
+    r"\b(?:can|could|would|will|do|did|have)\s+you\b|\bplease\b|\blet'?s(?:\W+\w+){2}"
+    r"|\b(?:tell|show|give)\s+me\b"
+    # A question opening the phrase, maybe after one lead-in word ("So what now").
+    r"|^\W*(?:(?:so|but|ok|okay|well|and)\W+)?(?:what|how|why|when|where|who|which"
+    r"|is|are|does|should|can\s+we|shall\s+we)\b",
+    re.IGNORECASE,
+)
+# Speech recognition's well-known hallucinations on silence ("Please like, share and
+# subscribe.", "Thanks for watching."): whole clauses of these words holding a core
+# word are taken out before the check where they open or end the phrase, so they
+# alone ask nothing. A clause with any other word is never cut into, since "please"
+# and "subscribe" are real ask words too ("Please subscribe me to the newsletter").
+_HALLUCINATION_WORDS = frozenset(
+    "please like comment share and subscribe don t dont forget to hit the my our this"
+    " channel bell notification notifications button thanks thank you so much for"
+    " watching".split()
+)
+_HALLUCINATION_CORE = frozenset({"subscribe", "channel", "watching", "bell"})
+_WAKE_NAMES = frozenset({"jarvis", "alexa", "hey"})
+_WAKE = re.compile(r"\b(?:jarvis|alexa)\b", re.IGNORECASE)
+# Not a request but the agent's own voice heard back: this many words or more, and
+# this share of them in its last lines said aloud.
+ECHO_MIN_WORDS = 6
+ECHO_SHARE = 0.8
+ECHO_LINES = 4
+
+
+def _words(text: str) -> list[str]:
+    return re.findall(r"[^\W\d_]+", text.casefold())
+
+
+# Where clauses end: punctuation, and quote marks but not an apostrophe inside a word.
+_CLAUSE_END = re.compile(r"([,;:.!?…\"“”«»‘]|(?<![^\W\d_])['’]|['’](?![^\W\d_]))")
+
+
+def _without_hallucinations(heard: str) -> str:
+    """The phrase with hallucination clauses taken out of its start and its end."""
+    parts = _CLAUSE_END.split(heard)
+    clauses = range(0, len(parts), 2)
+
+    def run(order: Iterable[int]) -> list[int]:
+        taken = []
+        for i in order:
+            words = _words(parts[i])
+            if not all(w in _HALLUCINATION_WORDS or w in _WAKE_NAMES for w in words):
+                break
+            taken.append(i)
+        words = [w for i in taken for w in _words(parts[i])]
+        return taken if any(w in _HALLUCINATION_CORE for w in words) else []
+
+    for i in {*run(clauses), *run(reversed(clauses))}:
+        parts[i] = " " + " ".join(w for w in _words(parts[i]) if w in _WAKE_NAMES) + " "
+    return "".join(parts)
+
+
+def request(heard: str) -> bool:
+    """Whether a phrase holds a Finnish or English request or question."""
+    heard = _without_hallucinations(heard)
+    words = _words(heard)
+    if _WAKE.search(heard) and len(_words(_WAKE.sub(" ", heard))) >= 2:
+        return True
+    for word in words:
+        if word in _FI_QUESTION or word in _FI_ASK:
+            return True
+        if re.sub(r"(?:han|hän)$", "", word) in _FI_QUESTION:
+            return True
+        if word not in _NOT_KO and _FI_KO.fullmatch(word):
+            return True
+        if word not in _NOT_LETS and _FI_LETS.fullmatch(word):
+            return True
+    return bool(_EN_ASK.search(heard))
+
+
+def echo(heard: str, said: list[str]) -> bool:
+    """Whether a phrase is mostly the agent's own last lines said aloud, heard back."""
+    words = _words(heard)
+    spoken = set(_words(" ".join(said[-ECHO_LINES:])))
+    return len(words) >= ECHO_MIN_WORDS and sum(w in spoken for w in words) >= (
+        ECHO_SHARE * len(words)
+    )
+
+
+# How the voice conversation's history marks a line the agent's chat had read aloud, and
+# the fast agent's own lines: its answer, said if the chat stays quiet, and its
+# narration of the quiet agent's work. Both are proposals the page may never speak.
+ALOUD = "Agent said aloud: "
+SAID, NARRATED_HEAD = "You: ", "You, while it worked: "
+
+
 # What the agent did since the person last spoke, as the fast agent is told it (#3799).
 MAX_STEPS = 12
 MAX_STEP_CHARS = 160
@@ -250,6 +382,8 @@ class Answer:
     back: bool = False
     # The words stop mid-thought (#3934): the page waits a little for the rest.
     more: bool = False
+    # Called noise, but sent as heard: it holds a request or a question (#4542).
+    rescued: bool = False
 
 
 @dataclass
@@ -272,6 +406,14 @@ class _Agent:
     last_lines: int = 0
     # Its process was told the way back to the deck chat (#3816).
     back: bool = False
+    # The lines really said aloud, newest last, for the echo guard (#4542): the chat's
+    # read aloud, and the fast agent's own once the page reports it spoke them.
+    # Known limit, accepted by the owner (#4542): the page reports a line when it starts
+    # to read it, before the sound plays, and the fallback line twice, so a line never
+    # heard can count. It only matters for a 6+ word phrase repeating 80 % of one.
+    voiced: list[str] = field(default_factory=list)
+    # How many of them the last phrase added, taken out with its answer (#3765).
+    last_voiced: int = 0
 
 
 _agents: dict[str, _Agent] = {}
@@ -383,14 +525,24 @@ def message(
     return "\n\n".join(parts)
 
 
-def parse(reply: str, heard: str, question: bool = False, back: bool = False) -> Answer:
+def parse(
+    reply: str,
+    heard: str,
+    question: bool = False,
+    back: bool = False,
+    said: list[str] | None = None,
+) -> Answer:
     """The two lines of a reply. A missing or reworded RELAY sends the words heard;
     a short yes or no is always sent, a lone "you" after a ``question`` as "Juu.".
     ``back``: a BACK line is the ask to go back to the deck chat (#3816).
     A phrase with doubted words reaches the chat as heard, marks and all, whatever the
-    reply: never as a guessed "Juu.", a jump to the deck chat or noise (#3817)."""
+    reply: never as a guessed "Juu.", a jump to the deck chat or noise (#3817).
+    A phrase called noise that holds a request or a question is sent as heard too,
+    unless it is mostly the agent's own lines in ``said`` heard back (#4542)."""
     more = any(line.strip().strip(".").upper() == MORE for line in reply.splitlines())
     answer = _parse_short(reply, heard, question, back)
+    if answer.relay is None and not answer.back and request(heard) and not echo(heard, said or []):
+        answer = Answer(answer.say, heard, rescued=True)
     # Noise and a jump send nothing, so nothing waits for more of them.
     return replace(answer, more=True) if more and answer.relay is not None else answer
 
@@ -549,7 +701,9 @@ async def heard(
         dropped = bool(drop) and drop == agent.last_id and agent.last_lines > 0
         if dropped:
             del agent.history[-agent.last_lines :]
-        agent.last_id, agent.last_lines = "", 0
+            # The page sends the thrown-away ask's lines read aloud again.
+            del agent.voiced[len(agent.voiced) - agent.last_voiced :]
+        agent.last_id, agent.last_lines, agent.last_voiced = "", 0, 0
         fresh = not _running(agent)
         answer, outcome, reply = await _turn(app, agent, text, aloud, question, dropped)
         await asyncio.to_thread(
@@ -564,6 +718,8 @@ async def heard(
                 "reply": reply,
                 "say": answer.say if answer else None,
                 **({"more": True} if answer is not None and answer.more else {}),
+                # Counted a month on, to narrow a word that sends noise (#4542).
+                **({"rescued": True} if answer is not None and answer.rescued else {}),
                 "relay": answer.relay if answer else text,
                 **({"back": True} if answer is not None and answer.back else {}),
                 "fresh": fresh,
@@ -578,10 +734,12 @@ async def heard(
             await _close(agent)
         # Every phrase heard is the voice conversation, answered or not: the page
         # sent it to the chat either way, and a fresh process needs it for what follows.
-        added = [f"Agent said aloud: {line}" for line in aloud]
+        agent.voiced = (agent.voiced + aloud)[-ECHO_LINES:]
+        agent.last_voiced = min(len(aloud), len(agent.voiced))
+        added = [ALOUD + line for line in aloud]
         added.append(f"Person: {text}")
         if answer is not None and answer.say:
-            added.append(f"You: {answer.say}")
+            added.append(SAID + answer.say)
         agent.history = (agent.history + added)[-HISTORY_LINES:]
         if phrase_id:
             agent.last_id, agent.last_lines = phrase_id, min(len(added), len(agent.history))
@@ -689,7 +847,7 @@ async def narrate(
         if agent.gone:
             await _close(agent)
         if said:
-            agent.history = (agent.history + [f"You, while it worked: {said}"])[-HISTORY_LINES:]
+            agent.history = (agent.history + [NARRATED_HEAD + said])[-HISTORY_LINES:]
         return said or None
 
 
@@ -789,7 +947,7 @@ async def _start(app, agent: _Agent) -> str | None:
 
 def _asked(agent: _Agent, aloud: list[str]) -> bool:
     """Whether the agent's last line read aloud was a question."""
-    lines = aloud or [line for line in agent.history if line.startswith("Agent said aloud: ")][-1:]
+    lines = aloud or [line for line in agent.history if line.startswith(ALOUD)][-1:]
     return bool(lines) and lines[-1].rstrip().endswith("?")
 
 
@@ -816,7 +974,8 @@ async def _turn(
         # Its answer may still come; a fresh process is told the conversation instead.
         await _close(agent)
         return None, outcome, None
-    return parse(reply, text, question, back=agent.back), ANSWERED, reply
+    said = agent.voiced + aloud
+    return parse(reply, text, question, back=agent.back, said=said), ANSWERED, reply
 
 
 def log_path(key: str) -> Path:
@@ -853,6 +1012,11 @@ async def spoken(key: str, phrase_id: str, text: str) -> None:
     back until the chat stays quiet, so a line proposed is often never heard."""
     record = {"at": time.time(), "spoken_for": phrase_id, "spoken": text}
     await asyncio.to_thread(_save, key, record)
+    agent = _agents.get(key)
+    if agent is not None and text.strip():
+        agent.voiced = (agent.voiced + [text])[-ECHO_LINES:]
+        # Said after its phrase's ask, so no thrown-away answer can take it out.
+        agent.last_voiced = 0
 
 
 def _kept_timing(timing: dict, names) -> dict:
@@ -873,6 +1037,10 @@ async def timed(key: str, phrase_id: str, timing: dict, host: dict | None = None
     kept = _kept_timing(timing, TIMINGS)
     if kept:
         kept.update(_kept_timing(host or {}, HOST_TIMINGS))
+        if timing.get("waited") in WAITED:
+            kept["waited"] = timing["waited"]
+        if isinstance(timing.get("early"), str) and timing["early"] in EARLY_WAYS:
+            kept["early"] = timing["early"]
         record = {"at": time.time(), "timing_for": phrase_id, "timing": kept}
         await asyncio.to_thread(_save, key, record)
 
@@ -1026,11 +1194,38 @@ def timing_parts(timing: dict | None) -> list[tuple[str, int]]:
     return parts
 
 
+def early_summary(phrases: list[dict]) -> list[dict]:
+    """How the recent timed phrases' words were made (#4540): per way, how many and
+    their median from the end of speech to the words, most common first, over the
+    phrases ``timing_summary`` counts."""
+    timings = [p["timing"] for p in phrases if p.get("timing")]
+    timings = [t for t in timings if "voice" in t or "shown" in t][:TIMED_SUMMARY]
+    ways: dict[str, list[int]] = {}
+    for timing in timings:
+        way = timing.get("early")
+        if way in EARLY_WAYS and isinstance(timing.get("words"), int):
+            ways.setdefault(way, []).append(timing["words"])
+    return [
+        {"label": EARLY_WAYS[way], "count": len(words), "median": round(statistics.median(words))}
+        for way, words in sorted(ways.items(), key=lambda item: -len(item[1]))
+    ]
+
+
 def timing_summary(phrases: list[dict]) -> list[dict]:
     """Each part's median and slowest over the newest ``TIMED_SUMMARY`` phrases whose
     answer reached the page, read aloud or not (``phrases`` newest first, as ``saved``
-    gives them)."""
-    timed_parts = [dict(timing_parts(p.get("timing"))) for p in phrases if p.get("timing")]
+    gives them). A phrase whose reply voice mode held on purpose (``waited``, #4543)
+    keeps its parts up to the page; its voice parts are left out, since that wait says
+    nothing about how fast the way is."""
+    timed_parts = []
+    for p in phrases:
+        if not p.get("timing"):
+            continue
+        parts = dict(timing_parts(p["timing"]))
+        if p["timing"].get("waited"):
+            for label in WAITED_PARTS:
+                parts.pop(label, None)
+        timed_parts.append(parts)
     timed_parts = [p for p in timed_parts if "Total" in p or "Total to the page" in p]
     timed_parts = timed_parts[:TIMED_SUMMARY]
     summary = []

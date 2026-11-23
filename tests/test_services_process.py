@@ -207,6 +207,10 @@ async def test_an_act_reaches_the_services_and_its_refusal_comes_back_by_name(tm
         ["eerovil/agentdeck", 9, "the owner kept it"],
         {},
     )
+    # #4478: a timed-out review wait's verdict read-back crosses too.
+    assert "recover_review" in work_services.CALLS["router"]
+    assert await router.recover_review("eerovil/agentdeck", 9) == {"outcome": "asked"}
+    assert app.state.services.calls[2][:3] == ("router", "recover_review", ["eerovil/agentdeck", 9])
 
 
 def test_the_web_says_a_filed_issue_starts_only_when_it_is_this_decks(tmp_path):
@@ -348,7 +352,8 @@ def _hooks(tmp_path) -> work_services.Hooks:
     return work_services.Hooks(
         start_work=nothing,
         review_chat=nothing,
-        reviewer=dict,
+        # The reviewer's own ports, for one built at start (#4458).
+        reviewer=lambda: {"start": nothing, "alive": lambda token: None, "checkout_of": list},
         interrupt=nothing,
         load_work=nothing,
         refresh_overview=nothing,
@@ -405,36 +410,79 @@ async def test_one_commit_status_walks_the_deck_once_however_many_works(web, tmp
 
 async def test_the_design_review_takes_the_code_reviewers_places(web, tmp_path, monkeypatch):
     """#4332 review: the design reviewer is the code reviewer, or, when ChatGPT reviews code,
-    one Claude reviewer on the same ledger and cap, made at the first design review."""
+    one Claude reviewer on the same ledger and cap. #4458: made at start, told what stopped,
+    and swept on a tick once the chats are copied, a failed sweep tried again."""
     made = []
 
     class Reviewer:
         def __init__(self, **kwargs):
             made.append(kwargs)
             self.kind = kwargs["kind"]
+            self.sweeps = 0
 
-        async def start_design(self, issue, url, *, checkout=""):
+        async def start_design(self, issue, url, *, checkout="", earlier=""):
             return (self.kind, issue, checkout)
 
+        async def sweep_now(self):
+            self.sweeps += 1
+            if self.sweeps == 1:
+                raise OSError("the ledger is unreadable")
+            return [{"token": "running"}]
+
     monkeypatch.setattr(work_services.agent_review, "AgentReviewer", Reviewer)
-    for kind, makes in (("claude", 1), ("chatgpt", 0)):
+    for kind in ("claude", "chatgpt"):
         made.clear()
         config = work_services_config(tmp_path)
+        config.services.enabled = True
         monkeypatch.setattr(work_services, "work_reviewer", lambda config, kind=kind: kind)
         services = work_services.build(
             config, state=web, db=web.db, issues=_Issues(), hooks=_hooks(tmp_path)
         )
-        assert len(made) == makes
+        assert len(made) == 1 and made[0]["ledger"] == config.review.ledger_path
+        assert made[0]["max_reviewers"] == config.review.max_reviewers
+        assert made[0]["kind"] == "claude"
+        assert made[0]["on_stopped"] is not None and services.reviewer is not None
         start = services.router._design._start
         assert await start("o/r#7", "u", checkout="/c") == ("claude", "o/r#7", "/c")
         await start("o/r#7", "u")
-        assert len(made) == 1 and made[0]["ledger"] == config.review.ledger_path
-        assert made[0]["max_reviewers"] == config.review.max_reviewers
+        assert len(made) == 1
+
+    monkeypatch.setattr(work_services, "REVIEWER_SWEEP_S", 0)
+    copied = asyncio.Event()
+
+    async def scanned():
+        await copied.wait()
+
+    services.hooks.scanned = scanned
+    retold = []
+
+    async def retell(running):
+        retold.append(running)
+
+    services.design_dropped.retell = retell
+    task = asyncio.create_task(services._sweep_reviewers())
+    for _ in range(3):
+        await asyncio.sleep(0)
+    assert services.reviewer.sweeps == 0, "no sweep before the chats are copied"
+    copied.set()
+    for _ in range(6):
+        await asyncio.sleep(0)
+    assert services.reviewer.sweeps >= 2, "a failed sweep stops no tick"
+    assert retold and retold[0] == [{"token": "running"}], "unheard notices tried again"
+    task.cancel()
+
     monkeypatch.setattr(work_services, "work_reviewer", lambda config: "off")
     services = work_services.build(
         config, state=web, db=web.db, issues=_Issues(), hooks=_hooks(tmp_path)
     )
+    assert services.reviewer is None
     assert (await services.router.design_review("o/r#7"))["status"] == 409
+    monkeypatch.setattr(work_services, "work_reviewer", lambda config: "claude")
+    config.services.enabled = False
+    services = work_services.build(
+        config, state=web, db=web.db, issues=_Issues(), hooks=_hooks(tmp_path)
+    )
+    assert services.reviewer is None, "no tick where the services do not run"
 
 
 # --- the services process reads the web's copy through the internal route (#4013) -------
@@ -667,6 +715,70 @@ def test_a_services_change_or_reconnect_is_republished_on_the_webs_bus():
     follower.moved(services_link.KINDS)
     assert woken == [1, 1] and reread == [1]
     assert bus.revision(WORK_INPUTS_TOPIC, REVIEWS_TOPIC) == (1, 1)
+
+
+def test_a_reviewer_reads_alive_from_its_chat_and_a_web_restart_never_reads_stopped(tmp_path):
+    """#4458: the copy carries ``shown_thinking`` only when the web is built to, so a design
+    reviewer read as stopped once ChatGPT reviewed code; and a copy refilled before a fresh
+    web's first scan lacks running chats, which must not read as stopped either."""
+    from agentdeck.config import AppConfig
+    from agentdeck.services_process import SessionFollower, remote_hooks
+
+    db = Db(tmp_path / "control.db")
+    web = AppState(db=db, budget_db=db)
+    key = "claude_code:test:reviewer"
+    web.sessions = {key: _session(key, minutes=1, thinking=True)}
+    web.bind_session_token("tok", key)
+    copy = AppState(db=db, budget_db=db)
+    follower = SessionFollower(None, copy, db, on_registered=lambda *ref: None)
+
+    async def nothing(*_args, **_kwargs):
+        return None
+
+    alive = remote_hooks(
+        AppConfig(),
+        web=None,
+        state=copy,
+        db=db,
+        feed=None,
+        scanned=nothing,
+        runtime_http=lambda: None,
+        wake_registry=None,
+        copied=nothing,
+        complete=lambda: follower.complete,
+    ).reviewer()["alive"]
+
+    # A web that sends no ``shown_thinking``: the chat's own ``thinking`` answers.
+    follower.apply(session_copy.SessionCopyFeed(web, shown=False).answer(None, None))
+    assert copy.sessions[key].shown_thinking is None and follower.complete
+    assert alive("tok") is True
+    web.sessions = {key: _session(key, minutes=1, thinking=False)}
+    follower.apply(session_copy.SessionCopyFeed(web, shown=False).answer(None, None))
+    assert alive("tok") is False
+
+    # The web restarts: its first answer is a reset from a web that has not scanned yet.
+    web.sessions = {}
+    scanned = [False]
+    feed = session_copy.SessionCopyFeed(web, scanned=lambda: scanned[0])
+    follower.apply(feed.answer(None, None))
+    assert key not in copy.sessions and not follower.complete
+    assert alive("tok") is True, "missing from a partial copy is not stopped"
+    scanned[0] = True
+    follower.apply(feed.answer(feed.revision, feed.epoch))
+    assert follower.complete and alive("tok") is None, "missing from a whole copy: unknown"
+
+
+def test_the_web_reads_the_routers_handed_over_works(tmp_path):
+    """#4450: the Works' status runs in the web, whose router is a ``RouterLink``; it reads the
+    file the router in the services process writes, or a handed-over Work ends as a bug."""
+    from agentdeck.work_router import HANDED_OVER, KeyFile, handed_over_path
+
+    config = work_services_config(tmp_path)
+    link = services_link.RouterLink(config, None, _NoState())
+    key = f"{HANDED_OVER}github_issue:eerovil/agentdeck#9"
+    assert key not in link.handed_over
+    KeyFile(handed_over_path(config.github_webhook.path)).add(key)
+    assert key in link.handed_over
 
 
 async def test_a_services_process_out_of_reach_shows_in_the_top_bar_and_healthz(tmp_path):

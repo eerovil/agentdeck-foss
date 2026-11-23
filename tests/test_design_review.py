@@ -29,6 +29,9 @@ def test_a_verdict_is_the_first_line_only():
         dr.verdict_of(f"/claude Review of o/r#9 at abc\n/claude Design review of {ISSUE}: pass")
         is None
     )
+    assert dr.verdict_of(f"/claude Design review of {ISSUE}: notes 9\n- x") == dr.Verdict(
+        ISSUE, dr.NOTES, "9"
+    )
     assert dr.verdict_of(f"/claude Design review of {ISSUE}: passing") is None
     assert dr.verdict_of("") is None
 
@@ -66,6 +69,30 @@ def test_only_the_decks_record_of_the_newest_design_decides():
     assert dr.state((DESIGN, quoted), urls, {"1": dr.PASS}) == dr.PASS
     # A design whose number is unread stays unreviewed, whatever is recorded.
     assert dr.state((DESIGN,), ("",), {"": dr.PASS}) == dr.UNREVIEWED
+
+
+def test_a_design_series_gets_two_rounds():
+    """#4463: the round is one more than the gaps before it since the last pass; a gap (or
+    notes) in round 2 is recorded as notes, which holds no code review."""
+    record: dict[str, str] = {}
+    assert dr.round_of(record, "10") == 1 and dr.earlier_gap(record, "10") == ""
+    assert dr.kept(record, dr.Verdict(ISSUE, dr.NOTES, "10")) == dr.GAP  # too early for notes
+    record["10"] = dr.GAP
+    assert dr.round_of(record, "12") == 2 and dr.earlier_gap(record, "12") == "10"
+    assert dr.kept(record, dr.Verdict(ISSUE, dr.GAP, "12")) == dr.NOTES
+    assert dr.kept(record, dr.Verdict(ISSUE, dr.NOTES, "12")) == dr.NOTES
+    assert dr.kept(record, dr.Verdict(ISSUE, dr.PASS, "12")) == dr.PASS
+    # Numbers order by value, not text; a later verdict does not count for an earlier design.
+    record.update({"9": dr.GAP, "100": dr.GAP})
+    assert dr.round_of(record, "12") == 3 and dr.earlier_gap(record, "12") == "10"
+    # A pass, or a pass with notes, ends a series: the next design is round 1 again.
+    for ended in (dr.PASS, dr.NOTES):
+        assert dr.round_of({**record, "11": ended}, "12") == 1
+        assert dr.earlier_gap({**record, "11": ended}, "12") == ""
+    assert dr.round_of(record, "") == 1 and dr.round_of({"x": dr.GAP}, "5") == 1
+    urls = (URL.format(1), URL.format(2))
+    assert dr.state((DESIGN, DESIGN), urls, {"1": dr.GAP, "2": dr.NOTES}) == dr.NOTES
+    assert dr.gap(dr.NOTES) == ""
 
 
 def test_the_verdict_record_is_kept_per_issue(tmp_path):
@@ -108,7 +135,7 @@ def test_the_brief_hands_out_the_verdict_lines_the_deck_reads():
         design_url=URL.format(55),
         base="main",
         request="deck-request",
-        token="tok-1",
+        token="tok-1-0123456789abcdef",
     )
     assert is_reviewer_prompt(text)
     for verdict in ("pass", "gap"):
@@ -116,9 +143,34 @@ def test_the_brief_hands_out_the_verdict_lines_the_deck_reads():
         assert line in text
         assert dr.verdict_of(line) == dr.Verdict(ISSUE, verdict, "55")
     assert (
-        "deck-request o/r#7 --session-token tok-1 --body-file" in text
+        "deck-request o/r#7 --session-token tok-1-0123456789abcdef --body-file"
+        " /var/tmp/design-review-tok-1-012345.md"
+        in text
         and "gh issue view 7 --repo o/r" in text
     )
+    # Its file is its own (#4468): one shared name sent an earlier reviewer's verdict.
+    # Only its first 12 characters: the whole token proves who sends a verdict.
+    assert "/var/tmp/design-review-tok-1-012345.md`, a name no other reviewer uses" in text
+    assert "design-review-tok-1-0123456789abcdef" not in text
+    # Round 1 (#4463): every gap at once, from the fixed list, no small details.
+    assert "only two reviews" in text and "no time on small details" in text
+    assert all(item in text for item in dr.CHECKLIST) and "last round" not in text
+    assert ": notes 55" not in text
+    last = dr.brief(
+        name="Claude",
+        issue=ISSUE,
+        design_url=URL.format(56),
+        base="main",
+        request="deck-request",
+        token="tok-1-0123456789abcdef",
+        earlier=URL.format(55),
+    )
+    assert "This is the last round" in last and URL.format(55) in last
+    assert "Check only those gaps" in last and dr.CHECKLIST[0] not in last
+    for verdict in ("pass", "notes"):
+        line = f"/claude Design review of {ISSUE}: {verdict} 56"
+        assert line in last and dr.verdict_of(line).comment == "56"
+    assert ": gap 56" not in last
 
 
 async def test_a_design_review_starts_only_on_an_unreviewed_design(tmp_path):
@@ -165,6 +217,10 @@ async def test_a_design_review_starts_only_on_an_unreviewed_design(tmp_path):
     assert "found a gap" in await round_.missing(ISSUE)
     verdicts.record(ISSUE, "2", "pass")
     comments.append({"body": DESIGN, "url": URL.format(4)})
+    # After a pass a new series begins: round 1, no earlier design named (#4463).
+    busy[0] = False
+    await round_.ask(ISSUE)
+    assert asked[-1] == (ISSUE, URL.format(4), "")
     assert "no design review after it" in await round_.missing(ISSUE)  # an older pass
     assert await round_.stale(ISSUE, dr.Verdict(ISSUE, dr.PASS, "4")) == ""
     assert "comment 4, not 2" in await round_.stale(ISSUE, dr.Verdict(ISSUE, dr.PASS, "2"))
@@ -208,3 +264,42 @@ async def test_the_status_says_where_the_round_stands(tmp_path):
     assert (await now())["state"] == dr.PASS
     comments.append({"body": DESIGN, "url": URL.format(3)})
     assert (await now())["state"] == dr.UNREVIEWED  # a newer design: its own round
+
+
+async def test_the_second_round_names_round_ones_design_and_its_gap_passes_with_notes(tmp_path):
+    """#4463: round 2's reviewer is handed the design whose gaps it rechecks, and the deck
+    records a gap it sends as notes, which opens the code review."""
+    from agentdeck.agent_review import Started
+
+    asked: list[dict] = []
+
+    async def start(issue, url, *, checkout="", **asks):
+        asked.append({"url": url, **asks})
+        return Started((), "a Claude reviewer started")
+
+    comments = [{"body": DESIGN, "url": URL.format(2)}]
+
+    async def read(issue):
+        return comments
+
+    verdicts = dr.Verdicts(tmp_path / "v.json")
+    round_ = dr.DesignRound(start, verdicts, read, reviews=lambda token, issue, comment: True)
+    await round_.ask(ISSUE)
+    assert asked == [{"url": URL.format(2)}]
+    assert round_.record(ISSUE, dr.Verdict(ISSUE, dr.GAP, "2"), "t") == dr.GAP
+    comments += [{"body": posted("gap", "2"), "url": URL.format(3)}]
+    comments += [{"body": DESIGN, "url": URL.format(4)}]
+    await round_.ask(ISSUE)
+    assert asked[-1] == {"url": URL.format(4), "earlier": URL.format(2)}
+    assert round_.record(ISSUE, dr.Verdict(ISSUE, dr.GAP, "4"), "t") == dr.NOTES
+    assert await round_.missing(ISSUE) == ""
+    with pytest.raises(dr.Refused, match="post no new design") as decided:
+        await round_.ask(ISSUE)
+    assert decided.value.why == dr.DECIDED
+    said = f"/claude Design review of {ISSUE}: gap 4\n- x races"
+    assert dr.restated(said, dr.NOTES) == f"/claude Design review of {ISSUE}: notes 4\n- x races"
+    assert dr.restated("\n" + said, dr.GAP) == "\n" + said
+    assert dr.restated("no verdict\n" + said, dr.NOTES) == "no verdict\n" + said
+    assert round_.kept(ISSUE, dr.Verdict(ISSUE, dr.NOTES, "9")) == dr.GAP  # a new series
+    found = await dr.status(ISSUE, verdicts, lambda comment: None, read)
+    assert found["state"] == dr.NOTES and "make the code answer each note" in found["next"]

@@ -133,7 +133,12 @@ def test_the_router_reads_its_checklist_digest_carry_and_answer_from_the_history
     assert checklist_waits([at(old, CHECKLIST, 1), at(new, CHECKLIST, 2, covered=True)])
     assert not checklist_waits([at(old, CHECKLIST, 1), at(new, ASKED, 2)])
     assert not checklist_waits([at(old, CHECKLIST, 1), at(old, CHECKLIST_DONE, 2)])
-    assert checklist_waits([at(old, ASKED, 1), at(new, CHECKLIST, 2), at(new, PASS, 3)])
+    # A pass written at the checklist's own head after it settles that head (#4589); one at
+    # another head, or older than the checklist, does not.
+    assert not checklist_waits([at(old, ASKED, 1), at(new, CHECKLIST, 2), at(new, PASS, 3)])
+    assert not checklist_waits([at(new, CHECKLIST, 2), at(new, ACCEPTED, 3)])
+    assert checklist_waits([at(old, ASKED, 1), at(new, CHECKLIST, 2), at(old, PASS, 3)])
+    assert checklist_waits([at(new, PASS, 1), at(new, CHECKLIST, 2)])
     # By each event's own time, not arrival: an ask that arrives last but is older holds none.
     late = ReviewEvent(PR, old, 0.5, ASKED, "late", {}, 9)
     assert checklist_waits([at(old, CHECKLIST, 1), late])
@@ -215,6 +220,14 @@ def test_a_round_stamp_names_the_review_chat_a_newer_review_replaced():
     # A stamp no row holds, or none, says nothing: today's rules decide.
     assert replaced_round([x, chat(HEAD, 4, ry, 2)], "r-" + "9" * 12) == ""
     assert replaced_round([x, chat(HEAD, 4, ry, 2)], "") == ""
+    # #4474: a late verdict about HEAD keeps its round past the chat its fix push opened at
+    # another head with no answer yet; not past one answered there, nor a newer one at HEAD.
+    pushed = [asked, x, chat(other, 4, ry, 2)]
+    assert replaced_round(pushed, rx, late_from=HEAD) == ""
+    found = ReviewEvent(PR, other, 3.0, FINDINGS, f"findings:{PR}@{other}", {}, 3)
+    assert replaced_round([*pushed, found], rx, late_from=HEAD) == f"{CHATS}#3"
+    again = [asked, x, chat(HEAD, 4, ry, 2)]
+    assert replaced_round(again, rx, late_from=HEAD[:12]) == f"{CHATS}#3"
     # Every opening path writes its ``chat`` rows through one call, which keeps the round.
     from types import SimpleNamespace
 

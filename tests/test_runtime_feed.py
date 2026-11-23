@@ -26,6 +26,7 @@ from agentdeck.runtime_feed import (
     ChangeCheck,
     ChangeFeed,
     RuntimeFeedClient,
+    drafts_item,
     workers_item,
 )
 
@@ -125,6 +126,99 @@ async def test_a_streamed_line_moves_nothing_but_the_turn_ending_does(tmp_path):
     await host.stop()
 
 
+def _stream(inner: dict) -> dict:
+    return {"type": "stream_event", "event": inner}
+
+
+async def test_a_finished_sentence_moves_the_chats_draft_and_a_piece_does_not(tmp_path):
+    """#4543: the worker runs with partial messages, and its 🔊 reply reaches the web a
+    sentence at a time, with no snapshot fetch for the pieces."""
+    host, spawned, feed = _watched_host(tmp_path)
+    drafts = drafts_item("claude_code", "test")
+    host.on_draft_change = lambda key: feed.mark(drafts, key)
+    feed.add_check(ChangeCheck(drafts, host.draft_keys, host.draft_entry))
+    await host.deliver("issue-1", "work it", cwd=str(tmp_path), delegated=False)
+    await _settle()
+    feed.run_checks()
+    assert "--include-partial-messages" in spawned[0]["args"]
+    process = spawned[0]["process"]
+
+    revision = feed.revision
+    process.stdout.emit(_stream({"type": "message_start", "message": {"id": "msg_1"}}))
+    process.stdout.emit(
+        _stream({"type": "content_block_start", "index": 0, "content_block": {"type": "text"}})
+    )
+    piece = {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta"}}
+    process.stdout.emit(_stream(piece | {"delta": {"type": "text_delta", "text": "🔊 On it"}}))
+    await _settle()
+    # Marked, but no whole sentence yet: the web has nothing new to read.
+    assert drafts not in _moved_since(feed, revision)
+    assert host.drafts() == {}
+
+    revision = feed.revision
+    process.stdout.emit(_stream(piece | {"delta": {"type": "text_delta", "text": ". Next"}}))
+    await _settle()
+    assert _moved_since(feed, revision) == [drafts]
+    assert host.drafts() == {
+        "sid-auto-1": {
+            "message_id": "msg_1",
+            "block": 0,
+            "text": "🔊 On it.",
+            "complete": False,
+            "stop_reason": "",
+            "voice": "first",
+        }
+    }
+    await host.stop()
+
+
+async def test_the_web_forgets_a_draft_once_the_runtime_feed_is_gone(monkeypatch):
+    """A page that connects while the runtime is down must not read an old 🔊 as new."""
+    from types import SimpleNamespace
+
+    from agentdeck.providers.claude_code.provider import ClaudeCodeProvider
+
+    shared = SimpleNamespace(mode=runtime_feed.FEED)
+    rounds = asyncio.Queue()
+
+    class Changes:
+        closed = False
+
+        async def wait(self, fallback_s, *, retry=False):
+            await rounds.get()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return None
+
+    shared.subscribe = lambda item: Changes()
+    monkeypatch.setattr(runtime_feed, "shared", lambda: shared)
+    draft = {"message_id": "msg_1", "text": "🔊 On it.", "complete": False}
+
+    async def read_drafts():
+        return {"sid-1": draft}
+
+    woken = []
+    state = SimpleNamespace(wake_chat_pages=lambda keys, only_open: woken.append(keys))
+    account = SimpleNamespace(key="claude_code:main", provider_id="claude_code", label="main")
+    provider = ClaudeCodeProvider()
+    task = asyncio.create_task(
+        provider._watch_drafts(account, SimpleNamespace(read_drafts=read_drafts), state)
+    )
+    rounds.put_nowait(None)
+    await _settle()
+    assert provider.draft(account, "sid-1") == draft
+    shared.mode = runtime_feed.DOWN
+    rounds.put_nowait(None)
+    await _settle()
+    assert provider.draft(account, "sid-1") is None
+    assert woken == [["claude_code:main:sid-1"], ["claude_code:main:sid-1"]]
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
 async def test_a_stall_is_announced_when_it_falls_due(tmp_path):
     """A stalled turn prints nothing, so its badge is a deadline, not an event."""
     host, _spawned, feed = _watched_host(tmp_path, stall_after_s=0.3)
@@ -178,7 +272,12 @@ async def test_the_runtime_serves_its_feed_and_wires_its_sources(tmp_path):
     # A Claude host is watched from the moment it exists.
     app.state.claude_workers.host("main")
     assert workers_item("claude_code", "main") in feed._checks
+    assert drafts_item("claude_code", "main") in feed._checks
     assert RELATIONS in feed._checks
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://runtime"
+    ) as client:
+        assert (await client.get("/claude/accounts/main/drafts")).json() == {"drafts": {}}
 
     # #3008: the boot's revival scan ending moves what the deck reads of that account's
     # workers (the revivals owed) with no worker changing, so the feed bumps it.

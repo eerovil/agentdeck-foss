@@ -18,11 +18,19 @@ command that starts it, not in settings a folder could change:
 - ``--disable-slash-commands``: no skills.
 - ``--permission-mode dontAsk`` with an allow list: whatever is not allowed is refused
   without a prompt. Never bypass, and no ``--allow-dangerously-skip-permissions``.
-- ``--system-prompt``: a short prompt instead of AgentDeck's session guide.
+- ``--system-prompt``: a short prompt and the folder's ``CLAUDE.md``, instead of
+  AgentDeck's session guide. The deck reads the guide itself, because Claude Code drops a
+  ``CLAUDE.md`` without a word in a folder whose settings deny ``Read`` (#4606).
+- ``CLAUDE_CODE_DISABLE_CLAUDE_MDS`` and ``CLAUDE_CODE_DISABLE_AUTO_MEMORY``: no guide
+  Claude Code finds by itself, and not the owner's auto-memory, which
+  ``--setting-sources`` does not keep out. ``scripts/check_locked_chat.py`` proves against
+  the installed CLI each night that neither gets in.
 
 Every spawn, fresh or resumed, writes and reads back the reader's MCP config and reads
-the folder's ``.mcp.json``; when either fails the spawn is refused rather than started
-without its limits.
+the folder's ``.mcp.json`` and ``CLAUDE.md``; when any fails the spawn
+is refused rather than started without its limits. A resumed chat keeps the system prompt
+it began with (Claude Code restores it from the transcript), so a changed guide reaches
+the next fresh chat.
 """
 
 from __future__ import annotations
@@ -36,6 +44,14 @@ from pathlib import Path
 from ..instructions import LOCKED_SYSTEM_PROMPT
 
 LOCKED_ROLE = "locked"
+GUIDE_NAME = "CLAUDE.md"
+# One argument of a command holds at most 128 KiB on Linux.
+GUIDE_MAX_BYTES = 100_000
+# Claude Code's own import rule: ``@path`` after a space or at a line's start, not in code.
+_IMPORT = re.compile(r"(?:^|\s)@((?:[^\s\\]|\\ )+)")
+_CODE = re.compile(
+    r"^[ \t]*(```|~~~).*?^[ \t]*\1|(?P<tick>`+)(?!`)[^\n]*?(?<!`)(?P=tick)(?!`)", re.M | re.S
+)
 FETCH_CONFIG_NAME = "locked-fetch-mcp.json"
 FETCH_SERVER = "deckfetch"
 FETCH_TOOL = f"mcp__{FETCH_SERVER}__hae_sivu"
@@ -103,6 +119,42 @@ def mcp_servers(cwd: str) -> list[str]:
     return names
 
 
+def _imports(text: str, folder: Path) -> list[str]:
+    """The files ``text`` imports with ``@``; a plain ``@name`` that is no file is a name."""
+    found = []
+    for match in _IMPORT.finditer(_CODE.sub("code", text)):
+        target = match.group(1).replace("\\ ", " ").rstrip(".,;:!?)")
+        if "/" in target or "." in target or (target and os.path.exists(folder / target)):
+            found.append(target)
+    return found
+
+
+def folder_guide(cwd: str) -> str:
+    """The text of the folder's ``CLAUDE.md``, the rules the chat answers by.
+
+    A guide that could reach the chat only in part is refused: an ``@file`` import would
+    be sent as it stands, since only Claude Code's own loader reads the file it names.
+    """
+    path = Path(cwd) / GUIDE_NAME
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+    except (OSError, ValueError) as exc:
+        raise LockedChatRefused(f"could not read {path}: {exc}") from exc
+    if not text:
+        raise LockedChatRefused(f"{path} is empty")
+    if "\0" in text:
+        raise LockedChatRefused(f"{path} holds a NUL character")
+    if len(text.encode("utf-8")) > GUIDE_MAX_BYTES:
+        raise LockedChatRefused(f"{path} is over {GUIDE_MAX_BYTES} bytes")
+    if imports := _imports(text, path.parent):
+        raise LockedChatRefused(f"{path} imports {imports[0]!r} with @, which is not read")
+    return text
+
+
+def system_prompt(guide: str) -> str:
+    return f"{LOCKED_SYSTEM_PROMPT}\n\n{guide}"
+
+
 def allowed_tools(servers: list[str]) -> str:
     return " ".join([*BUILT_IN_TOOLS, FETCH_TOOL, *(f"mcp__{name}__*" for name in servers)])
 
@@ -111,6 +163,7 @@ def command(
     cwd: str,
     fetch: Path,
     servers: list[str],
+    guide: str,
     *,
     model: str | None,
     resume_id: str | None = None,
@@ -125,6 +178,9 @@ def command(
         "--output-format",
         "stream-json",
         "--verbose",
+        # Text pieces as Claude writes them, for voice mode's early read (#4543):
+        # a locked chat is often spoken to.
+        "--include-partial-messages",
         "--setting-sources",
         "project",
         "--tools",
@@ -139,7 +195,7 @@ def command(
         "--allowedTools",
         allowed_tools(servers),
         "--system-prompt",
-        LOCKED_SYSTEM_PROMPT,
+        system_prompt(guide),
     ]
     if model:
         cmd += ["--model", model]
@@ -167,6 +223,15 @@ WITHHELD_ENV = (
 )
 
 
+# Set in its process: no account connectors, no guide Claude Code finds by itself (the
+# deck puts the folder's in the system prompt) and no auto-memory of the owner's (#4606).
+LOCKED_ENV = {
+    "ENABLE_CLAUDEAI_MCP_SERVERS": "false",
+    "CLAUDE_CODE_DISABLE_CLAUDE_MDS": "1",
+    "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
+}
+
+
 def lock_env(env: dict[str, str]) -> dict[str, str]:
     """``env`` with nothing of the deck's in it, for a locked chat's process.
 
@@ -183,5 +248,5 @@ def lock_env(env: dict[str, str]) -> dict[str, str]:
         env["PATH"] = os.pathsep.join(
             part for part in env["PATH"].split(os.pathsep) if part and part != shim
         )
-    env["ENABLE_CLAUDEAI_MCP_SERVERS"] = "false"
+    env.update(LOCKED_ENV)
     return env

@@ -10,8 +10,9 @@
 //
 // Document navigations are the one exception, and only for failures: they are
 // still fetched from the network and never cached, but when the fetch fails or
-// the proxy answers a gateway status, we substitute the cached restarting
-// screen (issue #606). Nothing about a *successful* navigation changes.
+// the proxy answers a gateway status, or no response comes within
+// NAVIGATION_LIMIT_MS (#4591), we substitute the cached restarting screen
+// (issue #606). Nothing about a *successful* navigation changes.
 
 // The cache name carries a content hash of the shell assets, substituted when
 // /sw.js is served. Any change to app.css/sse.js/etc. changes this string, so
@@ -205,6 +206,59 @@ function restartingScreen(fallback) {
     .catch(() => fallback || Response.error());
 }
 
+// How long a request may wait for its response before the worker stops waiting
+// (#4591). A phone back from sleep can hold a connection that died while it slept
+// without knowing; every request then waits on it for minutes, and the reload
+// button spins with the old page still on screen. Only the wait for the response
+// headers is limited: the timer is cleared the moment fetch() resolves, so a slow
+// but working body (a big page, htmx.min.js on a weak link) is never cut off.
+const NAVIGATION_LIMIT_MS = 15000;
+const ASSET_LIMIT_MS = 5000;
+
+// fetch(req), or a rejection once `ms` pass without a response. Used for page
+// loads only, and never aborted: passing fetch() any options turns a
+// navigate-mode request into a same-origin one, and its redirect handling must
+// stay exactly as it is.
+function fetchWithin(req, ms) {
+  let timer = null;
+  const limit = new Promise((resolve, reject) => {
+    timer = setTimeout(() => reject(new Error('timed out waiting for a response')), ms);
+  });
+  return Promise.race([fetch(req), limit]).finally(() => clearTimeout(timer));
+}
+
+// A static file from the network, cached on the way through. When no response
+// has started within `ms`, the cached copy is served and the stalled request
+// aborted, so it does not linger on a dead connection. With no cached copy (a
+// file outside ASSETS, or the first load after a deploy before the precache has
+// it) there is nothing better to give, so it keeps waiting on the network as it
+// did before #4591. The cache holds one deploy's files, so a copy whose `?v=`
+// differs is still this deploy's.
+const LATE = Symbol('late');
+function assetWithin(req, cache, ms) {
+  const controller = typeof AbortController === 'function' ? new AbortController() : null;
+  const cached = () => cache.match(req, { ignoreSearch: true });
+  const network = (controller ? fetch(req, { signal: controller.signal }) : fetch(req))
+    .then((res) => {
+      if (res && res.ok) cache.put(req, res.clone());
+      return res;
+    });
+  let timer = null;
+  const late = new Promise((resolve) => { timer = setTimeout(resolve, ms, LATE); });
+  return Promise.race([network, late])
+    .then((first) => {
+      if (first !== LATE) return first;
+      return cached().then((hit) => {
+        if (!hit) return network;
+        if (controller) controller.abort();
+        return hit;
+      });
+    })
+    // A network error: the cached copy, as before.
+    .catch(cached)
+    .finally(() => clearTimeout(timer));
+}
+
 self.addEventListener('fetch', (event) => {
   const req = event.request;
   if (req.method !== 'GET') return;
@@ -219,7 +273,7 @@ self.addEventListener('fetch', (event) => {
   // no navigation response is ever cached.
   if (req.mode === 'navigate') {
     event.respondWith(
-      fetch(req)
+      fetchWithin(req, NAVIGATION_LIMIT_MS)
         .then((res) => (res && GATEWAY_DOWN.includes(res.status) ? restartingScreen(res) : res))
         .catch(() => restartingScreen(null))
     );
@@ -234,15 +288,9 @@ self.addEventListener('fetch', (event) => {
 
   // Network-first: this is an always-online dashboard, so fetch the live asset
   // (a changed app.css/sse.js shows up immediately, no stale copy), update the
-  // cache, and fall back to the cache only when the network is unreachable.
+  // cache, and fall back to the cache only when the network is unreachable or
+  // has not started answering within ASSET_LIMIT_MS (#4591).
   event.respondWith(
-    caches.open(CACHE).then((cache) =>
-      fetch(req)
-        .then((res) => {
-          if (res && res.ok) cache.put(req, res.clone());
-          return res;
-        })
-        .catch(() => cache.match(req))
-    )
+    caches.open(CACHE).then((cache) => assetWithin(req, cache, ASSET_LIMIT_MS))
   );
 });

@@ -46,6 +46,12 @@ def _reader():
 reader = _reader()
 
 
+@pytest.fixture(autouse=True)
+def _reader_log(tmp_path, monkeypatch):
+    """A refused page is noted in the reader's log: here a temporary one, not the home's."""
+    monkeypatch.setattr(reader, "LOG", tmp_path / "locked-fetch.log")
+
+
 def _numeric(host: str) -> list[str]:
     """What the system resolver makes of an address written as a number; names fail."""
     infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP, flags=socket.AI_NUMERICHOST)
@@ -350,28 +356,43 @@ def test_a_compressed_or_binary_page_is_refused_and_a_big_one_cut():
 
 
 def test_one_deadline_ends_a_hanging_lookup_or_a_dripping_page():
+    """Only the deadline can end either call, so its refusal proves it; no clock (#4516).
+
+    The lookup never answers until the test lets it go; the page, a byte every 20 ms,
+    would take over two seconds, each byte well inside a per-read timeout.
+    """
+    released = threading.Event()
+
     def hang(host):
-        time.sleep(2)
+        released.wait(10)
         return [PUBLIC]
 
-    started = time.monotonic()
-    with pytest.raises(reader.Refused, match="in time"):
-        reader.fetch("https://slow.example/", resolve=hang, connect=_never, deadline=0.1)
-    assert time.monotonic() - started < 0.4
+    try:
+        with pytest.raises(reader.Refused, match="in time"):
+            reader.fetch("https://slow.example/", resolve=hang, connect=_never, deadline=0.1)
+    finally:
+        released.set()
 
     drip = _Site(OK + OK_BODY, drip=0.02)
-    started = time.monotonic()
     with pytest.raises(reader.Refused, match="in time"):
         reader.fetch(
             "http://a.example/", resolve=_names({"a.example": [PUBLIC]}), connect=drip, deadline=0.2
         )
-    assert time.monotonic() - started < 0.4
 
 
 def test_the_server_answers_mcp_and_runs_calls_side_by_side():
-    def hang(host):
-        time.sleep(1)
-        return [PUBLIC]
+    """Both page calls are inside their lookup at once, so neither waits for the other.
+
+    No wall-clock bound: a server that ran the calls one after the other never gets both
+    to the barrier, so each lookup fails and neither call reaches the private-address
+    refusal. The barrier's own 5 s timeout only ends that failing case. The deadline
+    itself is ``fetch``'s, tested above (#4516).
+    """
+    both_in = threading.Barrier(2, timeout=5)
+
+    def meet(host):
+        both_in.wait()
+        return ["10.0.0.1"]
 
     lines = [
         json.dumps(
@@ -405,9 +426,7 @@ def test_the_server_answers_mcp_and_runs_calls_side_by_side():
         ),
     ]
     out: list[str] = []
-    started = time.monotonic()
-    reader.serve(lines, out.append, resolve=hang, connect=_never, deadline=0.15)
-    assert time.monotonic() - started < 0.4
+    reader.serve(lines, out.append, resolve=meet, connect=_never, deadline=10)
     replies = {reply["id"]: reply for reply in map(json.loads, out)}
     assert sorted(replies) == [1, 2, 3, 4, 5]
     assert replies[1]["result"]["serverInfo"]["name"] == locked.FETCH_SERVER
@@ -415,7 +434,7 @@ def test_the_server_answers_mcp_and_runs_calls_side_by_side():
     assert locked.FETCH_TOOL == f"mcp__{locked.FETCH_SERVER}__hae_sivu"
     for n in (3, 4):
         assert replies[n]["result"]["isError"] is True
-        assert "in time" in replies[n]["result"]["content"][0]["text"]
+        assert "private network" in replies[n]["result"]["content"][0]["text"]
     assert "error" in replies[5]
 
 
@@ -453,6 +472,7 @@ def _folder(tmp_path: Path, servers=("keep",)) -> Path:
     (folder / ".mcp.json").write_text(
         json.dumps({"mcpServers": {name: {"command": "true"} for name in servers}})
     )
+    (folder / "CLAUDE.md").write_text("Vastaa suomeksi.\n", encoding="utf-8")
     return folder
 
 
@@ -497,12 +517,17 @@ async def test_a_locked_chat_spawns_with_its_limits_fresh_and_resumed(tmp_path, 
     assert "--strict-mcp-config" in args and "--disable-slash-commands" in args
     assert _flag(args, "--permission-mode") == "dontAsk"
     assert _flag(args, "--allowedTools") == "WebSearch mcp__deckfetch__hae_sivu mcp__keep__*"
-    assert _flag(args, "--system-prompt") == LOCKED_SYSTEM_PROMPT
+    assert _flag(args, "--system-prompt") == f"{LOCKED_SYSTEM_PROMPT}\n\nVastaa suomeksi."
     assert _flag(args, "--model") == "haiku"
+    # The 🔊 early read needs Claude's text pieces from a locked chat too (#4543).
+    assert "--include-partial-messages" in args
     assert not any("bypass" in item or "dangerously" in item for item in args)
     assert "--settings" not in args
     env = spawned[0]["kwargs"]["env"]
     assert env["ENABLE_CLAUDEAI_MCP_SERVERS"] == "false"
+    # The owner's auto-memory stays out, and the guide comes only by the prompt (#4606).
+    assert env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] == "1"
+    assert env["CLAUDE_CODE_DISABLE_CLAUDE_MDS"] == "1"
     for name in locked.WITHHELD_ENV:
         assert name not in env
     # No deck identity, gh shim or git credential setup reaches it.
@@ -515,11 +540,27 @@ async def test_a_locked_chat_spawns_with_its_limits_fresh_and_resumed(tmp_path, 
     assert _flag(command, "--resume") == "sid-1"
     assert _flag(command, "--tools") == "WebSearch"
     assert _flag(command, "--model") == "haiku"
+    assert _flag(command, "--system-prompt").endswith("Vastaa suomeksi.")
     await host.stop()
 
 
 @pytest.mark.parametrize(
-    "broken", ["no .mcp.json", "reader gone", "config unwritable", "folder names the reader"]
+    "broken",
+    [
+        "no .mcp.json",
+        "reader gone",
+        "config unwritable",
+        "folder names the reader",
+        "no guide",
+        "guide empty",
+        "guide imports",
+        "guide imports mid-line",
+        "guide imports in a list",
+        "guide imports a bare name",
+        "guide has NUL",
+        "guide too long",
+        "guide not text",
+    ],
 )
 async def test_a_locked_chat_without_its_limits_does_not_start(tmp_path, monkeypatch, broken):
     folder = _folder(tmp_path)
@@ -531,6 +572,22 @@ async def test_a_locked_chat_without_its_limits_does_not_start(tmp_path, monkeyp
     elif broken == "folder names the reader":
         (folder / ".mcp.json").write_text(
             json.dumps({"mcpServers": {"deckfetch": {"command": "true"}}})
+        )
+    elif broken == "no guide":
+        (folder / "CLAUDE.md").unlink()
+    elif broken.startswith("guide"):
+        (folder / "CLAUDE.md").write_bytes(
+            {
+                "guide empty": b" \n",
+                "guide imports": b"Rules\n@AGENTS.md\n",
+                "guide imports mid-line": b"See @rules/safety.md.\n",
+                "guide imports in a list": b"- @AGENTS.md\n",
+                # A file in the folder, so a name with no dot or slash is an import too.
+                "guide imports a bare name": b"See @CLAUDE.md\n",
+                "guide has NUL": b"Rules\0\n",
+                "guide too long": "ä".encode() * locked.GUIDE_MAX_BYTES,
+                "guide not text": b"\xff\xfe",
+            }[broken]
         )
     else:
         blocker = tmp_path / "blocker"
@@ -550,6 +607,17 @@ async def test_a_locked_chat_without_its_limits_does_not_start(tmp_path, monkeyp
     assert "locked chat refused" in (result.reason or "")
     assert spawned == []
     await host.stop()
+
+
+def test_a_guide_may_name_people_and_show_code_with_an_at_sign(tmp_path):
+    text = "Ask @anna or mail a@b.fi.\n`See @x/y.md`\n```\n@docs/z.md\n```"
+    (tmp_path / "CLAUDE.md").write_text(text)
+    assert locked.folder_guide(str(tmp_path)) == text
+    # Code that never closes is not code, and text between two pieces of it is not either.
+    for guide in ("```\n@docs/z.md", "`a` @docs/z.md `b`"):
+        (tmp_path / "CLAUDE.md").write_text(guide)
+        with pytest.raises(locked.LockedChatRefused):
+            locked.folder_guide(str(tmp_path))
 
 
 async def test_a_locked_chat_never_bypasses_and_never_takes_a_spare(tmp_path):
@@ -586,3 +654,38 @@ def test_a_bad_server_name_refuses_and_codex_has_no_locked_role(tmp_path):
     # A resumed locked chat stays locked: it never falls back to a guided role.
     assert stored_session_role("locked") == "locked"
     assert "locked" not in GUIDED_ROLES
+
+
+def _cli_check():
+    path = ROOT / "scripts" / "check_locked_chat.py"
+    spec = importlib.util.spec_from_file_location("check_locked_chat", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _request(check, **changed) -> dict:
+    body = {"system": check.GUIDE, "tools": [{"name": "WebSearch"}, {"name": locked.FETCH_TOOL}]}
+    return {**body, **changed}
+
+
+def test_the_cli_check_fails_when_the_guide_or_the_memory_is_wrong():
+    check = _cli_check()
+    memory = _request(check, messages=check.MEMORY + check.ABOVE)
+    good = _request(check)
+    assert check.problems([memory], [good], [good]) == []
+    for control, fresh, resumed in (
+        # The check could not see one of the two, so it proves nothing.
+        ([_request(check, messages=check.ABOVE)], [good], [good]),
+        ([_request(check, messages=check.MEMORY)], [good], [good]),
+        ([memory], [_request(check, messages=check.ABOVE)], [good]),
+        ([memory], [_request(check, tools=[{"name": "mcp__account__read"}])], [good]),
+        ([memory], [_request(check, system="")], [good]),
+        ([memory], [good], [_request(check, system="")]),
+        ([memory], [_request(check, messages=check.MEMORY)], [good]),
+        ([memory], [good], [_request(check, messages=check.MEMORY)]),
+        ([memory], [_request(check, tools=[{"name": "Bash"}])], [good]),
+        ([memory], [], [good]),
+        ([memory], [good], []),
+    ):
+        assert len(check.problems(control, fresh, resumed)) == 1

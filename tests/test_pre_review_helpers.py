@@ -1,4 +1,5 @@
-"""``agentdeck pre-review-helpers``: three Haiku helpers before a first review (#4437)."""
+"""``agentdeck pre-review-helpers``: three Haiku helpers and an Opus whole review before a first
+review (#4437, #4531)."""
 
 from __future__ import annotations
 
@@ -9,6 +10,7 @@ import signal
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 from pathlib import Path
 
@@ -29,6 +31,18 @@ def commit(repo: Path, name: str) -> str:
     git(repo, "add", name)
     git(repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", name)
     return git(repo, "rev-parse", "HEAD")
+
+
+@pytest.fixture(autouse=True)
+def usage_log(tmp_path, monkeypatch) -> Path:
+    """Every test's usage log is its own (#4510), never the host's."""
+    path = tmp_path / "usage" / "usage.jsonl"
+    monkeypatch.setenv("AGENTDECK_HELPER_USAGE_LOG", str(path))
+    return path
+
+
+def logged(path: Path) -> list[dict]:
+    return [json.loads(line) for line in path.read_text().splitlines()]
 
 
 @pytest.fixture
@@ -87,6 +101,13 @@ def test_each_helper_runs_isolated_and_bounded():
     assert sandbox["filesystem"]["allowRead"] == ["/var/tmp/x/repo", "/var/tmp/x/bin"]
     assert helpers.helper_tmp(Path("/var/tmp/x/repo")) == Path("/var/tmp/x/repo/.git/helper-tmp")
     assert "filesystem" not in helpers.helper_settings(None)["sandbox"]
+    # #4531: the whole review is the same command, on Opus with its own 10-minute limit.
+    whole = helpers.helper_command(repo=Path("/var/tmp/x/repo"), part=helpers.WHOLE)
+    assert whole[:4] == ["timeout", "-k", "10", "600"]
+    assert whole[whole.index("--model") + 1] == "claude-opus-5-5"
+    assert whole[4:] == [
+        "claude-opus-5-5" if arg == "claude-haiku-5-5" else arg for arg in argv[4:]
+    ], "otherwise the same isolation"
 
 
 def test_the_helper_env_drops_deck_and_github_variables(tmp_path, monkeypatch):
@@ -228,8 +249,179 @@ def test_stale_run_directories_are_swept(tmp_path):
         path.mkdir()
     os.utime(old, (0, 0))
     os.utime(other, (0, 0))
-    helpers.sweep_stale(tmp_path, now=helpers.STALE_S + 10)
+    # #4531: a day-old report and a lock nobody holds go; a held lock stays, whatever its age.
+    report, free = tmp_path / "o--r-9-0123456789ab.report", tmp_path / "o--r-9-0123456789ab.lock"
+    held_lock = tmp_path / "o--r-10-0123456789ab.lock"
+    part = tmp_path / "o--r-9-0123456789ab.report.4242.part"  # a SIGKILL before the rename
+    report.write_text("r")
+    part.write_text("r")
+    free.write_text("")
+    held, _ = helpers.take_head_lock(held_lock)
+    for path in (report, part, free, held_lock):
+        os.utime(path, (0, 0))
+    try:
+        helpers.sweep_stale(tmp_path, now=helpers.STALE_S + 10)
+    finally:
+        os.close(held)
     assert not old.exists() and new.exists() and other.exists(), "only old run directories"
+    assert not report.exists() and not free.exists() and held_lock.exists()
+    assert not part.exists()
+
+
+def test_the_whole_review_keeps_finds_at_the_floor_or_above(tmp_path):
+    """#4531: the Opus pass's suspicions under confidence 25 are left out and counted."""
+    findings = [
+        {"kind": "bug", "file": "a.py", "line": 3, "text": "bad", "confidence": 25},
+        {"kind": "edge case", "file": "b.py", "text": "unsure", "confidence": 24.5},
+        {"kind": "design", "text": "Simplify: x", "confidence": 90},
+        {"kind": "bug", "text": "no number", "confidence": "high"},
+        {"kind": "bug", "text": "a string number", "confidence": "10"},
+        {"kind": "bug", "text": "line one\nline two", "confidence": " 60 "},
+        {"kind": "bug", "text": "not a number", "confidence": "NaN"},
+        {"kind": "bug", "text": "none at all"},
+    ]
+    reply = (
+        "Findings comment, with an example:\n```json\n{}\n```\n"
+        f"Architecture: …\n```json\r\n{json.dumps({'findings': findings})}\r\n```\n"
+    )
+    # #4532 helper checks: a CRLF fence, a raw newline in a text, a number given as a string.
+    reply = reply.replace("line one\\nline two", "line one\nline two")
+    text, dropped = helpers.whole_findings(reply)
+    assert dropped == 2
+    assert text.splitlines() == [
+        "1. a.py:3 [bug, confidence 25] bad",
+        "2. [design, confidence 90] Simplify: x",
+        "3. [bug, confidence 60] line one",
+        "line two",
+        "",
+        "(Without a readable confidence, so not checked against the floor of 25; judge each as"
+        " a suspicion:)",
+        "1. [bug] no number",
+        "2. [bug] not a number",
+        "3. [bug] none at all",
+    ]
+    # #4532 review: an entry that is not a finding object is not lost in silence.
+    odd = '```json\n{"findings": ["a suspicion as a bare string"]}\n```'
+    assert helpers.whole_findings(odd) == (
+        "(No readable findings block; the reply as it is:)\n" + odd,
+        0,
+    )
+    assert helpers.whole_findings('```json\n{"findings": [], "verdict": "clean"}\n```') == (
+        "No findings.",
+        0,
+    )
+    assert helpers.whole_findings("no block")[0].endswith("the reply as it is:)\nno block")
+    # Through ``read_outcome``: the report names the floor and what fell under it.
+    path = tmp_path / "4.json"
+    path.write_text(json.dumps({"type": "result", "result": reply, "total_cost_usd": 1.8}))
+    outcome = helpers.read_outcome(helpers.WHOLE, path, 0)
+    assert outcome.dropped == 2 and outcome.findings == text
+    shown = helpers.report(pull(), "o/r#7", "h" * 40, "b" * 40, "c", [outcome], [])
+    assert "## Helper 4 (whole review by claude-opus-5-5, confidence 25 or above)" in shown
+    assert "(2 more under confidence 25 left out.)" in shown
+    # No total cost: the report shows the per-model cost, as the usage log does.
+    event = {"type": "result", "result": reply, "modelUsage": {"m": {"costUSD": 0.75}}}
+    path.write_text(json.dumps(event))
+    assert helpers.read_outcome(helpers.WHOLE, path, 0).cost_usd == 0.75
+    assert helpers.read_outcome(helpers.WHOLE, path, 124).failed == "timed out after 10 minutes"
+
+
+def test_the_whole_review_reads_the_reviewers_rules_without_fetching(tmp_path):
+    """#4531 design review: from the review-chat checkout's ``origin/main`` (no ``origin/HEAD``
+    needed, nothing fetched), the profile matched without case, its workflow source when it
+    is in the review-chat repository, and REVIEW.md from the deck's ``origin/master``."""
+    chat, deck = tmp_path / "chat", tmp_path / "deck"
+    files = {
+        "skills/github-repo-reviewer/SKILL.md": "SKILL",
+        "skills/github-repo-reviewer/references/baseline-review.md": "BASE",
+        "skills/github-repo-reviewer/profiles/_default.yaml": "DEFAULT",
+        "skills/github-repo-reviewer/profiles/Big--Shop.yaml": (
+            "review:\n  workflow_source:\n    repository: o/Chat\n    path: skills/fix/SKILL.md\n"
+        ),
+        "skills/fix/SKILL.md": "FIX",
+    }
+    for root, tree, ref in (
+        (chat, files, "main"),
+        (deck, {"skills/rate-my-pr/REVIEW.md": "RV"}, "master"),
+    ):
+        root.mkdir()
+        git(root, "init", "-q", "-b", "work")
+        for name, text in tree.items():
+            (root / name).parent.mkdir(parents=True, exist_ok=True)
+            (root / name).write_text(text)
+        git(root, "add", ".")
+        git(root, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "x")
+        git(root, "update-ref", f"refs/remotes/origin/{ref}", "HEAD")
+        # What is on disk is not what is read.
+        (root / next(iter(tree))).write_text("DRIFTED")
+    rules, warnings = helpers.reviewer_rules("big/shop", str(chat), "o/chat", deck)
+    assert {name.split(" ")[0]: text for name, text in rules.items()} == {
+        "reviewer-SKILL.md": "SKILL",
+        "reviewer-baseline-review.md": "BASE",
+        "reviewer-Big--Shop.yaml": files["skills/github-repo-reviewer/profiles/Big--Shop.yaml"],
+        "fix-SKILL.md": "FIX",
+        "rate-my-pr-REVIEW.md": "RV",
+    }
+    assert len(warnings) == 1 and "references/review-policy.md" in warnings[0]
+    rules, _ = helpers.reviewer_rules("o/none", str(chat), "o/chat", deck)
+    assert (
+        "reviewer-_default.yaml (the default profile; this repository has none of its own)" in rules
+    )
+    # The workflow source in another repository is not read, and says so.
+    _, warnings = helpers.reviewer_rules("big/shop", str(chat), "o/elsewhere", deck)
+    assert any("not in the review-chat repository" in warning for warning in warnings)
+    # A layout the pattern misses is named, not skipped in silence (#4532 helper check).
+    odd = "review:\n  workflow_source: {repository: o/chat, path: skills/fix/SKILL.md}\n"
+    profile = chat / "skills/github-repo-reviewer/profiles/Big--Shop.yaml"
+    profile.write_text(odd)
+    # A Latin-1 byte does not end the run (#4532 helper check).
+    (chat / "skills/github-repo-reviewer/references/baseline-review.md").write_bytes(b"caf\xe9")
+    git(chat, "add", ".")
+    git(chat, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "y")
+    git(chat, "update-ref", "refs/remotes/origin/main", "HEAD")
+    rules, warnings = helpers.reviewer_rules("big/shop", str(chat), "o/chat", deck)
+    assert any("not laid out as" in warning for warning in warnings)
+    assert rules["reviewer-baseline-review.md"] == "caf\ufffd"
+    # No SKILL.md: the whole review alone does not run.
+    git(chat, "update-ref", "-d", "refs/remotes/origin/main")
+    with pytest.raises(NotRun, match="SKILL.md is unreadable"):
+        helpers.reviewer_rules("big/shop", str(chat), "o/chat", deck)
+    with pytest.raises(NotRun, match="no review-chat checkout"):
+        helpers.reviewer_rules("big/shop", "", "o/chat", deck)
+
+
+def test_the_whole_reviews_context_is_this_body_the_issue_and_its_comments(monkeypatch):
+    data = {
+        "title": "T",
+        "body": "BODY",
+        "comments": [
+            {"author": {"login": "eero"}, "createdAt": "2026-11-19T10:00:00Z", "body": "ONE"},
+            {"body": "TWO"},
+            "junk",
+        ],
+    }
+    text = helpers.whole_context("o/r", 7, data, pull(title="PT", body="Refs #7 NOW"))
+    assert text.index("# Pull request o/r#9: PT") < text.index("NOW") < text.index("BODY")
+    assert text.index("BODY") < text.index("--- eero at 2026-11-19T10:00:00Z\nONE")
+    assert text.index("ONE") < text.index("--- someone at ?\nTWO")
+    # A cut takes comments, never this body (#4532 helper check).
+    monkeypatch.setattr(helpers, "MAX_CONTEXT_CHARS", 200)
+    data["comments"] = [{"body": "X" * 500}]
+    text = helpers.whole_context("o/r", 7, data, pull(title="PT", body="Refs #7 NOW"))
+    assert "NOW" in text and text.endswith("[… the rest is cut]\n")
+
+
+def test_a_closed_output_does_not_stop_the_run(tmp_path):
+    """#4531 design review: the caller of a background run is gone; printing goes nowhere and
+    the run carries on to its usage lines and report file."""
+    read, write = os.pipe()
+    os.close(read)
+    stream = os.fdopen(write, "w")
+    helpers._say("into a dead pipe", stream=stream)
+    helpers._say("and again", stream=stream)
+    helpers.save_report(tmp_path / "r.report", "THE REPORT")
+    assert (tmp_path / "r.report").read_text() == "THE REPORT\n"
+    assert list(tmp_path.iterdir()) == [tmp_path / "r.report"]
 
 
 @pytest.mark.parametrize(
@@ -277,6 +469,66 @@ def test_each_helpers_outcome(tmp_path, raw, code, found, failed):
     path.write_text(raw)
     outcome = helpers.read_outcome(1, path, code)
     assert outcome.findings == found and outcome.failed == failed
+    expected = "ok" if not failed else "timeout" if code in (124, 137) else "failed"
+    assert outcome.exit == expected
+
+
+# The shape ``claude -p --output-format json`` printed on 2026-11-19 (#4510), trimmed.
+REAL_RESULT = {
+    "type": "result",
+    "subtype": "success",
+    "is_error": False,
+    "result": "## Findings\nNo findings.",
+    "duration_ms": 2236,
+    "total_cost_usd": 0.00147552,
+    "usage": {
+        "input_tokens": 2,
+        "cache_creation_input_tokens": 6665,
+        "cache_read_input_tokens": 11382,
+        "output_tokens": 57,
+    },
+    "modelUsage": {
+        "claude-haiku-5-5": {
+            "inputTokens": 2,
+            "outputTokens": 57,
+            "cacheReadInputTokens": 11382,
+            "cacheCreationInputTokens": 6665,
+            "costUSD": 0.00147552,
+        }
+    },
+}
+
+
+def test_a_helpers_usage_is_read_whatever_its_exit(tmp_path):
+    spent = {
+        "model": "claude-haiku-5-5",
+        "input_tokens": 2,
+        "output_tokens": 57,
+        "cache_read_tokens": 11382,
+        "cache_write_tokens": 6665,
+        "cost_usd": 0.00147552,
+    }
+    assert helpers.usage_of(REAL_RESULT) == spent
+    # Without ``modelUsage``, the top-level ``usage``; without either, zeros and no cost.
+    top = {k: v for k, v in REAL_RESULT.items() if k != "modelUsage"}
+    assert helpers.usage_of(top) == spent
+    assert helpers.usage_of({"type": "result", "modelUsage": {"m": {"inputTokens": True}}}) == {
+        **spent,
+        "model": "m",
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "cost_usd": None,
+    }
+    assert helpers.usage_of(None)["cost_usd"] is None
+    # No total: the per-model costs (#4510 helper check).
+    no_total = {k: v for k, v in REAL_RESULT.items() if k != "total_cost_usd"}
+    assert helpers.usage_of(no_total)["cost_usd"] == 0.00147552
+    path = tmp_path / "1.json"
+    path.write_text(json.dumps({**REAL_RESULT, "is_error": True}))
+    failed = helpers.read_outcome(1, path, 1, wall_s=3.0)
+    assert failed.exit == "failed" and failed.usage == spent and failed.wall_s == 3.0
 
 
 def test_the_report_ends_with_what_to_post():
@@ -301,11 +553,15 @@ FAKE_CLAUDE = """#!/bin/sh
 cat > "$PWD/../out/seen-$$"
 env > "$PWD/../out/env-$$"
 gh pr list >/dev/null 2>&1 && echo gh-worked > "$PWD/../out/gh-$$"
-printf '{"type":"result","result":"## Findings\\\\n1. a.py:1 from %s","duration_ms":60000}' "$PWD"
+printf '{"type":"result","result":"## Findings\\\\n1. a.py:1 from %s","duration_ms":60000,'\\
+'"total_cost_usd":0.25,"modelUsage":{"claude-haiku-5-5":{"inputTokens":10,"outputTokens":20,'\\
+'"cacheReadInputTokens":30,"cacheCreationInputTokens":40}}}' "$PWD"
 """
 
 
-def test_a_whole_run_prints_the_findings_and_leaves_nothing(repos, tmp_path, monkeypatch, capsys):
+def test_a_whole_run_prints_the_findings_and_leaves_nothing(
+    repos, tmp_path, monkeypatch, capsys, usage_log
+):
     _origin, checkout, b1, _b2, head = repos
     root = tmp_path / "runs"
     claude = tmp_path / "fake-claude"
@@ -316,11 +572,17 @@ def test_a_whole_run_prints_the_findings_and_leaves_nothing(repos, tmp_path, mon
     monkeypatch.setenv("AGENTDECK_SESSION_TOKEN", "secret")
     monkeypatch.setattr(helpers, "read_pull", lambda spec, cwd: pull(head_oid=head))
     monkeypatch.setattr(helpers, "issue_text", lambda *a: "THE ISSUE BODY")
+    issue = {"title": "T", "body": "THE ISSUE BODY", "comments": [{"body": "A LATE COMMENT"}]}
+    monkeypatch.setattr(helpers, "read_issue", lambda *a: issue)
+    monkeypatch.setattr(helpers, "review_chat_settings", lambda: ("~/chat", "o/chat"))
+    monkeypatch.setattr(
+        helpers, "reviewer_rules", lambda *a: ({"reviewer-SKILL.md": "THE RULES"}, ["lacks x"])
+    )
     monkeypatch.setattr(helpers, "check_network", lambda: None)
     monkeypatch.setattr(helpers, "check_sandbox", lambda: None)
     monkeypatch.setattr(helpers, "account_roots", lambda: {"claude_code:main": tmp_path / "acct"})
     monkeypatch.setattr(helpers, "read_usage", lambda url: USAGE[:1])
-    monkeypatch.setattr(helpers, "helper_command", lambda repo: [str(claude)])
+    monkeypatch.setattr(helpers, "helper_command", lambda repo, part=1: [str(claude)])
     left = tmp_path / "acct" / "projects"
     left.mkdir(parents=True)
     real_start = helpers.start_helpers
@@ -332,7 +594,12 @@ def test_a_whole_run_prints_the_findings_and_leaves_nothing(repos, tmp_path, mon
             (left / name / "m").mkdir(parents=True)
         assert sorted(run.transcripts) == sorted(left / name for name in os.listdir(left))
         # #4437 review: one clone each, so no helper changes what another reads.
-        assert len({str(repo) for repo in repos.values()}) == 3
+        assert len({str(repo) for repo in repos.values()}) == 4
+        # #4531: the whole review's inputs sit in its own clone, where its sandbox reads them.
+        inputs = repos[helpers.WHOLE] / ".git" / "helper-review"
+        assert (inputs / "rules" / "reviewer-SKILL.md").read_text() == "THE RULES"
+        assert "A LATE COMMENT" in (inputs / "context.md").read_text()
+        assert "+change" in (inputs / "diff.patch").read_text()
         return real_start(run, repos, *rest)
 
     monkeypatch.setattr(helpers, "start_helpers", start)
@@ -355,24 +622,88 @@ def test_a_whole_run_prints_the_findings_and_leaves_nothing(repos, tmp_path, mon
     text = capsys.readouterr().out
     assert later[:12] not in text
     assert f"at {head[:12]} (base {b1[:12]}), on claude_code:main" in text
-    assert text.count("1. a.py:1 from ") == 3 and "/repo" in text
-    prompts, envs, gh = seen[:3], seen[3], seen[4]
+    assert text.count("1. a.py:1 from ") == 4 and "/repo" in text
+    # The fake's reply has no findings block: the whole review shows it as it is.
+    assert "(No readable findings block; the reply as it is:)" in text
+    assert "Warning: lacks x" in text
+    whole = [p for p in seen[:4] if "standing in for AgentDeck's pull-request reviewer" in p]
+    assert len(whole) == 1 and "rules/reviewer-SKILL.md" in whole[0] and "lacks x" in whole[0]
+    prompts = [p for p in seen[:4] if p not in whole]
+    envs, gh = seen[4], seen[5]
     assert all("THE ISSUE BODY" in p and "git diff base HEAD" in p for p in prompts)
     assert len({p.split("**")[1] for p in prompts}) == 3, "one list per helper"
+    # #4482: the "Every way in" question rides with the rest of the repository, once.
+    way_in = [p for p in prompts if "**Every way in.**" in p]
+    assert len(way_in) == 1 and "**The rest of the repository.**" in way_in[0]
     assert all("AGENTDECK_SESSION_TOKEN" not in e for e in envs)
     assert all(f"CLAUDE_CONFIG_DIR={tmp_path / 'acct'}" in e for e in envs)
     assert gh == []
-    assert list(root.iterdir()) == [], "the clone is removed"
+    lock, saved = helpers.head_files(pull(head_oid=head), root)
+    assert sorted(root.iterdir()) == [lock, saved], "the clone is removed; the report is kept"
+    assert saved.read_text().rstrip("\n") == text.split("\n", 1)[1].rstrip("\n")
     assert list(left.iterdir()) == [], "and Claude's folder for it"
+    # #4510: one usage line per helper, kept after the run's folder is gone.
+    lines = logged(usage_log)
+    assert [line["helper"] for line in lines] == [1, 2, 3, 4]
+    assert lines[3]["name"] == "whole review"
+    for line in lines:
+        assert line["pull"] == "o/r#9" and line["head"] == head
+        assert line["account"] == "claude_code:main" and line["exit"] == "ok"
+        assert (line["input_tokens"], line["output_tokens"]) == (10, 20)
+        assert (line["cache_read_tokens"], line["cache_write_tokens"]) == (30, 40)
+        assert line["cost_usd"] == 0.25 and line["model"] == "claude-haiku-5-5"
+        assert line["wall_s"] >= 0 and line["name"] == helpers.NAMES[line["helper"]]
     # The slot is free again.
     from agentdeck.host_slots import helper_slot_paths, try_take_slot
 
     fd = try_take_slot(helper_slot_paths(1))
     assert fd is not None
     os.close(fd)
+    # #4531 design review: the caller died and the coder runs it again on the same head. It
+    # prints the kept report, spending nothing and logging nothing.
+    assert helpers.run_helpers(args) == 0
+    again = capsys.readouterr().out
+    assert f"from {saved}, follows" in again and text.split("\n", 1)[1].strip() in again
+    assert len(logged(usage_log)) == 4
+    # While a run on that head holds the lock, a second one refuses and names the report file.
+    held, _ = helpers.take_head_lock(lock)
+    try:
+        refused = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                REFUSED.format(
+                    src=str(Path(helpers.__file__).parents[1]), root=str(root), head=head
+                ),
+            ],
+            capture_output=True,
+            text=True,
+            env={**os.environ, "AGENTDECK_HELPER_USAGE_LOG": str(usage_log)},
+        )
+    finally:
+        os.close(held)
+    assert refused.returncode == 1, refused.stderr
+    assert f"already running (pid {os.getpid()})" in refused.stdout
+    assert str(saved) in refused.stdout and "Helper checks:" not in refused.stdout
+    assert len(logged(usage_log)) == 4, "a refused run logs nothing"
 
 
-def test_an_unreadable_pull_request_still_names_it(repos, monkeypatch, capsys):
+REFUSED = """
+import argparse, sys
+from pathlib import Path
+sys.path.insert(0, {src!r})
+from agentdeck import pre_review_helpers as h
+h.ROOT = Path({root!r})
+h.check_network = lambda: None
+h.read_pull = lambda spec, cwd: h.Pull("o/r", 9, "t", "Refs #7", "master", "", {head!r})
+def boom(*a):
+    raise AssertionError("spent past the lock")
+h.read_issue = boom
+sys.exit(h.run_helpers(argparse.Namespace(cwd=".", pull="9", issue="", url="x", again=False)))
+"""
+
+
+def test_an_unreadable_pull_request_still_names_it(repos, monkeypatch, capsys, usage_log):
     """#4437 review: GitHub down while reading the pull request; the line the coder posts
     still names it, so ``pre-review-done`` takes it."""
     from agentdeck.review_paperwork import helper_receipt
@@ -399,6 +730,8 @@ def test_an_unreadable_pull_request_still_names_it(repos, monkeypatch, capsys):
     assert helpers.spec_ref("nine", str(checkout)) == ""
     # A Codex chat without escalation hears to escalate, before any gh call fails.
     monkeypatch.undo()
+    # The undo dropped the autouse fixture's log path too: keep the host's log untouched.
+    monkeypatch.setenv("AGENTDECK_HELPER_USAGE_LOG", str(usage_log))
     monkeypatch.setattr(helpers, "read_pull", down)
     monkeypatch.setenv("CODEX_SANDBOX_NETWORK_DISABLED", "1")
     args = argparse.Namespace(cwd=str(checkout), pull="o/r#9", issue="", url="http://deck")
@@ -408,7 +741,7 @@ def test_an_unreadable_pull_request_still_names_it(repos, monkeypatch, capsys):
     )
 
 
-def test_a_run_that_cannot_start_says_why_and_exits_0(tmp_path, monkeypatch, capsys):
+def test_a_run_that_cannot_start_says_why_and_exits_0(tmp_path, monkeypatch, capsys, usage_log):
     monkeypatch.setattr(helpers, "read_pull", lambda spec, cwd: pull(head_oid="h" * 40))
     monkeypatch.setattr(helpers, "issue_text", lambda *a: "")
 
@@ -421,6 +754,18 @@ def test_a_run_that_cannot_start_says_why_and_exits_0(tmp_path, monkeypatch, cap
     assert capsys.readouterr().out.strip() == (
         "Helper checks: #9 did not run (no network to the Claude API: unreachable)"
     )
+    # #4510: a run that never starts its helpers still logs a line for each.
+    lines = logged(usage_log)
+    assert [(line["helper"], line["exit"]) for line in lines] == [
+        (1, "did_not_run"),
+        (2, "did_not_run"),
+        (3, "did_not_run"),
+        (4, "did_not_run"),
+    ]
+    assert lines[0]["why"] == "no network to the Claude API: unreachable"
+    assert lines[0]["input_tokens"] == 0 and lines[0]["cost_usd"] is None
+    assert lines[0]["model"] == "", "no model ran"
+    usage_log.unlink()
     # A helper that cannot start (no ``timeout`` on the host) still says what to post.
     monkeypatch.setattr(helpers, "check_network", lambda: None)
     monkeypatch.setattr(helpers, "check_sandbox", lambda: None)
@@ -431,16 +776,111 @@ def test_a_run_that_cannot_start_says_why_and_exits_0(tmp_path, monkeypatch, cap
     monkeypatch.setattr(helpers, "make_clone", lambda *a: tmp_path / "repo")
     monkeypatch.setattr(helpers, "ROOT", tmp_path / "runs")
     monkeypatch.setenv("AGENTDECK_SLOT_DIR", str(tmp_path / "slots"))
-    monkeypatch.setattr(helpers, "helper_command", lambda repo: [str(tmp_path / "no-such-binary")])
+    monkeypatch.setattr(helpers, "read_issue", lambda *a: {})
+    monkeypatch.setattr(helpers, "review_chat_settings", lambda: ("", ""))
+    monkeypatch.setattr(
+        helpers, "helper_command", lambda repo, part=1: [str(tmp_path / "no-such-binary")]
+    )
     assert helpers.run_helpers(args) == 0
     assert (
         capsys.readouterr()
         .out.splitlines()[-1]
         .startswith("Helper checks: o/r#9 did not run (the helpers cannot start: ")
     )
+    lines = logged(usage_log)
+    assert len(lines) == 4 and {line["exit"] for line in lines} == {"did_not_run"}
+    assert lines[0]["head"] == "h" * 40 and lines[0]["account"] == "claude_code:main"
+    assert "no review-chat checkout" not in str(lines), "one line each, not two for helper 4"
+    usage_log.unlink()
+    # #4532 helper check: killed in the slot wait, with the whole review already skipped for
+    # want of the reviewer's rules; its line is not lost.
+    import agentdeck.host_slots as host_slots
+
+    def killed(*a):
+        raise SystemExit(143)
+
+    monkeypatch.setattr(host_slots, "take_a_slot", killed)
+    with pytest.raises(SystemExit):
+        helpers.run_helpers(argparse.Namespace(**{**vars(args), "again": True}))
+    capsys.readouterr()
+    lines = logged(usage_log)
+    assert [(line["helper"], line["exit"]) for line in lines] == [(4, "did_not_run")]
+    assert "no review-chat checkout" in lines[0]["why"]
     monkeypatch.setattr(helpers, "read_pull", lambda spec, cwd: pull(body="nothing"))
     assert helpers.run_helpers(args) == 0
     assert "names no issue" in capsys.readouterr().out
+    # #4532 review: a lock that cannot be taken stops the run, rather than letting a second
+    # paid run go beside another.
+    usage_log.unlink(missing_ok=True)
+    monkeypatch.setattr(helpers, "read_pull", lambda spec, cwd: pull(head_oid="h" * 40))
+
+    def no_lock(path):
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(helpers, "take_head_lock", no_lock)
+    monkeypatch.setattr(helpers, "read_issue", lambda *a: pytest.fail("spent past the lock"))
+    assert helpers.run_helpers(args) == 0
+    assert "did not run (this head's lock" in capsys.readouterr().out
+    lines = logged(usage_log)
+    assert len(lines) == 4 and {line["exit"] for line in lines} == {"did_not_run"}
+
+
+def test_a_run_cut_short_logs_what_its_helpers_spent(tmp_path, usage_log, monkeypatch):
+    """#4510 helper check: killed while helpers run, the finished one keeps its usage and the
+    running one gets an ``interrupted`` line, before ``stop`` removes the output."""
+    run = helpers.Run(tmp_path / "run")
+    (run.directory / "out").mkdir(parents=True)
+    (run.directory / "out" / "1.json").write_text(json.dumps(REAL_RESULT))
+    done = subprocess.Popen(["true"])
+    done.wait()
+    running = subprocess.Popen(["sleep", "30"])
+    run.processes = [done, running]
+    # #4531: each process's own helper, the whole review here among them.
+    run.parts = [1, helpers.WHOLE]
+    # #4511 review: helper 1 ended 2 s in (as ``wait_all`` saw it), the kill comes at 60 s;
+    # its line keeps its own 2 s, not the time to the kill.
+    run.ended[0] = (0, 2.0)
+    try:
+        helpers.log_cut_short(run, "o/r#9", "h" * 40, "claude_code:main", time.monotonic() - 60)
+    finally:
+        running.kill()
+        running.wait()
+    lines = logged(usage_log)
+    assert [(line["helper"], line["exit"]) for line in lines] == [(1, "ok"), (4, "interrupted")]
+    assert lines[1]["model"] == "claude-opus-5-5" and lines[1]["name"] == "whole review"
+    assert lines[0]["cache_read_tokens"] == 11382 and lines[1]["input_tokens"] == 0
+    assert lines[0]["wall_s"] == 2.0 and lines[1]["wall_s"] >= 60
+    # The default path is the deck's data folder, honouring XDG_DATA_HOME.
+    monkeypatch.delenv("AGENTDECK_HELPER_USAGE_LOG")
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    assert helpers.usage_log_path() == tmp_path / "data/agentdeck/pre-review-helpers/usage.jsonl"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="SIGHUP is POSIX")
+def test_a_kill_while_the_usage_is_written_waits_until_it_is_noted(monkeypatch):
+    """#4511 review: a SIGTERM between writing the usage lines and noting them written would
+    log them twice; it is held until both are done, then still stops the command.
+
+    #4520: held for the whole process, not only the main thread. A pytest-xdist worker has
+    other threads; a per-thread signal mask let one of them take the kill, and the handler
+    then ran in the main thread before ``noted``. A live thread here pins that case."""
+    old = signal.signal(signal.SIGTERM, helpers._on_signal)
+    steps = []
+    other = threading.Event()
+    bystander = threading.Thread(target=other.wait, daemon=True)
+    bystander.start()
+    try:
+        with pytest.raises(SystemExit) as stopped:
+            with helpers._signals_held():
+                steps.append("written")
+                os.kill(os.getpid(), signal.SIGTERM)
+                time.sleep(0.05)  # time for the bystander to take it, as it can under xdist
+                steps.append("noted")
+        assert steps == ["written", "noted"] and stopped.value.code == 128 + signal.SIGTERM
+        assert signal.getsignal(signal.SIGTERM) is helpers._on_signal
+    finally:
+        other.set()
+        signal.signal(signal.SIGTERM, old)
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="PR_SET_PDEATHSIG is Linux's")
@@ -454,7 +894,7 @@ def test_a_killed_command_leaves_no_helper_running(tmp_path):
         from pathlib import Path
         sys.path.insert(0, {str(Path(helpers.__file__).parents[1])!r})
         from agentdeck import pre_review_helpers as h
-        h.helper_command = lambda repo: [
+        h.helper_command = lambda repo, part=1: [
             "timeout", "-k", "1", "60", "sh", "-c", "echo $$ >> {pids}; exec sleep 60"
         ]
         run = h.Run(Path({str(tmp_path)!r}))

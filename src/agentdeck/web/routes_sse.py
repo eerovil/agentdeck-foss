@@ -1120,6 +1120,7 @@ async def _tail_session(
         chat_due = True
         next_deadline = float("inf")
         window_requested_at: float | None = None
+        sent_draft: dict | None = None
         current = session
         label: str | None = None
         live = False
@@ -1216,6 +1217,14 @@ async def _tail_session(
                         recent_evs = (recent_evs + progress_events)[-ACTIVITY_LOOKBACK:]
                         last_activity_t = loop.time() - _progress_age_s(last_ev)
                     read_mark_due = True
+                # The 🔊 reply being written (#4543), after the lines it may finish, and
+                # once on connect: a page that reconnects gets the current one.
+                draft = provider.draft(account, session.session_id)
+                if draft != sent_draft:
+                    sent_draft = draft
+                    # The slot swaps it in as HTML: the JSON rides in an escaped attribute.
+                    payload = escape(json.dumps(draft))
+                    yield format_sse("draft", f'<span data-draft="{payload}"></span>')
                 current = state.sessions.get(leg_key) or session
                 if (current.last_activity, current.last_progress) != read_seen_activity:
                     read_seen_activity = (current.last_activity, current.last_progress)

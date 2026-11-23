@@ -1245,6 +1245,10 @@ class TranscriptEvent:  # normalized transcript line (parsed from v0.2)
     # finished), as one short line. It renders as a grey notice so the chat shows where
     # the person's turn ended and the automatic one began (#3377).
     notice: str | None = None
+    # The provider's own id of the message this line is part of, when it has one:
+    # Claude's ``message.id``, which voice mode matches against the draft it read
+    # while the reply was being written (#4543).
+    message_id: str | None = None
 
 
 @dataclass

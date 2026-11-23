@@ -19,7 +19,10 @@ With ``[speech] keep_audio_days`` set, every transcribed phrase also keeps its
 audio, words and the service's noise reading in ``keep_audio_dir`` for that many
 days, which ``scripts/speech_bench.py`` runs other speech-to-text models on, quiet
 and noisy apart (#3499, back in #3934). A voice-mode probe (``source=probe``, the
-phrase so far, sent again whole once it ends) is not kept.
+phrase so far, sent again whole once it ends) is not kept. The phrase is kept after
+the reply goes back (#4540). A voice-mode phrase whose early pass's words were
+reused (no new speech past its clip) is kept in ``reused.jsonl`` instead, naming
+the early pass's line; one heard whole after its early pass ``replaces`` that line.
 
 ``/api/voice/heard`` gives a phrase heard in voice mode to the chat's fast agent
 (``voice_helper``) and returns what to say and what to send; a 503 there means the
@@ -41,6 +44,13 @@ agent did since the person last spoke, from the transcript, and returns one sent
 saying what it is doing, or 204 for nothing to say.
 ``/sessions/{key}/voice-log`` reads back what the fast agent heard and said (#3475).
 
+While it waits, a page whose detector decides also streams its microphone to
+``/api/speech/wake-stream`` (a WebSocket, #4539), passed on to the detector's
+``/stream``, so the beep comes on the 80 ms frame the name ends in rather than after
+the page's 0.8 s pause. It answers each phrase once with ``done``; a phrase that got
+no ``done`` is sent as a clip to ``/api/speech/wake`` as before, under the same id,
+and the wake log keeps one line per id whichever answered.
+
 ``GET /api/speech/status`` says whether the service has its model loaded yet: 🎤 asks
 when a phrase is slow to come back, so its bubble can say the service is starting
 (#3722).
@@ -49,6 +59,7 @@ when a phrase is slow to come back, so its bubble can say the service is startin
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import io
 import json
 import logging
@@ -60,10 +71,14 @@ import wave
 from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
+from socket import SO_SNDBUF, SOL_SOCKET
+from urllib.parse import urlsplit
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket
 from fastapi.responses import HTMLResponse, JSONResponse, Response
+from starlette.background import BackgroundTask
+from starlette.websockets import WebSocketDisconnect, WebSocketState
 
 from .. import meta_chat, voice_helper
 from .deps import get_config, get_db, get_state, get_templates, require_access, resolve_current_leg
@@ -91,12 +106,24 @@ KEEP_AUDIO_S = 30 * 86400
 # phrases' audio waits here, so one only Whisper woke on is kept too.
 RECENT_PHRASES = 20
 _recent_audio: OrderedDict[str, bytes] = OrderedDict()
+# Phrase ids the wake log has a detector line for (#4539): a phrase the stream
+# answered and the page also sent as a clip (its ``done`` came after the page gave
+# up waiting) is logged once, by whichever answered first. Both run in the one event
+# loop, so checking and adding is one step.
+LOGGED_IDS = 500
+_logged_ids: OrderedDict[str, None] = OrderedDict()
 MAX_ID_CHARS = 40
 # A chat's session key, as the page names the side chat a phrase went to (#4360).
 MAX_KEY_CHARS = 200
 # Phrases kept for comparing speech-to-text models (#3499, #3934), and where each
 # came from: 🎧 voice mode or 🎤 dictation.
 KEPT_LOG = "kept.jsonl"
+# Whole phrases whose early pass's words were used, as the speech service found no
+# new speech past its clip (#4540): kept apart, each naming its early pass's
+# ``kept.jsonl`` id, so a review can hear them whole and compare.
+REUSED_LOG = "reused.jsonl"
+# The page cuts a phrase at 28 s: an early clip length past this is not one.
+MAX_EARLY_S = 60.0
 # The longest microphone name a kept or wake log line carries (#4249).
 MIC_CHARS = 80
 SOURCES = ("voice", "dictation")
@@ -179,28 +206,84 @@ async def transcribe(request: Request) -> JSONResponse:
     _require_same_origin(request)
     audio = await _audio(request)
     source = request.query_params.get("source", "")
-    return JSONResponse(await _hear(request, audio, source))
+    later: list = []
+    heard = await _hear(request, audio, source, later=later)
+    # The words go back first; the phrase is kept for the bench after the reply is
+    # sent, off the phrase's own time (#4540).
+    return JSONResponse(heard, background=BackgroundTask(_run_later, later))
 
 
-async def _hear(request: Request, audio: bytes, source: str | None) -> dict:
+async def _run_later(saves: list) -> None:
+    for save in saves:
+        await save
+
+
+def _early_s(value: object) -> float | None:
+    """``?early_s=``: the length of the clip the page's early pass heard (#4540), or
+    None when absent or no length a phrase can have."""
+    try:
+        seconds = float(str(value))
+    except ValueError:
+        return None
+    return round(seconds, 3) if 0 < seconds <= MAX_EARLY_S else None
+
+
+async def _hear(
+    request: Request,
+    audio: bytes,
+    source: str | None,
+    language: str | None = None,
+    *,
+    later: list | None = None,
+) -> dict:
     """The host's words for ``audio``, as ``/api/speech/transcribe`` answers them, and
-    the phrase kept for the bench as ``source`` (#3934); ``None`` keeps nothing."""
+    the phrase kept for the bench as ``source`` (#3934); ``None`` keeps nothing. With
+    ``later`` the keeping is added there to run after the reply, else it is awaited.
+    ``language`` is the language heard last when the request's query does not carry
+    it (a streamed phrase names its own, #4539).
+
+    ``?early_s=`` and ``?early=`` name the page's early pass of this phrase, its clip's
+    length and id (#4540): with no new speech past that clip the reply is
+    ``{"reuse": true}`` with no words, and the page takes the early pass's. Heard
+    whole, the phrase's kept line ``replaces`` the early pass's, as it does with
+    ``?replaces=`` (a whole phrase sent again after its early pass failed), so the
+    bench keeps one line a phrase."""
     pinned = get_config(request).speech.language
     # The language heard last: a phrase too short to tell keeps it.
-    previous = request.query_params.get("language")
+    previous = language or request.query_params.get("language")
     if pinned in LANGUAGES:
         path = f"/transcribe?only={pinned}"
     elif previous in LANGUAGES:
         path = f"/transcribe?language={previous}"
     else:
         path = "/transcribe"
+    early_s = _early_s(request.query_params.get("early_s"))
+    if early_s is not None:
+        path += ("&" if "?" in path else "?") + f"early_s={early_s}"
     started = time.monotonic()
     reply = await _forward(request, path, content=audio, headers={"Content-Type": "audio/wav"})
     took = time.monotonic() - started
     heard = reply.json()
     language = pinned if pinned in LANGUAGES else heard.get("language")
+    reuse = early_s is not None and heard.get("reuse") is True
     if source is not None:
-        await _keep_phrase(request, audio, heard, pinned, took, source)
+        if reuse:
+            save = _keep_reused(request, audio, early_s, took, source)
+        else:
+            save = _keep_phrase(request, audio, heard, pinned, took, source)
+        if later is None:
+            await save
+        else:
+            later.append(save)
+    if reuse:
+        return {
+            "reuse": True,
+            "text": "",
+            "language": language if language in LANGUAGES else "en",
+            "speech_s": None,
+            "ms": round(took * 1000),
+            "segments": [],
+        }
     parts = heard.get("segments") if isinstance(heard.get("segments"), list) else []
     speech_s = heard.get("speech_s")
     return {
@@ -239,6 +322,13 @@ async def _keep_phrase(
         "ms": round(took_s * 1000),
         "mic": _mic(request),
     }
+    # Heard whole after an early pass of the same phrase (#4540): the bench leaves the
+    # early pass's line out, whichever of the two lands first.
+    replaces = _phrase_id(request.query_params.get("replaces")) or _phrase_id(
+        request.query_params.get("early")
+    )
+    if replaces and replaces != line["id"]:
+        line["replaces"] = replaces
     try:
         await asyncio.to_thread(
             _write_kept,
@@ -251,12 +341,45 @@ async def _keep_phrase(
         log.exception("could not keep a phrase in %s", speech.keep_audio_dir)
 
 
-def _write_kept(folder: Path, line: dict, audio: bytes, keep_s: float) -> None:
+async def _keep_reused(
+    request: Request, audio: bytes, early_s: float, took_s: float, source: str
+) -> None:
+    """A whole phrase whose early pass's words were used (#4540), kept in
+    ``reused.jsonl`` beside the early pass's ``kept.jsonl`` id when ``[speech]
+    keep_audio_days`` asks; a write that fails is logged and costs nothing."""
+    speech = get_config(request).speech
+    if speech.keep_audio_days <= 0 or source == "probe":
+        return
+    line = {
+        "id": uuid.uuid4().hex[:12],
+        "early": _phrase_id(request.query_params.get("early")),
+        "early_s": early_s,
+        "source": source if source in SOURCES else "",
+        "seconds": _seconds(audio),
+        "ms": round(took_s * 1000),
+        "mic": _mic(request),
+    }
+    try:
+        await asyncio.to_thread(
+            _write_kept,
+            Path(speech.keep_audio_dir).expanduser(),
+            line,
+            audio,
+            speech.keep_audio_days * 86400,
+            REUSED_LOG,
+        )
+    except OSError:
+        log.exception("could not keep a reused phrase in %s", speech.keep_audio_dir)
+
+
+def _write_kept(
+    folder: Path, line: dict, audio: bytes, keep_s: float, name: str = KEPT_LOG
+) -> None:
     """One kept phrase, its old lines' expiry and its own line as one step: phrases
     heard at once each run in their own thread, and an expiry rewriting the log must
     not lose a line another phrase appends meanwhile (#3934 review)."""
     with _kept_lock:
-        _write_log(folder, KEPT_LOG, line, audio, keep_s, expire_lines=True)
+        _write_log(folder, name, line, audio, keep_s, expire_lines=True)
 
 
 def _seconds(audio: bytes) -> float:
@@ -397,6 +520,10 @@ async def wake(request: Request) -> JSONResponse:
     keep = result["woken"] or result["score"] > NEAR_MISS
     if window and not keep:
         return JSONResponse(result)
+    if phrase and not _first_line(phrase):
+        # The stream answered this phrase already (#4539): the page still gets its
+        # answer, but the phrase is logged once.
+        return JSONResponse(result)
     line = {
         "id": phrase,
         "check": "window" if window else "detector",
@@ -414,8 +541,23 @@ async def wake(request: Request) -> JSONResponse:
     return JSONResponse(result)
 
 
+def _first_line(phrase: str) -> bool:
+    """Whether ``phrase`` has no detector line in the wake log yet, marking it."""
+    if phrase in _logged_ids:
+        return False
+    _logged_ids[phrase] = None
+    while len(_logged_ids) > LOGGED_IDS:
+        _logged_ids.popitem(last=False)
+    return True
+
+
 async def _confirm_wake(
-    request: Request, word: str, audio: bytes, result: dict, window: bool
+    request: Request,
+    word: str,
+    audio: bytes,
+    result: dict,
+    window: bool,
+    language: str | None = None,
 ) -> tuple[dict, dict | None]:
     """Whether speech recognition hears ``word`` in a clip the detector woke on
     (#4372): the kitchen's "Alexa" woke on noise at 0.94, where Whisper heard no
@@ -432,7 +574,7 @@ async def _confirm_wake(
     try:
         if not speech.socket:
             raise HTTPException(status_code=503, detail="no speech service configured")
-        heard = await _hear(request, audio, "voice" if goes_on else None)
+        heard = await _hear(request, audio, "voice" if goes_on else None, language)
     except HTTPException:
         took = round((time.monotonic() - started) * 1000)
         return {"confirmed": False, "heard": None, "confirm_ms": took}, None
@@ -444,6 +586,382 @@ async def _confirm_wake(
         "confirm_ms": round((time.monotonic() - started) * 1000),
     }
     return line, heard if confirmed and goes_on else None
+
+
+# ---- the waiting microphone, streamed (#4539) ---------------------------------
+
+# The detector's ``/stream`` upgrade (``scripts/wake_server.py``).
+STREAM_UPGRADE = "agentdeck-wake-stream"
+# 16 kHz 16-bit mono, as the page sends it.
+STREAM_BYTES_PER_S = 32000
+# The longest audio record the detector takes (its ``MAX_RECORD``).
+STREAM_RECORD_BYTES = 16000
+# The page pings every 10 s; a connection silent this long is gone (a phone's Wi-Fi
+# dropped, a screen went off) and frees its detector stream.
+STREAM_IDLE_S = 25.0
+# Audio the deck holds unsent to the detector before it calls the detector behind and
+# hands the page back to clips.
+STREAM_BEHIND_BYTES = 2 * STREAM_BYTES_PER_S
+# A phrase's audio kept for its log line and its confirm: the page cuts at 28 s.
+STREAM_PHRASE_BYTES = 30 * STREAM_BYTES_PER_S
+# A confirm hears the last 2 s, after up to this much more of the phrase: "Alexa"
+# crosses about 0.08 s before the word ends (#4524), so its end is not cut off.
+CONFIRM_MORE_S = 0.25
+CONFIRM_CLIP_BYTES = 2 * STREAM_BYTES_PER_S
+# The detector loads a model for a new stream, or starts on its socket's first use.
+DETECTOR_OPEN_TIMEOUT_S = 30.0
+# Each page's open stream, by the id it made once on load: its reconnect replaces it.
+_wake_streams: dict[str, WakeStream] = {}
+
+
+class _Fallback(Exception):
+    """The detector stream cannot go on; the page sends clips (the message says why)."""
+
+
+def _pcm_wav(pcm: bytes) -> bytes:
+    out = io.BytesIO()
+    with wave.open(out, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(STREAM_BYTES_PER_S // 2)
+        w.writeframes(pcm[: len(pcm) // 2 * 2])
+    return out.getvalue()
+
+
+def _record(kind: bytes, body: bytes) -> bytes:
+    return kind + len(body).to_bytes(4, "big") + body
+
+
+class _StreamPhrase:
+    def __init__(self, phrase: str, mic: str) -> None:
+        self.id = phrase
+        self.mic = mic
+        self.audio = bytearray()
+        self.ended = asyncio.Event()
+        self.ended_at = 0.0
+        self.crossed: dict | None = None
+        self.detected: dict | None = None
+        self.confirm: dict | None = None
+        self.confirming = False
+        self.finished = False
+        # The language the page heard last when the phrase started, for a confirm.
+        self.language: str | None = None
+
+
+class WakeStream:
+    """One page's waiting microphone, passed on to the detector (#4539).
+
+    Three things run at once: the page's audio and phrase marks forwarded to the
+    detector, the detector's events answered to the page, and a confirm per phrase
+    being checked by speech recognition. The forwarding never waits for Whisper, so
+    audio keeps flowing while a confirm runs. Every phrase the page ended gets one
+    ``done`` once its verdict is final, and its one wake log line then; a phrase the
+    page never ended gets neither, and the page sends it as a clip."""
+
+    def __init__(self, websocket: WebSocket, word: str, page: str) -> None:
+        self.websocket = websocket
+        self.speech = get_config(websocket).speech
+        self.word = word
+        self.page = page
+        self.confirms = word in self.speech.wake_confirm
+        self.phrases: dict[str, _StreamPhrase] = {}
+        self.current: _StreamPhrase | None = None
+        self.tasks: set[asyncio.Task] = set()
+        self.replaced = asyncio.Event()
+        self.writer: asyncio.StreamWriter | None = None
+
+    async def run(self) -> None:
+        reason = ""
+        try:
+            reader, self.writer = await self._open()
+            waits = {
+                asyncio.create_task(self._from_page()),
+                asyncio.create_task(self._from_detector(reader)),
+                asyncio.create_task(self.replaced.wait()),
+            }
+            try:
+                done, _ = await asyncio.wait(waits, return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                for task in waits | self.tasks:
+                    task.cancel()
+            first = next(iter(done))
+            if first.exception() is not None:
+                log.warning("wake stream failed", exc_info=first.exception())
+                reason = "stream failed"
+            elif first.result() is True:
+                reason = ""  # replaced by the same page's next connection
+            else:
+                reason = first.result()
+        except _Fallback as exc:
+            reason = str(exc)
+        finally:
+            if self.writer is not None:
+                self.writer.close()
+            if _wake_streams.get(self.page) is self:
+                del _wake_streams[self.page]
+        if reason:
+            log.info("wake stream for %s falls back to clips: %s", self.word, reason)
+            await self._send({"fallback": reason})
+        try:
+            if self.websocket.client_state != WebSocketState.DISCONNECTED:
+                await self.websocket.close()
+        except RuntimeError:
+            pass
+
+    async def _open(self) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        speech = self.speech
+        if not speech.wake_socket or speech.wake != "detector":
+            raise _Fallback("no detector")
+        threshold = speech.wake_thresholds.get(self.word, speech.wake_threshold)
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_unix_connection(str(Path(speech.wake_socket).expanduser())),
+                DETECTOR_OPEN_TIMEOUT_S,
+            )
+        except (OSError, TimeoutError) as exc:
+            raise _Fallback("detector unreachable") from exc
+        # A small kernel buffer, so "behind" below is seen within about 3 s rather
+        # than the ~6 s Linux's default would hold unseen.
+        sock = writer.get_extra_info("socket")
+        if sock is not None:
+            with contextlib.suppress(OSError):
+                sock.setsockopt(SOL_SOCKET, SO_SNDBUF, STREAM_RECORD_BYTES)
+        writer.write(
+            (
+                f"POST /stream?threshold={threshold}&word={self.word} HTTP/1.1\r\n"
+                f"Host: wake\r\nUpgrade: {STREAM_UPGRADE}\r\nConnection: Upgrade\r\n"
+                "Content-Length: 0\r\n\r\n"
+            ).encode()
+        )
+        try:
+            status = await asyncio.wait_for(reader.readline(), DETECTOR_OPEN_TIMEOUT_S)
+            while (await asyncio.wait_for(reader.readline(), DETECTOR_OPEN_TIMEOUT_S)) not in (
+                b"\r\n",
+                b"\n",
+                b"",
+            ):
+                pass
+        except (OSError, TimeoutError, ValueError) as exc:
+            writer.close()
+            raise _Fallback("detector did not answer") from exc
+        code = status.split(b" ")[1:2]
+        if code != [b"101"]:
+            writer.close()
+            raise _Fallback("detector busy" if code == [b"503"] else "detector refused")
+        return reader, writer
+
+    async def _from_page(self) -> str:
+        while True:
+            try:
+                message = await asyncio.wait_for(self.websocket.receive(), STREAM_IDLE_S)
+            except TimeoutError:
+                return ""
+            except (WebSocketDisconnect, RuntimeError):
+                return ""
+            if message["type"] == "websocket.disconnect":
+                return ""
+            if message.get("bytes") is not None:
+                if not self._audio(message["bytes"]):
+                    return "detector behind"
+            elif message.get("text") is not None:
+                self._mark(message["text"])
+
+    def _audio(self, pcm: bytes) -> bool:
+        phrase = self.current
+        if phrase is None or phrase.ended.is_set() or not pcm:
+            return True
+        if len(phrase.audio) < STREAM_PHRASE_BYTES:
+            phrase.audio += pcm
+        # The detector takes at most half a second a record.
+        for start in range(0, len(pcm), STREAM_RECORD_BYTES):
+            self.writer.write(_record(b"A", pcm[start : start + STREAM_RECORD_BYTES]))
+        return self.writer.transport.get_write_buffer_size() <= STREAM_BEHIND_BYTES
+
+    def _mark(self, text: str) -> None:
+        try:
+            body = json.loads(text)
+        except ValueError:
+            return
+        if not isinstance(body, dict):
+            return
+        if "phrase" in body:
+            phrase = _phrase_id(body.get("phrase"))
+            if not phrase or phrase in self.phrases:
+                return
+            # A phrase the page started over without ending is dropped unlogged: the
+            # page sends it as a clip.
+            if self.current is not None and not self.current.ended.is_set():
+                self.phrases.pop(self.current.id, None)
+            mic = "".join(ch for ch in str(body.get("mic") or "") if ch.isprintable())
+            self.current = _StreamPhrase(phrase, mic[:MIC_CHARS])
+            language = body.get("language")
+            self.current.language = language if language in LANGUAGES else None
+            self.phrases[phrase] = self.current
+            self.writer.write(_record(b"P", phrase.encode()))
+        elif "end" in body:
+            phrase = self.current
+            if phrase is None or phrase.id != body.get("end") or phrase.ended.is_set():
+                return
+            phrase.ended_at = time.monotonic()
+            phrase.ended.set()
+            self.writer.write(_record(b"E", phrase.id.encode()))
+
+    async def _from_detector(self, reader: asyncio.StreamReader) -> str:
+        while True:
+            try:
+                line = await reader.readline()
+            except (OSError, ValueError):
+                return "detector stream failed"
+            if not line:
+                return "detector stream ended"
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(event, dict):
+                continue
+            if "crossed" in event:
+                await self._crossed(event)
+            elif "end" in event:
+                phrase = self.phrases.get(str(event["end"]))
+                if phrase is not None:
+                    phrase.detected = event
+                    await self._finish(phrase)
+
+    async def _crossed(self, event: dict) -> None:
+        phrase = self.phrases.get(str(event["crossed"]))
+        if phrase is None or phrase.crossed is not None:
+            return
+        phrase.crossed = event
+        if not self.confirms:
+            # "Hey Jarvis" beeps at once; what follows in the phrase is the message.
+            await self._send({"woken": phrase.id, "score": event.get("score")})
+            return
+        phrase.confirming = True
+        await self._send({"confirming": phrase.id})
+        task = asyncio.create_task(self._confirm(phrase))
+        self.tasks.add(task)
+        task.add_done_callback(self.tasks.discard)
+
+    async def _confirm(self, phrase: _StreamPhrase) -> None:
+        """Whether Whisper hears the name in the phrase's last 2 s (#4372), beside
+        the forwarding; cancelled with the connection, it sends and logs nothing."""
+        try:
+            await asyncio.wait_for(phrase.ended.wait(), CONFIRM_MORE_S)
+        except TimeoutError:
+            pass
+        clip = _pcm_wav(bytes(phrase.audio[-CONFIRM_CLIP_BYTES:]))
+        started = time.monotonic()
+        try:
+            fields, _ = await _confirm_wake(
+                self.websocket,
+                self.word,
+                clip,
+                {"speech_after": False},
+                window=False,
+                language=phrase.language,
+            )
+        except Exception:  # noqa: BLE001 - the phrase still gets its done
+            log.exception("wake stream confirm failed")
+            took = round((time.monotonic() - started) * 1000)
+            fields = {"confirmed": False, "heard": None, "confirm_ms": took}
+        phrase.confirm = fields
+        phrase.confirming = False
+        if fields["confirmed"]:
+            await self._send({"woken": phrase.id, "score": phrase.crossed.get("score")})
+        await self._finish(phrase)
+
+    async def _finish(self, phrase: _StreamPhrase) -> None:
+        """The phrase's one ``done`` and one log line, once both the detector's end and
+        any confirm are in."""
+        if phrase.finished or phrase.detected is None or phrase.confirming:
+            return
+        phrase.finished = True
+        self.phrases.pop(phrase.id, None)
+        woken = phrase.crossed is not None and (
+            not self.confirms or bool(phrase.confirm and phrase.confirm["confirmed"])
+        )
+        score = float(phrase.detected.get("score") or 0.0)
+        audio = _pcm_wav(bytes(phrase.audio))
+        _recent_audio[phrase.id] = audio
+        while len(_recent_audio) > RECENT_PHRASES:
+            _recent_audio.popitem(last=False)
+        # The line is written before ``done`` goes out: the page may close the
+        # moment it reads it, and that cancels this task.
+        if _first_line(phrase.id):
+            await self._log(phrase, woken, score, audio)
+        await self._send({"done": phrase.id, "woken": woken, "score": score})
+
+    async def _log(self, phrase: _StreamPhrase, woken: bool, score: float, audio: bytes) -> None:
+        assert phrase.detected is not None
+        keep = woken or score > NEAR_MISS
+        line = {
+            "id": phrase.id,
+            "check": "detector",
+            "mode": self.speech.wake,
+            "word": self.word,
+            "seconds": round(len(phrase.audio) / STREAM_BYTES_PER_S, 2),
+            # From the page's end of the phrase to the detector's last frame.
+            "ms": round((time.monotonic() - phrase.ended_at) * 1000) if phrase.ended_at else None,
+            "mic": phrase.mic,
+            "woken": woken,
+            "score": score,
+            "speech_after": False,
+            "stream": True,
+            # Seconds into the phrase of the frame that crossed, or null.
+            "crossed_at": phrase.detected.get("at"),
+            **(phrase.confirm or {}),
+        }
+        await asyncio.to_thread(
+            _write_wake_log,
+            Path(self.speech.wake_log_dir).expanduser(),
+            line,
+            audio if keep else None,
+        )
+
+    async def _send(self, event: dict) -> None:
+        try:
+            await self.websocket.send_json(event)
+        except (WebSocketDisconnect, RuntimeError, OSError):
+            pass
+
+
+@router.websocket("/api/speech/wake-stream")
+async def wake_stream(websocket: WebSocket) -> None:
+    """The waiting microphone, streamed to the wake word detector (#4539).
+
+    ``?page=`` the id the page made once on load; ``?word=alexa`` as for
+    ``/api/speech/wake``; ``?language=`` the language last heard, for a confirm.
+    The page sends text ``{"phrase": id, "mic"}``, then 16 kHz 16-bit mono audio as
+    binary messages, then ``{"end": id}``, and ``{"ping": 1}`` every 10 s. It gets
+    ``{"woken": id, "score"}`` the moment the phrase wakes ("Alexa" once speech
+    recognition heard the name, after ``{"confirming": id}``), one ``{"done": id,
+    "woken", "score"}`` per ended phrase, and ``{"fallback": reason}`` before the
+    deck closes a stream that cannot go on."""
+    if not _same_origin_socket(websocket):
+        await websocket.close(code=1008)
+        return
+    word = websocket.query_params.get("word") or WAKE_WORDS[0]
+    page = _phrase_id(websocket.query_params.get("page"))
+    if word not in WAKE_WORDS or not page:
+        await websocket.close(code=1008)
+        return
+    await websocket.accept()
+    stream = WakeStream(websocket, word, page)
+    older = _wake_streams.get(page)
+    _wake_streams[page] = stream
+    if older is not None:
+        older.replaced.set()
+    await stream.run()
+
+
+def _same_origin_socket(websocket: WebSocket) -> bool:
+    """As ``_require_same_origin`` for a WebSocket, whose scheme is ``ws``/``wss``:
+    another site's page cannot open the microphone stream."""
+    if websocket.headers.get("sec-fetch-site") == "cross-site":
+        return False
+    origin = websocket.headers.get("origin")
+    return not origin or urlsplit(origin).netloc == websocket.headers.get("host")
 
 
 @router.post("/api/speech/wake-log")
@@ -708,6 +1226,7 @@ async def voice_log(request: Request, session_key: str) -> HTMLResponse:
     for phrase in phrases:
         phrase["when"] = datetime.fromtimestamp(phrase["at"]).strftime("%Y-%m-%d %H:%M:%S")
         phrase["parts"] = voice_helper.timing_parts(phrase.get("timing"))
+        phrase["early"] = voice_helper.EARLY_WAYS.get((phrase.get("timing") or {}).get("early"))
     return get_templates(request).TemplateResponse(
         request,
         "voice_log.html",
@@ -716,6 +1235,7 @@ async def voice_log(request: Request, session_key: str) -> HTMLResponse:
             "phrases": phrases,
             "answered": voice_helper.ANSWERED,
             "summary": voice_helper.timing_summary(phrases),
+            "early_summary": voice_helper.early_summary(phrases),
             "summary_of": voice_helper.TIMED_SUMMARY,
         },
     )

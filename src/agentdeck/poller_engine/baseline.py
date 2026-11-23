@@ -49,6 +49,7 @@ __all__ = [
     "extract_failures",
     "extract_passed",
     "lookup_key",
+    "reports_failures",
 ]
 
 BRANCH_REGRESSION = "branch_regression"
@@ -95,11 +96,12 @@ def extract_failures(
     When the read was cut short (``read_tail`` opens it with ``…``) and holds more than one
     summary, an earlier one may lie before the cut, so the list is not called complete.
 
-    ``succeeded`` short-circuits all of that, because a run that exited zero failed nothing and
-    needs no output read to prove it.  Without this the feature has no clean-base case at all:
-    pytest prints the summary section only when it has something to put in it, so an all-pass
-    suite -- exactly the green baseline every card wants to compare against -- would be filed
-    as an unreadable failure list and never recorded.
+    ``succeeded`` short-circuits all of that: it means the queue judged the run passed -- it
+    exited zero *and* its log reports no failures (``reports_failures``; a piped pytest exits
+    zero on failures, #4565) -- so it needs no failure list read.  Without this the feature has
+    no clean-base case at all: pytest prints the summary section only when it has something to
+    put in it, so an all-pass suite -- exactly the green baseline every card wants to compare
+    against -- would be filed as an unreadable failure list and never recorded.
 
     ``known`` is the ids the run itself recorded as failing, where it kept a per-test record;
     each summary line reads as the longest of them it opens with, and as the pattern otherwise.
@@ -123,6 +125,39 @@ def extract_failures(
         return tuple(sorted(seen[:MAX_FAILURES])), False
     complete = len(sections) == 1 or not text.startswith("…")
     return tuple(sorted(seen)), complete
+
+
+# pytest's closing count, e.g. ``==== 75 passed, 2 errors in 12.30s ====`` or, under ``-q``,
+# ``75 passed, 2 errors in 12.30s (0:00:12)``. pytest always ends it with the run's duration, so
+# only a line made of nothing but counts and that duration reads as one: a test's own output such
+# as ``3 failed`` or ``5 errors in parsing the file`` does not.
+_COUNT = r"\d+ (?:passed|failed|errors?|skipped|deselected|xfailed|xpassed|warnings?|reruns?)"
+_COUNT_LINE = re.compile(
+    rf"^=*\s*{_COUNT}(?:,\s*{_COUNT})*\s+in\s+\d+(?:\.\d+)?s(?:\s+\(\d+:\d\d:\d\d\))?\s*=*$"
+)
+_BAD_COUNT = re.compile(r"\b(\d+) (?:failed|errors?)\b")
+# A summary line names its test file (``FAILED tests/a.py::test_x - …``, ``ERROR tests/a.py -
+# ImportError``); a live-log line such as ``ERROR    app.worker:worker.py:12 retrying`` does not.
+# Read anywhere, not only under the header, so ``pytest | grep FAILED`` still counts.
+_REPORTED_LINE = re.compile(r"^(?:FAILED|ERROR)\s+\S+?\.py(?:::|\s|$)")
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def reports_failures(text: str) -> bool:
+    """Whether a log reports a failed or erroring test, whatever the command's exit code said.
+
+    A command that pipes pytest (``pytest … | tail``) exits with the pipe's last command, so
+    zero alone does not prove nothing failed (#4565). A summary line saying ``FAILED`` or
+    ``ERROR`` about a test file, or pytest's closing count with a failure or error in it, does
+    prove something did. An all-pass run prints neither. Colour codes are read past.
+    """
+    for raw in text.splitlines():
+        line = _ANSI.sub("", raw).strip()
+        if _REPORTED_LINE.match(line):
+            return True
+        if _COUNT_LINE.match(line) and any(int(n) > 0 for n in _BAD_COUNT.findall(line)):
+            return True
+    return False
 
 
 def extract_passed(text: str) -> tuple[str, ...]:

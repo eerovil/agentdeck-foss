@@ -78,6 +78,7 @@ from ..instructions import (
 from ..usage import read_shared_cache
 from . import locked, permission_rules, registry
 from . import transcripts as transcripts_mod
+from .drafts import DraftBuffer
 from .held import (
     OFFSET_SAVE_INTERVAL_S,
     HeldProcess,
@@ -512,6 +513,9 @@ class _LiveWorker:
     # delivery would, so it is not reclaimed before the phrase arrives, while
     # ``last_delivery_at`` keeps meaning a real message went in.
     woken_at: float = 0.0
+    # The reply Claude is writing now, for voice mode's early read (#4543). Memory only:
+    # a runtime that reattaches mid-turn starts one that has not seen the turn start.
+    draft: DraftBuffer = field(default_factory=DraftBuffer)
 
 
 # Where held workers' sockets live, beside -- never inside -- the runtime's own directory.
@@ -881,6 +885,8 @@ class ClaudeWorkerHost:
         # runtime's change feed can compare and tell the web (#2865). Called on every
         # stdout event, a process exit, and every save of the records.
         self.on_state_change: Callable[[str | None], None] = lambda _key: None
+        # Told when a worker's draft may have moved (#4543), on the drafts feed item.
+        self.on_draft_change: Callable[[str], None] = lambda _key: None
         self._records: dict[str, WorkerRecord] = {}
         self._live: dict[str, _LiveWorker] = {}
         self._control_waiters: dict[str, asyncio.Future] = {}
@@ -1490,6 +1496,7 @@ class ClaudeWorkerHost:
                 scope_unit=info.scope_unit,
                 holder_key=key,
                 read_offset=info.offset,
+                draft=DraftBuffer(turn_seen=not rec.turn_open_at),
             )
             live.reader_task = asyncio.create_task(
                 self._read_loop(key, live), name=f"claude-worker:{self.account.key}:{key}"
@@ -1775,6 +1782,28 @@ class ClaudeWorkerHost:
         entry = self._snapshot_rows([(key, rec)])[key]
         entry.pop("last_activity_at", None)
         return entry
+
+    def draft_keys(self) -> list[str]:
+        """Every live worker key, for the drafts feed item (#4543)."""
+        return list(self._live)
+
+    def draft_entry(self, key: str) -> dict[str, Any] | None:
+        """The 🔊 reply this worker is writing, keyed by its chat (#4543), or None."""
+        live = self._live.get(key)
+        rec = self._records.get(key)
+        view = live.draft.view() if live is not None else None
+        if view is None or rec is None or not rec.session_id:
+            return None
+        return {**view, "session_id": rec.session_id}
+
+    def drafts(self) -> dict[str, dict[str, Any]]:
+        """Every live worker's draft by chat session id, for the web (#4543)."""
+        found = {}
+        for key in self.draft_keys():
+            entry = self.draft_entry(key)
+            if entry is not None:
+                found[entry.pop("session_id")] = entry
+        return found
 
     def next_change_at(self) -> float | None:
         """When a snapshot row next changes with no event to say so (#2865).
@@ -3318,6 +3347,8 @@ class ClaudeWorkerHost:
             "--output-format",
             "stream-json",
             "--verbose",
+            # Text pieces as Claude writes them, for voice mode's early read (#4543).
+            "--include-partial-messages",
             "--append-system-prompt",
             instructions,
         ]
@@ -3843,18 +3874,21 @@ class ClaudeWorkerHost:
 
         The host's mode, bypass switch, deck guide and hook settings never apply. The
         page reader's MCP config is rewritten and read back and the folder's
-        ``.mcp.json`` read each time, so a cleaned-up artifact directory or a missing
-        file refuses the spawn instead of starting the chat without its limits.
+        ``.mcp.json`` and ``CLAUDE.md`` read each time, so a cleaned-up artifact
+        directory or a missing file refuses the spawn instead of starting the chat
+        without its limits.
         """
         try:
             fetch = locked.write_fetch_config(self._artifact_root)
             servers = locked.mcp_servers(rec.cwd)
+            guide = locked.folder_guide(rec.cwd)
         except locked.LockedChatRefused as exc:
             raise WorkerError(f"locked chat refused: {exc}") from exc
         return locked.command(
             rec.cwd,
             fetch,
             servers,
+            guide,
             model=model or rec.model,
             resume_id=resume_id,
             resume_at=(
@@ -4168,6 +4202,12 @@ class ClaudeWorkerHost:
                         # Not answered, so the boss is asked after all.
                         log.warning("could not refuse a safety check for %s", key)
                 self._handle_event(key, live, event)
+                if live.draft.take(event):
+                    self.on_draft_change(key)
+                if event.get("type") == "stream_event":
+                    # A text piece moves only the draft; the rows the web reads of this
+                    # worker are compared on the lines around it.
+                    continue
                 if live.holder_key and (
                     event.get("type") in _HOLDER_SAVE_EVENTS
                     or time.monotonic() - live.offset_saved_at >= OFFSET_SAVE_INTERVAL_S
@@ -4220,6 +4260,8 @@ class ClaudeWorkerHost:
         # happened, this process's scope has to be read before it is
         # forgotten, or a cap kill goes unexplained (#1546).
         self.on_state_change(key)
+        # Its draft went with it (#4543).
+        self.on_draft_change(key)
         if live.holder_key:
             await self._forget_holder(key, live)
         await self._settle_scope(key, live)

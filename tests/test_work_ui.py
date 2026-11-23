@@ -2598,6 +2598,36 @@ async def test_a_pull_requests_text_stays_as_the_reader_left_it(tmp_path):
         await browser.close()
 
 
+def test_a_reopened_works_old_pull_requests_are_history_not_its_status(tmp_path):
+    """#4585: the pull request merged in an earlier round sits shut under Earlier rounds;
+    the round's own pull request is the Work's output, and the status reads only it."""
+    app = _app(tmp_path, board=_board())
+    worker = _add(app, "claude_code:test:worker", WORK)
+    app.state.app_state.set_pull_requests(
+        worker, (PullRequestRef("eerovil/agentdeck", 90), PullRequestRef("eerovil/agentdeck", 91))
+    )
+    rows = {
+        ("eerovil/agentdeck", 90): {"state": "MERGED", "mergedAt": "2026-11-01T10:00:00Z",
+                                    "headRefOid": "a" * 40, "baseRefName": "master"},
+        ("eerovil/agentdeck", 91): {"state": "OPEN", "headRefOid": "b" * 40,
+                                    "baseRefName": "master", "isDraft": True},
+    }
+    app.state.issues.cached_pulls = lambda wanted: {ref: rows[ref] for ref in wanted if ref in rows}
+    app.state.control_db.start_work_round(WORK.work_id, ["eerovil/agentdeck#90"], "reopened")
+    html = _client(app).get(work_href(WORK.work_id)).text
+    earlier = html.split("data-wd-earlier>", 1)[1].split("</details>", 1)[0]
+    assert "Earlier rounds (1)" in earlier
+    assert 'data-wd-earlier-output="https://github.com/eerovil/agentdeck/pull/90"' in earlier
+    assert "/pull/91" not in earlier
+    current = html.split("data-wd-earlier>", 1)[0]
+    assert "/pull/91" in current and "/pull/90" not in current
+    # With nothing of its own yet, the round says so.
+    rows.pop(("eerovil/agentdeck", 91))
+    app.state.app_state.set_pull_requests(worker, (PullRequestRef("eerovil/agentdeck", 90),))
+    html = _client(app).get(work_href(WORK.work_id)).text
+    assert "No pull request in this round yet." in html
+
+
 def test_work_page_disclosures_are_keyed_by_work(tmp_path):
     app = _app(tmp_path, board=_board())
     _add(app, "claude_code:test:worker", WORK)

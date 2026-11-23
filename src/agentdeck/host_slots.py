@@ -629,7 +629,7 @@ def _configured_count(variable: str, default: int) -> int:
 def helper_slot_count() -> int:
     """How many ``agentdeck pre-review-helpers`` runs may go at once on this host (#4437).
 
-    Two, so at most six ``claude -p`` helpers and six parallel calls on the accounts. A pool
+    Two, so at most eight ``claude -p`` helpers and eight parallel calls on the accounts. A pool
     of its own rather than ``heavy``: a heavy slot is held by whole test suites, and a helper
     run is network-bound and light on CPU, so it would wait behind them for nothing.
     """

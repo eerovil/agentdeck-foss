@@ -67,6 +67,10 @@ APPROVAL_ACTIONS = frozenset({APPROVE_MERGE, WITHDRAW_MERGE})
 # Ship now, fix later (#4212): merge a pull request its review sent back with findings, and
 # leave those findings to this same Work's next pull request.
 SHIP_NOW = "ship_now"
+# Pressed again at once without the recent-press guard: Merge when ready and Withdraw refuse
+# a repeat themselves (#3320), and a second Ship now joins the press still running or answers
+# from the deck's record, so it never ships twice (#4558). Each press still has its own id.
+REPEAT_SAFE_ACTIONS = APPROVAL_ACTIONS | {SHIP_NOW}
 # Works, close on a Work waiting for a person to try it live (#4210): closes its issue, records
 # the live check as verified and finishes the Work, in one press with no confirm. Offered from
 # the Work's own state (``derived.kind == "try_wait"``), not from Needs you.

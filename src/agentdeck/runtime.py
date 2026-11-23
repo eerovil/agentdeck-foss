@@ -8,7 +8,7 @@ import shutil
 import time
 import uuid
 from collections import defaultdict
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
@@ -25,16 +25,26 @@ from .config import AppConfig, owned_session_base_url
 from .db import Db, open_db
 from .flaky_quarantine import FILENAME as QUARANTINE_FILENAME
 from .flaky_quarantine import Quarantine
+from .github_cache import GitHubMetadataCache
 from .host_slots import MemoryGate, describe_heavy_slots, heavy_slot_paths
 from .jobs import LOCAL as JOB_LANE_LOCAL
 from .jobs import QUEUED as JOB_QUEUED
 from .jobs import RUNNING as JOB_RUNNING
-from .jobs import Job, JobError, JobQueue, NotifyOutcome, configure_jobs_slice, rows_for_work
+from .jobs import (
+    Job,
+    JobError,
+    JobQueue,
+    NotifyOutcome,
+    awaits_ready,
+    configure_jobs_slice,
+    rows_for_work,
+)
 from .models import (
     SNAPSHOT_CAPABILITIES_KEY,
     Account,
     ForkFrom,
     InjectResult,
+    PullRequestRef,
 )
 from .providers import PROVIDERS
 from .providers.base import unknown_account_detail
@@ -1798,6 +1808,10 @@ def _wire_change_feed(
         feed.add_check(
             runtime_feed.ChangeCheck(item, keys, entry, deadline=host.next_change_at)
         )
+        # The reply each worker is writing (#4543), compared once its sentences moved.
+        drafts = runtime_feed.drafts_item("claude_code", label)
+        host.on_draft_change = lambda key: feed.mark(drafts, key)
+        feed.add_check(runtime_feed.ChangeCheck(drafts, host.draft_keys, host.draft_entry))
 
     claude_workers.on_host = watch_claude
     for label, host in claude_workers.hosts.items():
@@ -1873,6 +1887,58 @@ def _wire_change_feed(
     if executions is not None:
         executions.on_change = lambda: feed.bump(runtime_feed.RUNS)
     return feed
+
+
+def job_chat_leg(budget_db: Db, job: Job) -> str:
+    """The leg of ``job``'s chat its notices go to (#4556).
+
+    The job's own session, which was the chat's working leg when it was queued, unless the
+    chat has grown a newer leg since: a chat continued on another session must hear of the
+    job there, not in the leg it left behind. A leg added before the job is not taken, since
+    a chat can be handed back to an earlier leg without a new one (#1501).
+    """
+    own = job.session_key or ""
+    chat = budget_db.chat_for_session(own) if own else None
+    if chat is None or not chat.legs or chat.newest_session_key == own:
+        return own
+    newest = chat.newest_session_key
+    added = budget_db.chat_leg_added_at(newest)
+    if added is None or added.timestamp() <= job.submitted_at:
+        return own
+    return newest
+
+
+def chat_waits_on_proof(budget_db: Db, job: Job, cache: GitHubMetadataCache) -> bool:
+    """Whether ``job``'s chat has not marked its Work's pull requests ready yet (#4556).
+
+    Its registrations in the control database, under any leg of its chat, and each one's draft
+    flag as the shared GitHub cache holds it, which the webhooks keep current at no API cost.
+    A registration that named no Work can only wake it (``awaits_ready``).
+    """
+    from .git_context import _pull_cache_key
+
+    chat = budget_db.chat_for_session(job.session_key or "")
+    keys = set(chat.legs) if chat is not None else set()
+    keys.add(job.session_key or "")
+    registered = budget_db.load_session_pull_requests()
+    work = job.work_id.strip().casefold()
+    named: dict[tuple[str, int], PullRequestRef] = {}
+    unnamed: dict[tuple[str, int], PullRequestRef] = {}
+    for key in keys:
+        for ref in registered.get(key, ()):
+            if not ref.work_id.strip():
+                unnamed[ref.identity] = ref
+            elif ref.work_id.strip().casefold() == work:
+                named[ref.identity] = ref
+
+    def read(refs: Iterable[PullRequestRef]) -> list[tuple[Any, bool]]:
+        lookups = [cache.peek(_pull_cache_key(ref.repository, ref.number)) for ref in refs]
+        return [(lookup.value, lookup.complete) for lookup in lookups]
+
+    return awaits_ready(
+        read(named.values()),
+        read(ref for identity, ref in unnamed.items() if identity not in named),
+    )
 
 
 def create_runtime_app(config: AppConfig) -> FastAPI:
@@ -1996,9 +2062,13 @@ def create_runtime_app(config: AppConfig) -> FastAPI:
             except Exception:  # noqa: BLE001 -- a failed refresh must not stop the runtime
                 log.exception("run execution refresh failed")
 
+    def _job_chat_leg(job: Job) -> str:
+        return job_chat_leg(budget_db, job)
+
     async def _tell_submitter(job: Job, message: str) -> NotifyOutcome:
+        target = _job_chat_leg(job)
         outcome = await restart_nudges.deliver_to_session(
-            job.session_key or "",
+            target,
             message=message,
             # Stable and job-scoped: a retry of the same finished job replays
             # rather than posting a second copy into the chat.
@@ -2006,7 +2076,7 @@ def create_runtime_app(config: AppConfig) -> FastAPI:
         )
         log.info(
             "jobs: told %s about job %s -> %s",
-            job.session_key,
+            target,
             job.id,
             _nudge_result(outcome),
         )
@@ -2016,15 +2086,16 @@ def create_runtime_app(config: AppConfig) -> FastAPI:
         return NotifyOutcome(outcome.accepted, outcome.reason or "")
 
     async def _tell_progress(job: Job, message: str, number: int) -> NotifyOutcome:
+        target = _job_chat_leg(job)
         outcome = await restart_nudges.deliver_to_session(
-            job.session_key or "",
+            target,
             message=message,
             # One id per progress message (#3038), so each is delivered at most once.
             delivery_id=f"job-progress:{job.id}:{number}",
         )
         log.info(
             "jobs: told %s how job %s goes (%d) -> %s",
-            job.session_key,
+            target,
             job.id,
             number,
             _nudge_result(outcome),
@@ -2037,6 +2108,11 @@ def create_runtime_app(config: AppConfig) -> FastAPI:
         chat = budget_db.chat_for_session(job.session_key or "")
         chat_id = chat.chat_id if chat is not None else (job.session_key or "")
         return bool(chat_id) and budget_db.add_pending_event(note_id, chat_id, text)
+
+    pull_cache = GitHubMetadataCache()
+
+    def _chat_waits_on_proof(job: Job) -> bool:
+        return chat_waits_on_proof(budget_db, job, pull_cache)
 
     def _ownership_label(repository: str) -> str:
         """The label that hands an issue in ``repository`` to a worker, from the manifests."""
@@ -2069,6 +2145,8 @@ def create_runtime_app(config: AppConfig) -> FastAPI:
         memory_gate=memory_gate,
         # A green verification that proves its commit is a pending note (#4306).
         keep_note=_keep_job_note,
+        # Not while its chat has no pull request marked ready yet: it waits on this (#4556).
+        chat_waits=_chat_waits_on_proof,
     )
 
     # Not gated on config.jobs.enabled: the slot pool is the host's, and a
@@ -2740,6 +2818,11 @@ def create_runtime_app(config: AppConfig) -> FastAPI:
         # runtime will bring back from one nobody will (#3008).
         snapshot = claude_workers.host(label).snapshot()
         return {**snapshot, "revival": restart_nudges.revivals_due()}
+
+    @app.get("/claude/accounts/{label}/drafts")
+    async def claude_drafts(label: str) -> dict[str, Any]:
+        # The 🔊 replies being written, by chat session id, for voice mode (#4543).
+        return {"drafts": claude_workers.host(label).drafts()}
 
     @app.post("/claude/accounts/{label}/deliver")
     async def claude_deliver(label: str, body: DeliverRequest) -> dict[str, Any]:

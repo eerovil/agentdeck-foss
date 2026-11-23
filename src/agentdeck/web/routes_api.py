@@ -59,6 +59,7 @@ from ..wake_on import (
     KIND_COMMIT,
     KIND_DEPLOYMENT,
     KIND_REVIEW,
+    KIND_WATCH,
     WakeRequest,
     WakeRequestError,
     parse_request,
@@ -1507,6 +1508,9 @@ class WakeOnRequest(BaseModel):
     # A time wait's check (#4256): {"command": "<shell>", "every_minutes": 60, "cwd": "/abs"},
     # run until the wait's time; it wakes the chat only on exit 0, an error or the deadline.
     check: dict | None = None
+    # A watch (#4466): what would be back, in a few words. With ``at`` or ``after_minutes`` and
+    # a ``check`` whose exit 0 says the problem is back, the deck reopens the Work's issue.
+    watch: str | None = None
 
 
 def _wake_on_service(request: Request):
@@ -1527,6 +1531,22 @@ def _wake_on_payload(request: Request, session_key: str, service) -> dict:
     }
 
 
+def _only_work(request: Request, session_key: str) -> str:
+    """The one Work this chat is directly in, for a watch that names none (#4466)."""
+    from .work_view import _direct_works
+
+    state = get_state(request)
+    chat_id = state.chat_identity_key(session_key)
+    works = _direct_works(state.work_projection(), {chat_id}).get(chat_id, ())
+    if len(works) != 1:
+        raise HTTPException(
+            status_code=422,
+            detail="a watch reopens one Work's issue: name it with work_id (owner/repo#n)"
+            f" — this chat is directly in {len(works)} Works",
+        )
+    return works[0]
+
+
 @router.get("/sessions/{session_key}/wake-on")
 async def get_session_wake_on(request: Request, session_key: str) -> dict:
     session_key, _session = resolve_chat_key(request, session_key)
@@ -1545,6 +1565,9 @@ async def post_session_wake_on(
         fields = parse_request(**body.model_dump())
     except WakeRequestError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if fields.get("kind") == KIND_WATCH and not fields.get("work_id"):
+        # A watch reopens one Work's issue (#4466): the chat's only Work, unless it names one.
+        fields["work_id"] = _only_work(request, session_key)
     router_service = getattr(request.app.state, "work_router", None)
     if fields.get("kind") == KIND_REVIEW and getattr(router_service, "reviewer_off", False):
         # No verdict can ever come (#3849): the wait would only run out its timeout.
@@ -1770,9 +1793,12 @@ async def post_session_ship_now(request: Request, session_key: str, body: ShipNo
     that head, the head ships in a pull request the deck opens for it (#4212 review).
 
     Several pull requests are shipped in the order given, as the button ships all of the
-    Work's; the first refused one stops the rest, which are named in ``not_shipped``."""
-    from ..services_link import ServicesUnavailable
-    from ..work_router import AgainRefused
+    Work's; the first refused one stops the rest, which are named in ``not_shipped``. One still
+    running when the merge service stops waiting (``state: running``, #4558) stops the rest
+    too, named in ``not_started``; ``next`` tells the agent what it may do, and a repeat with
+    the same body is always safe."""
+    from ..services_link import ServicesUnavailable, ServicesUncertain
+    from ..work_router import SHIP_RUNNING, AgainRefused
 
     session_key, _session = resolve_chat_key(request, session_key)
     targets = list(body.pull_requests)
@@ -1807,7 +1833,7 @@ async def post_session_ship_now(request: Request, session_key: str, body: ShipNo
     shipped: list[dict] = []
     for index, (ref, head) in enumerate(refs):
         try:
-            shipped.append(await router_service.ship_now(ref.repository, ref.number, head=head))
+            answer = await router_service.ship_now(ref.repository, ref.number, head=head)
         except (AgainRefused, ServicesUnavailable) as exc:
             if not shipped:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -1818,8 +1844,69 @@ async def post_session_ship_now(request: Request, session_key: str, body: ShipNo
                 "shipped": shipped,
                 "not_shipped": rest,
                 "refused": str(exc),
+                "next": SHIP_REPEAT_SAFE,
             }
-    return {"session_key": session_key, **shipped[0], "shipped": shipped}
+        except ServicesUncertain as exc:
+            # The merge service is stuck past the web's wait (#4558): still unknown, but a
+            # repeat joins or finishes the same press, so it is safe to make. Those already
+            # recorded in this call are still named (#4559 helper checks).
+            if not shipped:
+                raise HTTPException(status_code=504, detail=SHIP_UNCERTAIN) from exc
+            return {
+                "session_key": session_key,
+                **shipped[0],
+                "shipped": shipped,
+                "not_shipped": [f"{r.repository}#{r.number}" for r, _ in refs[index:]],
+                "uncertain": f"{ref.repository}#{ref.number}",
+                "next": SHIP_UNCERTAIN,
+            }
+        shipped.append(answer)
+        if isinstance(answer, dict) and answer.get("state") == SHIP_RUNNING:
+            # The rest wait (#4558): this press may still be refused, which stops them.
+            rest = [f"{r.repository}#{r.number}" for r, _ in refs[index + 1 :]]
+            return {
+                "session_key": session_key,
+                **answer,
+                "shipped": shipped,
+                "not_started": rest,
+                "next": SHIP_RUNNING_NEXT + (SHIP_REST_NEXT if rest else ""),
+            }
+    return {
+        "session_key": session_key,
+        **shipped[0],
+        "shipped": shipped,
+        "next": SHIP_RECORDED_NEXT,
+    }
+
+
+#: What a ship-now reply tells the agent it may do next (#4558).
+SHIP_REPEAT_SAFE = (
+    "Calling ship-now again with the same pull request and head is safe: a press still"
+    " running is joined, one cut off is finished, and one already recorded answers"
+    " `recorded`. Nothing ships twice."
+)
+SHIP_RECORDED_NEXT = (
+    "`recorded`: the head is marked shipped and its findings are left to this Work. It is not"
+    " merged yet: it merges once its tests are green (and nothing else holds the Work), and"
+    " this chat hears when it merges. " + SHIP_REPEAT_SAFE
+)
+SHIP_RUNNING_NEXT = (
+    "`running`: the press is still under way in the merge service, which can take minutes."
+    " This chat gets a message when it ends: the ship message once it is recorded, or the"
+    " reason it stopped. Do not poll. " + SHIP_REPEAT_SAFE + " If no message comes within"
+    " 10 minutes (a merge-service restart drops the press), register a 10-minute time wait"
+    " and call ship-now again with the same body then."
+)
+SHIP_REST_NEXT = (
+    " The pull requests in `not_started` were not started: once this chat hears the first"
+    " one ended, call ship-now again with the same body; recorded ones answer at once and"
+    " only the rest start."
+)
+SHIP_UNCERTAIN = (
+    "Not confirmed: the merge service took the Ship now request but did not answer in time,"
+    " so it may still be running. " + SHIP_REPEAT_SAFE + " Register a 10-minute time wait"
+    " and call ship-now again with the same body then, rather than polling."
+)
 
 
 def _work_pulls_of_chat(state, session_key: str) -> set[str]:
@@ -1871,6 +1958,102 @@ async def post_session_pre_review_done(
     return {"session_key": session_key, **done}
 
 
+class DeckBugBody(BaseModel):
+    # Checked by ``deck_bug.report``, whose refusal says the whole body (#4579).
+    topic: str = ""
+    expected: str = ""
+    observed: str = ""
+    pull_request: str = ""
+    head: str = ""
+
+
+async def _deck_bug_body(request: Request) -> DeckBugBody:
+    """The report's body, read here rather than by FastAPI so that every malformed one, bad
+    JSON or a field that is not text included, is refused with the whole body (#4579 review)."""
+    from .. import deck_bug
+
+    try:
+        raw = await request.json()
+    except ValueError:
+        raw = None
+    fields = DeckBugBody.model_fields
+    if not isinstance(raw, dict):
+        problem = "the body must be a JSON object"
+    else:
+        wrong = sorted(n for n in fields if n in raw and not isinstance(raw[n], str))
+        problem = f"`{'`, `'.join(wrong)}` must be text" if wrong else ""
+    if problem:
+        raise HTTPException(status_code=422, detail=f"{problem}. {deck_bug.USAGE}")
+    return DeckBugBody(**{n: raw[n] for n in fields if n in raw})
+
+
+def _deck_bug_board(request: Request) -> Any:
+    issues = getattr(request.app.state, "issues", None)
+    return issues.read_board() if issues is not None else None
+
+
+@router.post("/sessions/{session_key}/deck-bug")
+async def post_session_deck_bug(request: Request, session_key: str) -> dict:
+    """A Work's agent reports that the deck asked for something it thinks is wrong (#4579).
+
+    Filed into AgentDeck's issues by its Poller, folded by ``topic``, without the ownership
+    label. Only the report itself runs in a thread: its lock is held across a small file write.
+    A chat with a pull request names it or its head, the evidence a report needs.
+    """
+    from .. import deck_bug, issue_post
+
+    session_key, _session = resolve_chat_key(request, session_key)
+    body = await _deck_bug_body(request)
+    state = get_state(request)
+    work = issue_post.issue_post_target(state, session_key)
+    if work is None:
+        raise HTTPException(status_code=409, detail="this chat is in no Work, or in several")
+    registered = state.pull_requests_for(session_key)
+    if registered and not (body.pull_request or body.head):
+        raise HTTPException(
+            status_code=422,
+            detail=f"name the `pull_request` or `head` the bug is about. {deck_bug.USAGE}",
+        )
+    pull = ""
+    if body.pull_request:
+        try:
+            ref = _pull_request_ref(body.pull_request)
+        except HTTPException as exc:
+            raise HTTPException(
+                status_code=422, detail=f"{exc.detail}. {deck_bug.USAGE}"
+            ) from exc
+        if ref.identity not in {held.identity for held in registered}:
+            raise HTTPException(
+                status_code=409,
+                detail=f"this chat has not registered {ref.repository}#{ref.number}",
+            )
+        pull = f"{ref.repository}#{ref.number}"
+    limiter = getattr(request.app.state, "deck_bug_limiter", None)
+    if limiter is None:
+        raise HTTPException(status_code=503, detail="this deck takes no deck-bug reports")
+    try:
+        answer = await asyncio.to_thread(
+            deck_bug.report,
+            limiter, _deck_bug_board(request), session_key=session_key, work_id=work.work_id,
+            topic=body.topic, expected=body.expected, observed=body.observed,
+            pull_request=pull, head=body.head,
+            revision=str(getattr(request.app.state, "revision", None) or ""),
+        )
+    except deck_bug.Refused as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.detail) from exc
+    return {"session_key": session_key, **answer}
+
+
+@router.get("/sessions/{session_key}/deck-bug")
+async def get_session_deck_bug(request: Request, session_key: str) -> dict:
+    """The agent-reported deck bug topics this deck knows of (#4579), to reuse one."""
+    from .. import deck_bug
+
+    session_key, _session = resolve_chat_key(request, session_key)
+    found = await asyncio.to_thread(deck_bug.topics, _deck_bug_board(request))
+    return {"session_key": session_key, **found}
+
+
 @router.post("/sessions/{session_key}/design-review")
 async def post_session_design_review(request: Request, session_key: str) -> dict:
     """Review the design of this chat's Work before its code (#4332): a deck reviewer reads
@@ -1911,8 +2094,9 @@ DESIGN_UNCERTAIN_TEXT = (
 @router.get("/sessions/{session_key}/design-review")
 async def get_session_design_review(request: Request, session_key: str) -> dict:
     """Where this chat's Work's design review stands (#4337): ``state`` is ``none``,
-    ``unreviewed``, ``queued`` (waiting for a reviewer place, #4342), ``reviewing``, ``pass``
-    or ``gap``, with the design comment, its reviewer
+    ``unreviewed``, ``queued`` (waiting for a reviewer place, #4342), ``reviewing``,
+    ``pass``, ``gap`` or ``notes`` (passed with notes, #4463), with the design comment, its
+    reviewer
     and what to do ``next``. Read here, never asked of the merge service, so it answers even
     while a request to it hangs."""
     import time

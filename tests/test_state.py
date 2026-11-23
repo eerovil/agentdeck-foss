@@ -105,6 +105,24 @@ def test_session_presentation_rebuilds_when_another_process_links_a_chat_leg(tmp
     assert len(linked.top_level) == 1
 
 
+def test_a_persons_message_is_kept_per_chat_across_legs_and_restarts(tmp_path):
+    """#4562: the Work page reads when a person last wrote to a chat; a new leg is the same
+    chat, a restart keeps it, and an older write never moves it back."""
+    db = Db(tmp_path / "chat.db")
+    db.ensure_session_chats(("claude_code:main:old", "claude_code:main:new"))
+    db.append_chat_leg("claude_code:main:old", "claude_code:main:new")
+    state = AppState(db=db, budget_db=db)
+    chat_id = state.chat_identity_key("claude_code:main:new")
+    assert chat_id == state.chat_identity_key("claude_code:main:old")
+    assert state.person_message_at([chat_id]) is None
+
+    at = state.note_person_message("claude_code:main:new")
+    assert state.person_message_at([chat_id, "another-chat"]) == at
+    db.note_person_message(chat_id, (at - timedelta(hours=1)).isoformat())
+    assert AppState(db=db, budget_db=db).person_message_at([chat_id]) == at
+    assert AppState(db=db, budget_db=db).person_message_at(["another-chat"]) is None
+
+
 def test_session_presentation_reuses_parent_graphs_until_parentage_changes(
     monkeypatch,
 ):

@@ -754,7 +754,9 @@ def _job(argv: list[str]) -> int:
         help=(
             "with --verification: another checkout the command also tests, such as a second "
             "repository of the same Work; repeatable. Each is recorded next to --cwd as what "
-            "the run verified, and the job runs on this host"
+            "the run verified, and the job runs on this host. Only the --cwd checkout's commit "
+            "is credited as tested: a pull request in a --workspace checkout needs a "
+            "verification job of its own, run with --cwd on that checkout"
         ),
     )
     submit.add_argument(
@@ -938,6 +940,15 @@ def _job_submit(parser: argparse.ArgumentParser, socket_path: Path, args) -> int
             "record verification jobs yet, so this run will not count as release evidence.",
             file=sys.stderr,
         )
+    if args.verification and args.workspace:
+        # A run naming two repositories credited only the --cwd one, and its agent read the
+        # other pull request's "tests are not green" as a deck fault (#4589).
+        print(
+            f"job {job['id']}: only the commit in --cwd ({cwd}) is credited as tested; a pull "
+            "request in a --workspace checkout needs a verification job of its own, run with "
+            "--cwd on that checkout.",
+            file=sys.stderr,
+        )
     if not args.wait:
         where = _job_lane_description(lane)
         print(f"queued job {job['id']}{where}: {' '.join(command)}")
@@ -977,8 +988,8 @@ def _job_announcement(job: dict, *, progress: bool) -> str:
     said += ", and one with its progress every five minutes while it runs." if progress else "."
     if job.get("purpose") == "verification" and job.get("work_id") and not job.get("run_id"):
         said += (
-            " A green run that proves its commit sends no message, because the deck reads the "
-            "result itself: do not wait for it, and mark your pull request ready now."
+            " Mark your pull requests ready now: once all of them are, a green run that proves "
+            "its commit sends no message, because the deck reads the result itself."
         )
     return said
 

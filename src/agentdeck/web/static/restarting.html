@@ -72,9 +72,9 @@
 <body data-restarting-screen>
   <main class="card" role="status" aria-live="polite">
     <div class="brand">agentdeck</div>
-    <div class="spinner" aria-hidden="true"></div>
-    <h1>Restarting</h1>
-    <p>The deck is coming back up. This page reloads itself the moment it does.</p>
+    <div class="spinner" id="spinner" aria-hidden="true"></div>
+    <h1 id="title">Restarting</h1>
+    <p id="lead">The deck is coming back up, or the connection is being re-made. This page reloads itself the moment it does.</p>
     <div class="status">
       <span class="status-text" id="status">Waiting for the deck…</span>
       <button type="button" id="retry">Retry now</button>
@@ -94,21 +94,85 @@
 
   function say(text) { statusEl.textContent = text; }
 
+  // One check may wait this long. A phone back from sleep can hold a dead
+  // connection that a check would otherwise wait on for minutes (#4591).
+  var CHECK_LIMIT_MS = 5000;
+  // The worker also shows this screen when a page load gets no answer in time
+  // (#4591). /healthz can answer on a fresh connection while the page load hangs
+  // again, which would show this screen, reload, and show it again for ever. So
+  // this screen counts its own reloads, and after RELOAD_CAP within RELOAD_WINDOW_MS
+  // it stops and says so. A deploy restart reloads it once, far below the cap.
+  var RELOAD_CAP = 3;
+  var RELOAD_WINDOW_MS = 120000;
+  var RELOADS_KEY = 'agentdeck:restarting-reloads';
+
+  function recentReloads() {
+    try {
+      var now = Date.now();
+      var list = JSON.parse(sessionStorage.getItem(RELOADS_KEY) || '[]');
+      return Array.isArray(list) ? list.filter(function (at) {
+        return typeof at === 'number' && now - at < RELOAD_WINDOW_MS;
+      }) : [];
+    } catch (_) { return []; }
+  }
+  function noteReload() {
+    try {
+      var list = recentReloads();
+      list.push(Date.now());
+      sessionStorage.setItem(RELOADS_KEY, JSON.stringify(list));
+    } catch (_) {}
+  }
+  function clearReloads() {
+    try { sessionStorage.removeItem(RELOADS_KEY); } catch (_) {}
+  }
+  var stuck = false;
+  function giveUp() {
+    stuck = true;
+    if (timer) { clearTimeout(timer); timer = null; }
+    document.getElementById('spinner').hidden = true;
+    document.getElementById('title').textContent = 'Connection stuck';
+    document.getElementById('lead').textContent =
+      'The connection seems stuck — close and reopen the app.';
+    say('Stopped retrying.');
+  }
+
+  function checkHealth() {
+    var controller = typeof AbortController === 'function' ? new AbortController() : null;
+    var limit = null;
+    var waited = new Promise(function (resolve, reject) {
+      limit = setTimeout(function () {
+        if (controller) controller.abort();
+        reject(new Error('no answer in time'));
+      }, CHECK_LIMIT_MS);
+    });
+    var options = { cache: 'no-store' };
+    if (controller) options.signal = controller.signal;
+    return Promise.race([fetch('/healthz', options), waited]).then(function (res) {
+      clearTimeout(limit);
+      return res;
+    }, function (err) {
+      clearTimeout(limit);
+      throw err;
+    });
+  }
+
   function schedule(ms) {
     if (timer) clearTimeout(timer);
     timer = setTimeout(check, ms);
   }
 
   function check() {
-    if (checking || reloading) return;
+    if (checking || reloading || stuck) return;
     checking = true;
     attempts += 1;
     say('Checking…');
     // no-store so neither the HTTP cache nor a stale worker can answer for a
     // process that is still down.
-    fetch('/healthz', { cache: 'no-store' }).then(function (res) {
+    checkHealth().then(function (res) {
       checking = false;
       if (res && res.ok) {
+        if (recentReloads().length >= RELOAD_CAP) { giveUp(); return; }
+        noteReload();
         reloading = true;
         say('Back — reloading…');
         // This body was served under the URL the user originally asked for, so
@@ -133,11 +197,24 @@
   }
 
   function checkNow() {
+    if (stuck) return;
     delay = 800;
     schedule(0);
   }
 
-  document.getElementById('retry').addEventListener('click', checkNow);
+  // A tap is a person asking to try again: it starts the count afresh.
+  document.getElementById('retry').addEventListener('click', function () {
+    if (stuck) {
+      stuck = false;
+      clearReloads();
+      document.getElementById('spinner').hidden = false;
+      document.getElementById('title').textContent = 'Restarting';
+      document.getElementById('lead').textContent =
+        'The deck is coming back up, or the connection is being re-made. ' +
+        'This page reloads itself the moment it does.';
+    }
+    checkNow();
+  });
   // A phone that was asleep through the whole restart should recover on the
   // first look, not after the backoff timer next fires.
   document.addEventListener('visibilitychange', function () {

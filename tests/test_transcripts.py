@@ -282,7 +282,8 @@ def _enqueue(text):
 
 def test_read_events_parses_roles(tmp_path):
     p = tmp_path / "t.jsonl"
-    _write(p, [USER, ASSISTANT, TOOL_RESULT])
+    assistant = {**ASSISTANT, "message": {**ASSISTANT["message"], "id": "msg_01"}}
+    _write(p, [USER, assistant, TOOL_RESULT])
     read = transcripts.read_events(p)
     assert [e.role for e in read.events] == ["user", "assistant", "tool"]
     a = read.events[1]
@@ -290,6 +291,9 @@ def test_read_events_parses_roles(tmp_path):
     assert a.tool_name == "Bash"
     assert "ls -la" in a.tool_summary
     assert a.model == "claude-opus-4-8"
+    # Claude's message id, which voice mode matches to the reply it read early (#4543).
+    assert a.message_id == "msg_01"
+    assert read.events[0].message_id is None
 
 
 def test_claude_tool_calls_carry_expandable_full_input(tmp_path):

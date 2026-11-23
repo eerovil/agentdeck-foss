@@ -44,6 +44,17 @@ WAKE = (
             "Deck now runs 12345678",
         ),
         (
+            "AgentDeck watch: your check for the sync TypeError says the problem is back"
+            " (exit 0 at 14:00). The deck reopened o/r#1 with its output.",
+            "wake-on",
+            "Problem back · the sync TypeError",
+        ),
+        (
+            "AgentDeck watch: your check for the sync TypeError itself failed 3 runs in a row.",
+            "wake-on",
+            "Watch check failing · the sync TypeError",
+        ),
+        (
             "AgentDeck: the review of eerovil/x#7 at 56b13fc14b26 (review chat"
             " eerovil/review-chats#5792) passed clean. The deck records the pass.",
             "work-release",

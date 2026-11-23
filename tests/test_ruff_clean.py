@@ -31,8 +31,10 @@ def test_master_passes_ruff_check():
     if ruff is None:
         pytest.skip("ruff is installed neither in this environment nor on PATH")
     # The repo's own `[tool.ruff]` in pyproject.toml applies: it runs from the root.
+    # `--no-cache`: a `.ruff_cache/` left in a test pod's copy is read as part of the
+    # public copy by `test_export_public.py` (#4571).
     result = subprocess.run(
-        [*ruff, "check", "src", "tests", "scripts"],
+        [*ruff, "check", "--no-cache", "src", "tests", "scripts"],
         cwd=REPO,
         capture_output=True,
         text=True,

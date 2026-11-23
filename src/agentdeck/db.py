@@ -193,6 +193,25 @@ class DeliveryRoute(NamedTuple):
     refused_at_delivery: str = ""
 
 
+class WorkRound(NamedTuple):
+    """A Work's current round (#4585): when it started, and the pull requests (lowercased
+    ``owner/repo#n``) that had merged or closed by then, which count for nothing now."""
+
+    started_at: datetime
+    earlier: frozenset[str]
+
+
+def _json_strings(text: Any) -> list[str]:
+    """A stored JSON list of strings, lowercased; [] for anything else."""
+    try:
+        value = json.loads(text) if isinstance(text, str) else None
+    except ValueError:
+        return []
+    if not isinstance(value, list):
+        return []
+    return [str(item).lower() for item in value if isinstance(item, str)]
+
+
 class RoutingStoreError(Exception):
     """The routing store could not answer. Never read as "nothing is frozen"."""
 
@@ -582,6 +601,12 @@ CREATE TABLE IF NOT EXISTS boss_turn_windows (
     session_key TEXT PRIMARY KEY,
     opened_at TEXT NOT NULL
 );
+-- One row per chat: when the deck last accepted a person's own message to it from its
+-- pages (#4562). Unlike boss_turn_windows, deck notices and agents never write it.
+CREATE TABLE IF NOT EXISTS chat_person_messages (
+    chat_id TEXT PRIMARY KEY,
+    at TEXT NOT NULL
+);
 -- One row per board command the boss sent from a chat (#1131). Nothing writes or reads it
 -- since the Poller's board commands were retired (#3025); the table stays so old databases
 -- need no migration.
@@ -900,6 +925,17 @@ CREATE TABLE IF NOT EXISTS work_merged_pulls (
     base TEXT NOT NULL,
     merged_at TEXT NOT NULL,
     PRIMARY KEY (work_id, pull)
+);
+-- The rounds of a reopened Work (#4585): one row per Work. ``earlier`` is a JSON list of the
+-- lowercased ``owner/repo#n`` pull requests that had merged or closed when a round started:
+-- the release, the live check and the Work page count only the others. ``started_at`` moves
+-- only when ``earlier`` grows, so a repeated reopen or message never ages the current round.
+-- Written by the Work router (a reopen) and the web (a person's follow-up), as one union.
+CREATE TABLE IF NOT EXISTS work_rounds (
+    work_id TEXT PRIMARY KEY,
+    started_at TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    earlier TEXT NOT NULL
 );
 -- Lighter review of robot pull requests outside their guarded code (#4399): one row per pull
 -- request (``owner/repo#n``, lowercased). ``record`` is the JSON the light-review service keeps
@@ -2076,6 +2112,21 @@ class Db:
                 return self._chat_for_session_conn(session_key)
         except sqlite3.Error as exc:
             self._log_failure("chat identity read", exc)
+            return None
+
+    def chat_leg_added_at(self, session_key: str) -> datetime | None:
+        """When ``session_key`` became a leg of its chat, or None when it is none (#4556)."""
+        try:
+            with self._lock:
+                row = self._conn.execute(
+                    "SELECT added_at FROM chat_legs WHERE session_key = ?", (session_key,)
+                ).fetchone()
+        except sqlite3.Error as exc:
+            self._log_failure("chat identity read", exc)
+            return None
+        try:
+            return datetime.fromisoformat(row[0]) if row else None
+        except (TypeError, ValueError):
             return None
 
     def chat_by_id(self, chat_id: str) -> ChatIdentity | None:
@@ -4839,6 +4890,19 @@ class Db:
             (session_key, opened_at),
         )
 
+    def load_person_messages(self) -> dict[str, str]:
+        """When a person last wrote to each chat from the deck's pages (#4562)."""
+        rows = self._query("SELECT chat_id, at FROM chat_person_messages")
+        return {str(chat_id): str(at) for chat_id, at in rows}
+
+    def note_person_message(self, chat_id: str, at: str) -> None:
+        """Keep the later of the stored time and ``at``: a replayed send never moves it back."""
+        self._write(
+            "INSERT INTO chat_person_messages(chat_id, at) VALUES (?, ?)"
+            " ON CONFLICT(chat_id) DO UPDATE SET at=MAX(at, excluded.at)",
+            (chat_id, at),
+        )
+
     def record_manual_new_chat_cwd(self, cwd: str) -> None:
         self._write(
             "INSERT INTO manual_new_chat_state(singleton, cwd, updated_at)"
@@ -5106,8 +5170,82 @@ class Db:
     def load_done_blockers(self) -> frozenset[str]:
         """The Work ids that count as done for the issues they block: deployed and waiting
         only for a try (#4384), or with a registered pull request merged (#4398). Unread is
-        empty for either part, so its blockers block."""
-        return self.load_try_waits() | frozenset(self.load_merged_pulls())
+        empty for either part, so its blockers block. A merge from an earlier round of the
+        Work (#4585) does not count: a follow-up round blocks again until it merges."""
+        merged = self.load_merged_pulls()
+        try:
+            rounds = self.load_work_rounds(merged) if merged else {}
+        except Exception:  # noqa: BLE001 - unread rounds: every merge counts, as before them
+            log.warning("work rounds unread; every merge counts", exc_info=True)
+            rounds = {}
+        current = {
+            work_id
+            for work_id, pulls in merged.items()
+            if any(
+                pull.lower() not in (rounds[work_id].earlier if work_id in rounds else ())
+                for pull, _base in pulls
+            )
+        }
+        return self.load_try_waits() | frozenset(current)
+
+    # --- rounds of a reopened Work (#4585) ---
+
+    def start_work_round(self, work_id: str, earlier: Iterable[str], reason: str) -> bool:
+        """Start a new round of ``work_id`` with ``earlier`` settled; whether one started.
+
+        One ``BEGIN IMMEDIATE`` transaction: the stored set and ``earlier`` are joined, and
+        the row is written only when that adds a pull request. A repeat (a redelivered
+        reopen, a second message) leaves ``started_at`` where it was, so the current round's
+        own live check and Merge never read as from an earlier one. A failed write starts
+        nothing, which is what a Work did before rounds."""
+        wanted = {str(pull).lower() for pull in earlier if str(pull)}
+        if not wanted:
+            return False
+        try:
+            with self._lock, self._conn:
+                self._conn.execute("BEGIN IMMEDIATE")
+                row = self._conn.execute(
+                    "SELECT earlier FROM work_rounds WHERE work_id = ?", (work_id,)
+                ).fetchone()
+                stored = set(_json_strings(row[0])) if row is not None else set()
+                if wanted <= stored:
+                    return False
+                self._conn.execute(
+                    "INSERT INTO work_rounds(work_id, started_at, reason, earlier)"
+                    " VALUES (?, ?, ?, ?) ON CONFLICT(work_id) DO UPDATE SET"
+                    " started_at=excluded.started_at, reason=excluded.reason,"
+                    " earlier=excluded.earlier",
+                    (
+                        work_id,
+                        datetime.now(UTC).isoformat(),
+                        reason,
+                        json.dumps(sorted(stored | wanted)),
+                    ),
+                )
+            return True
+        except sqlite3.Error as exc:
+            self._log_failure("write", exc)
+            return False
+
+    def load_work_rounds(self, work_ids: Iterable[str] | None = None) -> dict[str, WorkRound]:
+        """``work_id`` -> its current round; a Work never reopened has none. Raises when
+        unread: a caller decides whether that is "no round" (everything counts, as before)."""
+        wanted = None if work_ids is None else sorted(set(work_ids))
+        if wanted == []:
+            return {}
+        sql = "SELECT work_id, started_at, earlier FROM work_rounds"
+        params: tuple = ()
+        if wanted is not None:
+            sql += f" WHERE work_id IN ({', '.join('?' for _ in wanted)})"
+            params = tuple(wanted)
+        found: dict[str, WorkRound] = {}
+        for work_id, started_at, earlier in self._query_or_raise(sql, params):
+            try:
+                started = datetime.fromisoformat(str(started_at))
+            except ValueError:
+                continue
+            found[str(work_id)] = WorkRound(started, frozenset(_json_strings(earlier)))
+        return found
 
     # --- lighter review of robot pull requests (#4399) ---
 

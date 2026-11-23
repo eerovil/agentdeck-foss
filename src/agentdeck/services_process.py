@@ -140,8 +140,11 @@ def remote_hooks(
     runtime_http: Callable[[], Any],
     wake_registry,
     copied: Callable[[tuple[str, ...], float], Any],
+    complete: Callable[[], bool] = lambda: True,
 ) -> work_services.Hooks:
-    """``Hooks`` over the web's internal routes and this process's own database."""
+    """``Hooks`` over the web's internal routes and this process's own database.
+
+    ``complete()`` says whether the chat copy is a whole one (``SessionFollower.complete``)."""
 
     async def start_work(
         repository: str, number: int, *, wait: bool = False, on_refused: bool = False, labels=()
@@ -211,7 +214,13 @@ def remote_hooks(
             key = state.session_key_for_token(token)
             session = state.sessions.get(key) if key else None
             if session is None:
-                return None
+                # A copy refilled after a web restart, before the web's first scan, lacks chats
+                # that run: missing from it is not stopped (#4458).
+                return None if complete() else True
+            if session.shown_thinking is None:
+                # The web sends ``shown_thinking`` only when it is built to (#4458): without
+                # it, the chat's own ``thinking`` says whether its turn is still open.
+                return bool(session.thinking)
             return bool(session.shown_thinking)
 
         return {"start": start, "alive": alive, "checkout_of": checkout_of}
@@ -321,6 +330,10 @@ class SessionFollower:
         self._db = db
         self._on_registered = on_registered
         self.copied = asyncio.Event()
+        #: Whether the copy now held is a whole one (#4458): cleared by a ``reset`` answer,
+        #: which refills the copy from a web that may not have scanned yet; ``copied`` is set
+        #: once, for the first.
+        self.complete = False
         self._applied = asyncio.Event()
         self._task: asyncio.Task | None = None
 
@@ -356,7 +369,10 @@ class SessionFollower:
         changed, registrations = session_copy.apply(self._state, answer)
         if registrations:
             self.reload_registrations()
+        if answer.get("reset"):
+            self.complete = False
         if answer.get("scanned"):
+            self.complete = True
             self.copied.set()
         if changed or registrations:
             # What ``sessions_changed`` announces in the web; the release looks again.
@@ -447,6 +463,7 @@ def create_services_app(
             runtime_http=lambda: runtime_http,
             wake_registry=wake_registry,
             copied=follower.holds,
+            complete=lambda: follower.complete,
         )
         services = work_services.build(
             config, state=state, db=db, issues=issues, hooks=hooks, watcher=watcher

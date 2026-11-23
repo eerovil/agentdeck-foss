@@ -48,7 +48,16 @@ from .classify import (
     target_repo,
 )
 from .classify import repo_flag as classify_repo_flag
-from .install import RECURSION_GUARD, real_gh
+from .install import (
+    EXIT_NO_GH,
+    FAILURE_LOG_NAME,  # noqa: F401 — re-exported: tests and callers read it here
+    MAX_NESTING,
+    RECURSION_GUARD,
+    nesting,
+    real_gh,
+    refuse_loop,
+)
+from .install import log_failure as _log_failure
 
 # Exit code for a read this shim declined to make.  Distinct from `gh`'s own
 # codes so a caller can tell "GitHub said no" from "the deck said wait", and
@@ -58,7 +67,6 @@ EXIT_REFUSED = 75
 # No non-human authority may make this call (#2289): nothing ran, and no other
 # identity will be tried. EX_NOPERM, so it reads as "not allowed", not "wait".
 EXIT_NO_AUTHORITY = 77
-EXIT_NO_GH = 127
 
 # Asking for a fresh answer.  A worker that has just pushed must be able to see
 # its own write; getting this wrong in the direction of too-fresh costs one API
@@ -84,12 +92,6 @@ NO_OWNER_LABEL_ENV = "AGENTDECK_NO_OWNER_LABEL"
 _LABEL_REFUSED = re.compile(r"could not add label", re.IGNORECASE)
 #: ``gh``'s answer when an assignee cannot be resolved, before anything is created.
 _ASSIGNEE_REFUSED = re.compile(r"could not assign user", re.IGNORECASE)
-
-# Every failed call, one JSON line each: which authority, installation and token spoke, and
-# what GitHub answered (#2714). Beside the metadata cache, so a test's cache is its log too.
-FAILURE_LOG_NAME = "gh-shim-failures.jsonl"
-_FAILURE_LOG_MAX_BYTES = 2_000_000
-
 
 def _await(coro):
     """Drive one coroutine from this synchronous entry point.
@@ -117,11 +119,6 @@ def _await(coro):
 
 def _note(message: str) -> None:
     sys.stderr.write(f"agentdeck gh shim: {message}\n")
-
-
-def _failure_log() -> Path:
-    cache = os.environ.get("AGENTDECK_GITHUB_CACHE", "~/.cache/agentdeck/github_metadata.sqlite3")
-    return Path(cache).expanduser().with_name(FAILURE_LOG_NAME)
 
 
 def _speaker(environment: dict[str, str]) -> tuple[str, dict[str, object]]:
@@ -152,20 +149,6 @@ def _speaker(environment: dict[str, str]) -> tuple[str, dict[str, object]]:
             words += ", a token other than the cached one"
         words += ")"
     return words, fields
-
-
-def _log_failure(record: dict[str, object]) -> Path | None:
-    """Append one failed call to the failure log. Observational: never fails the call."""
-    path = _failure_log()
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        if path.exists() and path.stat().st_size > _FAILURE_LOG_MAX_BYTES:
-            path.replace(path.with_name(path.name + ".1"))
-        with path.open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps(record, sort_keys=True) + "\n")
-    except OSError:
-        return None
-    return path
 
 
 def _report_failure(
@@ -235,7 +218,7 @@ def _run_real(
     binary = real_gh(environment)
     if binary is None:
         return gave_up(EXIT_NO_GH, "no real `gh` found on PATH")
-    child = {**environment, RECURSION_GUARD: "1", "GH_DEBUG": "api"}
+    child = {**environment, RECURSION_GUARD: str(nesting(environment) + 1), "GH_DEBUG": "api"}
     try:
         done = subprocess.run(  # noqa: S603 — argv comes from our own caller
             [binary, *argv],
@@ -777,10 +760,18 @@ def _read(
 def main(argv: list[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     environment = dict(os.environ)
+
+    # A shim inside a shim inside a shim: the `gh` this shim runs calls back into it
+    # (#4505). Refuse before anything else runs, so the loop ends here, once.
+    depth = nesting(environment)
+    if depth >= MAX_NESTING:
+        return refuse_loop(arguments, environment, depth)
+
     cache = GitHubMetadataCache()
 
-    # Already inside a shim-launched `gh`: never wrap ourselves twice.
-    if environment.get(RECURSION_GUARD):
+    # Already inside a shim-launched `gh`: never wrap ourselves twice, and never
+    # spend a quota probe — only the outermost shim checks the budget.
+    if depth:
         return _passthrough(arguments, environment, cache, kind="recursive")
 
     fresh = environment.get(FRESH_ENV, "").strip() not in ("", "0", "false", "no")

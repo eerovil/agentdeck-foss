@@ -359,6 +359,9 @@
         body,
         // randomUUID exists only on https; the deck is also opened over plain http.
         headers: {
+          // A person's message from a deck page, as HTMX marks its own (#4562): it ends a
+          // Work's "Waiting for a try" once the agent goes back to work.
+          "HX-Request": "true",
           "X-Agentdeck-Action-Id": crypto.randomUUID
             ? crypto.randomUUID()
             : Date.now().toString(36) + Math.random().toString(36).slice(2),

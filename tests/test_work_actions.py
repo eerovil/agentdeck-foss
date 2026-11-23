@@ -724,6 +724,9 @@ def test_ship_now_is_offered_at_findings_and_ships_through_the_router(tmp_path, 
         )
     )
     assert _shipped_of(reader, ref) == ("a/b#9",)
+    # #4585: one shipped in an earlier round of the Work is not this round's line.
+    earlier = SimpleNamespace(earlier_outputs=(SimpleNamespace(repository="a/b", number=9),))
+    assert _shipped_of(reader, ref, earlier) == ()
     assert _shipped_of(SimpleNamespace(), ref) == ()
     # A press refused after it passed the head offers Ship now again, quoting the findings
     # at the head it passed (a base update carried the pass to the live one), until marked.
@@ -792,6 +795,8 @@ def test_ship_now_is_offered_at_findings_and_ships_through_the_router(tmp_path, 
             shipped.append((repository, number, head))
             if len(shipped) == 1:
                 raise AgainRefused("eerovil/agentdeck#9 moved past cccccccccccc")
+            if len(shipped) == 3:
+                return {"head": "a" * 40, "state": "running", "outcome": "still running"}
             return {"head": "a" * 40, "outcome": "review pass recorded"}
 
     class Release:
@@ -825,6 +830,51 @@ def test_ship_now_is_offered_at_findings_and_ships_through_the_router(tmp_path, 
     done = _post(client, "ship_now", "press-0003", confirmed=shown)
     assert done.status_code == 200 and "this Work then fixes its findings" in done.text
     assert shipped == [("eerovil/agentdeck", 7, HEAD)] * 2
+    # A press still running past the wait reads as under way, not shipped (#4558), and is a
+    # real second press straight after the first: the recent-press guard lets Ship now
+    # through, as the merge service joins a running press (#4559 review). The same press id
+    # sent again still writes nothing.
+    from agentdeck import work_actions
+
+    slow = _post(client, "ship_now", "press-0006", confirmed=shown)
+    assert slow.status_code == 200 and "is under way" in slow.text, slow.text
+    assert "this Work then fixes its findings" not in slow.text
+    calls = len(shipped)
+    replay = _post(client, "ship_now", "press-0006", confirmed=shown)
+    assert len(shipped) == calls, replay.text
+    # With a second pull request left, it is named as not started and not pressed (#4559).
+    import asyncio
+
+    shipped.clear()
+    shipped.append("refused already")
+    shipped.append("shipped already")
+    step = work_actions.Step(
+        "deck_ship_now",
+        "eerovil/agentdeck",
+        3,
+        pulls=(f"eerovil/agentdeck#7@{HEAD}", f"eerovil/agentdeck#8@{'d' * 40}"),
+    )
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(work_router=Router())))
+    outcome, receipt = asyncio.run(routes_works._write(request, step, "Ship now", "press-0007"))
+    assert outcome == "done" and "Ship now of eerovil/agentdeck#7 is under way" in receipt
+    assert "Not started yet: eerovil/agentdeck#8" in receipt
+    assert shipped[2:] == [("eerovil/agentdeck", 7, HEAD)]
+    # Shipped, then refused: the first refusal stops the rest, as the API does (#4559 review).
+
+    class Stops:
+        async def ship_now(self, repository, number, head=""):
+            shipped.append(number)
+            if number == 8:
+                raise AgainRefused("its review has not come back with findings")
+            return {"head": head, "outcome": "review pass recorded"}
+
+    shipped.clear()
+    three = replace(step, pulls=(*step.pulls, f"eerovil/agentdeck#9@{'e' * 40}"))
+    request.app.state.work_router = Stops()
+    outcome, receipt = asyncio.run(routes_works._write(request, three, "Ship now", "press-0008"))
+    assert outcome == "done" and shipped == [7, 8], receipt
+    assert "eerovil/agentdeck#8 not shipped" in receipt
+    assert "Not started: eerovil/agentdeck#9" in receipt
 
 
 def test_a_merge_the_work_no_longer_offers_writes_nothing(tmp_path, monkeypatch):

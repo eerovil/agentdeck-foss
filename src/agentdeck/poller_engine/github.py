@@ -1564,6 +1564,10 @@ def _contributed_diff(output: str) -> str | None:
     (``release.rebase_moved``). Position is the base's business, and whose head it is is the
     engine's — neither is this function's.
 
+    The one exception is a Ship now pass (#4576): the owner shipped that code, so
+    ``work_router.ship_merge_between`` lets an agent's push carry it when the push is only
+    merge commits of the base and every code file's contributed lines are the same.
+
     One deliberate loss remains here. A base edit landing in the few lines *between* two
     nearby hunks can split one hunk in two, which changes the marker count and costs a review;
     the markers earn that, because without them one hunk's removals and the next one's

@@ -25,7 +25,7 @@ from agentdeck.github_webhook_log import Repository, WebhookLog
 from agentdeck.models import PullRequestRef
 from agentdeck.poller_ops import work_repositories
 from agentdeck.webhook_tailer import WebhookTailer
-from agentdeck.work_release import OWNER_CALL_ASK, SIBLING_SWEEP_ASK
+from agentdeck.work_release import MINOR_LINES, OWNER_CALL_ASK, SIBLING_SWEEP_ASK
 from agentdeck.work_router import (
     ESCALATED_ASK,
     HANDED_OVER,
@@ -364,6 +364,10 @@ def test_the_reviewers_verdict_is_sent_but_its_chatter_is_not(root):
     assert "the reviewer posted" in events[0].text
     # #3314: findings tell the agent to put a finding only the owner can settle to the owner.
     assert OWNER_CALL_ASK in events[1].text and OWNER_CALL_ASK not in events[0].text
+    # The sweep and the shared-cause ask too: this is how such a reviewer's findings reach
+    # the agent (#4497 review), and in the link form a refused text falls back to.
+    assert f"{SIBLING_SWEEP_ASK} {OWNER_CALL_ASK}" in events[1].text
+    assert SIBLING_SWEEP_ASK in events[1].link and SIBLING_SWEEP_ASK not in events[0].text
 
 
 # The live delivery from agentdeck#2940 (2026-10-12 21:54 Helsinki), trimmed to the fields read:
@@ -390,6 +394,7 @@ def test_the_decks_own_reviewer_findings_are_sent(root):
     assert "the deck's reviewer posted on issue eerovil/agentdeck#2940" in events[0].text
     assert "Review findings for PR #2941" in events[0].text
     assert OWNER_CALL_ASK in events[0].text and OWNER_CALL_ASK not in events[1].text
+    assert SIBLING_SWEEP_ASK in events[0].text  # #4497 review
 
 
 def test_the_decks_reviewer_findings_in_their_other_shape_are_sent(root):
@@ -409,6 +414,46 @@ async def test_the_decks_own_reviewer_findings_reach_the_works_chat(root, harnes
     await harness.drain()
     assert [message.chat_id for message in harness.scheduled] == ["chat-a"]
     assert harness.authorized_asked == []
+    assert "Mechanism check" not in harness.scheduled[0].text
+    # #4596 (owner: Simplify): a third round on the Work's pull requests citing the file two
+    # earlier rounds cited asks nothing with the findings, even with a ``changes-needed``
+    # verdict already at the head (an earlier review of the same commit): only a verdict's
+    # message asks.
+    pull, second, third = "eerovil/agentdeck#9", "eerovil/agentdeck#10", "c" * 40
+    harness.pulls[("eerovil/agentdeck", 10)] = ("chat-a", "eerovil/agentdeck#7")
+    for ref in (pull, second):
+        for n, head in enumerate(("a" * 40, "b" * 40)):
+            data = {"text": f"Review findings for PR {ref} at {head[:9]}: src/x/work_start.py:{n}"}
+            harness.note(ref, head, review_history.FINDINGS, f"f{ref}{n}", data=data)
+        harness.asked(ref, third)
+        harness.note(ref, third, review_history.CHANGES, f"v{ref}", data={})
+    body = (
+        f"/claude\nReview findings for PR #9 at {third[:9]} and #10 at {third[:9]}:\n\n"
+        "1. `work_start.py:7` races"
+    )
+    comment(root, "d2", sender=DECK_BOT, body=body, comment_id=5)
+    await harness.drain()
+    assert "Mechanism check" not in harness.scheduled[-1].text
+    assert not [e for e in harness.history if e.kind == review_history.MECHANISM]
+
+
+async def test_another_reviewers_findings_never_ask(root, harness):
+    """#4596: the ChatGPT reviewer's findings come before its verdict too, so its third round
+    citing a file asks nothing with them, with or without a ``changes-needed`` verdict at the
+    head; a pull request whose verdicts the release refuses gets no ask at all (accepted)."""
+    reviewer = {"login": "review-bot[bot]", "type": "Bot"}
+    pull, third = "eerovil/agentdeck#9", "c" * 40
+    for n, head in enumerate(("a" * 40, "b" * 40)):
+        data = {"text": f"Review findings for PR {pull} at {head[:9]}: src/x/work_start.py:{n}"}
+        harness.note(pull, head, review_history.FINDINGS, f"f{n}", data=data)
+    harness.asked(pull, third)
+    body = f"Review findings for PR #9 at {third[:9]}\n/claude\n\n1. `work_start.py:7` races"
+    comment(root, "r7", sender=reviewer, body=body, comment_id=7)
+    harness.note(pull, third, review_history.CHANGES, "v", data={})
+    comment(root, "r8", sender=reviewer, body=body, comment_id=8)
+    await harness.drain()
+    assert all("Mechanism check" not in m.text for m in harness.scheduled)
+    assert not [e for e in harness.history if e.kind == review_history.MECHANISM]
 
 
 def test_a_comment_on_a_pull_request_is_marked_as_one(root):
@@ -1036,6 +1081,59 @@ async def test_a_blockers_merged_pull_request_starts_what_it_blocks(
     assert starts == started
     assert db.load_merged_pulls().get("github_issue:eerovil/agentdeck#7", []) == recorded
     assert asked == ([("blocking", 7), ("blocked_by", 30)] if recorded else [])
+
+
+async def test_a_reopen_starts_a_round_and_an_earlier_merge_unblocks_nothing(
+    root, harness, tmp_path
+):
+    """#4585: a reopen of #7 starts its next round with the merged #9 earlier, once; a late
+    delivery of #9's merge is not recorded again, so #30 stays blocked by the round."""
+    db = Db(tmp_path / "control.db")
+    asked, starts = _unblock_harness(harness, {7: [_dep(30)]}, {30: [_dep(7)]})
+    work = "github_issue:eerovil/agentdeck#7"
+    rounds = []
+
+    def start_round(work_id):
+        rounds.append(work_id)
+        return db.start_work_round(work_id, ["eerovil/agentdeck#9"], "reopened")
+
+    harness.service._note_merged = db.note_merged_pull
+    harness.service._forget_merged = db.forget_merged_pulls
+    harness.service._deployed = db.load_done_blockers
+    harness.service._start_round = start_round
+    harness.service._earlier_pulls = lambda work_id: next(
+        (round_.earlier for round_ in db.load_work_rounds([work_id]).values()), ()
+    )
+    db.note_merged_pull(work, "eerovil/agentdeck#9", "master")
+    for delivery in ("d1", "d2"):
+        deliver(root, event="issues", delivery=delivery, action="reopened", sender=PERSON,
+                issue={"number": 7, "state": "open", "labels": []})
+        await harness.drain()
+    started = db.load_work_rounds()[work].started_at
+    assert rounds == [work, work]
+    assert db.load_work_rounds()[work].earlier == {"eerovil/agentdeck#9"}
+    assert db.load_work_rounds()[work].started_at == started
+    merged_pull(root, "d3", base="master")
+    await harness.drain()
+    assert db.load_merged_pulls().get(work, []) == []
+    assert work not in db.load_done_blockers()
+    assert starts == []
+
+
+async def test_a_reopen_round_that_cannot_start_never_stops_the_router(root, harness):
+    """#4585: a round write that raises is logged; the reopen still drops the merges."""
+    forgot = []
+
+    def broken(work_id):
+        raise OSError("database is locked")
+
+    harness.service._forget_merged = lambda work_id: forgot.append(work_id) or True
+    harness.service._note_merged = lambda *args: True
+    harness.service._start_round = broken
+    deliver(root, event="issues", delivery="d1", action="reopened", sender=PERSON,
+            issue={"number": 7, "state": "open", "labels": []})
+    await harness.drain()
+    assert forgot == ["github_issue:eerovil/agentdeck#7"]
 
 
 async def test_a_reopened_blocker_with_no_chat_blocks_again(root, harness, tmp_path):
@@ -1730,6 +1828,12 @@ async def test_review_fixes_that_grew_the_diff_add_a_design_check(root, harness)
         f"agentdeck pre-review-helpers --cwd <checkout> --pull {pull} --issue eerovil/agentdeck#7`"
         in first
     ), "the Work's issue, where the comment is checked, not the body's first reference"
+    # #4567: run at the first push, a comment for an earlier head stands if only its finds
+    # were fixed since.
+    assert "Already ran them on an earlier head" in " ".join(first.split())
+    assert "otherwise, or when it says `did not run`, run them again on this head" in " ".join(
+        first.split()
+    )
     assert harness.size_reads == [], "no earlier round: nothing is read"
     second = await round_at(MID, 1100, "d2")
     assert "6. " not in second, "10% is not over"
@@ -2055,6 +2159,25 @@ async def test_pre_review_done_refuses_a_checked_repository_head_with_no_test_ru
 )
 def test_growth_needs_both_the_percent_and_the_floor(before, after, point):
     assert bool(_grown(before, after)) is point
+
+
+async def test_a_push_after_a_pass_at_the_checklists_head_gets_its_own_checklist(root, harness):
+    """#4589: a minor fix's pass at the head a checklist was sent for settles that checklist,
+    so the next push is not taken as covered by it (and left waiting on a call the agent
+    never knew it owed): it gets a checklist of its own."""
+    pull = "eerovil/agentdeck#9"
+    harness.service.pre_review_on = True
+    harness.heads[("eerovil/agentdeck", 9)] = OLD
+    pull_event(root, "p1", sha=OLD)
+    await harness.drain()
+    harness.note(pull, OLD, review_history.PASS, f"minor-fixed:c:{pull}@{OLD}")
+    assert not harness.service.pre_review_held(pull)
+    harness.heads[("eerovil/agentdeck", 9)] = NEW
+    pull_event(root, "p2", action="synchronize", sha=NEW)
+    await harness.drain()
+    assert harness.scheduled[-1].id == f"work-event:pre-review:{pull}@{NEW}"
+    assert not [e for e in harness.history if e.data.get("covered")]
+    assert harness.service.pre_review_held(pull) and harness.reviews == []
 
 
 async def test_a_ready_head_waits_on_the_agents_pre_review(root, harness):
@@ -2485,6 +2608,256 @@ async def test_a_head_that_only_merged_its_base_is_not_reviewed_again(root, harn
     assert notes[note_id][1].count(synced_again[:12]) == 1
 
 
+async def test_a_ship_now_pass_carries_across_a_base_merge_that_touched_its_files(root, harness):
+    """#4576: a pull request shipped with Ship now, then conflicted; the base merge that cleared it
+    touched the pull request's own files and changed a doc's lines, so the pass was lost and
+    a full review started. A Ship now pass carries to a head ``ship_merge`` proves only merged
+    the base; a plain pass does not take that proof, and an unproven head is reviewed. A crash
+    after the carried row is finished by the retry, and only while that head is the newest."""
+    from agentdeck.review_history import SHIP_NOTE
+    from agentdeck.work_router import REVIEW, Event
+
+    pull, merged, other, plain = "eerovil/agentdeck#9", "a" * 40, "b" * 40, "c" * 40
+    digests = {OLD: "d" * 64, merged: "e" * 64, other: "f" * 64, plain: "1" * 64}
+    proofs, notes = [], {}
+
+    async def digest(ref, head):
+        return digests.get(head, "")
+
+    async def ship_merge(repository, number, old, new):
+        proofs.append((old, new))
+        return new == merged
+
+    harness.service._digest = digest
+    harness.service._base_only = lambda *args: asyncio.sleep(0, result=False)
+    harness.service._ship_merge = ship_merge
+    harness.service._pending_note = lambda chat, note_id, text: (
+        notes.setdefault(note_id, text) is not None
+    )
+    harness.asked(pull, OLD, digest="d" * 64)
+    harness.note(pull, OLD, review_history.FINDINGS, "findings:1", data={"text": "1. off"})
+    data = {"note": SHIP_NOTE, "digest": "d" * 64}
+    harness.note(pull, OLD, review_history.ACCEPTED, "accepted:ship", data=data)
+    pull_event(root, "d1", action="synchronize", sha=merged)
+    await harness.drain()
+    assert harness.asks == [] and proofs == [(OLD, merged)]
+    assert harness.kinds(pull, merged) == ["accepted"]
+    events = harness.reviews_of(pull)
+    assert review_history.ship_pass_head(events, merged) == OLD
+    assert harness.verdicts == [("chat-a", [pull])] and not harness.service.pending.entries
+    [text] = notes.values()
+    assert "the owner shipped with Ship now" in text and merged[:12] in text
+    # A head with its own code changes is reviewed.
+    pull_event(root, "d2", action="synchronize", sha=other)
+    await harness.drain()
+    assert len(harness.asks) == 1 and proofs[-1] == (merged, other)
+
+    # A plain pass never takes the Ship now proof: its changed digest is reviewed.
+    plain_pull = "eerovil/agentdeck#10"
+    digests["2" * 40] = "2" * 64
+    harness.asked(plain_pull, plain, digest="1" * 64)
+    harness.answered(plain_pull, plain, review_history.PASS)
+    calls = len(proofs)
+    owner = ("chat-a", "eerovil/agentdeck#7")
+    event = Event(REVIEW, "eerovil/agentdeck", 10, True, head="2" * 40)
+    await harness.service._review(owner, event)
+    assert len(proofs) == calls and len(harness.asks) == 2
+
+    # The router stopped after writing a carried row: the start, still pending, finishes the
+    # hand-off on retry, with the same ids, and starts no review.
+    crashed = "3" * 40
+    data = {"digest": "4" * 64, "carried_from": other}
+    harness.note(pull, crashed, review_history.PASS, f"carried:{pull}@{crashed}", data=data)
+    key = f"review:{pull}@{crashed}"
+    entry = {"kind": REVIEW, "repository": "eerovil/agentdeck", "number": 9, "head": crashed}
+    harness.service.pending.put(key, entry, harness.now)
+    harness.heads[("eerovil/agentdeck", 9)] = crashed
+    harness.now += 3600
+    verdicts = len(harness.verdicts)
+    await harness.service.retry_pending()
+    assert len(harness.asks) == 2 and key not in harness.service.pending
+    assert len(harness.verdicts) == verdicts + 1 and f"work-unchanged:{pull}@{crashed}" in notes
+    # ... but not once a newer head has a wait of its own: ending the chat's waits on the
+    # pull request (not kept per head) would end that one too (#4576 design review).
+    stale, newer = "5" * 40, "6" * 40
+    data = {"digest": "7" * 64, "carried_from": crashed}
+    harness.note(pull, stale, review_history.PASS, f"carried:{pull}@{stale}", data=data)
+    harness.service.pending.put(f"review:{pull}@{stale}", {**entry, "head": stale}, harness.now)
+    harness.now += 1
+    harness.asked(pull, newer)
+    verdicts = len(harness.verdicts)
+    await harness.service._review(owner, Event(REVIEW, "eerovil/agentdeck", 9, True, head=stale))
+    assert len(harness.verdicts) == verdicts and f"work-unchanged:{pull}@{stale}" not in notes
+    assert f"review:{pull}@{stale}" not in harness.service.pending
+
+
+async def test_ship_merge_between_proves_only_a_base_merge_with_the_same_code(monkeypatch):
+    """#4576: the proof a Ship now pass carries on. The first parents back to the shipped head
+    are merge commits, and each code file contributes the same lines; a doc file, context and
+    line numbers may differ. Anything else, or anything unread, is reviewed."""
+    from agentdeck import gh_cli, work_router
+
+    shipped, merged = "a" * 40, "b" * 40
+    parents = {merged: [shipped, "c" * 40]}
+    files = 2
+    code = "diff --git a/src/x.py b/src/x.py\nindex 1..2 100644\n--- a/src/x.py\n+++ b/src/x.py\n"
+    doc = "diff --git a/docs/x.md b/docs/x.md\n--- a/docs/x.md\n+++ b/docs/x.md\n"
+    diffs = {
+        shipped: code + "@@ -1,2 +1,2 @@\n ctx\n-old\n+new\n" + doc + "@@ -1 +1 @@\n-a\n+b\n",
+        merged: code + "@@ -9,2 +9,2 @@\n other\n-old\n+new\n" + doc + "@@ -1 +1 @@\n-a\n+c\n",
+    }
+
+    async def run_once(argv, *, timeout, repo=None, **kw):
+        path = argv[-1] if argv[-2] != "--jq" else argv[-3]
+        if "/commits/" in path:
+            found = parents.get(path.rpartition("/")[2])
+            return (0, "\n".join(found).encode(), b"") if found else (1, b"", b"")
+        if "/pulls/" in path:
+            return 0, b"master\n", b""
+        diff = diffs.get(path.rpartition("...")[2])
+        if argv[-1] == ".files | length":
+            return (0, f"{files}\n".encode(), b"") if diff is not None else (1, b"", b"")
+        return (0, diff.encode(), b"") if diff is not None else (1, b"", b"")
+
+    monkeypatch.setattr(gh_cli, "run_once", run_once)
+    between = work_router.ship_merge_between
+    assert await between("o/r", 9, shipped, merged)
+    assert not await between("o/r", 9, shipped, shipped)
+    files = 300  # GitHub cuts a compare's files at 300: the diff may be cut too
+    assert not await between("o/r", 9, shipped, merged)
+    files = 2
+    files = 3  # the diff lacks a file the comparison lists: unproven
+    assert not await between("o/r", 9, shipped, merged)
+    files = 2
+    kept = dict(diffs)
+    for sha in (shipped, merged):  # a code file left out of both diffs alike: still unproven
+        diffs[sha] = diffs[sha].split("diff --git a/docs", 1)[0]
+    assert not await between("o/r", 9, shipped, merged)
+    diffs.update(kept)
+    diffs[merged] = diffs[merged].replace("+new", "+newer")  # its code changed: reviewed
+    assert not await between("o/r", 9, shipped, merged)
+    diffs[merged] = diffs[shipped]
+    parents[merged] = [shipped]  # a commit of its own, not a merge
+    assert not await between("o/r", 9, shipped, merged)
+    parents[merged] = ["d" * 40, "c" * 40]  # does not lead back to the shipped head
+    assert not await between("o/r", 9, shipped, merged)
+    parents[merged] = [shipped, "c" * 40]
+    del diffs[shipped]  # unread
+    assert not await between("o/r", 9, shipped, merged)
+
+
+async def test_behind_base_reads_how_far_the_head_lags_its_base(monkeypatch):
+    """#4576: the press warns of a conflict when its head lacks base commits; unread is no
+    warning."""
+    from agentdeck import gh_cli, work_router
+
+    answers = {".base.ref": (0, b"master\n"), ".behind_by": (0, b"3\n")}
+
+    async def run_once(argv, *, timeout, repo=None, **kw):
+        if argv[-1] == ".behind_by":
+            assert argv[-2:] == ["--jq", ".behind_by"] and "/compare/master..." in argv[-3]
+        code, out = answers[argv[-1]]
+        return code, out, b""
+
+    monkeypatch.setattr(gh_cli, "run_once", run_once)
+    assert await work_router.behind_base("o/r", 9, "a" * 40)
+    answers[".behind_by"] = (0, b"0\n")
+    assert not await work_router.behind_base("o/r", 9, "a" * 40)
+    answers[".base.ref"] = (1, b"")
+    assert not await work_router.behind_base("o/r", 9, "a" * 40)
+
+
+@pytest.mark.parametrize("refuse", [False, True])
+async def test_a_review_start_waits_for_a_running_ship_now_press(
+    root, harness, monkeypatch, refuse
+):
+    """#4576 design: a base merge pushed while a Ship now press runs, before its pass is
+    written, is held pending and goes once the press ends: carried when the press passed the
+    head, reviewed as usual when it was refused."""
+    from agentdeck import work_router
+    from agentdeck.work_router import AgainRefused, ShipPorts
+
+    monkeypatch.setattr(work_router, "SHIP_WAIT_S", 0.01)
+    pull, merged = "eerovil/agentdeck#9", "a" * 40
+    gate = asyncio.Event()
+    records: dict[tuple[str, str], review_history.ShippedHead] = {}
+
+    class Release:
+        ports = SimpleNamespace(pulls=lambda work: [pull])
+
+        async def on_pull_event(self, *args):
+            return None
+
+        def no_code_head(self, work, ref):
+            return None
+
+        async def owner_accepted(self, work, ref, head, note):
+            await gate.wait()
+            if refuse:
+                return "refused: tests are red"
+            data = {"note": note, "digest": "d" * 64}
+            harness.note(ref, head, review_history.ACCEPTED, f"accepted:{head}", data=data)
+            return f"review pass recorded for {ref} at {head[:12]}"
+
+        def approval(self, work):
+            return ""
+
+        async def evaluate(self, work):
+            return ""
+
+    def claim(ref, head, work):
+        records.setdefault((ref, head), review_history.ShippedHead(ref, head, work=work))
+        return True
+
+    def note_shipped(ref, head):
+        records[(ref, head)] = replace(records[(ref, head)], shipped=True)
+        return True
+
+    async def open_head(repository, number):
+        return OLD, False
+
+    async def digest(ref, head):
+        return {OLD: "d" * 64, merged: "e" * 64}.get(head, "")
+
+    harness.service._release = Release()
+    harness.service._ship = ShipPorts(
+        open_head=open_head,
+        mark_ready=lambda repository, number: None,
+        claim=claim,
+        note_shipped=note_shipped,
+        shipped=lambda ref, head: records.get((ref, head)),
+    )
+    harness.service._digest = digest
+    harness.service._ship_merge = lambda *args: asyncio.sleep(0, result=True)
+    harness.asked(pull, OLD, digest="d" * 64)
+    harness.note(pull, OLD, review_history.FINDINGS, "findings:1", data={"text": "1. off"})
+    first = await harness.service.ship_now("eerovil/agentdeck", 9, head=OLD)
+    assert first["state"] == "running"
+    harness.heads[("eerovil/agentdeck", 9)] = merged
+    pull_event(root, "d1", action="synchronize", sha=merged)
+    await harness.drain()
+    key = f"review:{pull}@{merged}"
+    assert harness.asks == [] and key in harness.service.pending
+    assert harness.kinds(pull, merged) == [] and harness.service.pending.entries[key]["next_at"] > (
+        harness.now
+    )
+    gate.set()
+    press = next(iter(harness.service.ship_runs.tasks.values()))
+    if refuse:
+        with pytest.raises(AgainRefused, match="tests are red"):
+            await press
+    else:
+        await press
+    assert harness.service.pending.entries[key]["next_at"] <= harness.now, "due at once"
+    await harness.service.retry_pending()
+    assert key not in harness.service.pending
+    if refuse:
+        # Its pass was never written: the held start is reviewed as any other.
+        assert harness.asks == [{}] and harness.kinds(pull, merged) == ["asked"]
+    else:
+        assert harness.asks == [] and harness.kinds(pull, merged) == ["accepted"]
+
+
 async def test_fixing_a_no_code_review_starts_no_new_review(root, harness, monkeypatch):
     """#3322: a ready press at the verdict's own head, or a push of doc files, answers a
     no-code review, which then counts as a pass; a push that changes code is reviewed."""
@@ -2509,7 +2882,7 @@ async def test_fixing_a_no_code_review_starts_no_new_review(root, harness, monke
             return f"review pass recorded for {ref} at {head[:12]}"
 
     harness.service._release = Release()
-    harness.service._no_code = lambda repo, n, old, new, before: asyncio.sleep(
+    harness.service._no_code = lambda repo, n, old, new, before, **_: asyncio.sleep(
         0, result=new == NEW and before == frozenset({"src/a.py"})
     )
     harness.asked(pull, OLD)
@@ -2542,8 +2915,11 @@ async def test_fixing_a_no_code_review_starts_no_new_review(root, harness, monke
         return touched
 
     async def files(repository, number):
-        return {"src/a.py", "README.md"}
+        return {"src/a.py", "src/new.py", "README.md"} | (sizes or {}).keys() - base_merged
 
+    sizes: dict[str, int] | None = None
+    base_merged = {"src/base_moved.py", "src/b.py", "src/moved.py", "src/z.py"}
+    base_merged |= {"games/v8/index.html", "src/elsewhere.py"}
     monkeypatch.setattr(work_router, "compared_files", compared)
     monkeypatch.setattr(work_router, "pull_files", files)
     between = work_router.no_code_between
@@ -2557,7 +2933,378 @@ async def test_fixing_a_no_code_review_starts_no_new_review(root, harness, monke
         (None, None, False),
     ):
         touched = changed
-        assert await between("eerovil/agentdeck", 9, OLD, NEW, before) is proven, changed
+        why = []
+        assert await between("eerovil/agentdeck", 9, OLD, NEW, before, why=why) is proven, changed
+        assert bool(why) is not proven, (changed, why)
+
+    # #4474: after a minor verdict, test files any size and up to MINOR_LINES lines of the
+    # files the diff had; never a code file the fix adds, and nothing unread.
+    renamed: frozenset[str] = frozenset()
+
+    async def changes(repository, old, new):
+        return None if sizes is None else (sizes, renamed)
+
+    monkeypatch.setattr(work_router, "compared_changes", changes)
+    before = {"src/a.py", "src/test_timings.py"}
+    for changed, proven in (
+        ({"src/a.py": 3, "README.md": 900}, True),
+        ({"src/a.py": MINOR_LINES, "tests/test_a.py": 500}, True),
+        # #4575: store keeps its tests in ``<app>/testing/``; a new one there is a test file.
+        ({"shop/products/testing/test_barcode_search.py": 120, "src/a.py": 31}, True),
+        ({"app/specs/test_a.py": 120, "web/__tests__/a.test.js": 120}, True),
+        # #4575 review: a helper beside the tests is free too, as the wording says.
+        ({"shop/products/testing/factories.py": 80, "app/specs/user_spec.rb": 50}, True),
+        # #4604: a JavaScript test beside its code is a test file by its name.
+        ({"frontend/admin/columnFilter.test.ts": 666, "src/a.py": 31}, True),
+        ({"web/A.Test.TSX": 120, "web/b.test.mjs": 120, "c.test.js": 120}, True),
+        ({"frontend/admin/latest.ts": 1}, False),
+        ({"src/openapi.spec.ts": 1}, False),
+        ({"frontend/a.test.ts/code.ts": 1}, False),
+        ({"frontend/a.test.ts.py": 1}, False),
+        ({"frontend/.test.ts": 1}, False),
+        ({"src/a.py": MINOR_LINES + 1}, False),
+        # A module named test_* outside a test directory is code.
+        ({"src/test_timings.py": MINOR_LINES + 1}, False),
+        ({"src/a.py": 2, "src/new.py": 1}, False),
+        ({"src/a.py": 2, "src/base_moved.py": 300}, True),
+        ({"README.md": 3}, True),
+        (None, False),
+    ):
+        sizes = changed
+        why: list[str] = []
+        assert (
+            await between("eerovil/agentdeck", 9, OLD, NEW, before, minor=True, why=why)
+            is proven
+        ), changed
+        # #4575: every refusal gives the agent its reason, and a pass gives none.
+        assert bool(why) is not proven, (changed, why)
+    sizes = {"src/a.py": MINOR_LINES + 1}
+    why = []
+    await between("eerovil/agentdeck", 9, OLD, NEW, before, minor=True, why=why)
+    assert why == [
+        f"it changes {MINOR_LINES + 1} lines of code (added plus removed) in files the pull"
+        f" request already had, over the limit of {MINOR_LINES}"
+    ]
+    sizes = {"src/a.py": 2, "src/new.py": 1}
+    why = []
+    await between("eerovil/agentdeck", 9, OLD, NEW, before, minor=True, why=why)
+    assert why[0].startswith("it adds the code file `src/new.py` to the pull request")
+    # A code file renamed, even with no line changed, is reviewed; a test file renamed is not.
+    sizes, renamed = {"docs/a.md": 0}, frozenset({"src/a.py"})
+    assert await between("eerovil/agentdeck", 9, OLD, NEW, before, minor=True) is False
+    sizes, renamed = {"tests/test_b.py": 0}, frozenset({"tests/test_a.py"})
+    assert await between("eerovil/agentdeck", 9, OLD, NEW, before, minor=True) is True
+    # #4604: code renamed to a test name is still code moved.
+    sizes, renamed = {"src/a.test.ts": 0}, frozenset({"src/a.py", "src/a.test.ts"})
+    assert await between("eerovil/agentdeck", 9, OLD, NEW, before, minor=True) is False
+    # #4593: a file of the diff now moved is reviewed; one of neither diff, renamed by a base
+    # merge, is not.
+    sizes, renamed = {"src/moved.py": 0}, frozenset({"src/new.py"})
+    why = []
+    assert await between("eerovil/agentdeck", 9, OLD, NEW, before, minor=True, why=why) is False
+    assert why == ["it renames or moves the code file `src/new.py`"]
+    sizes = {"games/v8/index.html": 58}
+    renamed = frozenset({"games/v7/index.html", "games/v8/index.html"})
+    assert await between("eerovil/agentdeck", 9, OLD, NEW, before, minor=True) is True
+    # #4594 review: a file of neither diff moved onto a path of the diff at the reviewed head
+    # replaces that code, even as a pure rename: reviewed. A test file moved off it is free.
+    sizes, renamed = {"src/a.py": 0}, frozenset({"src/elsewhere.py", "src/a.py"})
+    why = []
+    assert await between("eerovil/agentdeck", 9, OLD, NEW, before, minor=True, why=why) is False
+    assert why == ["it renames or moves the code file `src/a.py`"]
+    sizes, renamed = {"src/z.py": 0}, frozenset({"tests/test_z.py", "src/z.py"})
+    assert await between("eerovil/agentdeck", 9, OLD, NEW, before, minor=True) is True
+    renamed = frozenset()
+    # Without the diff's files a minor fix is held to doc files, as a no-code one is.
+    touched = {"src/a.py"}
+    assert await between("eerovil/agentdeck", 9, OLD, NEW, None, minor=True) is False
+
+
+class LateRelease:
+    """#4474: a ``minor`` verdict about OLD came after the fix push to NEW (the release kept
+    it at OLD); its fix check records a ``minor-fixed`` pass, as the release does."""
+
+    def __init__(self, harness) -> None:
+        self.harness = harness
+        self.held: tuple | None = (OLD, frozenset({"src/a.py"}), True)
+        self.fixed: list[str] = []
+
+    async def on_pull_event(self, *args):
+        return None
+
+    def no_code_head(self, work, ref):
+        return self.held
+
+    async def no_code_fixed(self, work, ref, head):
+        from agentdeck.work_release import PASS_RECORDED
+
+        self.fixed.append(head)
+        self.held = None
+        self.harness.note(ref, head, review_history.PASS, f"minor-fixed:c:{ref}@{head}")
+        return f"{PASS_RECORDED} for {ref} at {head[:12]}"
+
+
+def late_router(harness):
+    closes: list[tuple] = []
+
+    async def close_review(work, pull, head, settled, reason):
+        closes.append((work, pull, head, settled(pull, head), settled(pull, OLD), reason))
+        return [5]
+
+    release = LateRelease(harness)
+    harness.service._release = release
+    harness.service._close_review = close_review
+    harness.service._no_code = lambda repo, n, old, new, before, minor=False, **_: asyncio.sleep(
+        0, result=old == OLD and new == NEW and minor is True
+    )
+    harness.heads[("eerovil/agentdeck", 9)] = NEW
+    return release, closes
+
+
+async def test_a_late_minor_verdicts_fix_passes_and_closes_its_review_chat(harness):
+    """#4474: the release hands the router a late verdict's Work and pull request; the fix at
+    the live head passes with no second review and the chat its push opened is closed, unless
+    that start is still running (its own end closes it)."""
+    pull, work = "eerovil/agentdeck#9", "github_issue:eerovil/agentdeck#7"
+    release, closes = late_router(harness)
+    # Another Work's verdict, or a pull request it does not own, checks nothing.
+    await harness.service.late_fixed("github_issue:eerovil/agentdeck#8", pull)
+    await harness.service.late_fixed(work, "eerovil/agentdeck#99")
+    assert release.fixed == [] and closes == []
+    harness.service._in_flight.add(f"{pull}@{NEW}")
+    await harness.service.late_fixed(work.upper(), pull.upper())
+    assert release.fixed == [NEW] and closes == []
+    harness.service._in_flight.clear()
+    release.held = (OLD, frozenset({"src/a.py"}), True)
+    await harness.service.late_fixed(work, pull)
+    [(chat_work, chat_pull, head, now, then, reason)] = closes
+    assert (chat_work, chat_pull, head) == ("eerovil/agentdeck#7", pull, NEW)
+    assert now and not then
+    assert "minor fixes" in reason and NEW[:12] in reason
+    # A fix too big for the minor limit is reviewed: nothing passes, nothing closes.
+    release.held = (OLD, frozenset({"src/a.py"}), True)
+    harness.service._no_code = lambda *a, **k: asyncio.sleep(0, result=False)
+    await harness.service.late_fixed(work, pull)
+    assert len(closes) == 1
+    # #4575 review: its checklist went out before the verdict, so the reason goes apart.
+    release.held = (OLD, frozenset({"src/a.py"}), True)
+
+    def too_big(*a, why, **k):
+        why.append("it changes 300 lines of code")
+        return asyncio.sleep(0, result=False)
+
+    harness.service._no_code = too_big
+    harness.note(pull, NEW, review_history.CHECKLIST, f"work-event:pre-review:{pull}@{NEW}")
+    await harness.service.late_fixed(work, pull)
+    [said] = [m for m in harness.scheduled if m.id == f"work-event:not-small:{pull}@{NEW}"]
+    assert "it changes 300 lines of code" in said.text and "already sent" in said.text
+    assert not harness.service._not_small
+
+
+@pytest.mark.parametrize("start", ["covered", "uncertain", "again", "passed-before"])
+async def test_a_review_start_a_late_minor_pass_overtook_writes_no_ask(harness, monkeypatch, start):
+    """#4474: the fix push's review start was running when the late verdict's pass landed at
+    its head: no ``asked`` row goes over that pass, and the start's own end closes the chat it
+    opened. A review asked again, or one started after the pass, keeps today's rules."""
+    from agentdeck import work_router
+
+    pull = "eerovil/agentdeck#9"
+    release, closes = late_router(harness)
+    release.held = None  # the verdict is not in yet as the push is seen
+    passing = start != "again"
+
+    async def start_review(pull_ref, work, **asks):
+        harness.asks.append(asks)
+        if passing:
+            harness.note(pull, NEW, review_history.PASS, f"minor-fixed:c:{pull}@{NEW}")
+        if start == "uncertain":
+            raise RuntimeError("gh timed out after it pressed")
+        return SimpleNamespace(pulls=[(pull, NEW)])
+
+    harness.service._start_review = start_review
+    monkeypatch.setattr(work_router, "covers", lambda outcome, ref, head: True)
+    if start == "passed-before":
+        harness.note(pull, NEW, review_history.PASS, f"minor-fixed:c:{pull}@{NEW}")
+    again = "r1" if start == "again" else ""
+    event = work_router.Event(
+        work_router.REVIEW, "eerovil/agentdeck", 9, True, head=NEW, again=again
+    )
+    await harness.service._review(("chat-a", "eerovil/agentdeck#7"), event, asked=True)
+    asked = [e for e in harness.reviews_of(pull) if e.kind == review_history.ASKED]
+    if start in ("covered", "uncertain"):
+        assert harness.asks and asked == [] and [c[2] for c in closes] == [NEW]
+    elif start == "again":
+        assert len(asked) == 1 and closes == []
+    else:
+        assert closes == []
+
+
+async def test_a_compare_reports_a_pure_rename_apart(monkeypatch):
+    """#4474 review: GitHub reports a content-identical rename with 0 additions and 0
+    deletions, so its old name comes back as renamed, not as a size of 0."""
+    import json
+    import shutil
+    import subprocess
+
+    from agentdeck import work_router
+
+    payload = {
+        "status": "ahead",
+        "files": [
+            {
+                "filename": "docs/a.md",
+                "previous_filename": "src/a.py",
+                "status": "renamed",
+                "additions": 0,
+                "deletions": 0,
+            },
+            {"filename": "src/b.py", "status": "modified", "additions": 2, "deletions": 1},
+        ],
+    }
+    seen = []
+
+    async def lines(repository, command):
+        seen.append(command)
+        if shutil.which("jq") is None:  # the lines jq prints for the payload
+            return [
+                "ahead 2",
+                "0 docs/a.md",
+                "renamed src/a.py",
+                "renamed docs/a.md",
+                "3 src/b.py",
+            ]
+        out = subprocess.run(
+            ["jq", "-r", command[-1]], input=json.dumps(payload), capture_output=True, text=True
+        )
+        return out.stdout.splitlines()
+
+    monkeypatch.setattr(work_router, "_gh_lines", lines)
+    assert await work_router.compared_changes("eerovil/agentdeck", OLD, NEW) == (
+        {"docs/a.md": 0, "src/b.py": 3},
+        frozenset({"src/a.py", "docs/a.md"}),
+    )
+    assert seen[0][2] == f"repos/eerovil/agentdeck/compare/{OLD}...{NEW}"
+
+
+async def test_a_late_verdict_reads_its_heads_files_from_the_base(monkeypatch):
+    """#4474: a late verdict's files are the pull request's at the head it names, read from
+    the base to that head, renames under both names; the live head must descend from it, and
+    a base or compare that cannot be read leaves the files unread."""
+    from agentdeck import work_router
+
+    base = "d" * 40
+    answers: dict[str, list[str] | None] = {
+        f"compare/{OLD}...{NEW}": ["ahead 1", "src/a.py"],
+        "pulls/9": [base],
+        f"compare/{base}...{OLD}": ["2", "src/a.py", "docs/b.md", "src/old_b.py"],
+    }
+
+    async def lines(repository, command):
+        path = command[2].removeprefix(f"repos/{repository}/")
+        return answers.get(path)
+
+    monkeypatch.setattr(work_router, "_gh_lines", lines)
+    read = work_router.late_read
+    assert await read("eerovil/agentdeck", 9, OLD, NEW) == (
+        True,
+        {"src/a.py", "docs/b.md", "src/old_b.py"},
+    )
+    answers[f"compare/{base}...{OLD}"] = ["300"]
+    assert await read("eerovil/agentdeck", 9, OLD, NEW) == (True, None)
+    answers["pulls/9"] = ["not a sha"]
+    assert await read("eerovil/agentdeck", 9, OLD, NEW) == (True, None)
+    answers[f"compare/{OLD}...{NEW}"] = ["diverged 1", "src/a.py"]
+    assert await read("eerovil/agentdeck", 9, OLD, NEW) == (False, None)
+
+
+async def test_a_minor_verdict_hands_its_flag_to_the_size_check(root, harness):
+    """#4474: a release holding a minor verdict says so, and the router asks the size check
+    with ``minor``; a no-code one asks without it."""
+    pull = "eerovil/agentdeck#9"
+    calls = []
+
+    class Release:
+        held = (OLD, frozenset({"src/a.py"}), True)
+
+        async def on_pull_event(self, *args):
+            return None
+
+        def no_code_head(self, work, ref):
+            return self.held if ref == pull else None
+
+        async def no_code_fixed(self, work, ref, head):
+            self.held = None
+            harness.answered(ref, head, review_history.PASS)
+            return f"review pass recorded for {ref} at {head[:12]}"
+
+    small = True
+
+    async def no_code(repo, n, old, new, before, why, **flags):
+        calls.append(flags)
+        if not small:
+            why.append("it adds the code file `src/new.py` to the pull request")
+        return small
+
+    harness.service._release = Release()
+    harness.service._no_code = no_code
+    harness.asked(pull, OLD)
+    harness.heads[("eerovil/agentdeck", 9)] = NEW
+    pull_event(root, "m1", action="synchronize", sha=NEW)
+    await harness.drain()
+    assert calls == [{"minor": True}] and harness.asks == []
+
+    # #4575: a push the size check refuses says so, with its reason, above that head's
+    # checklist: store#4161's agent read the generic checklist as the pass carried over.
+    small, newest = False, "d" * 40
+    harness.service.pre_review_on = True
+    harness.service._release.held = (NEW, frozenset({"src/a.py"}), True)
+    harness.heads[("eerovil/agentdeck", 9)] = newest
+    pull_event(root, "m2", action="synchronize", sha=newest)
+    await harness.drain()
+    checklist = harness.scheduled[-1]
+    assert checklist.id == f"work-event:pre-review:{pull}@{newest}" and harness.asks == []
+    text = " ".join(checklist.text.split())
+    assert text.split(" AgentDeck: ", 1)[1].startswith(
+        f"your push {newest[:12]} to {pull} is not the small fix the minor-fixes"
+        f" review at {NEW[:12]} allows: it adds the code file `src/new.py` to the pull request."
+    )
+    assert "call `pre-review-done`" in text and "will not merge on it" in text
+    assert not harness.service._not_small, "said once, then forgotten"
+    # #4575 review: a second push while that checklist waits is covered by it, and its own
+    # reason comes as a message of its own.
+    covered = "9" * 40
+    harness.heads[("eerovil/agentdeck", 9)] = covered
+    pull_event(root, "m2b", action="synchronize", sha=covered)
+    await harness.drain()
+    said_apart = harness.scheduled[-1]
+    assert said_apart.id == f"work-event:not-small:{pull}@{covered}" and harness.asks == []
+    assert "the pre-review checklist the deck already sent" in said_apart.text
+    assert not harness.service._not_small
+    # A code push after a standing pass (no third item, no no-code row) is the next round,
+    # and says nothing of a small fix: the review is asked as usual.
+    said = []
+
+    class Watched(dict):
+        def __setitem__(self, key, value):
+            said.append(key)
+            super().__setitem__(key, value)
+
+    harness.service._not_small = Watched()
+    later = "e" * 40
+    harness.service._release.held = (newest, None)
+    harness.heads[("eerovil/agentdeck", 9)] = later
+    harness.answered(pull, newest, review_history.PASS)
+    pull_event(root, "m3", action="synchronize", sha=later)
+    await harness.drain()
+    assert calls[-1] == {} and said == []
+    # A plain no-code verdict refused for size is said, as a minor one is.
+    last = "f" * 40
+    harness.service._release.held = (later, None)
+    harness.answered(pull, later, review_history.NO_CODE)
+    harness.heads[("eerovil/agentdeck", 9)] = last
+    pull_event(root, "m4", action="synchronize", sha=last)
+    await harness.drain()
+    assert said == [f"{pull}@{last}"]
 
 
 async def test_a_push_to_any_branch_reaches_the_release_by_its_branch(root, harness):
@@ -2697,6 +3444,13 @@ async def test_ship_now_passes_the_reviewed_head_and_leaves_its_findings_to_the_
         async def evaluate(self, work):
             return "waits for its tests"
 
+        async def look_after_ship(self, work):
+            # Each press's one look comes after it left the running list (#4558 redesign).
+            looks.append(harness.service.ship_runs.head_of(pull))
+            return "waits for its tests"
+
+    looks: list[str] = []
+
     async def open_head(repository, number):
         return open_heads.get((repository, number), ("", False))
 
@@ -2737,20 +3491,35 @@ async def test_ship_now_passes_the_reviewed_head_and_leaves_its_findings_to_the_
         await harness.service.ship_now("eerovil/agentdeck", 9)
     harness.now += 10
     harness.note(pull, OLD, review_history.ESCALATED, "escalated:1", data={"url": "https://c/1"})
+    behind = []
+
+    async def lags(repository, number, head):
+        behind.append((repository, number, head))
+        return True
+
+    harness.service._ship = replace(harness.service._ship, behind=lags)
     answer = await harness.service.ship_now("EerOvil/AgentDeck", 9)
     assert readied == [9]
+    # Behind its base: the answer warns a conflict may come, and how to keep the pass (#4576).
+    assert behind == [("eerovil/agentdeck", 9, OLD)]
+    assert "is behind its base branch" in answer["outcome"]
     assert accepted == [("github_issue:eerovil/agentdeck#7", pull, OLD, SHIP_NOTE)]
     # The findings stay with the Work's own issue: no new one.
     assert answer["head"] == OLD and merges == ["github_issue:eerovil/agentdeck#7"]
     assert records[(pull, OLD)].shipped  # only a finished press says Shipped (review)
+    assert looks == ["", "", ""], "one look per press, refused or shipped, never under way"
     assert records[(pull, OLD)].work == "eerovil/agentdeck#7"
     [told] = [item for item in harness.scheduled if "ship-now" in item.id]
     assert told.chat_id == "chat-a" and "push nothing more" in told.text
+    assert "merge the base in with a merge commit and push only that" in told.text
+    assert "is behind its base branch" in told.text, "a running press shows no outcome"
     assert "new pull request for this same issue" in told.text
     assert "keep the issue open" in told.text and "(eerovil/agentdeck#7)" in told.text
-    # A second press of the same head ships nothing again.
-    with pytest.raises(AgainRefused, match="already shipped: its findings are left to"):
-        await harness.service.ship_now("eerovil/agentdeck", 9)
+    # A second press of the same head ships nothing again, and answers recorded (#4558).
+    again = await harness.service.ship_now("eerovil/agentdeck", 9)
+    assert again["state"] == "recorded" and "already shipped: its findings are left to" in (
+        again["outcome"]
+    )
     assert len(accepted) == 1
     # A draft whose branch moved while it was readied is not shipped.
     open_heads[("eerovil/agentdeck", 9)] = (NEW, True)
@@ -2871,11 +3640,12 @@ async def test_ship_now_of_a_head_a_fix_was_pushed_on_ships_it_in_its_own_pull_r
     [told] = [item for item in harness.scheduled if "ship-now" in item.id]
     assert told.id == f"work-event:ship-now:{split_pull}@{OLD}"
     assert f"{pull} is now a draft holding your fix" in told.text
+    assert f"does not cover in {pull}. {SIBLING_SWEEP_ASK}" in told.text  # #4497 helper checks
     assert f"until {split_pull} merges, then merge its base into it" in told.text
     assert "the issue stays open" in told.text
-    # A second press finds the same pull request and ships nothing twice.
-    with pytest.raises(AgainRefused, match="already shipped"):
-        await harness.service.ship_now("eerovil/agentdeck", 9, head=OLD)
+    # A second press finds the same pull request and ships nothing twice (#4558: recorded).
+    again = await harness.service.ship_now("eerovil/agentdeck", 9, head=OLD)
+    assert again["state"] == "recorded" and again["pull_request"] == split_pull
     assert len(accepted) == 1 and len(splits) == 3
     # A shown head whose review no longer stands at findings ships nothing.
     with pytest.raises(AgainRefused, match="holds no findings standing at that commit"):
@@ -2890,7 +3660,7 @@ async def test_ship_now_cut_off_anywhere_is_finished_by_the_next_press(root, har
     presses at once ship it once."""
     import asyncio
 
-    from agentdeck.work_router import AgainBusy, AgainRefused, ShipPorts
+    from agentdeck.work_router import AgainRefused, ShipPorts
 
     pull = "eerovil/agentdeck#9"
     accepted = []
@@ -2958,17 +3728,19 @@ async def test_ship_now_cut_off_anywhere_is_finished_by_the_next_press(root, har
     # A press made from a confirm that showed another head's findings ships nothing.
     with pytest.raises(AgainRefused, match="moved past dddddddddddd, whose findings"):
         await harness.service.ship_now("eerovil/agentdeck", 9, head="d" * 40)
-    # Two presses at once: the second waits for the first, which ships it once.
+    # Two presses at once: the second joins the first (#4558), which ships it once.
     fail["accept"] = ""
     gate.clear()
     first = asyncio.ensure_future(harness.service.ship_now("eerovil/agentdeck", 9))
     await asyncio.sleep(0)
-    with pytest.raises(AgainBusy, match="still running"):
-        await harness.service.ship_now("eerovil/agentdeck", 9)
+    second = asyncio.ensure_future(harness.service.ship_now("eerovil/agentdeck", 9))
+    await asyncio.sleep(0)
+    assert len(harness.service.ship_runs.tasks) == 1
     gate.set()
-    answer = await first
-    assert answer["head"] == OLD and accepted == [OLD]
-    assert records[(pull, OLD)].shipped
+    answer, again = await first, await second
+    assert answer == again and answer["head"] == OLD and answer["state"] == "recorded"
+    assert accepted == [OLD] and records[(pull, OLD)].shipped
+    assert harness.service.ship_runs.tasks == {} and harness.service.ship_runs.resolved == {}
 
 
 async def test_a_press_refused_after_its_pass_is_finished_by_the_next_press(root, harness):
@@ -3044,7 +3816,8 @@ async def test_a_press_refused_after_its_pass_is_finished_by_the_next_press(root
     with pytest.raises(AgainRefused, match=r"Merge was not recorded \(.*could not be read"):
         await harness.service.ship_now("eerovil/agentdeck", 9)
     assert accepted == [OLD] and not records[(pull, OLD)].shipped
-    assert told() == [] and looked == []
+    # A stopped press makes the release look again (#4558), so no line says it is under way.
+    assert told() == [] and looked == ["github_issue:eerovil/agentdeck#7"]
     # The next press records the Merge press, but the head could not be marked shipped.
     live["merge"] = ""
     with pytest.raises(AgainRefused, match="could not be marked shipped, so it does not merge"):
@@ -3065,8 +3838,137 @@ async def test_a_press_refused_after_its_pass_is_finished_by_the_next_press(root
     assert "finished" in answer["outcome"]
     assert accepted == [OLD] and len(merges) == 1 and looked
     assert records[(pull, OLD)].shipped and len(told()) == 1 and list(records) == [(pull, OLD)]
-    with pytest.raises(AgainRefused, match="already shipped: its findings are left to this Work"):
-        await harness.service.ship_now("eerovil/agentdeck", 9)
+    # A repeat of a finished press is an answer, not a refusal (#4558).
+    again = await harness.service.ship_now("eerovil/agentdeck", 9)
+    assert again["state"] == "recorded" and again["head"] == OLD
+    assert "already shipped: its findings are left to this Work" in again["outcome"]
+
+
+async def test_a_slow_ship_now_answers_running_and_tells_the_chat_how_it_ended(
+    root, harness, monkeypatch
+):
+    """#4558: a press longer than the call's wait answers ``running`` and goes on; a repeat
+    joins it, the release reads it as under way, and a press that stops after its caller left
+    tells the Work's chat, leaves the table first and makes the release look again. A head
+    already marked shipped answers ``recorded`` before any GitHub read, merged or not."""
+    import asyncio
+
+    from agentdeck import work_router
+    from agentdeck.work_router import AgainRefused, ShipPorts
+
+    monkeypatch.setattr(work_router, "SHIP_WAIT_S", 0.01)
+    pull = "eerovil/agentdeck#9"
+    runs = harness.service.ship_runs
+    gate = asyncio.Event()
+    look_open = asyncio.Event()
+    look_open.set()
+    looked, reads = [], []
+    records: dict[tuple[str, str], review_history.ShippedHead] = {}
+
+    class Release:
+        ports = SimpleNamespace(pulls=lambda work: [pull])
+
+        async def on_pull_event(self, *args):
+            return None
+
+        def no_code_head(self, work, ref):
+            return None
+
+        async def owner_accepted(self, work, ref, head, note):
+            await gate.wait()
+            return "refused: tests are red"
+
+        def approval(self, work):
+            return ""
+
+        async def evaluate(self, work):
+            # Out of the table first, so the line it stores is not "under way".
+            looked.append(runs.running(pull, OLD))
+            await look_open.wait()
+            return ""
+
+    async def open_head(repository, number):
+        reads.append(number)
+        return OLD, False
+
+    def claim(ref, head, work):
+        records.setdefault((ref, head), review_history.ShippedHead(ref, head, work=work))
+        return True
+
+    harness.service._release = Release()
+    harness.service._ship = ShipPorts(
+        open_head=open_head,
+        mark_ready=lambda repository, number: None,
+        claim=claim,
+        note_shipped=lambda ref, head: False,
+        shipped=lambda ref, head: records.get((ref, head)),
+        shipped_by_work=lambda work: [r for r in records.values() if r.shipped],
+    )
+    harness.note(pull, OLD, review_history.FINDINGS, "findings:1", data={"text": "1. off"})
+    first = await harness.service.ship_now("eerovil/agentdeck", 9, head=OLD)
+    assert first["state"] == "running" and first["head"] == OLD
+    assert runs.running(pull, OLD) and not runs.running(pull, NEW)
+    again = await harness.service.ship_now("eerovil/agentdeck", 9, head=OLD.upper())
+    assert again["state"] == "running" and len(runs.tasks) == 1 and reads == [9]
+    gate.set()
+    task = next(iter(runs.tasks.values()))
+    with pytest.raises(AgainRefused, match="tests are red"):
+        await task
+    assert runs.tasks == {} and runs.resolved == {} and runs.left == set()
+    assert looked == [False]
+    told = [item for item in harness.scheduled if "ship-stopped" in item.id]
+    assert len(told) == 1 and "tests are red" in told[0].text
+    assert "same pull request and head is safe" in told[0].text
+    # A press its caller waited for to the end tells nothing more: the caller heard it.
+    gate.clear()
+    monkeypatch.setattr(work_router, "SHIP_WAIT_S", 5.0)
+    waited = asyncio.ensure_future(harness.service.ship_now("eerovil/agentdeck", 9, head=OLD))
+    await asyncio.sleep(0)
+    gate.set()
+    with pytest.raises(AgainRefused, match="tests are red"):
+        await waited
+    assert len([item for item in harness.scheduled if "ship-stopped" in item.id]) == 1
+    # Refused before the wait ran out, but its closing look outlasts the wait: the caller
+    # hears ``running``, so the chat must hear the refusal once the look ends (#4559 review).
+    monkeypatch.setattr(work_router, "SHIP_WAIT_S", 0.01)
+    look_open.clear()
+    # Its id is stamped to the second, so the earlier message would absorb it.
+    harness.scheduled[:] = [item for item in harness.scheduled if "ship-stopped" not in item.id]
+    slow = asyncio.ensure_future(harness.service.ship_now("eerovil/agentdeck", 9, head=OLD))
+    await asyncio.sleep(0)
+    press = runs.tasks[f"{pull}@{OLD}"]  # off the list once refused, before its look
+    await asyncio.sleep(0.05)
+    assert slow.done() and slow.result()["state"] == "running"
+    look_open.set()
+    with pytest.raises(AgainRefused, match="tests are red"):
+        await press
+    told = [item for item in harness.scheduled if "ship-stopped" in item.id]
+    assert len(told) == 1 and "tests are red" in told[0].text
+    assert runs.left == set()
+    # Marked shipped and merged since: the repeat answers recorded with no GitHub read.
+    records[(pull, OLD)] = replace(records[(pull, OLD)], shipped=1.0)
+    reads.clear()
+    done = await harness.service.ship_now("eerovil/agentdeck", 9, head=OLD)
+    assert done["state"] == "recorded" and done["pull_request"] == pull and reads == []
+    # A split's source pull request at the shipped commit names the split one.
+    records[(pull, OLD)] = replace(records[(pull, OLD)], pull="eerovil/agentdeck#30", fix=pull)
+    split = await harness.service.ship_now("eerovil/agentdeck", 9, head=OLD)
+    assert split["pull_request"] == "eerovil/agentdeck#30" and reads == []
+    # Another caller's press already shipping the head this one resolves to (a carried pass,
+    # or a split pull request pressed beside its source): this one waits for it and ships
+    # nothing itself (#4559 helper checks).
+    records.clear()
+    other = asyncio.get_running_loop().create_future()
+    runs.tasks["eerovil/agentdeck#9@carried"] = other
+    runs.resolved["eerovil/agentdeck#9@carried"] = f"{pull}@{OLD}"
+    joined = asyncio.ensure_future(harness.service.ship_now("eerovil/agentdeck", 9, head=OLD))
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert not joined.done() and reads == [9]
+    other.set_result({"pull_request": pull, "head": OLD, "state": "recorded"})
+    assert (await joined)["state"] == "recorded" and records == {}
+    runs.tasks.clear()
+    runs.resolved.clear()
 
 
 async def _true_moved(harness) -> bool:

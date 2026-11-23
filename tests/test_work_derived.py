@@ -959,6 +959,50 @@ def test_a_check_only_a_person_can_make_waits_for_a_try_outside_needs_you():
     assert status(**tried, closed=True).kind != "try_wait"
     assert status(**tried, pr_open=True).kind != "try_wait"
     assert status(**tried, live_pending=True).kind != "try_wait"
+    # #4562: a person sent the chat back to work after the check, and it waits on that work.
+    assert status(**tried, live_superseded=True).kind != "try_wait"
+
+
+def test_a_person_message_and_a_newer_wait_replace_waiting_for_a_try():
+    """#4562: "Works, close" asked a person to try #796, the person then sent its chat new
+    work, and between turns the row still read Waiting for a try with the old note."""
+    from agentdeck.web.work_view import _LiveState, _try_superseded
+    from agentdeck.work import WorkEvidence, WorkMembership, WorkProvenance
+
+    checked = AT
+    said = AT + timedelta(minutes=10)
+    messages: dict[str, datetime] = {}
+    side = WorkMembership(WORK, "side-chat", (WorkProvenance(WorkEvidence.SIDE_CHAT, "s1"),))
+    other = WorkMembership(WORK, "a-reader", (WorkProvenance(WorkEvidence.REGISTERED_ISSUE, "s2"),))
+    work = SimpleNamespace(memberships=(side, other))
+    state = SimpleNamespace(
+        person_message_at=lambda chats: max(
+            (messages[c] for c in chats if c in messages), default=None
+        ),
+        work_projection=lambda: SimpleNamespace(get=lambda ref: work if ref == WORK else None),
+    )
+    owner = ("owner-chat", "agentdeck#2895")
+    tried = _LiveState(result="needs_person", line="try it", at=checked)
+    newer = [said + timedelta(minutes=1)]
+    older = [said - timedelta(minutes=1)]
+
+    def superseded(live=tried, starts=newer):
+        return _try_superseded(state, None, WORK, owner, live, starts)
+
+    assert superseded() is False, "no person message"
+    messages["owner-chat"] = said
+    assert superseded() is True, "a wait begun after the person's message"
+    assert superseded(starts=older) is False, "only a wait from before the message"
+    assert superseded(starts=[]) is False, "a reply that waits on nothing stays a try (#4210)"
+    assert superseded(live=_LiveState(result="verified", at=checked)) is False
+    messages["owner-chat"] = checked - timedelta(minutes=1)
+    assert superseded() is False, "a message from before the check"
+    # A linked side chat counts; a chat that only registered the issue does not.
+    messages["a-reader"] = said
+    assert superseded() is False
+    messages["side-chat"] = said
+    assert superseded() is True
+    assert _try_superseded(state, None, WORK, None, tried, newer) is False, "no owner"
 
 
 def test_a_live_check_is_pending_from_the_ask_until_a_result_recorded_after_it():
@@ -980,7 +1024,8 @@ def test_a_live_check_is_pending_from_the_ask_until_a_result_recorded_after_it()
     assert _live_state(app, WORK.work_id).pending is True, "an older result"
     checks[WORK.work_id] = LiveCheck(WORK.work_id, "failed", "500", AT + timedelta(minutes=5))
     assert _live_state(app, WORK.work_id) == type(_live_state(app, WORK.work_id))(
-        pending=False, result="failed", line="live check failed: 500"
+        pending=False, result="failed", line="live check failed: 500",
+        at=AT + timedelta(minutes=5),
     )
 
 
@@ -1113,6 +1158,7 @@ def _derived_with_reviews(
     ended=AT,
     history=(),
     closed=(),
+    pre_review=(),
 ):
     """``open_reviews`` (``(repository, number) -> (_open(...), ...)``) are review chats opened
     at their heads and still open; ``passes`` (``pull -> {"head", "at", "chat"}``) pass verdicts;
@@ -1127,7 +1173,9 @@ def _derived_with_reviews(
     )
     app = SimpleNamespace(
         state=SimpleNamespace(
-            work_router=SimpleNamespace(switched=lambda repository: True),
+            work_router=SimpleNamespace(
+                switched=lambda repository: True, pre_review_held=lambda pull: pull in pre_review
+            ),
             assistant=None,
             wake_on=SimpleNamespace(registry=SimpleNamespace(for_chat=lambda chat: waits)),
             control_db=None,
@@ -1326,7 +1374,13 @@ def test_a_closed_issue_with_an_open_pull_request_follows_the_pull_request():
 def test_a_wait_on_its_own_pull_request_does_not_hide_ready_for_merge():
     """#3003: trailhead issues#667, #679 and #680 were reviewed and tested, and read "Waiting on
     pull request …" because their agents waited for their own pull request to merge."""
-    from agentdeck.wake_on import KIND_COMMIT, KIND_PULL_REQUEST, KIND_TIME, WakeRequest
+    from agentdeck.wake_on import (
+        KIND_COMMIT,
+        KIND_PULL_REQUEST,
+        KIND_REVIEW,
+        KIND_TIME,
+        WakeRequest,
+    )
 
     def wait(kind, repository="eerovil/agentdeck", number=9, note="", sha=""):
         return WakeRequest(
@@ -1356,6 +1410,17 @@ def test_a_wait_on_its_own_pull_request_does_not_hide_ready_for_merge():
     assert found.line.startswith(
         "Waiting on its pull request — review passed; waiting to read its diff, until "
     )
+    # #4575: store#4161's review waited on its agent's own pre-review-done, and the wait on its
+    # merge read Waiting, then Needs retry three hours on. Nothing moves it but the agent, so
+    # the Work reads as ended and its agent is asked (``ask_for_next_steps``).
+    held = _derived_with_reviews({}, waits=own, ended=fresh, pre_review={"eerovil/agentdeck#9"})
+    assert held.kind == ENDED
+    other = _derived_with_reviews({}, waits=own, ended=fresh, pre_review={"eerovil/agentdeck#8"})
+    assert other.kind == WAITING
+    # A wait on that pull request's review is no next step either (#4575 review).
+    review = (wait(KIND_REVIEW),)
+    held = _derived_with_reviews({}, waits=review, ended=fresh, pre_review={"eerovil/agentdeck#9"})
+    assert held.kind == ENDED
     # #3097: abacus#2084's pass was lost, and its Work read Waiting for a day.
     stuck = _derived_with_reviews({}, waits=own)
     assert stuck.kind == "pr_stuck" and stuck.line.endswith(f"nothing since {deck_clock(AT)}")
@@ -1363,6 +1428,33 @@ def test_a_wait_on_its_own_pull_request_does_not_hide_ready_for_merge():
     assert (row.section, row.attention.category, row.attention.bug) == (
         "needs_you", "needs_retry", ""
     )
+    # #4579: held hours on a ready head no review ever started on is the deck's bug (store#4161
+    # waited 6 h on a review nobody started); findings at that head, or another hold, are not.
+    unreviewed = {"hold": {"why": f"eerovil/agentdeck#9 has no review pass at {'a' * 12}",
+                           "words": "not reviewed at its head", "since": AT.timestamp(),
+                           "green": True}}
+    never = _derived_with_reviews({}, waits=own, entry=unreviewed)
+    assert never.kind == "pr_stuck" and never.bug
+    # Red or unread tests stop pre-review-done themselves, an older head or another pull
+    # request is not this one, and an asked review has started: none is the bug.
+    for hold in (
+        {"green": False},
+        {"green": None},
+        {"why": f"eerovil/agentdeck#9 has no review pass at {'b' * 12}"},
+        {"why": f"eerovil/agentdeck#8 has no review pass at {'a' * 12}"},
+    ):
+        other = {"hold": {**unreviewed["hold"], **hold}}
+        assert not _derived_with_reviews({}, waits=own, entry=other).bug, hold
+    asked = [_event("asked", "a" * 40, AT - timedelta(minutes=5))]
+    assert not _derived_with_reviews({}, waits=own, entry=unreviewed, history=asked).bug
+    row = front_row(card(derived=never), current=False)
+    assert (row.attention.category, row.attention.bug) == ("needs_retry", "review_never_started")
+    reviewed = [_event("changes", "a" * 40, AT - timedelta(minutes=5), told=True)]
+    found = _derived_with_reviews({}, waits=own, entry=unreviewed, history=reviewed)
+    assert found.kind == "pr_stuck" and not found.bug
+    untested = {"hold": {"why": "eerovil/agentdeck#9 has no green verification at x",
+                         "words": "no test run started", "since": AT.timestamp()}}
+    assert not _derived_with_reviews({}, waits=own, entry=untested).bug
     # The release's own hold, and findings after it, read in its words.
     since = (datetime.now(UTC) - timedelta(minutes=30)).timestamp()
     tests = {"hold": {"why": "x", "words": "no test run started", "since": since}}
@@ -1744,6 +1836,36 @@ def test_a_work_held_only_for_its_tests_is_asked_to_run_them(tmp_path):
     assert ask_for_next_steps(app, [ended]) == 1
     assert "its review passed" in scheduled[0].text
     assert "question box" not in scheduled[0].text
+
+
+def test_a_work_whose_review_waits_on_its_checklist_is_asked_for_pre_review_done(tmp_path):
+    """#4575: store#4161's agent took a minor verdict's pass as carried and waited on the
+    merge for nine hours; the request names the one step that moves it."""
+    from agentdeck.web.work_view import ask_for_next_steps
+    from agentdeck.work_facts import OutputFact
+
+    app, scheduled, _ = _asking_app(tmp_path, _state(_session()))
+    app.state.work_router = SimpleNamespace(
+        pre_review_held=lambda pull: pull == "eerovil/agentdeck#9"
+    )
+    output = OutputFact(
+        url="https://github.com/eerovil/agentdeck/pull/9", repository="eerovil/agentdeck",
+        number=9, found_by="registered", state="open", head="a" * 40,
+    )
+    ended = card(derived=status(ended_at=AT, asks=True), outputs=(output,))
+    assert ask_for_next_steps(app, [ended]) == 1
+    text = scheduled[0].text
+    assert "pre-review-done" in text and '{"pull_request": "eerovil/agentdeck#9"}' in text
+    assert "question box" not in text
+    # Two held pull requests: the request gives a body for each (#4575 review).
+    app.state.work_router = SimpleNamespace(pre_review_held=lambda pull: True)
+    second = replace(output, url=output.url.replace("/9", "/10"), number=10)
+    ended = card(derived=status(ended_at=AT, asks=True), outputs=(output, second))
+    scheduled.clear()
+    assert ask_for_next_steps(app, [ended]) == 1
+    text = scheduled[0].text
+    assert '{"pull_request": "eerovil/agentdeck#9"}' in text
+    assert '{"pull_request": "eerovil/agentdeck#10"}' in text
 
 
 def test_a_work_whose_verification_failed_is_not_asked_to_run_it_again(tmp_path):
@@ -2278,6 +2400,66 @@ def test_the_stall_flag_is_read_as_the_provider_set_it():
     assert derived_for(_app(), snapshot, WORK, card()).kind == UNFINISHED
 
 
+def test_a_work_sent_back_to_work_after_a_try_reads_its_new_wait():
+    """#4562 end to end: the wait registered after the person's message, not before it, ends
+    Waiting for a try; the person-message time is read from the owning chat."""
+    from agentdeck.wake_on import KIND_TIME
+    from agentdeck.web.work_view import derived_for
+    from agentdeck.work_resolution import LiveCheck
+
+    merged = OutputFact(
+        url="https://github.com/eerovil/agentdeck/pull/9",
+        repository="eerovil/agentdeck",
+        number=9,
+        found_by="registered",
+        state="merged",
+    )
+    tried_at = NOW - timedelta(hours=2)
+    said = NOW - timedelta(hours=1)
+    state = _state(_session(last_text="Queued the report.", ended_at=NOW))
+    heard = {}
+    state.person_message_at = lambda chats: heard.get("chat-a") if "chat-a" in chats else None
+    snapshot = SimpleNamespace(state=state, presentation=None)
+    waits = [
+        SimpleNamespace(
+            kind=KIND_TIME,
+            repository="",
+            number=None,
+            sha="",
+            deadline=None,
+            target="the report",
+            work_id="",
+            session_key="chat-a",
+            registered_at=(said + timedelta(minutes=5)).timestamp(),
+        )
+    ]
+    app = _app()
+    app.state.wake_on = SimpleNamespace(registry=SimpleNamespace(for_chat=lambda c: waits))
+    check = LiveCheck(WORK.work_id, "needs_person", "open the cart on a phone", tried_at)
+    app.state.control_db = SimpleNamespace(work_live_check=lambda work_id: check)
+    tried = card(outputs=(merged,))
+    assert derived_for(app, snapshot, WORK, tried).kind == "try_wait", "no person message"
+    heard["chat-a"] = said
+    found = derived_for(app, snapshot, WORK, tried)
+    assert (found.kind, found.line) != ("try_wait", "Waiting for a try — open the cart on a phone")
+    assert "the report" in found.line
+    waits[0].registered_at = (said - timedelta(minutes=5)).timestamp()
+    assert derived_for(app, snapshot, WORK, tried).kind == "try_wait", "a wait from before"
+    # A verification run queued after the message is new work too; one from before is not.
+    waits.clear()
+    run = {
+        "id": "job-1",
+        "purpose": "verification",
+        "work_id": WORK.work_id,
+        "state": "running",
+        "submitted_at": (said + timedelta(minutes=5)).timestamp(),
+    }
+    found = derived_for(app, snapshot, WORK, tried, [run])
+    assert found.kind != "try_wait" and "its tests" in found.line
+    run["submitted_at"] = (said - timedelta(minutes=5)).timestamp()
+    assert derived_for(app, snapshot, WORK, tried, [run]).kind == "try_wait"
+
+
 def test_a_chat_that_moved_on_to_another_work_leaves_a_closed_one_closed():
     """#3964: one chat asked for v2 and v3 after v1 merged showed "Working" on all three."""
     from agentdeck.web.work_view import derived_for
@@ -2728,3 +2910,56 @@ def test_a_work_in_the_merge_queue_reads_its_place():
     assert status(queue_pr=9, queue_place=2, queue_size=2, running=True).kind == WORKING
     assert status(queue_pr=9, queue_place=12, queue_size=21).line.endswith("12th of 21")
     assert status(queue_pr=9, queue_place=21, queue_size=21).line.endswith("21st of 21")
+
+
+def test_a_work_handed_to_another_deck_rests_instead_of_ending_as_a_bug():
+    """#4450: issues#1446 went to another person; the router stopped its agent and told it to
+    do nothing more, then the deck asked it for a next step and filed its ending as a bug."""
+    from agentdeck.web.work_view import derived_for
+    from agentdeck.work_router import HANDED_OVER
+
+    said = "I'm leaving this Work stopped: the issue was handed over to @someone."
+    snapshot = SimpleNamespace(
+        state=_state(_session(last_text=said)), presentation=None
+    )
+    asking = _app()
+    asking.state.work_endings = SimpleNamespace(get=lambda work_id: (None, None))
+    assert derived_for(asking, snapshot, WORK, card()).kind == ENDED
+    asking.state.work_router.handed_over = {f"{HANDED_OVER}{WORK.work_id}"}
+    found = derived_for(asking, snapshot, WORK, card())
+    assert found.kind == PARKED and not found.bug
+    assert found.line == "Parked — its issue went to another deck"
+    # Resting so, it leaves this deck's own sections even when Other decks does not list it
+    # (its issue closed there), where nothing could hide it; a running turn stays shown.
+    from agentdeck.web.work_view import own_rows
+
+    rested = front_row(card(derived=found), current=False)
+    running = front_row(card(derived=status(handed_over=True, running=True)), current=True)
+    assert own_rows(asking, [rested, running], set()) == [running]
+    assert own_rows(asking, [running], {WORK.work_id}) == []
+    # Closed or finished on the other deck, Other decks drops it, and so do these sections.
+    closed = front_row(card(derived=status(handed_over=True, closed=True)), current=False)
+    finished = front_row(card(derived=status(handed_over=True, finished=True)), current=False)
+    assert own_rows(asking, [closed, finished, running], set()) == [running]
+    asking.state.work_router.handed_over = set()
+    assert own_rows(asking, [rested], set()) == [rested]
+    asking.state.work_router.handed_over = {f"{HANDED_OVER}{WORK.work_id}"}
+    # Asked once already, it still rests rather than reading as a bug.
+    nudged = status(handed_over=True, ended_at=AT, nudged_at=AT - NUDGE_GRACE, asks=True)
+    assert nudged.kind == PARKED and not nudged.bug
+    # Its review, its death and its merge are the other deck's too: none is started, told or
+    # reported here.
+    for others in (
+        dict(pr_open=True, review_pr=9, review_since=AT, review_stuck_at=AT, review_active=AT),
+        dict(pr_open=True, review_pr=9, review_active=AT, review_stuck_at=AT,
+             review_retried=True),
+        dict(died=True, died_at=AT),
+        dict(pr_open=True, ready_pr=9, ready_reviewed_at=AT),
+    ):
+        assert status(**others).kind != PARKED, others
+        rested = status(handed_over=True, **others)
+        assert rested.kind == PARKED and not rested.bug, others
+    # A turn, a question and a closed issue still read as themselves.
+    assert status(handed_over=True, running=True).kind == WORKING
+    assert status(handed_over=True, question="Which day?").kind == QUESTION
+    assert status(handed_over=True, closed=True).kind == CLOSED

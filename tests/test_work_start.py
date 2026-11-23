@@ -1799,3 +1799,29 @@ async def test_the_start_sign_is_a_rocket_and_one_marked_comment(monkeypatch):
     assert found["body"] == "theirs"
     assert calls[-1][0][-1].endswith("issues/7/comments?per_page=1&page=2")
     assert await work_signals.newest_comment(ISSUE, 7, 0) is None
+
+    # #4466: a watch's reopen posts its marked comment once, then reopens the issue; a found
+    # marker (a try after a crash) skips the post, and a failed read changes nothing.
+    marker = "<!-- agentdeck-watch:abc -->"
+    found_ids: list[bytes] = [b"", b"991\n"]
+
+    async def watch(argv, *, timeout, stdin=None, repo=None, owner=None):
+        calls.append((list(argv[1:]), stdin))
+        return 0, (found_ids.pop(0) if "--paginate" in argv else b""), b""
+
+    monkeypatch.setattr(work_signals.gh_cli, "run_once", watch)
+    del calls[:]
+    assert await work_signals.reopen_with_comment(ISSUE, 7, marker, f"back\n{marker}")
+    read, post, reopen = calls
+    assert marker in read[0][-1] and read[0][-3].endswith("issues/7/comments?per_page=100")
+    assert post[0][2:4] == ["POST", f"repos/{ISSUE}/issues/7/comments"]
+    assert json.loads(post[1]) == {"body": f"back\n{marker}"}
+    assert reopen[0][2:4] == ["PATCH", f"repos/{ISSUE}/issues/7"]
+    assert json.loads(reopen[1]) == {"state": "open"}
+    del calls[:]
+    assert await work_signals.reopen_with_comment(ISSUE, 7, marker, "again")
+    assert [call[0][1:3] for call in calls][1] == ["-X", "PATCH"] and len(calls) == 2
+    monkeypatch.setattr(work_signals.gh_cli, "run_once", run_once)  # every call exits 1
+    del calls[:]
+    assert not await work_signals.reopen_with_comment(ISSUE, 7, marker, "again")
+    assert len(calls) == 1

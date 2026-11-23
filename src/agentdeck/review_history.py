@@ -48,6 +48,10 @@ RERUN_REFUSED = "rerun-refused"
 #: comment), and ``resumed`` when the label came off again. Only the check reads them (#4422).
 STOPPED = "stopped"
 RESUMED = "resumed"
+#: The deck asked the owner, through the Work's agent, whether a mechanism that drew findings
+#: for a third round stays (#4498; ``data``: ``path``, ``heads``, ``delivery``). One per pull
+#: request, keyed ``mechanism:<pull>``; nothing that reads a review's state reads it.
+MECHANISM = "mechanism"
 #: A check run takes 65,535 characters of text; findings are kept up to here.
 FINDINGS_LIMIT = 60_000
 
@@ -192,17 +196,30 @@ def strip_round_stamps(text: str) -> str:
     return ROUND_STAMP_RE.sub("", text or "")
 
 
-def replaced_round(events: Iterable[ReviewEvent], stamp: str) -> str:
+def replaced_round(events: Iterable[ReviewEvent], stamp: str, *, late_from: str = "") -> str:
     """The review chat (``owner/repo#n``) a comment stamped ``stamp`` came from, when a newer
     review chat replaced it, else "" (#4386). One review chat is open per Work at a time and a
     new one replaces the old, so a ``chat`` row naming another chat, newer than the stamped
     chat's own, at any head of the pull request (a carry may take several steps, and a base
     merge with nothing to carry links no heads), means the comment answers an old round.
-    A stamp no ``chat`` row holds says nothing: the caller keeps its rules by head and time."""
+    A stamp no ``chat`` row holds says nothing: the caller keeps its rules by head and time.
+
+    ``late_from`` is the head a late ``minor`` or ``no-code`` verdict names after its fix was
+    pushed (#4474): a newer chat at another head that has no answer yet does not replace it.
+    That is the review the fix push started, which the late verdict may still settle."""
     stamp = (stamp or "").lower()
     if not stamp:
         return ""
+    events = list(events)
     chats = [event for event in events if event.kind == CHAT]
+    if late_from:
+        chats = [
+            event
+            for event in chats
+            if event.head.startswith(late_from.lower())
+            or str(event.data.get("round") or "").lower() == stamp
+            or answered(events, event.head)
+        ]
     own = [event for event in chats if str(event.data.get("round") or "").lower() == stamp]
     if not own:
         return ""
@@ -386,10 +403,22 @@ def findings_text(events: Iterable[ReviewEvent], head: str) -> tuple[str, str]:
 
 def checklist_waits(events: Iterable[ReviewEvent]) -> bool:
     """Whether a pull request's review waits on its agent's checklist, at any head: the newest
-    of its checklists, checklist-dones and asks is a checklist (#3880, #3933)."""
+    of its checklists, checklist-dones and asks is a checklist (#3880, #3933), and no pass was
+    written at that checklist's own head after it. Such a pass (a minor or no-code fix counted
+    as passed, an owner's acceptance) settles the head with no review, so nothing waits on the
+    agent there: one pull request's page said its checklist waited for hours after it passed
+    (#4589)."""
+    events = list(events)
     marks = [e for e in events if e.kind in (CHECKLIST, CHECKLIST_DONE, ASKED)]
     newest = max(marks, key=lambda event: (event.at, event.seq), default=None)
-    return newest is not None and newest.kind == CHECKLIST
+    if newest is None or newest.kind != CHECKLIST:
+        return False
+    return not any(
+        event.kind in (PASS, ACCEPTED)
+        and event.head == newest.head
+        and (event.at, event.seq) > (newest.at, newest.seq)
+        for event in events
+    )
 
 
 def last_digest(events: Iterable[ReviewEvent]) -> tuple[str, str]:

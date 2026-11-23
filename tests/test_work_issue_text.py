@@ -70,3 +70,31 @@ async def test_a_huge_issue_is_cut_and_says_so(monkeypatch):
     text = await issue_text("o/r", 7, run=_runner(pages, []))
     assert "[cut here: read the rest on GitHub]" in text
     assert "x" * 60 not in text
+
+
+@pytest.mark.asyncio
+async def test_a_threads_comments_are_read_every_page_since_a_time(monkeypatch):
+    """#4478: a dropped verdict is read back from every page since the head's first ask; a
+    failed read is ``None``, never an empty thread."""
+    from agentdeck import work_signals
+
+    argvs: list[list[str]] = []
+    answers = [(0, b'{"id": 1}\n{"id": 2}\n"x"\n', b""), (1, b"", b"HTTP 502")]
+
+    async def run_once(argv, *, timeout, repo=None, **_):
+        argvs.append(list(argv))
+        return answers.pop(0)
+
+    monkeypatch.setattr(work_signals.shutil, "which", lambda name: "/usr/bin/gh")
+    monkeypatch.setattr(work_signals.gh_cli, "run_once", run_once)
+    since = "2026-11-18T12:30:00Z"
+    assert await work_signals.read_comments("o/r", 7, since) == [{"id": 1}, {"id": 2}]
+    assert argvs[0][1:] == [
+        "api",
+        "--paginate",
+        f"repos/o/r/issues/7/comments?per_page=100&since={since}",
+        "--jq",
+        ".[]",
+    ]
+    assert await work_signals.read_comments("o/r", 7) is None
+    assert argvs[1][3] == "repos/o/r/issues/7/comments?per_page=100"

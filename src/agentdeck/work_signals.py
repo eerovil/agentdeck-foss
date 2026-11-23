@@ -29,6 +29,8 @@ from . import gh_cli
 log = logging.getLogger(__name__)
 
 GH_TIMEOUT_S = 15.0
+#: A read of every comment on an issue, page by page: a long issue takes several (#4466).
+PAGED_TIMEOUT_S = 90.0
 STARTED = "rocket"
 SEEN = "eyes"
 MARKER = "<!-- agentdeck-work-start id="
@@ -173,6 +175,29 @@ async def read_comment(repository: str, comment_id: int) -> dict | None:
         log.warning("work signal: comment %s of %s unread", comment_id, repository, exc_info=True)
         return None
     return comment if isinstance(comment, dict) else None
+
+
+async def read_comments(repository: str, number: int, since: str = "") -> list[dict] | None:
+    """An issue's or pull request's comments, as GitHub's REST API gives them, oldest first,
+    updated at ``since`` (ISO time) or later, every page; ``None`` if unread (#4478)."""
+    gh = shutil.which("gh")
+    if gh is None:
+        return None
+    query = f"?per_page=100&since={since}" if since else "?per_page=100"
+    path = f"repos/{repository}/issues/{int(number)}/comments{query}"
+    try:
+        code, out, _err = await gh_cli.run_once(
+            [gh, "api", "--paginate", path, "--jq", ".[]"],
+            timeout=2 * GH_TIMEOUT_S,
+            repo=repository,
+        )
+        if code != 0:
+            return None
+        found = [json.loads(line) for line in out.decode("utf-8", "replace").splitlines() if line]
+    except Exception:  # noqa: BLE001 - unread recovers nothing, and today's path runs
+        log.warning("work signal: comments of %s#%s unread", repository, number, exc_info=True)
+        return None
+    return [item for item in found if isinstance(item, dict)]
 
 
 async def read_map(repository: str, number: int) -> dict | None:
@@ -425,4 +450,57 @@ async def write_map_body(repository: str, number: int, body: str) -> bool:
         "-",
         "--silent",
         stdin=json.dumps({"body": body}).encode(),
+    )
+
+
+async def reopen_with_comment(repository: str, number: int, marker: str, comment: str) -> bool:
+    """Reopen an issue with a comment, for a watch that found its problem back (#4466).
+
+    The comment is looked for by ``marker`` first, so a try after a crash between the post
+    and the save never posts it twice; the reopen is idempotent. True once both landed.
+    """
+    gh = shutil.which("gh")
+    if gh is None:
+        log.warning("work signal: gh is not available on this host")
+        return False
+    try:
+        code, out, _err = await gh_cli.run_once(
+            [
+                gh,
+                "api",
+                "--paginate",
+                f"repos/{repository}/issues/{number}/comments?per_page=100",
+                "--jq",
+                f'.[] | select(.body // "" | contains("{marker}")) | .id',
+            ],
+            timeout=PAGED_TIMEOUT_S,
+            repo=repository,
+        )
+    except Exception:  # noqa: BLE001 - unread is tried again
+        log.warning("work signal: comments of %s#%s unread", repository, number, exc_info=True)
+        return False
+    if code != 0:
+        return False
+    if not (out or b"").split() and not await _gh(
+        repository,
+        "api",
+        "-X",
+        "POST",
+        f"repos/{repository}/issues/{number}/comments",
+        "--input",
+        "-",
+        "--silent",
+        stdin=json.dumps({"body": comment}).encode(),
+    ):
+        return False
+    return await _gh(
+        repository,
+        "api",
+        "-X",
+        "PATCH",
+        f"repos/{repository}/issues/{number}",
+        "--input",
+        "-",
+        "--silent",
+        stdin=json.dumps({"state": "open"}).encode(),
     )

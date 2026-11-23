@@ -19,7 +19,7 @@ before any code:
   deck posts it on the issue, so the owner sees it, records it in its own file
   (``Verdicts``), and hands it to the Work's agent (``WorkRelease.on_design_review``).
   On a gap the agent fixes the design, posts it again as a new ``**Design:**`` comment, and asks
-  again, until a review passes.
+  again, until a review passes or the second round ends it with notes (#4463, below).
 - **The gate.** No code review of the Work's pull requests starts while its issue's newest
   ``**Design:**`` comment has no passing verdict in that record (``DesignRound.missing``,
   checked by ``WorkRouterService._design_gap`` at every start; ``pre-review-done`` and
@@ -41,6 +41,18 @@ the Work router keeps it in its saved retry list (``work_router.PendingActions``
 place taken: tried again with the same growing wait, dropped after a day. ``GET
 …/design-review`` shows it as ``queued``. Chosen by the owner on PR #4344: no order of its
 own, no place number.
+
+**At most two rounds (#4463, built in #4496).** Rounds piled up to about six a Work, nearly
+half of their gaps holes in the previous round's fix. So a design series (the designs since
+the issue's last passing one) gets two reviews. Round 1 lists every gap at once, worked
+through a fixed list (``CHECKLIST``), and skips small details; round 2 rechecks only round 1's
+gaps and their fixes. A gap still open after round 2 does not hold the code: the deck records
+the design as passed with notes (``NOTES``), the Work may start coding, and the code review
+checks the code against each note. The round is read from the deck's own record
+(``round_of``): one more than the gap verdicts on earlier design comments since the last pass.
+Owner's choice: the cap, round 2's scope, the notes, and telling the reviewer it has two
+rounds so it skips small details. Assumed: the fixed list, design-level designs, a new series
+after a pass counting from one again, and the deck (not the reviewer) deciding the round.
 """
 
 from __future__ import annotations
@@ -56,6 +68,11 @@ DESIGN_MARK = "**Design:**"
 
 PASS = "pass"
 GAP = "gap"
+#: The design passed with notes: round 2 still found gaps, which go to the code review as
+#: notes to check instead of holding the code (#4463).
+NOTES = "notes"
+#: A design series gets this many reviews (#4463, the owner's choice).
+MAX_ROUNDS = 2
 #: The issue has no design comment.
 NONE = "none"
 #: Its newest design comment has no verdict after it.
@@ -69,7 +86,7 @@ _DESIGN_RE = re.compile(r"(?m)^[ \t]*" + re.escape(DESIGN_MARK))
 #: The verdict line as the reviewer sends it.
 _VERDICT_RE = re.compile(
     r"(?i)^\s*/claude\s+Design review of\s+(?P<ref>[\w.-]+/[\w.-]+#\d+)\s*:\s*"
-    r"(?P<verdict>pass|gap)\b(?:[ \t]+(?P<comment>\d+)\b)?"
+    r"(?P<verdict>pass|gap|notes)\b(?:[ \t]+(?P<comment>\d+)\b)?"
 )
 _COMMENT_ID_RE = re.compile(r"#issuecomment-(?P<id>\d+)$")
 
@@ -104,6 +121,24 @@ def verdict_of(text: str) -> Verdict | None:
     return None
 
 
+def restated(text: str, verdict: str) -> str:
+    """``text`` with its verdict line's word replaced by ``verdict`` (#4463): the deck posts
+    the verdict it records, so the issue shows ``notes`` where a last-round reviewer wrote
+    ``gap``, and ``gap`` for a ``notes`` before the last round. ``text`` unchanged when its
+    first non-empty line is no verdict."""
+    lines = (text or "").split("\n")
+    for index, line in enumerate(lines):
+        if not line.strip():
+            continue
+        match = _VERDICT_RE.match(line)
+        if match is None:
+            return text
+        start, end = match.span("verdict")
+        lines[index] = line[:start] + verdict + line[end:]
+        return "\n".join(lines)
+    return text
+
+
 def comment_id(url: str) -> str:
     """The number of an issue comment from its URL, or ""."""
     match = _COMMENT_ID_RE.search((url or "").strip())
@@ -124,12 +159,49 @@ def newest_design(comments: list[dict]) -> dict | None:
     return None
 
 
+def _ordered(verdicts: dict[str, str], before: str) -> list[tuple[int, str, str]]:
+    """The recorded verdicts on design comments older than ``before``, newest first. Comment
+    numbers grow with time on GitHub, so their order is the designs' order."""
+    if not before.isdigit():
+        return []
+    found = [(int(k), k, v) for k, v in verdicts.items() if k.isdigit() and int(k) < int(before)]
+    return sorted(found, reverse=True)
+
+
+def round_of(verdicts: dict[str, str], comment: str) -> int:
+    """Which review of its series the design comment ``comment`` gets (#4463): one more than
+    the gap verdicts on the designs before it since the last pass (``verdicts`` as
+    ``Verdicts.of`` gives them). A new design after a pass starts again at one."""
+    gaps = 0
+    for _number, _key, verdict in _ordered(verdicts, comment):
+        if verdict != GAP:
+            break
+        gaps += 1
+    return gaps + 1
+
+
+def earlier_gap(verdicts: dict[str, str], comment: str) -> str:
+    """The number of the design before ``comment`` whose review found the gaps it answers,
+    or "" when ``comment`` opens its series (#4463)."""
+    for _number, key, verdict in _ordered(verdicts, comment):
+        return key if verdict == GAP else ""
+    return ""
+
+
+def kept(verdicts: dict[str, str], verdict: Verdict) -> str:
+    """The verdict the deck records for ``verdict`` (#4463): a gap in the last round becomes
+    notes, and notes before it are a gap; a pass stays a pass."""
+    if verdict.verdict == PASS:
+        return PASS
+    return NOTES if round_of(verdicts, verdict.comment) >= MAX_ROUNDS else GAP
+
+
 def state(
     comments: list[str] | tuple[str, ...],
     urls: list[str] | tuple[str, ...],
     verdicts: dict[str, str],
 ) -> str:
-    """The issue's design state: ``none``, ``unreviewed``, ``gap`` or ``pass``.
+    """The issue's design state: ``none``, ``unreviewed``, ``gap``, ``pass`` or ``notes``.
 
     ``comments`` are the issue's comment bodies, oldest first, and ``urls`` their URLs, from
     which each comment's number is read. ``verdicts`` is the deck's own record of the issue
@@ -177,10 +249,12 @@ class Verdicts:
 
 
 def gap(state_now: str) -> str:
-    """What the design round still needs before a code review, or "" (``DesignRound.missing``)."""
+    """What the design round still needs before a code review, or "" (``DesignRound.missing``):
+    a design passed with notes holds nothing (#4463)."""
     how = (
         "call `POST $AGENTDECK_URL/api/sessions/<session-key>/design-review`, and fix the"
-        " design until a review passes"
+        " design until a review passes; a design gets two rounds, and a gap left after the"
+        " second is a note for the code review"
     )
     if state_now == GAP:
         return (
@@ -192,12 +266,70 @@ def gap(state_now: str) -> str:
     return ""
 
 
-def brief(*, name: str, issue: str, design_url: str, base: str, request: str, token: str) -> str:
+#: What a round-1 reviewer works through (#4463, assumed): a case outside it is no gap.
+CHECKLIST = (
+    "what runs at the same time (robots, processes, requests, timers) and which row, lock or"
+    " file decides between them",
+    "what a crash, a timeout and a retry do at each step: nothing left half done, nothing run"
+    " twice",
+    "for a large change, its parts and which one owns each row, file or step",
+    "parts or lines of the design that contradict each other",
+)
+
+
+def brief(
+    *,
+    name: str,
+    issue: str,
+    design_url: str,
+    base: str,
+    request: str,
+    token: str,
+    earlier: str = "",
+) -> str:
     """The first message of one design reviewer's chat. It opens like every reviewer's, so
     the chat list leaves it out (``agent_review.is_reviewer_prompt``). ``request`` is the
     reviewer's ``deck-request`` command (``agent_review.DECK_REQUEST``); ``token`` its own
-    session token, which the deck asks of a verdict (a Codex shell has no variable for it)."""
+    session token, which the deck asks of a verdict (a Codex shell has no variable for it).
+    Its message file is named by the token's first 12 characters (#4468): a name no other
+    reviewer uses, that does not leave the whole token in a listable ``/var/tmp``.
+
+    ``earlier`` is the URL of the design whose review found the gaps this one answers: this
+    is then the last round (#4463), which rechecks only those gaps and their fixes."""
     number = comment_id(design_url)
+    listed = "\n".join(f"  {n}. {item}" for n, item in enumerate(CHECKLIST, 1))
+    if earlier:
+        scope = f"""- This is the last round: a design gets only two reviews (#4463). Read \
+the design before it, {earlier}, and the deck's gap verdict after it. Check only those gaps: \
+is each one fixed here, and does its fix open a hole of its own? Raise nothing else, and no \
+small details.
+- A gap you still find does not hold the code back. The deck records the design as passed \
+with notes, the Work starts coding, and the code review checks the code for each note. So \
+write each one so a code reviewer can check it in code: the case, and what must hold."""
+        lines = f"""  - If every gap from round 1 is fixed, its first line is exactly \
+`/claude Design review of {issue}: pass {number}`, and the next lines say in a few sentences \
+what you checked.
+  - Otherwise its first line is exactly `/claude Design review of {issue}: notes {number}`, \
+and each next line is one gap still open: which round-1 gap it is, and the case that shows \
+it."""
+    else:
+        scope = f"""- A design gets only two reviews (#4463): this one, and one more that \
+rechecks only the gaps you list now. Whatever is still open after that goes to the code \
+review as a note. So list every gap now, in this one message, and spend no time on small \
+details: only what would break the change.
+- Work through this list, and only this list:
+{listed}
+  A gap is a case on that list the design leaves open or gets wrong: two things racing for \
+one row, a step a crash leaves half done, a retry that runs something twice, a part nobody \
+owns. Wording, tests, names, code style and function-level details are not gaps: a design \
+stays at the level of parts, rows, locks and failure paths, and the code review sees the \
+rest in real code."""
+        lines = f"""  - If the design holds, its first line is exactly \
+`/claude Design review of {issue}: pass {number}`, and the next lines say in a few sentences \
+what you checked.
+  - Otherwise its first line is exactly `/claude Design review of {issue}: gap {number}`, and \
+each next line is one gap: the line of the design it breaks, or that the design missed it, \
+and the case that shows it."""
     return f"""You are AgentDeck's {name} reviewer. The deck started you to review the design \
 of the Work {issue} before any code is written for it: the comment {design_url}. This \
 directory is a throwaway checkout of `{base}`, the code as it is now, made for you; the deck \
@@ -207,24 +339,15 @@ removes it when you stop.
 {issue.partition("#")[0]} --comments`. Read the code here only as far as the design needs. \
 Take about 10 to 15 minutes. This review is read-only: do not edit, commit or push, and do not \
 comment on GitHub.
-- Check the design, not code. It must say: what runs at the same time (robots, processes, \
-requests, timers) and which row, lock or file decides between them; what happens on a crash, \
-a timeout and a retry at each step; and for a large change, its parts and what each owns. A \
-gap is a case the design leaves open or gets wrong: two things racing for one row, a step a \
-crash leaves half done, a retry that runs something twice, a part nobody owns. Wording and \
-code style are not gaps.
+{scope}
 - Send one message through the deck, which posts it on the issue and hands it to the Work's \
-agent. Write it to a file under `/var/tmp` and send it with
-    `{request} {issue} --session-token {token} --body-file <file>`
+agent. Write it to `/var/tmp/design-review-{token[:12]}.md`, a name no other reviewer uses (a \
+reviewer before you may have left its own verdict under another name, #4468), and send it with
+    `{request} {issue} --session-token {token} --body-file /var/tmp/design-review-{token[:12]}.md`
   with a 10-minute timeout, never in the background. The deck's answer is the delivery. If the \
 command fails or its answer is unclear, run the same command once more: a repeat is the same \
 request.
-  - If the design holds, its first line is exactly \
-`/claude Design review of {issue}: pass {number}`, and the next lines say in a few sentences \
-what you checked.
-  - Otherwise its first line is exactly `/claude Design review of {issue}: gap {number}`, and each \
-next line is one gap: the line of the design it breaks, or that the design missed it, and the \
-case that shows it.
+{lines}
 - Finish by saying in a few sentences what you found and why you gave that verdict.
 """
 
@@ -279,7 +402,10 @@ _NEXT = {
     " turn; the verdict comes to this chat as a message. Asking again adds nothing",
     REVIEWING: "a reviewer is on it (or still starting): the verdict comes to this chat as a"
     " message; write no code until it passes",
-    PASS: "the design passed: build to it",
+    PASS: "the design passed: build to it (a redesign answering a design finding, once the"
+    " owner approved it, #4476)",
+    NOTES: "the design passed with notes after its two review rounds (#4463): build to it,"
+    " and make the code answer each note; the code review checks the code against them",
     GAP: f"the review found a gap: post the fixed design as a new `{DESIGN_MARK}` comment,"
     " then `POST …/design-review`",
 }
@@ -370,7 +496,7 @@ class DesignRound:
         when every reviewer place is taken (the router then keeps it and tries again, #4342)."""
         from .review_refs import ReviewBusy, ReviewError
 
-        design, _comments = await self._newest(issue)
+        design, comments = await self._newest(issue)
         if design is None:
             raise Refused(
                 f"{issue} has no design comment: post one opening with `{DESIGN_MARK}` on its"
@@ -381,7 +507,15 @@ class DesignRound:
         number = comment_id(url)
         if not number:
             raise Refused(f"the newest design comment of {issue} has no readable URL", 503)
-        now = self.verdicts.of(issue).get(number)
+        recorded = self.verdicts.of(issue)
+        now = recorded.get(number)
+        if now == NOTES:
+            raise Refused(
+                f"the newest design of {issue} passed with notes after its two review rounds"
+                " (#4463): build to it and make the code answer each note; post no new design"
+                " for the notes",
+                why=DECIDED,
+            )
         if now == PASS:
             raise Refused(
                 f"the newest design of {issue} already passed its review: build to it, or post"
@@ -394,8 +528,21 @@ class DesignRound:
                 f" as a new comment opening with `{DESIGN_MARK}`, then call this again",
                 why=DECIDED,
             )
+        # The last round names the design whose gaps it rechecks (#4463).
+        before = earlier_gap(recorded, number)
+        earlier = next(
+            (
+                str(item.get("url") or "")
+                for item in comments
+                if before and comment_id(str(item.get("url") or "")) == before
+            ),
+            "",
+        )
+        if before and not earlier:
+            earlier = url.rsplit("#issuecomment-", 1)[0] + f"#issuecomment-{before}"
+        asks = {"earlier": earlier} if earlier else {}
         try:
-            started = await self._start(issue, url, checkout=checkout)
+            started = await self._start(issue, url, checkout=checkout, **asks)
         except ReviewBusy as exc:
             raise Busy(str(exc)) from exc
         except ReviewError as exc:
@@ -424,11 +571,19 @@ class DesignRound:
         self._sent_by_its_reviewer(issue, verdict, token)
         return await self.stale(issue, verdict)
 
-    def record(self, issue: str, verdict: Verdict, token: str) -> None:
+    def kept(self, issue: str, verdict: Verdict) -> str:
+        """What the deck would record for ``verdict`` now (#4463, ``kept``): read before it is
+        posted, so the post says the same."""
+        return kept(self.verdicts.of(issue), verdict)
+
+    def record(self, issue: str, verdict: Verdict, token: str) -> str:
         """Record ``verdict`` once posted: the gate's evidence. The same sender rule as
-        ``accept``, so no path records a verdict ``accept`` would refuse."""
+        ``accept``, so no path records a verdict ``accept`` would refuse. Returns what it
+        recorded: a gap in the last round is notes (#4463, ``kept``)."""
         self._sent_by_its_reviewer(issue, verdict, token)
-        self.verdicts.record(issue, verdict.comment, verdict.verdict)
+        recorded = kept(self.verdicts.of(issue), verdict)
+        self.verdicts.record(issue, verdict.comment, recorded)
+        return recorded
 
     async def stale(self, issue: str, verdict: Verdict) -> str:
         """Why ``verdict`` is about no design the agent still stands by, or "". A verdict

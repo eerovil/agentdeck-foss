@@ -37,6 +37,16 @@ will not start wakes the chat with the reason. Most day-later live checks woke a
 to read "nothing yet" (#4244), so the deck reads it instead. The deck never records a live
 check or closes an issue from a check: a woken chat reads the result and does that.
 
+A watch (``watch``, #4466) is the one exception, and the inverse of a time wait: a chat whose
+first live check passed writes a command that tells "the problem is back", records
+``verified``, and closes its issue, leaving the long real-use wait to the deck. Exit 0 says
+the problem is back: the deck posts the output on the Work's issue under a marker, reopens it
+(``reopen_owed``, a claimed step retried until it settles), and only then writes the message
+that says what it did. Exit 3 says not seen; an error wakes the chat only after
+``WATCH_ERRORS_TO_WAKE`` in a row, and its deadline ends it with no message. It keeps no Work
+current: the Work is finished. Its check may not run in a Work's worktree, which is removed a
+few days after the issue closes.
+
 A review wait (``review``, #3183) waits on the reviewer's verdict on a pull request. The
 deck already hands that verdict to the Work's chat as a message of its own, so the verdict
 ends the wait without a second one (``answer_reviews``); only its timeout sends a message. A
@@ -126,6 +136,21 @@ KIND_REVIEW = "review"
 #: A Work moving into Needs answer or Ready for merge (#3446): the deck's own Needs you list,
 #: no GitHub event. Not spent by a message; one message per Work that moves in.
 KIND_NEEDS_YOU = "needs_you"
+#: A closed Work's fix watched for the problem coming back (#4466): a time wait whose check's
+#: exit 0 reopens the Work's issue, and whose deadline ends it with no message.
+KIND_WATCH = "watch"
+#: A watch's check failing this many runs in a row wakes its chat; fewer are counted silently,
+#: as one failed read in a week of hourly runs is not worth a wake (#4466).
+WATCH_ERRORS_TO_WAKE = 3
+#: How long one web worker's claim on a watch's reopen holds the other off (#3070); a claim
+#: older than this was left by a crash, and the reopen is taken again.
+REOPEN_CLAIM_S = 600.0
+#: How long a failed reopen waits before it is tried again, and how many tries it gets before
+#: the chat is told the deck could not reopen the issue.
+REOPEN_RETRY_S = 60.0
+REOPEN_TRIES = 5
+#: The marker on the deck's comment for one watch, so a retry after a crash never posts twice.
+WATCH_MARKER = "<!-- agentdeck-watch:{id} -->"
 #: The waits on a GitHub event whose timeout is given one more round (#4080): most timeouts
 #: woke a chat only to read that the build, merge or deploy was still running.
 PATIENT_KINDS = frozenset({KIND_PULL_REQUEST, KIND_COMMIT, KIND_DEPLOYMENT})
@@ -202,6 +227,13 @@ LIVE_READ_AGAIN_S = 30 * 60.0
 LIVE_READ_CAP_S = 24 * 3600.0
 #: The waits that read: a deploy has no cheap read, so it keeps the timeout message.
 LIVE_READ_KINDS = frozenset({KIND_PULL_REQUEST, KIND_COMMIT})
+#: How long a review wait's timeout waits for a verdict read-back the services process took
+#: but did not answer, before reading again once (#4478).
+RECOVER_RETRY_S = 120.0
+RECOVER_UNCERTAIN_NOTE = (
+    " The deck's check for a verdict already posted on GitHub did not answer in time; if a"
+    " verdict reaches this chat after this message, that verdict stands."
+)
 #: A merge wait ends with no message when the release's own merge notice reached the same chat
 #: this recently (#4253): the chat already heard of the merge.
 MERGE_TOLD_S = 30 * 60.0
@@ -323,6 +355,16 @@ class WakeRequest:
     #: Which registration of this wait the check belongs to: registering it again bumps it,
     #: so a run started before that is ignored when it ends (it ran the old command).
     check_gen: int = 0
+    #: A watch (#4466): its check's failed runs in a row; whether its check found the problem
+    #: back and the Work's issue is still to reopen, with that run's output and time; the
+    #: reopen's claim (``REOPEN_CLAIM_S``), its failed tries, and when it may run again.
+    check_errors: int = 0
+    reopen_owed: bool = False
+    fired_output: str = ""
+    fired_at: float = 0.0
+    reopen_claimed_at: float = 0.0
+    reopen_tries: int = 0
+    reopen_retry_at: float = 0.0
 
     @property
     def target(self) -> str:
@@ -334,6 +376,8 @@ class WakeRequest:
             return f"this deck's own deploy of commit {self.sha}"
         if self.kind == KIND_TIME:
             return self.note or "a check-back time"
+        if self.kind == KIND_WATCH:
+            return self.note
         if self.kind == KIND_NEEDS_YOU:
             labels = {"answer": "Needs answer", "merge": "Ready for merge"}
             which = labels.get(self.only, "Needs answer or Ready for merge")
@@ -375,6 +419,7 @@ class WakeRequest:
                 "every_minutes": round(self.check_every_s / 60),
                 "next_run": self.check_at,
                 "not_yet_runs": self.check_runs,
+                **({"errors_in_a_row": self.check_errors} if self.kind == KIND_WATCH else {}),
             }
             if self.check_command
             else None
@@ -418,6 +463,7 @@ def parse_request(
     timeout_minutes: int | None = None,
     work_id: str | None = None,
     check: dict | None = None,
+    watch: str | None = None,
     now: datetime | None = None,
 ) -> dict:
     """Validate one registration body into the fields of a ``WakeRequest``.
@@ -440,6 +486,7 @@ def parse_request(
         name=name,
         timeout_minutes=timeout_minutes,
         check=check,
+        watch=watch,
         now=now,
     )
     wanted = (work_id or "").strip()
@@ -478,9 +525,17 @@ def _request_fields(
     timeout_minutes: int | None,
     check: dict | None,
     now: datetime | None,
+    watch: str | None = None,
 ) -> dict:
     """``parse_request`` without the Work the wait is for."""
     at = at or None
+    if watch is not None:
+        others = (pull_request, review, commit, deployment, deck_deploy, needs_you, only, name)
+        if any(value not in (None, "") for value in (*others, timeout_minutes, waiting_for)):
+            raise WakeRequestError(
+                "a watch takes only watch, at or after_minutes, check and work_id"
+            )
+        return _watch_request(watch, at, after_minutes, check, now)
     given = [
         value
         for value in (
@@ -614,6 +669,50 @@ def _time_request(
         "repository": "",
         "note": note,
     }
+
+
+def _watch_request(
+    watch: str,
+    at: str | None,
+    after_minutes: int | None,
+    check: dict | None,
+    now: datetime | None,
+) -> dict:
+    """A watch (#4466): what would be back, its deadline (``at`` or ``after_minutes``, as a
+    time wait), and the check that tells, which no Work's worktree may hold."""
+    note = " ".join(str(watch).split())
+    if not note:
+        raise WakeRequestError("watch must say in a few words what would be back")
+    if (at is None) == (after_minutes is None):
+        raise WakeRequestError("a watch needs its deadline: give at or after_minutes")
+    if check is None:
+        raise WakeRequestError(
+            "a watch needs a check: a command that exits 0 when the problem is back"
+        )
+    if len(note) > MAX_NOTE:
+        raise WakeRequestError(f"watch is at most {MAX_NOTE} characters")
+    fields = _time_request(at, after_minutes, note, None, None, now)
+    fields.update(_check_fields(check, fields["timeout_s"]), kind=KIND_WATCH)
+    if any(WORKTREES in text for text in (fields["check_command"], fields["check_cwd"])):
+        raise WakeRequestError(
+            "a watch's check must not use a Work's worktree (.worktrees/): it is removed a few"
+            " days after the issue closes, in the middle of the watch. Run it in the main"
+            " checkout (read files at origin/HEAD) or leave cwd out to run it in home"
+        )
+    return fields
+
+
+#: The directory Works' own checkouts live in, which a watch's check may not use (#4466).
+WORKTREES = ".worktrees"
+
+
+def ends_at(request: WakeRequest) -> float:
+    """When a wait is over. A watch outlives its deadline by one check run's longest time,
+    so a run started just before it still reopens the issue when it finds the problem back
+    (#4466); no run starts after the deadline."""
+    if request.kind == KIND_WATCH:
+        return request.deadline + CHECK_TIMEOUT_S
+    return request.deadline
 
 
 def _check_fields(check: object, wait_s: float) -> dict:
@@ -924,9 +1023,10 @@ def review_stop(
         lines = []
     else:
         return None
+    body = _text(issue.get("body"))
     pinned = sorted(
         (repository.lower(), pull)
-        for repository, pull in chat_review.pinned_heads(_text(issue.get("body")), title)
+        for repository, pull in chat_review.pinned_heads(body, title)
     )
     if lines:
         # A closing line is about the pull requests it names: in a chat covering several, the
@@ -947,6 +1047,11 @@ def review_stop(
             )
         ]
         pinned = covered or (pinned if len(pinned) == 1 else [])
+    # A pull request the chat lists only as already passed background gets no verdict from
+    # it, so its stop says nothing about that pull request's review or merge (#4599). Dropped
+    # after the closing line is matched, so a line naming only one cuts nobody's wait.
+    background = chat_review.background_pulls(body)
+    pinned = [item for item in pinned if item not in background]
     pulls = tuple(f"{repository}#{pull}" for repository, pull in pinned)
     try:
         opened_at = datetime.fromisoformat(_text(issue.get("created_at"))).timestamp()
@@ -977,6 +1082,15 @@ def _merge_wait_note(request: WakeRequest) -> str:
         " acted, register the merge wait again."
         if request.kind == KIND_PULL_REQUEST
         else ""
+    )
+
+
+def recovered_message(request: WakeRequest, url: str) -> str:
+    """A review wait the deck answered by reading back a verdict its webhook dropped (#4478)."""
+    return (
+        f"AgentDeck wake-on: the review verdict for {request.target} was posted at {url} and"
+        " missed by the webhook; the deck has taken it in now and sent it to this chat. Act on"
+        " it; do not ask for a fresh review."
     )
 
 
@@ -1787,6 +1901,76 @@ def check_message(request: WakeRequest, code: int | None, output: str, why: str,
     )
 
 
+def reopen_due(request: WakeRequest, now: float) -> bool:
+    """Whether a watch's owed reopen may be taken now (#4466): owed, past its retry time, and
+    not claimed within ``REOPEN_CLAIM_S``."""
+    return (
+        request.reopen_owed
+        and not request.pending_text
+        and now >= request.reopen_retry_at
+        and (not request.reopen_claimed_at or now >= request.reopen_claimed_at + REOPEN_CLAIM_S)
+    )
+
+
+def reopen_at(request: WakeRequest) -> float:
+    """When a watch's owed reopen may next be taken (``reopen_due``)."""
+    claimed = request.reopen_claimed_at + REOPEN_CLAIM_S if request.reopen_claimed_at else 0.0
+    return max(request.reopen_retry_at, claimed)
+
+
+def watch_issue(request: WakeRequest) -> IssueRef | None:
+    """The issue a watch reopens: its Work's (#4466); None when the Work is no issue's."""
+    from .work import WorkRef
+
+    ref = WorkRef.from_work_id(request.work_id)
+    return IssueRef(repository=ref.repository, number=ref.number) if ref is not None else None
+
+
+def watch_comment(request: WakeRequest) -> str:
+    """The comment a watch posts on its issue before it reopens it, with the check's output.
+
+    Only what was seen: it is posted before the reopen and the chat's message, which may
+    still fail (#4471 review), and without the command, which may hold a secret or a
+    private address that issue readers must not get.
+    """
+    return (
+        f"The deck's watch for {request.target} found the problem back at"
+        f" {_clock(request.fired_at)}: its check exited 0. The check's output:"
+        f"{_fenced(request.fired_output)}\n{WATCH_MARKER.format(id=request.id)}"
+    )
+
+
+def watch_message(request: WakeRequest, reopened: bool) -> str:
+    """The message a watch whose check found the problem back sends, once its reopen settled."""
+    issue = watch_issue(request)
+    where = f"{issue.repository}#{issue.number}" if issue else "this Work's issue"
+    done = (
+        f"The deck reopened {where} and posted the check's output there."
+        if reopened
+        else f"The deck could not reopen {where}: reopen it yourself and post the output there."
+    )
+    return (
+        f"AgentDeck watch: your check for {request.target} says the problem is back (exit 0 at"
+        f" {_clock(request.fired_at)}). {done} Its output:{_fenced(request.fired_output)}\n"
+        "Look at it once yourself. If it is back, record the live check as `failed`, say on the"
+        " issue what failed, and fix it in a new pull request. If the check was wrong, say so"
+        " on the issue, close it again, and register a corrected watch if one is still worth it."
+    )
+
+
+def watch_failed_message(
+    request: WakeRequest, code: int | None, output: str, why: str, at: float, runs: int
+) -> str:
+    """A watch whose check failed ``runs`` times in a row: the chat hears, nothing reopens."""
+    return (
+        f"AgentDeck watch: your check for {request.target} itself failed {runs} runs in a row,"
+        f" the last at {_clock(at)} ({why}), so the deck stopped watching. It did not reopen the"
+        f" issue. The last output:{_fenced(output)}\nLook once yourself: if the problem is"
+        " back, reopen the issue and say so there; otherwise fix the command and register the"
+        f" watch again (exit 0 when the problem is back, {CHECK_NOT_YET} when it is not)."
+    )
+
+
 #: How much of a check's output the deck holds while it runs: the tail, never the whole of a
 #: busy log query's output in the web process.
 CHECK_OUTPUT_HELD = 4 * MAX_CHECK_OUTPUT
@@ -1933,6 +2117,9 @@ class WakeOnRegistry:
                         check_at=request.check_at,
                         check_runs=0,
                         check_last="",
+                        check_errors=0,
+                        # A reopen owed stays owed (#4466): its issue may already be reopened,
+                        # and the chat must still hear of it.
                         check_gen=held.check_gen + 1,
                     )
                     current[index] = renewed
@@ -2007,6 +2194,7 @@ class WakeOnRegistry:
                     held.id == request_id
                     and held.check_command
                     and not held.pending_text
+                    and not held.reopen_owed
                     and held.check_at <= now < held.deadline
                 ):
                     current[index] = replace(held, check_at=now + held.check_every_s)
@@ -2022,13 +2210,15 @@ class WakeOnRegistry:
         *,
         last: str = "",
         wake: Callable[[WakeRequest], str] | None = None,
+        change: Callable[[WakeRequest], WakeRequest] | None = None,
     ) -> WakeRequest | None:
         """End one check run on the wait as it is held now, in one locked step.
 
         Only while the run still belongs to it: same registration (``check_gen``), not
-        owing a message, before its deadline. ``wake`` gives the message it then owes,
-        stored as ``pending_text`` and returned for sending; without it the run said not
-        yet and is counted (``last``). None when the run no longer belongs to the wait.
+        owing a message or a reopen, before it ends (``ends_at``). ``wake`` gives the message
+        it then owes, stored as ``pending_text`` and returned for sending; ``change`` gives the wait
+        as it is to be held (a watch's run, #4466); without either the run said not yet and
+        is counted (``last``). None when the run no longer belongs to the wait.
         """
         with self._file.locked():
             current = list(self.all())
@@ -2037,13 +2227,58 @@ class WakeOnRegistry:
                     held.id != request_id
                     or held.check_gen != gen
                     or held.pending_text
-                    or now >= held.deadline
+                    or held.reopen_owed
+                    or now >= ends_at(held)
                 ):
                     continue
-                if wake is None:
-                    settled = replace(held, check_runs=held.check_runs + 1, check_last=last)
+                if change is not None:
+                    settled = change(held)
+                elif wake is None:
+                    settled = replace(
+                        held, check_runs=held.check_runs + 1, check_last=last, check_errors=0
+                    )
                 else:
                     settled = replace(held, pending_text=wake(held))
+                current[index] = settled
+                self._save(current)
+                return settled
+        return None
+
+    def claim_reopen(self, request_id: str, now: float) -> WakeRequest | None:
+        """Take a watch's owed reopen (#4466), under the file's lock, so of two web workers
+        side by side (#3070) only one posts; None when it is not owed, not due, or claimed
+        less than ``REOPEN_CLAIM_S`` ago."""
+        with self._file.locked():
+            current = list(self.all())
+            for index, held in enumerate(current):
+                if held.id == request_id and reopen_due(held, now):
+                    current[index] = replace(held, reopen_claimed_at=now)
+                    self._save(current)
+                    return current[index]
+        return None
+
+    def settle_reopen(
+        self, request_id: str, reopened: bool, now: float, wake: Callable[[WakeRequest], str]
+    ) -> WakeRequest | None:
+        """End one reopen try on the watch as held now (#4466): reopened, or out of tries, it
+        owes ``wake``'s message and no reopen; else it is tried again ``REOPEN_RETRY_S`` on.
+        None when no reopen is owed any more (cancelled, or settled by the other worker)."""
+        with self._file.locked():
+            current = list(self.all())
+            for index, held in enumerate(current):
+                if held.id != request_id or not held.reopen_owed or held.pending_text:
+                    continue
+                tries = held.reopen_tries + (0 if reopened else 1)
+                if reopened or tries >= REOPEN_TRIES:
+                    settled = replace(held, reopen_owed=False, reopen_tries=tries)
+                    settled = replace(settled, pending_text=wake(settled))
+                else:
+                    settled = replace(
+                        held,
+                        reopen_tries=tries,
+                        reopen_claimed_at=0.0,
+                        reopen_retry_at=now + REOPEN_RETRY_S,
+                    )
                 current[index] = settled
                 self._save(current)
                 return settled
@@ -2319,13 +2554,19 @@ class WakeOnService:
         live_read: Callable[[WakeRequest], Awaitable[Outcome | NothingToReport | None]]
         | None = None,
         ask_review: Callable[[str, int, str], Awaitable[str]] | None = None,
+        recover_review: Callable[[str, int], Awaitable[str]] | None = None,
         ready_head: Callable[[WakeRequest], bool] = lambda request: False,
         release_notices: Callable[[str, datetime], Iterable[str]] = lambda chat_id, since: (),
         check_env: Callable[[str], dict[str, str]] = lambda session_key: {},
         note: Callable[[str, str, str], bool] | None = None,
         compare: Callable[[str, str, str], Awaitable[bool]] | None = None,
+        reopen: Callable[[str, int, str, str], Awaitable[bool]] | None = None,
     ) -> None:
         self._enabled = bool(enabled)
+        # A watch's reopen (#4466): ``reopen(repository, number, marker, comment)`` posts the
+        # comment unless one with the marker is there, reopens the issue, and says whether
+        # both landed. None where the deck has no GitHub writes: the chat is told to do it.
+        self._reopen = reopen
         # A deployment wait on a commit follows its commit (#4445). ``compare(repository,
         # base, head)`` says whether ``head`` contains ``base`` (GitHub's compare), raising
         # when it cannot tell, off the event loop; without it no later deploy counts.
@@ -2352,6 +2593,11 @@ class WakeOnService:
         # None of the reads blocks the event loop.
         self._live_read = live_read
         self._ask_review = ask_review
+        # A timed-out review wait first reads back a verdict whose webhook never came, as the
+        # URL of the comment taken in or "" (#4478). An uncertain call gets one retry: the
+        # deadline it moved the wait to, by wait id.
+        self._recover_review = recover_review
+        self._recovery_uncertain: dict[str, float] = {}
         self._ready_head = ready_head
         self._release_notices = release_notices
         # Waits a read or a re-ask is settling now: ``expire_due`` and ``next_due`` leave them.
@@ -2512,11 +2758,14 @@ class WakeOnService:
             if request.pending_text:
                 due.append(self._retry_at.get(request.id, now))
                 continue
+            if request.reopen_owed:
+                due.append(reopen_at(request))
+                continue
             if tracks_build(request):
                 due.extend(self._build_due(request, now))
                 continue
-            due.append(request.deadline)
-            if request.check_command and request.id not in self._checks:
+            due.append(ends_at(request) if request.deadline <= now else request.deadline)
+            if request.check_command and request.id not in self._checks and now < request.deadline:
                 due.append(request.check_at)
             if request.kind == KIND_DECK_DEPLOY and request.sha in self._unsure_at:
                 due.append(self._unsure_at[request.sha] + UNSURE_RETRY_S)
@@ -2733,6 +2982,9 @@ class WakeOnService:
                 continue
             if request.pending_text:
                 self._fire(request, request.pending_text)
+            elif request.reopen_owed:
+                if reopen_due(request, now):
+                    self._settle(request, self._reopen_watch)
             elif request.kind == KIND_DECK_DEPLOY and self._deck_includes(request.sha):
                 self._fire(
                     request,
@@ -2745,6 +2997,13 @@ class WakeOnService:
                 ):
                     self._start_build_run(request, keys)
             elif request.deadline <= now:
+                if request.kind == KIND_WATCH:
+                    if now < ends_at(request):
+                        continue  # a run started before the deadline may still find it back
+                    # Its time ran out with the problem never back (#4466): no wake.
+                    log.info("wake-on: watch %s ended quietly", request.id)
+                    self.registry.remove([request.id])
+                    continue
                 if request.kind == KIND_NEEDS_YOU and not self._present(request):
                     # Its week is up with nobody in the chat: end it without a word (#3464).
                     log.info("wake-on: %s is away; ended %s", request.session_key, request.id)
@@ -2772,12 +3031,14 @@ class WakeOnService:
                     and self._settle(request, self._ask_again)
                 ):
                     continue
-                down = ""
-                if request.kind == KIND_REVIEW:
-                    try:
-                        down = self._reviewer_down()
-                    except Exception:  # noqa: BLE001 - a health read never blocks a wake
-                        log.warning("wake-on: reviewer health unreadable", exc_info=True)
+                if (
+                    request.kind == KIND_REVIEW
+                    and request.number is not None
+                    and self._recover_review is not None
+                    and self._settle(request, self._recover_at_timeout)
+                ):
+                    continue
+                down = self._down() if request.kind == KIND_REVIEW else ""
                 self._fire(request, timeout_message(request, self._review_chats, down))
 
     def _settle(self, request: WakeRequest, work: Callable[[WakeRequest], Awaitable[None]]) -> bool:
@@ -2804,6 +3065,54 @@ class WakeOnService:
         self._side_tasks.add(task)
         task.add_done_callback(self._side_tasks.discard)
         return True
+
+    def _down(self) -> str:
+        """Why no reviewer can start at all (#4064), or ""; a health read never blocks a wake."""
+        try:
+            return self._reviewer_down()
+        except Exception:  # noqa: BLE001 - a health read never blocks a wake
+            log.warning("wake-on: reviewer health unreadable", exc_info=True)
+            return ""
+
+    async def _recover_at_timeout(self, request: WakeRequest) -> None:
+        """#4478: before a review wait's timeout says no verdict came, read back a verdict
+        posted for it whose webhook never came, once. Taken in, the verdict reaches the chat
+        and ends the wait the usual way; a wait it left held is told so in a short message
+        rather than "no verdict". A call the services process took but did not answer may
+        still be taking one in, so the wait is moved on once (``RECOVER_RETRY_S``) and read
+        again before anything is said. Every other run ends the wait."""
+        from .services_link import ServicesUncertain
+
+        found = ""
+        uncertain = False
+        try:
+            found = await self._recover_review(  # type: ignore[misc]
+                request.repository, int(request.number or 0)
+            )
+        except ServicesUncertain:
+            uncertain = True
+        except Exception:  # noqa: BLE001 - nothing found: the timeout says so as today
+            log.warning("wake-on: reading back %s's verdict failed", request.target, exc_info=True)
+        now = self._clock()
+        held = next((item for item in self.registry.all() if item.id == request.id), None)
+        retried = self._recovery_uncertain.pop(request.id, None)
+        if held is None or held.deadline > now or held.pending_text:
+            return  # answered, cancelled or renewed while it read
+        if uncertain and retried != held.deadline:
+            # The first uncertain call of this deadline: a renewal since is a fresh timeout.
+            deadline = now + RECOVER_RETRY_S
+            self._recovery_uncertain[request.id] = deadline
+            log.info("wake-on: %s's verdict read-back did not answer; again", request.target)
+            if self.registry.revise(held.id, now, deadline=deadline) is None:
+                self._recovery_uncertain.pop(request.id, None)
+            return
+        if found:
+            self._fire(held, recovered_message(held, found))
+            return
+        text = timeout_message(held, self._review_chats, self._down())
+        if uncertain:
+            text += RECOVER_UNCERTAIN_NOTE
+        self._fire(held, text)
 
     async def _read_at_timeout(self, request: WakeRequest) -> None:
         """B1 of #4253: read a timed-out merge or CI wait from GitHub once. A result wakes
@@ -3172,6 +3481,7 @@ class WakeOnService:
                 request.check_command
                 and request.id not in self._checks
                 and not request.pending_text
+                and not request.reopen_owed
                 and request.check_at <= now < request.deadline
             ):
                 taken = self.registry.claim_check(request.id, now)
@@ -3212,6 +3522,9 @@ class WakeOnService:
             last = f"{_clock(now)}, printed: {tail or '(nothing)'}"
             self.registry.settle_check(request.id, request.check_gen, now, last=last)
             return
+        if request.kind == KIND_WATCH:
+            self._watch_done(request, code, output, why, now)
+            return
         owed = self.registry.settle_check(
             request.id,
             request.check_gen,
@@ -3220,6 +3533,79 @@ class WakeOnService:
         )
         if owed is not None:
             self._fire(owed, owed.pending_text)
+
+    def _watch_done(
+        self, request: WakeRequest, code: int | None, output: str, why: str, now: float
+    ) -> None:
+        """A watch's run that did not say not seen (#4466). Exit 0 owes a reopen, and no
+        message until it settles (``_reopen_watch``); an error is counted, and only
+        ``WATCH_ERRORS_TO_WAKE`` in a row owe the chat a message."""
+        if code == 0:
+            tail = output.strip()[-MAX_CHECK_OUTPUT:]
+            self.registry.settle_check(
+                request.id,
+                request.check_gen,
+                now,
+                change=lambda held: replace(
+                    held,
+                    reopen_owed=True,
+                    fired_output=tail,
+                    fired_at=now,
+                    reopen_claimed_at=0.0,
+                    reopen_tries=0,
+                    reopen_retry_at=0.0,
+                ),
+            )
+            return
+
+        def failed(held: WakeRequest) -> WakeRequest:
+            runs = held.check_errors + 1
+            if runs >= WATCH_ERRORS_TO_WAKE:
+                return replace(
+                    held,
+                    check_errors=runs,
+                    pending_text=watch_failed_message(held, code, output, why, now, runs),
+                )
+            tail = " ".join(output.split())[-MAX_CHECK_LAST:]
+            return replace(
+                held, check_errors=runs, check_last=f"{_clock(now)}, {why}: {tail or '(nothing)'}"
+            )
+
+        owed = self.registry.settle_check(request.id, request.check_gen, now, change=failed)
+        if owed is not None and owed.pending_text:
+            self._fire(owed, owed.pending_text)
+
+    async def _reopen_watch(self, request: WakeRequest) -> None:
+        """Reopen a watch's issue with the check's output, then owe its message (#4466).
+
+        Claimed first under the registry's lock, so a second web worker skips it; the comment
+        carries the watch's marker, so a try after a crash never posts it twice, and the
+        reopen itself is idempotent. The message is written only once the try settled, so it
+        always says what the deck really did.
+        """
+        held = self.registry.claim_reopen(request.id, self._clock())
+        if held is None:
+            return
+        issue = watch_issue(held)
+        reopened = False
+        if issue is not None and self._reopen is not None:
+            try:
+                reopened = await self._reopen(
+                    issue.repository,
+                    issue.number,
+                    WATCH_MARKER.format(id=held.id),
+                    watch_comment(held),
+                )
+            except Exception:  # noqa: BLE001 - a failed try is tried again
+                log.warning("wake-on: reopening for watch %s failed", held.id, exc_info=True)
+        settled = self.registry.settle_reopen(
+            held.id,
+            reopened or issue is None or self._reopen is None,
+            self._clock(),
+            lambda owed: watch_message(owed, reopened),
+        )
+        if settled is not None and settled.pending_text:
+            self._fire(settled, settled.pending_text)
 
     def needs_you_waited(self) -> bool:
         """Whether any chat waits on Works needing the owner: the overview then rebuilds on

@@ -78,7 +78,8 @@ Work's own facts. Nothing here is stored and nothing here asks the agent to call
    **— review asked for changes at 15:11, sent to the agent** or **… not sent: no chat owns
    it**. A hold only a person lifts (the spec-only label) is **Needs you — its pull
    request held: spec-only label** at once; any other that nothing moved for ``PR_STALE`` (no
-   push, no review, no turn) is **Needs you — … · nothing since 13:02**, Needs retry;
+   push, no review, no turn) is **Needs you — … · nothing since 13:02**, Needs retry, reported as
+   a bug when its hold is a ready head no review ever started on (#4579);
 9. otherwise the agent ended its turn without a next step: no question, no wait, no review,
    no closed issue. Its pull requests all merged with the issue still open is one of these:
    the agent decides whether work is left and closes the issue if not. That is never a
@@ -100,7 +101,10 @@ Work's own facts. Nothing here is stored and nothing here asks the agent to call
    message** (#3560). The label also stands over the earlier rules that only wait on a person — the
    reviewer's escalation, Ready for merge, a held pull request, a posted spec — whatever pull
    request is open (#3757): the person already said they will write. A question, a turn, a death, a
-   wait or a review in progress still reads as itself.
+   wait or a review in progress still reads as itself. A Work whose issue went to another deck
+   reads **Parked — its issue went to another deck** (#4450) over every rule but a turn, a
+   question and a closed issue: the router stopped its agent and told it to do nothing more, so
+   its ending, its review and its death are not this deck's to ask about, start or report.
 
 Since #2944 this is the one status of such a Work: the front page's section, the operator's
 category and the buttons follow it too (``work_story.work_status``). A time not on today's
@@ -181,6 +185,14 @@ PR_STALE = timedelta(hours=3)
 MAX_QUOTE = 140
 
 _SENTENCE_END = re.compile(r"(?<=[.!?])\s|\n")
+#: What a Work handed to another deck still reads as itself (#4450): a turn or a question a
+#: person started there, and an issue that closed. Everything else rests as Parked: its review,
+#: its next step, its death and its merge are the other deck's now.
+_HANDED_OVER_KEEPS = frozenset({QUESTION, WORKING, STALLED, REVIVING, FINISHED, CLOSED})
+#: Of those, what keeps a handed-over Work in this deck's own sections: a turn or a question
+#: still live here. Resting, finished or closed, it is the other deck's (#4450 review).
+HANDED_OVER_SHOWN = frozenset({QUESTION, WORKING, STALLED, REVIVING})
+
 #: A markdown link, shown as its text alone: a status line is plain words (#2944).
 _LINK = re.compile(r"\[([^\]]+)\]\([^)\s]+\)")
 #: A fenced code block, which never holds the question a reply ends on (#3887).
@@ -244,6 +256,9 @@ class DerivedInputs:
     merged: bool = False
     live_result: str = ""
     live_line: str = ""
+    # A person wrote to the Work's chats after a ``needs_person`` check, and the agent then
+    # began a wait of its own (#4562): it went back to work, so that wait shows, not the try.
+    live_superseded: bool = False
     finished: bool = False  # a person finished the Work (D15)
     review_pr: int | None = None  # a ready pull request an open review chat is about
     review_since: datetime | None = None  # when that review chat opened
@@ -287,6 +302,9 @@ class DerivedInputs:
     pr_findings_at: datetime | None = None
     pr_findings_told: bool = False
     pr_quiet_since: datetime | None = None
+    #: The release's hold is "no review pass at its head" (#4579): ready, not conflicting, its
+    #: agent idle, and no review at that head. Stuck that way, no review ever started.
+    pr_unreviewed: bool = False
     last_text: str = ""  # the ended turn's final text
     ended_at: datetime | None = None
     #: The pull request a Ready for merge line names, when the release says only a person's
@@ -320,6 +338,9 @@ class DerivedInputs:
     #: ``_PARKED_OVER``, whatever pull request is open (#3733, #3757); the next person's
     #: message starts the agent again.
     parked: bool = False
+    #: The router handed its issue to another deck and stopped its agent (#3731): it rests as
+    #: ``parked`` does, until the issue is assigned back (#4450).
+    handed_over: bool = False
 
 
 @dataclass(frozen=True)
@@ -341,7 +362,8 @@ class DerivedStatus:
     review_failed: bool = False
     #: The review chat (``owner/repo#n``) a Ready for merge line links (#2992).
     review_ref: str = ""
-    #: An ending AgentDeck reports as a bug: the agent ended without a next step twice (#2960).
+    #: An ending AgentDeck reports as a bug: the agent ended without a next step twice (#2960),
+    #: or a ready head no review ever started on, stuck for hours (``PR_STUCK``, #4579).
     bug: bool = False
     #: The Mac approval page a chat waiting on the boss's tap linked (#3106), "" otherwise.
     approval_href: str = ""
@@ -493,7 +515,13 @@ def derived_status(
     rules, nudge and bug report are unchanged: they read ``kind``.
     """
     status = _first_rule(inputs, now=now, clock=clock)
-    if inputs.parked and status.kind in _PARKED_OVER:
+    if inputs.handed_over and status.kind not in _HANDED_OVER_KEEPS:
+        # Another deck works it now: this deck asks, reviews, retries and reports nothing.
+        summary = "its issue went to another deck"
+        status = DerivedStatus(
+            PARKED, f"Parked — {summary}", summary=summary, chat_href=inputs.chat_href
+        )
+    elif inputs.parked and status.kind in _PARKED_OVER:
         summary = "waits for your message"
         status = DerivedStatus(
             PARKED, f"Parked — {summary}", summary=summary, chat_href=inputs.chat_href
@@ -665,6 +693,7 @@ def _first_rule(
         and not inputs.closed
         and not inputs.pr_open
         and not inputs.live_pending
+        and not inputs.live_superseded
     ):
         # Only a person can see it works (#4210): the agent asked no question and ended its
         # turn, so this is not an ending to ask about, nor a question for Needs you.
@@ -826,8 +855,12 @@ def _pr_wait(
     stale = quiet + PR_STALE if quiet is not None else None
     if stale is not None and now >= stale:
         summary = f"{said} · nothing since {clock(quiet)}"
+        # A ready head no review started on for hours is the deck's, not a slow lane (#4579):
+        # an open review chat would read In review above, and findings are the agent's.
+        unreviewed = inputs.pr_unreviewed and inputs.pr_findings_at is None
         return DerivedStatus(
-            PR_STUCK, f"Needs you — {summary}", at=quiet, summary=summary, chat_href=href
+            PR_STUCK, f"Needs you — {summary}", at=quiet, summary=summary, chat_href=href,
+            bug=unreviewed,
         )
     line = f"Waiting on {said}" + (f", until {clock(until)}" if until else "")
     deadline = min((t for t in (until, stale) if t is not None), default=None)

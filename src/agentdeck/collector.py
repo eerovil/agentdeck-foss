@@ -7,7 +7,8 @@ Per account we run up to four cooperating tasks:
 - a **source watcher** — coalesces filesystem changes and wakes the scan loop,
 - a **liveness sweep** (cheap ``sweep_liveness``) — run when the source watch sees
   a write, a live terminal chat's process exits (a pidfd each), or the provider's
-  next clock deadline falls due; ``liveness_interval_s`` only spaces sweeps (#2865),
+  next clock deadline falls due; ``liveness_interval_s`` only spaces sweeps (#2865).
+  The write also wakes an open page on the written chat at once (#4543),
 - a **usage poller** (provider-supplied) — the OAuth limit reader.
 
 One additional host sampler publishes aggregate CPU and memory usage. The heavy-command
@@ -331,6 +332,10 @@ class Collector:
                         (change, Path(path)) for change, path in changes
                     )
                 wake.set()
+                if wake_liveness:
+                    # A page open on a chat whose transcript was written reads it
+                    # now, not after the sweep's spacing (#4543).
+                    self._wake_written_chats(account_key, changes)
                 # The same writes are what the liveness sweep reads (#2865).
                 if wake_liveness and (liveness := self._liveness_wakes.get(account_key)):
                     liveness.set()
@@ -347,6 +352,18 @@ class Collector:
                 # Release a scan loop already waiting on this watcher; on its
                 # next pass it sees the missing wake and resumes periodic scans.
                 wake.set()
+
+    def _wake_written_chats(self, account_key: str, changes) -> None:
+        account = next((a for a in self.accounts if a.key == account_key), None)
+        if account is None:
+            return
+        try:
+            keys = self._provider(account).written_chats(
+                account, (Path(path) for change, path in changes if change is Change.modified)
+            )
+            self.state.wake_chat_pages(keys, only_open=True)
+        except Exception as exc:  # noqa: BLE001 -- the sweep still wakes the page
+            log.debug("waking chat pages for %s failed: %s", account_key, exc)
 
     async def _account_watch_loop(
         self, account: Account, wake: asyncio.Event
@@ -739,7 +756,12 @@ class Collector:
         feed = runtime_feed.shared()
         bus = self.state.bus
         self._runtime_feed_unlisten = feed.add_listener(
-            lambda kinds: bus.publish(runtime_feed.RUNTIME_TOPIC, kinds)
+            lambda kinds: (
+                # A draft moves once a sentence and only chat pages read it (#4543).
+                bus.publish(runtime_feed.RUNTIME_TOPIC, kinds - {runtime_feed.DRAFTS})
+                if kinds - {runtime_feed.DRAFTS}
+                else None
+            )
         )
         self._runtime_feed_hold = feed.subscribe(lambda _item: False)
 

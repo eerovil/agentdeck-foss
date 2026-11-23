@@ -23,9 +23,9 @@ cannot be reached at all, a subscription falls back to its consumer's old cadenc
 the runtime restarts later than the web during a deploy (ADR 0007, "Consequences").
 
 Items are ``<kind>`` or ``<kind>:<scope>``; the kinds are :data:`WORKERS`, :data:`JOBS`,
-:data:`RELATIONS` and :data:`RUNS`. Every change the client learns of is also published
-on the web's :class:`~agentdeck.events.EventBus` under :data:`RUNTIME_TOPIC`, with the
-frozenset of kinds that moved, for views (the Work overview) that read runtime rows.
+:data:`RELATIONS`, :data:`RUNS` and :data:`DRAFTS`. Every change the client learns of is
+also published on the web's :class:`~agentdeck.events.EventBus` under :data:`RUNTIME_TOPIC`,
+with the frozenset of kinds that moved, for views (the Work overview) that read runtime rows.
 """
 
 from __future__ import annotations
@@ -53,7 +53,9 @@ WORKERS = "workers"
 JOBS = "jobs"
 RELATIONS = "relations"
 RUNS = "runs"
-KINDS = frozenset({WORKERS, JOBS, RELATIONS, RUNS})
+# The reply a worker is writing now (#4543): moves once a sentence, read only by chat pages.
+DRAFTS = "drafts"
+KINDS = frozenset({WORKERS, JOBS, RELATIONS, RUNS, DRAFTS})
 
 # How long the runtime holds a request with nothing to say. It is a keep-alive, not a
 # poll: answering it reads nothing.
@@ -74,6 +76,11 @@ ALL: Any = object()  # mark every key of a check
 def workers_item(provider_id: str, label: str) -> str:
     """The feed item for one account's keyed workers (and, for Codex, its threads)."""
     return f"{WORKERS}:{provider_id}:{label}"
+
+
+def drafts_item(provider_id: str, label: str) -> str:
+    """The feed item for one account's drafts (#4543)."""
+    return f"{DRAFTS}:{provider_id}:{label}"
 
 
 def kind_of(item: str) -> str:

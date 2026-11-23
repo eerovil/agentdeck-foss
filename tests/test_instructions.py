@@ -1,5 +1,7 @@
 import pytest
+from public_copy import private_feature
 
+from agentdeck import mac_runner
 from agentdeck.command_artifacts import SESSION_TOKEN_ENV
 from agentdeck.providers.instructions import (
     GUIDED_ROLES,
@@ -10,6 +12,7 @@ from agentdeck.providers.instructions import (
     USE_CASE_WALKTHROUGH_NOT_APPLICABLE,
     WORK_SESSION_ROLE_INSTRUCTIONS,
     agentdeck_session_instructions,
+    guide_topics,
     resolve_session_role,
     session_guide_fingerprint,
     stored_session_role,
@@ -45,7 +48,10 @@ def test_primary_session_guide_covers_agentdeck_action_contracts():
     assert "structured user-input" in guide
     assert "Never infer approval" in guide
     # #3857: any chat can move its own pages to another chat, not only the deck chat.
-    assert '`"from": "<session-key>"`' in flat and "/api/view/open-chat" in flat
+    # Served on request since #4459.
+    open_chat = " ".join(guide_topics()["open-chat"].split())
+    assert '`"from": "<session-key>"`' in open_chat and "/api/view/open-chat" in open_chat
+    assert "`GET $AGENTDECK_URL/api/guide/open-chat`" in flat
     # Wayfinder's decision habits, for every agent (#3690).
     assert "the last is **None of these**" in flat
     assert "`Changes assumed: <detail> — <why>`" in flat
@@ -108,11 +114,13 @@ def test_session_guide_lets_every_session_question_an_outdated_rule():
             assert 'offer "Allow once" and "Don\'t"' in flat
             # The Poller's board commands were retired with its cards (#3025).
             assert "board-commands" not in flat
-            # The merge queue a person asks an agent to reorder (#3022).
-            assert "GET $AGENTDECK_URL/api/merge-queue/<owner>/<repo>" in flat
-            assert '{"order": ["#<number>", ...]}' in flat
-            # A Work a person asks an agent to star (#3116).
-            assert "PUT $AGENTDECK_URL/api/works/<owner>/<repo>/<issue number>/star" in flat
+            # The merge queue a person asks an agent to reorder (#3022), and a Work a
+            # person asks an agent to star (#3116): on request since #4459.
+            assert "`GET $AGENTDECK_URL/api/guide/merge-queue`" in flat
+            queue = " ".join(guide_topics()["merge-queue"].split())
+            assert "GET $AGENTDECK_URL/api/merge-queue/<owner>/<repo>" in queue
+            assert '{"order": ["#<number>", ...]}' in queue
+            assert "PUT $AGENTDECK_URL/api/works/<owner>/<repo>/<issue number>/star" in queue
 
 
 def test_session_guide_requires_concise_updates_and_handoffs_for_every_role():
@@ -146,10 +154,73 @@ def test_session_guide_requires_concise_updates_and_handoffs_for_every_role():
         assert "end with a numbered list of their steps in the reply" in flat
         assert "Every turn must conclude its user-facing work with a final response" in flat
         assert "The final response completes the turn" in flat
-        # #3136: workers kept posting screenshots and mockups when asked to prototype.
-        assert "the real app on its own local dev server on this host" in flat
-        assert "Screenshots, static mockup pages and design tools are not prototypes" in flat
-        assert "Post no screenshots of a prototype on the issue" in flat
+        assert "`GET $AGENTDECK_URL/api/guide/prototype`" in flat
+    # #3136: workers kept posting screenshots and mockups when asked to prototype.
+    # Served on request since #4459.
+    prototype = " ".join(guide_topics()["prototype"].split())
+    assert "the real app on its own local dev server on this host" in prototype
+    assert "Screenshots, static mockup pages and design tools are not prototypes" in prototype
+    assert "Post no screenshots of a prototype on the issue" in prototype
+    # #4560: rounds lost minutes each to a fresh server per round and to links and
+    # screenshots sent before anyone checked the server answered.
+    assert "documents a prototype start command" in prototype
+    assert "request the tailnet link the person will open once yourself" in prototype
+    assert "following redirects, and see a 2xx answer" in prototype
+    assert "read the server's log first" in prototype
+    assert "edit the files under the running prototype" in prototype
+    assert "restart that same server when it does not), then request the page again" in prototype
+    assert "never a fresh worktree or container per round" in prototype
+
+
+#: The longest guide any provider and role may start with (#4459). Rarely needed sections
+#: are served at `/api/guide/<topic>` instead; raise this only with a reason in the commit.
+#: 24_800 since #4567: the Work guide names the helper checks' command and how to give it
+#: room (a 30-minute background call, escalated in Codex), as it runs at the
+#: first push, before any checklist that could carry it. 24_950 since #4579: the owner
+#: approved one Work line telling the agent to report a deck it thinks is wrong (`deck-bug`)
+#: rather than override it; it is needed every turn, so it cannot move to a guide topic.
+SESSION_GUIDE_BUDGET_CHARS = 24_950
+
+
+def test_session_guide_stays_within_its_budget_and_points_at_every_topic(
+    capsys, tmp_path, monkeypatch
+):
+    """#4459: the guide went out with every call of every chat and kept growing. Its size
+    is printed and held under a budget, and every topic it moved out is pointed at.
+
+    Measured on a deck with the Mac program set up, so the switched-off chat's note counts.
+    A chat someone switched on gets the whole Mac recipe on purpose and is not measured.
+    """
+    monkeypatch.setenv(mac_runner.BASE_URL_ENV, "http://mac.example/")
+    monkeypatch.setenv(mac_runner.TOKEN_ENV, "shared")
+    monkeypatch.setenv(mac_runner.STATE_ENV, str(tmp_path / "switched-on.json"))
+    sizes = {}
+    pointed = ""
+    for provider in ("claude_code", "codex"):
+        for role in GUIDED_ROLES:
+            guide = agentdeck_session_instructions(
+                provider=provider, role=role, session_token="t" * 43, origin="https://deck.example"
+            )
+            sizes[f"{provider}/{role}"] = len(guide)
+            pointed += guide
+    with capsys.disabled():
+        print("\nsession guide characters:", sizes)
+    assert max(sizes.values()) <= SESSION_GUIDE_BUDGET_CHARS, sizes
+    for topic in guide_topics():
+        # The public stand-in points no chat at the Mac recipe.
+        if topic == "mac-runner" and getattr(mac_runner, "PUBLIC_STUB", False):
+            continue
+        assert f"`GET $AGENTDECK_URL/api/guide/{topic}`" in pointed, topic
+
+
+@private_feature(mac_runner)
+def test_the_mac_recipe_is_offered_only_where_the_mac_program_is_set_up(monkeypatch):
+    monkeypatch.setenv(mac_runner.BASE_URL_ENV, "http://mac.example/")
+    monkeypatch.setenv(mac_runner.TOKEN_ENV, "shared")
+    assert mac_runner.SWITCH_ON_ROUTE in guide_topics()["mac-runner"]
+    # A deck with no Mac program offers no recipe whose call would only fail.
+    monkeypatch.delenv(mac_runner.BASE_URL_ENV)
+    assert mac_runner.SWITCH_ON_ROUTE not in guide_topics()["mac-runner"]
 
 
 @pytest.mark.parametrize("provider", ("claude_code", "codex"))
@@ -523,6 +594,12 @@ def test_work_session_guide_says_what_the_deck_reads_and_names_no_poller():
         # #4320: make the change run, not wait for a later deploy or a job's schedule.
         assert "redeploy a merge that only a later deploy would apply" in flat
         assert "offer to run a changed scheduled job now" in flat
+        # #4567: the helper checks start at the first push, beside the first full test run.
+        assert "Post the use-case walkthrough, then start its helper checks" in flat
+        assert "beside the first full test run" in flat
+        # The Work's issue, not the body's first reference; and room to run (#4567 helpers).
+        assert "pre-review-helpers --cwd . --pull <pr> --issue <work issue>`" in flat
+        assert "background call with `timeout: 1800000`, in Codex escalated" in flat
         # No poller duties: nothing dispatches this chat, so nothing is owed to one.
         assert "There is no control command and no terminal report to file" in flat
         assert "worker-control" not in flat
@@ -534,6 +611,7 @@ def test_the_pre_review_checklist_says_how_to_do_each_point():
     into the checklist the deck sends then; each rule it held is still said there."""
     flat = " ".join(PRE_REVIEW_HOW.split())
     assert "--verification --session-token" in flat
+    assert "Start it right after the pull request's first push" in flat  # #4567
     # A diagram only for a new feature or when the owner asked for one (#4254), one per
     # feature, read by its boxes (#3860).
     assert "only when this Work adds a new feature" in flat
@@ -565,14 +643,19 @@ def test_the_pre_review_checklist_says_how_to_do_each_point():
 
 def test_web_research_reaches_claude_and_the_page_reader_reaches_both():
     """#4290: Claude's search cannot reach Reddit, Codex's can, so only Claude is sent to
-    `agentdeck research`; both get the page reader."""
+    `agentdeck research`; both get the page reader. Served on request since #4459."""
+    web = " ".join(guide_topics()["web"].split())
+    web_read = " ".join(guide_topics()["web-read"].split())
+    assert "~/agentdeck/.venv/bin/agentdeck research` with the question on stdin" in web
+    assert "you are not yourself a delegated chat" in web
+    assert "answers it with links and verbatim quotes" in web
+    assert "agentdeck research" not in web_read
+    for text in (web, web_read):
+        assert "~/agentdeck/.venv/bin/agentdeck read <url>" in text
+        assert "do not retry a 3 at once" in text
     for role in GUIDED_ROLES:
         claude = " ".join(agentdeck_session_instructions(provider="claude_code", role=role).split())
         codex = " ".join(agentdeck_session_instructions(provider="codex", role=role).split())
-        assert "~/agentdeck/.venv/bin/agentdeck research` with the question on stdin" in claude
-        assert "you are not yourself a delegated chat" in claude
-        assert "answers it with links and verbatim quotes" in claude
-        assert "agentdeck research" not in codex
-        for guide in (claude, codex):
-            assert "~/agentdeck/.venv/bin/agentdeck read <url>" in guide
-            assert "do not retry a 3 at once" in guide
+        assert "`GET $AGENTDECK_URL/api/guide/web`" in claude
+        assert "/api/guide/web`" not in codex
+        assert "`GET $AGENTDECK_URL/api/guide/web-read`" in codex

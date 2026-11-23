@@ -204,11 +204,17 @@
       return false;
     }
     window.AgentDeckWorkInProgress = workInProgress;
+    // A reload with the reload button's time limit (#4591), so a hung one stops
+    // spinning and says so; a plain one before page_refresh.js has loaded.
+    function timedReload(by) {
+      if (window.AgentDeckPageRefresh) window.AgentDeckPageRefresh.reload(by);
+      else window.location.reload();
+    }
     function reloadWhenIdle() {
       if (reloading || !updatePending || workInProgress()) return;
       reloading = true;
       if (updateRetry !== null) { clearInterval(updateRetry); updateRetry = null; }
-      window.location.reload();
+      timedReload('update');
     }
     navigator.serviceWorker.addEventListener('controllerchange', function () {
       if (reloading) return;
@@ -242,7 +248,7 @@
       if (data.type !== 'agentdeck:open' && data.type !== 'agentdeck:open-home') return;
       var path = data.type === 'agentdeck:open' && typeof data.path === 'string'
         && /^\/(?![\/\\])/.test(data.path) ? data.path : '/';
-      if (location.pathname + location.search + location.hash === path) window.location.reload();
+      if (location.pathname + location.search + location.hash === path) timedReload('open');
       else window.location.assign(path);
     });
   })();
@@ -299,6 +305,12 @@
 </head>
 <body class="{% block body_class %}{% endblock %}" hx-ext="sse,keyed-works,keyed-rows" {% block body_sse %}sse-connect="/events"{% endblock %}>
   <header class="topbar">
+    {# Says the page is not live yet after the app comes back (#4601): a phone's
+       network can take 10–20 s to wake, and the old page looked live meanwhile.
+       Hung just under the bar, over the page, so nothing moves (page_refresh.js). #}
+    <div class="resume-notice" id="resume-notice" role="status" aria-live="polite" hidden>
+      <button type="button" data-resume-notice disabled></button>
+    </div>
     <div class="topbar-row">
       {% block topbar_nav %}{% endblock %}
       {# The wordmark carries a house mark alongside it so a phone can keep this
@@ -632,7 +644,11 @@
       // a slow first connect, or any reconnect — would never be pushed (#2611).
       refreshPendingInteraction();
     });
-    document.body.addEventListener('htmx:sseMessage', function () { lastMsgAt = Date.now(); });
+    document.body.addEventListener('htmx:sseMessage', function () {
+      lastMsgAt = Date.now();
+      heardAt = lastMsgAt;
+      resumeHeard();
+    });
     document.body.addEventListener('htmx:sseClose', function (e) {
       if (e.detail && e.detail.source) sources.delete(e.detail.source);
     });
@@ -640,8 +656,9 @@
     function streamStale() { return Date.now() - lastMsgAt > 75000; }
     function reconnectStreams(replace) {
       // Start a fresh grace period before connecting. The next real open/message
-      // refreshes this again; if reconnecting fails, the watchdog retries rather
-      // than reloading and wiping focused/selected controls or deliberate scroll.
+      // refreshes this again. If nothing arrives, the resume checks below reload
+      // the page, but never over unsent text, a ticked answer, an open panel or a
+      // deliberate scroll (#4591).
       lastMsgAt = Date.now();
       // Every stream, not only the body's: on a desktop the front page and an open Work
       // are columns with streams of their own (#2290), and `closeStreams` shuts those too.
@@ -653,8 +670,77 @@
     function recover() {
       if (document.visibilityState === 'visible' && streamStale()) {
         reconnectStreams(true);
+        startResumeChecks();
       }
     }
+
+    // After a resume, the live updates must really arrive (#4591). A phone back
+    // from sleep can hold a connection that died while it slept without knowing:
+    // the reconnect above then waits on it, the old page stays on screen, and the
+    // only cure was to close the app. `heardAt` is written only by a real stream
+    // message — not by an open, which a stuck stream can still report, and not by
+    // reconnectStreams(), which moves `lastMsgAt` for the watchdog's grace period.
+    var timings = window.AgentDeckResumeTimings || {};
+    var RESUME_CHECK_MS = timings.resumeCheckMs || 8000;
+    var RESUME_RELOAD_MS = timings.resumeReloadMs || 20000;
+    // A quick wake hears the stream's first update well inside this, so the
+    // notice that the page is not live yet never flashes on it (#4601).
+    var RESUME_NOTICE_MS = timings.noticeMs || 1000;
+    var heardAt = 0;
+    var resumedAt = 0;
+    var resumeTimers = [];
+    var notLive = false;
+    function refresher() { return window.AgentDeckPageRefresh || null; }
+    function cancelResumeChecks() {
+      resumeTimers.forEach(clearTimeout);
+      resumeTimers = [];
+    }
+    function heardSinceResume() { return heardAt > resumedAt; }
+    function markNotLive(on) {
+      notLive = on;
+      var r = refresher();
+      if (r) r.setLive(!on);
+    }
+    function resumeHeard() {
+      var r = refresher();
+      if (resumedAt && r && r.stallOpen()) {
+        r.noteStall({ first_message_at_ms: Date.now() - resumedAt });
+      }
+      if (r) r.setNotice('hidden');
+      cancelResumeChecks();
+      if (notLive) markNotLive(false);
+    }
+    function startResumeChecks() {
+      cancelResumeChecks();
+      // A page with no live updates (the kiosk with no session) never hears one.
+      if (!streamElements().length) return;
+      resumedAt = Date.now();
+      resumeTimers.push(setTimeout(function () {
+        if (heardSinceResume() || document.hidden) return;
+        var r = refresher();
+        if (r) r.setNotice('reconnecting');
+      }, RESUME_NOTICE_MS));
+      resumeTimers.push(setTimeout(function () {
+        if (heardSinceResume() || document.hidden) return;
+        markNotLive(true);
+        var r = refresher();
+        if (r) r.setNotice('not-live');
+        if (r) r.startStall({resumed_at: resumedAt, reconnect_at_ms: Date.now() - resumedAt});
+        reconnectStreams(true);
+      }, RESUME_CHECK_MS));
+      resumeTimers.push(setTimeout(function () {
+        if (heardSinceResume() || document.hidden) return;
+        // A reload must not wipe what someone is in the middle of; the amber
+        // button then waits for their tap. A browser without a service worker
+        // has no such check, so it never reloads by itself.
+        if (!window.AgentDeckWorkInProgress || window.AgentDeckWorkInProgress()) return;
+        var r = refresher();
+        if (r) r.reload('auto');
+        else location.reload();
+      }, RESUME_RELOAD_MS));
+    }
+    // A page that loaded is past any restarting-screen loop (restarting.html).
+    try { sessionStorage.removeItem('agentdeck:restarting-reloads'); } catch (_) {}
 
     var bgClosed = false;
     function streamElements() {
@@ -670,7 +756,11 @@
       });
     }
     window.addEventListener('pagehide', closeStreams);
-    window.addEventListener('pageshow', function (e) { if (e.persisted) location.reload(); });
+    window.addEventListener('pageshow', function (e) {
+      if (!e.persisted) return;
+      if (window.AgentDeckPageRefresh) window.AgentDeckPageRefresh.reload('restore');
+      else location.reload();
+    });
     // Battery: backgrounding an installed PWA fires visibilitychange(hidden) but
     // NOT reliably pagehide, and Android keeps the app + its SSE socket alive for
     // minutes. Left open, the server keeps tailing the transcript and pushing
@@ -710,14 +800,20 @@
     document.addEventListener('visibilitychange', function () {
       applyBgPause();
       if (document.hidden) {
+        // Nothing checks or reloads a page nobody is looking at.
+        cancelResumeChecks();
+        if (refresher()) refresher().setNotice('hidden');
         if (voiceOn()) return;
         closeStreams();
         bgClosed = true;
         return;
       }
+      // Only a reopened stream owes a prompt first message. One kept open for
+      // voice mode may be quiet for up to 30 s; the watchdog below covers it.
       if (bgClosed) {
         bgClosed = false;
         reconnectStreams(false);
+        startResumeChecks();
       }
       refreshPendingInteraction();
       setTimeout(recover, 2000);

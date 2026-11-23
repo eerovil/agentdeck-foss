@@ -36,8 +36,14 @@ def test_both_enforcement_halves_share_one_notion_of_heavy():
     """A suite refused under Claude and started under Codex is the bug."""
     hook = _hook()
 
-    assert hook.HEAVY is classify.HEAVY
-    assert hook.EXEMPT is classify.EXEMPT
+    # The hook loads classify.py by path as a module of its own, so its regexes
+    # are other objects than ours; `is` across the two held only while `re`'s
+    # cache did (#4582). Check the re-export inside the hook, and the text here.
+    assert hook.classify is not None, "the hook could not load classify.py"
+    for name in ("HEAVY", "EXEMPT"):
+        ours, shared = getattr(hook, name), getattr(classify, name)
+        assert ours is getattr(hook.classify, name), name
+        assert (ours.pattern, ours.flags) == (shared.pattern, shared.flags), name
     assert hook.reason("pytest -q", "/tmp") == classify.queue_advice("pytest -q", "/tmp")
 
 

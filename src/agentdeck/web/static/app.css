@@ -238,7 +238,25 @@ a.job-queue-chat:hover, a.job-queue-chat:focus-visible { color: var(--fg);
 /* A <button>, unlike its neighbours, so it sheds the button chrome (#2240). */
 .refresh-nav-link { padding: 0; background: none; font: inherit; cursor: pointer; }
 .refresh-nav-link.is-refreshing svg { animation: refresh-spin .8s linear infinite; }
+/* The page has not heard its live updates since the app came back (#4591): the
+   same amber as the Mac's waiting state, border included, so it shows at 16px. */
+.refresh-nav-link.is-not-live { color: var(--warn); border-color: var(--warn);
+  background: color-mix(in srgb, var(--warn) 14%, transparent); }
 @keyframes refresh-spin { to { transform: rotate(1turn); } }
+/* "Reconnecting…" after the app comes back (#4601): hung just under the sticky
+   topbar and over the page, so it takes no height and nothing moves. Amber, like
+   the reload button, once a tap on it reloads. */
+.resume-notice { position: absolute; top: calc(100% + 6px); left: 50%;
+  transform: translateX(-50%); z-index: 11; pointer-events: none; }
+.resume-notice[hidden] { display: none; }
+.resume-notice button { pointer-events: auto; font: inherit; font-size: 12px;
+  line-height: 1.3; padding: 3px 10px; border-radius: 999px; white-space: nowrap;
+  border: 1px solid var(--line); background: var(--panel2); color: var(--muted);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, .25); }
+/* Untappable until a reload can help, so a tap passes through to the page. */
+.resume-notice button:disabled { cursor: default; opacity: 1; pointer-events: none; }
+.resume-notice.is-not-live button { cursor: pointer; color: var(--warn);
+  border-color: var(--warn); background: color-mix(in srgb, var(--warn) 14%, var(--panel)); }
 @media (prefers-reduced-motion: reduce) { .refresh-nav-link.is-refreshing svg { animation: none; } }
 .mac-runner-nav-link[data-waiting="0"] { color: var(--muted); }
 .mac-runner-nav-link:not([data-waiting="0"]) { color: var(--warn);
@@ -2206,6 +2224,7 @@ body.voice-log-page main { width: min(800px, 100%); }
 .voice-log-timing-summary th { color: var(--muted); font-weight: normal; font-size: 12px; }
 .voice-log-timing-summary td + td { font-variant-numeric: tabular-nums; }
 .voice-log-timing-total td { font-weight: 600; border-top: 1px solid var(--line); }
+.voice-log-timing-summary .voice-log-early-summary { margin-top: 10px; }
 .voice-log-timing { font-size: 12px; color: var(--muted); }
 /* A part keeps its label and seconds on one line (#4360). */
 .voice-log-timing-part { white-space: nowrap; }

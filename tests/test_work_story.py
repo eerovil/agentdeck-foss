@@ -688,6 +688,72 @@ def test_a_message_to_the_work_is_sent_through_the_chosen_chats_own_send(tmp_pat
     assert 'data-wd-receipt="accepted"' in response.text and "Worker chat" in response.text
 
 
+def _merged(number=2300, state="merged", hours=2):
+    when = datetime.now(UTC) - timedelta(hours=hours) if state == "merged" else None
+    url = f"https://github.com/eerovil/agentdeck/pull/{number}"
+    return OutputFact(url, "eerovil/agentdeck", number, "registered", state, merged_at=when)
+
+
+def _send_after(tmp_path, monkeypatch, outputs, result, *, send_state=202):
+    """A Work-page message to a Work whose card shows ``outputs`` and whose agent recorded
+    ``result`` as its live check; the Work's round afterwards (#4585)."""
+    from dataclasses import replace
+
+    from agentdeck.web import routes_actions, routes_works
+
+    async def fake_inject(request, session_key):
+        if send_state != 202:
+            raise HTTPException(status_code=send_state, detail="not taken")
+        return HTMLResponse(
+            "chat status", status_code=202, headers={"X-AgentDeck-Action-State": "accepted"}
+        )
+
+    real = routes_works.start_follow_up_round
+    monkeypatch.setattr(routes_actions, "inject_message", fake_inject)
+    monkeypatch.setattr(
+        routes_works,
+        "start_follow_up_round",
+        lambda app, card: real(app, replace(card, outputs=tuple(outputs))),
+    )
+    app = _app(tmp_path)
+    if result:
+        app.state.control_db.set_work_live_check(WORK.work_id, result, "looked", "")
+    response = _client(app).post(
+        work_href(WORK.work_id) + "/message", data={"message": "next: the docs page too"}
+    )
+    assert response.status_code == send_state
+    return app.state.control_db.load_work_rounds().get(WORK.work_id)
+
+
+def test_a_message_on_a_fully_merged_checked_work_starts_a_round(tmp_path, monkeypatch):
+    """#4585: the round was merged and checked live, so the person's next step is a new
+    round: its pull requests stop counting for the release and the page."""
+    outputs = (_merged(), _merged(2301, "closed"))
+    round_ = _send_after(tmp_path, monkeypatch, outputs, "verified")
+    assert round_ is not None
+    assert round_.earlier == {"eerovil/agentdeck#2300", "eerovil/agentdeck#2301"}
+
+
+@pytest.mark.parametrize(
+    ("outputs", "result", "send_state"),
+    [
+        # The answer to a Waiting-for-a-try belongs to the round it was asked in.
+        ((_merged(),), "needs_person", 202),
+        ((_merged(),), "not_live", 202),
+        # Merged, not yet checked live: "how is it going?" stays in its round.
+        ((_merged(),), "", 202),
+        # The next pull request is already open.
+        ((_merged(), _merged(2301, "open")), "verified", 202),
+        # The check was recorded before the newest merge.
+        ((_merged(), _merged(2301, hours=-1)), "verified", 202),
+        # A message the chat did not take starts nothing.
+        ((_merged(),), "verified", 422),
+    ],
+)
+def test_a_message_mid_round_starts_no_round(tmp_path, monkeypatch, outputs, result, send_state):
+    assert _send_after(tmp_path, monkeypatch, outputs, result, send_state=send_state) is None
+
+
 def test_a_refused_send_answers_in_words(tmp_path, monkeypatch):
     from agentdeck.web import routes_actions
 
@@ -1361,6 +1427,8 @@ def test_a_running_job_comes_first_and_the_rest_are_counted():
     status = work_status(_work(pull=True, chats=(chat,), jobs=jobs))
 
     assert [job.state for job in jobs] == ["running", "queued"]
+    # #4562: a running job still knows when it was queued, which ``since`` no longer says.
+    assert jobs[0].queued < jobs[0].since and jobs[1].queued == jobs[1].since
     assert status.headline == "Job running"
     assert re.fullmatch("x" * 39 + r"… · running \d+ min \(\+1 more\)\.", status.summary)
 

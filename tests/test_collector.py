@@ -334,6 +334,48 @@ async def test_stable_root_watcher_ignores_unrelated_account_changes(tmp_path, m
             await task
 
 
+async def test_a_transcript_write_wakes_only_an_open_page_on_that_chat(tmp_path, monkeypatch):
+    """#4543: an open chat page read a new transcript line only after the next
+    liveness sweep, spaced 3 s apart; the source watch now wakes it straight away,
+    and a chat nobody follows costs no publication."""
+    opened = _quick_awatch(monkeypatch)
+    project = tmp_path / "projects" / "p"
+    project.mkdir(parents=True)
+    watched, unwatched = project / "open.jsonl", project / "closed.jsonl"
+    (project / "open").mkdir()
+    subagent = project / "open" / "agent.jsonl"
+    for path in (watched, unwatched, subagent):
+        path.write_text("{}\n")
+    config = AppConfig(
+        accounts=[AccountConfig(provider="claude_code", label="main", config_dir=str(tmp_path))]
+    )
+    state = AppState()
+    collector = Collector(config, state)
+    account = collector.accounts[0]
+    assert ClaudeCodeProvider().written_chats(account, [watched, subagent, tmp_path / "x"]) == [
+        f"{account.key}:open"
+    ]
+    page = state.bus.subscribe(f"chat:{account.key}:open")
+    task = asyncio.create_task(
+        collector._watch_loop(
+            account.key, [str(tmp_path / "projects")], asyncio.Event(), wake_liveness=True
+        )
+    )
+    try:
+        await _opened(opened, tmp_path / "projects")
+        with unwatched.open("a") as handle:
+            handle.write("{}\n")
+        with watched.open("a") as handle:
+            handle.write("{}\n")
+        assert (await asyncio.wait_for(page.get(), 2.0))[0] == f"chat:{account.key}:open"
+        assert state.bus.revision(f"chat:{account.key}:closed") == (0,)
+    finally:
+        page.close()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
 async def test_appending_to_a_watched_root_file_does_not_force_a_full_scan(tmp_path):
     """Issue #1487: Claude's ``history.jsonl`` is both a direct child of the
     account root and a watched source, so the topology watcher saw every prompt

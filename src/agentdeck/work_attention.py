@@ -128,6 +128,8 @@ BUG_CHAT_STOPPED = "chat_stopped"
 BUG_ENDED_WITHOUT_NEXT_STEP = "ended_without_next_step"
 # A ready pull request's review chat went quiet with no reviewer running (#2943, #2960).
 BUG_REVIEW_STUCK = "review_stuck"
+# A ready pull request's head waited hours with no review started at all (#4579).
+BUG_REVIEW_NEVER_STARTED = "review_never_started"
 # The Deckhand causes that mean a chat's turn died or failed, rather than ended quietly.
 _CHAT_ERRORS = frozenset({"died_mid_turn", "turn_failed"})
 
@@ -294,8 +296,10 @@ def _derived(card: WorkCard, row_reason: str, made) -> OperatorAttention:
         return made(RELEASE_BLOCKED, row_reason, OPEN, INSPECT)
     if kind == "pr_stuck":
         # A pull request whose hold nothing moved for hours (#3097): a lost pass, findings that
-        # never arrived, tests nobody ran. Not filed as a bug: a slow lane is not the deck's.
-        return made(NEEDS_RETRY, row_reason, OPEN, INSPECT)
+        # never arrived, tests nobody ran. A slow lane is not the deck's, but a ready head no
+        # review ever started on is (#4579): every ready head is reviewed by itself.
+        cause = BUG_REVIEW_NEVER_STARTED if card.derived.bug else ""
+        return _bug(made(NEEDS_RETRY, row_reason, OPEN, INSPECT), cause)
     if kind == "review_stuck":
         # Every ready head is reviewed by itself, so a review nobody ran is the deck's (#2960).
         return _bug(

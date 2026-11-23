@@ -144,6 +144,7 @@ async def test_a_kiosk_locked_chat_wakes_within_its_own_limits_checked_again(tmp
     folder = tmp_path / "kitchen"
     folder.mkdir()
     (folder / ".mcp.json").write_text(json.dumps({"mcpServers": {"keep": {"command": "true"}}}))
+    (folder / "CLAUDE.md").write_text("Guide")
     host, spawned = _host(tmp_path, permission_mode="bypassPermissions")
     # Started as the kiosk starts it: locked, a token, a model, and no permission mode.
     await host.deliver(
@@ -188,6 +189,7 @@ async def test_a_kiosk_locked_chat_wakes_within_its_own_limits_checked_again(tmp
     # A limit gone since the last spawn refuses the wake, as it refuses the send.
     host, spawned = _host(tmp_path / "again")
     (folder / ".mcp.json").write_text(json.dumps({"mcpServers": {"keep": {"command": "true"}}}))
+    (folder / "CLAUDE.md").write_text("Guide")
     await host.deliver(
         "kitchen",
         "hello",
@@ -390,6 +392,7 @@ async def test_a_kiosk_locked_chat_warmed_over_http_steers_its_phrase_into_one_l
     folder = tmp_path / "kitchen"
     folder.mkdir()
     (folder / ".mcp.json").write_text(json.dumps({"mcpServers": {"keep": {"command": "true"}}}))
+    (folder / "CLAUDE.md").write_text("Guide")
     account = Account("claude_code:main", "claude_code", "main", tmp_path / "cfg")
     spawned = []
 

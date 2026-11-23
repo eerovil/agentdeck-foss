@@ -80,7 +80,7 @@ def due(
     return found
 
 
-def _instance(board: Any) -> tuple[str, str] | None:
+def instance(board: Any) -> tuple[str, str] | None:
     """``(state path, repository id)`` of the instance managing ``HOME``, or None."""
     managing = getattr(board, "managing", None)
     scopes = managing(HOME) if managing is not None else ()
@@ -131,7 +131,7 @@ def report(
     rows = due(rows, now=now, since=since)
     if not rows:
         return 0
-    target = _instance(board)
+    target = instance(board)
     if target is None:
         return 0
     state_path, repo = target

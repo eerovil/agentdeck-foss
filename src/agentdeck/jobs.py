@@ -53,12 +53,13 @@ import json
 import logging
 import os
 import re
+import shlex
 import signal
 import sys
 import time
 import tomllib
 import uuid
-from collections.abc import Awaitable, Callable, Collection, Iterable
+from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -457,6 +458,11 @@ KILL_GRACE_S = 30.0
 # message tail, because six thousand tests can name a lot of failures — and still bounded,
 # because a run whose summary does not fit simply reports an incomplete list and never compares.
 FAILURE_SUMMARY_CHARS = 64_000
+# What a run that exited zero but reported failing tests says about it (#4565).
+HIDDEN_FAILURES_NOTE = (
+    "The command exited 0, but its output reports failed or erroring tests, so it counts as "
+    "failed. A pipe (`pytest … | tail`) hides pytest's own exit code; run pytest unpiped."
+)
 # A missing worker can be transient during recovery, but retrying a permanently
 # removed account every dispatch tick would spend a day producing log noise.
 NOTIFY_RETRY_S = 60.0
@@ -716,6 +722,9 @@ Notifier = Callable[[Job, str], Awaitable[bool | NotifyOutcome]]
 ProgressNotifier = Callable[[Job, str, int], Awaitable[bool | NotifyOutcome]]
 #: (job, note id, text): keep a pending note for the job's chat, waking nothing (#4306).
 NoteKeeper = Callable[[Job, str, str], bool]
+# Whether a job's chat still waits on its green verification (#4556): a Work with a pull
+# request still a draft, or none ready, is still to be told: its agent has not handed it over.
+ChatWaits = Callable[[Job], bool]
 
 
 def _notify_outcome(value: bool | NotifyOutcome) -> NotifyOutcome:
@@ -773,11 +782,15 @@ class JobQueue:
         memory_gate: MemoryGate | None = None,
         configure_slice: Callable[[], Awaitable[bool]] | None = None,
         keep_note: NoteKeeper | None = None,
+        chat_waits: ChatWaits | None = None,
     ) -> None:
         self._dir = Path(state_dir)
         # A green verification that proves its commit wakes nobody (#4080); its chat hears
         # of it as a pending note with its next message (#4306).
         self._keep_note = keep_note
+        # Unless its chat has not marked every open pull request ready yet (#4556): then it may
+        # be waiting on this run to do so, and is woken as for any other job.
+        self._chat_waits = chat_waits
         # Whether this host has the memory for one more local job (#3614), shared with the
         # slot leases, and how many local jobs the last sweep held back for lack of it, which
         # the job panel says.
@@ -1616,6 +1629,14 @@ class JobQueue:
             # its failures were not the commit's doing, and then it must prove its tree held
             # still exactly as a green one does. So must each follow-up (#2495): a rerun whose
             # checkout was edited while its pod copied it tested the fix, not the commit.
+            # A piped pytest exits with its pipe's last command (#4565): a zero whose log
+            # reports failed or erroring tests is a failed run, recorded and announced as one.
+            hidden = (
+                code == 0
+                and _reads_as_test_run(job)
+                and await asyncio.to_thread(_log_reports_failures, job)
+            )
+            failed = code != 0 or hidden
             if _is_verification(job) or job.follows:
                 after, after_all = await asyncio.to_thread(_snapshots, job)
                 self._jobs[job.id] = replace(
@@ -1623,7 +1644,7 @@ class JobQueue:
                     verified_workspace=after.as_record(),
                     verified_workspaces=after_all,
                 )
-            if _is_verification(job) and code != 0:
+            if _is_verification(job) and failed:
                 present = await asyncio.to_thread(_failures_present_on_base, self._jobs[job.id])
                 self._jobs[job.id] = replace(self._jobs[job.id], base_present=present)
             # A queued row carries no note of its own unless it was moved here
@@ -1635,8 +1656,10 @@ class JobQueue:
                     f"{job.lane} until {_clock_time(unreachable_until)}."
                 )
                 note = "\n\n".join(part for part in (note, said) if part)
+            if hidden:
+                note = "\n\n".join(part for part in (note, HIDDEN_FAILURES_NOTE) if part)
             persisted = self._finish(
-                job.id, state=DONE if code == 0 else FAILED, exit_code=code, note=note
+                job.id, state=FAILED if failed else DONE, exit_code=code, note=note
             )
         # Only once the outcome is on disk: until then the exit file is the one record of how
         # the command ended, and the next runtime finishes the row from it.
@@ -1933,7 +1956,8 @@ class JobQueue:
             said = (
                 "Its command is not a plain pytest call, so the queue does not rerun its "
                 "failing tests alone: they would run outside whatever the command sets up. "
-                "Fix them, or rerun the whole command."
+                "Fix them, recheck them through the same command narrowed to their ids, and "
+                "then rerun the whole command."
             )
             current = self._jobs[finished.id]
             self._jobs[finished.id] = replace(
@@ -2075,7 +2099,7 @@ class JobQueue:
             or job.id in self._announcing
         ):
             return
-        if _result_speaks_for_itself(current):
+        if _result_speaks_for_itself(current) and not self._waits_on_it(current):
             # Its chat hears of it with its next message (#4306); a note not kept is the
             # silence of before.
             self._note_proof(current)
@@ -2087,7 +2111,10 @@ class JobQueue:
             return
         self._announcing.add(job.id)
         try:
-            outcome = _notify_outcome(await self._notify(current, job_message(current)))
+            followed_up = any(other.follows == current.id for other in self._jobs.values())
+            outcome = _notify_outcome(
+                await self._notify(current, job_message(current, followed_up=followed_up))
+            )
             if not outcome.delivered:
                 self._defer_or_give_up(
                     job.id,
@@ -2106,6 +2133,22 @@ class JobQueue:
         finally:
             self._announcing.discard(job.id)
 
+    def _waits_on_it(self, job: Job) -> bool:
+        """Whether ``job``'s chat still waits on its green verification (#4556); a check that
+        fails wakes it, as a wake too many costs a turn and one too few stalls the Work."""
+        if self._chat_waits is None:
+            return False
+        try:
+            return bool(self._chat_waits(job))
+        except Exception:  # noqa: BLE001 - unknown is woken
+            log.warning(
+                "jobs: could not tell whether %s waits on job %s",
+                job.session_key,
+                job.id,
+                exc_info=True,
+            )
+            return True
+
     def _note_proof(self, job: Job) -> None:
         """Keep a pending note that ``job`` proved its commit, once per job and commit."""
         head = proven_commit(job.to_dict())
@@ -2115,6 +2158,13 @@ class JobQueue:
             f"AgentDeck: verification job {job.id} of {job.work_id} passed at {head[:12]}:"
             " the deck credits that commit as tested."
         )
+        if job.workspaces:
+            # Only the run's own checkout is credited (``poller_engine.verification``), and
+            # an agent read the other repository's missing credit as a deck fault (#4589).
+            text += (
+                " The other checkouts it named with --workspace are not credited: a pull"
+                " request there needs a verification job of its own, with --cwd on it."
+            )
         try:
             self._keep_note(job, f"job-proved:{job.id}@{head[:12]}", text)
         except Exception:  # noqa: BLE001 - a note lost is the silence of before
@@ -2325,6 +2375,38 @@ def _result_speaks_for_itself(job: Job) -> bool:
     return proves_commit(job.to_dict())
 
 
+def awaits_ready(
+    pulls: Iterable[tuple[Mapping[str, object] | None, bool]],
+    unnamed: Iterable[tuple[Mapping[str, object] | None, bool]] = (),
+) -> bool:
+    """Whether a Work's chat still waits on its green verification (#4556).
+
+    ``pulls`` are the Work's registered pull requests as the shared GitHub cache last read them,
+    each with whether that read is still fresh; ``None`` for one it has not read. The chat
+    waits unless at least one is open and ready and none is open and a draft: an agent that
+    has not marked every pull request ready may be waiting on this run to do so. Merged and
+    closed ones are earlier rounds and say nothing. Only a fresh read of an open one whose
+    ``isDraft`` is false counts as ready: one read too long ago, a row without a state or
+    without a draft flag, or one never read is unknown and counts as waiting, since a pull
+    request turned back to a draft must not read as ready for ever.
+
+    ``unnamed`` are the chat's registrations that named no Work: they may be another Work's,
+    so a draft or an unknown one among them wakes the chat, but a ready one never keeps it
+    silent.
+    """
+    ready = False
+    for named, rows in ((True, pulls), (False, unnamed)):
+        for pull, fresh in rows:
+            if not isinstance(pull, Mapping) or not pull.get("state"):
+                return True
+            if str(pull["state"]).upper() != "OPEN":
+                continue
+            if pull.get("isDraft") is not False or not fresh:
+                return True
+            ready = ready or named
+    return not ready
+
+
 def _result_class(job: Job, *, state: str, exit_code: int | None) -> str:
     """Separate a command that ran and failed from runner/queue failures."""
     if state == DONE:
@@ -2513,6 +2595,18 @@ def _git(*args: str, cwd: str) -> str:
     return done.stdout.strip()
 
 
+def _reads_as_test_run(job: Job) -> bool:
+    """Whether a zero exit is worth checking against the log (#4565): a verification, a
+    follow-up, or a command that runs pytest somewhere in it, piped or wrapped. A plain
+    ``cat`` of an old test log is none of these, and its exit code stands."""
+    return _is_verification(job) or bool(job.follows) or any("pytest" in p for p in job.command)
+
+
+def _log_reports_failures(job: Job) -> bool:
+    """Whether a job that exited zero still reports failed or erroring tests in its log."""
+    return baseline.reports_failures(read_tail(job.log_path, limit=FAILURE_SUMMARY_CHARS))
+
+
 def _read_failures(job: Job, *, succeeded: bool = False) -> tuple[tuple[str, ...], bool]:
     """The failing test ids in this job's log, each made whole by the per-test record when the
     suite kept one: a parametrized id can hold `` - `` itself (#3865)."""
@@ -2525,6 +2619,9 @@ def _read_failures(job: Job, *, succeeded: bool = False) -> tuple[tuple[str, ...
     ]
     text = read_tail(job.log_path, limit=FAILURE_SUMMARY_CHARS)
     failures, complete = extract_failures(text, succeeded=succeeded, known=known)
+    if complete and not failures and baseline.reports_failures(text):
+        # A summary of only skips beside a count of failures names none of them: not whole.
+        complete = False
     if complete and text.startswith("…") and not flaky.runs_pytest(job.command):
         # A script may run pytest several times, and an earlier run's summary can lie before
         # the cut even when only one remains after it (#4197). One pytest prints one summary,
@@ -3281,14 +3378,90 @@ def _cut_off_minutes(job: Job) -> int:
     return max(0, round((ended - started) / 60))
 
 
-def job_message(job: Job) -> str:
-    """What the submitting chat is told when its job ends."""
+# Output that shows a pytest run, for a command that does not call pytest itself (a script or
+# ``make test``): only then is a missing failure list worth a line.
+_PYTEST_OUTPUT = re.compile(
+    r"test session starts|short test summary info|^=+ .*\b\d+ (?:failed|passed|errors?)\b",
+    re.MULTILINE,
+)
+# ``pytest`` as a word of its own inside a command (``bash -lc "… python -m pytest …"``), not a
+# file or directory that merely contains it (``pytest.ini``, ``/tmp/pytest-of-me/…``).
+_PYTEST_WORD = re.compile(r"(?:^|[\s/])pytest(?:\s|$)")
+_LISTED_FAILURES = 20
+
+
+def _failing_tests_lines(job: Job, tail: str) -> list[str]:
+    """Which tests a failed test job failed, and how to recheck them (#4566).
+
+    Rerunning a whole file or suite to recheck one or two tests cost a Work half its time
+    (#4564), so the notice names the failing ids and asks for a rerun of just those. The ids
+    come only from the log's pytest summary, already read onto the job: when that is missing
+    or cut short the notice says so rather than guess.
+    """
+    if job.state != FAILED or job.exit_code is None:
+        return []
+    # Only the job's own command, options and all, runs a test as the run did: a focused rerun
+    # keeps it and swaps only its test paths, since ``-c``, ``-p`` or a script's own setup
+    # can decide what collects.
+    through = (
+        f"the job's own command, `{shlex.join(job.command)}`, keeping its options and "
+        "replacing its test paths with the node ids"
+    )
+    failures = list(job.failures)
+    if not failures:
+        if not (
+            flaky.runs_pytest(job.command)
+            or any(_PYTEST_WORD.search(str(part)) for part in job.command)
+            or _PYTEST_OUTPUT.search(tail)
+            or _PYTEST_OUTPUT.search(read_tail(job.log_path, limit=FAILURE_SUMMARY_CHARS))
+        ):
+            return []
+        if job.failures_complete:
+            return [
+                "The pytest summary names no failing test, so read the output above for "
+                "what failed."
+            ]
+        return [
+            "Failing tests: could not be read. The log holds no pytest summary of failures, "
+            "or the part of it that was read ends before one; open the full output to find "
+            "them.",
+            f"Once you know them, recheck just those tests by node id ({through}), not the "
+            "whole file or suite, and run the full set once, on your final commit, as the "
+            "verification.",
+        ]
+    capped = len(failures) >= baseline.MAX_FAILURES and not job.failures_complete
+    heading = (
+        "Failing tests:"
+        if job.failures_complete
+        else "Failing tests (the list may be incomplete: the output was too long or read "
+        "only in part):"
+    )
+    lines = [heading, *(f"- {test}" for test in failures[:_LISTED_FAILURES])]
+    if len(failures) > _LISTED_FAILURES:
+        more = len(failures) - _LISTED_FAILURES
+        # A list cut at the read's cap holds as many as were read; there may be more.
+        lines.append(f"- and {'at least ' if capped else ''}{more} more in the full output")
+    lines.append(
+        f"After a fix, recheck just these by node id: run {through}, not the whole file or "
+        "suite. Then run the full set once, on your final commit, as the verification."
+    )
+    return lines
+
+
+def job_message(job: Job, *, followed_up: bool = False) -> str:
+    """What the submitting chat is told when its job ends.
+
+    ``followed_up`` says the queue already reruns or resubmits this job's failures itself, and
+    its note says so: advice to recheck them by hand would then contradict it.
+    """
     outcome = {
         DONE: "finished successfully",
         FAILED: "failed",
         CANCELLED: "was cancelled",
         INTERRUPTED: "did not run",
     }.get(job.state, job.state)
+    if job.state == FAILED and HIDDEN_FAILURES_NOTE in (job.note or ""):
+        outcome = "failed: its exit code 0 hid the test failures its output reports"
     cut_off = job.state == INTERRUPTED and bool(job.started_at)
     if cut_off:
         outcome = f"was cut off by a runtime restart after {_cut_off_minutes(job)} min"
@@ -3313,6 +3486,10 @@ def job_message(job: Job) -> str:
     if job.state == INTERRUPTED:
         lines.append("")
         lines.append("Resubmit it with `agentdeck job submit` if you still need it.")
+    rerun = [] if followed_up or job.follows else _failing_tests_lines(job, tail)
+    if rerun:
+        lines.append("")
+        lines.extend(rerun)
     text = "\n".join(lines)
     # A passed job is a success notice: one step and a short answer (#4253). A failure is not.
     return deck_notices.routine(text) if job.state == DONE else text

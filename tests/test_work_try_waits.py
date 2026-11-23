@@ -74,6 +74,10 @@ async def keep(waits, lock, cards, *, degraded=False):
 def test_the_set_is_waiting_for_a_try_and_never_reopened():
     cards = [card(A), card(B, reopened=True), card("github_issue:acme/x#3", kind="in_review")]
     assert deployed_set(cards) == {A}
+    # #4585: a reopen that started a round is read from that round's own check.
+    in_round = card(B, reopened=True)
+    in_round.round_started_at = datetime(2026, 11, 20, tzinfo=UTC)
+    assert deployed_set([card(A), in_round]) == {A, B}
     assert _reopened({"state": "open", "state_reason": "reopened"})
     assert _reopened({"state": "OPEN", "state_reason": "REOPENED"})
     assert not _reopened({"state": "open", "state_reason": None})
