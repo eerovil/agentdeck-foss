@@ -21,6 +21,7 @@ from .review_refs import (  # noqa: F401 -- the same names the real module re-ex
     normalise,
     pull_facts,
     review_target,
+    target_closed,
     target_digest,
     target_head,
 )
@@ -42,3 +43,11 @@ async def open_review(*args, **kwargs):
 
 async def close_settled_review(*args, **kwargs) -> list[int]:
     return []
+
+
+async def open_chat(*args, **kwargs):
+    raise ReviewError("this edition has no review chats")
+
+
+async def close_issue(*args, **kwargs) -> bool:
+    return False

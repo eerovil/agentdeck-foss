@@ -10,7 +10,10 @@
 {% block content %}
 <article class="local-file-view">
   <header class="local-file-head">
-    <h1>{{ path.name }}</h1>
+    <div class="local-file-title">
+      <h1>{{ path.name }}</h1>
+      <a class="local-file-download" href="?download=1" download="{{ path.name }}">Download</a>
+    </div>
     <div class="local-file-path">{{ path }}</div>
     {% if markdown %}
     <a class="local-file-mode" href="?raw=1">source</a>

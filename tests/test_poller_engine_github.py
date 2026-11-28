@@ -12,6 +12,7 @@ import json
 import os
 import subprocess
 import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1144,6 +1145,12 @@ def test_a_window_about_to_reset_part_spent_reports_what_it_will_waste(tmp_path)
 
     assert account_expiring_headroom(tmp_path, "claude_code:alt") == 10.0
     assert account_expiring_headroom(tmp_path, "claude_code:alt", target_pct=99.0) == 14.0
+    # #4717: a planned reset after the week's own reset does not end this week, so it keeps
+    # its usual target; one before it does, and aims at the whole window.
+    now = datetime.now(UTC)
+    after, before = now + timedelta(days=3), now + timedelta(hours=6)
+    assert account_expiring_headroom(tmp_path, "claude_code:alt", planned_reset=after) == 10.0
+    assert account_expiring_headroom(tmp_path, "claude_code:alt", planned_reset=before) == 15.0
 
 
 def test_a_window_with_days_left_to_run_wastes_nothing_yet(tmp_path):
@@ -1153,6 +1160,9 @@ def test_a_window_with_days_left_to_run_wastes_nothing_yet(tmp_path):
     _weekly(tmp_path, "alt", pct=20.0, resets_in_h=120.0)
 
     assert account_expiring_headroom(tmp_path, "claude_code:alt") == 0.0
+    # #4717: unless a person ends it by hand, however far ahead that is.
+    planned = datetime.now(UTC) + timedelta(days=3)
+    assert account_expiring_headroom(tmp_path, "claude_code:alt", planned_reset=planned) == 80.0
 
 
 def test_an_account_at_its_target_and_an_unknown_one_both_waste_nothing(tmp_path):

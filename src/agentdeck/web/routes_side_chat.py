@@ -17,9 +17,18 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse
 
 from ..models import ForkFrom
+from ..session_secrets import secret_notice
 from .action_timing import bind_action, supplied_action_id
 from .deps import get_injector, get_state, get_templates, require_access, resolve_current_leg
-from .routes_actions import _note_person_message, _require_same_origin, _turn_form
+from .routes_actions import (
+    _admit_secret,
+    _issue_secret,
+    _note_person_message,
+    _require_same_origin,
+    _revoke_secret,
+    _secret_command_or_422,
+    _turn_form,
+)
 from .side_chat import SIDE, find_side_chat, moved_on, side_brief, side_view_context
 from .uploads import cleanup_uploaded_files
 
@@ -68,6 +77,10 @@ async def _send(request: Request, session_key: str) -> HTMLResponse:
     state = get_state(request)
     action_id = supplied_action_id(request) or ""
     message, uploads, _form = await _turn_form(request, attachments_alone=True)
+    # A temporary secret goes on as its name and a one-use ticket, never its value (#4610).
+    secret = _secret_command_or_422(message, uploads.paths)
+    if secret is not None:
+        message = _admit_secret(secret, uploads, action_id)
 
     def refuse(text: str, status_code: int = 409) -> HTTPException:
         cleanup_uploaded_files(uploads.paths)
@@ -87,10 +100,15 @@ async def _send(request: Request, session_key: str) -> HTMLResponse:
     injector = get_injector(request)
     if side.state == "live" and side.session_key is not None and side.fork is not None:
         side_account, side_session, side_provider = resolve_current_leg(request, side.session_key)
-        text = moved_on(request, side.fork, main.key, newest) + message
+        opening = moved_on(request, side.fork, main.key, newest)
+        text = opening + message
         refusal = side_provider.user_message_refusal(text)
         if refusal is not None:
             raise refuse(refusal, 422)
+        issued = None
+        if secret is not None:
+            issued = await _issue_secret(secret, side_session.key, action_id)
+            text = opening + secret_notice(issued.name, issued.ticket)
         result = await injector.start(
             side_account,
             side_session,
@@ -104,15 +122,21 @@ async def _send(request: Request, session_key: str) -> HTMLResponse:
             allow_over_budget=True,
         )
         if not result.accepted:
+            uncertain = result.write_uncertain or result.runtime_unreachable
+            if issued is not None and not uncertain:
+                await _revoke_secret(issued)
             # The write may have happened: say so with a 5xx, so the page keeps the action
             # id and sending the same words again is delivered once.
-            status = 503 if result.write_uncertain or result.runtime_unreachable else 409
+            status = 503 if uncertain else 409
             raise refuse(result.reason or "The side chat did not take the message.", status)
         if newest is not None:
             state.note_side_chat_seen(side.fork.token, main.key, newest[0])
         # A person's message to the side chat, which a Work counts as its own (#4562).
         _note_person_message(request, side_session.key)
         return await _view(request, main.key, status_code=202)
+    if secret is not None:
+        # A ticket belongs to a chat that exists, and this message would start one.
+        raise refuse("Start the side chat with an ordinary message, then send the secret.")
     # Told it is a side chat, so it does not take itself for the chat it copies (#4556).
     message = side_brief(main.key) + message
     refusal = provider.fork_refusal(account, main) or provider.user_message_refusal(message)

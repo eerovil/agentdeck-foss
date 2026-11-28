@@ -27,6 +27,7 @@ from agentdeck.review_history import (
     checklist_waits,
     clip_findings,
     head_review,
+    kept_pass,
     last_digest,
     newest_verdict,
     passed,
@@ -237,10 +238,61 @@ def test_a_round_stamp_names_the_review_chat_a_newer_review_replaced():
     owner = SimpleNamespace(db=object(), record_review_event=lambda *a, **k: written.append(k))
     AppState.record_chat_review_head(owner, CHATS, 3, "eerovil/agentdeck", 9, HEAD, rx.upper())
     AppState.record_chat_review_head(owner, CHATS, 4, "eerovil/agentdeck", 9, HEAD)
+    AppState.record_chat_review_head(owner, CHATS, 5, "eerovil/agentdeck", 9, HEAD, "", "E/X#2")
     assert [k["data"] for k in written] == [
         {"chat": f"{CHATS}#3", "round": rx},
         {"chat": f"{CHATS}#4"},
+        {"chat": f"{CHATS}#5", "asked": "e/x#2"},  # what opened it (#4665)
     ]
+
+
+def test_a_replaced_chat_s_pass_counts_only_when_its_replacement_asked_about_another():
+    """#4665: one review chat lists every open pull request of a Work, so a sibling's new commit
+    replaces it while it still reviews this pull request at an unchanged commit. Its pass then
+    counts, unless anything since asked about this one or answered it at the head."""
+    rx, ry = "r-" + "1" * 12, "r-" + "2" * 12
+    sibling, other = "eerovil/agentdeck#10", "b" * 40
+
+    def row(kind, head, at, data):
+        return ReviewEvent(PR, head, float(at), kind, f"{kind}:{at}", data, int(at * 10))
+
+    own = row(CHAT, HEAD, 1, {"chat": f"{CHATS}#3", "round": rx})
+    asked = row(ASKED, HEAD, 0.5, {})  # the ask that opened #3: older, so it says nothing
+
+    def newer(mark=sibling, head=HEAD, at=2):
+        return row(CHAT, head, at, {"chat": f"{CHATS}#4", "round": ry, "asked": mark})
+
+    base = [asked, own, newer()]
+    assert kept_pass(base, rx.upper(), PR.upper(), HEAD[:12]) == f"{CHATS}#3"
+    # Not replaced, no stamp, an unknown stamp, a head too short or not the chat's: no answer.
+    assert kept_pass([asked, own], rx, PR, HEAD) == ""
+    assert kept_pass(base, "", PR, HEAD) == kept_pass(base, ry[:-1] + "9", PR, HEAD) == ""
+    assert kept_pass(base, rx, PR, HEAD[:6]) == kept_pass(base, rx, PR, other) == ""
+    # The newer chat was a re-ask or ask about this pull request, a press (or a target with no
+    # pull request), from before the mark, or at another commit: it asked about this one.
+    for mark in (PR.upper(), "*", ""):
+        assert kept_pass([asked, own, newer(mark)], rx, PR, HEAD) == "", mark
+    assert kept_pass([asked, own, newer(head=other)], rx, PR, HEAD) == ""
+    assert kept_pass([*base, newer(PR, at=3)], rx, PR, HEAD) == ""  # a third, about this one
+    # An ask since #3 opened that names another chat, or none (an uncertain start), blocks;
+    # one naming #3 itself (the ask that opened it, written after its row) does not.
+    assert kept_pass([*base, row(ASKED, HEAD, 1.5, {"chat": f"{CHATS}#4"})], rx, PR, HEAD) == ""
+    assert kept_pass([*base, row(ASKED, other, 3, {"uncertain": True})], rx, PR, HEAD) == ""
+    named = row(ASKED, HEAD, 1.2, {"chat": f"{CHATS.upper()}#3"})
+    assert kept_pass([*base, named], rx, PR, HEAD) == f"{CHATS}#3"
+    # Any verdict but a pass at the head, from any chat and however old, blocks it; so does
+    # every verdict there after the newer chat opened: that is its own answer.
+    for kind in VERDICTS - {PASS, ACCEPTED}:
+        assert kept_pass([row(kind, HEAD, 0.2, {}), *base], rx, PR, HEAD) == "", kind
+    for kind in VERDICTS:
+        late = row(kind, HEAD, 2.5, {"chat": f"{CHATS}#4"})
+        assert kept_pass([*base, late], rx, PR, HEAD) == "", kind
+    # An older pass at the head is no hold, nor is #3's own pass delivered again.
+    assert kept_pass([row(PASS, HEAD, 0.2, {}), *base], rx, PR, HEAD) == f"{CHATS}#3"
+    again = row(PASS, HEAD, 2.5, {"chat": f"{CHATS}#3"})
+    assert kept_pass([*base, again], rx, PR, HEAD) == f"{CHATS}#3"
+    # A verdict at another head says nothing about this one.
+    assert kept_pass([*base, row(FINDINGS, other, 3, {})], rx, PR, HEAD) == f"{CHATS}#3"
 
 
 def test_the_table_keeps_each_event_once_and_forgets_a_closed_pull_request(tmp_path):

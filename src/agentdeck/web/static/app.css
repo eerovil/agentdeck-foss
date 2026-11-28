@@ -1040,15 +1040,15 @@ details.ev.tool > .ev-text { margin-top: 6px; max-height: 420px; overflow: auto;
 .ev.tool-quiet:not([open]) .ev-time, .ev.tool-quiet:not([open]) .tool-peek { font-size: 12px; }
 .ev.ev-folded.tool-quiet:not(.ev-unfolded)::before { left: 2px; top: 1px; }
 /* A message the deck sent: a grey line with its time, the text behind a tap. */
-details.ev.deck-notice { border: 0; background: none; padding: 1px 2px; color: var(--muted);
+details.ev.deck-notice, details.deck-notes { border: 0; background: none; padding: 1px 2px; color: var(--muted);
   font-size: 12px; }
-details.ev.deck-notice > summary { cursor: pointer; list-style: none; display: flex;
+details.ev.deck-notice > summary, details.deck-notes > summary { cursor: pointer; list-style: none; display: flex;
   align-items: baseline; gap: 6px; min-width: 0; }
-details.ev.deck-notice > summary::-webkit-details-marker { display: none; }
+details.ev.deck-notice > summary::-webkit-details-marker, details.deck-notes > summary::-webkit-details-marker { display: none; }
 .deck-notice-dot { flex: none; font-size: 8px; }
 .deck-notice-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-details.ev.deck-notice > summary .ev-time { margin-left: auto; flex: none; }
-details.ev.deck-notice > .ev-text { margin-top: 4px; padding: 6px 8px; border: 1px solid var(--line);
+details.ev.deck-notice > summary .ev-time, details.deck-notes > summary .ev-time { margin-left: auto; flex: none; }
+details.ev.deck-notice > .ev-text, details.deck-notes > .ev-text { margin-top: 4px; padding: 6px 8px; border: 1px solid var(--line);
   border-radius: var(--radius); background: var(--panel); color: var(--fg); font-size: 13px; }
 .ev.tool-call.tool-run-item > summary > .ev-role,
 .ev.tool-call.tool-run-item > summary > .tool-name,
@@ -1443,6 +1443,25 @@ details.ev.deck-notice > .ev-text { margin-top: 4px; padding: 6px 8px; border: 1
 .speech-supported .voice-control { display: none; }
 .voice-recordable .voice-control[data-host-speech] { display: inline-flex; }
 .inject-form .voice-button { -webkit-touch-callout: none; user-select: none; }
+/* Pocket mode (#4792): 🌙 shows only while voice mode is on; its black screen covers
+   everything and takes every touch (pocket_mode.js). */
+.inject-form .voice-control .pocket-button { display: none; margin-left: 5px; }
+.voice-on .inject-form .voice-control .pocket-button { display: flex; }
+.pocket-on, .pocket-on body { overflow: hidden; overscroll-behavior: none; }
+.pocket-screen { position: fixed; inset: 0; z-index: 2147483000; display: flex;
+  align-items: flex-end; justify-content: center; padding-bottom: 18vh; background: #000;
+  touch-action: none; user-select: none; -webkit-user-select: none;
+  -webkit-touch-callout: none; -webkit-tap-highlight-color: transparent; }
+.pocket-hint { width: min(320px, 84vw); color: #555; text-align: center; font-size: 13px; }
+.pocket-hint[hidden] { display: none; }
+.pocket-hint p { margin: 0 0 10px; }
+.pocket-track { position: relative; height: 48px; border: 1px solid #222; border-radius: 24px;
+  background: #080808; }
+.pocket-track-label { position: absolute; inset: 0; display: flex; align-items: center;
+  justify-content: center; pointer-events: none; }
+.pocket-knob { position: absolute; top: 3px; left: 3px; display: flex; align-items: center;
+  justify-content: center; width: 42px; height: 40px; border-radius: 20px; color: #888;
+  background: #1c1c1c; font-size: 18px; }
 .inject-form .voice-button[aria-pressed="true"] { animation: none;
   border-color: var(--remote); background: color-mix(in srgb, var(--remote) 25%, var(--panel2)); }
 /* 🎤 is voice mode's microphone (#3540): on, listening, or waiting for "Hey Jarvis"
@@ -1856,6 +1875,9 @@ body.bg-paused *, body.bg-paused *::before, body.bg-paused *::after {
   /* Its own stacking layer, so nothing pinned in the list (the project tabs, #3226) can
      paint over the chat that slides above it. */
   .session-sidebar { display: block; isolation: isolate; }
+  /* The list keeps its 12px top padding, so its pinned tabs are pulled up by as much: a
+     sticky row parks below the padding, and rows showed through above it (#4629). */
+  .session-sidebar .front-bar { top: -12px; }
   .session-detail { z-index: 2; background: var(--bg); touch-action: pan-y;
     transform: translate3d(var(--mobile-chat-x, 0), 0, 0);
     transition: transform 180ms cubic-bezier(.2, .75, .25, 1);
@@ -2235,7 +2257,12 @@ body.local-file-page main { width: min(1100px, 100%); }
 .local-file-view { min-width: 0; }
 .local-file-head { position: sticky; top: 0; z-index: 2; margin-bottom: 14px;
   padding: 8px 0 12px; border-bottom: 1px solid var(--line); background: var(--bg); }
-.local-file-head h1 { overflow-wrap: anywhere; margin: 0 0 5px; font-size: 1.25rem; }
+.local-file-title { display: flex; align-items: flex-start; gap: 10px; }
+.local-file-head h1 { min-width: 0; overflow-wrap: anywhere; margin: 0 0 5px; font-size: 1.25rem; }
+/* Sits beside the name, so it adds no row to the header on a phone (#4814). */
+.local-file-download { flex: none; margin-left: auto; padding: 3px 9px; border: 1px solid var(--line);
+  border-radius: 6px; color: var(--remote); font-size: 12px; line-height: 1.4;
+  text-decoration: none; }
 .local-file-path { overflow-wrap: anywhere; color: var(--muted); font: 12px/1.4 monospace; }
 .local-file-mode { display: inline-block; margin-top: 7px; color: var(--remote); font-size: 12px; }
 .local-markdown { padding: 2px 2px 40px; line-height: 1.55; overflow-wrap: anywhere; }
@@ -2389,7 +2416,8 @@ body.local-file-page main { width: min(1100px, 100%); }
 .account-section > .muted { margin: 0 0 12px; font-size: 12px; }
 .account-defaults-form { display: grid; grid-template-columns: 1fr 1fr; gap: 7px 10px; }
 .account-defaults-form label { color: var(--muted); font-size: 12px; font-weight: 600; }
-.account-defaults-form select { width: 100%; padding: 9px; border: 1px solid var(--line);
+.account-defaults-form select, .account-defaults-form input { width: 100%; min-width: 0;
+  box-sizing: border-box; padding: 9px; border: 1px solid var(--line);
   border-radius: 8px; color: var(--fg); background: var(--bg); font: inherit; }
 .account-default-actions { grid-column: 1 / -1; display: flex; align-items: center;
   justify-content: space-between; gap: 10px; margin-top: 5px; }
@@ -2659,6 +2687,17 @@ body.local-file-page main { width: min(1100px, 100%); }
   padding: .3rem 0; border-top: 1px solid var(--line); font-size: .85rem; min-width: 0; }
 .front-rows > .fr:first-child { border-top: 0; }
 .fr-mark { color: var(--muted); font-weight: 700; text-align: center; }
+/* A row swiped to the right on a phone opens its Work page (#4625): it follows the finger and
+   uncovers the label. `pan-y` leaves the sideways movement to front_filters.js. */
+@media (max-width: 999px) {
+  .front-page .fr { touch-action: pan-y pinch-zoom; }
+  .front-rows:has(> .fr-swiping) { overflow-x: clip; }
+  .fr.fr-swiping { position: relative; transform: translateX(var(--swipe-x, 0)); }
+  .fr.fr-swiping::after { content: "Work"; position: absolute; right: 100%; top: 0; bottom: 0; width: 90px;
+    display: flex; align-items: center; justify-content: center; background: var(--line); color: var(--fg);
+    font-size: .8rem; font-weight: 700; }
+  .fr.fr-swipe-ready::after { background: #2470c8; color: #fff; }
+}
 /* A row whose Work page is on its way (#2422): its mark turns into a spinner. */
 .fr.fr-opening .fr-mark { font-size: 0; }
 .fr.fr-opening .fr-mark::before { display: none; }
@@ -2685,6 +2724,11 @@ body.local-file-page main { width: min(1100px, 100%); }
 .fr-staging { color: var(--live); }
 /* The operator's category above the Work page's technical story (#2236). */
 .wd-op { display: flex; flex-wrap: wrap; align-items: baseline; gap: .2rem .5rem; margin: 0 0 .3rem; }
+/* Close issue beside Answer and Hide stays on one line of a phone (#4631). */
+.wd-op:has([data-front-action="close"]) { column-gap: .3rem; }
+@media (max-width: 24rem) {
+  .wd-op:has([data-front-action="close"]) .fr-action { padding-inline: .3rem; }
+}
 .wd-op-head { margin: 0; color: var(--warn); font-weight: 700; }
 .wd-op-reason { color: var(--muted); font-weight: 400; }
 .fr-action { padding: .05rem .5rem; border: 1px solid var(--warn); border-radius: 999px; color: var(--warn);
@@ -2730,17 +2774,9 @@ button.fr-action:disabled { opacity: .5; cursor: progress; }
 /* Nothing needs you: one calm line instead of a heading and an empty box. */
 .front-needs:has([data-front-empty]) .front-title { display: none; }
 .front-needs [data-front-empty]::before { content: "✓ "; color: var(--live); }
-/* Show older and its search under Recently finished (#4289): one muted line, the search
-   box opening on the same line only when its icon is tapped. */
+/* Show older under Recently finished (#4289): one muted line. */
 .front-older-bar { display: flex; align-items: center; gap: .5rem; margin: .15rem 0 .35rem 1.1rem; }
 .front-older-more { background: none; border: 0; padding: 0; color: var(--muted); font: inherit; font-size: .8rem; text-decoration: underline; cursor: pointer; }
-.front-older-find { display: flex; align-items: center; gap: .35rem; }
-.front-older-find > summary { list-style: none; cursor: pointer; color: var(--muted); font-size: .9rem; }
-.front-older-find > summary::-webkit-details-marker { display: none; }
-.front-older-find[open] { flex: 1; }
-.front-older-search { flex: 1; display: inline-flex; }
-.front-older-search input[type="search"] { flex: 1; min-width: 0; font-size: 16px; padding: .15rem .35rem; }
-.front-older-find:not([open]) .front-older-search { display: none; }
 .front-board { display: flex; flex-wrap: wrap; align-items: baseline; gap: .15rem .5rem; margin: .5rem 0;
   font-size: .8rem; color: var(--muted); }
 .front-board a { color: var(--muted); }
@@ -2791,8 +2827,33 @@ button.fr-action:disabled { opacity: .5; cursor: progress; }
 /* One line of project tabs, pinned under the top bar while the list scrolls (#3226). It
    costs a line of height by the owner's choice: switching project is the front page's most
    used control. The side margins let its background cover the rows that scroll under it. */
-.front-tabs { position: sticky; top: var(--front-tabs-top, 0px); z-index: 9; margin: 0 -.75rem .5rem;
-  padding: 0 .75rem; background: var(--bg); }
+.front-bar { position: sticky; top: var(--front-tabs-top, 0px); z-index: 9; display: flex; align-items: center;
+  margin: 0 -.75rem .5rem; padding: 0 .75rem; background: var(--bg); }
+.front-tabs { flex: 1; min-width: 0; }
+/* The search (#4624): its icon leads the line, and its field, once open, takes it. */
+.front-find-open { flex: none; min-width: 36px; height: 36px; padding: 0 8px 0 0; border: 0; background: none;
+  color: var(--muted); font-size: 20px; line-height: 1; text-align: left; cursor: pointer; }
+.front-find { flex: 1; min-width: 0; position: relative; display: flex; }
+.front-find[hidden] { display: none; }
+.front-find:not([hidden]) ~ .front-tabs, .front-bar:has(> .front-find:not([hidden])) > .front-find-open { display: none; }
+.front-find input[type="search"] { flex: 1; min-width: 0; box-sizing: border-box; height: 36px; padding: 0 40px 0 12px;
+  border: 1px solid var(--line); border-radius: 999px; background: transparent; color: var(--fg); font: inherit; font-size: 16px; }
+.front-find input::-webkit-search-cancel-button { display: none; }
+.front-find-close { position: absolute; right: 0; top: 0; width: 40px; height: 36px; padding: 0; border: 0; background: none;
+  color: var(--muted); font-size: 20px; line-height: 1; cursor: pointer; }
+.front-find-note { margin: 0 0 .4rem; font-size: .8rem; color: var(--muted); }
+.front-find-note[hidden] { display: none; }
+.front-find-note button { padding: 0; border: 0; background: none; color: var(--fg); font: inherit;
+  text-decoration: underline; cursor: pointer; }
+/* No tabs (one project): no line of its own, the icon ends the counts line. */
+.front-bar:has(> .front-tabs[hidden]):has(> .front-find[hidden]) { height: 0; margin-bottom: 0; }
+.front-bar:has(> .front-tabs[hidden]) > .front-find-open { position: absolute; right: .75rem; bottom: 0; padding: 0; text-align: right; }
+.front-top:has(~ .front-bar > .front-tabs[hidden]) { padding-right: 2.75rem; }
+/* While it searches, only what it searches shows. Recently stopped lists Works already above,
+   and Recently finished's count leaves out the older matches under it. */
+.front-top:has(~ .front-bar.finding), .front-bar.finding ~ :is(.front-stopped, .work-other),
+.front-bar.finding ~ .front-sec :is(.work-more, .front-rows:not(.front-older-rows) > .front-empty),
+.front-bar.finding ~ .front-sec [data-front-group="finished"] .fr-group-count { display: none; }
 .front-tabs[hidden] { display: none; }
 .front-tabs-row { display: flex; overflow-x: auto; border-bottom: 1px solid var(--line);
   scrollbar-width: none; }
@@ -2922,6 +2983,13 @@ a.fr-tree:hover, a.fr-tree:focus-visible { color: var(--fg); text-decoration: un
 .front-page .fr-finished .fr-title { font-weight: 400; }
 .front-page .fr-action { display: inline-flex; align-items: center; min-height: 2rem; padding: 0 .75rem; }
 .front-page .fr-finished .fr-action { border-color: var(--line); color: var(--fg); font-weight: 500; }
+/* A Work idle over 48 h is one line (#4633): its title, cut short, and its age in days. */
+.front-page .fr.fr-idle { padding: .1rem 0; font-size: .78rem; }
+.front-page .fr-idle .fr-body { display: flex; align-items: baseline; gap: .5rem; overflow: hidden; }
+.front-page .fr-idle .fr-title-line { min-width: 0; }
+.front-page .fr-idle .fr-title { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+  overflow-wrap: normal; font-weight: 400; opacity: .8; }
+.front-page .fr-idle .fr-idle-age { flex: none; margin-left: auto; color: var(--muted); font-size: .72rem; }
 .front-page .front-needs [data-front-empty] { margin: .7rem 0 0; }
 .front-page .front-board { flex-direction: column; align-items: flex-start; gap: .35rem; margin: 1rem 0 1.5rem;
   padding-top: .6rem; border-top: 1px solid var(--line); }
@@ -2935,6 +3003,13 @@ a.fr-tree:hover, a.fr-tree:focus-visible { color: var(--fg); text-decoration: un
 .fr-chev { margin-left: auto; width: 1.4rem; height: 36px; padding: 0; border: 0; background: none; color: var(--muted);
   font: inherit; font-size: .8rem; cursor: pointer; }
 .fr-group-note ~ .fr-chev { margin-left: 0; }
+/* Finish all (#4623) is inside the header's own height. */
+.front-page .fr-finish-all { margin-left: auto; min-height: 0; padding: .05rem .55rem; font-size: .72rem;
+  line-height: 1.35; letter-spacing: 0; text-transform: none; white-space: nowrap; }
+.front-page .fr-finish-all[hidden] { display: none; }
+.fr-group-note ~ .fr-finish-all { margin-left: 0; }
+.fr-group-issue_closed .fr-group-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fr-finish-all:not([hidden]) ~ .fr-chev { margin-left: 0; }
 .fr-chev::before { content: "\25BE"; }
 .fr-new { margin-left: .2rem; padding: .05rem .45rem; border-radius: 9px; background: var(--fg); color: var(--bg);
   font-size: .62rem; font-weight: 600; letter-spacing: .04em; white-space: nowrap; }

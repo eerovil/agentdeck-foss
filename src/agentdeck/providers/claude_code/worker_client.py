@@ -18,6 +18,7 @@ import httpx
 from ... import runtime_feed
 from ...models import (
     SNAPSHOT_CAPABILITIES_KEY,
+    SNAPSHOT_KEEP_WARM_V1,
     Account,
     ForkFrom,
     InjectResult,
@@ -422,6 +423,33 @@ class ClaudeWorkerClient(RuntimeSocketClient):
             images=images,
             delivery_id=delivery_id,
             allow_over_budget=allow_over_budget,
+        )
+
+    async def keep_warm(
+        self, session_id: str, message: str, *, delivery_id: str
+    ) -> InjectResult:
+        """Send the keep-warm ping to this chat's worker, running or stopped; the runtime
+        decides whether it is written (#4737, #4752). It carries the session and the end
+        of the last turn this client last saw, and is refused when either moved since.
+        Sent only to a runtime that has the ping's own route."""
+        entry = self._owned.get(session_id)
+        if entry is None:
+            return InjectResult(False, "this session is not a deck-owned worker")
+        if not self.supports(SNAPSHOT_KEEP_WARM_V1):
+            return InjectResult(False, "the runtime has no keep-warm route yet")
+        last_result_at = entry.get("last_result_at")
+        if not isinstance(last_result_at, (int, float)) or last_result_at <= 0:
+            return InjectResult(False, "this chat has finished no turn to keep warm")
+        # No fence: a lost connection is not posted again. A ping is worth nothing late.
+        return await self._post(
+            "keep-warm",
+            {
+                "key": entry["key"],
+                "message": message,
+                "delivery_id": delivery_id,
+                "expected_session_id": session_id,
+                "expected_last_result_at": last_result_at,
+            },
         )
 
     def turn_held(self, session_id: str) -> bool:

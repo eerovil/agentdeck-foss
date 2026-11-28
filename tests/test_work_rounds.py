@@ -275,7 +275,7 @@ def test_an_earlier_rounds_pre_review_hold_is_no_wait_of_this_one(tmp_path, monk
 
     db = Db(tmp_path / "control.db")
     pulls = ("eerovil/agentdeck#9", "eerovil/agentdeck#12")
-    monkeypatch.setattr(work_router, "work_pulls", lambda state, work_id: pulls)
+    monkeypatch.setattr(work_router, "work_pulls", lambda state, work_id, projection: pulls)
     app = SimpleNamespace(
         state=SimpleNamespace(
             control_db=db, work_router=SimpleNamespace(pre_review_held=lambda pull: True)
@@ -285,3 +285,16 @@ def test_an_earlier_rounds_pre_review_hold_is_no_wait_of_this_one(tmp_path, monk
     db.start_work_round(WORK, ["eerovil/agentdeck#9"], work_rounds.REOPENED)
     assert "on eerovil/agentdeck#12." in _pre_review_waits(app, None, WORK)
     assert "#9" not in _pre_review_waits(app, None, WORK)
+    # The Work's design review asked and unanswered holds it instead (#4781).
+    import json
+    import time
+
+    ledger = tmp_path / "ledger.json"
+    issue = WORK.removeprefix("github_issue:")
+    line = {"pull": f"design:{issue}", "head": "comment-5", "started": time.time()}
+    ledger.write_text(json.dumps([line]))
+    app.state.config = SimpleNamespace(
+        github_webhook=SimpleNamespace(path=tmp_path / "streams"),
+        review=SimpleNamespace(ledger_path=ledger),
+    )
+    assert "#12 waits on the Work's design review" in _pre_review_waits(app, None, WORK)

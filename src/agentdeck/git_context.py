@@ -15,7 +15,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
-from . import gh_cli, merge_checks
+from . import code_lines, gh_cli, merge_checks
 from .github_cache import GitHubMetadata, GitHubMetadataCache
 from .models import Session
 
@@ -37,9 +37,11 @@ log = logging.getLogger(__name__)
 # ``autoMergeRequest`` says GitHub merges it by itself once its required checks pass, which is
 # what makes a Work worth asking ``merge_checks`` about (#2275); the same query again.
 # ``body`` is the pull request's own description, which a Work page row shows under its title
-# (#4137); the same query once more.
+# (#4137); the same query once more. ``baseRefOid`` is the base commit the size's code lines
+# are counted against in a local checkout, comments left out (#4812); the same query again.
 _PR_FIELDS = (
-    "number,title,url,state,isDraft,mergedAt,headRefName,baseRefName,headRefOid,updatedAt,"
+    "number,title,url,state,isDraft,mergedAt,headRefName,baseRefName,baseRefOid,headRefOid,"
+    "updatedAt,"
     "additions,deletions,changedFiles,files,autoMergeRequest,body"
 )
 _COMMIT_RE = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
@@ -430,6 +432,8 @@ class GitContextResolver:
                 dirty = any(line and not line.startswith("## ") for line in lines)
             if remote_code == 0:
                 checkout = github_repository(remote_text)
+                if checkout:
+                    code_lines.COUNTER.remember(checkout, cwd)
 
         # The checkout's own remote names the repository; a repo named by the
         # session's issue URL identifies work whose worktree is already gone.
@@ -462,6 +466,7 @@ class GitContextResolver:
             registered_pulls = tuple(pull for pull, _complete in resolved if pull is not None)
             for pull in registered_pulls:
                 pulls[(pull.repository.lower(), pull.number)] = pull
+            await self._count_code_lines(registered_pulls)
 
             # A shared checkout may have moved to another chat's branch. Once
             # this chat registers its own PR, expose local branch/dirty state
@@ -479,6 +484,22 @@ class GitContextResolver:
         if not git_found and repository is None and not ordered:
             return None
         return GitContext(repository, branch, dirty, ordered, pulls_complete, head_sha)
+
+    async def _count_code_lines(self, pulls: Iterable[PullRequestContext]) -> None:
+        """Count each open pull request's code lines at its head in a local checkout, for the
+        Work row's size (#4812). Local git only; a head counted already is not counted again,
+        and one no checkout here holds stays GitHub's number."""
+        counts = []
+        for pull in pulls:
+            if not pull.is_open or not pull.head_sha:
+                continue
+            held = self._metadata.peek(_pull_cache_key(pull.repository, pull.number)).value
+            base = held.get("baseRefOid") if isinstance(held, dict) else None
+            if not isinstance(base, str) or not _COMMIT_RE.fullmatch(base):
+                continue
+            if code_lines.COUNTER.held(pull.repository, base, pull.head_sha) is None:
+                counts.append(code_lines.COUNTER.count(pull.repository, base, pull.head_sha))
+        await asyncio.gather(*counts)
 
     @staticmethod
     def _repository_from_session(session: Session) -> str | None:

@@ -11,7 +11,11 @@ from pathlib import Path
 import httpx
 
 from agentdeck.action_context import client_action_context
-from agentdeck.models import SNAPSHOT_CONTEXT_MANAGEMENT_V1, Account
+from agentdeck.models import (
+    SNAPSHOT_CONTEXT_MANAGEMENT_V1,
+    SNAPSHOT_KEEP_WARM_V1,
+    Account,
+)
 from agentdeck.providers.claude_code.worker_client import ClaudeWorkerClient
 
 
@@ -64,6 +68,53 @@ async def test_worker_client_negotiates_context_capability_and_key(tmp_path):
 
     assert client.supports(SNAPSHOT_CONTEXT_MANAGEMENT_V1)
     assert client.worker_key("sid-1") == "issue-1"
+
+
+async def test_a_keep_warm_ping_waits_for_a_runtime_that_can_refuse_it(tmp_path):
+    """#4737, #4752: an older runtime would deliver the ping as a message, so it is never
+    asked, and the ping names the session and the finished turn it was judged on."""
+    capabilities: list[str] = []
+    posts: list[dict] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            posts.append({"path": request.url.path, **json.loads(request.content)})
+            return httpx.Response(
+                200, json={"accepted": False, "action": "rejected", "reason": "active_turn"}
+            )
+        return httpx.Response(
+            200,
+            json={
+                "workers": {
+                    "issue-1": {"session_id": "sid-1", "last_result_at": 12.5},
+                    "issue-2": {"session_id": "sid-new", "last_result_at": 0.0},
+                },
+                "snapshot_capabilities": capabilities,
+            },
+        )
+
+    client = ClaudeWorkerClient(_account(tmp_path), transport=httpx.MockTransport(handler))
+    await client.refresh()
+    assert not (await client.keep_warm("sid-1", "ping", delivery_id="keep-warm:1")).accepted
+    assert not (await client.keep_warm("sid-other", "ping", delivery_id="keep-warm:2")).accepted
+    assert posts == []
+
+    capabilities.append(SNAPSHOT_KEEP_WARM_V1)
+    await client.refresh()
+    assert not (await client.keep_warm("sid-new", "ping", delivery_id="keep-warm:3")).accepted
+    assert posts == []  # a chat that finished no turn has no cache to keep
+    refused = await client.keep_warm("sid-1", "ping", delivery_id="keep-warm:1")
+    assert not refused.accepted and "active_turn" in (refused.reason or "")
+    assert posts == [
+        {
+            "path": "/claude/accounts/main/keep-warm",
+            "key": "issue-1",
+            "message": "ping",
+            "delivery_id": "keep-warm:1",
+            "expected_session_id": "sid-1",
+            "expected_last_result_at": 12.5,
+        }
+    ]
 
 
 async def test_worker_client_forwards_client_action_id(tmp_path):

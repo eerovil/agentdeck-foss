@@ -9,6 +9,7 @@
 # claims that holds uncommitted files or unmerged commits, untouched for 30 days and with no
 # process in it, has that work saved to the hard disk and is then removed (#4267). One instance
 # failing does not stop the rest; the exit status says whether any did.
+# Last, worktrees' identical files are made to share their disk blocks (#4615).
 set -u
 
 instances="${AGENTDECK_POLLER_INSTANCES:-$HOME/.local/share/agentdeck/poller/instances}"
@@ -34,4 +35,9 @@ for dir in "$instances"/*/; do
         status=1
     fi
 done
+# Last, so nothing is spent on a worktree that just went (#4615).
+if ! nice ionice -c 3 "$python" "$janitor" --share-files; then
+    echo "sharing identical worktree files failed" >&2
+    status=1
+fi
 exit "$status"

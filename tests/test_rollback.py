@@ -15,6 +15,7 @@ from worker_harness import claude_host, settle
 from agentdeck.app import create_app
 from agentdeck.config import AccountConfig, AppConfig, HistoryConfig, InjectConfig
 from agentdeck.models import Capability, InjectResult, Session, SessionStatus, TranscriptEvent
+from agentdeck.pending_events import with_notes
 from agentdeck.providers import PROVIDERS
 from agentdeck.providers.claude_code import transcripts as claude_transcripts
 from agentdeck.transcript_rollbacks import HIDDEN
@@ -56,6 +57,14 @@ def test_a_rollback_resumes_at_the_message_the_prompt_hangs_off(tmp_path):
     assert claude_transcripts.rewind_ref(path, 99) is None
     # The button is hidden on that first prompt.
     assert claude_transcripts.first_prompt_seq(path) == 1
+
+
+def test_a_card_shows_the_persons_words_not_the_notes_ahead_of_them(tmp_path):
+    path = tmp_path / "chat.jsonl"
+    text = with_notes(["Job passed. " * 40], "Why so slow?")
+    for content in (text, [{"type": "text", "text": text}]):
+        path.write_text(json.dumps(_line("user", "u1", None, content)) + "\n")
+        assert claude_transcripts.transcript_meta(path).last_prompt == "Why so slow?"
 
 
 async def test_the_next_turn_resumes_the_same_session_at_the_cut_once(tmp_path):
@@ -120,13 +129,18 @@ def _app(tmp_path):
     return app
 
 
-def _rewindable(monkeypatch, *, sent_at: float):
+def _rewindable(monkeypatch, *, sent_at: float, text: str = "remember BANANA"):
     claude = PROVIDERS["claude_code"]
     rewinds = []
 
     async def read_transcript(account, session, after_seq=0):
         sent = datetime.fromtimestamp(sent_at, UTC)
-        return [TranscriptEvent(5, "user", "remember BANANA", ts=sent)]
+        later = with_notes(["Job 2 passed.", "Job 3 passed."], "and then")
+        return [
+            TranscriptEvent(5, "user", text, ts=sent),
+            TranscriptEvent(6, "user", text, ts=sent, subagent="helper"),
+            TranscriptEvent(7, "user", later, ts=sent),
+        ]
 
     async def rewind(account, session, at, *, chat_keys=(), since=None):
         rewinds.append((session.key, at, tuple(chat_keys), since))
@@ -160,7 +174,10 @@ def _wait(chat_id: str, wait_id: str, registered_at: float) -> WakeRequest:
 async def test_rollback_hides_the_rest_and_cancels_what_the_agent_forgot(tmp_path, monkeypatch):
     app = _app(tmp_path)
     sent_at = float(int(time.time()) - 60)  # whole seconds survive the datetime round trip
-    rewinds = _rewindable(monkeypatch, sent_at=sent_at)
+    # Notes ahead of a message (#4618) stay out of the composer and wait for the next one.
+    rewinds = _rewindable(
+        monkeypatch, sent_at=sent_at, text=with_notes(["Job passed."], "remember BANANA")
+    )
     registry = WakeOnRegistry(tmp_path / "wake-on.json")
     chat_id = app.state.app_state.chat_identity_key("claude_code:test:sid")
     registry.add(_wait(chat_id, "before", sent_at - 1))
@@ -174,6 +191,11 @@ async def test_rollback_hides_the_rest_and_cancels_what_the_agent_forgot(tmp_pat
         )
     assert response.status_code == 200
     assert response.json() == {"text": "remember BANANA", "cancelled_waits": 1}
+    assert [n["text"] for n in app.state.pending_events.waiting(chat_id)] == [
+        "Job passed.",
+        "Job 2 passed.",
+        "Job 3 passed.",
+    ]
     # The runtime cancels the jobs from the removed part in the same call that rolls back.
     assert rewinds == [("claude_code:test:sid", "r1", ("claude_code:test:sid",), sent_at), "done"]
     assert [item.id for item in registry.all()] == ["before"]

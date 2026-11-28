@@ -36,8 +36,9 @@ def cache_key(prefix: str, repository: str, number: int) -> str:
 
 
 # Moves whenever a webhook marked a map's cached body, sub-issue list or "blocked by" list
-# out of date in this process (#3627), or a re-read behind an open page changed one (#3739).
-# Part of every Work page's build key: those reads are the page's own, so nothing else would
+# out of date in this process (#3627), or a re-read behind an open page changed one (#3739)
+# or a Work's own issue record (#4639). Part of every Work page's build key: those reads are the
+# page's own, so nothing else would
 # tell an open map page to build again.
 _generation = 0
 

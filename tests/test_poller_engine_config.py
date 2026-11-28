@@ -606,71 +606,27 @@ def test_only_the_main_deck_of_a_shared_project_runs_its_extensions(
     assert "manifest.decks.main" in _locations(wrong)
 
 
-def test_each_account_can_name_its_own_usage_ceiling(tmp_path):
-    overlay = _inspect(
-        tmp_path,
-        overlay=_OVERLAY.replace(
-            'account = "claude_code:main"',
-            'account = "claude_code:main"\n'
-            'fallback_accounts = ["codex:codex", "claude_code:alt"]\n'
-            'usage_ceilings = { "claude_code:main" = 50, "codex:codex" = 90, '
-            '"claude_code:alt" = 90 }',
-        ),
-    ).overlay
-
-    assert overlay.accounts == (
-        "claude_code:main",
-        "codex:codex",
-        "claude_code:alt",
-    )
-    assert overlay.usage_ceilings == {
-        "claude_code:main": 50.0,
-        "codex:codex": 90.0,
-        "claude_code:alt": 90.0,
-    }
-
-
-def test_usage_ceilings_must_name_offered_accounts_and_valid_percentages(tmp_path):
-    draft = _inspect(
-        tmp_path,
-        overlay=_OVERLAY.replace(
-            'account = "claude_code:main"',
-            'account = "claude_code:main"\n'
-            'usage_ceilings = { "codex:absent" = 101 }',
-        ),
-    )
-
-    assert not draft.ok
-    assert any("usage_ceilings" in problem.location for problem in draft.report.problems)
-
-
-def test_each_account_can_name_how_full_its_window_should_end_up(tmp_path):
-    """#1965. Accounts left out keep the engine default, so an empty table is the norm."""
-    overlay = _inspect(
-        tmp_path,
-        overlay=_OVERLAY.replace(
-            'account = "claude_code:main"',
-            'account = "claude_code:main"\n'
-            'fallback_accounts = ["claude_code:alt"]\n'
-            'usage_targets = { "claude_code:alt" = 99 }',
-        ),
-    ).overlay
-
-    assert overlay.usage_targets == {"claude_code:alt": 99.0}
-    assert _inspect(tmp_path).overlay.usage_targets == {}
-
-
-def test_usage_targets_must_name_offered_accounts_and_valid_percentages(tmp_path):
-    draft = _inspect(
-        tmp_path,
-        overlay=_OVERLAY.replace(
-            'account = "claude_code:main"',
-            'account = "claude_code:main"\nusage_targets = { "codex:absent" = 140 }',
-        ),
-    )
-
-    assert not draft.ok
-    assert any("usage_targets" in problem.location for problem in draft.report.problems)
+def test_an_overlay_still_carrying_the_unread_usage_tables_loads(tmp_path):
+    """#4728: `usage_ceilings` and `usage_targets` were parsed, checked and used by nothing,
+    yet a bad entry refused the Overlay. Hosts still carry them, so they load unread: an
+    account the order does not offer, a percentage out of range, a value that is no table."""
+    for tables in (
+        'usage_ceilings = { "claude_code:main" = 50, "codex:absent" = 101 }\n'
+        'usage_targets = { "codex:absent" = 140 }',
+        'usage_ceilings = "none"\nusage_targets = 3',
+    ):
+        draft = _inspect(
+            tmp_path,
+            overlay=_OVERLAY.replace(
+                'account = "claude_code:main"',
+                'account = "claude_code:main"\n'
+                'fallback_accounts = ["claude_code:alt"]\n' + tables,
+            ),
+        )
+        assert draft.ok and _locations(draft) == []
+        assert draft.overlay.accounts == ("claude_code:main", "claude_code:alt")
+        assert not hasattr(draft.overlay, "usage_ceilings")
+        assert not hasattr(draft.overlay, "usage_targets")
 
 
 def test_a_fallback_list_that_is_not_account_keys_is_a_problem(tmp_path):
@@ -983,6 +939,30 @@ def test_a_repository_may_merge_on_its_own_only_with_code(tmp_path, repo, value,
     assert draft.ok is ok, draft.report.render()
     if not ok:
         assert any(p.location.endswith(f".{key}") for p in draft.report.problems)
+
+
+@pytest.mark.parametrize(
+    ("repo", "value", "ok"),
+    [
+        ("issues", '"julkaistu"', True),
+        ("fork", '"julkaistu"', False),
+        ("issues", '" "', False),
+        ("issues", "true", False),
+        ("issues", '"' + "x" * 51 + '"', False),
+    ],
+)
+def test_the_published_label_lives_on_a_repository_of_issues(tmp_path, repo, value, ok):
+    """#4794: the deck's router labels a Work's issue, so the key names a label and sits on a
+    repository that holds issues."""
+    manifest, overlay = _with_fork()
+    manifest = manifest.replace(
+        f'id = "{repo}"\n', f'id = "{repo}"\npublished_label = {value}\n', 1
+    )
+    assert f"published_label = {value}" in manifest
+    draft = _inspect(tmp_path, manifest=manifest, overlay=overlay)
+    assert draft.ok is ok, draft.report.render()
+    if not ok:
+        assert any(p.location.endswith(".published_label") for p in draft.report.problems)
 
 
 @pytest.mark.parametrize(

@@ -15,14 +15,16 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 from public_copy import private_feature
 from test_work_attention import HEAD, ORG, PR, STOPPED_CHAT, WORK, _derived, _row
 from test_work_attention import _work as _work_of
 
-from agentdeck import chat_review, gh_cli
+from agentdeck import chat_review, gh_cli, spoken_merge
 from agentdeck import chat_review as _chat_review
+from agentdeck.voice_mode import VOICE_LINE
 from agentdeck.work_actions import (
     RECENT_ACTION_S,
     TRIED_COMMENT,
@@ -382,12 +384,97 @@ def test_close_closes_the_source_issue_as_completed(tmp_path, monkeypatch):
                               "--reason", "completed"]
 
 
+def _merged_open():
+    """Every pull request merged, the issue still open, the chat's last reply a question (#4631)."""
+    return replace(
+        _unstarted(), start_label="", unsettled_registered=False,
+        derived=_derived("asked_in_chat", "asked"),
+        outputs=tuple(replace(o, state="merged") for o in _ready().outputs),
+    )
+
+
+def _no_pulls_open():
+    """No pull request at all, the issue still open (#4631)."""
+    return replace(_merged_open(), outputs=(), work_state="open", issue_title="Why?")
+
+
+@pytest.mark.parametrize("made", [_merged_open, _no_pulls_open])
+def test_closing_a_work_with_nothing_open_finishes_it_and_redraws_the_front_page(
+    tmp_path, monkeypatch, made
+):
+    app, gh, holder = _route_app(tmp_path, monkeypatch, made)
+    refreshed = []
+
+    async def reread(keys, *, limit):
+        refreshed.append((list(keys), limit))
+        return 1
+
+    app.state.issues = SimpleNamespace(refresh_issue_records=reread)
+
+    class Overview:
+        async def refresh(self):
+            refreshed.append(app.state.control_db.work_signoffs()[WORK.work_id][1])
+
+    app.state.work_overview = Overview()
+    app.state.control_db.hide_work(WORK.work_id, None)
+
+    assert _post(_client(app), "close").status_code == 200 and len(gh.calls) == 1
+    read, finished = refreshed  # the closed issue is read, then the front page is rebuilt
+    assert read == ([(WORK.repository, WORK.number)], 1) and finished is not None
+    assert app.state.control_db.hidden_works() == {}
+    assert app.state.control_db.work_live_check(WORK.work_id) is None
+
+
+def test_an_uncertain_close_records_no_finish(tmp_path, monkeypatch):
+    app, _gh, _ = _route_app(
+        tmp_path, monkeypatch, _merged_open, gh=_Gh((1, b"", b"HTTP 404"))
+    )
+
+    assert _post(_client(app), "close").status_code == 202
+    assert app.state.control_db.work_signoffs() == {}
+
+
+def test_a_merged_works_close_is_worked_out_again_at_the_press(tmp_path, monkeypatch):
+    app, gh, holder = _route_app(tmp_path, monkeypatch, _merged_open)
+    for now in (
+        replace(holder["card"], derived=_derived("question", "asked")),
+        replace(holder["card"], outputs=_ready().outputs),
+    ):
+        holder["card"] = now
+        assert _post(_client(app), "close").status_code == 409
+    assert gh.calls == []
+
+
+def test_close_is_confirmed_unless_the_works_merges_are_done():
+    def confirm(work):
+        shown = buttons(work, operator_attention(work, work_status(work)))
+        return next(item.confirm for item in shown if item.action == "close")
+
+    asks = "Close this Work's issue on GitHub?"
+    assert confirm(_unstarted()) == confirm(_no_pulls_open()) == asks
+    assert confirm(_merged_open()) == ""
+    closed = tuple(replace(output, state="closed") for output in _merged_open().outputs)
+    assert confirm(replace(_no_pulls_open(), outputs=closed)) == asks
+
+
 def test_works_close_closes_records_verified_and_finishes_once(tmp_path, monkeypatch):
     app, gh, _ = _route_app(tmp_path, monkeypatch, _tried)
+    order = []
+
+    async def reread(_keys, *, limit):
+        order.append("reread")
+
+    async def refresh():
+        order.append("refresh")
+
+    app.state.issues = SimpleNamespace(refresh_issue_records=reread)
+    app.state.work_overview = SimpleNamespace(refresh=refresh)
     client = _client(app)
 
     first = _post(client, "tried_ok")
     again = _post(client, "tried_ok")
+
+    assert order == ["reread", "refresh"]
 
     assert first.status_code == again.status_code == 200 and len(gh.calls) == 1
     assert gh.calls[0][0][-4:] == ["--reason", "completed", "--comment", TRIED_COMMENT]
@@ -519,6 +606,7 @@ def test_chatgpt_review_is_the_existing_review_workflow(tmp_path, monkeypatch):
     async def open_review(
         config, target, *, start=True, pulls=(), board=None, releases=None, earlier=None,
         shipped=None,
+        pressed=False,
     ):
         asked.append((target, start))
         assert pulls == (f"{ORG}/agentdeck#7",), "the open pull request rides along (#2637)"
@@ -551,6 +639,7 @@ def test_agent_review_opens_the_review_chat_and_starts_a_claude_reviewer_on_it(
     async def open_review(
         config, target, *, start=True, pulls=(), board=None, releases=None, earlier=None,
         shipped=None,
+        pressed=False,
     ):
         asked.append((target, start))
         assert pulls == (f"{ORG}/agentdeck#7",)
@@ -585,6 +674,7 @@ def test_agent_review_leaves_a_chat_someone_already_holds(tmp_path, monkeypatch)
     async def open_review(
         config, target, *, start=True, pulls=(), board=None, releases=None, earlier=None,
         shipped=None,
+        pressed=False,
     ):
         return chat_review.ReviewOutcome(
             f"{ORG}/agentdeck", 5, "u", 12, False, note="#12 is in-progress"
@@ -660,6 +750,384 @@ def test_merge_when_ready_is_not_sent_when_refused_and_may_be_pressed_again(
     assert _post(client, "approve_merge", "press-0005").status_code == 200, "again at once"
 
 
+def _spoken_app(tmp_path, monkeypatch, make, *, cards=1):
+    """The deck chat exists, the owner just spoke in it, and the overview lists the Work."""
+    from types import SimpleNamespace
+
+    from agentdeck import meta_chat
+    from agentdeck.web import routes_works
+
+    app, _gh, holder = _route_app(tmp_path, monkeypatch, make)
+    card = holder["card"]
+    other = replace(card, work_id=card.work_id.replace("agentdeck#", "games#"))
+
+    class Overview:
+        async def current(self, *, wait=0.0):
+            return SimpleNamespace(cards=(card, other)[:cards])
+
+        async def refresh(self):
+            return None
+
+    app.state.work_overview = Overview()
+    state = app.state.app_state
+    monkeypatch.setattr(routes_works, "get_db", lambda request: None)
+    monkeypatch.setattr(meta_chat, "is_deck_chat", lambda st, db, key: key == "deck-key")
+    monkeypatch.setattr(
+        state, "session_key_for_token", {"deck-token": "deck-key", "w": "work-key"}.get
+    )
+    _hear(state, "Merge agentdeck 5")
+    presses = []
+
+    class Release:
+        def handles(self, work_id):
+            return True
+
+        async def request_merge(self, work_id, *, fresh=False):
+            presses.append((work_id, fresh))
+            return "waits for its tests"
+
+    app.state.work_release = Release()
+    return app, presses
+
+
+def _hear(state, words, send_id=None):
+    """The owner's message from a page, delivered at once."""
+    send_id = send_id or f"send-{uuid4().hex}"
+    state.person_message_arrived("deck-key", send_id)
+    state.person_message_accepted("deck-key", send_id, words)
+    return send_id
+
+
+def _aged(state, **ago):
+    chat = state.chat_identity_key("deck-key")
+    said = state.person_words[chat]
+    state.person_words[chat] = said._replace(at=said.at - timedelta(**ago))
+
+
+def _say(client, work="agentdeck#5", source="deck-token"):
+    return client.post("/api/works/merge", json={"work": work, "from": source})
+
+
+def test_a_spoken_merge_is_the_pages_press_once_per_message(tmp_path, monkeypatch):
+    """#4643: the owner's words press the Work page's own button; a repeated call for the same
+    message answers with what its press did."""
+    from agentdeck.web import routes_works
+
+    app, presses = _spoken_app(tmp_path, monkeypatch, _ready)
+    client = _client(app)
+    answer = _say(client)
+    assert answer.status_code == 200, answer.text
+    said = answer.json()
+    assert (said["state"], said["work"], said["button"]) == ("sent", ISSUE, "Merge")
+    assert "waits for its tests" in said["detail"]
+    assert presses == [(WORK.work_id, False)]
+    assert "Already sent" in _say(client).json()["detail"]
+    (press,) = app.state.control_db.load_work_actions(WORK.work_id)
+    assert press.action == "merge"
+    with monkeypatch.context() as late:
+        late.setattr(routes_works, "SPOKEN_MERGE_S", 0)
+        assert "Already sent" in _say(client).json()["detail"], "a late repeat too"
+    # Also when that press failed.
+    db, state = app.state.control_db, app.state.app_state
+    heard = state.person_words[state.chat_identity_key("deck-key")]
+    with monkeypatch.context() as failed:
+        row = replace(press, outcome="failed", result="why")
+        failed.setattr(db, "work_action", lambda _id: row)
+        assert "was not sent: why" in _say(client).json()["detail"]
+        # A resend of the message takes the words back, and the repeat tells of the press.
+        failed.setattr(db, "newest_spoken_press", lambda *_: row)
+        _hear(state, heard.words, heard.send_id)
+        told = _say(client).json()
+        assert told["state"] == "earlier" and "was not sent: why" in told["detail"]
+    assert "was sent" in _say(client).json()["detail"]
+    # Said again right away: the page's own double-press window.
+    _hear(app.state.app_state, "Mergeä agentdeck 5.")
+    again = _say(client)
+    assert (again.status_code, again.json()["state"]) == (409, "refused")
+    assert len(presses) == 1
+
+
+def test_a_spoken_merge_before_ready_presses_merge_when_ready(tmp_path, monkeypatch):
+    from agentdeck.web import routes_works
+
+    app, presses = _spoken_app(tmp_path, monkeypatch, _idle)
+    refused = _say(_client(app))
+    assert refused.status_code == 409 and "does not hold this Work's merges" in refused.text
+    assert presses == []
+    real = routes_works.load_work_detail
+
+    approval = "offered"
+
+    async def detail(app_, ref, **kw):
+        return replace(await real(app_, ref, **kw), approval=approval)
+
+    monkeypatch.setattr(routes_works, "load_work_detail", detail)
+    answer = _say(_client(app)).json()
+    assert (answer["state"], answer["button"]) == ("sent", "Merge when ready")
+    approval = "approved"
+    _hear(app.state.app_state, "yes, merge 5")
+    standing = _say(_client(app)).json()
+    assert standing["state"] == "sent" and "already pressed" in standing["detail"]
+    assert presses == [(WORK.work_id, True)]
+
+
+def test_a_spoken_merge_is_refused_without_the_owners_words_or_one_work(tmp_path, monkeypatch):
+    app, presses = _spoken_app(tmp_path, monkeypatch, _ready, cards=2)
+    client = _client(app)
+    assert _say(client, source="w").status_code == 403, "another chat"
+    assert _say(client, source="nobody").status_code == 403
+    state = app.state.app_state
+    state.sessions["deck-key"] = SimpleNamespace(key="deck-key")
+    by_key = _say(client, source="deck-key")
+    del state.sessions["deck-key"]
+    assert by_key.status_code == 403, "the key is no proof: every chat can read it"
+    assert _say(client, work="agentdeck#99").status_code == 404
+    unclear = _say(client, work="5")
+    assert unclear.status_code == 409 and len(unclear.json()["works"]) == 2
+    _aged(state, hours=1)
+    assert _say(client).status_code == 403, "a wake-on's turn, long after the owner spoke"
+    state.withdraw_person_words("deck-key")
+    assert _say(client).status_code == 403
+    assert presses == [] and app.state.control_db.load_work_actions(WORK.work_id) == ()
+
+
+def test_a_spoken_merge_needs_the_owners_own_words_for_that_work(tmp_path, monkeypatch):
+    """Review of #4644: a recent message of the owner's is not consent to any merge."""
+    app, presses = _spoken_app(tmp_path, monkeypatch, _ready)
+    state, client = app.state.app_state, _client(app)
+    for words in ("What is agentdeck 5 about?", "Merge agentdeck 6", "", "file an issue"):
+        _hear(state, words)
+        answer = _say(client)
+        assert answer.status_code == 403 and "say: merge agentdeck 5" in answer.text, words
+    _hear(state, "merge agentdeck 5")
+    state.person_words.clear()
+    assert _say(client).status_code == 403, "a restart forgot the words"
+    # A newer message takes the request back.
+    _hear(state, "merge agentdeck 5")
+    _hear(state, "no, wait")
+    assert _say(client).status_code == 403
+    assert presses == [] and app.state.control_db.load_work_actions(WORK.work_id) == ()
+
+
+def _during_read(monkeypatch, happens):
+    """``happens`` once, while the spoken call reads the Work."""
+    from agentdeck.web import routes_works
+
+    real, todo = routes_works.load_work_detail, [happens]
+
+    async def detail(app_, ref, **kw):
+        read = await real(app_, ref, **kw)
+        if todo:
+            todo.pop()()
+        return read
+
+    monkeypatch.setattr(routes_works, "load_work_detail", detail)
+
+
+@pytest.mark.parametrize(
+    "happens", ["message", "delivering", "edited", "resent", "stop", "old", "overview"]
+)
+def test_a_request_taken_back_while_the_work_is_read_presses_nothing(
+    tmp_path, monkeypatch, happens
+):
+    """Review round 2 of #4644: the check is made with the reservation, not before the reads."""
+    app, presses = _spoken_app(tmp_path, monkeypatch, _ready)
+    state = app.state.app_state
+    _hear(state, "what is new", "send-old")
+    asked = _hear(state, "merge agentdeck 5")
+    act = {
+        # An older message's id with other text, its words not read yet; a plain resend.
+        "edited": lambda: state.person_message_arrived("deck-key", "send-old"),
+        "resent": lambda: _hear(state, "merge agentdeck 5", asked),
+        "message": lambda: _hear(state, "no, wait"),
+        "delivering": lambda: state.person_message_arrived("deck-key", "send-later"),
+        "stop": lambda: state.withdraw_person_words("deck-key"),
+        "old": lambda: _aged(state, minutes=16),
+        "overview": lambda: _hear(state, "no, wait"),
+    }[happens]
+    if happens == "overview":
+        service = app.state.work_overview
+        current = service.current
+
+        async def slow(*, wait=0.0):
+            act()
+            return await current(wait=wait)
+
+        service.current = slow
+    else:
+        _during_read(monkeypatch, act)
+    answer = _say(_client(app))
+    assert answer.status_code == 403 and "nothing was sent" in answer.text
+    assert ("took the request back" in answer.text) is (happens != "overview")
+    assert presses == [] and app.state.control_db.load_work_actions(WORK.work_id) == ()
+
+
+def test_a_call_refused_at_the_reservation_tells_of_the_other_calls_press(tmp_path, monkeypatch):
+    """Design note 4: call A pressed while B read the Work, then the owner spoke again."""
+    app, presses = _spoken_app(tmp_path, monkeypatch, _ready)
+    state, client, db = app.state.app_state, _client(app), app.state.control_db
+    chat = state.chat_identity_key("deck-key")
+
+    def other_message_pressed():
+        db.reserve_work_action("a" * 40, WORK.work_id, "merge", spoken_by=(chat, "send-a"))
+        _hear(state, "no, wait")
+
+    _during_read(monkeypatch, other_message_pressed)
+    monkeypatch.setattr("agentdeck.work_actions.recent_press", lambda *a, **k: None)
+    answer = _say(client).json()
+    assert answer["state"] == "earlier" and "may have been sent" in answer["detail"]
+    assert presses == []
+
+
+def test_a_repeated_call_after_the_words_are_gone_finds_the_press(tmp_path, monkeypatch):
+    """Design notes 2 and 3: after a withdrawal or a restart, a repeat tells of the earlier
+    press and that it pressed nothing, and never says a withdrawn Merge when ready stands."""
+    from agentdeck.web import routes_works
+
+    app, presses = _spoken_app(tmp_path, monkeypatch, _idle)
+    real, approval = routes_works.load_work_detail, "offered"
+
+    async def detail(app_, ref, **kw):
+        return replace(await real(app_, ref, **kw), approval=approval)
+
+    monkeypatch.setattr(routes_works, "load_work_detail", detail)
+    state, client = app.state.app_state, _client(app)
+    assert _say(client).json()["state"] == "sent"
+    approval = "approved"
+    state.person_words.clear()
+    repeat = _say(client).json()
+    assert repeat["state"] == "earlier" and repeat["button"] == "Merge when ready"
+    assert "pressed nothing" in repeat["detail"] and "It still stands." in repeat["detail"]
+    assert repeat["pressed_at"]
+    # The owner pressed Withdraw, then said something that is no plain request.
+    approval = "offered"
+    _hear(state, "do merge it now")
+    assert "does not stand now" in _say(client).json()["detail"]
+    assert len(presses) == 1
+    # Old enough to be another matter.
+    monkeypatch.setattr(routes_works, "SPOKEN_MERGE_S", 0)
+    assert _say(client).status_code == 403
+
+
+def test_a_message_arrives_grants_and_is_resent_once(tmp_path, monkeypatch):
+    """Design notes 1 and 2: one order per chat for messages and withdrawals; a resend, also
+    after a restart, gives back nothing that was taken back."""
+    from agentdeck.state import AppState
+
+    app, presses = _spoken_app(tmp_path, monkeypatch, _ready)
+    state, client = app.state.app_state, _client(app)
+    chat = state.chat_identity_key("deck-key")
+
+    def words():
+        said = state.person_words.get(chat)
+        return said.words if said is not None else None
+
+    def arrive(send_id):
+        state.person_message_arrived("deck-key", send_id)
+
+    def accept(send_id, text="merge agentdeck 5"):
+        state.person_message_accepted("deck-key", send_id, text)
+
+    _hear(state, "merge agentdeck 5", "send-one")
+    assert words() == "merge agentdeck 5"
+    # A resend takes back like any message, and grants nothing.
+    arrive("send-one")
+    assert words() is None
+    accept("send-one")
+    assert words() is None
+    # A resend after a newer message.
+    _hear(state, "no, wait")
+    arrive("send-one"), accept("send-one")
+    assert words() is None
+    # Stop between arrival and acceptance, and then a resend.
+    arrive("send-two")
+    state.withdraw_person_words("deck-key")
+    accept("send-two")
+    arrive("send-two"), accept("send-two")
+    assert words() is None and _say(client).status_code == 403
+    # A resend between arrival and acceptance.
+    arrive("send-three"), arrive("send-three"), accept("send-three")
+    assert words() is None
+    # An older message accepted late does not stand over a newer one.
+    arrive("send-four"), arrive("send-five"), accept("send-five", "no"), accept("send-four")
+    assert words() == "no"
+    # Edited text under an older message's id takes back what a newer one said.
+    _hear(state, "what is new", "send-old")
+    _hear(state, "merge agentdeck 5")
+    assert words()
+    _hear(state, "no, wait", "send-old")
+    assert words() is None
+    _hear(state, "no")
+    # No id of the page's own: it only takes back.
+    arrive(None), accept(None)
+    assert words() is None
+    # A send that could not be stored grants nothing, and neither does its resend.
+    with monkeypatch.context() as broken:
+        broken.setattr(state.db, "record_person_send", lambda *a: None)
+        _hear(state, "merge agentdeck 5", "send-six")
+        assert words() is None
+    # The same id again, the write working, over a newer message: nothing stands.
+    _hear(state, "no, wait")
+    _hear(state, "merge agentdeck 5", "send-six")
+    assert words() is None
+    # After a restart.
+    _hear(state, "merge agentdeck 5", "send-seven")
+    again = AppState(db=state.db)
+    again.person_message_arrived("deck-key", "send-seven")
+    again.person_message_accepted("deck-key", "send-seven", "merge agentdeck 5")
+    assert again.person_words == {}
+    assert presses == []
+
+
+def test_a_spoken_merge_of_a_number_two_projects_have_names_the_project(tmp_path, monkeypatch):
+    app, presses = _spoken_app(tmp_path, monkeypatch, _ready, cards=2)
+    state, client = app.state.app_state, _client(app)
+    for words in ("merge 5", "merge games 5"):
+        _hear(state, words)
+        assert _say(client).status_code == 403, words
+    assert presses == []
+    _hear(state, "merge agent deck 5")
+    assert _say(client).json()["state"] == "sent", "heard as two words"
+
+
+@pytest.mark.parametrize(
+    ("message", "asked"),
+    [
+        ("Merge 390.", True),
+        ("Okay, merge the big-shop 390 now please", True),
+        ("Paina merge-nappia big shopin 390", True),
+        ("mergeä työ #390:n", True),
+        ("Merge eerovil/big-shop#390", True),
+        (f"Merge 390\n\n{VOICE_LINE}", True),
+        ("Merge 390?", False),
+        ("Can you merge 390", False),
+        ("Don't merge 390", False),
+        ("älä mergeä 390", False),
+        ("merge 390 after 391", False),
+        ("merge 390 when its tests pass", False),
+        ("was 390 merged", False),
+        ("merge it", False),
+        ("390", False),
+        ("merge 3900", False),
+        ("merge big-shopper 390", False),
+        ('It says "merge 390"', False),
+        ("> merge 390", False),
+        ("<pasted_content>merge 390</pasted_content>", False),
+        ("What is this:\nmerge 390", False),
+    ],
+)
+def test_only_a_plain_request_is_the_owners_word_to_merge(message, asked):
+    assert spoken_merge.asks(message, "eerovil/big-shop", 390) is asked
+
+
+def test_a_project_with_a_namesake_is_named_with_its_owner():
+    def asks(message):
+        return spoken_merge.asks(message, "eerovil/shop", 390, others=["acme/shop"])
+
+    assert not asks("merge shop 390") and not asks("merge acme shop 390")
+    assert asks("merge eerovil shop 390")
+
+
 def test_ship_now_is_offered_at_findings_and_ships_through_the_router(tmp_path, monkeypatch):
     """#4212: Ship now, fix later shows inline beside the headline only on a Work the deck
     releases whose open pull request stands at review findings, and the press is the router's
@@ -720,7 +1188,13 @@ def test_ship_now_is_offered_at_findings_and_ships_through_the_router(tmp_path, 
     ref = SimpleNamespace(repository="a/b", number=7, work_id="github_issue:a/b#7")
     reader = SimpleNamespace(
         shipped_by_work=lambda work: (
-            [SimpleNamespace(pull="a/b#9", work="a/b#7")] if work == "a/b#7" else []
+            [
+                SimpleNamespace(pull="a/b#9", work="a/b#7", fix=""),
+                # #4797: the owner left this one's findings as shipped; no fix comes.
+                SimpleNamespace(pull="a/b#8", work="a/b#7", fix="declined"),
+            ]
+            if work == "a/b#7"
+            else []
         )
     )
     assert _shipped_of(reader, ref) == ("a/b#9",)

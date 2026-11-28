@@ -21,11 +21,14 @@ so the two can be deployed independently (#116).
 from __future__ import annotations
 
 import json
+import logging
+import os
 import subprocess
+import time
 import tomllib
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -316,6 +319,42 @@ def _durable_memo[T](name: str, root: str | Path, compute: Callable[[str | Path]
 def forget_durable_reads() -> None:
     """Drop every memoized read. For tests that rewrite state within one mtime tick."""
     _DURABLE_MEMO.clear()
+    _TOML_MEMO.clear()
+
+
+# --- reusing a parsed TOML file while it has not moved ---
+
+#: (reader, path) -> (fingerprint, result): a few per Poller project.
+_TOML_MEMO: dict[tuple[str, str], tuple[tuple, object]] = {}
+#: A file changed this recently is parsed again every time: a second write inside the same
+#: filesystem clock tick, at the same size, would leave its fingerprint as it was.
+_TOML_SETTLE_NS = 1_000_000_000
+
+
+def _parsed_toml[T](name: str, path: Path, parse: Callable[[dict], T]) -> T:
+    """``parse`` of the TOML file at ``path``, reused for as long as the file has not moved.
+
+    One page asks for every project's labels, accounts and repositories once per project it
+    may start a Work in: hundreds of parses, a quarter of a second of each open (#4639).
+    The result is shared between callers, so nobody may change it. Raises what the read does
+    (``OSError``, ``ValueError``), and remembers no failure.
+    """
+    key = (name, str(path))
+    with path.open("rb") as handle:
+        stat = os.fstat(handle.fileno())
+        signature = (stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+        remembered = _TOML_MEMO.get(key)
+        if remembered is not None and remembered[0] == signature:
+            return remembered[1]  # type: ignore[return-value]
+        value = parse(tomllib.load(handle))
+    if abs(time.time_ns() - stat.st_ctime_ns) > _TOML_SETTLE_NS:
+        _TOML_MEMO[key] = (signature, value)
+    return value
+
+
+def _overlay(path: Path) -> dict:
+    """A machine-local overlay as parsed; shared, so never changed by a reader."""
+    return _parsed_toml("overlay", path, lambda raw: raw)
 
 
 # --- the board as a read model: which repositories hold issues, and which instance reads them ---
@@ -450,6 +489,9 @@ class _ManifestFacts:
     # ``(repo id, deploy_name)`` of the deploying repositories that name their production
     # deploy (#4445): the deck's deploy wait on a merge there is named by it.
     deploy_names: tuple[tuple[str, str], ...] = ()
+    # ``(repo id, published_label)`` of the issue repositories whose Works' issues carry a
+    # label once their registered pull requests all merged (#4794).
+    published_labels: tuple[tuple[str, str], ...] = ()
     # Every ``[[repos]]`` id, issue repository or not, as the manifest names it.
     repos: tuple[str, ...] = ()
     # The ``[[repos]]`` ids that hold code (``holds_code = true``, #4233).
@@ -471,10 +513,12 @@ class _ManifestFacts:
 
 def _manifest(path: Path) -> _ManifestFacts:
     try:
-        with path.open("rb") as handle:
-            raw = tomllib.load(handle)
+        return _parsed_toml("manifest", path, _manifest_facts)
     except (OSError, ValueError):  # TOMLDecodeError is a ValueError
         return _ManifestFacts(readable=False)
+
+
+def _manifest_facts(raw: dict) -> _ManifestFacts:
     boardless = "board" not in raw
     board = raw.get("board")
     # No [board] table is the boardless declaration (#1481): the project keeps card status in
@@ -568,6 +612,16 @@ def _manifest(path: Path) -> _ManifestFacts:
             and entry.get("auto_deploys") is True
             and isinstance(entry.get("deploy_name"), str)
             and entry["deploy_name"].strip()
+        ),
+        published_labels=tuple(
+            (str(entry.get("id")).strip(), entry["published_label"].strip())
+            for entry in (repos if isinstance(repos, list) else [])
+            if isinstance(entry, dict)
+            and entry.get("id")
+            and entry.get("holds_issues") is True
+            and isinstance(entry.get("published_label"), str)
+            and entry["published_label"].strip()
+            and len(entry["published_label"].strip()) <= 50
         ),
         releasing_repos=tuple(
             str(entry.get("id")).strip()
@@ -707,8 +761,7 @@ def work_unassigned_elsewhere(root: str | Path) -> frozenset[str]:
             found.update(_qualified(facts.org, repo).lower() for repo in facts.issue_repos)
             continue
         try:
-            with (base_root / instance / "overlay.toml").open("rb") as handle:
-                claims = tomllib.load(handle).get("claims")
+            claims = _overlay(base_root / instance / "overlay.toml").get("claims")
         except (OSError, ValueError):
             continue
         if isinstance(claims, dict) and claims.get("unassigned") is False:
@@ -765,8 +818,7 @@ def _light_limit(value: object) -> int:
 def _overlay_checkouts(instance_dir: Path) -> dict[str, str]:
     """The overlay's ``[checkouts]``, by lowercased repository id; empty when unread."""
     try:
-        with (instance_dir / "overlay.toml").open("rb") as handle:
-            checkouts = tomllib.load(handle).get("checkouts")
+        checkouts = _overlay(instance_dir / "overlay.toml").get("checkouts")
     except (OSError, tomllib.TOMLDecodeError):
         return {}
     if not isinstance(checkouts, dict):
@@ -794,8 +846,7 @@ def work_code_checkouts(root: str | Path) -> dict[str, tuple[str, ...]]:
         if not (facts.readable and facts.org):
             continue
         try:
-            with (base_root / instance / "overlay.toml").open("rb") as handle:
-                checkouts = tomllib.load(handle).get("checkouts")
+            checkouts = _overlay(base_root / instance / "overlay.toml").get("checkouts")
         except (OSError, tomllib.TOMLDecodeError):
             continue
         if not isinstance(checkouts, dict):
@@ -831,8 +882,7 @@ def work_accounts(root: str | Path) -> dict[str, tuple[str, ...] | None]:
         if not (facts.readable and facts.org):
             continue
         try:
-            with (base_root / instance / "overlay.toml").open("rb") as handle:
-                worker = tomllib.load(handle).get("worker")
+            worker = _overlay(base_root / instance / "overlay.toml").get("worker")
         except (OSError, tomllib.TOMLDecodeError):
             ordered = None
         else:
@@ -857,6 +907,65 @@ def work_accounts(root: str | Path) -> dict[str, tuple[str, ...] | None]:
                 )
         for repo in facts.issue_repos:
             found.setdefault(_qualified(facts.org, repo).lower(), ordered)
+    return found
+
+
+def work_models(root: str | Path, today: date | None = None) -> dict[str, str]:
+    """Each project repository's own default model for a Work's agent, where one is set (#4723).
+
+    The machine-local overlay's ``[worker] model`` (a provider's model alias, as New work
+    offers them), read beside the accounts ``work_accounts`` reads. ``model_from`` and
+    ``model_until`` are optional TOML dates on this host's clock: the model holds from the
+    first day through the day before the second, so a trial ends by itself for new Works.
+    ``model_repos`` optionally names the issue repositories it holds for, by manifest id;
+    without it, every one of the project's. Reviewers and helpers never read it. An
+    unreadable overlay or a malformed value names no model for that project alone, and says
+    so in the log: the Work then starts on the account's default, as before.
+    """
+    today = today or date.today()
+    base_root = Path(root).expanduser() / "instances"
+    warn = logging.getLogger(__name__).warning
+    found: dict[str, str] = {}
+    for instance in _instance_names(root):
+        facts = _manifest(base_root / instance / "poller.toml")
+        if not (facts.readable and facts.org):
+            continue
+        try:
+            worker = _overlay(base_root / instance / "overlay.toml").get("worker")
+        except (OSError, ValueError):  # not TOML, or not UTF-8: this project's alone
+            warn("work model: %s's overlay is unreadable", instance)
+            continue
+        if not isinstance(worker, dict) or "model" not in worker:
+            continue
+        model = worker["model"]
+        start, end = worker.get("model_from"), worker.get("model_until")
+        only = worker.get("model_repos")
+        if (
+            not isinstance(model, str)
+            or not model.strip()
+            or not all(limit is None or type(limit) is date for limit in (start, end))
+            or (start is not None and end is not None and start >= end)
+            or not (
+                only is None
+                or isinstance(only, list)
+                and only
+                and all(isinstance(repo, str) for repo in only)
+            )
+        ):
+            warn(
+                "work model: %s's [worker] model, model_from, model_until or model_repos"
+                " is malformed",
+                instance,
+            )
+            continue
+        if (start is not None and today < start) or (end is not None and today >= end):
+            continue
+        named = None if only is None else {repo.strip().lower() for repo in only}
+        if named is not None and (unknown := named - {r.lower() for r in facts.issue_repos}):
+            warn("work model: %s's model_repos names no issue repository: %s", instance, unknown)
+        for repo in facts.issue_repos:
+            if named is None or repo.lower() in named:
+                found.setdefault(_qualified(facts.org, repo).lower(), model.strip())
     return found
 
 
@@ -947,6 +1056,10 @@ def release_policies(root: str | Path) -> dict[str, object]:
             ),
             tests_checked=frozenset(
                 _qualified(facts.org, repo).lower() for repo in facts.tests_checked_repos
+            ),
+            published_labels=tuple(
+                (_qualified(facts.org, repo).lower(), label)
+                for repo, label in facts.published_labels
             ),
             light_review=tuple(
                 (

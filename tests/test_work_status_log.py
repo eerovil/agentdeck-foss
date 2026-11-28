@@ -369,6 +369,37 @@ async def test_no_overview_is_built_before_every_accounts_first_scan(monkeypatch
     assert (await service.current(wait=2.0)).hidden == 1 and built == [True, True]
 
 
+@pytest.mark.asyncio
+async def test_a_front_page_open_is_not_held_for_a_slow_rebuild(monkeypatch):
+    # #4639: the old cards are served, and the rebuild goes on behind the page.
+    from agentdeck.web import routes_pages, work_view
+    from agentdeck.web.work_view import WorkOverview, WorkOverviewService
+
+    release = asyncio.Event()
+
+    async def slow(app, **kwargs):
+        await release.wait()
+        return WorkOverview(hidden=2)
+
+    async def scanned(timeout: float) -> bool:
+        return True
+
+    state = SimpleNamespace(
+        collector=SimpleNamespace(wait_initial_scans=scanned),
+        app_state=SimpleNamespace(bus=SimpleNamespace(publish=lambda topic: None)),
+    )
+    service = WorkOverviewService(SimpleNamespace(state=state))
+    service.overview = WorkOverview(hidden=1)
+    monkeypatch.setattr(work_view, "load_work_overview", slow)
+
+    started = asyncio.get_running_loop().time()
+    assert (await service.current(wait=routes_pages.FRESH_WAIT_S)).hidden == 1
+    assert asyncio.get_running_loop().time() - started < 1.0
+    release.set()
+    await service._soon
+    assert service.overview.hidden == 2
+
+
 # --- through the deck ----------------------------------------------------------------------------
 
 

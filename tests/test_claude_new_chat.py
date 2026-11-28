@@ -86,9 +86,10 @@ def test_new_session_defaults_use_claude_settings_and_worker_override(tmp_path):
         "fable",
         "medium",
     )
-    assert next(
-        choice.label for choice in provider.selectable_models if choice.value == "fable"
-    ) == "Fable 5.1"
+    # One Fable entry, the alias, unversioned like the others (#4697).
+    labels = {choice.value: choice.label for choice in provider.selectable_models}
+    assert labels["fable"] == "Fable"
+    assert not [value for value in labels if value.startswith("claude-")]
 
 
 async def test_probe_false_when_workers_disabled():

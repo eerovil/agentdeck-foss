@@ -531,6 +531,9 @@ CREATE TABLE IF NOT EXISTS session_work_bindings (
     bound_at TEXT NOT NULL,
     PRIMARY KEY (session_key, work_id)
 );
+-- ``_OWN_CHAT_CTE`` asks once per started Work for its first side chat (#4639).
+CREATE INDEX IF NOT EXISTS idx_session_work_bindings_work
+    ON session_work_bindings(work_id, evidence, bound_at);
 -- A side chat started from a Work's page, until it is linked (#2388). The press's own
 -- action id is also the new chat's session token, so ``session_tokens`` names the chat;
 -- the issue comes from the work_id. Only the pull requests seen at the press cannot be
@@ -607,6 +610,14 @@ CREATE TABLE IF NOT EXISTS chat_person_messages (
     chat_id TEXT PRIMARY KEY,
     at TEXT NOT NULL
 );
+-- One row per message a page sent a chat, by the page's own id for that send (#4643): only
+-- the first arrival of an id may give words standing, also after a restart.
+CREATE TABLE IF NOT EXISTS chat_person_sends (
+    chat_id TEXT NOT NULL,
+    send_id TEXT NOT NULL,
+    at TEXT NOT NULL,
+    PRIMARY KEY (chat_id, send_id)
+);
 -- One row per board command the boss sent from a chat (#1131). Nothing writes or reads it
 -- since the Poller's board commands were retired (#3025); the table stays so old databases
 -- need no migration.
@@ -642,6 +653,14 @@ CREATE TABLE IF NOT EXISTS work_actions (
     result TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_work_actions_work ON work_actions(work_id, reserved_at);
+-- Which of those presses were made for words said to a chat (#4643), and the send that
+-- carried the words. Written in the reservation's own transaction.
+CREATE TABLE IF NOT EXISTS spoken_presses (
+    action_id TEXT PRIMARY KEY,
+    chat_id TEXT NOT NULL,
+    send_id TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_spoken_presses_chat ON spoken_presses(chat_id);
 -- One row per Work the operator hid from Needs you (#2238). A display preference of this
 -- deck only: nothing on GitHub or the board changes. ``comments`` is the source issue's
 -- comment count when it was hidden; a new comment expires the row. NULL is "not known then".
@@ -740,7 +759,8 @@ CREATE TABLE IF NOT EXISTS work_metadata (
     live_check_note TEXT,
     live_check_at TEXT,
     live_check_session_key TEXT,
-    background_summary TEXT
+    background_summary TEXT,
+    resolution_writes INTEGER
 );
 -- Where a person moved a wayfinder map's boxes (#3627): one JSON object per map Work, box key
 -- to ``[x, y]``, the same on every device. A box not named keeps the server's layout.
@@ -1271,6 +1291,8 @@ class Db:
         self._chat_index_stamp: int | None = None
         # Work ids already in ``works``, so a repeated sighting costs no write.
         self._known_work_ids: set[str] = set()
+        # What ``session_work_bindings`` last read.
+        self._work_bindings_read: list[SessionWorkBinding] = []
         self._init_schema()
         self._known_work_ids = set(self.load_works())
         # Only a process starting up may wait that long: after this, a write waits
@@ -2792,7 +2814,15 @@ class Db:
     # source of a chat's PRs.
 
     def load_session_pull_requests(self) -> dict[str, tuple[PullRequestRef, ...]]:
-        rows = self._query(
+        return self._session_pull_requests(self._query)
+
+    def load_session_pull_requests_or_raise(self) -> dict[str, tuple[PullRequestRef, ...]]:
+        """``load_session_pull_requests`` for a read whose failure must not read as "none
+        registered": the published label (#4794) would come off and its intent go."""
+        return self._session_pull_requests(self._query_or_raise)
+
+    def _session_pull_requests(self, query) -> dict[str, tuple[PullRequestRef, ...]]:
+        rows = query(
             "SELECT session_key, repository, number, work_id FROM session_pull_requests"
             " ORDER BY session_key, added_at, rowid"
         )
@@ -3054,7 +3084,13 @@ class Db:
             "SELECT session_key, work_id, evidence, parent_chat_id, bound_at"
             " FROM session_work_bindings ORDER BY session_key, work_id"
         )
-        return [SessionWorkBinding(*(str(value) for value in r)) for r in rows]
+        # The same row objects while no row moved: this is read after every commit, and the
+        # Work projection compares them (#4639).
+        if self._work_bindings_read != rows:
+            self._work_bindings_read = [
+                SessionWorkBinding(*(str(value) for value in r)) for r in rows
+            ]
+        return list(self._work_bindings_read)
 
     def work_backfill(self, name: str) -> str | None:
         """The summary a named one-time backfill recorded, or None if it never ran."""
@@ -3385,6 +3421,43 @@ class Db:
         )
         return [str(row[0]) for row in rows]
 
+    def record_keep_warm(self, message_id: str, chat_id: str, text: str) -> bool:
+        """Store a keep-warm ping as sent, before it is; False when it already was (#4737).
+
+        The row is the ping's once-only record and nothing else: it is never due, so the
+        scheduler never sends it, and it has no hold reason, so no chat shows it.
+        """
+        now = datetime.now(UTC).isoformat()
+        try:
+            with self._lock, self._conn:
+                cursor = self._conn.execute(
+                    "INSERT OR IGNORE INTO scheduled_messages"
+                    " (id, chat_id, message, due_at, created_at, state, updated_at)"
+                    " VALUES (?, ?, ?, ?, ?, 'delivered', ?)",
+                    (message_id, chat_id, text, now, now, now),
+                )
+                return cursor.rowcount == 1
+        except sqlite3.Error as exc:
+            self._log_failure("keep-warm record", exc)
+            return False
+
+    def fail_keep_warm(self, message_id: str, reason: str) -> None:
+        """A keep-warm ping the runtime refused: the row stays, so it is not tried again."""
+        self._write(
+            "UPDATE scheduled_messages SET state = 'failed', reason = ?, updated_at = ?"
+            " WHERE id = ? AND substr(id, 1, 10) = 'keep-warm:' AND state = 'delivered'",
+            (reason, datetime.now(UTC).isoformat(), message_id),
+        )
+
+    def chat_has_undelivered_message(self, chat_id: str) -> bool:
+        """Whether a stored message for this chat is still waiting or mid-send."""
+        rows = self._query(
+            "SELECT 1 FROM scheduled_messages WHERE chat_id = ?"
+            " AND state IN ('scheduled', 'dispatching') LIMIT 1",
+            (chat_id,),
+        )
+        return bool(rows)
+
     def has_scheduled_message(self, message_id: str) -> bool:
         rows = self._query(
             "SELECT 1 FROM scheduled_messages WHERE id = ?", (message_id,)
@@ -3476,12 +3549,14 @@ class Db:
         A due row still waiting or mid-send counts from its due time or its last move (its
         claim), a delivered one from its delivery; the newest per chat. A turn a message
         starts shows as running only seconds later, so its Work must not read as ended
-        meanwhile, but a row that stays unsent past ``since`` counts no longer.
+        meanwhile, but a row that stays unsent past ``since`` counts no longer. A keep-warm
+        ping hands a chat nothing to do (#4737), so its row is no handoff.
         """
         rows = self._query(
             "SELECT chat_id, due_at, updated_at FROM scheduled_messages"
             " WHERE (state IN ('scheduled', 'dispatching') AND due_at <= ?)"
-            " OR (state = 'delivered' AND updated_at >= ?)",
+            " OR (state = 'delivered' AND updated_at >= ?"
+            " AND substr(id, 1, 10) != 'keep-warm:')",
             (now.isoformat(), since.isoformat()),
         )
         found: dict[str, datetime] = {}
@@ -3999,11 +4074,19 @@ class Db:
     def delete_work_side_chat(self, action_id: str) -> None:
         self._write("DELETE FROM work_side_chats WHERE action_id = ?", (action_id,))
 
-    def reserve_work_action(self, action_id: str, work_id: str, action: str) -> bool | None:
+    def reserve_work_action(
+        self,
+        action_id: str,
+        work_id: str,
+        action: str,
+        *,
+        spoken_by: tuple[str, str] | None = None,
+    ) -> bool | None:
         """Reserve a Work action before its write (#2237); False means the id is spent.
 
         ``None`` is "the reservation could not be made", which the route refuses on: without
-        a durable row nothing stops the same press writing twice.
+        a durable row nothing stops the same press writing twice. ``spoken_by`` is the chat and
+        the page's send id of the words a spoken press was made for (#4643).
         """
         try:
             with self._lock, self._conn:
@@ -4013,6 +4096,12 @@ class Db:
                     " VALUES (?, ?, ?, ?, NULL, NULL, '')",
                     (action_id, work_id, action, datetime.now(UTC).isoformat()),
                 )
+                if cursor.rowcount == 1 and spoken_by is not None:
+                    self._conn.execute(
+                        "INSERT OR REPLACE INTO spoken_presses(action_id, chat_id, send_id)"
+                        " VALUES (?, ?, ?)",
+                        (action_id, *spoken_by),
+                    )
                 return cursor.rowcount == 1
         except sqlite3.Error as exc:
             log.debug("work action reservation failed: %s", exc)
@@ -4102,6 +4191,21 @@ class Db:
                 ).fetchone()
         except sqlite3.Error as exc:
             log.debug("work action read failed: %s", exc)
+            return None
+        return self._work_action_press(row) if row is not None else None
+
+    def newest_spoken_press(self, chat_id: str, work_id: str) -> WorkActionPress | None:
+        """The Work's newest press made for words said to this chat (#4643)."""
+        try:
+            with self._lock:
+                row = self._conn.execute(
+                    f"SELECT {self._WORK_ACTION_COLUMNS} FROM work_actions WHERE work_id = ?"
+                    " AND action_id IN (SELECT action_id FROM spoken_presses WHERE chat_id = ?)"
+                    " ORDER BY reserved_at DESC, rowid DESC LIMIT 1",
+                    (work_id, chat_id),
+                ).fetchone()
+        except sqlite3.Error as exc:
+            log.debug("spoken press read failed: %s", exc)
             return None
         return self._work_action_press(row) if row is not None else None
 
@@ -4643,20 +4747,25 @@ class Db:
 
     def work_resolution(self, work_id: str) -> WorkResolution | None:
         """The Work's resolution (#2328), or None when none was written or it is unreadable."""
-        from .work_resolution import WorkResolution
-
         try:
             with self._lock:
-                row = self._conn.execute(
-                    "SELECT problem_summary, solution_summary, decision_rationale,"
-                    " correctness_summary, resolution_updated_at, resolution_run_id,"
-                    " resolution_session_key, background_summary FROM work_metadata"
-                    " WHERE work_id = ? AND resolution_updated_at IS NOT NULL",
-                    (work_id,),
-                ).fetchone()
+                return self._work_resolution(work_id)
         except sqlite3.Error as exc:
             log.debug("work resolution read failed: %s", exc)
             return None
+
+    def _work_resolution(self, work_id: str) -> WorkResolution | None:
+        """``work_resolution`` for a caller that holds the lock and handles the read's error."""
+        from .work_resolution import WorkResolution
+
+        row = self._conn.execute(
+            "SELECT problem_summary, solution_summary, decision_rationale,"
+            " correctness_summary, resolution_updated_at, resolution_run_id,"
+            " resolution_session_key, background_summary, resolution_writes"
+            " FROM work_metadata"
+            " WHERE work_id = ? AND resolution_updated_at IS NOT NULL",
+            (work_id,),
+        ).fetchone()
         if row is None:
             return None
         try:
@@ -4673,19 +4782,47 @@ class Db:
             str(row[5] or ""),
             str(row[6] or ""),
             background=str(row[7] or ""),
+            # A summary from before the count (#4726) was written at least once.
+            writes=int(row[8] or 1),
         )
 
-    def set_work_resolution(self, resolution: WorkResolution) -> WorkResolution | None:
-        """Replace the Work's whole resolution, keeping its title; the stored record, or None."""
+    def set_work_resolution(
+        self, resolution: WorkResolution, *, limit: int | None = None
+    ) -> WorkResolution | None:
+        """Replace the Work's whole resolution, keeping its title; the stored record, or None.
+
+        With ``limit`` (#4726), a write past that many is taken only when its ``solution``
+        differs from the stored one, and raises ``ResolutionRefused`` otherwise. A write equal
+        to the stored record in every part is the same request again: it is stored, for its
+        new time and writer, but counts as no write, so a retry never uses one up. The read and
+        the write share one lock, so two writers cannot both take the last free write.
+        """
+        from .work_resolution import ResolutionRefused
+
         stamp = datetime.now(UTC).isoformat()
         try:
             with self._lock, self._conn:
+                stored = self._work_resolution(resolution.work_id)
+                # The same record again still gets a new time and writer: the page reads a
+                # summary as behind a head pushed after it was written (#3199).
+                repeat = stored is not None and stored.texts() == resolution.texts()
+                if (
+                    stored is not None
+                    and not repeat
+                    and limit is not None
+                    and stored.writes >= limit
+                    and stored.solution == resolution.solution
+                ):
+                    raise ResolutionRefused(stored.writes)
+                writes = (stored.writes if stored is not None else 0) + (0 if repeat else 1)
                 self._conn.execute(
                     "INSERT INTO work_metadata (work_id, problem_summary, solution_summary,"
                     " decision_rationale, correctness_summary, resolution_updated_at,"
-                    " resolution_run_id, resolution_session_key, background_summary)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                    " resolution_run_id, resolution_session_key, background_summary,"
+                    " resolution_writes)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
                     " ON CONFLICT(work_id) DO UPDATE SET"
+                    " resolution_writes = excluded.resolution_writes,"
                     " problem_summary = excluded.problem_summary,"
                     " solution_summary = excluded.solution_summary,"
                     " decision_rationale = excluded.decision_rationale,"
@@ -4704,12 +4841,32 @@ class Db:
                         resolution.run_id or None,
                         resolution.session_key or None,
                         resolution.background,
+                        writes,
                     ),
                 )
         except sqlite3.Error as exc:
             log.debug("work resolution write failed: %s", exc)
             return None
         return self.work_resolution(resolution.work_id)
+
+    def allow_work_resolution_write(self, work_id: str, below: int) -> bool:
+        """Count the Work's summary as written fewer than ``below`` times (#4726).
+
+        For the deck's own ask to rewrite the summary: the write it asked for is then taken
+        whatever part it changes. False when nothing could be written.
+        """
+        try:
+            with self._lock, self._conn:
+                self._conn.execute(
+                    "UPDATE work_metadata SET resolution_writes = ? WHERE work_id = ?"
+                    " AND resolution_updated_at IS NOT NULL"
+                    " AND COALESCE(resolution_writes, 1) >= ?",
+                    (max(below - 1, 0), work_id, below),
+                )
+        except sqlite3.Error as exc:
+            log.debug("work resolution write failed: %s", exc)
+            return False
+        return True
 
     def append_work_correctness(
         self, work_id: str, append: Callable[[str], str], *, tries: int = 3
@@ -4902,6 +5059,28 @@ class Db:
             " ON CONFLICT(chat_id) DO UPDATE SET at=MAX(at, excluded.at)",
             (chat_id, at),
         )
+
+    def record_person_send(self, chat_id: str, send_id: str, at: str) -> bool | None:
+        """Whether this is the first time the page's send reaches the deck (#4643).
+
+        ``None`` when that could not be recorded.
+        """
+        try:
+            with self._lock, self._conn:
+                # Far longer than a page goes on resending one send.
+                self._conn.execute(
+                    "DELETE FROM chat_person_sends WHERE at < ?",
+                    ((datetime.now(UTC) - timedelta(days=30)).isoformat(),),
+                )
+                cursor = self._conn.execute(
+                    "INSERT OR IGNORE INTO chat_person_sends(chat_id, send_id, at)"
+                    " VALUES (?, ?, ?)",
+                    (chat_id, send_id, at),
+                )
+                return cursor.rowcount == 1
+        except sqlite3.Error as exc:
+            log.warning("person send not recorded: %s", exc)
+            return None
 
     def record_manual_new_chat_cwd(self, cwd: str) -> None:
         self._write(

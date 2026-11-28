@@ -1272,7 +1272,7 @@ async def test_recently_finished_goes_by_when_the_work_finished(tmp_path):
     (row,) = overview.front.starred
     assert row.card.work_id == commented.work_id and row.card.finished_at is None
     html = render_work_front(app.state.templates, overview, "starred")
-    assert commented.work_id in html and "Finished" in html
+    assert commented.work_id in html and "fr-finished" in html and "fr-idle" in html
 
 
 def test_a_finish_time_is_the_close_time_and_nothing_else():
@@ -1509,6 +1509,7 @@ def test_the_older_slices_routes_are_the_work_page_now(tmp_path):
         "/works/{work_id:path}/message",
         "/works/{work_id:path}/action",  # the one Work action route (#2237)
         "/works/{work_id:path}/take-over",  # another deck's Work comes here (#3834)
+        "/works/finish-all",  # Finish all (#4623); this deck's record only, no workspace
         "/works/{work_id:path}/visibility",  # Hide and Bring back (#2238)
         "/works/{work_id:path}/star",  # Star and Unstar (#3116)
         "/api/works/{work_id:path}/star",  # the same for agents (#3116)
@@ -1528,6 +1529,7 @@ def test_the_older_slices_routes_are_the_work_page_now(tmp_path):
         "/api/works/pr-ready",  # an agent's `gh pr ready` re-reads its row now (#3903)
         "/api/works/pr-ready/received",  # it printed that press's checklist (#4253)
         "/api/works/population",  # read-only rows for staging comparisons (#2250)
+        "/api/works/merge",  # the merge button, said to the deck chat (#4643)
         "/api/works/needs-you",  # what needs the owner, for the deck chat (#3773)
         "/api/works/status-log",  # every logged status change (#2751)
         "/api/works/status-log/flaps",  # the short trips somewhere and back (#2751)
@@ -1986,6 +1988,12 @@ def test_show_older_searches_and_filters_by_project(tmp_path):
     assert _older_ids(client.get("/works/finished?search=1&q=trailhead%2310").text) == [
         WorkRef("eerovil/trailhead", 10).work_id
     ]
+    # A Poller project's name finds its repositories' Works, as it does on the page (#4624).
+    app.state.issues.read_board = lambda: BoardView(
+        scopes=(BoardScope("bazaar", org="eerovil", issue_repositories=("eerovil/trailhead",)),)
+    )
+    bazaar = _older_ids(client.get("/works/finished?search=1&q=bazaar").text)
+    assert set(bazaar) == set(trailhead)
     empty = client.get("/works/finished?search=1&q=nothing-like-this").text
     assert _older_ids(empty) == [] and "No finished Work matches." in empty
     # An emptied box lists nothing and puts the first page's button back.
@@ -2022,6 +2030,9 @@ async def test_recently_finished_always_shows_with_show_older(tmp_path):
     page = _client(app).get("/").text
     section = page.split('id="front-finished"', 1)[1].split("</section>", 1)[0]
     assert 'id="front-older-rows"' in section and 'hx-get="/works/finished"' in section
+    # The search is above the list, outside every part a push replaces (#4624).
+    bar = page.split('id="front-bar"', 1)[1].split("</nav>", 1)[0]
+    assert 'id="front-find-input"' in bar and "sse-swap" not in bar
 
 
 def test_viewing_and_classifying_works_writes_nothing(tmp_path):
@@ -4196,4 +4207,96 @@ async def test_show_older_rows_survive_a_push_and_follow_the_project_tab(tmp_pat
         await page.wait_for_function(f"() => document.querySelectorAll('{older}').length === 2")
         ids = await page.locator(older).evaluate_all("els => els.map(e => e.dataset.workId)")
         assert ids == [work.work_id for work in trail]
+
+        # The search (#4624) filters the rows on the page and asks for older ones, in this tab.
+        await page.evaluate("() => localStorage.setItem('agentdeck-front-collapsed', "
+                            "JSON.stringify({working: true}))")
+        await page.locator("[data-find-open]").click()
+        box = page.locator("#front-find-input")
+        # Typed letter by letter, a late answer to an earlier word never stays.
+        await box.press_sequentially("trailhead#5", delay=20)
+        await page.wait_for_function(f"() => document.querySelectorAll('{older}').length === 2")
+        assert not await page.locator('#works [data-work-id$="#950"]').is_visible()
+        await box.fill("trailhead#950")
+        await page.locator('#works [data-work-id$="#950"]').wait_for(state="visible")
+        await page.locator("[data-older-none]").wait_for()
+        await box.fill("agentdeck#90")
+        note = page.locator("#front-find-note")
+        await page.locator("[data-find-all]").wait_for()
+        assert await note.inner_text() == "0 current Works · 2 more in other projects"
+        await page.locator("[data-find-all]").click()
+        await page.locator('#works [data-work-id$="#901"]').wait_for(state="visible")
+
+        # A pushed row that does not match stays hidden; one that does shows.
+        _add(app, "claude_code:test:n2", WorkRef("eerovil/agentdeck", 902), thinking=True)
+        _add(app, "claude_code:test:n3", WorkRef("eerovil/trailhead", 903), thinking=True)
+        await app.state.work_overview.refresh()
+        await page.locator('#works [data-work-id$="#902"]').wait_for(state="visible")
+        assert not await page.locator('#works [data-work-id$="#903"]').is_visible()
+        assert await page.locator(
+            '[data-front-group="working"] .fr-group-count').inner_text() == "3"
+        assert await box.input_value() == "agentdeck#90"
+        assert await page.evaluate("() => document.documentElement.scrollWidth") == 390
+        # A starred Work is a row in Starred and in its own group (#4745): counted once.
+        said = await note.inner_text()
+        app.state.control_db.star_work("github_issue:eerovil/agentdeck#902")
+        await app.state.work_overview.refresh()
+        await page.locator('#works-starred [data-work-id$="#902"]').wait_for(state="visible")
+        await page.locator('#works [data-work-id$="#902"]').wait_for(state="visible")
+        assert said[0] in "23" and await note.inner_text() == said
+        app.state.control_db.star_work("github_issue:eerovil/agentdeck#902", starred=False)
+        await app.state.work_overview.refresh()
+        await page.locator('#works-starred [data-work-id$="#902"]').wait_for(state="detached")
+
+        # A header does not fold, nor a swipe change the tab, behind the search.
+        keep = ("() => ['agentdeck-front-collapsed', 'agentdeck-front-hidden-projects']"
+                ".map(k => localStorage.getItem(k))")
+        before = await page.evaluate(keep)
+        await page.locator('[data-front-group="working"]').click()
+        await page.locator('#works [data-work-id$="#901"]').evaluate("""row => {
+          const at = x => new Touch({identifier: 1, target: row, clientX: x, clientY: 300});
+          for (const [type, x] of [['touchstart', 300], ['touchend', 100]]) {
+            row.dispatchEvent(new TouchEvent(type, {bubbles: true, changedTouches: [at(x)],
+              touches: type === 'touchstart' ? [at(x)] : []}));
+          }
+        }""")
+        assert await page.evaluate(keep) == before
+        assert await box.input_value() == "agentdeck#90"
+
+        # Closing brings everything back, the folded group folded again. Escape does it from
+        # the list and the body too, where focus lands once the widening button is gone, but
+        # not while it has something else to close, nor from outside the list.
+        form = page.locator("#front-find")
+        escape = """where => document.querySelector(where).dispatchEvent(new KeyboardEvent(
+            'keydown', {key: 'Escape', bubbles: true}))"""
+        await page.evaluate(escape, ".topbar")
+        await page.evaluate("""() => document.body.insertAdjacentHTML(
+            'beforeend', '<dialog open id="over"></dialog>')""")
+        await page.evaluate(escape, "body")
+        await page.evaluate("() => document.getElementById('over').remove()")
+        await page.evaluate("() => { document.querySelector('main').inert = true; }")
+        await page.evaluate(escape, "body")
+        await page.evaluate("() => { document.querySelector('main').inert = false; }")
+        assert await form.is_visible()
+        await page.evaluate(escape, '[data-front-group="working"]')
+        assert not await form.is_visible()
+        await page.locator("[data-find-open]").click()
+        await box.fill("agentdeck#90")
+        await page.locator("[data-find-all]").click()
+        await page.locator("[data-find-all]").wait_for(state="detached")
+        await page.keyboard.press("Escape")
+        assert not await form.is_visible()
+        await page.locator("#front-tabs").wait_for(state="visible")
+        assert not await page.locator('#works [data-work-id$="#901"]').is_visible()
+        assert await page.locator(older).count() == 0
+        await more.wait_for(state="visible")
+        # The wider search ends with it: the tab is the one it started in.
+        assert await page.locator('[data-project-tab="trailhead"]').get_attribute(
+            "aria-pressed") == "true"
+        # One project has no tabs: the closed search takes no line of its own (#4624).
+        assert await page.evaluate("""() => {
+            document.getElementById('front-tabs').hidden = true;
+            return document.getElementById('front-bar').offsetHeight; }""") == 0
+        box = await page.locator("[data-find-open]").bounding_box()
+        assert box and box["x"] + box["width"] <= 390 and box["y"] > 0
         await browser.close()

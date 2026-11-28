@@ -1,5 +1,6 @@
 """Messages the deck sent into a chat render as one-line markers (#3200)."""
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -8,7 +9,18 @@ from fastapi.templating import Jinja2Templates
 
 from agentdeck import deck_notices
 from agentdeck.db import Db
+from agentdeck.jobs import (
+    CANCELLED,
+    DONE,
+    FAILED,
+    HIDDEN_FAILURES_NOTE,
+    INTERRUPTED,
+    Job,
+    job_message,
+    progress_message,
+)
 from agentdeck.models import TranscriptEvent
+from agentdeck.pending_events import with_notes
 from agentdeck.scheduled_messages import ScheduledMessage
 from agentdeck.voice_mode import VOICE_LINE_FI
 from agentdeck.web.render import register_filters, render_transcript_events
@@ -80,10 +92,16 @@ WAKE = (
             "work-release",
             "Something new happened to o/r#1",
         ),
+        (deck_notices.KEEP_WARM_TEXT, "keep-warm", "Cache kept warm"),
     ],
 )
 def test_each_deck_message_gets_a_one_line_label(text, kind, expected):
     assert deck_notices.label(text, kind) == expected
+    # Only the ping itself is the ping (#4737): a prompt that opens with its words is a person's.
+    assert deck_notices.is_keep_warm(deck_notices.KEEP_WARM_TEXT)
+    assert deck_notices.notice_kind(deck_notices.KEEP_WARM_TEXT, {}) == "keep-warm"
+    assert not deck_notices.is_keep_warm("AgentDeck keep-warm: why do I see this?")
+    assert deck_notices.notice_kind("AgentDeck keep-warm: why do I see this?", {}) is None
     # A success notice opens with the routine line (#4253); its label and sender read the same.
     routine = deck_notices.routine(text)
     assert routine.startswith(deck_notices.ROUTINE_LINE)
@@ -159,6 +177,70 @@ def test_deck_messages_render_as_markers_and_a_persons_own_stay_messages(tmp_pat
     assert 'class="ev deck-notice"' in rows[6] and "Looks done" in rows[6]
     assert "deck-notice" not in rows[7]  # the deck sent this text to another chat
     assert "deck-notice" not in rows[8]  # not the turn the record wrote
+    # Notes ahead of a message (#4618): one line above the person's own words, and the
+    # deck's message keeps its marker, by its record as much as by its prefix.
+    notes = ["AgentDeck: job 1 passed.\n\nIts log.", "AgentDeck: job 2 passed."]
+    noted = [
+        TranscriptEvent(seq=10, role="user", text=with_notes(notes, "Why so slow?"), ts=now),
+        TranscriptEvent(seq=11, role="user", text=with_notes(notes[:1], "Looks done"), ts=now),
+        TranscriptEvent(
+            seq=12,
+            role="user",
+            text=with_notes(notes[:1], "").rstrip(),
+            ts=now,
+            image_media_types=("image/png",),
+        ),
+    ]
+    html = render_transcript_events(templates, noted, session_key="k", store=store, chat_id="c")
+    person, deck, image = html.split('id="event-')[1:]
+    line = html.split('id="event-')[0]
+    assert 'class="deck-notes"' in line and "2 deck notes" in line and "Its log." in line
+    assert '<div class="ev-text">Why so slow?</div>' in person
+    assert "job 1" not in person and "job 2" not in person.split('class="deck-notes"')[0]
+    assert 'class="ev deck-notice"' in deck and "job 1 passed" in deck and "Looks done" in deck
+    assert "1 deck note<" in html and "The message itself follows" not in html
+    assert 'class="ev user' not in deck
+    marker = deck.split("</details>")[0]
+    # Each note once: the marker's text row leaves the notes out, as they are listed.
+    assert marker.count("job 1 passed") == 1 and marker.count("Looks done") == 2
+    assert "Deck notes that came" not in html
+    assert "ev-image" in image and "ev-text" not in image
+
+    # A job's message is the deck's too, and the routine line is for the agent alone.
+    def told(**changes):
+        return job_message(replace(queued, **changes))
+
+    queued = Job("1d57623dd536", ["pytest"], "/tmp", "/nonexistent.log", 0.0, state=DONE)
+    for text, label in (
+        (told(), "Job finished successfully · 1d57623d"),
+        (with_notes(notes[:1], told()), "Job finished successfully · 1d57623d"),
+        (told(state=FAILED), "Job failed · 1d57623d"),
+        (told(state=FAILED, note=HIDDEN_FAILURES_NOTE), "Job failed · 1d57623d"),
+        (told(state=CANCELLED), "Job was cancelled · 1d57623d"),
+        (told(state=INTERRUPTED), "Job did not run · 1d57623d"),
+        (
+            told(state=INTERRUPTED, started_at=1.0, finished_at=61.0),
+            "Job was cut off by a runtime restart after 1 min · 1d57623d",
+        ),
+        (progress_message(queued, 120.0), "Job is still running · 1d57623d"),
+    ):
+        event = [TranscriptEvent(seq=14, role="user", text=text, ts=now)]
+        html = render_transcript_events(templates, event, session_key="k")
+        assert 'class="ev deck-notice"' in html and f">{label}<" in html
+        assert 'class="ev user' not in html and "Routine notice" not in html
+        assert "Your queued job" in html
+    # A person may begin that way too, and an agent may quote the routine line.
+    for own in ("is stuck, please cancel it", "1d57623dd536 failed. Why?"):
+        assert deck_notices.notice_kind(f"Your queued job {own}", {}) is None
+    for role, shown in (("user", False), ("assistant", True)):
+        said = deck_notices.routine("Some other notice.")
+        event = [TranscriptEvent(seq=15, role=role, text=said, ts=now)]
+        html = render_transcript_events(templates, event, session_key="k")
+        assert "Some other notice." in html and ("Routine notice" in html) is shown
+    # A turn whose notes are not listed beside it keeps them in its text.
+    quoted = [TranscriptEvent(seq=13, role="assistant", text=noted[0].text, ts=now)]
+    html = render_transcript_events(templates, quoted, session_key="k")
+    assert "deck-notes" not in html and "job 2 passed" in html
     # No store, no records: the text prefix alone still marks the deck's message.
     plain = render_transcript_events(templates, events[1:3], session_key="k")
     assert plain.count("deck-notice-label") == 1

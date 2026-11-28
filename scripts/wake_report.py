@@ -4,7 +4,8 @@
 Reads the wake log voice mode writes while it waits for "Hey Jarvis"
 (``[speech] wake_log_dir``): one ``detector`` line per waiting phrase the detector
 checked, one ``whisper`` line for each phrase Whisper transcribed, joined by the
-phrase id, and a ``waiting`` line where each spell of waiting starts and stops. In
+phrase id, and a ``waiting`` line where each spell of waiting starts and stops
+(``carry`` lines, a kiosk whose sound started late, are skipped). In
 ``[speech] wake = "shadow"`` every waiting phrase should have both checks.
 
 It prints how often each check woke, where they disagree (with Whisper's words for

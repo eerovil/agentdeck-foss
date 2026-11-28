@@ -1939,10 +1939,29 @@ async def test_only_a_browser_send_records_a_persons_message(tmp_path):
         typed = await client.post(
             "/sessions/codex:test:sid/inject",
             data={"message": "from the page"},
-            headers={"origin": "http://test", "hx-request": "true"},
+            headers={
+                "origin": "http://test",
+                "hx-request": "true",
+                "x-agentdeck-action-id": "send-from-page",
+            },
         )
-    assert typed.status_code == 202
-    assert state.person_message_at([chat_id]) is not None
+        assert typed.status_code == 202
+        assert state.person_message_at([chat_id]) is not None
+        assert state.person_words[chat_id].words == "from the page"
+        # Each way to take a request back does so on arrival, whatever it answers (#4643).
+        for path in (
+            "inject", "steer", "interrupt", "interaction", "continue", "rollback",
+            "held/none/cancel", "pending/1/dismiss", "pending/1/resend",
+        ):
+            state.person_message_arrived("codex:test:sid", f"send-before-{path}")
+            state.person_message_accepted("codex:test:sid", f"send-before-{path}", "merge 5")
+            assert chat_id in state.person_words
+            await client.post(
+                f"/sessions/codex:test:sid/{path}",
+                data={"seq": "1"},
+                headers={"origin": "http://test", "hx-request": "true"},
+            )
+            assert chat_id not in state.person_words, path
 
 
 async def test_secret_command_delivers_only_a_value_free_notice(tmp_path, monkeypatch):
@@ -3984,6 +4003,21 @@ async def test_a_quota_retry_row_names_its_reset_instead_of_a_runtime_restart(tm
     assert chat_time(reset) in page.text
     assert "Waiting for the runtime to restart" not in page.text
 
+    # #4671: the chat carried on, so the retry will not be sent and its row goes.
+    state.update_session(
+        replace(
+            state.sessions[session.key],
+            turn_failed=False,
+            automatic_retry_at=None,
+        )
+    )
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        page = await client.get("/sessions/codex:test:sid")
+
+    assert 'id="held-messages"' in page.text
+    assert "Retrying at" not in page.text
+    assert retry.id in app.state.scheduled_messages.pending_ids()
+
 
 def _restarting_box(app, monkeypatch, interaction):
     """A chat asking something when its runtime went away; returns what was forgotten (#4106)."""
@@ -4146,6 +4180,27 @@ async def test_a_permission_prompt_and_a_dismissal_name_what_was_decided(tmp_pat
 
     assert "Dismissed: q2?" in [row.text for row in _held_rows(app)]
     assert forgotten == [{"q2"}]
+
+
+async def test_a_secret_is_never_taken_as_an_answer(tmp_path, monkeypatch):
+    """#4610: an answer reaches the model as typed, so a secret in one is refused."""
+    app = _web_app(tmp_path, max_message_chars=1000)
+    _restarting_box(app, monkeypatch, _box())
+    response = await _answer(
+        app, {"interaction_id": "tok-1", "other__q1": " /secret TOKEN hunter2"}
+    )
+    assert response.status_code == 422
+    assert "hunter2" not in response.text
+    assert list(_held_rows(app)) == []
+    # An option the agent offered is its own words, so it can be picked.
+    question = InteractionQuestion(
+        "q1", "Q1", "Which?", [InteractionOption("/secret in side chats", "")]
+    )
+    _restarting_box(app, monkeypatch, replace(_box(), questions=[question]))
+    picked = await _answer(
+        app, {"interaction_id": "tok-1", "answer__q1": "/secret in side chats"}
+    )
+    assert picked.status_code != 422
 
 
 async def test_the_api_says_when_an_answer_is_held(tmp_path, monkeypatch):
@@ -7332,6 +7387,38 @@ async def test_interaction_selection_survives_live_updates_e2e(tmp_path, monkeyp
         sent = parse_qs((await posted.value).post_data or "")
         assert sent["decision"] == ["accept"]
         assert await page.locator("text=Merge it?").is_visible()
+        # A secret typed as an answer is never saved, and one an older page saved is dropped
+        # when the box is drawn again, keeping the other answers (#4610).
+        await page.wait_for_function("() => !document.querySelector('.htmx-request')")
+        merge = page.locator('input[name="other__r2.0"]')
+        stored = "sessionStorage.getItem('agentdeck:question-draft:codex:test:sid')"
+        await merge.fill("ordinary words")
+        assert "ordinary words" in await page.evaluate(stored)
+        await merge.fill("  /secret TOKEN hunter2")
+        assert "hunter2" not in (await page.evaluate(stored) or "")
+        await merge.blur()  # a focused field saves the box again as it is removed
+        await page.evaluate(
+            """() => sessionStorage.setItem('agentdeck:question-draft:codex:test:sid',
+              JSON.stringify({'other__r2.0': ' /secret TOKEN hunter2',
+                              'other__r3.0': 'kept words'}))"""
+        )
+        await emit(
+            "interaction",
+            render_pending_interaction(
+                app.state.templates, "codex:test:sid",
+                replace(box, id=open_questions_id(["r2.0", "r3.0"]), questions=(
+                    replace(asked, id="r2.0", prompt="Merge it now?"),
+                    replace(asked, id="r3.0", prompt="Tag it?"),
+                )),
+            ),
+        )
+        await page.wait_for_selector("text=Merge it now?")
+        await page.wait_for_function(
+            "() => document.querySelector('input[name=\"other__r3.0\"]').value === 'kept words'"
+        )
+        assert await merge.input_value() == ""
+        assert "hunter2" not in await page.evaluate(stored)
+        assert "kept words" in await page.evaluate(stored)
         await browser.close()
 
 

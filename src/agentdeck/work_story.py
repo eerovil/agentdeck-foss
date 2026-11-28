@@ -24,9 +24,10 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from . import wayfinder_map
 from .work_derived import PARKED, is_mac_pause_link
 from .work_overview import (
     HANDOFF_STATES,
@@ -143,7 +144,7 @@ def _merged(card: WorkCard) -> bool:
     return any(output.state == "merged" for output in card.outputs)
 
 
-def _all_landed(card: WorkCard) -> bool:
+def all_landed(card: WorkCard) -> bool:
     """Something merged and nothing is still open: the merge step has finished (#2316)."""
     return _merged(card) and all(output.settled for output in card.outputs)
 
@@ -200,7 +201,7 @@ def _milestones(card: WorkCard) -> tuple[Milestone, ...]:
     else:
         check = (STEP_IDLE, "None") if done else (STEP_IDLE, "Not yet")
 
-    if done or _all_landed(card):
+    if done or all_landed(card):
         merge = (STEP_DONE, "Merged" if _merged(card) else "Done")
     else:
         merge = (STEP_WAITING, "Waiting")
@@ -329,6 +330,48 @@ _DERIVED_HEADLINES = {
 }
 
 
+# Derived statuses in Needs you that hold Close issue (#4631): an open question or approval (a
+# reviewer's question and a spec's included), a turn still running, and an issue that closed
+# already.
+_CLOSE_HELD = frozenset({"question", "review_escalated", "spec_wait", "stalled", "closed"})
+
+
+def _nothing_to_merge(card: WorkCard) -> bool:
+    """No pull request open or merged in this round, on an issue known open: research, say.
+
+    One that closed unmerged is none: ``outputs`` drops it, or holds it until the open list
+    is read again.
+
+    ``issue_title`` is only known for a cached issue, never a pull request's record: closing a
+    Work that stands for a pull request would close that pull request.
+    """
+    none = all(output.state == "closed" for output in card.outputs)
+    return none and card.work_state == "open" and bool(card.issue_title)
+
+
+def close_offered(card: WorkCard) -> bool:
+    """Whether a Work in Needs you may be closed here: merges done, or none to make (#4631).
+
+    Its issue is open and no pull request is. Not while a question box waits: closing would
+    leave it open, and an open question keeps a Work out of Finished. Nor while any of its chats
+    works or its agent waits on its own wake-up or job, nor on a scheduled issue, or one with
+    sub-issues, which outlives one merge. Whether it is in Needs you is the caller's to know.
+    """
+    if card.work_state == "done" or card.finished_at is not None or card.awaiting_finish:
+        return False
+    if card.paused or card.scheduled or not (all_landed(card) or _nothing_to_merge(card)):
+        return False
+    if card.unsettled_registered or card.has_sub_issues or wayfinder_map.is_map(card.labels):
+        return False
+    # The derived status speaks for one chat; any of the Work's others may be mid-turn.
+    if card.working_count or any(item.interaction for item in waiting_attention(card)):
+        return False
+    derived = card.derived
+    return derived is None or not (
+        derived.kind in _CLOSE_HELD or derived.live_checking or derived.self_waking
+    )
+
+
 def derived_story(card: WorkCard) -> WorkStatus:
     """The status of a Work the deck runs itself (#2895 step 3, D1, D7), as ``work_status``
     gives it to every surface (#2944)."""
@@ -339,6 +382,8 @@ def derived_story(card: WorkCard) -> WorkStatus:
     # Built with the line, never cut back out of it (#2956): a Stopped line naming a pull
     # request read "ended at PR #37 · 13:02".
     summary = derived.summary
+    # Finish is refused on an open issue; Close issue replaces it where it is offered (#4631).
+    end = "close the issue" if close_offered(card) else "finish the Work"
     you = {
         "question": (
             (
@@ -369,10 +414,10 @@ def derived_story(card: WorkCard) -> WorkStatus:
         "unfinished": "Read its last message and tell it what to do next",
         "pr_held": "Lift the hold, merge it by hand, or finish the Work",
         "pr_stuck": "Open the pull request and see why nothing moved it",
-        "live_failed": "Read what failed live, then tell the agent what to do or finish the Work",
+        "live_failed": f"Read what failed live, then tell the agent what to do or {end}",
         "not_live": (
             "Deploy what is not running yet and tell the agent to check it again,"
-            " or finish the Work"
+            f" or {end}"
         ),
         "review_escalated": "Read the reviewer's question and answer it in the chat",
         "spec_wait": "Read the spec, then approve it or say what to change",
@@ -714,6 +759,9 @@ class FrontRow:
     # A map's children that wait on another of its tickets, not on the owner (#3736,
     # ``work_tree._held_tickets``): folded in, but never a Needs you of their own.
     held: frozenset[str] = frozenset()
+    # Whole days since the Work last moved once it is past ``IDLE_AFTER`` (#4633,
+    # ``idle_days``), which draws the row as one line; 0 for a row drawn whole.
+    idle_days: int = 0
 
     @property
     def starred(self) -> bool:
@@ -724,6 +772,8 @@ class FrontRow:
     def revision(self) -> str:
         stopped = self.stopped_at.isoformat() if self.stopped_at is not None else ""
         base = f"{self.card.revision}:{stopped}:{int(self.unseen)}"
+        if self.idle_days:
+            base = f"{base}:idle{self.idle_days}"
         if not self.children and not self.progress:
             return base
         # A parent row redraws when any child it shows, or its sub-issue count, changes (#3622).
@@ -785,6 +835,20 @@ class FrontRow:
         from .work_actions import finish_button
 
         return finish_button(self.actor)
+
+    @property
+    def finish_all_id(self) -> str:
+        """The Work **Finish all** takes this row for (#4623), or "": only an Issue closed row
+        whose Finish asks nothing, since one press for all must not answer for an open pull
+        request. The actor's, as the row's own Finish."""
+        from .work_attention import ISSUE_CLOSED
+
+        if getattr(self.attention, "category", "") != ISSUE_CLOSED:
+            return ""
+        actor = self.actor
+        if not actor.awaiting_finish or self.finish.confirm:
+            return ""
+        return actor.work_id
 
     @property
     def start(self) -> Any:
@@ -1005,6 +1069,49 @@ def front_row(card: WorkCard, *, current: bool) -> FrontRow:
     return FrontRow(card, story, IN_PROGRESS if current else QUIET, line)
 
 
+# A Work that has not moved for longer than this is one line on the front page (#4633).
+IDLE_AFTER = timedelta(hours=48)
+
+
+def _last_moved(row: FrontRow) -> datetime | None:
+    """When a row's Work last moved, or None for one that is moving now or has no known time.
+
+    A finished Work goes by when it finished, or by the chat that carried on in it. Any other
+    goes by its chats, or by when it last came to need a person if that is newer. A parent row
+    is as recent as its newest folded Work.
+    """
+    members = (row, *row.children)
+    if any(member.card.working_count for member in members):
+        return None
+    times: list[datetime | None] = []
+    for member in members:
+        ended = member.finished_order if member.section == FINISHED else None
+        times += [ended] if ended else [member.card.last_activity, member.stopped_at]
+    return max((when for when in times if when is not None), default=None)
+
+
+def idle_days(row: FrontRow, now: datetime) -> int:
+    """Whole days since a row's Work last moved, once past ``IDLE_AFTER``; else 0."""
+    moved = _last_moved(row)
+    if moved is None or now - moved <= IDLE_AFTER:
+        return 0
+    return (now - moved).days
+
+
+def idle_deadline(rows: Sequence[FrontRow], now: datetime) -> datetime | None:
+    """When the first of these rows goes idle, or has its age in days grow, by itself."""
+    due = []
+    for row in rows:
+        moved = _last_moved(row)
+        if moved is None:
+            continue
+        # A second late, as a row goes idle only once strictly past ``IDLE_AFTER``.
+        ripe = moved + IDLE_AFTER + timedelta(seconds=1)
+        while_idle = moved + timedelta(days=(now - moved).days + 1)
+        due.append(while_idle if now >= ripe else ripe)
+    return min(due, default=None)
+
+
 # The counts-line keys whose words change with the count: (one, several).
 SUMMARY_PLURALS = {"answer": ("question", "questions"), "review": ("review", "reviews")}
 
@@ -1042,6 +1149,9 @@ class FrontSections:
     parked: tuple[FrontRow, ...] = ()
     # Current Works only a person can check live (#4210), kept out of Needs you and Working.
     trying: tuple[FrontRow, ...] = ()
+    # The ``finished`` rows listed only for their star (#4121): finished too long ago, or with
+    # no known finish time, for Recently finished. Starred lists them and no other group.
+    kept: frozenset[str] = frozenset()
 
     @property
     def rows(self) -> tuple[FrontRow, ...]:
@@ -1055,9 +1165,9 @@ class FrontSections:
     def starred(self) -> tuple[FrontRow, ...]:
         """The page's Starred group (#4121): every listed starred Work, most needing you first.
 
-        Only a display: each row stays in its own section, so the counts line, the top bar's
-        list and everything else that asks what a Work is doing read it the same. A row the
-        person hid stays hidden, star or not."""
+        Only a display: each row stays in its own section and its own group lists it too
+        (#4745), so the counts line, the top bar's list and everything else that asks what a
+        Work is doing read it the same. A row the person hid stays hidden, star or not."""
         return tuple(
             row
             for section in (
@@ -1072,9 +1182,10 @@ class FrontSections:
     def starred_new(self) -> int:
         return sum(1 for row in self.starred if row.unseen)
 
-    def others(self, rows: Sequence[FrontRow]) -> tuple[FrontRow, ...]:
-        """``rows`` as a group lists them: the starred ones are in Starred alone (#4121)."""
-        return tuple(row for row in rows if not row.starred)
+    @property
+    def recent(self) -> tuple[FrontRow, ...]:
+        """The rows Recently finished lists: ``finished`` without those only a star keeps."""
+        return tuple(row for row in self.finished if row.card.work_id not in self.kept)
 
     @property
     def new(self) -> int:
@@ -1125,14 +1236,20 @@ class FrontSections:
         )
 
     def groups_in(self, place: str) -> tuple[FrontGroup, ...]:
-        """The groups listed at one place in the front page's flow (``FRONT_PLACES``), without
-        the starred rows Starred lists instead (#4121)."""
+        """The groups listed at one place in the front page's flow (``FRONT_PLACES``). A
+        starred row is in its group as well as in Starred (#4745)."""
         from .work_attention import FRONT_PLACES
 
         return tuple(
-            group for group in self._grouped(self.others(self.needs_you))
+            group for group in self._grouped(self.needs_you)
             if FRONT_PLACES.get(group.category, "cleanup") == place
         )
+
+    @property
+    def finishable(self) -> tuple[FrontRow, ...]:
+        """The rows the page's Finish all may take (#4623): the Issue closed group's own, but
+        never a starred one, though the group lists it now (#4745)."""
+        return tuple(row for row in self.needs_you if row.finish_all_id and not row.starred)
 
     @property
     def summary(self) -> tuple[tuple[str, int, str], ...]:
@@ -1205,13 +1322,16 @@ def front_sections(
     The Work id breaks every tie, so a refresh with nothing new renders the same order.
     A Work in ``hidden`` leaves Needs you for the Hidden list; every other section is
     unaffected by it (#2238). A paused Work is on the Paused list only (#2548).
-    A starred Work is never cut (#4121): the page lists it in Starred alone
-    (``FrontSections.starred``), so it takes no place from the bounds above. A finished one
-    stays however long ago it finished, or with no known finish time, and an open one that
-    went quiet is listed in ``idle`` rather than counted.
-    Recently stopped is the ``MAX_STOPPED`` shown unstarred Needs you rows with the newest
+    A starred Work is never cut (#4121): the page lists it in Starred
+    (``FrontSections.starred``) as well as in its own group (#4745), and it takes no place
+    from the bounds on Active and Finished. A finished one stays however long ago it
+    finished, or with no known finish time, and an open one that went quiet is listed in
+    ``idle`` rather than counted; Starred alone lists those (``kept``, ``idle``), since no
+    other group would.
+    Recently stopped is the ``MAX_STOPPED`` shown Needs you rows with the newest
     ``stopped_at`` (#2283); a row with none yet, or whose issue closed (#3388), is not
-    listed there.
+    listed there. A star changes nothing in it (#4745): a starred stop takes a place like any
+    other, and is past the bound like any other, since Starred lists it anyway.
     """
 
     def stamp(row: FrontRow) -> float:
@@ -1221,15 +1341,22 @@ def front_sections(
     by: dict[str, list[FrontRow]] = {
         NEEDS_YOU: [], IN_PROGRESS: [], FINISHED: [], QUIET: [], PAUSED: []
     }
+    if now is not None:
+        rows = [replace(row, idle_days=idle_days(row, now)) for row in rows]
     unknown = 0  # finished, but when is not known yet: counted as finished, never as quiet
+    kept: set[str] = set()  # finished rows only their star lists
     for row in rows:
         section = row.section
         ended = row.finished_order
-        if section == FINISHED and not row.starred:
-            if ended is None:
+        if section == FINISHED:
+            old = ended is not None and now is not None and now - ended > RECENT_WORK
+            if row.starred:
+                if ended is None or old:
+                    kept.add(row.card.work_id)
+            elif ended is None:
                 unknown += 1
                 continue
-            if now is not None and now - ended > RECENT_WORK:
+            elif old:
                 section = QUIET
         by[section].append(row)
     def order(row: FrontRow) -> tuple[bool, float, str]:
@@ -1248,7 +1375,7 @@ def front_sections(
     active = [row for row in active if not row.parked]
     waiting = [row for row in active if row.waits]
     active = [row for row in active if not row.waits]
-    # Starred leads both lists, so each bound below counts only the rows its group lists.
+    # A star is never cut from Active or Finished: their bounds count only the unstarred rows.
     active_limit = max_active + sum(1 for row in active if row.starred)
     def finished_rank(row: FrontRow) -> tuple[bool, float, str]:
         # Only a starred row can have no finish time here: it goes after those that have one.
@@ -1272,7 +1399,6 @@ def front_sections(
         (
             row for row in needs
             if row.stopped_at is not None
-            and not row.starred
             and getattr(row.attention, "category", "") not in {ISSUE_CLOSED, UNSTARTED}
         ),
         key=lambda row: (-row.stopped_at.timestamp(), row.card.work_id),
@@ -1299,6 +1425,7 @@ def front_sections(
         stopped=tuple(stopped),
         paused=tuple(paused),
         parked=tuple(parked),
+        kept=frozenset(kept),
     )
 
 

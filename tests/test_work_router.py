@@ -37,6 +37,7 @@ from agentdeck.work_router import (
     WorkRouterService,
     _grown,
     classify,
+    issue_owner_of_pull,
     owner_of_issue,
     owner_of_pull,
     pulls_by_work,
@@ -1403,7 +1404,7 @@ class FakeState:
     def current_session_for_chat(self, chat):
         return None
 
-    def chat_identity_key(self, leg):
+    def chat_identity_key(self, leg, chats=None):
         return leg.split("/")[0]
 
     def work_projection(self):
@@ -1443,6 +1444,15 @@ def test_a_pull_request_belongs_to_the_one_work_its_registering_chat_joined():
     )
     assert owner_of_pull(state, "eerovil/agentdeck", 9) == ("chat-a", "eerovil/agentdeck#7")
     assert owner_of_pull(state, "eerovil/other", 9) is None, "same number, other repository"
+    # The release tells the issue's owner (#4753), found from the Work ``owner_of_pull`` names
+    # as ``owner/repo#n``: the registering chat, or another chat that owns the issue.
+    assert issue_owner_of_pull(state, "eerovil/agentdeck", 9) is None, "no issue owner"
+    state._work = FakeState(memberships=[("chat-a", True)], activity={"chat-a": 0})._work
+    assert issue_owner_of_pull(state, "eerovil/agentdeck", 9) == ("chat-a", "eerovil/agentdeck#7")
+    state._work = FakeState(memberships=[("chat-b", True)], activity={"chat-b": 0})._work
+    state.sessions.update(FakeState(activity={"chat-b": 0}).sessions)
+    assert issue_owner_of_pull(state, "eerovil/agentdeck", 9) == ("chat-b", "eerovil/agentdeck#7")
+    assert issue_owner_of_pull(state, "eerovil/other", 9) is None
 
 
 def test_a_pull_request_whose_chat_joined_two_works_is_not_placed():
@@ -1825,7 +1835,7 @@ async def test_review_fixes_that_grew_the_diff_add_a_design_check(root, harness)
     assert "6. " not in first
     # #4437: the helper checks are asked for before the first review only.
     assert (
-        f"agentdeck pre-review-helpers --cwd <checkout> --pull {pull} --issue eerovil/agentdeck#7`"
+        f"agentdeck pre-review-helpers --cwd . --pull {pull} --issue eerovil/agentdeck#7`"
         in first
     ), "the Work's issue, where the comment is checked, not the body's first reference"
     # #4567: run at the first push, a comment for an earlier head stands if only its finds
@@ -1835,6 +1845,10 @@ async def test_review_fixes_that_grew_the_diff_add_a_design_check(root, harness)
         first.split()
     )
     assert harness.size_reads == [], "no earlier round: nothing is read"
+    # #4786: the deck's refusal names the big pull request's reading guide.
+    assert "1,000 changed lines or more lacks a `Reading guide:` section" in " ".join(
+        first.split()
+    )
     second = await round_at(MID, 1100, "d2")
     assert "6. " not in second, "10% is not over"
     assert "pre-review-helpers --cwd" not in second
@@ -2075,7 +2089,7 @@ async def test_no_code_review_starts_before_the_design_passed(root, harness):
         gap = "the issue's newest `**Design:**` comment has no design review after it"
         read: list[str] = []
 
-        async def missing(self, work):
+        async def missing(self, work, queued=None):
             self.read.append(work)
             return self.gap
 
@@ -2088,6 +2102,18 @@ async def test_no_code_review_starts_before_the_design_passed(root, harness):
     await harness.drain()
     with pytest.raises(AgainRefused, match="no design review after it"):
         await harness.service.pre_review_done("eerovil/agentdeck", 9)
+    # Held only by the design review it already asked for: wait, with nothing to fix (#4781).
+    from agentdeck.design_review import WAITING_GAP
+
+    design.gap = WAITING_GAP
+    with pytest.raises(AgainRefused) as waiting:
+        await harness.service.pre_review_done("eerovil/agentdeck", 9)
+    assert WAITING_GAP in str(waiting.value) and "Fix it" not in str(waiting.value)
+    harness.service._tell_design_gap(("chat", "eerovil/agentdeck#7"), pull, NEW, WAITING_GAP)
+    [wait_told] = [m for m in harness.scheduled if m.id.startswith("work-event:design-gap:")]
+    assert "review-request" not in wait_told.text
+    harness.scheduled.clear()
+    design.gap = Design.gap
     with pytest.raises(AgainRefused, match="no code review before its design"):
         await harness.service.ask_again("eerovil/agentdeck", 9, "walkthrough posted")
     # With no checklist the ready event goes straight to the dispatch, which holds it too.
@@ -2099,6 +2125,7 @@ async def test_no_code_review_starts_before_the_design_passed(root, harness):
     assert harness.reviews == [] and not harness.service._spent(pull, OLD)
     told = [m for m in harness.scheduled if m.id.startswith("work-event:design-gap:")]
     assert len(told) == 1 and "no design review after it" in told[0].text
+    assert "review-request" in told[0].text
     assert not harness.service.pending.entries
     assert set(design.read) == {"eerovil/agentdeck#7"}
     # Once it passed, the agent's own request starts the review.
@@ -2193,7 +2220,9 @@ async def test_a_ready_head_waits_on_the_agents_pre_review(root, harness):
     assert harness.reviews == []
     [checklist] = harness.scheduled
     assert checklist.id == f"work-event:pre-review:eerovil/agentdeck#9@{OLD}"
-    assert "A diagram only for a new feature" in checklist.text
+    # No diagram unless the owner asked (#4721).
+    assert "1. No diagram work unless the owner asked for a diagram" in checklist.text
+    assert "A diagram only for a new feature" not in checklist.text
     assert '{"pull_request": "eerovil/agentdeck#9"}' in checklist.text
     # ... and says how to do each point, moved there from the guide (#4252).
     assert "<!-- agentdeck-diagram -->" in checklist.text
@@ -2746,6 +2775,54 @@ async def test_ship_merge_between_proves_only_a_base_merge_with_the_same_code(mo
     assert not await between("o/r", 9, shipped, merged)
 
 
+async def test_same_files_merge_proves_only_a_base_merge_that_undoes_nothing(monkeypatch):
+    """#4635: the proof a Merge press stands on, with the reported shape: the branch was built
+    on ``stacked``, which then merged into the base. The same tree with the base's changes
+    thrown away (``-s ours``), or a base revert undone, is no proof."""
+    from agentdeck import gh_cli, work_router
+
+    old, new, base, inner = ("a" * 40, "b" * 40, "c" * 40, "d" * 40)
+    earlier, stacked = "e" * 40, "f" * 40  # both already in ``old``
+    good = {
+        f"git/commits/{new}": f"tree\n{old}\n{base}",
+        f"git/commits/{old}": f"tree\n{stacked}",
+        "pulls/9": "master",
+        f"compare/master...{base}": "0",
+        f"compare/{base}...{new}": "ahead 2\nsrc/x.py\nsrc/y.py",
+        f"compare/{old}...{base}": f"2\n{inner} {earlier}\n{base} {inner} {stacked}",
+        f"compare/{earlier}...{inner}": "ahead 1\nsrc/other.py",
+        f"compare/{inner}...{base}": "ahead 1\nsrc/x.py",  # the stacked work
+        f"compare/{stacked}...{base}": "ahead 1\nsrc/other.py",
+    }
+    answers = dict(good)
+
+    async def run_once(argv, *, timeout, repo=None, **kw):
+        found = answers.get(argv[2].removeprefix("repos/o/r/"))
+        return (1, b"", b"") if found is None else (0, found.encode(), b"")
+
+    monkeypatch.setattr(gh_cli, "run_once", run_once)
+    assert await work_router.same_files_merge("o/r", 9, old, new)
+    for path, answer in (
+        (f"git/commits/{new}", f"other\n{old}\n{base}"),  # a file changed
+        (f"git/commits/{new}", f"tree\n{old}"),  # a commit of its own
+        (f"git/commits/{new}", f"tree\n{base}\n{old}"),  # the base took the branch in
+        (f"git/commits/{new}", f"tree\n{old}\n{base}\n{inner}"),  # three parents
+        (f"compare/master...{base}", "1"),  # not on the base branch
+        (f"compare/{earlier}...{inner}", "ahead 1\nsrc/y.py"),  # a base change undone
+        (f"compare/{stacked}...{base}", "ahead 1\nsrc/x.py"),  # changed by the merge itself
+        (f"compare/{stacked}...{base}", "diverged 1\nsrc/other.py"),
+        (f"compare/{base}...{new}", "ahead 300\nsrc/x.py"),  # cut short
+        (f"compare/{old}...{base}", f"3\n{inner} {earlier}\n{base} {inner} {stacked}"),
+        (f"compare/{old}...{base}", "0"),
+        (f"compare/{old}...{base}", f"1\n{inner}"),  # a root commit
+    ):
+        answers = {**good, path: answer}
+        assert not await work_router.same_files_merge("o/r", 9, old, new), (path, answer)
+    for path in good:  # unread
+        answers = {key: value for key, value in good.items() if key != path}
+        assert not await work_router.same_files_merge("o/r", 9, old, new), path
+
+
 async def test_behind_base_reads_how_far_the_head_lags_its_base(monkeypatch):
     """#4576: the press warns of a conflict when its head lacks base commits; unread is no
     warning."""
@@ -2944,7 +3021,16 @@ async def test_fixing_a_no_code_review_starts_no_new_review(root, harness, monke
     async def changes(repository, old, new):
         return None if sizes is None else (sizes, renamed)
 
+    # #4743: over the limit, the count is taken again from the pull request's own diff.
+    own: int | None = None
+    recounted: list[list[str]] = []
+
+    async def own_changes(repository, number, old, new, names):
+        recounted.append(sorted(names))
+        return own
+
     monkeypatch.setattr(work_router, "compared_changes", changes)
+    monkeypatch.setattr(work_router, "own_changes", own_changes)
     before = {"src/a.py", "src/test_timings.py"}
     for changed, proven in (
         ({"src/a.py": 3, "README.md": 900}, True),
@@ -2985,6 +3071,46 @@ async def test_fixing_a_no_code_review_starts_no_new_review(root, harness, monke
         f"it changes {MINOR_LINES + 1} lines of code (added plus removed) in files the pull"
         f" request already had, over the limit of {MINOR_LINES}"
     ]
+    # #4743: a base merge brought 182 lines into files the diff already had, and the fix is
+    # 10 of the 192. Only the fix counts; a fix still too large says what was left out; an
+    # unread recount, or one that is not smaller, keeps the plain count.
+    del recounted[:]
+    sizes = {"src/a.py": 182, "src/test_timings.py": 10, "tests/test_a.py": 40, "src/b.py": 9}
+    for recount, proven, said in (
+        (10, True, ""),
+        (MINOR_LINES, True, ""),
+        (
+            MINOR_LINES + 1,
+            False,
+            f"it changes {MINOR_LINES + 1} lines of code (added plus"
+            " removed) in files the pull request already had, not counting lines merged in from"
+            f" the base branch, over the limit of {MINOR_LINES}",
+        ),
+        (
+            None,
+            False,
+            "it changes 192 lines of code (added plus removed) in files the pull"
+            f" request already had, over the limit of {MINOR_LINES}",
+        ),
+        (
+            500,
+            False,
+            "it changes 192 lines of code (added plus removed) in files the pull"
+            f" request already had, over the limit of {MINOR_LINES}",
+        ),
+    ):
+        own, why = recount, []
+        assert (
+            await between("eerovil/agentdeck", 9, OLD, NEW, before, minor=True, why=why)
+            is proven
+        ), recount
+        assert why == ([said] if said else []), recount
+    # Only the code files the diff had are counted again, and a fix within the limit is not.
+    assert recounted == [["src/a.py", "src/test_timings.py"]] * 5
+    own, sizes = 0, {"src/a.py": MINOR_LINES}
+    assert await between("eerovil/agentdeck", 9, OLD, NEW, before, minor=True) is True
+    assert len(recounted) == 5
+    own = None
     sizes = {"src/a.py": 2, "src/new.py": 1}
     why = []
     await between("eerovil/agentdeck", 9, OLD, NEW, before, minor=True, why=why)
@@ -3139,6 +3265,189 @@ async def test_a_review_start_a_late_minor_pass_overtook_writes_no_ask(harness, 
         assert closes == []
 
 
+def carry_to(harness, head=NEW):
+    """The release's own carry: OLD's pass copied to ``head``, which only merged its base."""
+    pull = "eerovil/agentdeck#9"
+    data = {"digest": "d" * 64, "carried_from": OLD}
+    harness.note(pull, head, review_history.PASS, f"carried:{pull}@{head}", data=data)
+
+
+@pytest.mark.parametrize(
+    "when", ["digest", "growth", "design", "covered", "uncertain", "replay", "asked"]
+)
+async def test_a_carried_pass_stops_a_running_automatic_start(harness, monkeypatch, when):
+    """#4658: the release carried a pass to the head while its review start ran, and the
+    start's ``asked`` row then voided it. The start stops, whichever wait it was in, ends the
+    chat's own wait and sends no checklist; the agent's own request is still asked."""
+    from agentdeck import work_router
+
+    pull = "eerovil/agentdeck#9"
+    service = harness.service
+    _release, closes = late_router(harness)
+    service._release = None
+    service.pre_review_on = when in ("digest", "growth")
+    owner = ("chat-a", "eerovil/agentdeck#7")
+    event = work_router.Event(work_router.REVIEW, "eerovil/agentdeck", 9, True, head=NEW)
+
+    async def digest(ref, head):
+        if when in ("digest", "asked"):
+            carry_to(harness)
+        return "d" * 64
+
+    async def growth(ref, event):
+        if when == "growth":
+            carry_to(harness)
+        return ""
+
+    async def design_gap(owner):
+        if when == "design":
+            carry_to(harness)
+            return "no design review passed"
+        return ""
+
+    async def start_review(pull_ref, work, **asks):
+        harness.asks.append(asks)
+        if when in ("covered", "uncertain"):
+            carry_to(harness)
+        if when == "uncertain":
+            raise RuntimeError("gh timed out after it pressed")
+        return SimpleNamespace(pulls=[(pull, NEW)])
+
+    service._digest, service._design_gap, service._growth = digest, design_gap, growth
+    service._start_review = start_review
+    monkeypatch.setattr(work_router, "covers", lambda outcome, ref, head: True)
+    if when == "replay":
+        carry_to(harness)
+    await service._review(owner, event, asked=when == "asked")
+    asked = review_history.ASKED in harness.kinds(pull, NEW)
+    if when == "asked":
+        assert asked and harness.verdicts == []
+        return
+    assert not asked and not harness.scheduled
+    assert review_history.passed(
+        review_history.standing_verdict(review_history.at_head(harness.reviews_of(pull), NEW))
+    )
+    assert harness.verdicts == [("chat-a", [pull])] and not service.pending.entries
+    opened = when in ("covered", "uncertain")
+    assert bool(harness.asks) is opened and [c[2] for c in closes] == [NEW] * opened
+    assert not opened or "only its base branch changed" in closes[0][5]
+    # A repeated call is told no review is coming, and registers no wait.
+    harness.heads[("eerovil/agentdeck", 9)] = NEW
+    waits = []
+    service._wait_review = lambda *args: waits.append(args)
+    assert (await service.pre_review_done("eerovil/agentdeck", 9))["outcome"] == "not reviewed"
+    assert waits == []
+    # An older head's late stop ends no newer head's wait.
+    harness.now += 1
+    harness.asked(pull, "b" * 40)
+    service._stop_on_carried(owner, pull, NEW)
+    assert harness.verdicts == [("chat-a", [pull])]
+
+
+async def test_a_pending_start_a_carried_pass_met_ends_its_wait_on_retry(harness):
+    """#4658: the release carried the pass while the start waited to be retried, or the deck
+    stopped between ending the wait and dropping the row."""
+    pull = "eerovil/agentdeck#9"
+    harness.heads[("eerovil/agentdeck", 9)] = NEW
+    row = {"kind": "review", "repository": "eerovil/agentdeck", "number": 9, "head": NEW}
+    harness.service.pending.put(f"review:{pull}@{NEW}", row, harness.now)
+    harness.now += 1
+    carry_to(harness)
+    harness.now += 4_000
+    await harness.service.retry_pending()
+    assert harness.verdicts == [("chat-a", [pull])]
+    assert harness.asks == [] and not harness.service.pending.entries
+
+
+@pytest.mark.parametrize("ends", ["carried", "nothing", "asked", "capped", "no note"])
+async def test_an_own_request_made_while_an_automatic_start_runs_is_not_lost(harness, ends):
+    """#4658: ``review-request`` met a start in flight, which may end without asking. The
+    request is kept with its note until a review of the head is asked for; past the cap the
+    chat is told and its wait ends."""
+    from agentdeck.work_router import MAX_AGAIN, AgainBusy
+
+    pull, service = "eerovil/agentdeck#9", harness.service
+    harness.heads[("eerovil/agentdeck", 9)] = NEW
+    waits = []
+    service._wait_review = lambda *args: waits.append(args)
+    service._in_flight.add(f"{pull}@{NEW}")
+    for note in ("first", "the owner decided", "") if ends != "no note" else ("",):
+        with pytest.raises(AgainBusy):
+            await service.ask_again("eerovil/agentdeck", 9, note)
+    [held] = service._requests(pull, NEW)
+    harness.now += 100
+    if ends == "nothing":  # its start ended and only the kept request is left
+        service._in_flight.clear()
+        with pytest.raises(AgainBusy):
+            await service.ask_again("eerovil/agentdeck", 9, "a newer note")
+        assert service.pending.entries[held]["note"] == "a newer note"
+        service._in_flight.add(f"{pull}@{NEW}")
+    if ends in ("carried", "capped", "no note"):
+        carry_to(harness)
+        service._stop_on_carried(("chat-a", "eerovil/agentdeck#7"), pull, NEW)
+        assert harness.verdicts == []  # the request still waits on its review
+        done = await service.pre_review_done("eerovil/agentdeck", 9)
+        assert done["outcome"] == "pending" and done["waiting"]
+        waits.clear()
+    harness.now += 4_000
+    await service.retry_pending()
+    assert service._requests(pull, NEW) == [held] and harness.asks == []  # still running
+    service._in_flight.clear()
+    if ends == "asked":
+        from agentdeck import work_router
+
+        event = work_router.Event(work_router.REVIEW, "eerovil/agentdeck", 9, True, head=NEW)
+        service._note_asked(pull, event, "", uncertain=True)
+        assert not service.pending.entries
+        return
+    if ends == "capped":
+        for n in range(MAX_AGAIN):
+            harness.note(pull, NEW, review_history.ASKED, f"old{n}", at=1.0, data={"again": f"{n}"})
+    harness.now += 4_000
+    await service.retry_pending()
+    assert not service.pending.entries
+    if ends in ("capped", "no note"):
+        assert harness.asks == [] and harness.verdicts == [("chat-a", [pull])]
+        assert "the review you asked for did not start" in harness.scheduled[-1].text
+    else:
+        again = ends == "carried"
+        assert harness.asks == ([{"note": "the owner decided", "again": True}] if again else [{}])
+        assert waits == [("chat-a", pull, True)] and harness.verdicts == []
+
+
+@pytest.mark.parametrize("met", ["retry", "ready press", "replay"])
+async def test_an_own_first_request_a_carried_pass_met_is_asked_again(harness, met):
+    """#4658: the request's own pending row keeps its note, and becomes an ask-again row when
+    a pass was carried to its head before it could start."""
+    from agentdeck import work_router
+    from agentdeck.chat_review import ReviewBusy
+
+    service = harness.service
+    harness.heads[("eerovil/agentdeck", 9)] = NEW
+    start = service._start_review
+
+    async def busy(pull, work, **asks):
+        raise ReviewBusy("someone is mid-review")
+
+    service._start_review = busy
+    asked = await service.ask_again("eerovil/agentdeck", 9, "the owner decided")
+    assert asked["outcome"] == "pending"
+    harness.now += 1
+    carry_to(harness)
+    service._start_review = start
+    owner = ("chat-a", "eerovil/agentdeck#7")
+    if met == "ready press":
+        await service._ready_again(None, owner, "eerovil/agentdeck", 9, NEW)
+    elif met == "replay":
+        event = work_router.Event(REVIEW, "eerovil/agentdeck", 9, True, head=NEW)
+        await service._review(owner, event)
+    for _ in range(2):
+        harness.now += 4_000
+        await service.retry_pending()
+    assert harness.asks == [{"note": "the owner decided", "again": True}]
+    assert not service.pending.entries and harness.verdicts == []
+
+
 async def test_a_compare_reports_a_pure_rename_apart(monkeypatch):
     """#4474 review: GitHub reports a content-identical rename with 0 additions and 0
     deletions, so its old name comes back as renamed, not as a size of 0."""
@@ -3184,6 +3493,151 @@ async def test_a_compare_reports_a_pure_rename_apart(monkeypatch):
         frozenset({"src/a.py", "docs/a.md"}),
     )
     assert seen[0][2] == f"repos/eerovil/agentdeck/compare/{OLD}...{NEW}"
+
+
+async def test_a_minor_fix_is_counted_in_the_pull_requests_own_diff(monkeypatch):
+    """#4743: ``own_changes`` compares the pull request's diff against its base at the
+    reviewed head and at the new one, from GitHub's compare payload: lines a base merge
+    brought into a file of the diff count nothing; a line the fix adds, drops, rewrites or
+    moves does, a block moved past unchanged code included (#4744 review); anything unread
+    is ``None``, so the caller keeps its plain count."""
+    import base64
+    import shutil
+    import subprocess
+
+    from agentdeck import work_router
+
+    def patch(*rows: str) -> str:
+        return "@@ -1,4 +1,6 @@ def f():\n context\n" + "\n".join(rows)
+
+    left_was, left_now = "a" * 40, "b" * 40
+
+    def payload(files: dict[str, str | None], status: str = "ahead", left: str = "") -> dict:
+        return {
+            "status": status,
+            "merge_base_commit": {"sha": left},
+            "files": [
+                {"filename": name, "additions": 1, "deletions": 0}
+                | ({} if rows is None else {"patch": rows})
+                for name, rows in files.items()
+            ],
+        }
+
+    def sized(files: dict[str, int], status: str = "ahead") -> dict:
+        return {
+            "status": status,
+            "files": [
+                {"filename": name, "additions": size, "deletions": 0}
+                for name, size in files.items()
+            ],
+        }
+
+    block = [f"+line {n}" for n in range(101)]
+    was = {
+        "src/merged.py": patch("+a = 1", "-b = 2", " shared", "+c = 3"),
+        "src/added.py": patch("+a = 1"),
+        "src/rewritten.py": patch("+a = 1", "+b = 2"),
+        "src/moved.py": patch("+a = 1", "+b = 2", "+c = 3"),
+        "src/dropped.py": patch("+a = 1", "-b = 2"),
+        "src/big.py": patch("+a = 1"),
+        "src/relocated.py": patch(*block),
+    }
+    now = {
+        # The base merge moved the hunk and its context; the pull request's own lines stand.
+        "src/merged.py": "@@ -90,7 +190,9 @@ def g():\n other\n+a = 1\n-b = 2\n+c = 3",
+        # A character Python's line split cuts at must not leave the patch unread.
+        "src/added.py": patch("+a = 1", "+b = '\u2028\u0085' # \r"),
+        "src/rewritten.py": patch("+a = 1", "+b = 3"),
+        "src/moved.py": patch("+b = 2", "+c = 3", "+a = 1"),
+        "src/big.py": None,
+        # #4744 review: the fix moved the pull request's own block past unchanged code, so
+        # its added lines read the same, in the same order, from another place.
+        "src/relocated.py": "@@ -400,3 +400,104 @@ class Other:\n elsewhere\n" + "\n".join(block),
+    }
+    base_range = f"compare/{left_was}...{left_now}"
+    answers: dict[str, dict | None] = {
+        "pulls/9": {"base": {"ref": "release/next"}},
+        f"compare/release/next...{OLD}": payload(was, left=left_was),
+        f"compare/release/next...{NEW}": payload(now, left=left_now),
+        base_range: sized({"src/merged.py": 180, "src/relocated.py": 50, "src/added.py": 9}),
+    }
+    asked: list[str] = []
+
+    async def lines(repository, command):
+        path = command[2].removeprefix(f"repos/{repository}/")
+        asked.append(path)
+        answer = answers.get(path)
+        if answer is None:
+            return None
+        if shutil.which("jq") is None:  # the lines jq prints for the payload
+            if "files" not in answer:
+                return [answer["base"]["ref"]]
+            head = f"{answer['status']} {len(answer['files'])}"
+            if "merge_base_commit" not in command[-1]:
+                return [head] + [
+                    f"{row['additions'] + row['deletions']} {row['filename']}"
+                    for row in answer["files"]
+                ]
+            return [f"{head} {answer['merge_base_commit']['sha']}"] + [
+                base64.b64encode(json.dumps([row["filename"], row.get("patch")]).encode()).decode()
+                for row in answer["files"]
+            ]
+        out = subprocess.run(
+            ["jq", "-r", command[-1]], input=json.dumps(answer), capture_output=True, text=True
+        )
+        return out.stdout.splitlines()
+
+    monkeypatch.setattr(work_router, "_gh_lines", lines)
+
+    async def count(sizes: dict[str, int]) -> int | None:
+        return await work_router.own_changes("eerovil/agentdeck", 9, OLD, NEW, sizes)
+
+    # Each file with its plain count between the two heads: the base merge's 180 lines in a
+    # file of the diff are not the fix.
+    assert await count({"src/merged.py": 180}) == 0
+    assert await count({"src/merged.py": 185}) == 5
+    assert await count({"src/added.py": 10}) == 1
+    assert await count({"src/added.py": 3}) == 1  # the base changed more than the plain count
+    assert await count({"src/rewritten.py": 2}) == 2
+    assert await count({"src/moved.py": 2}) == 2
+    assert await count({"src/dropped.py": 2}) == 2  # the fix took the file out of the diff
+    assert await count({"src/merged.py": 180, "src/added.py": 10, "src/rewritten.py": 2}) == 3
+    assert await count({"src/nowhere.py": 0}) == 0 and await count({}) == 0
+    # #4744 review: a 101-line block moved inside its file leaves the own diff's lines as
+    # they were, and is still the block removed and added, with a base merge or without.
+    assert await count({"src/relocated.py": 252}) == 202
+    answers[f"compare/release/next...{NEW}"] = payload(now, left=left_was)
+    del asked[:]
+    assert await count({"src/relocated.py": 202}) == 202
+    assert base_range not in asked  # no base merge between the heads: nothing to take off
+    assert await count({"src/merged.py": 180}) == 180
+    answers[f"compare/release/next...{NEW}"] = payload(now, left=left_now)
+    # A patch GitHub left out is unread, and so is the whole count.
+    assert await count({"src/added.py": 10, "src/big.py": 1}) is None
+    # Unread: the base, any compare, 300 files, a head the base already holds, or a base
+    # range that does not run forward.
+    for path, answer in (
+        ("pulls/9", None),
+        ("pulls/9", {"base": {"ref": ""}}),
+        (f"compare/release/next...{OLD}", None),
+        (f"compare/release/next...{NEW}", None),
+        (f"compare/release/next...{NEW}", payload(now, "behind", left_now)),
+        (f"compare/release/next...{OLD}", payload(was, "identical", left_was)),
+        (f"compare/release/next...{OLD}", payload(was, left="")),
+        (f"compare/release/next...{NEW}", payload(now, left="not a sha")),
+        (
+            f"compare/release/next...{NEW}",
+            payload({f"f{n}.py": "+a" for n in range(300)}, left=left_now),
+        ),
+        (base_range, None),
+        (base_range, sized({"src/added.py": 9}, "diverged")),
+        (base_range, sized({f"f{n}.py": 1 for n in range(300)})),
+    ):
+        kept, answers[path] = answers[path], answer
+        assert await count({"src/added.py": 10}) is None, (path, answer)
+        answers[path] = kept
+    answers[f"compare/release/next...{NEW}"] = payload(now, "diverged", left_now)
+    assert await count({"src/added.py": 10}) == 1
 
 
 async def test_a_late_verdict_reads_its_heads_files_from_the_base(monkeypatch):
@@ -4397,6 +4851,13 @@ async def test_a_ready_press_at_a_head_under_review_says_where_its_review_is(roo
     await press("r7")
     assert f"has findings: fix them. {SIBLING_SWEEP_ASK} Then push" in harness.scheduled[-1].text
     assert len(harness.asks) == 2 and len(waits) == count
+    # #4658: a review asked for after that verdict is awaited; nothing says "has findings".
+    harness.now += 1
+    harness.asked(pull, OLD, again="own")
+    rows[OLD] = ChatRow(51, "Review eerovil/agentdeck#7", labels=("in-progress",))
+    told = len(harness.scheduled)
+    await press("r8")
+    assert len(harness.scheduled) == told and len(waits) == count + 1
 
 
 async def test_a_ready_event_at_a_reviewed_head_reviews_the_live_head(root, harness):
@@ -4558,7 +5019,8 @@ async def test_a_new_head_while_the_old_heads_chat_is_held_is_asked_again(root, 
 
     async def held(pull, work):
         harness.reviews.append((pull, work))
-        return answers.pop(SHA, SimpleNamespace(head_sha=SHA, heads=((pull, SHA),)))
+        chat = "Eerovil/Review-Chats#5"
+        return answers.pop(SHA, SimpleNamespace(head_sha=SHA, heads=((pull, SHA),), chat=chat))
 
     harness.service._start_review = held
     pull_event(root, "d1", action="synchronize")
@@ -4568,6 +5030,14 @@ async def test_a_new_head_while_the_old_heads_chat_is_held_is_asked_again(root, 
     await harness.drain()
     assert len(harness.reviews) == 2
     assert harness.service._spent("eerovil/agentdeck#9", SHA)
+    # #4665: the ask names the chat it got, so a replaced chat's pass of a sibling still counts.
+    [ask] = [event for event in harness.history if event.kind == review_history.ASKED]
+    assert ask.data["chat"] == "eerovil/review-chats#5"
+    # Across the services socket too: the outcome carries its chat.
+    from agentdeck import work_services
+
+    plain = SimpleNamespace(heads=(("a/b#1", SHA),), summary="", chat="x/y#5")
+    assert work_services.outcome_from(work_services.plain_outcome(plain)).chat == "x/y#5"
 
 
 def test_covers_reads_the_chats_own_commits():
@@ -4781,7 +5251,12 @@ class _DesignDeck:
             return self.comments.get(issue)
 
         self.verdicts = design_review.Verdicts(tmp_path / "design-verdicts.json")
-        self.round = design_review.DesignRound(start, self.verdicts, read)
+        self.closed = False
+
+        async def closed(issue):
+            return self.closed
+
+        self.round = design_review.DesignRound(start, self.verdicts, read, closed=closed)
 
     def design(self, issue: str, number: int) -> None:
         url = f"https://github.com/{issue.replace('#', '/issues/')}#issuecomment-{number}"
@@ -4799,6 +5274,13 @@ async def test_a_design_review_waits_for_a_reviewer_place(root, harness, tmp_pat
     harness.service._design = deck.round
     first = await harness.service.design_review(issue, "/w/7")
     assert first["queued"] and "time wait" not in first["next"]
+    # The code review's gate now says to wait for it, not to ask again (#4781), and the
+    # release's local read sees it waiting.
+    from agentdeck.design_review import WAITING_GAP
+
+    assert await harness.service._design_gap(("chat", issue)) == WAITING_GAP
+    ledger = tmp_path / "ledger.json"
+    assert wr.design_asked(root, ledger, issue, harness.now)
     entry = dict(harness.service.pending.entries[key])
     assert entry["checkout"] == "/w/7" and entry["next_at"] == harness.now + wr.RETRY_FIRST_S
     harness.now += 5
@@ -4824,6 +5306,32 @@ async def test_a_design_review_waits_for_a_reviewer_place(root, harness, tmp_pat
     answer = await restarted.service.design_review(issue)
     assert "already reviews" in answer["started"] and "queued" not in answer
     assert restarted.service.pending.entries == {} and restarted.scheduled == []
+
+
+async def test_the_owners_answer_at_the_design_series_limit(harness, tmp_path):
+    """#4765: past three series the router starts no review; the owner's "skip" is recorded
+    and starts none, "more" starts it, and a bad answer is refused."""
+    from agentdeck import design_review
+
+    deck = _DesignDeck(tmp_path)
+    issue = "eerovil/agentdeck#7"
+    for number in ("10", "20", "30"):
+        deck.verdicts.record(issue, number, design_review.PASS)
+    deck.design(issue, 70)
+    deck.places = 2
+    service = harness.service
+    service._design = deck.round
+    stopped = await service.design_review(issue, "/w/7")
+    assert stopped["status"] == 409 and "question box" in stopped["refused"]
+    assert (await service.design_review(issue, owner="maybe"))["status"] == 400
+    assert service.pending.entries == {} and deck.started == []
+    more = await service.design_review(issue, "/w/7", owner=design_review.MORE)
+    assert "started" in more and len(deck.started) == 1
+    deck.verdicts.record(issue, "70", design_review.PASS)
+    deck.design(issue, 80)
+    skipped = await service.design_review(issue, owner=design_review.SKIP)
+    assert skipped["recorded"] == design_review.OWNER and len(deck.started) == 1
+    assert deck.verdicts.of(issue)["80"] == design_review.OWNER
 
 
 async def test_a_waiting_design_review_is_dropped_only_for_a_reason(root, harness, tmp_path):
@@ -4855,14 +5363,24 @@ async def test_a_waiting_design_review_is_dropped_only_for_a_reason(root, harnes
     service.pending.discard(key)
     for change in (
         lambda: deck.verdicts.record(issue, "70", design_review.PASS),
+        lambda: setattr(deck, "closed", True),  # #4675
         lambda: deck.comments.__setitem__(issue, []),
         lambda: harness.issues.pop(("eerovil/agentdeck", 7)),
     ):
         await wait_then_try(change)
         assert key not in service.pending.entries and deck.started == []
         harness.issues[("eerovil/agentdeck", 7)] = ("chat-a", issue)
+        deck.closed = False
         deck.verdicts = design_review.Verdicts(tmp_path / f"v{harness.now}.json")
         deck.round.verdicts = deck.verdicts
+    # Asked again after the close while it waits: refused, and no longer waiting (#4675).
+    deck.design(issue, 70)
+    deck.places, deck.closed = 0, False
+    assert (await service.design_review(issue))["queued"] and key in service.pending.entries
+    deck.closed = True
+    assert (await service.design_review(issue))["status"] == 409
+    assert key not in service.pending.entries
+    deck.closed = False
     await wait_then_try(lambda: setattr(harness, "now", harness.now + wr.PENDING_MAX_AGE_S))
     assert key not in service.pending.entries and deck.started == []
     deck.design(issue, 70)
@@ -4870,6 +5388,503 @@ async def test_a_waiting_design_review_is_dropped_only_for_a_reason(root, harnes
     service._design = None
     await service.settle_without_reviewer()
     assert key not in service.pending.entries and harness.scheduled == []
+
+
+# --- the design review by ChatGPT (#4722) ---
+
+BOT = {"login": "review-bot[bot]", "type": "Bot"}
+
+
+class _DesignChats:
+    """ChatGPT as the design reviewer: the chats opened and closed, and what was told."""
+
+    def __init__(self, harness, tmp_path) -> None:
+        from agentdeck import design_review
+
+        self.deck = _DesignDeck(tmp_path)
+        self.deck.design(ISSUE7, 70)
+        self.wanted, self.pressed, self.fails = True, True, False
+        self.opened: list[tuple[str, str]] = []
+        self.closed: list[str] = []
+        self.told: dict[str, dict] = {}
+        self.hears = True
+        self.gate = None  # an event the open waits for, to hold a chat mid-open
+        chats = self
+
+        async def open_chat(title, body):
+            if chats.gate is not None:
+                await chats.gate.wait()
+            if chats.fails:
+                raise RuntimeError("gh is down")
+            chats.opened.append((title, body))
+            return f"eerovil/chat#{len(chats.opened)}", chats.pressed
+
+        async def close_chat(chat, comment):
+            chats.closed.append(chat)
+            return True
+
+        class Release:
+            async def on_design_review(self, work_id, key, text, url, **how):
+                if chats.hears:
+                    chats.told.setdefault(key, {"text": text, "url": url, **how})
+                return chats.hears
+
+        harness.service._design = self.deck.round
+        harness.service._design_chat = design_review.ChatRoute(
+            lambda: chats.wanted, open_chat, close_chat
+        )
+        harness.service._release = Release()
+
+
+ISSUE7, KEY7 = "eerovil/agentdeck#7", "design:eerovil/agentdeck#7"
+
+
+async def test_chatgpt_reviews_a_design_and_its_verdict_reaches_the_work_once(
+    root, harness, tmp_path
+):
+    """#4722: one chat per design comment, however often it is asked; the verdict ChatGPT
+    posts on the issue is recorded, told once and never forwarded as a comment; round 2
+    names round 1's design, and its gap is notes."""
+    from agentdeck import design_review
+    from agentdeck import work_router as wr
+
+    chats = _DesignChats(harness, tmp_path)
+    service = harness.service
+    first = await service.design_review(ISSUE7, "/w/7")
+    assert "ChatGPT" in first["started"] and "queued" not in first
+    [(title, body)] = chats.opened
+    assert title == "Design review of eerovil/agentdeck#7 (70)" and "issuecomment-70" in body
+    entry = dict(service.pending.entries[KEY7])
+    assert (entry["comment"], entry["chat"]) == ("70", "eerovil/chat#1")
+    assert entry["next_at"] == harness.now + design_review.CHAT_LIMIT_S
+    assert wr.design_queue(wr.pending_path(root), ISSUE7)["chat"] == "eerovil/chat#1"
+    # Asked again, and tried by the retry before the limit: nothing more is opened or asked.
+    assert (await service.design_review(ISSUE7))["started"] == first["started"]
+    service.pending.hurry([KEY7], harness.now)
+    await service.retry_pending()
+    assert len(chats.opened) == 1 and chats.deck.started == [] and chats.closed == []
+    assert service.pending.entries[KEY7]["next_at"] == entry["next_at"]
+    comment(root, "d1", sender=BOT, body=f"Design review of {ISSUE7}: gap 70\n1. two asks race")
+    await harness.drain()
+    assert chats.deck.verdicts.of(ISSUE7) == {"70": "gap"}
+    assert list(chats.told) == ["comment:100"] and chats.told["comment:100"]["gap"]
+    assert "two asks race" in chats.told["comment:100"]["text"]
+    assert chats.closed == ["eerovil/chat#1"] and KEY7 not in service.pending.entries
+    assert harness.scheduled == []  # not forwarded as somebody's comment
+    # The fixed design: the last round, which names the first; its gap is recorded as notes.
+    chats.deck.design(ISSUE7, 71)
+    await service.design_review(ISSUE7)
+    again = chats.opened[1][1]
+    assert "This is the last round" in again and "issuecomment-70" in again
+    late = f"Design review of {ISSUE7}: gap 71\nstill"
+    comment(root, "d2", sender=BOT, body=late, comment_id=101)
+    await harness.drain()
+    assert chats.deck.verdicts.of(ISSUE7)["71"] == "notes"
+    told = chats.told["comment:101"]
+    assert told["notes"] and not told["gap"]
+    assert told["text"].startswith(f"Design review of {ISSUE7}: notes 71")
+
+
+@pytest.mark.parametrize(
+    ("body", "how", "taken"),
+    [
+        (f"Design review of {ISSUE7}: pass 70", {"sender": BOT}, True),
+        # ChatGPT's own GitHub connector speaks under the login that owns the chat (#3216).
+        (f"Design review of {ISSUE7}: pass 70", {"via": "chatgpt-codex-connector"}, True),
+        (
+            f"Design review of {ISSUE7}: pass 70",
+            {"via": "chatgpt-codex-connector", "sender": {"login": "mallory", "type": "User"}},
+            False,
+        ),
+        (f"Design review of {ISSUE7}: pass 70", {}, False),  # a person, no connector
+        (f"Design review of {ISSUE7}: pass 69", {"sender": BOT}, False),  # another design
+        ("Design review of eerovil/agentdeck#8: pass 70", {"sender": BOT}, False),
+    ],
+)
+async def test_only_the_asked_chats_reviewer_gives_a_design_verdict(
+    root, harness, tmp_path, body, how, taken
+):
+    chats = _DesignChats(harness, tmp_path)
+    await harness.service.design_review(ISSUE7)
+    harness.service.pending.put(KEY7, {"chat": "eerovil/chat#1"}, harness.now)
+    comment(root, "d1", body=body, **how)
+    await harness.drain()
+    assert bool(chats.deck.verdicts.of(ISSUE7)) is taken and bool(chats.told) is taken
+    assert (KEY7 in harness.service.pending.entries) is not taken
+    assert harness.scheduled == []
+
+
+@pytest.mark.parametrize(
+    ("pressed", "fails", "wanted", "wait"),
+    [
+        (True, False, True, 20 * 60.0),  # no verdict in time
+        # No worker was started now: the start is owed to the run in flight, so the chat
+        # still gets the whole limit.
+        (False, False, True, 20 * 60.0),
+        (True, True, True, 0.0),  # the chat could not be opened
+        (True, False, False, 0.0),  # ChatGPT is not the reviewer now (the timed switch)
+    ],
+)
+async def test_the_decks_reviewer_takes_a_design_chatgpt_does_not_answer(
+    root, harness, tmp_path, pressed, fails, wanted, wait
+):
+    """#4722: at the limit, counted from the chat's opening, the entry stops naming the chat,
+    the chat is closed and the deck's own reviewer starts; a verdict after that is dropped."""
+    chats = _DesignChats(harness, tmp_path)
+    chats.pressed, chats.fails, chats.wanted = pressed, fails, wanted
+    chats.deck.places = 1
+    service = harness.service
+    url = "https://github.com/eerovil/agentdeck/issues/7#issuecomment-70"
+    answer = await service.design_review(ISSUE7)
+    if not wait:
+        assert chats.deck.started == [url] and "reviewer started" in answer["started"]
+        assert chats.opened == [] and KEY7 not in service.pending.entries
+        return
+    assert chats.deck.started == []
+    harness.now += wait - 1
+    service.pending.hurry([KEY7], harness.now)
+    await service.retry_pending()
+    assert chats.deck.started == [] and chats.closed == []
+    harness.now += 1
+    assert service.pending.entries[KEY7]["next_at"] == harness.now
+    chats.wanted = True  # a fallen-back request is never handed to ChatGPT again
+    chats.deck.places = 0
+    await service.retry_pending()
+    assert chats.closed == ["eerovil/chat#1"] and len(chats.opened) == 1
+    assert not service.pending.entries[KEY7]["comment"]
+    assert (await service.design_review(ISSUE7))["queued"] and len(chats.opened) == 1
+    comment(root, "d1", sender=BOT, body=f"Design review of {ISSUE7}: pass 70")
+    await harness.drain()
+    assert chats.deck.verdicts.of(ISSUE7) == {} and chats.told == {}
+    chats.deck.places = 1
+    harness.now = service.pending.entries[KEY7]["next_at"]
+    await service.retry_pending()
+    assert chats.deck.started == [url] and KEY7 not in service.pending.entries
+
+
+async def test_the_series_limit_note_follows_design_comments(root, harness, tmp_path):
+    """#4800 review, the owner's narrow fix: the series-limit note is read with no GitHub
+    call, so each design comment created, edited or deleted sets it by the local limit rule
+    as it arrives: a withdrawal or delete of the stopped design clears it, a newer design is
+    noted only while the limit holds for it; an edit of the stopped design itself, an older
+    comment or another issue's leaves it."""
+    from agentdeck import design_review as dr
+
+    deck = _DesignDeck(tmp_path)
+    harness.service._design = deck.round
+    withdrawn = "**Design (withdrawn, the owner chose a narrow fix):** old plan"
+
+    def edited(delivery, comment_id, body, number=7):
+        deliver(
+            root,
+            event="issue_comment",
+            delivery=delivery,
+            action="edited",
+            sender=PERSON,
+            issue={"number": number},
+            comment={
+                "body": body,
+                "html_url": f"https://github.com/c/{delivery}",
+                "id": comment_id,
+            },
+        )
+
+    deck.verdicts.mark_limited(ISSUE7, "70")
+    edited("e1", 70, "**Design:**\nthe stopped design, reworded")
+    edited("e2", 60, withdrawn)  # an older design
+    edited("e3", 90, withdrawn, number=8)  # another issue
+    await harness.drain()
+    assert deck.verdicts.limited(ISSUE7) == {"70"}
+    edited("e4", 70, withdrawn)
+    await harness.drain()
+    assert deck.verdicts.limited(ISSUE7) == set()
+    # It records no verdict, so the comment edited back to a live design is gated again.
+    assert deck.verdicts.of(ISSUE7) == {}
+    deck.verdicts.record(ISSUE7, "30", dr.PASS)
+    deck.comments[ISSUE7] = [
+        {
+            "body": "**Design:**\nrestored",
+            "url": "https://github.com/eerovil/agentdeck/issues/7#issuecomment-70",
+        }
+    ]
+    assert "no design review after it" in await deck.round.missing(ISSUE7)
+    deck.verdicts.mark_limited(ISSUE7, "71")
+    comment(root, "c1", body="a reply, no design", comment_id=72)
+    await harness.drain()
+    assert deck.verdicts.limited(ISSUE7) == {"71"}
+    # Two series ended so far: a newer design is under the limit, so the note goes.
+    deck.verdicts.record(ISSUE7, "20", dr.PASS)
+    comment(root, "c2", body="**Design:**\na new plan", comment_id=80)
+    await harness.drain()
+    assert deck.verdicts.limited(ISSUE7) == set()
+    # Three ended: a newer design is at the limit and is noted, created or edited.
+    deck.verdicts.record(ISSUE7, "10", dr.PASS)
+    comment(root, "c3", body="**Design:**\na fourth plan", comment_id=81)
+    await harness.drain()
+    assert deck.verdicts.limited(ISSUE7) == {"81"}
+    edited("e5", 82, "**Design:**\nan edited-in plan")
+    await harness.drain()
+    assert deck.verdicts.limited(ISSUE7) == {"82"}
+    # What the release and the turn-end nudge read follows each event (round 3).
+    from agentdeck.work_router import design_limited
+
+    def deleted(delivery, comment_id, body):
+        deliver(
+            root,
+            event="issue_comment",
+            delivery=delivery,
+            action="deleted",
+            sender=PERSON,
+            issue={"number": 7},
+            comment={"body": body, "html_url": "", "id": comment_id},
+        )
+
+    deleted("d0", 90, "a newer reply, no design")
+    await harness.drain()
+    assert design_limited(tmp_path / "ledger.json", ISSUE7)
+    edited("e6", 82, "on second thought, no plan here")  # the noted design loses its mark
+    await harness.drain()
+    assert not design_limited(tmp_path / "ledger.json", ISSUE7)
+    deck.verdicts.mark_limited(ISSUE7, "82")
+    # Deleting an older comment leaves the note; deleting the stopped design clears it.
+    for delivery, comment_id in (("d1", 81), ("d2", 82)):
+        deleted(delivery, comment_id, "**Design:**\ngone")
+        await harness.drain()
+        assert deck.verdicts.limited(ISSUE7) == ({"82"} if delivery == "d1" else set())
+    # A newer design the owner allowed one more series for is not at the limit.
+    deck.verdicts.mark_limited(ISSUE7, "82")
+    deck.verdicts.allow(ISSUE7, "84")
+    comment(root, "c4", body="**Design:**\nthe allowed plan", comment_id=84)
+    await harness.drain()
+    assert deck.verdicts.limited(ISSUE7) == set()
+    assert set(deck.verdicts.of(ISSUE7)) == {"10", "20", "30"}
+
+
+async def test_two_asks_at_once_open_one_design_chat(root, harness, tmp_path):
+    """#4722: the entry is reserved before the chat opens. A second ask and a retry try that
+    run while it opens open nothing and start no fallback; a chat that opens after the entry
+    went elsewhere is closed at once, and never named."""
+    chats = _DesignChats(harness, tmp_path)
+    service = harness.service
+    chats.gate = asyncio.Event()
+    first = asyncio.create_task(service.design_review(ISSUE7))
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert service.pending.entries[KEY7]["comment"] == "70" and chats.opened == []
+    second = await service.design_review(ISSUE7)
+    assert "ChatGPT" in second["started"]
+    harness.now += 61  # the reservation's first try, with the open still running
+    chats.deck.places = 1
+    await service.retry_pending()
+    assert chats.deck.started == [] and service.pending.entries[KEY7]["comment"] == "70"
+    chats.gate.set()
+    await first
+    assert len(chats.opened) == 1 and service.pending.entries[KEY7]["chat"] == "eerovil/chat#1"
+    # A restart lost the open: the reservation falls back, and the late chat is closed.
+    service.pending.discard(KEY7)
+    chats.gate = asyncio.Event()
+    late = asyncio.create_task(service.design_review(ISSUE7))
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    service._design_opening.clear()
+    harness.now += 61
+    await service.retry_pending()
+    assert chats.deck.started and KEY7 not in service.pending.entries
+    chats.gate.set()
+    await late
+    assert chats.closed[-1] == "eerovil/chat#2" and KEY7 not in service.pending.entries
+
+
+async def test_a_design_chat_ends_with_what_it_was_opened_for(root, harness, tmp_path):
+    """#4722 helper checks: a newer design asked once ChatGPT stopped being the reviewer goes
+    to the deck's own, and a closed issue ends the chat; both close the chat issue. A verdict
+    comment the deck fails on is still not sent on as a person's comment."""
+    chats = _DesignChats(harness, tmp_path)
+    service = harness.service
+    await service.design_review(ISSUE7)
+    chats.wanted = False
+    chats.deck.design(ISSUE7, 71)
+    chats.deck.places = 1
+    assert "reviewer started" in (await service.design_review(ISSUE7))["started"]
+    assert chats.closed == ["eerovil/chat#1"] and len(chats.opened) == 1
+    chats.wanted = True
+    chats.deck.design(ISSUE7, 72)
+    await service.design_review(ISSUE7)
+    assert service.pending.entries[KEY7]["chat"] == "eerovil/chat#2"
+
+    async def broken(key, entry):
+        raise RuntimeError("the store is down")
+
+    service._finish_design_verdict = broken
+    comment(root, "d1", sender=BOT, body=f"Design review of {ISSUE7}: pass 72")
+    await harness.drain()
+    assert harness.scheduled == [] and service.pending.entries[KEY7]["verdict_comment"] == "100"
+    del service._finish_design_verdict
+    service.pending.put(KEY7, {"verdict_comment": "", "verdict": ""}, harness.now)
+    chats.deck.closed = True
+    assert (await service.design_review(ISSUE7))["status"] == 409
+    assert chats.closed[-1] == "eerovil/chat#2" and KEY7 not in service.pending.entries
+
+
+@pytest.mark.parametrize("then", ["retry", "ask", "newer", "closed", "gone"])
+async def test_a_design_verdict_cut_off_before_the_work_heard_is_finished_by_the_retry(
+    root, harness, tmp_path, then
+):
+    """#4722: the entry is kept until the Work was told. A retry, or the same delivery again,
+    finishes the telling with the same id, and a recorded verdict is not recorded anew.
+
+    Every later try asks again whether its design is still the newest (the review of
+    77b61212d): a newer design, a closed issue or a Work gone drops it untold with its chat,
+    and the recorded verdict stays for the round count."""
+    chats = _DesignChats(harness, tmp_path)
+    service = harness.service
+    await service.design_review(ISSUE7)
+    chats.hears = False
+    comment(root, "d1", sender=BOT, body=f"Design review of {ISSUE7}: gap 70\n1. x")
+    tailer = WebhookTailer(root, consumer="work-router")
+    batch = list(tailer.deliveries())
+    await service.apply(batch)
+    entry = service.pending.entries[KEY7]
+    assert entry["verdict_comment"] == "100" and chats.told == {} and chats.closed == []
+    assert chats.deck.verdicts.of(ISSUE7) == {"70": "gap"}
+    # A second verdict comment for the same design changes nothing.
+    comment(root, "d2", sender=BOT, body=f"Design review of {ISSUE7}: pass 70", comment_id=101)
+    await harness.drain()
+    assert service.pending.entries[KEY7]["verdict_comment"] == "100"
+    chats.hears = True
+    if then == "ask":
+        # The agent's next ask, with a newer design: the old verdict is dropped untold under
+        # the entry's lock, and the same ask reserves the new design and returns.
+        chats.deck.design(ISSUE7, 71)
+        answer = await asyncio.wait_for(service.design_review(ISSUE7), 5)
+        assert "ChatGPT" in answer["started"] and chats.told == {}
+        assert chats.closed == ["eerovil/chat#1"] and len(chats.opened) == 2
+        entry = service.pending.entries[KEY7]
+        assert (entry["comment"], entry["chat"]) == ("71", "eerovil/chat#2")
+        assert not entry.get("verdict_comment")
+        assert chats.deck.verdicts.of(ISSUE7) == {"70": "gap"}
+        return
+    if then != "retry":
+        if then == "newer":
+            chats.deck.design(ISSUE7, 71)
+        elif then == "closed":
+            chats.deck.closed = True
+        else:
+            harness.issues.pop(("eerovil/agentdeck", 7))
+        harness.now = service.pending.entries[KEY7]["next_at"]
+        await service.retry_pending()
+        assert chats.told == {} and chats.closed == ["eerovil/chat#1"]
+        assert KEY7 not in service.pending.entries and chats.deck.started == []
+        assert chats.deck.verdicts.of(ISSUE7) == {"70": "gap"}
+        return
+    harness.now = service.pending.entries[KEY7]["next_at"]
+    await service.retry_pending()
+    assert list(chats.told) == ["comment:100"] and chats.told["comment:100"]["gap"]
+    assert chats.closed == ["eerovil/chat#1"] and KEY7 not in service.pending.entries
+    await service.apply(batch)  # the delivery again, after all of it
+    assert list(chats.told) == ["comment:100"] and chats.deck.verdicts.of(ISSUE7) == {"70": "gap"}
+
+
+async def test_one_design_has_one_reviewer_across_the_switch(root, harness, tmp_path):
+    """#4722 review: a design the deck's own reviewer is already on (asked while the switch
+    was on) gets no ChatGPT chat once the switch is off, so ChatGPT's opposite verdict on it
+    is dropped; and a chat's verdict never replaces one the deck's reviewer recorded."""
+    from agentdeck.design_review import Verdict
+
+    chats = _DesignChats(harness, tmp_path)
+    service, deck = harness.service, chats.deck
+    chats.wanted, deck.places = False, 1
+    assert "reviewer started" in (await service.design_review(ISSUE7))["started"]
+    deck.round.reviewing = lambda issue, number: (issue, number) == (ISSUE7, "70")
+    chats.wanted = True
+    assert "already reviews" in (await service.design_review(ISSUE7))["started"]
+    assert chats.opened == [] and KEY7 not in service.pending.entries
+    comment(root, "d0", sender=BOT, body=f"Design review of {ISSUE7}: pass 70", comment_id=99)
+    await harness.drain()
+    assert deck.verdicts.of(ISSUE7) == {} and chats.told == {}
+    deck.round._reviews = lambda token, issue, number: True
+    assert deck.round.record(ISSUE7, Verdict(ISSUE7, "gap", "70"), "tok") == "gap"
+    assert deck.round.take(ISSUE7, Verdict(ISSUE7, "pass", "70")) == "gap"
+    # The next design goes to ChatGPT, and its verdict is told once.
+    deck.design(ISSUE7, 71)
+    await service.design_review(ISSUE7)
+    comment(root, "d1", sender=BOT, body=f"Design review of {ISSUE7}: notes 71\n1. x")
+    await harness.drain()
+    assert deck.verdicts.of(ISSUE7) == {"70": "gap", "71": "notes"} and len(chats.told) == 1
+    # A design the deck's reviewer already decided takes no verdict from a chat still open.
+    deck.design(ISSUE7, 72)
+    await service.design_review(ISSUE7)
+    deck.verdicts.record(ISSUE7, "72", "gap")
+    comment(root, "d2", sender=BOT, body=f"Design review of {ISSUE7}: pass 72", comment_id=101)
+    await harness.drain()
+    assert deck.verdicts.of(ISSUE7)["72"] == "gap" and len(chats.told) == 1
+
+
+@pytest.mark.parametrize("newer", [False, True])
+async def test_a_design_verdict_waits_while_the_issue_cannot_be_read(
+    root, harness, tmp_path, newer
+):
+    """#4722 review: a verdict that arrives while the newest design cannot be read is kept,
+    neither recorded nor told, and checked again at the retry: taken when its design is
+    still the newest, dropped with its chat when the Work posted a newer one meanwhile."""
+    chats = _DesignChats(harness, tmp_path)
+    service, deck = harness.service, chats.deck
+    await service.design_review(ISSUE7)
+    deck.comments[ISSUE7] = None
+    comment(root, "d1", sender=BOT, body=f"Design review of {ISSUE7}: pass 70")
+    await harness.drain()
+    for _ in range(2):  # the retry while it is still unread keeps waiting
+        assert service.pending.entries[KEY7]["verdict_comment"] == "100"
+        assert deck.verdicts.of(ISSUE7) == {} and chats.told == {} and chats.closed == []
+        harness.now = service.pending.entries[KEY7]["next_at"]
+        await service.retry_pending()
+    deck.design(ISSUE7, 71 if newer else 70)
+    harness.now = service.pending.entries[KEY7]["next_at"]
+    await service.retry_pending()
+    assert chats.closed == ["eerovil/chat#1"] and KEY7 not in service.pending.entries
+    assert deck.verdicts.of(ISSUE7) == ({} if newer else {"70": "pass"})
+    assert list(chats.told) == ([] if newer else ["comment:100"])
+
+
+@pytest.mark.parametrize("recorded", [False, True])
+async def test_a_design_verdict_unread_for_the_whole_limit(root, harness, tmp_path, recorded):
+    """#4722 design notes: a verdict whose issue stays unreadable for the whole limit falls
+    back to the deck's own reviewer as if ChatGPT gave none. One already recorded for that
+    design is never handed over: it waits, and is told once the issue reads again."""
+    from agentdeck import design_review
+
+    chats = _DesignChats(harness, tmp_path)
+    service, deck = harness.service, chats.deck
+    await service.design_review(ISSUE7)
+    deck.comments[ISSUE7] = None
+    comment(root, "d1", sender=BOT, body=f"Design review of {ISSUE7}: pass 70")
+    await harness.drain()
+    if recorded:
+        deck.verdicts.record(ISSUE7, "70", "pass")
+    deck.places = 1
+    harness.now += design_review.CHAT_LIMIT_S - 1
+    service.pending.hurry([KEY7], harness.now)
+    await service.retry_pending()
+    assert service.pending.entries[KEY7]["verdict_comment"] == "100" and chats.closed == []
+    harness.now += 1
+    service.pending.hurry([KEY7], harness.now)
+    await service.retry_pending()
+    entry = service.pending.entries[KEY7]
+    assert chats.told == {} and deck.started == []
+    if not recorded:
+        assert not entry["comment"] and not entry["verdict_comment"]
+        assert set(chats.closed) == {"eerovil/chat#1"} and deck.verdicts.of(ISSUE7) == {}
+        deck.design(ISSUE7, 70)
+        harness.now = entry["next_at"]
+        await service.retry_pending()
+        assert len(deck.started) == 1 and KEY7 not in service.pending.entries
+        return
+    assert entry["verdict_comment"] == "100" and chats.closed == []
+    deck.design(ISSUE7, 70)
+    harness.now = entry["next_at"]
+    await service.retry_pending()
+    assert list(chats.told) == ["comment:100"] and chats.closed == ["eerovil/chat#1"]
+    assert KEY7 not in service.pending.entries and deck.started == []
 
 
 # --- lighter review (#4399) ---
@@ -4968,3 +5983,39 @@ async def test_ask_again_on_a_light_head_still_starts_its_review(root, harness):
     answer = await harness.service.ask_again("eerovil/agentdeck", 9, "please look")
     assert answer["outcome"] == "asked"
     assert len(harness.reviews) == 1
+
+
+def test_design_asked_reads_a_review_asked_and_unanswered(tmp_path):
+    """#4781: the release and the turn-end nudge read, with no GitHub call, whether a design
+    review was asked for and has not answered: a request waiting for a place, a ChatGPT chat
+    or a deck reviewer on a comment with no verdict; one that answered, or aged out, is not."""
+    import json
+
+    from agentdeck import design_review
+    from agentdeck import work_router as wr
+    from agentdeck.agent_review import MAX_AGE_S
+
+    issue, root, ledger = "o/r#7", tmp_path / "streams", tmp_path / "ledger.json"
+    root.mkdir()
+    assert not wr.design_asked(root, ledger, issue, 1000.0)  # nothing on disk
+    line = {"pull": "design:o/r#7", "head": "comment-5", "started": 1000.0}
+    other = {"pull": "design:o/r#8", "head": "comment-9", "started": 1000.0}
+    ledger.write_text(json.dumps([line, other]))
+    assert wr.design_asked(root, ledger, "O/R#7", 1000.0)
+    assert not wr.design_asked(root, ledger, issue, 1000.0 + MAX_AGE_S + 1)
+    verdicts = design_review.Verdicts.beside(ledger)
+    verdicts.record(issue, "5", design_review.PASS)
+    assert not wr.design_asked(root, ledger, issue, 1000.0), "it answered"
+    pending = wr.PendingActions(wr.pending_path(root))
+    pending.put("design:o/r#7", {"kind": "design", "issue": issue}, 1000.0)
+    assert wr.design_asked(root, ledger, issue, 1000.0), "it waits for a place"
+    pending.put("design:o/r#7", {"comment": "5", "chat": "c"}, 1000.0)
+    assert not wr.design_asked(root, ledger, issue, 1000.0), "ChatGPT's answer is recorded"
+    pending.put("design:o/r#7", {"comment": "6", "chat": "c"}, 1000.0)
+    assert wr.design_asked(root, ledger, issue, 1000.0)
+    # #4800: the series limit is read the same way, until the owner answers.
+    assert not wr.design_limited(ledger, issue)
+    verdicts.mark_limited(issue, "8")
+    assert wr.design_limited(ledger, "O/R#7") and not wr.design_limited(ledger, "o/r#8")
+    verdicts.allow(issue, "8")
+    assert not wr.design_limited(ledger, issue), "one more series"

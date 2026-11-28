@@ -18,6 +18,7 @@ when idle and give back its graphics memory while voice mode waits.
                   &word=jarvis    which wake word: ``jarvis`` (default) or ``alexa``
     POST /stream  Upgrade: agentdeck-wake-stream  -> 101, then two-way (#4539)
                   ?threshold=0.5&word=jarvis  as for /wake
+                  &sure=0.99  a second, higher score to tell of (none without it)
     GET  /status                          -> {"model"}
 
 ``speech_after`` says whether speech follows the wake word in the same phrase
@@ -28,7 +29,8 @@ wait for the page's 0.8 s pause: after the ``101`` the deck writes records, each
 type byte, a 4-byte big-endian length and its payload: ``P`` a phrase starts (its
 id), ``A`` 16 kHz 16-bit mono audio, ``E`` the phrase ended (its id). This writes
 one JSON line per event: ``{"crossed": id, "score", "at"}`` on the first 80 ms frame
-of a phrase at or over the threshold, ``at`` its end in seconds into the phrase, and
+of a phrase at or over the threshold, ``at`` its end in seconds into the phrase,
+``{"sure": id, "score", "at"}`` likewise for ``sure``, after the crossing, and
 ``{"end": id, "score", "at"}`` once every frame of the phrase is scored, ``score``
 its peak and ``at`` the crossing or null. Records are handled in order, so a
 crossing in a phrase's last frames always comes before its ``end``. Each stream has
@@ -111,7 +113,7 @@ class Detector:
         self.streams = 0
         self.idle: dict[str, list] = {}
 
-    def stream(self, word: str, threshold: float) -> Stream:
+    def stream(self, word: str, threshold: float, sure: float | None = None) -> Stream:
         """A model of its own for one page's stream, or ``Busy`` past ``STREAMS``."""
         with self.lock:
             if self.streams >= STREAMS:
@@ -128,7 +130,9 @@ class Detector:
             with self.lock:
                 self.streams -= 1
             raise
-        return Stream(model, MODELS[word], threshold, lambda: self._release(word, model))
+        return Stream(
+            model, MODELS[word], threshold, lambda: self._release(word, model), sure=sure
+        )
 
     def _release(self, word: str, model) -> None:
         with self.lock:
@@ -184,11 +188,21 @@ class Busy(Exception):
 class Stream:
     """One page's waiting microphone, 80 ms frame by frame (#4539)."""
 
-    def __init__(self, model, name: str, threshold: float, release, decode=None) -> None:
+    def __init__(
+        self,
+        model,
+        name: str,
+        threshold: float,
+        release,
+        decode=None,
+        sure: float | None = None,
+    ) -> None:
         self.model = model
         self.decode = decode or int16_frame
         self.name = name
         self.threshold = threshold
+        # The higher score told of on its own, or None.
+        self.sure_at = sure
         self.release = release
         self.phrase = ""
         self.start("")
@@ -201,13 +215,15 @@ class Stream:
         self.frames = 0
         self.peak = 0.0
         self.crossed: float | None = None
+        self.sure = False
 
-    def feed(self, audio: bytes) -> dict | None:
-        """Scores every whole frame in ``audio``; the first crossing of the phrase."""
+    def feed(self, audio: bytes) -> list[dict]:
+        """Scores every whole frame in ``audio``; the phrase's first crossing, and its
+        first frame at or over ``sure``, when they are in it."""
         data = self.pending + audio
         whole = len(data) // (FRAME * 2) * FRAME * 2
         self.pending = data[whole:]
-        crossing = None
+        events: list[dict] = []
         for start in range(0, whole, FRAME * 2):
             frame = self.decode(data[start : start + FRAME * 2])
             score = float(self.model.predict(frame)[self.name])
@@ -215,15 +231,22 @@ class Stream:
             self.peak = max(self.peak, score)
             if self.crossed is None and score >= self.threshold:
                 self.crossed = round(self.frames * FRAME / SAMPLE_RATE, 2)
-                crossing = {"crossed": self.phrase, "score": round(score, 4), "at": self.crossed}
-        return crossing
+                events.append(
+                    {"crossed": self.phrase, "score": round(score, 4), "at": self.crossed}
+                )
+            crossed = self.crossed is not None
+            if crossed and not self.sure and self.sure_at is not None and score >= self.sure_at:
+                self.sure = True
+                at = round(self.frames * FRAME / SAMPLE_RATE, 2)
+                events.append({"sure": self.phrase, "score": round(score, 4), "at": at})
+        return events
 
-    def end(self) -> tuple[dict | None, dict]:
+    def end(self) -> list[dict]:
         """The phrase's last frames, as a clip scores them: the part frame and the
-        tail of silence, which a name said at the very end still rises in. Returns a
-        crossing in that tail, if any, and the phrase's end."""
-        crossing = self.feed(bytes(FRAME * 2 * TAIL_FRAMES))
-        return crossing, {"end": self.phrase, "score": round(self.peak, 4), "at": self.crossed}
+        tail of silence, which a name said at the very end still rises in. Returns
+        the events in that tail, if any, then the phrase's end."""
+        events = self.feed(bytes(FRAME * 2 * TAIL_FRAMES))
+        return [*events, {"end": self.phrase, "score": round(self.peak, 4), "at": self.crossed}]
 
 
 def int16_frame(data: bytes):
@@ -253,20 +276,18 @@ def serve_stream(stream: Stream, rfile, wfile, touch=lambda: None) -> None:
         if kind == b"P":
             stream.start(body.decode("ascii", "replace"))
         elif kind == b"A":
-            crossing = stream.feed(body)
-            if crossing:
+            for event in stream.feed(body):
                 log.info(
-                    "stream: %s crossed %.3f at %.2fs",
+                    "stream: %s %s %.3f at %.2fs",
                     stream.name,
-                    crossing["score"],
-                    crossing["at"],
+                    "crossed" if "crossed" in event else "sure",
+                    event["score"],
+                    event["at"],
                 )
-                send(crossing)
+                send(event)
         elif kind == b"E":
-            crossing, end = stream.end()
-            if crossing:
-                send(crossing)
-            send(end)
+            for event in stream.end():
+                send(event)
             stream.start("")
         else:
             raise ValueError(f"unknown record {kind!r}")
@@ -343,10 +364,13 @@ class Handler(BaseHTTPRequestHandler):
         word = params.get("word", ["jarvis"])[0]
         if not 0 < threshold < 1 or word not in MODELS:
             raise ValueError("a threshold between 0 and 1 and a known wake word")
+        sure = float(params["sure"][0]) if "sure" in params else None
+        if sure is not None and not 0 < sure < 1:
+            raise ValueError("sure must be between 0 and 1")
         if self.headers.get("Upgrade", "").lower() != STREAM_UPGRADE:
             raise ValueError(f"expected Upgrade: {STREAM_UPGRADE}")
         try:
-            stream = self.server.detector.stream(word, threshold)
+            stream = self.server.detector.stream(word, threshold, sure)
         except Busy as exc:
             self._json(503, {"error": str(exc)})
             return

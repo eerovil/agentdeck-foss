@@ -263,6 +263,7 @@ class DeliveryReceipts:
         require_active: bool = False,
         command_artifacts: dict[str, Any] | None = None,
         fork: str | None = None,
+        keep_warm: bool = False,
     ) -> str:
         payload_data = {
             "message": message,
@@ -287,6 +288,8 @@ class DeliveryReceipts:
         # was fenced here, the poller's ``kanban``, went in #3741.
         if require_idle:
             payload_data["require_idle"] = True
+        if keep_warm:
+            payload_data["keep_warm"] = True
         if require_active:
             payload_data["require_active"] = True
         if target is not None:

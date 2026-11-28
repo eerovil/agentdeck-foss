@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
+import httpx
 import pytest
 
 from agentdeck import shutdown
@@ -209,3 +210,85 @@ async def test_lifespan_teardown_without_a_signal_rearms_a_recreated_app():
         asyncio.sleep(0, result={"accepted": True}),
     )
     assert result == {"accepted": True}
+
+
+async def test_a_request_the_stopping_server_cancels_is_told_so_not_500():
+    """#4738: a deploy cancelled a ``pre-review-done`` that had already asked for its review,
+    and uvicorn answered a bare 500. The cancellation still goes on to the server."""
+    from fastapi import FastAPI
+
+    app = FastAPI()
+    entered = asyncio.Event()
+
+    @app.middleware("http")
+    async def passing(request, call_next):
+        return await call_next(request)
+
+    @app.get("/slow")
+    async def slow():
+        entered.set()
+        await asyncio.sleep(60)
+
+    @app.get("/stream")
+    async def stream():
+        from fastapi.responses import StreamingResponse
+
+        async def body():
+            yield b"first"
+            entered.set()
+            await asyncio.sleep(60)
+
+        return StreamingResponse(body())
+
+    app.add_middleware(shutdown.CutOffAnswer)
+
+    async def cut_off(path: str) -> list[dict]:
+        sent: list[dict] = []
+        entered.clear()
+        scope = {
+            "type": "http",
+            "method": "GET",
+            "path": path,
+            "raw_path": path.encode(),
+            "query_string": b"",
+            "headers": [],
+            "http_version": "1.1",
+            "scheme": "http",
+            "server": ("deck", 80),
+            "client": ("127.0.0.1", 1),
+        }
+
+        async def receive():
+            await asyncio.sleep(60)
+
+        async def send(message):
+            sent.append(message)
+
+        task = asyncio.create_task(app(scope, receive, send))
+        await asyncio.wait_for(entered.wait(), 2)
+        await asyncio.sleep(0)
+        # Uvicorn's own call at the end of its graceful window.
+        task.cancel(msg="Task cancelled, timeout graceful shutdown exceeded")
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        return sent
+
+    sent = await cut_off("/slow")
+    assert [m["type"] for m in sent] == ["http.response.start", "http.response.body"]
+    assert b"may or may not have taken effect" in sent[1]["body"]
+    # Not 503: the services process reads that as "nothing was sent" and sends the call again,
+    # which would start a Work's agent or a reviewer twice (#4013).
+    assert sent[0]["status"] == 504
+    from agentdeck.services_process import WebCalls, WebNoAnswer
+
+    async def cut(request):
+        return httpx.Response(sent[0]["status"], content=sent[1]["body"])
+
+    calls = WebCalls("http://deck", "key", transport=httpx.MockTransport(cut))
+    with pytest.raises(WebNoAnswer):
+        await calls.post("start_work", {})
+    await calls.aclose()
+
+    # A stream already answering is left as it was: no second response start.
+    sent = await cut_off("/stream")
+    assert [m["status"] for m in sent if m["type"] == "http.response.start"] == [200]

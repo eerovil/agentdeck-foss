@@ -23,6 +23,7 @@ from . import (
     agent_review,
     deck_bug,
     github_suspension,
+    keep_warm,
     live_chats,
     mac_runner,
     review_history,
@@ -33,6 +34,7 @@ from . import (
     shutdown,
     wayfinder_map,
     work_endings,
+    work_published,
     work_release,
     work_services,
     work_signals,
@@ -126,7 +128,8 @@ from .web.work_view import (
 from .webhook_status_cache import WebhookStatusCacheService
 from .webhook_tailer import WebhookWatcher
 from .work_message import on_delivered as work_message_delivered
-from .work_router import configured_own_logins
+from .work_router import PendingActions, configured_own_logins, pending_path
+from .work_router import issue_owner_of_pull as work_issue_owner_of_pull
 from .work_router import owner_of_issue as work_owner_of_issue
 from .work_router import owner_of_pull as work_owner_of_pull
 from .work_signals import open_blockers
@@ -295,13 +298,16 @@ def create_app(config: AppConfig) -> FastAPI:
 
     assistant = AssistantService(config, state)
 
-    def resolve_scheduled_target(chat_id: str):
+    def current_chat_session(chat_id: str):
         chat = state.chat_by_id(chat_id)
-        session = (
+        return (
             state.current_session_for_chat(chat)
             if chat is not None
             else state.sessions.get(chat_id)
         )
+
+    def resolve_scheduled_target(chat_id: str):
+        session = current_chat_session(chat_id)
         return (
             delivery_target_for(session, collector.accounts)
             if session is not None
@@ -318,6 +324,8 @@ def create_app(config: AppConfig) -> FastAPI:
         injector,
         resolve_scheduled_target,
         resolve_answer_target=resolve_answer_target,
+        current_session=current_chat_session,
+        session_known=lambda key: key in state.sessions,
         on_change=lambda chat_id: state.sessions_changed((chat_id,)),
         # Another Work's agent's message (#3908) leaves the owner's open question standing.
         on_delivered=work_message_delivered(state, assistant),
@@ -475,6 +483,18 @@ def create_app(config: AppConfig) -> FastAPI:
             return ""
         return str(await router_service.recover_review(repository, number) or "")
 
+    def wake_owns_pull(request) -> bool:
+        # A merge wait of the chat the release tells of this pull request's merge (#4753):
+        # the chat that owns the issue of the pull request's Work (``release_chat``), in a
+        # repository the release merges.
+        router_service = getattr(app.state, "work_router", None)
+        if router_service is None or not router_service.enabled or request.number is None:
+            return False
+        if not router_service.switched(request.repository):
+            return False
+        owner = work_issue_owner_of_pull(state, request.repository, request.number)
+        return owner is not None and owner[0] == request.chat_id
+
     def wake_ready_head(request) -> bool:
         # A commit wait on the head of a ready or merged pull request this chat registered in a
         # repository the release merges (#4253), from cached rows alone.
@@ -489,6 +509,14 @@ def create_app(config: AppConfig) -> FastAPI:
         refs = {ref for ref in refs if router_service.switched(ref[0])}
         rows = issues.cached_pulls(refs).values() if refs else ()
         return any(settled_head(row, request.sha) for row in rows)
+
+    def wake_deploy_name(repository: str) -> str:
+        # The commit status the repository's manifest names as its production deploy (#4726).
+        # Read only for a green status at a ready head, so the manifests are read rarely.
+        from .poller_ops import release_policies
+
+        policy = release_policies(config.poller.root).get(repository.lower())
+        return dict(getattr(policy, "deploy_names", ())).get(repository.lower(), "")
 
     wake_on = WakeOnService(
         config.github_webhook.path,
@@ -517,9 +545,11 @@ def create_app(config: AppConfig) -> FastAPI:
         # A timed-out review wait reads back a verdict whose webhook never came (#4478).
         recover_review=wake_recover_review,
         ready_head=wake_ready_head,
+        deploy_name=wake_deploy_name,
         release_notices=lambda chat_id, since: scheduled_messages.ids_since(
             chat_id, "work-release:", since
         ),
+        owns_pull=wake_owns_pull,
         # A time wait's check runs as its chat's own Claude account (#4256).
         check_env=lambda session_key: check_account_env(config, session_key),
         # The routine ends that wake nobody leave a pending note for the chat (#4306).
@@ -542,6 +572,12 @@ def create_app(config: AppConfig) -> FastAPI:
     )
     services_later = services_link.Later(services_transport)
     work_router = services_link.RouterLink(config, services_transport, state, services_later)
+    # A registration or a new round here records its Work's published-label sync in the
+    # shared pending file and wakes the router (#4794).
+    work_published.configure(
+        PendingActions(pending_path(config.github_webhook.path)),
+        nudge=work_router.note_published,
+    )
     work_release_service = services_link.ReleaseLink(
         config, services_transport, state, services_later
     )
@@ -709,6 +745,8 @@ def create_app(config: AppConfig) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        # A round started in a worker thread nudges the router through this loop (#4794).
+        work_published.bind_loop()
         sweep_abandoned_uploads()
         relation_follower = asyncio.create_task(
             follow_runtime_relations_forever(), name="runtime-relation-follower"
@@ -868,6 +906,21 @@ def create_app(config: AppConfig) -> FastAPI:
         if config.github_webhook.enabled
         else None
     )
+    # A chat waiting on the deck is pinged before its prompt cache runs out (#4737). Off
+    # wherever the deck asks its chats nothing, for the same reason.
+    app.state.keep_warm = (
+        keep_warm.KeepWarmService(
+            db,
+            resolve_scheduled_target,
+            queued=lambda key: keep_warm.has_pending(injector.status(key)),
+            at_limit=lambda key: keep_warm.at_limit(state.usage.get(key)),
+            on_change=lambda chat_id: state.sessions_changed((chat_id,)),
+        )
+        if config.github_webhook.enabled
+        and config.inject.enabled  # the write kill-switch covers the ping too
+        and config.inject.keep_warm_pings
+        else None
+    )
     app.state.chat_board = chat_board_service
     app.state.review_fallback = review_fallback
     app.state.push = push
@@ -995,6 +1048,9 @@ def create_app(config: AppConfig) -> FastAPI:
     async def stamp_received(request, call_next):
         request.state.received_at = time.perf_counter()
         return await call_next(request)
+
+    # Outermost of all: a request this stopping process cancels is told so, not "500" (#4738).
+    app.add_middleware(shutdown.CutOffAnswer)
 
     app.mount(
         "/static",

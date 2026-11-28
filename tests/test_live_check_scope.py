@@ -118,10 +118,14 @@ ALLOWED = {
         "docs/",
         "tests/",
     },
+    # The guide in a starting Work's own worktree, measured at each start (#4724).
+    "src/agentdeck/guide_size.py": {"AGENTS.md", "CLAUDE.md"},
     # The guide in a locked chat's own folder, never this repository's.
     "src/agentdeck/providers/claude_code/locked.py": {"CLAUDE.md"},
     # Which changed files a no-code verdict allows, by name.
     "src/agentdeck/work_release.py": {"docs/"},
+    # The owner's global guide in the home and account folders, never this repository's.
+    "src/agentdeck/worker_cuts.py": {".claude/CLAUDE.md", "CLAUDE.md"},
 }
 
 _MAYBE = re.compile(

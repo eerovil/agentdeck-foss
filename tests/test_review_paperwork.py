@@ -42,18 +42,20 @@ def test_an_issue_in_another_repository_needs_its_full_name():
 
 def test_each_gap_is_named_and_complete_paperwork_has_none():
     files = ("src/agentdeck/x.py", "docs/diagrams/flow.md")
-    missing = gaps(Paperwork("Some body", files, ("hello",)), "o/r", "o/r", 7)
+    drawn = files[1:]
+    missing = gaps(Paperwork("Some body", files, ("hello",), drawn), "o/r", "o/r", 7)
     assert len(missing) == 3
     assert "`Refs #7`" in missing[0]
     assert "`Use-case walkthrough:`" in missing[1]
     assert "`docs/diagrams/flow.md`" in missing[2] and "agentdeck-diagram" in missing[2]
-    assert gaps(Paperwork("Refs #7", files, (WALK, DIAGRAM)), "o/r", "o/r", 7) == []
+    assert gaps(Paperwork("Refs #7", files, (WALK, DIAGRAM), drawn), "o/r", "o/r", 7) == []
     # #4264 review: the mark mentioned in prose is no diagram comment; trailing space is fine.
     mention = "Post the diagram ending `<!-- agentdeck-diagram -->` please"
-    assert len(gaps(Paperwork("Refs #7", files, (WALK, mention)), "o/r", "o/r", 7)) == 1
-    assert gaps(Paperwork("Refs #7", files, (WALK, DIAGRAM + "\n\n")), "o/r", "o/r", 7) == []
-    # No diagram changed: no diagram comment needed (#4254 draws one only for a new feature).
-    assert gaps(Paperwork("Refs #7", files[:1], (WALK,)), "o/r", "o/r", 7) == []
+    assert len(gaps(Paperwork("Refs #7", files, (WALK, mention), drawn), "o/r", "o/r", 7)) == 1
+    trailing = Paperwork("Refs #7", files, (WALK, DIAGRAM + "\n\n"), drawn)
+    assert gaps(trailing, "o/r", "o/r", 7) == []
+    # No drawing changed, only box notes: no diagram comment needed (#4598).
+    assert gaps(Paperwork("Refs #7", files, (WALK,)), "o/r", "o/r", 7) == []
 
 
 @pytest.mark.parametrize(
@@ -103,6 +105,37 @@ def test_the_helper_checks_comment_is_asked_for_before_the_first_review(
 
 
 @pytest.mark.parametrize(
+    ("changed", "body", "gap"),
+    [
+        (999, "Refs #7", False),
+        (1000, "Refs #7", True),
+        (4655, "Refs #7\n\n## Reading guide: why so big\n1. `a.py`", False),
+        (1000, "Refs #7\n**Reading guide:** one new file", False),
+        (1000, "Refs #7\nreading guide: lower case", False),
+        (1000, "Refs #7\nSee the Reading guide: below", True),
+        (1000, "Refs #7\n> Reading guide: quoted", True),
+        (1000, "Refs #7\n```\nReading guide: in code\n```", True),
+        (1000, "Refs #7\n<!-- Reading guide: hidden -->", True),
+        (1000, "Refs #7\n<!--\nReading guide: hidden\n-->", True),
+        (1000, "Refs #7\nThe deck skips <!-- comments.\n\nReading guide: hidden", True),
+        # A ``<!--`` shown inside a code block opens no comment (#4786 helpers).
+        (1000, "Refs #7\n```html\n<!--\n```\n\nReading guide: why", False),
+        (1000, "Refs #7\n<!-- a\nb -->\nReading guide: after a comment", False),
+        # A delimiter in an inline code span is shown text and opens no comment (#4786 review).
+        (1000, "Refs #7\nSkips `<!--` in prose.\n\n## Reading guide: why", False),
+        (1000, "Refs #7\n``a `<!--` b`` here\nReading guide: why", False),
+        (1000, "Refs #7\n<!-- `-->` is in a span -->\nReading guide: why", False),
+        (1000, "Refs #7\nx <!-- `code` y\nReading guide: hidden", True),
+    ],
+)
+def test_a_big_pull_request_needs_a_reading_guide(changed, body, gap):
+    missing = gaps(Paperwork(body, (), (WALK,), changed=changed), "o/r", "o/r", 7)
+    assert bool(missing) is gap
+    if gap:
+        assert "`Reading guide:`" in missing[0] and f"{changed:,} lines" in missing[0]
+
+
+@pytest.mark.parametrize(
     ("comment", "found"),
     [
         ("Use-case walkthrough: not applicable — tests only", True),
@@ -119,8 +152,13 @@ def test_the_walkthrough_is_a_line_of_its_own(comment, found):
 
 async def test_reads_github_and_an_unread_check_finds_nothing(monkeypatch):
     replies = {
-        "pr": {"body": "Refs #7", "files": [{"path": "docs/diagrams/a.md"}, "junk"]},
+        "pr": {"body": "Refs #7", "files": [{"path": "docs/diagrams/a.md"}, "junk"]}
+        | {"baseRefOid": "b" * 40, "headRefOid": "h" * 40},
         "issue": {"comments": [{"body": WALK}, {"body": None}]},
+        "api": {
+            "merge_base_commit": {"sha": "m" * 40},
+            "data": {"repository": {"old": None, "new": {"text": "# New"}}},
+        },
     }
     seen: list = []
 
@@ -138,9 +176,147 @@ async def test_reads_github_and_an_unread_check_finds_nothing(monkeypatch):
     assert len(await review_paperwork.check("o/r", 10, "o/r#7", helpers=True)) == 2
     assert seen[0][:5] == ["gh", "pr", "view", "9", "--repo"]
     assert seen[1][:4] == ["gh", "issue", "view", "7"]
+    assert seen[2][2] == f"repos/o/r/compare/{'b' * 40}...{'h' * 40}?per_page=1"
+    assert f"old={'m' * 40}:docs/diagrams/a.md" in seen[3]
+    assert f"new={'h' * 40}:docs/diagrams/a.md" in seen[3]
+    # A big pull request's body owes a reading guide (#4786); a bool or junk size is unread.
+    replies["pr"] |= {"additions": 900, "deletions": 100}
+    big = await review_paperwork.check("o/r", 9, "o/r#7")
+    assert len(big) == 2 and "changes 1,000 lines" in big[1]
+    assert seen[0][-1] == "body,files,baseRefOid,headRefOid,additions,deletions"
+    replies["pr"] |= {"additions": True, "deletions": "999"}
+    assert len(await review_paperwork.check("o/r", 9, "o/r#7")) == 1
     replies["issue"] = None
     assert await review_paperwork.check("o/r", 9, "o/r#7") == []
     assert await review_paperwork.check("o/r", 9, "not a work") == []
+
+
+DRAWN = """# Flow
+
+Intro.
+
+```mermaid
+flowchart TD
+  a[A] --> b[B]
+```
+
+## Colours
+
+- **blue**: a step
+
+## Boxes
+
+- **A**: does it
+"""
+
+
+def noted(note: str) -> str:
+    return DRAWN.replace("## Colours", f"{note}\n\n## Colours")
+
+
+def inside(line: str) -> str:
+    """``DRAWN`` in a four-backtick block, with ``line`` inside it above the arrow."""
+    return DRAWN.replace("```", "````").replace("  a[A]", f"{line}\n  a[A]")
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "drawn"),
+    [
+        # #4598: the comment shows neither the box notes nor the introduction.
+        (DRAWN, DRAWN.replace("does it", "does it twice"), False),
+        (DRAWN, DRAWN.replace("Intro.", "Longer.") + "- **B**: more\n", False),
+        (DRAWN, DRAWN.replace("Intro.", "Intro.\n# Notes"), False),
+        # #4647: nor a plain note under the block, also one split by a blank line.
+        (DRAWN, noted("Past 3 s it checks.\n\nThen more."), False),
+        (noted("Old note."), noted("New note."), False),
+        # A changed block or colour beside a note, and a second block after one, still ask.
+        (DRAWN, noted("Note.").replace("b[B]", "b[C]"), True),
+        (DRAWN, noted("Note.").replace("a step", "a question"), True),
+        (DRAWN, noted("Note.\n\n```mermaid\nflowchart TD\n  c[C]\n```"), True),
+        # What may be a legend under the block counts, and so does the text after it.
+        (DRAWN, noted("- **amber**: new"), True),
+        (DRAWN, noted("| amber | new |"), True),
+        (DRAWN, noted("### Legend"), True),
+        (noted("Legend\n------"), noted("Key\n------"), True),
+        (noted("Legend\n==="), noted("Key\n==="), True),
+        (noted("amber | old\n--- | ---"), noted("amber | new\n--- | ---"), True),
+        (DRAWN, noted("> amber: new"), True),
+        (DRAWN, noted("    amber: new"), True),
+        (DRAWN, noted("1."), True),
+        (DRAWN, noted("<b>amber</b>"), True),
+        (DRAWN, noted("<br/>"), True),
+        (DRAWN, noted("</div>"), True),
+        (DRAWN, noted("<!-- amber -->"), True),
+        (DRAWN, noted("<span\nclass='x'>amber</span>"), True),
+        # Text that only looks like one of them.
+        (DRAWN, noted("Checks\n#4645): too."), False),
+        (DRAWN, noted("<3 s is short."), False),
+        (DRAWN, noted("<https://example.com/a> has more."), False),
+        (DRAWN, noted("<first-last@example.com> knows."), False),
+        (DRAWN, noted("<a/b@example.com> knows."), False),
+        (DRAWN, noted("```x``` is the flag."), False),
+        (noted("### Legend\n\namber: old"), noted("### Legend\n\namber: new"), True),
+        # A line inside the block that is no closing fence for it does not end it.
+        (inside("```"), inside("```").replace("b[B]", "b[C]"), True),
+        (inside("    ````"), inside("    ````").replace("b[B]", "b[C]"), True),
+        (inside("## Boxes"), inside("## Boxes").replace("b[B]", "b[C]"), True),
+        # Unusual shapes count as drawing.
+        (DRAWN.replace("```", "~~~"), DRAWN.replace("```", "~~~").replace("b[B]", "b[C]"), True),
+        (DRAWN.replace("```", "  ```"), DRAWN.replace("```", "  ```").replace("[B]", "[C]"), True),
+        (
+            DRAWN.replace("Colours", "Colours (key)"),
+            DRAWN.replace("Colours", "Colours (key)").replace("a step", "a question"),
+            True,
+        ),
+        (DRAWN.replace("```\n\n", ""), DRAWN.replace("```\n\n", "").replace("step", "x"), True),
+        (DRAWN, DRAWN.replace("b[B]", "b[C]"), True),
+        (DRAWN, DRAWN.replace("a step", "a question"), True),
+        (DRAWN, DRAWN.replace("# Flow", "# Other"), True),
+        (None, DRAWN, True),  # added
+        (DRAWN, None, False),  # deleted
+        ("unread", DRAWN, False),
+    ],
+)
+async def test_only_a_changed_drawing_asks_for_the_comment(monkeypatch, old, new, drawn):
+    async def run(argv, *, timeout, repo=None, **kw):
+        if argv[2] != "graphql":
+            return 0, json.dumps({"merge_base_commit": {"sha": "m"}}).encode()
+        assert repo == "o/r"  # graphql names no repository in its argv
+        if old == "unread":
+            return 1, b""
+        blob = {
+            "old": None if old is None else {"text": old},
+            "new": None if new is None else {"text": new},
+        }
+        return 0, json.dumps({"data": {"repository": blob}}).encode()
+
+    monkeypatch.setattr(review_paperwork.gh_cli, "run", run)
+    path = "docs/diagrams/a.md"
+    found = await review_paperwork.read_drawn("o/r", "b", "h", [path])
+    assert found == ((path,) if drawn else ())
+
+
+async def test_an_added_diagram_asks_unread_and_a_posted_comment_reads_nothing(monkeypatch):
+    files = [
+        {"path": "docs/diagrams/new.md", "changeType": "ADDED"},
+        {"path": "docs/diagrams/old.md", "changeType": "MODIFIED"},
+    ]
+    pull = {"body": "Refs #7", "files": files, "baseRefOid": "b", "headRefOid": "h"}
+    comments = [{"body": WALK}]
+    calls: list[str] = []
+
+    async def run(argv, *, timeout, **kw):
+        calls.append(argv[1])
+        reply = {"pr": pull, "issue": {"comments": comments}}.get(argv[1])
+        return (0, json.dumps(reply).encode()) if reply else (1, b"")  # compare fails
+
+    monkeypatch.setattr(review_paperwork.gh_cli, "run", run)
+    paper = await review_paperwork.read("o/r", 9, "o/r", 7)
+    assert paper.drawn == ("docs/diagrams/new.md",)
+    calls.clear()
+    comments.append({"body": DIAGRAM})
+    assert (await review_paperwork.read("o/r", 9, "o/r", 7)).drawn == ()
+    assert calls == ["pr", "issue"]
 
 
 ROBOT = "Acme/bot"

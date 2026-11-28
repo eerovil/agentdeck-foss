@@ -1,5 +1,5 @@
 {# The Work-first front page's live parts (#2219), most needing the owner first (#3818,
-   replacing #3578's): `starred` (every starred Work, and only there, #4121), `needs` (Needs answer), `release`, `stuck`, `active`, `cleanup` (Issue
+   replacing #3578's): `starred` (every starred Work, each also in its own group, #4121, #4745), `needs` (Needs answer), `release`, `stuck`, `active`, `cleanup` (Issue
    closed, Not started), `waiting`, `live`, `try` (Waiting for a try, #4210), `finished`, `paused`, `parked` (#4305), `stopped`. `part` picks one. The
    Work lists are keyed rows that `work_list.js`
    swaps by `data-work-id` and `data-work-rev`, so an unchanged row keeps focus; each part
@@ -9,7 +9,8 @@
    Finish on a Work whose issue closed (#2510), not_live ones too (#4126), and Start agent on one no agent works on (#3558). A row names the chat its Work opens into, and
    a phone opens that chat instead of the Work page (#2512, `session_navigation.js`). The title
    shows in full and the detail line wraps (#3386); age and repo# end the detail line, and the side column is
-   only for a row's one button (#2526). #}
+   only for a row's one button (#2526). A Work idle over 48 h is one line, its title cut short
+   and its age in days, with no detail or button (#4633); Hidden and Show older keep whole rows. #}
 {%- set front = work_overview.front -%}
 {%- from "partials/work_actions.html" import control -%}
 {%- from "partials/work_macros.html" import size, diff_icon, use_dot -%}
@@ -27,12 +28,14 @@
 {%- set when = (item.continued or card.finished_at or card.last_activity) if finished else card.last_activity %}
 {%- if when %} data-work-active="{{ when.isoformat() }}"{% endif %}
 {%- endmacro -%}
-{%- macro head(key, label, count, note="", link="", new=0, keep=false) -%}
+{%- macro head(key, label, count, note="", link="", new=0, keep=false, finishable=0) -%}
 {#- Every header folds its group (#2283): `work_list.js` keeps the folded keys in localStorage,
     and a folded group still shows its count, NEW pill and note. #}
 <h3 class="fr-group fr-group-{{ key }}" data-front-group="{{ key }}"{% if keep %} data-front-keep{% endif %}><span class="fr-group-mark" aria-hidden="true"></span><span class="fr-group-label">{{ label }}</span> <span class="fr-group-count">{{ count }}</span>
   {%- if new %}<span class="fr-new" data-front-new="{{ new }}">{{ new }} new</span>{% endif %}
   {%- if link %}<a class="fr-group-note" href="{{ link }}"{% if note == "All Works" %} data-all-works{% endif %}>{{ note }}</a>{% elif note %}<span class="fr-group-note">{{ note }}</span>{% endif -%}
+  {#- Finish all (#4623), Issue closed only; its form is outside the rows a push replaces. #}
+  {%- if key == "issue_closed" %}<button type="submit" form="front-finish-all" class="fr-action fr-finish-all" data-finish-all{% if finishable < 2 %} hidden{% endif %}>Finish all</button>{% endif %}
   <button type="button" class="fr-chev" data-front-toggle="{{ key }}" aria-expanded="true" aria-label="Show or hide {{ label }}"></button></h3>
 {%- endmacro -%}
 {%- macro title(item, hidden=false) -%}
@@ -43,6 +46,10 @@
 {%- set name = item.map.title if item.map else item.card.title -%}
 {%- if item.unseen and not hidden %}<span class="fr-title-line"><span class="fr-title">{{ diff_icon(item.card) }}{{ star }}{{ name }}</span><span class="fr-dot" role="img" aria-label="new" title="New since you last opened it"></span></span>
 {%- else %}<span class="fr-title">{{ diff_icon(item.card) }}{{ star }}{{ name }}</span>{% endif -%}
+{%- endmacro -%}
+{%- macro idle_age(item) -%}
+{#- The days are in the row's revision, so the row redraws when they change. -#}
+<span class="fr-idle-age">{{ item.idle_days }}d</span>
 {%- endmacro -%}
 {%- macro room(side, tried=false) -%}
 {#- The place the row's buttons take at the end of its detail line (#4210): the same labels,
@@ -58,7 +65,8 @@
     place, so they neither narrow the text nor add a line of their own. -#}
 {#- An older row under Show older (#4289) has no buttons: it is off the front page already,
     and every action is on its Work page. -#}
-{%- if older %}{% set side = [] %}
+{%- set idle = item.idle_days and not hidden and not older -%}
+{%- if older or idle %}{% set side = [] %}
 {%- elif item.trying and not hidden and not paused %}{% set side = item.tried %}
 {%- elif hidden %}{% set side = [item.bring_back] %}
 {%- elif paused %}{% set side = [item.resume] %}
@@ -66,11 +74,12 @@
 {%- elif op and op.category == "unstarted" %}{% set side = [item.start] %}
 {%- elif (op and op.category == "issue_closed") or item.finish_unproven %}{% set side = [item.finish] %}
 {%- else %}{% set side = [] %}{% endif -%}
-<article class="fr fr-{{ item.section }} fr-tone-{{ item.status.tone }}{% if op %} fr-cat-{{ op.category }}{% endif %}{% if item.unseen and not hidden %} fr-unseen{% endif %}{% if item.continued and card.working_count %} fr-chatting{% endif %}"
+<article class="fr fr-{{ item.section }} fr-tone-{{ item.status.tone }}{% if op %} fr-cat-{{ op.category }}{% endif %}{% if item.unseen and not hidden %} fr-unseen{% endif %}{% if item.continued and card.working_count %} fr-chatting{% endif %}{% if idle %} fr-idle{% endif %}"
          data-work-id="{{ card.work_id }}" data-work-rev="{{ item.revision }}"
          data-front-section="{{ item.section }}" data-wd-tone="{{ item.status.tone }}"
          {%- if card.project %} data-work-project="{{ card.project }}"{% endif %}
          {%- if group %} data-front-in="{{ group }}"{% endif %}
+         {%- if group == "issue_closed" and item.finish_all_id and not item.starred %} data-finish-id="{{ item.finish_all_id }}"{% endif %}
          {%- if item.stopped_at %} data-work-stopped="{{ item.stopped_at.isoformat() }}"{% endif %}
          {%- if not older %}{{ active(item, finished=item.section == "finished") }}{% endif %}
          {%- if item.unseen and not hidden %} data-work-unseen="{{ item.stopped_at.isoformat() if item.stopped_at else '' }}"{% endif %}
@@ -81,7 +90,8 @@
      {#- An older row opens its Work page on a phone too (#4289). #}
      {%- if card.chat_href and not item.progress and not older %} data-chat-href="{{ card.chat_href }}"{% endif %}>
     {{ title(item, hidden) }}
-    {%- if item.section == "finished" or older %}
+    {%- if idle %}{{ idle_age(item) }}
+    {%- elif item.section == "finished" or older %}
     {#- An older row whose issue is still open (#4289): idle a week, so it left the page. -#}
     <span class="fr-line"><span class="fr-what">{% if group == "starred" %}<span class="fr-headline">Finished</span> · {% endif %}<span class="fr-source">{{ ref(item) }}</span>{% if older and card.work_id in older_open %} · <span data-older-open>issue open</span>{% elif item.reason and item.section == "finished" %} · merged{% endif %} ·
       {#- Size does not expire, and waking a finished Work's chat is what it warns about (#4168). #}
@@ -105,7 +115,7 @@
     </span>
     {%- endif %}
   </a>
-  {%- if item.progress %}
+  {%- if item.progress and not idle %}
   {#- A parent issue's row (#3622): how far its sub-issues are, a line of its own. When the row
       shows a child's state, the line opens that child's Work, one tap from its question. #}
   {#- A map's line opens its first waiting question's chat, at its form (#3696). -#}
@@ -113,7 +123,7 @@
   {%- elif item.lead %}<a class="fr-tree" href="{{ item.lead.card.href }}" data-work-tree="{{ item.lead.card.work_id }}">{{ item.progress }} &rarr;</a>
   {%- else %}<span class="fr-tree" data-work-tree>{{ item.progress }}</span>{% endif %}
   {%- endif %}
-  {%- if older %}
+  {%- if older or idle %}
   {%- elif item.trying and not hidden and not paused %}
   <span class="fr-side fr-tried">{% for button in item.tried %}{{ control(item.actor, button) }}{% endfor %}</span>
   {%- elif side %}
@@ -135,7 +145,8 @@
 {%- macro needs_groups(place) -%}
 {#- The Needs you groups listed at one place in the page's flow (#3578). -#}
 {%- for group in front.groups_in(place) %}
-{{ head(group.category, group.label, group.rows | length, note=group.note, new=group.new) }}
+{{ head(group.category, group.label, group.rows | length, note=group.note, new=group.new,
+         finishable=group.rows | selectattr("finish_all_id") | rejectattr("starred") | list | length if group.category == "issue_closed" else 0) }}
 {%- for item in group.rows %}
 {{ put(row, item, group=group.category) }}
 {%- endfor %}
@@ -148,7 +159,7 @@
     row read as a last activity that did not update (#2397). -#}
 {%- set card = item.card -%}
 {%- set op = item.attention -%}
-<article class="fr fr-stopped{% if op %} fr-cat-{{ op.category }}{% endif %}{% if item.unseen %} fr-unseen{% endif %}"
+<article class="fr fr-stopped{% if op %} fr-cat-{{ op.category }}{% endif %}{% if item.unseen %} fr-unseen{% endif %}{% if item.idle_days %} fr-idle{% endif %}"
          data-work-id="{{ card.work_id }}" data-work-rev="{{ item.revision }}"
          data-front-section="stopped" data-front-in="stopped"
          {%- if item.stopped_at %} data-work-stopped="{{ item.stopped_at.isoformat() }}"{% endif %}
@@ -160,8 +171,11 @@
   <a class="fr-body" href="{{ card.href }}" title="{{ card.source_label }}"
      {%- if card.chat_href %} data-chat-href="{{ card.chat_href }}"{% endif %}>
     {{ title(item) }}
+    {%- if item.idle_days %}{{ idle_age(item) }}
+    {%- else %}
     <span class="fr-line"><span class="fr-what">&rarr; <span class="fr-landed" data-front-landed>{{ op.label if op else "Needs you" }}</span>{% if item.line %} · {{ item.line }}{% endif %}</span>
       <span class="fr-when">{{ use_dot(card.use) }}{{ age(card) }}<span class="fr-source fr-ref">{{ ref(item) }}</span></span></span>
+    {%- endif %}
   </a>
 </article>
 {%- endmacro -%}
@@ -176,8 +190,8 @@
 {%- endfor %}
 
 {%- elif part == "starred" %}
-{#- Every starred Work, whatever it is doing (#4121); no other group lists one. A paused row
-    keeps its Resume. Its header and rows take no height while nothing is starred. #}
+{#- Every starred Work, whatever it is doing (#4121); its own group lists it too (#4745). A paused row
+    keeps its Resume unless it is idle (#4633). Its header and rows take no height while nothing is starred. #}
 {%- if front.starred %}
 {{ head("starred", "Starred", front.starred | length, new=front.starred_new) }}
 {%- endif %}
@@ -195,7 +209,7 @@
 {{ needs_groups(part) }}
 
 {%- elif part == "live" %}
-{%- set items = front.others(front.live) %}
+{%- set items = front.live %}
 {%- if items %}
 {{ head("live", "Live checking", items | length, "merged; the agent checks it live") }}
 {%- endif %}
@@ -206,7 +220,7 @@
 {%- elif part == "try" %}
 {#- Live, and only a person can see it works (#4210): outside Needs you, each row with Works,
     close and Doesn't work. -#}
-{%- set items = front.others(front.trying) %}
+{%- set items = front.trying %}
 {%- if items %}
 {{ head("try", "Waiting for a try", items | length, "only a person can check these live") }}
 {%- endif %}
@@ -216,7 +230,7 @@
 
 {%- elif part == "paused" %}
 {#- The Works a person paused (#2548), each row with only Resume (#2566). #}
-{%- set items = front.others(front.paused) %}
+{%- set items = front.paused %}
 {%- if items %}
 {{ head("paused", "Paused", items | length, "until you resume them") }}
 {%- for item in items %}
@@ -231,7 +245,7 @@
 {%- elif part == "parked" %}
 {#- The Works a person parked until they write (#4305): out of Waiting, which lists only what
     something automatic moves on. Each row opens its chat for that message. #}
-{%- set items = front.others(front.parked) %}
+{%- set items = front.parked %}
 {%- if items %}
 {{ head("parked", "Parked", items | length, "waits for your message") }}
 {%- endif %}
@@ -248,7 +262,7 @@
 {%- endfor %}
 
 {%- elif part == "active" %}
-{%- set items = front.others(front.active) %}
+{%- set items = front.active %}
 {%- if items %}
 {{ head("working", "Working now", items | length, "All Works", "/works") }}
 {%- endif %}
@@ -260,7 +274,7 @@
 {%- endif %}
 
 {%- elif part == "waiting" %}
-{%- set items = front.others(front.waiting) %}
+{%- set items = front.waiting %}
 {%- if items %}
 {{ head("waiting", "Waiting", items | length, "on a review, job, blocker or deploy") }}
 {%- endif %}
@@ -277,9 +291,9 @@
 {%- endfor %}
 
 {%- elif part == "finished" %}
-{#- Always drawn (#4289): Show older and the search under it are how an older Work is found,
+{#- Always drawn (#4289): Show older and the search (#4624) put older rows under it, which is how an older Work is found,
     so the header stays even with nothing finished this week. -#}
-{%- set items = front.others(front.finished) %}
+{%- set items = front.recent %}
 {{ head("finished", "Recently finished", items | length, keep=true) }}
 {%- for item in items %}
 {{ put(row, item, group="finished") }}

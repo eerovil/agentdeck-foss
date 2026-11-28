@@ -784,3 +784,31 @@ def test_app_state_rebuilds_the_projection_when_any_input_moves(state, tmp_path)
     finally:
         runtime.close()
     assert state.work_projection() is state.work_projection()
+
+
+def test_saved_bindings_are_the_same_rows_until_one_moves(tmp_path):
+    """#4639: the rows are read after every commit and compared each pass."""
+    from agentdeck.db import Db
+
+    db = Db(tmp_path / "control.db")
+
+    def put(key):
+        db._write(
+            "INSERT INTO session_work_bindings"
+            "(session_key, work_id, evidence, parent_chat_id, bound_at)"
+            " VALUES (?, ?, 'run', '', ?)",
+            (key, WORK_A.work_id, "2026-11-25T00:00:00+00:00"),
+        )
+
+    put("a")
+    first = db.session_work_bindings()
+    again = db.session_work_bindings()
+    assert again[0] is first[0] and again is not first
+    again.clear()
+    assert db.session_work_bindings() == first
+    put("b")
+    assert [row.session_key for row in db.session_work_bindings()] == ["a", "b"]
+    db._write("UPDATE session_work_bindings SET evidence = 'backfilled' WHERE session_key = 'a'")
+    assert [row.evidence for row in db.session_work_bindings()] == ["backfilled", "run"]
+    db._write("DELETE FROM session_work_bindings")
+    assert db.session_work_bindings() == []

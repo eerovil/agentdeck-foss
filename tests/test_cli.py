@@ -592,6 +592,38 @@ def test_job_submit_names_a_claude_chat_from_its_bare_session_id(
     assert "nothing will announce" not in captured.err
 
 
+def test_job_list_prints_the_newest_rows_cut_short_unless_asked_for_all(monkeypatch, capsys):
+    """#4754: the whole queue was 172k characters in the context of every chat that looked for
+    a run on its head. A job still waiting or running is never left out."""
+    long = ["bash", "-c", "x" * 300]
+    jobs = [{"id": f"old{n}", "state": "done", "exit_code": 0, "command": long} for n in range(30)]
+    jobs.insert(2, {"id": "waits", "state": "queued", "command": ["pytest"]})
+    jobs.append({"id": "runs", "state": "running", "label": "y" * 200})
+    monkeypatch.setattr(cli, "list_jobs", lambda _socket: jobs)
+
+    assert cli._job(["list"]) == 0
+    *lines, note = capsys.readouterr().out.splitlines()
+    newest = [f"old{n}" for n in range(12, 30)]
+    assert [line.split()[0] for line in lines] == ["waits", *newest, "runs"]
+    assert lines[1] == "old12  done  exit=0  bash -c " + "x" * 191 + "…"
+    assert lines[-1] == "runs  running  " + "y" * 200  # at the limit: whole
+    assert note == "(12 older finished jobs not shown; --all lists them)"
+
+    assert cli._job(["list", "--all"]) == 0
+    everything = capsys.readouterr().out.splitlines()
+    assert len(everything) == 32 and everything[0].endswith("x" * 300)
+
+    # more waiting or running than the limit: all of them, and no finished one
+    busy = [{"id": f"q{n}", "state": "queued", "command": ["true"]} for n in range(25)]
+    assert cli._job_list([jobs[0], *busy])[-2:] == [
+        "q24  queued  true",
+        "(1 older finished jobs not shown; --all lists them)",
+    ]
+    assert cli._job_list(jobs[:3]) == [cli._job_line(job, 200) for job in jobs[:3]]
+    monkeypatch.setattr(cli, "list_jobs", lambda _socket: [])
+    assert cli._job(["list"]) == 0 and capsys.readouterr().out == ""  # no blank line
+
+
 def test_job_submit_sends_a_suite_to_a_pod_unless_told_otherwise(tmp_path, monkeypatch, capsys):
     """What an agent types by default has to be what the host wants.
 

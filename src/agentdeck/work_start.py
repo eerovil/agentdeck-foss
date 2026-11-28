@@ -251,7 +251,6 @@ def start_account(app: Any, repository: str = "") -> Any:
     chosen = choose_account(
         list(startable),
         shared_cache_dir(usage.shared_cache_dir) if usage is not None else None,
-        {},
         notes,
         cold=True,
         planned_resets=app.state.db.planned_resets(),
@@ -272,6 +271,41 @@ def chosen_account(app: Any, repository: str, choice: Any = None) -> Any:
             return account
     log.warning("work start: the picked account %s may not start a chat now", choice.account_key)
     return None
+
+
+def with_project_model(app: Any, repository: str, choice: Any = None) -> Any:
+    """``choice`` with the project's own default model where the press picked none (#4723).
+
+    The same ``choice`` back when it names a model already, the project sets none
+    (``poller_ops.work_models``), or the provider the Work starts on (the picked account's,
+    else the deck's own) does not offer it: a mistyped model says so in the log and is
+    never saved, and a Codex pick is left alone. Only the Work's own agent starts through a
+    choice, so a reviewer or helper never gets the project's model.
+    """
+    from .db import StartChoice
+    from .poller_ops import work_models
+    from .providers import PROVIDERS
+
+    if choice is not None and choice.model:
+        return choice
+    poller = getattr(app.state.config, "poller", None)
+    if poller is None:
+        return choice
+    try:
+        model = work_models(poller.root).get(repository.lower(), "")
+    except Exception:  # noqa: BLE001 - an unreadable setting is the account's default
+        log.warning("work start: could not read the project model", exc_info=True)
+        return choice
+    if not model:
+        return choice
+    picked = choice.account_key if choice is not None else ""
+    provider_id = picked.split(":", 1)[0] if picked else AUTO_PROVIDERS[0]
+    provider = PROVIDERS.get(provider_id)
+    if provider is None or not provider.is_valid_model(model):
+        if provider_id == AUTO_PROVIDERS[0]:
+            log.warning("work start: %s's project model “%s” is not offered", repository, model)
+        return choice
+    return (choice or StartChoice())._replace(model=model)
 
 
 def chosen_options(choice: Any, provider: Any) -> dict[str, str | None]:
@@ -472,6 +506,35 @@ def _other_checkouts_text(app: Any, repository: str, main: str) -> str:
     if not others:
         return ""
     return OTHER_CHECKOUTS_TEXT.format(paths=", ".join(f"`{path}`" for path in others))
+
+
+#: What the Work's agent is told when its repository's guide is over the size limit (#4724):
+#: every model call re-reads the guide, and one had grown to 231k characters unseen (#4714).
+#: The agent passes it on to the person; trimming a guide is a docs Work of its own.
+BIG_GUIDE_TEXT = (
+    "This repository's guide ({files}) is up to {size:,} characters, over the deck's limit of "
+    "{limit:,}; every model call re-reads it. Say so in one line of your first reply, and do "
+    "not trim it in this Work unless the issue asks for that."
+)
+
+
+def _big_guide_text(folder: str) -> str:
+    """The guide-size warning for the first message, measured in ``folder``, where the agent
+    works; empty when the guide is within the limit, or the folder is unknown."""
+    from .guide_size import GUIDE_LIMIT, oversized_guide
+
+    if not folder:
+        return ""
+    try:
+        size, files = oversized_guide(folder)
+    except Exception:  # noqa: BLE001 - a missing line must never stop the start
+        log.warning("work start: could not measure the guide in %s", folder, exc_info=True)
+        return ""
+    if not size:
+        return ""
+    log.warning("work start: the guide in %s is %s characters (%s)", folder, size, files)
+    names = ", ".join(f"`{name}`" for name in files[:3])
+    return BIG_GUIDE_TEXT.format(files=names, size=size, limit=GUIDE_LIMIT)
 
 
 #: Background checkout refreshes in flight, held so none is collected before it ends.
@@ -762,7 +825,8 @@ async def start_work_agent(
     work_id = ref.work_id
     action_id = start_action_id(work_id)
     db = app.state.control_db
-    choice = db.work_start_choice(work_id)
+    saved = db.work_start_choice(work_id)
+    choice = with_project_model(app, repository, saved)
     account = chosen_account(app, repository, choice)
     if account is None:
         log.warning("work start: no account may start a chat for %s", work_id)
@@ -783,6 +847,9 @@ async def start_work_agent(
     if not reserved:
         # Spent (``False``) or unrecordable (``None``): either way, never a second start.
         return "already started" if reserved is False else "not recorded"
+    if choice is not saved and not db.record_work_start_choice(work_id, choice):
+        # Saved once this start is the Work's, so a later leg of its chat keeps the model.
+        log.warning("work start: the project model for %s was not saved", work_id)
     # A Work spare an open New work form kept for this repository takes it warm (#3590).
     from .web.start_spares import WORK
 
@@ -818,7 +885,7 @@ async def start_work_agent(
     timing.mark("worktree")
     # After the worktree claim, which fetches in the same main checkout.
     _refresh_checkouts_in_background(app, repository, main)
-    brief = _brief(app, ref, FIRST_TEXT, labels, where, main)
+    brief = _brief(app, ref, FIRST_TEXT, labels, where, main, folder)
     if merged_text := await merged:
         brief = f"{brief} {merged_text}"
     pasted = await issue
@@ -933,10 +1000,17 @@ async def _issue_text(repository: str, number: int) -> str:
 
 
 def _brief(
-    app: Any, ref: WorkRef, opening: str, labels: Iterable[str], where: str, main: str = ""
+    app: Any,
+    ref: WorkRef,
+    opening: str,
+    labels: Iterable[str],
+    where: str,
+    main: str = "",
+    folder: str = "",
 ) -> str:
     """A deck start's brief after its opening line: spec-only, merging, evidence, the
-    project's other checkouts, folder. ``main`` is the Work's own main checkout."""
+    project's other checkouts, an oversized guide, folder. ``main`` is the Work's own main
+    checkout, ``folder`` the one its agent works in, whose guide it reads."""
     return " ".join(
         filter(
             None,
@@ -947,6 +1021,7 @@ def _brief(
                 _evidence_text(app, ref.repository, ref.number),
                 _open_pull_text(app, ref.repository, ref.number),
                 _other_checkouts_text(app, ref.repository, main),
+                _big_guide_text(folder),
                 where,
             ),
         )
@@ -1200,7 +1275,9 @@ async def bind_before_issue(
     # The worker must exist before it can be told anything: a cold spawn may still be under
     # way. A start the runtime refused gets no message; its settle starts the Work again.
     if await _launched(early):
-        text = _brief(app, ref, ISSUE_FILED_TEXT.format(url=url), labels, where, early.main)
+        text = _brief(
+            app, ref, ISSUE_FILED_TEXT.format(url=url), labels, where, early.main, folder
+        )
         message = first_message(IssueRef(ref.repository, ref.number), (), text)
         if not await _tell(provider, early, message, work_id):
             # Told to wait for this message, it would sit idle with the Work marked started:

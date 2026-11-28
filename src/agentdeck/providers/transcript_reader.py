@@ -91,6 +91,9 @@ class TranscriptMeta:
     # its account refused only here: it has no reply, and its end looks like any other (#4118).
     turn_error: dict | None = None
     task_status: str | None = None
+    # The newest turn was opened by the deck's keep-warm ping (#4737): the fields above
+    # describe the turn before it.
+    keep_warm_turn: bool = False
 
 
 class LineParser:
@@ -266,6 +269,17 @@ def objects_forwards(
 PROMPT = "prompt"  # a user message
 AGENT_TEXT = "agent_text"  # a visible agent reply
 RESET = "reset"  # a boundary (e.g. a compaction) that discards everything older
+# The opener of a turn no reader counts (the deck's keep-warm ping, #4737): the reply
+# that answered it is dropped and the walk goes on to the turn before.
+HIDDEN_TURN = "hidden_turn"
+# A line that opens a turn and carries no message (a background notification): a reply
+# after it is not a hidden turn's.
+TURN = "turn"
+
+# How many lines past a reply the walk goes on looking for the hidden opener it may have
+# answered, once the prompt is settled. A hidden turn is a line or two; a real one is not
+# walked whole for this.
+HIDDEN_LOOKBACK = 16
 
 
 @dataclass(frozen=True)
@@ -285,6 +299,8 @@ class NewestMessages:
     message_at: datetime | None = None
     prompt_decided: bool = False
     text_decided: bool = False
+    # The newest turn's opener is a ``HIDDEN_TURN`` line: the slots above skip that turn.
+    hidden_newest: bool = False
 
     def merged_with(
         self,
@@ -336,11 +352,22 @@ def newest_messages_backwards(
     means "this line is of that kind but carries no message", which keeps the
     scan going. The walk stops as soon as both slots are settled, so it normally
     costs one turn's bytes.
+
+    A reply is settled for good only once the line that opened its turn is met: behind a
+    ``HIDDEN_TURN`` it is dropped again. With the prompt still open the walk goes on to
+    that opener anyway; with it settled, for ``HIDDEN_LOOKBACK`` lines at most.
     """
     prompt = text = role = None
     message_at: datetime | None = None
-    prompt_decided = text_decided = False
+    prompt_decided = text_decided = hidden_newest = False
+    opened = False  # a turn's opener other than a hidden one was met
+    text_open = False  # the reply is settled and its turn's opener is not met yet
+    lookback = HIDDEN_LOOKBACK
     for obj in objects_backwards(path, prefilter=prefilter, limit=limit, chunk=chunk):
+        if prompt_decided and text_open:
+            lookback -= 1
+            if lookback < 0:
+                break
         try:
             verdict = classify(obj)
         except Exception:  # a bad line must skip, never break a scan
@@ -354,17 +381,30 @@ def newest_messages_backwards(
             # holds, so an unsettled slot is settled empty right here.
             prompt_decided = text_decided = True
             break
+        if kind == HIDDEN_TURN:
+            if text_open:
+                # The reply met last answered this line: it is no message either.
+                text, text_decided, text_open = None, False, False
+                if role == "agent":
+                    role, message_at = None, None
+            hidden_newest = hidden_newest or not opened
+            continue
+        if kind == TURN or (kind == PROMPT and value):
+            opened = True
+            text_open = False
         if kind == PROMPT and not prompt_decided and value:
             prompt, prompt_decided = value, True
         elif kind == AGENT_TEXT and not text_decided and value:
-            text, text_decided = value, True
+            text, text_decided, text_open = value, True, True
+        elif prompt_decided and text_decided and not text_open:
+            break
         else:
             continue
         if role is None:
             role = "user" if kind == PROMPT else "agent"
             if message_timestamp is not None:
                 message_at = message_timestamp(obj)
-        if prompt_decided and text_decided:
+        if prompt_decided and text_decided and not text_open:
             break
     return NewestMessages(
         prompt=prompt,
@@ -373,6 +413,7 @@ def newest_messages_backwards(
         message_at=message_at,
         prompt_decided=prompt_decided,
         text_decided=text_decided,
+        hidden_newest=hidden_newest,
     )
 
 

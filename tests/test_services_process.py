@@ -161,6 +161,28 @@ def test_the_feed_sends_only_what_moved_and_starts_over_on_another_epoch(web):
     assert feed.answer(moved["revision"], "another web worker")["reset"]
 
 
+def test_registrations_are_sorted_again_only_once_one_moved(web, monkeypatch):
+    sorts: list[int] = []
+    real = session_copy.registrations_of
+    monkeypatch.setattr(
+        session_copy, "registrations_of", lambda state: (sorts.append(1), real(state))[1]
+    )
+    feed = session_copy.SessionCopyFeed(web)
+    feed.answer(None, None)
+    feed.compare()
+    web.sessions["claude_code:main:a"].thinking = True
+    feed.compare()
+    assert len(sorts) == 1
+    web.set_pull_requests("claude_code:main:a", (PullRequestRef("eerovil/agentdeck", 12),))
+    assert feed.compare() and len(sorts) == 2
+    # The same pull request registered for another Work is equal, and still a change.
+    moved = (PullRequestRef("eerovil/agentdeck", 12, work_id="github_issue:eerovil/agentdeck#8"),)
+    web.session_pull_requests["claude_code:main:a"] = moved
+    assert feed.compare() and len(sorts) == 3
+    web.set_issues("claude_code:main:a", (IssueRef("eerovil/agentdeck", 99),))
+    assert feed.compare() and len(sorts) == 4
+
+
 async def test_a_held_read_answers_once_a_chat_moves(web):
     feed = session_copy.SessionCopyFeed(web)
     first = feed.answer(None, None)
@@ -211,6 +233,59 @@ async def test_an_act_reaches_the_services_and_its_refusal_comes_back_by_name(tm
     assert "recover_review" in work_services.CALLS["router"]
     assert await router.recover_review("eerovil/agentdeck", 9) == {"outcome": "asked"}
     assert app.state.services.calls[2][:3] == ("router", "recover_review", ["eerovil/agentdeck", 9])
+
+
+async def test_a_call_waits_for_a_whole_chat_copy_and_says_restarting_without_one(
+    tmp_path, monkeypatch
+):
+    """#4738: a ``pre-review-done`` sent two seconds after the services restarted was
+    answered from an empty chat copy, as a pull request no Work's chat registered."""
+    from agentdeck import services_process
+    from agentdeck.services_process import SessionFollower, create_services_app
+
+    monkeypatch.setattr(services_process, "COPY_WAIT_S", 0.05)
+    app = create_services_app(work_services_config(tmp_path), watchdog=False)
+    app.state.services = _Services()
+    state = AppState()
+    follower = SessionFollower(None, state, None, on_registered=lambda *ref: None)
+    app.state.whole_copy = follower.whole
+    transport = services_link.SocketTransport(
+        lambda: tmp_path / "unused.sock", transport=httpx.ASGITransport(app=app)
+    )
+    router = services_link.RouterLink(work_services_config(tmp_path), transport, _NoState())
+
+    with pytest.raises(services_link.ServicesUnavailable, match="restarting; try again"):
+        await router.pre_review_done("eerovil/agentdeck", 9)
+    assert app.state.services.calls == [], "nothing ran, so sending it again is safe"
+    # A filing hold places no chat, so it never waits. Nor does a call the web sends without
+    # waiting for its answer: refused, a filed issue's start would be dropped unsaid.
+    await transport.call("services", "hold_filing", ["eerovil/agentdeck", "k", 5], {})
+    link_later = services_link.Later(transport)
+    for target, method in sorted(services_process.UNWAITED):
+        link_later.send(target, method, "eerovil/agentdeck", 9)
+    await link_later.flush()
+    assert [call[1] for call in app.state.services.calls] == [
+        "hold_filing",
+        "star",
+        "note_filed",
+        "note_published",
+        "note_registered",
+    ]
+    app.state.services.calls.clear()
+
+    # The copy lands while a call waits: the call runs, as the retry on #4734 should have.
+    monkeypatch.setattr(services_process, "COPY_WAIT_S", 5.0)
+    waiting = asyncio.create_task(router.pre_review_done("eerovil/agentdeck", 9))
+    await asyncio.sleep(0.01)
+    assert not waiting.done()
+    follower.apply({"scanned": True, "sessions": [], "removed": []})
+    assert await waiting == {"outcome": "asked"}
+    # A web that restarted refills the copy before it has scanned (#4458): not whole again.
+    follower.apply({"reset": True, "sessions": [], "removed": []})
+    assert not await follower.whole(0.01)
+    # A first scan that never ends does not refuse every call for good.
+    monkeypatch.setattr(work_services, "START_SCAN_WAIT_SECONDS", 0.0)
+    assert await follower.whole(0.01)
 
 
 def test_the_web_says_a_filed_issue_starts_only_when_it_is_this_decks(tmp_path):

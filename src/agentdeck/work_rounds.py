@@ -95,6 +95,10 @@ def start(db: Any, work_id: str, earlier: Iterable[str], reason: str) -> bool:
         return False
     if started:
         log.info("work rounds: %s started a new round (%s)", work_id, reason)
+        # The new round has no pull requests yet: its published label comes off (#4794).
+        from . import work_published
+
+        work_published.request([work_id])
     return started
 
 

@@ -232,6 +232,73 @@ def replaced_round(events: Iterable[ReviewEvent], stamp: str, *, late_from: str 
     return chat or stamp if newer else ""
 
 
+#: What a ``chat`` row's ``asked`` says when the chat was opened by a person's press or about
+#: no single pull request (#4665): it asked about every pull request it lists.
+ASKED_ALL = "*"
+
+
+def kept_pass(events: Iterable[ReviewEvent], stamp: str, pull: str, head: str) -> str:
+    """The replaced review chat (``owner/repo#n``) whose pass stamped ``stamp`` still counts for
+    ``pull`` at ``head``, else "" (#4665).
+
+    One review chat lists every open pull request of a Work, so a sibling's new commit replaces
+    the chat while it is still reviewing ``pull`` at an unchanged commit. That chat's pass is
+    still a full review of the commit; ``replaced_round`` alone dropped it, and the Work waited
+    for a second review of the same commit. It counts only when nothing newer asked about
+    ``pull`` or answered it:
+
+    - the stamped chat's own ``chat`` row is at ``head``;
+    - every newer chat's row is at ``head`` too and was opened by an ask about another pull
+      request (its ``asked`` names one; none, ``ASKED_ALL`` or ``pull`` itself is an ask about
+      ``pull``: a re-ask, a person's press, a chat from before the mark, a crash before the
+      ``asked`` row);
+    - no ``asked`` row since the stamped chat opened names another chat, or no chat at all
+      (an uncertain start, a press that lost to a concurrent chat);
+    - no verdict but a pass stands at ``head`` from any chat, older ones included;
+    - no verdict at ``head`` is dated after the newer chat opened: that is the newer review's
+      own answer, which wins (the stamped chat's own pass, delivered again, is not one).
+    """
+    stamp = (stamp or "").lower()
+    head = (head or "").lower()
+    wanted = (pull or "").casefold()
+    if not stamp or len(head) < 7 or not wanted:
+        return ""
+    events = list(events)
+    chats = [event for event in events if event.kind == CHAT]
+    own = [event for event in chats if str(event.data.get("round") or "").lower() == stamp]
+    if not own or not any(event.head.startswith(head) for event in own):
+        return ""
+    chat = str(own[0].data.get("chat") or "").lower()
+    if not chat:
+        return ""
+    since = min((event.at, event.seq) for event in own)
+    newer = [
+        event
+        for event in chats
+        if str(event.data.get("chat") or "").lower() != chat and (event.at, event.seq) > since
+    ]
+    if not newer:
+        return ""
+    for event in newer:
+        mark = str(event.data.get("asked") or "").casefold()
+        if not event.head.startswith(head) or mark in ("", ASKED_ALL, wanted):
+            return ""
+    for event in events:
+        if event.kind != ASKED or (event.at, event.seq) <= since:
+            continue
+        if str(event.data.get("chat") or "").lower() != chat:
+            return ""
+    first_newer = min((event.at, event.seq) for event in newer)
+    for event in at_head(events, head):
+        if event.kind not in VERDICTS:
+            continue
+        if event.kind == PASS and str(event.data.get("chat") or "").lower() == chat:
+            continue  # this chat's own pass, delivered again
+        if event.kind not in (PASS, ACCEPTED) or (event.at, event.seq) > first_newer:
+            return ""
+    return chat
+
+
 def clip_findings(text: str) -> str:
     """Findings as kept on their event, for the GitHub check (#4152), saying when cut. A round
     stamp is taken out (#4386): a later chat quotes this text as an earlier round's."""
@@ -456,6 +523,11 @@ def passed(event: ReviewEvent | None) -> bool:
     """Whether ``event`` (``newest_verdict``'s) is a pass, the owner's acceptance included."""
     return event is not None and event.kind in (PASS, ACCEPTED)
 
+
+#: A shipped head's ``fix`` when the owner chose to leave its findings as shipped (#4797):
+#: no fix pull request follows, and the Work may close once its live check is verified. No
+#: pull request reference looks like it.
+FIX_DECLINED = "declined"
 
 #: The note of the pass a Ship now press records (#4212).
 SHIP_NOTE = "Shipped now with its findings left to fix in this Work"

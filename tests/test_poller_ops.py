@@ -409,3 +409,28 @@ def test_issue_label_targets_read_the_manifests_alone(tmp_path, monkeypatch):
         poller_ops.LabelTarget("eerovil/agentdeck", ("agent", "claude")),
         poller_ops.LabelTarget("acmecorp/bazaar", ("claude",)),
     )
+
+
+def test_a_manifest_is_parsed_once_until_it_moves(tmp_path, monkeypatch):
+    """#4639: a page asks hundreds of times; a change is still seen at once."""
+    path = tmp_path / "poller.toml"
+    path.write_text('org = "one"\n')
+    parses = []
+    load = poller_ops.tomllib.load
+    monkeypatch.setattr(
+        poller_ops.tomllib, "load", lambda handle: parses.append(1) or load(handle)
+    )
+    # Just written: a same-tick rewrite could hide, so it is parsed every time.
+    assert poller_ops._manifest(path).org == "one"
+    path.write_text('org = "two"\n')
+    assert poller_ops._manifest(path).org == "two" and len(parses) == 2
+
+    monkeypatch.setattr(poller_ops, "_TOML_SETTLE_NS", -1)
+    first = poller_ops._manifest(path)
+    assert poller_ops._manifest(path) is first and len(parses) == 3
+    path.write_text('org = "three"\n')
+    assert poller_ops._manifest(path).org == "three"
+    path.write_text("org = [")
+    assert not poller_ops._manifest(path).readable
+    path.unlink()
+    assert not poller_ops._manifest(path).readable

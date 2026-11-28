@@ -19,6 +19,8 @@ from pathlib import Path
 import httpx
 
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
+# The page's own check is JavaScript's ``\s``, which also counts the byte order mark.
+_SECRET_COMMAND_RE = re.compile(r"[\s\ufeff]*/secret(?:[\s\ufeff]+|\Z)")
 _MAX_SECRET_CHARS = 65_536
 _SECRET_TTL_S = 3600.0
 _CONTROL_ENV_NAMES = {
@@ -74,15 +76,14 @@ class IssuedSecret:
 
 def parse_secret_command(message: str) -> SecretCommand | None:
     """Parse ``/secret NAME VALUE`` without ever including VALUE in an error."""
-    if not message.startswith("/secret"):
+    command = _SECRET_COMMAND_RE.match(message)
+    if command is None:
         return None
-    if len(message) > len("/secret") and not message[len("/secret")].isspace():
-        return None
-    parts = message.split(maxsplit=2)
-    if len(parts) == 1:
+    parts = re.split(r"[\s\ufeff]+", message[command.end() :], maxsplit=1)
+    name = parts[0]
+    if not name:
         raise SecretCommandError("Use /secret NAME VALUE")
-    name = parts[1]
-    value = parts[2] if len(parts) == 3 else ""
+    value = parts[1] if len(parts) == 2 else ""
     validate_secret(name, value)
     return SecretCommand(name=name, value=value)
 

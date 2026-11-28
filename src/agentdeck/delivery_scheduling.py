@@ -41,7 +41,6 @@ def target_of(account: str) -> tuple[str, str]:
 def _expiring_budget_first(
     order: list[str],
     usage_cache: Path | None,
-    usage_targets: Mapping[str, float],
     notes: list[str],
     planned_resets: Mapping[str, datetime] | None = None,
 ) -> list[str]:
@@ -50,7 +49,6 @@ def _expiring_budget_first(
         name: usage.account_expiring_headroom(
             usage_cache,
             name,
-            target_pct=usage_targets.get(name, usage.USAGE_TARGET_PCT),
             planned_reset=plan_for(planned_resets, name),
         )
         for name in order
@@ -76,7 +74,6 @@ PACE_TIE = 0.1
 def _budget_pace_first(
     order: list[str],
     usage_cache: Path | None,
-    usage_targets: Mapping[str, float],
     notes: list[str],
     planned_resets: Mapping[str, datetime] | None = None,
 ) -> list[str]:
@@ -97,7 +94,6 @@ def _budget_pace_first(
         pace = usage.account_budget_pace(
             usage_cache,
             name,
-            target_pct=usage_targets.get(name, usage.USAGE_TARGET_PCT),
             planned_reset=plan_for(planned_resets, name),
         )
         if pace is None:
@@ -127,7 +123,6 @@ _WINDOW_NAMES = {"five_hour": "five-hour", "seven_day": "seven-day", "month": "m
 def _room_first(
     order: list[str],
     usage_cache: Path | None,
-    usage_targets: Mapping[str, float],
     notes: list[str],
     planned_resets: Mapping[str, datetime] | None = None,
 ) -> list[str]:
@@ -138,8 +133,7 @@ def _room_first(
     pile every new card onto one account until a window runs out and stops its chats mid-turn.
     Accounts of the leading account's provider with any window at ``NEAR_FULL_PCT`` or more
     move behind those with room, each keeping their order. When none has room, or nothing
-    reads, the order stands. An account its operator opted out with a target of 0 never
-    counts as having room.
+    reads, the order stands.
     """
     provider = target_of(order[0])[0]
     slots = [index for index, name in enumerate(order) if target_of(name)[0] == provider]
@@ -158,12 +152,7 @@ def _room_first(
                 continue
             if name not in full or pct > full[name][1]:
                 full[name] = (window, pct)
-    roomy = [
-        order[index]
-        for index in slots
-        if order[index] not in full
-        and usage_targets.get(order[index], usage.USAGE_TARGET_PCT) > 0
-    ]
+    roomy = [order[index] for index in slots if order[index] not in full]
     if not full or not roomy:
         return order
     promoted = list(order)
@@ -172,11 +161,8 @@ def _room_first(
         promoted[index] = name
     if promoted[0] != order[0]:
         before = order[0]
-        if before in full:
-            window, pct = full[before]
-            why = f"{before}'s {_WINDOW_NAMES.get(window, window)} window is {pct:.0f}% full"
-        else:
-            why = f"{before} is opted out and {', '.join(full)} nearly full"
+        window, pct = full[before]
+        why = f"{before}'s {_WINDOW_NAMES.get(window, window)} window is {pct:.0f}% full"
         notes.append(f"{why} — starting the card on {promoted[0]} instead")
     return promoted
 
@@ -187,13 +173,15 @@ _NEVER_CLEARS = datetime.max.replace(tzinfo=UTC)
 def choose_account(
     accounts: list[str],
     usage_cache: Path | None,
-    usage_targets: Mapping[str, float],
     notes: list[str],
     *,
     cold: bool = False,
     planned_resets: Mapping[str, datetime] | None = None,
 ) -> str:
     """An eligible account, or ``""`` when every one has an open hard-quota circuit.
+
+    Every account is aimed at the engine's own target (``USAGE_TARGET_PCT``): the per-account
+    targets an Overlay once set reached no caller and went (#4728).
 
     ``cold`` is a card with no account of its own yet; its first account is chosen by the
     budget each account has left per hour (#2757) rather than by the operator's order alone.
@@ -216,10 +204,10 @@ def choose_account(
         notes.append("all configured accounts have open hard-quota circuits; withholding delivery")
         return ""
     if cold:
-        order = _budget_pace_first(order, usage_cache, usage_targets, notes, planned_resets)
-    order = _expiring_budget_first(order, usage_cache, usage_targets, notes, planned_resets)
+        order = _budget_pace_first(order, usage_cache, notes, planned_resets)
+    order = _expiring_budget_first(order, usage_cache, notes, planned_resets)
     if cold:
-        order = _room_first(order, usage_cache, usage_targets, notes, planned_resets)
+        order = _room_first(order, usage_cache, notes, planned_resets)
     refused: list[tuple[str, str, datetime | None]] = []
     for name in order:
         reason, clears_at = usage.account_refusal_detail(usage_cache, name)

@@ -50,6 +50,12 @@ class WorkResolution:
     session_key: str = ""
     # Last, with a default, so the four-part constructions keep their positions (#3928).
     background: str = ""
+    # How many writes that changed a part this record has had (#4726).
+    writes: int = 0
+
+    def texts(self) -> tuple[str, ...]:
+        """Every part's text, in page order: what two writes are compared by."""
+        return tuple(getattr(self, name) for name, _heading in PARTS)
 
     def parts(self) -> tuple[tuple[str, str, str], ...]:
         """(field, heading, text) for every part, in page order."""
@@ -108,6 +114,24 @@ def resolution_blocks(text: str) -> tuple[Block, ...]:
 
 class ResolutionError(ValueError):
     """A resolution write that cannot be stored as asked."""
+
+
+# The two writes a Work's agent is asked for: one after its first look, one whole before review.
+# Each later one re-reads nothing new but costs a tool call and its echo (#4726).
+AGENT_WRITES = 2
+
+
+class ResolutionRefused(ResolutionError):
+    """A write past ``AGENT_WRITES`` that leaves the ``solution`` part as it is (#4726)."""
+
+    def __init__(self, writes: int) -> None:
+        self.writes = writes
+        super().__init__(
+            f"This Work's summary was already written {writes} times, and this write leaves"
+            " its solution part as it is, so it was not stored. Write it again only when the"
+            " solution itself changed; the deck adds test and review results to the"
+            " correctness part by itself."
+        )
 
 
 def with_evidence(resolution: WorkResolution, sentence: str) -> WorkResolution:

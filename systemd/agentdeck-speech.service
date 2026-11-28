@@ -15,6 +15,9 @@ Environment=GIT_TERMINAL_PROMPT=0 SSH_ASKPASS_REQUIRE=never
 ExecStart=%h/.local/share/agentdeck/speech-venv/bin/python %h/agentdeck/scripts/speech_server.py --device cuda --idle-exit 0
 # Speech is heard live: keep it ahead of test suites for the CPU.
 CPUWeight=500
+# Never swapped out (#4669): loaded is not enough. On a full host 1.6 GB of it was
+# in swap after a break, and the next phrase took 19 s.
+MemorySwapMax=0
 # A crash restarts it, so the next phrase does not wait for a cold start (#3766).
 Restart=on-failure
 RestartSec=5

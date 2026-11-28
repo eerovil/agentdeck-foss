@@ -373,6 +373,10 @@
           {%- if host_speech %} data-voice-wake="{{ voice_wake }}"{% endif %}>
       <button type="button" class="speech-button voice-button" data-voice-button aria-pressed="false"
               aria-label="Read replies aloud" title="Read replies aloud">🎧</button>
+      {#- Pocket mode (#4792): a black screen that ignores touches while voice mode
+          goes on. Shown only while voice mode is on, so the box keeps its size. #}
+      <button type="button" class="speech-button pocket-button" data-pocket-button
+              aria-label="Pocket mode" title="Pocket mode: black screen, touches ignored">🌙</button>
       <span class="speech-status" role="status" hidden></span>
     </span>
     {%- endif %}

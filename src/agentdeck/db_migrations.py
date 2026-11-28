@@ -314,6 +314,11 @@ MIGRATIONS = (
             ("chat_forks", "seen_seq", "INTEGER"),
         ),
     ),
+    Migration(
+        23,
+        "how many times a Work's summary was written",
+        (("work_metadata", "resolution_writes", "INTEGER"),),
+    ),
 )
 
 

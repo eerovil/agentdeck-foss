@@ -201,10 +201,18 @@ def structured_reset_at(payload: object) -> datetime | None:
 
 
 _STATED_RESET = re.compile(
-    r"\bresets\s+(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*"
-    r"(?P<period>am|pm)\s*\((?P<zone>[^()]+)\)\s*$",
+    r"\bresets\s+(?:(?P<month>[a-z]{3})[a-z]*\.?\s+(?P<day>\d{1,2}),?\s+)?"
+    r"(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*"
+    r"(?P<period>am|pm)\s*\((?P<zone>[^()]+)\)(?:\s*$|\.(?:\s|$))",
     re.IGNORECASE,
 )
+_MONTHS = {
+    name: number
+    for number, name in enumerate(
+        ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"),
+        start=1,
+    )
+}
 
 
 def stated_reset_at(evidence: str, *, now: datetime | None = None) -> datetime | None:
@@ -228,6 +236,28 @@ def stated_reset_at(evidence: str, *, now: datetime | None = None) -> datetime |
         return None
     local_now = _aware(now or datetime.now(UTC)).astimezone(zone)
     hour = hour % 12 + (12 if match.group("period").lower() == "pm" else 0)
+    if match.group("month") is not None:
+        # A window further off than a day names its date, "resets Dec 2, 10am (…)" (#4764).
+        # The year is not said: the next such date is the boundary.
+        month = _MONTHS.get(match.group("month").lower())
+        if month is None:
+            return None
+        for year in range(local_now.year, local_now.year + 5):  # Feb 29 waits for a leap year
+            try:
+                candidate = local_now.replace(
+                    year=year,
+                    month=month,
+                    day=int(match.group("day")),
+                    hour=hour,
+                    minute=minute,
+                    second=0,
+                    microsecond=0,
+                )
+            except ValueError:
+                continue  # Feb 29 outside a leap year: not this year's date
+            if candidate > local_now:
+                return candidate.astimezone(UTC)
+        return None
     candidate = local_now.replace(hour=hour, minute=minute, second=0, microsecond=0)
     if candidate <= local_now:
         candidate += timedelta(days=1)

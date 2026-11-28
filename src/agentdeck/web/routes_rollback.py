@@ -9,7 +9,8 @@ the agent changed and messages it already sent stay, and the confirm box says so
 The agent no longer remembers anything it asked for in the removed part, so the
 chat's wake-ons and ``agentdeck job``s registered from that message on are cancelled
 without a word to it. The answer carries the removed message's text, which the page
-puts back into the message box.
+puts back into the message box, without the deck notes that rode on it: those of every
+removed message wait for the chat's next one (#4618).
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ from fastapi import APIRouter, HTTPException, Request
 
 from .. import deck_notices
 from ..attachments import display_message
+from ..note_text import split_notes
 from .deps import get_state, resolve_session
 from .routes_actions import _require_same_origin
 
@@ -47,6 +49,8 @@ def _refuse(status_code: int, text: str) -> HTTPException:
 @router.post("/sessions/{session_key}/rollback")
 async def rollback_session(request: Request, session_key: str) -> dict:
     _require_same_origin(request)
+    # Before the form is awaited: what was said no longer stands (#4643).
+    get_state(request).withdraw_person_words(resolve_session(request, session_key)[1].key)
     form = await request.form()
     raw_seq = form.get("seq")
     try:
@@ -74,14 +78,12 @@ async def _rollback(request: Request, account, session, provider, seq: int) -> d
     """The rollback itself, under its chat's lock, so each press sees the last one's result."""
     state = get_state(request)
     at = await asyncio.to_thread(provider.rewind_ref, account, session, seq)
-    message = next(
-        (
-            event
-            for event in await provider.read_transcript(account, session, after_seq=seq - 1)
-            if event.seq == seq and event.role == "user"
-        ),
-        None,
-    )
+    removed = [
+        event
+        for event in await provider.read_transcript(account, session, after_seq=seq - 1)
+        if event.role == "user"
+    ]
+    message = next((event for event in removed if event.seq == seq), None)
     if at is None or message is None:
         raise _refuse(409, NOT_A_CUT)
     if _sent_by_deck(request, session.key, message):
@@ -95,6 +97,8 @@ async def _rollback(request: Request, account, session, provider, seq: int) -> d
     if not result.accepted:
         busy = "worker_busy" in (result.reason or "")
         raise _refuse(409, BUSY if busy else f"The chat could not be rolled back: {result.reason}")
+    # Before anything below can fail: the agent has forgotten them already. Safe to repeat.
+    _keep_notes(request, session.key, removed)
     # After the process ended, so the count holds every line the removed part wrote.
     _offset, last = await provider.transcript_cursor(account, session)
     if not state.record_transcript_rollback(session.key, seq, max(seq, last)):
@@ -104,7 +108,7 @@ async def _rollback(request: Request, account, session, provider, seq: int) -> d
             "hide. Try again.",
         )
     waits = _cancel_waits(request, session.key, since)
-    return {"text": display_message(message.text), "cancelled_waits": waits}
+    return {"text": split_notes(display_message(message.text))[1], "cancelled_waits": waits}
 
 
 def _sent_by_deck(request: Request, session_key: str, message) -> bool:
@@ -116,6 +120,20 @@ def _sent_by_deck(request: Request, session_key: str, message) -> bool:
     texts = deck_notices.candidate_texts([message])
     records = store.deck_message_ids(chat_id, texts) if store is not None and texts else {}
     return deck_notices.notice_kind(message.text, records, message.ts) is not None
+
+
+def _keep_notes(request: Request, session_key: str, removed: list) -> None:
+    """Put the deck notes of the removed messages back for the next one (#4618): the agent
+    forgot them, and the composer gets only the person's own words."""
+    service = getattr(request.app.state, "pending_events", None)
+    if service is None:
+        return
+    chat_id = get_state(request).chat_identity_key(session_key)
+    for event in removed:
+        if event.subagent:
+            continue
+        for number, note in enumerate(split_notes(event.text or "")[0], start=1):
+            service.add(chat_id, f"rolled-back:{session_key}:{event.seq}:{number}", note)
 
 
 def _cancel_waits(request: Request, session_key: str, since: float | None) -> int:

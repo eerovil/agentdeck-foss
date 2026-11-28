@@ -8,7 +8,13 @@ from agentdeck.config import InjectConfig
 from agentdeck.db import Db
 from agentdeck.inject import InjectionService
 from agentdeck.models import Account, Capability, InjectResult, Session, SessionStatus
-from agentdeck.pending_events import NOTES_END, NOTES_HEADING, PendingEvents, with_notes
+from agentdeck.pending_events import (
+    NOTES_END,
+    NOTES_HEADING,
+    PendingEvents,
+    split_notes,
+    with_notes,
+)
 
 CHAT = "chat-a"
 
@@ -299,3 +305,10 @@ async def test_notes_that_would_make_the_message_too_long_wait_for_the_next_one(
     await send(service, provider, "hi", tmp_path=tmp_path)
     assert provider.sent == [with_notes(["short note"], "hi")]
     assert [note["id"] for note in notes.waiting(CHAT)] == ["n2"]
+
+
+def test_a_shown_message_splits_back_into_its_notes_and_itself():
+    notes = ["First.\n\nMore of it.", "Second."]
+    assert split_notes(with_notes(notes, "Hi\n\nthere")) == (notes, "Hi\n\nthere")
+    for own in ("Hi", "", f"What is this?\n\n{with_notes(notes, 'x')}", f"{NOTES_HEADING} cut"):
+        assert split_notes(own) == ([], own)

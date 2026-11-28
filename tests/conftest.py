@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import gc
 import itertools
 import json
 import math
@@ -310,12 +311,52 @@ def pytest_collection_finish(session: pytest.Session) -> None:
 def pytest_runtest_protocol(item: pytest.Item, nextitem):
     if _timings is None:
         yield
+        _leftover_files.collect_if_many()
         return
     _timings.start(item.nodeid)
     try:
         yield
     finally:
         _timings.stop(item.nodeid)
+    _leftover_files.collect_if_many()
+
+
+class LeftoverFiles:
+    """Free finished tests' open files before the process runs out of them (#4649).
+
+    A test's app is a reference cycle holding about ten SQLite files, so only a full
+    garbage collection closes them. Python runs one only once enough new objects have
+    piled up next to the old ones, and with this suite's big heap one xdist worker went
+    a whole run without: 937 open files of the 1,024 a queued job may have. Whichever
+    test opened the next one failed. Collecting after every test would cost most of a
+    test's time, so it waits until `STEP` more files are open than the fewest
+    seen since the last one.
+    """
+
+    STEP = 256
+
+    def __init__(self) -> None:
+        self._left = 0
+
+    @staticmethod
+    def count() -> int:
+        try:
+            return len(os.listdir("/proc/self/fd"))
+        except OSError:  # not Linux
+            return 0
+
+    def collect_if_many(self) -> bool:
+        count = self.count()
+        # Files closed since the last collection leave room for that many more leftovers.
+        self._left = min(self._left, count)
+        if count < self._left + self.STEP:
+            return False
+        gc.collect()
+        self._left = self.count()
+        return True
+
+
+_leftover_files = LeftoverFiles()
 
 
 def pytest_runtest_logreport(report: pytest.TestReport) -> None:

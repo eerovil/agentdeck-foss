@@ -40,6 +40,8 @@ def test_fingerprint_ignores_image_paths_but_not_count():
     assert _fp(effort=None) != _fp(effort="high")
     assert _fp(permission_mode=None) != _fp(permission_mode="bypassPermissions")
     assert _fp(allow_over_budget=False) != _fp(allow_over_budget=True)
+    # A keep-warm ping is not the same request as that text sent as a message (#4737).
+    assert _fp(keep_warm=False) == _fp() != _fp(keep_warm=True)
 
 
 def test_absent_effort_keeps_legacy_fingerprint():

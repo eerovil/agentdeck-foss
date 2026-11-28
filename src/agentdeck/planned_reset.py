@@ -12,7 +12,7 @@ runtime service's ``RuntimeDirectory``, which systemd deletes on every runtime r
 from __future__ import annotations
 
 from collections.abc import Mapping
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 
 def plan_for(plans: Mapping[str, datetime] | None, account: str) -> datetime | None:
@@ -24,9 +24,11 @@ def plan_for(plans: Mapping[str, datetime] | None, account: str) -> datetime | N
 
 
 def parse_time(text: str, *, now: datetime | None = None) -> datetime:
-    """``HH:MM`` on the host's clock (its next occurrence) or an ISO instant with a zone.
+    """``HH:MM`` on the host's clock (its next occurrence), or an ISO date and time.
 
-    Raises ``ValueError`` for anything else, or for an instant already past.
+    An ISO time with no zone is on the host's clock too: that is what the account page's
+    date-and-time field sends (#4717). Raises ``ValueError`` for anything else, or for an
+    instant already past.
     """
     text = (text or "").strip()
     local_now = (now or datetime.now(UTC)).astimezone()
@@ -39,15 +41,42 @@ def parse_time(text: str, *, now: datetime | None = None) -> datetime:
             moment = datetime.fromisoformat(text)
         except ValueError:
             moment = None
-        if moment is None or moment.tzinfo is None:
-            raise ValueError("give a time as HH:MM or an ISO time with a zone")
+        if moment is not None and _is_date_alone(text):
+            moment = None  # midnight is not what a person naming a day meant
+        if moment is None:
+            raise ValueError("give a time as HH:MM or a date and time (YYYY-MM-DDTHH:MM)")
+        if moment.tzinfo is None:
+            moment = _on_host_clock(moment, local_now) or moment.astimezone()
         if moment <= local_now:
             raise ValueError("that time has already passed")
         return moment
-    moment = local_now.replace(hour=clock.hour, minute=clock.minute, second=0, microsecond=0)
-    if moment <= local_now:
-        moment += timedelta(days=1)
-    return moment
+    # Built without a zone and placed on the host's clock afterwards, so a tomorrow across a
+    # clock change is still that clock time.
+    wall = local_now.replace(
+        tzinfo=None, hour=clock.hour, minute=clock.minute, second=0, microsecond=0
+    )
+    return _on_host_clock(wall, local_now) or (wall + timedelta(days=1)).astimezone()
+
+
+def _on_host_clock(wall: datetime, after: datetime) -> datetime | None:
+    """A zone-less time placed on the host's clock, still ahead of ``after``, or ``None``.
+
+    An hour the clocks repeat has two readings (``fold``); the earlier one still ahead is
+    the one meant, for a bare ``HH:MM`` and for a date and time alike.
+    """
+    for candidate in (wall.replace(fold=0), wall.replace(fold=1)):
+        moment = candidate.astimezone()
+        if moment > after:
+            return moment
+    return None
+
+
+def _is_date_alone(text: str) -> bool:
+    try:
+        date.fromisoformat(text)
+    except ValueError:
+        return False
+    return True
 
 
 def apply(db, state, account: str, text: str, *, now: datetime | None = None) -> datetime | None:

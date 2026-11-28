@@ -133,17 +133,28 @@ These are best effort, not absolute (operator decision on #2895, ADR 0008). Acce
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
+import json
 import logging
 import re
 import secrets
 import time
-from collections.abc import Awaitable, Callable, Collection, Coroutine, Iterable, Iterator
+from collections.abc import (
+    Awaitable,
+    Callable,
+    Collection,
+    Coroutine,
+    Iterable,
+    Iterator,
+    Mapping,
+)
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from . import (
+    code_lines,
     deck_notices,
     design_review,
     review_history,
@@ -195,11 +206,13 @@ PRE_REVIEW_TEXT = """AgentDeck: before {pull} at {short} goes to review, check t
  The reviewer checks each one and sends the pull request back if it is missing. The deck\
  itself refuses `pre-review-done`, naming the gap, while the body lacks `Refs #<issue>`, the\
  issue lacks the `Use-case walkthrough:` line (before the first review, the `Helper checks:`\
- line), a changed diagram lacks its issue comment, or the issue's newest `**Design:**` comment\
- has no passing design review.
+ line), a new diagram, or one whose title, Mermaid block or colours changed, lacks its issue\
+ comment (an edit to its introduction, a plain note under the block or `## Boxes` notes\
+ alone needs none), a pull request of {big:,} changed lines or more lacks a `Reading guide:`\
+ section in its body, or the issue's newest `**Design:**` comment has no passing design review.
 {helpers}
-1. A diagram only for a new feature, or when the owner asked for one: then it matches the\
- code and the issue's diagram comment matches it. Otherwise none is needed.
+1. No diagram work unless the owner asked for a diagram: then the issue's diagram comment\
+ shows it. The reviewer does not read diagrams.
 2. The issue has the `Use-case walkthrough:` line, and for a visible change the screenshots\
  with the `Ease of use and look:` line.
 3. Post one comment on the issue mapping each spec decision, each owner answer and the\
@@ -227,6 +240,8 @@ NOT_SMALL_TEXT = """AgentDeck: your push {short} to {pull} is not the small fix 
  show it waiting on you.
 
 """
+#: After a design gap the deck's own review start met (#4332).
+_DESIGN_GAP_NEXT = " Then ask for the review with `review-request`."
 #: The checklist's extra point when review fixes grew the diff past ``GROWTH_PERCENT`` of the
 #: previous round's (#4220, owner's choice: an agent note, not a question or a reviewer brief).
 GROWN_TEXT = """
@@ -234,20 +249,21 @@ GROWN_TEXT = """
  lines (+{percent}%). Before fixing more, post a short note on the issue: is this still the\
  right design, and which remaining findings could be left to a follow-up issue instead?"""
 #: The checklist's first point before a pull request's first review (#4437): three Haiku
-#: helpers and one Opus whole review (#4531) check the change and the coder fixes what is
+#: helpers check the change and the coder fixes what is
 #: real. Shown, and its comment checked by ``pre-review-done``, only while no review of the
 #: pull request was asked for yet. The Work brief asks to run them at the first push (#4567):
 #: a comment for an earlier head stands when the pushes since only fixed its finds, a
-#: judgement no script makes, so the coder is told when to run them again.
+#: judgement no script makes, so the coder is told when to run them again. Once a review was
+#: asked for, the command itself refuses to run (#4726, ``pre_review_helpers.review_asked``).
 HELPERS_TEXT = """
-Before these, as this pull request has had no review yet, run the helper checks:\
- `~/agentdeck/.venv/bin/agentdeck pre-review-helpers --cwd <checkout> --pull {pull}{issue}`\
- (how: below). Fix each real find and push; then post one issue\
- comment opening `Helper checks: {pull}` that lists each find as fixed, or dropped with a\
+Before these, as this pull request has had no review yet, run the helper checks: queue\
+ `~/agentdeck/.venv/bin/agentdeck pre-review-helpers --cwd . --pull {pull}{issue}` as an\
+ `agentdeck job` run in the checkout (how: below). Fix each real find and push; then post one\
+ issue comment opening `Helper checks: {pull}` that lists each find as fixed, or dropped with a\
  one-line reason, or the `Helper checks: {pull} did not run (<why>)` line the command prints.\
- Already ran them on an earlier head and posted that comment? It stands when every push\
- since changed only what its finds asked for; otherwise, or when it says `did not run`, run\
- them again on this head.
+ Already ran them on an earlier head and posted that comment? It stands when every push since\
+ changed only what its finds asked for; otherwise, or when it says `did not run`, run them again\
+ on this head.
 """
 #: Growth over this percent of the previous round's changed lines (added plus removed, the
 #: whole diff) adds ``GROWN_TEXT`` (#4220, owner's choice: 15%, against the previous round).
@@ -261,6 +277,8 @@ RETRY_MAX_S = 30 * 60.0
 #: A pending action that has not happened within this long is dropped with a warning: the
 #: person or the worker will have asked again some other way by then.
 PENDING_MAX_AGE_S = 24 * 3600.0
+#: The pending kinds of the published label (``work_published``, #4794): never aged out.
+PUBLISHED_KINDS = frozenset({"published", "published-pass"})
 #: How many times one unchanged head may be reviewed again on request (#3183); past that, the
 #: point is a person's to settle, not another reviewer run's.
 MAX_AGAIN = 2
@@ -296,6 +314,8 @@ CLOSE = "close"
 #: A design review waiting for a reviewer place (#4342), kept as ``design:<owner/repo#n>`` and
 #: tried again like a code review that found every place taken.
 DESIGN = "design"
+#: How much of ChatGPT's design verdict comment the entry keeps for telling the Work (#4722).
+DESIGN_VERDICT_CHARS = 8000
 #: How long a close waits for a merge of the Work's pull request, the usual closer, to show.
 CLOSE_HOLD_S = RETRY_FIRST_S
 #: A closing comment is quoted when its closer posted it this close to the close, cut here.
@@ -877,6 +897,105 @@ async def compared_changes(
     return changes, frozenset(renamed)
 
 
+async def _diff_lines(
+    repository: str, base: str, head: str
+) -> tuple[str, dict[str, list[str] | None]] | None:
+    """The commit where ``head`` left ``base``, and the added and removed lines, in order, of
+    each file ``head`` changes since (GitHub's three-dot compare: a pull request's own diff
+    at that head); a file whose patch GitHub left out (binary or too large) is ``None``.
+    ``None`` when unread, cut short at 300 files, or ``head`` is no longer ahead of
+    ``base``."""
+    compared = await _gh_lines(
+        repository,
+        [
+            "gh",
+            "api",
+            f"repos/{repository}/compare/{base}...{head}",
+            "--jq",
+            '"\\(.status) \\(.files | length) \\(.merge_base_commit.sha)",'
+            " (.files[] | [.filename, .patch] | @json | @base64)",
+        ],
+    )
+    status, count, left = ((compared or [""])[0].split(" ") + ["", ""])[:3]
+    # A head the base already holds (merged since) has no diff left to read: unread.
+    if status not in ("ahead", "diverged") or not count.isdigit() or int(count) >= 300:
+        return None
+    if not _SHA.fullmatch(left):
+        return None
+    patches: dict[str, list[str] | None] = {}
+    for line in compared[1:]:
+        # Base64, as a patch may hold a character the line split above cuts at (U+2028).
+        try:
+            name, patch = json.loads(base64.b64decode(line, validate=True))
+        except ValueError:
+            return None
+        if not isinstance(name, str):
+            return None
+        patches[name] = (
+            [row for row in patch.split("\n") if row[:1] in ("+", "-")]
+            if isinstance(patch, str)
+            else None
+        )
+    return left, patches
+
+
+_SHA = re.compile(r"[0-9a-f]{40}")
+
+
+async def own_changes(
+    repository: str, number: int, old: str, new: str, sizes: Mapping[str, int]
+) -> int | None:
+    """How many lines the fix itself changed from ``old`` to ``new`` in the files of
+    ``sizes`` (each with its plain count of lines changed between the two heads), leaving
+    out what a base merge brought into them (#4743). Per file, the larger of two counts:
+
+    - the pull request's own diff against the base at each head, its added and removed
+      lines compared in order: a line the fix adds, drops or rewrites counts, and so does
+      what a merge's conflict resolution carries;
+    - the plain count less the lines the base itself changed in that file between the two
+      commits where the heads left it. The first count alone reads a block of the pull
+      request's own lines moved past unchanged code as nothing, as its lines keep their
+      order (#4744 review); here it is the block removed and added.
+
+    ``None`` when anything is unread (a file whose patch GitHub left out included): the
+    caller then keeps the plain count, which is never smaller for want of a read."""
+    import difflib
+
+    base = await _gh_lines(
+        repository, ["gh", "api", f"repos/{repository}/pulls/{number}", "--jq", ".base.ref"]
+    )
+    if not base or not base[0].strip():
+        return None
+    ref = base[0].strip()
+    read_was = await _diff_lines(repository, ref, old)
+    read_now = await _diff_lines(repository, ref, new) if read_was is not None else None
+    if read_was is None or read_now is None:
+        return None
+    (left_was, was), (left_now, now) = read_was, read_now
+    merged: Mapping[str, int] = {}
+    if left_was != left_now:
+        # What the base changed between the two commits the heads left it at. A file it
+        # renamed is listed under its new name, so nothing is taken off the old one.
+        base_changes = await compared_changes(repository, left_was, left_now)
+        if base_changes is None:
+            return None
+        merged = base_changes[0]
+    lines = 0
+    for name, plain in sizes.items():
+        # A file absent from a diff has no line of its own there; one without a patch is unread.
+        before, after = was.get(name, []), now.get(name, [])
+        if before is None or after is None:
+            return None
+        same = sum(
+            block.size
+            for block in difflib.SequenceMatcher(
+                None, before, after, autojunk=False
+            ).get_matching_blocks()
+        )
+        lines += max(len(before) + len(after) - 2 * same, plain - merged.get(name, 0))
+    return lines
+
+
 async def pull_files(repository: str, number: int) -> set[str] | None:
     """The files of a pull request's diff, renames under both names; ``None`` when unread."""
     files = await _gh_lines(
@@ -956,6 +1075,78 @@ async def ship_merge_between(repository: str, number: int, old: str, new: str) -
         return False
     after = await _code_diffs(repository, ref, new)
     return after is not None and after == before
+
+
+#: How many base commits new to the branch ``same_files_merge`` reads.
+SAME_FILES_COMMITS = 10
+
+
+async def same_files_merge(repository: str, number: int, old: str, new: str) -> bool:
+    """Whether ``new`` is one merge of the base into ``old`` that left every file as it was
+    (#4635): the proof a person's Merge press stands across it, though the pull request's
+    diff shrank because a pull request it was built on merged first.
+
+    The same tree is not enough: a merge that threw the base's changes away (``-s ours``)
+    keeps it too, and would land a revert nobody saw. So no base change may be undone either.
+    The merged base commit must be on the base branch, and no base commit new to ``old`` may
+    itself change a file ``new`` holds differently from the base. A merge commit changes only
+    what it took from none of its parents. Reading each commit, not one merge base, matters:
+    a stack has several, and an old one can hide a revert the base made since. Anything
+    unread, cut short or not plainly so is ``False``: a new press is needed.
+    """
+    old, new = old.lower(), new.lower()
+    if not all(re.fullmatch(r"[0-9a-f]{40}", sha) for sha in (old, new)) or old == new:
+        return False
+
+    async def commit(sha: str) -> list[str]:
+        argv = ["gh", "api", f"repos/{repository}/git/commits/{sha}"]
+        lines = await _gh_lines(repository, [*argv, "--jq", ".tree.sha, .parents[].sha"])
+        return [line.strip().lower() for line in lines or ()]
+
+    merged, before = await commit(new), await commit(old)
+    if len(merged) != 3 or not before or merged[0] != before[0] or merged[1] != old:
+        return False  # unread, other files, or not one merge of two commits on top of ``old``
+    base = merged[2]
+    pull = ["gh", "api", f"repos/{repository}/pulls/{number}", "--jq", ".base.ref"]
+    ref = ((await _gh_lines(repository, pull)) or [""])[0].strip()
+    if not ref:
+        return False
+    on_base = await _gh_lines(
+        repository,
+        ["gh", "api", f"repos/{repository}/compare/{ref}...{base}", "--jq", ".ahead_by"],
+    )
+    if [line.strip() for line in on_base or ()] != ["0"]:
+        return False  # not a commit of the base branch
+    differs = await compared_files(repository, base, new)
+    if differs is None:
+        return False
+    rows = await _gh_lines(
+        repository,
+        [
+            "gh",
+            "api",
+            f"repos/{repository}/compare/{old}...{base}",
+            "--jq",
+            '"\\(.total_commits)", (.commits[] | [.sha, .parents[].sha] | join(" "))',
+        ],
+    )
+    if not rows or rows[0].strip() != str(len(rows) - 1):
+        return False  # unread, or GitHub listed only some of the commits
+    commits = [row.lower().split() for row in rows[1:]]
+    if not 0 < len(commits) <= SAME_FILES_COMMITS:
+        return False
+    for sha, *parents in commits:
+        if not parents:
+            return False
+        own: set[str] | None = None
+        for parent in parents:
+            changed = await compared_files(repository, parent, sha)
+            if changed is None:
+                return False
+            own = set(changed) if own is None else own & changed
+        if own & differs:
+            return False  # the base's own change to it is not in ``new``
+    return True
 
 
 async def _code_diffs(repository: str, base: str, head: str) -> dict[str, str] | None:
@@ -1114,7 +1305,14 @@ async def _minor_between(
     anything else, or anything unread, is reviewed, its reason appended to ``why`` (#4575)."""
     from .work_release import is_doc_path
 
-    compared = await compared_changes(repository, old, new)
+    # Code lines without whole-line comments, counted locally when a checkout here holds both
+    # heads and ``new`` descends from ``old`` (#4812); GitHub's compare, ahead only, otherwise.
+    local = await code_lines.COUNTER.count(repository, old, new, ancestor=True)
+    compared = (
+        (local.sizes(), local.renamed)
+        if local is not None
+        else await compared_changes(repository, old, new)
+    )
     if compared is None:
         why.append(_UNREAD_COMPARISON)
         return False
@@ -1153,11 +1351,23 @@ async def _minor_between(
             )
             return False
     if lines > MINOR_LINES:
-        why.append(
-            f"it changes {lines} lines of code (added plus removed) in files the pull request"
-            f" already had, over the limit of {MINOR_LINES}"
-        )
-        return False
+        # Lines a base merge brought into files of the diff are not the fix (#4743): count
+        # again by what changed in the pull request's own diff.
+        counted = {
+            name: size
+            for name, size in changes.items()
+            if not _free_in_minor_fix(name) and name in before
+        }
+        own = await own_changes(repository, number, old, new, counted)
+        merged = ""
+        if own is not None and own < lines:
+            lines, merged = own, ", not counting lines merged in from the base branch"
+        if lines > MINOR_LINES:
+            why.append(
+                f"it changes {lines} lines of code (added plus removed) in files the pull"
+                f" request already had{merged}, over the limit of {MINOR_LINES}"
+            )
+            return False
     return True
 
 
@@ -1266,16 +1476,19 @@ class PendingActions:
     def __contains__(self, key: str) -> bool:
         return key in self.entries
 
-    def put(self, key: str, fields: dict, now: float) -> None:
-        """Write an action down as pending, or push its next attempt back if it already is."""
+    def put(self, key: str, fields: dict, now: float, *, at: float | None = None) -> None:
+        """Write an action down as pending, or push its next attempt back if it already is.
+        ``at`` names the next attempt's time itself, leaving the growing wait as it was: a
+        wait with a deadline of its own (#4722)."""
         with self._file.locked():
             entry = dict(self.entries.get(key) or {"since": now, "attempts": 0})
             entry.update(fields)
             entry["attempts"] = int(entry.get("attempts", 0)) + 1
-            backoff = Backoff(first=RETRY_FIRST_S, cap=RETRY_MAX_S)
-            backoff.next_s = float(entry.get("delay", 0.0))
-            entry["delay"] = backoff.failed()
-            entry["next_at"] = now + entry["delay"]
+            if at is None:
+                backoff = Backoff(first=RETRY_FIRST_S, cap=RETRY_MAX_S)
+                backoff.next_s = float(entry.get("delay", 0.0))
+                entry["delay"] = backoff.failed()
+            entry["next_at"] = now + entry["delay"] if at is None else at
             self._save({**self.entries, key: entry})
 
     def hurry(self, prefixes: Iterable[str], now: float) -> list[str]:
@@ -1477,10 +1690,17 @@ class WorkRouterService:
         ship_runs: ShipRuns | None = None,
         pending_note: Callable[[str, str, str], bool] | None = None,
         design: design_review.DesignRound | None = None,
+        design_chat: design_review.ChatRoute | None = None,
         light: object | None = None,
         close_review: Callable[..., Awaitable[object]] | None = None,
+        published: object | None = None,
+        works_of_pull: Callable[[str, int], Iterable[str]] = lambda repository, number: (),
     ) -> None:
         self._enabled = bool(enabled)
+        # The published label on a Work's issue (#4794, ``work_published.PublishedLabels``);
+        # ``None`` labels nothing. ``works_of_pull`` names the Works that registered one.
+        self._published = published
+        self._works_of_pull = works_of_pull
         # ``(work, pull, head, settled, reason)``: close the Work's review chat once the one
         # pull request it waits on passed after a late minor verdict (#4474); ``None`` closes
         # nothing, and that chat's own verdict decides.
@@ -1489,6 +1709,15 @@ class WorkRouterService:
         self._light = light
         # A big Work's design review (#4332); ``None`` refuses each ask.
         self._design = design
+        # ChatGPT as the design reviewer (#4722); ``None`` asks the deck's own every time.
+        self._design_chat = design_chat
+        # The design chats this process is opening right now, as (key, design comment, asked
+        # at): a retry try never takes one of them for a chat that failed to open.
+        self._design_opening: set[tuple] = set()
+        # One run at a time of whatever finishes or replaces a design's pending entry
+        # (#4722): taken once on each path (the ask, the retry, the verdict comment), and
+        # ``_finish_design_verdict`` runs under it without taking it.
+        self._design_locks: dict[str, asyncio.Lock] = {}
         # (chat id, note id, text): a pending note for the chat's next message, waking nothing
         # (#4306): a pass carried over a base merge is told that way.
         self._pending_note = pending_note
@@ -1630,6 +1859,7 @@ class WorkRouterService:
         #: end time, so a web that dies mid-filing cannot hold starts for ever.
         self.filing_holds: Callable[[str], bool] = lambda repository: False
         self._checks: set[asyncio.Task] = set()
+        self._published_task: asyncio.Task | None = None
         #: Pull requests a ``gh pr ready`` is waiting on right now (``ready_press``): a
         #: checklist made for one while it waits goes into its reply, not to the chat (#4253).
         #: A waiting ``gh pr ready``'s claim per pull request: the chat that pressed, and the
@@ -1666,6 +1896,8 @@ class WorkRouterService:
     async def stop(self) -> None:
         for check in list(self._checks):
             check.cancel()
+        if self._published_task is not None:
+            self._published_task.cancel()
         for name in ("_retry_task", "_sweep_task"):
             loop_task = getattr(self, name)
             setattr(self, name, None)
@@ -1718,6 +1950,7 @@ class WorkRouterService:
         ``PendingActions.changed``, and a new or rescheduled action wakes it to re-plan.
         """
         failures = Backoff()
+        self._check_published()
         if self.reviewer_off:
             try:
                 await self.settle_without_reviewer()
@@ -1941,8 +2174,15 @@ class WorkRouterService:
                     and self._starred(item[0].removeprefix(f"{START}:"))
                 )
             )
+        published = [(key, entry) for key, entry in due if entry.get("kind") in PUBLISHED_KINDS]
+        if published:
+            # Kept until a sync settles it, however long that takes, and run beside this
+            # loop, so a slow GitHub read holds up no other action (#4794).
+            self._start_published(published, now)
         for key, entry in due:
-            if now - float(entry.get("since", now)) > PENDING_MAX_AGE_S:
+            if entry.get("kind") in PUBLISHED_KINDS:
+                continue
+            elif now - float(entry.get("since", now)) > PENDING_MAX_AGE_S:
                 log.warning("work-router: dropping %s, still not done after a day", key)
                 self.pending.discard(key)
             elif entry.get("kind") == MESSAGE:
@@ -1970,6 +2210,76 @@ class WorkRouterService:
                 # Tried and neither done nor rescheduled (a start already in flight): push
                 # it back, so the deadline loop never spins on it.
                 self.pending.put(key, {}, self._clock())
+
+    def _start_published(self, due: list[tuple[str, dict]], now: float) -> None:
+        """Hand the due published-label entries to one task, or, while one runs, look at
+        them again a few seconds on. Either way each moves its ``next_at`` past ``now``, so
+        the deadline loop never spins on them; a sync then ends or re-arms its own."""
+        from . import work_published
+
+        running = self._published_task is not None and not self._published_task.done()
+        for key, _ in due:
+            with self.pending._file.locked():  # noqa: SLF001 - only an entry still there
+                if key in self.pending.entries:
+                    self.pending.put(key, {}, now, at=now + work_published.LOCK_WAIT_S)
+        if running:
+            return
+        self._published_task = asyncio.create_task(
+            self._run_published(due), name="work-router-published"
+        )
+
+    async def _run_published(self, due: list[tuple[str, dict]]) -> None:
+        for key, entry in due:
+            try:
+                await self._retry_published(key, entry)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - logged; this entry backs off, the rest run
+                log.warning("work-router: published label sync %s failed", key, exc_info=True)
+                with contextlib.suppress(Exception):
+                    self.pending.put(key, {}, self._clock())
+
+    async def _retry_published(self, key: str, entry: dict) -> None:
+        from . import work_published
+
+        published = self._published
+        if not isinstance(published, work_published.PublishedLabels):
+            self.pending.discard(key)
+        elif entry.get("kind") == work_published.PASS:
+            await published.run_pass(self.pending, key, entry)
+        else:
+            await published.sync(self.pending, key, entry)
+
+    def _check_published(self) -> None:
+        """Reconcile a repository whose published label was turned on or changed (#4794)."""
+        if self._published is None:
+            return
+        try:
+            self._published.check_settings(self.pending)
+        except Exception:  # noqa: BLE001 - logged; the next batch looks again
+            log.warning("work-router: published label settings not checked", exc_info=True)
+
+    def _note_published(self, delivery: Delivery) -> None:
+        """A registered pull request closed or reopened, in a switched repository or not: its
+        Works' labels are synced (#4794). Written to the pending file before the delivery's
+        offset is committed; an unread registration or a failed write raises."""
+        if self._published is None or delivery.event != "pull_request":
+            return
+        if _text(delivery.payload.get("action")) not in {"closed", "reopened"}:
+            return
+        pull = delivery.payload.get("pull_request")
+        number = pull.get("number") if isinstance(pull, dict) else None
+        if not isinstance(number, int):
+            return
+        from . import work_published
+
+        works = list(self._works_of_pull(delivery.stream.lower(), number))
+        if works:
+            work_published.request_into(self.pending, works, self._clock(), strict=True)
+
+    def note_published(self) -> None:
+        """Another process wrote a published-label intent (#4794): the retry loop re-plans."""
+        self.pending.changed.set()
 
     async def _retry_start(self, key: str, entry: dict) -> None:
         repository = str(entry.get("repository") or "").lower()
@@ -2016,23 +2326,151 @@ class WorkRouterService:
                     return
                 head, again = current, ""
                 entry = {}
+        pull = f"{repository}#{number}"
+        # The agent's own request: no pass that was only carried here answers it (#4658).
+        own = bool(entry.get("asked") or again) and not again.startswith(NO_VERDICT)
         if (
             entry
-            and not self._carry_unfinished(f"{repository}#{number}", head)
-            and self._passed_since(f"{repository}#{number}", head, entry.get("since"))
+            and not self._carry_unfinished(pull, head)
+            and self._passed_since(pull, head, entry.get("since"))
+            and not (own and self._carried_pass(pull, head))
+            and not (entry.get("request") and self._fix_pass(pull, head))
         ):
             # Kept while another review of this head ran, which then passed it (#3324): a
             # review now would only re-open a release that already waits for a person's Merge.
             log.info("work-router: %s passed since it was asked for; not reviewed", key)
+            if not again and self._carried_pass(pull, head):
+                self._stop_on_carried(owner, pull, head)
             self.pending.discard(key)
             return
-        note = str(entry.get("note") or "") if again else ""
+        if entry.get("request") and not self._request_due(key, entry, owner, pull, head):
+            return
+        if entry.get("request") and not self._spent(pull, head):
+            # The start it came in on ended without asking: it is the head's first review.
+            fields = {"kind": REVIEW, "repository": repository, "number": number, "head": head}
+            fields.update(asked=True, note=str(entry.get("note") or ""))
+            self.pending.put(f"review:{pull}@{head}", fields, self._clock())
+            self.pending.discard(key)
+            again = ""
+        note = str(entry.get("note") or "") if again or entry.get("asked") else ""
         # Only the agent's own request reviews a diff an earlier head's review read (#3314).
         await self._review(
             owner,
             Event(REVIEW, repository, number, True, head=head, again=again, note=note),
             asked=bool(entry.get("asked")),
         )
+        if not own or not entry.get("asked"):
+            return
+        # A pass that came meanwhile may have ended the chat's wait (#4658): the review now
+        # asked for has one, and one no longer coming has none. Still pending, it is left as
+        # it is: renewed at every retry, its timeout would never tell the chat.
+        since = float(entry.get("since") or 0)
+        if any(
+            event.kind == review_history.ASKED and event.at >= since
+            for event in review_history.at_head(self._history(pull), head)
+        ):
+            self._wait_on_review(owner, pull, asked=True)
+        elif not any(at.startswith(f"review:{pull}@{head}") for at in self.pending.entries):
+            self._end_wait(owner, pull, head)
+
+    def _requests(self, pull: str, head: str) -> list[str]:
+        """The pending keys of the agent's own requests kept for ``head`` (``_keep_request``)."""
+        prefix = f"review:{pull}@{head}+"
+        return [
+            key
+            for key, entry in self.pending.entries.items()
+            if key.startswith(prefix) and entry.get("request")
+        ]
+
+    def _keep_request(self, pull: str, head: str, note: str) -> None:
+        """Keep the agent's own review request, made while an automatic start of ``head`` ran
+        or waited, as a pending row of its own (#4658): that start may end without asking (a
+        carried pass, a checklist, a busy reviewer), and the request must outlive it. The
+        start's ``asked`` row meets it (``_note_asked``). One row per head, the last note."""
+        repository, _, number = pull.rpartition("#")
+        held = self._requests(pull, head)
+        again = held[0].rpartition("+")[2] if held else secrets.token_hex(6)
+        fields = {"kind": REVIEW, "repository": repository, "number": int(number), "head": head}
+        if not note.strip() and held:
+            note = str(self.pending.entries[held[0]].get("note") or "")
+        fields.update(again=again, note=note, asked=True, request=True)
+        self.pending.put(f"review:{pull}@{head}+{again}", fields, self._clock())
+
+    def _request_due(self, key: str, entry: dict, owner: Owner, pull: str, head: str) -> bool:
+        """Whether a kept request is to be asked now: not while a start of its head runs, nor
+        once one asked after it, nor past the ask-again cap, which its chat is told."""
+        if f"{pull}@{head}" in self._in_flight:
+            self.pending.put(key, {}, self._clock())
+            return False
+        since = float(entry.get("since") or 0)
+        asks = [
+            event
+            for event in review_history.at_head(self._history(pull), head)
+            if event.kind == review_history.ASKED
+        ]
+        if any(event.at >= since for event in asks):
+            self.pending.discard(key)
+            return False
+        repository, _, number = pull.rpartition("#")
+        why = ""
+        if self._spent(pull, head) and not str(entry.get("note") or "").strip():
+            # As ``ask_again`` refuses one (#3344).
+            why = f"{pull} at {head[:12]} has its verdict, and the request had no note"
+        elif self._spent(pull, head) and self._again_count(pull, head) >= MAX_AGAIN:
+            why = _cap_refusal(repository, int(number), head, False)
+        if why:
+            if owner[0]:
+                now = datetime.now(UTC)
+                self._deliver(
+                    ScheduledMessage(
+                        id=f"work-event:request-refused:{key.removeprefix('review:')}",
+                        chat_id=owner[0],
+                        text=f"AgentDeck: the review you asked for did not start: {why}.",
+                        due_at=now,
+                        created_at=now,
+                    )
+                )
+            self._end_wait(owner, pull, head, refused=True)
+            self.pending.discard(key)
+            return False
+        return True
+
+    def _end_wait(self, owner: Owner, pull: str, head: str, *, refused: bool = False) -> None:
+        """End the chat's wait on ``pull``'s verdict quietly: none is coming. Not while the
+        agent's own request for ``head`` is kept, whose review the wait is for, unless that
+        request is the one ``refused``."""
+        if not refused and self._requests(pull, head):
+            return
+        if owner[0] and self._on_verdict is not None:
+            with contextlib.suppress(Exception):
+                self._on_verdict(owner[0], [pull])
+
+    def _carried_pass(self, pull: str, head: str) -> bool:
+        """Whether the pass standing at ``head`` was carried to it from an earlier head."""
+        events = review_history.at_head(self._history(pull), head)
+        verdict = review_history.standing_verdict(events)
+        return review_history.passed(verdict) and verdict.key.startswith("carried:")
+
+    def _stop_on_carried(self, owner: Owner, pull: str, head: str) -> None:
+        """Every path that starts no review because a carried pass stands at ``head`` ends here
+        (#4658): the running start, its retry, a replay or a repeated ready press. The chat's
+        wait ends before the pending row goes, so a crash between leaves the retry to do both
+        again."""
+        pending_key = f"review:{pull}@{head}"
+        entry = self.pending.entries.get(pending_key) or {}
+        if entry.get("asked") and self._unasked_verdict(pull, head):
+            # The row is the agent's own first request, kept for a busy reviewer: it is still
+            # asked, whichever path met the carried pass.
+            self._keep_request(pull, head, str(entry.get("note") or ""))
+            self.pending.discard(pending_key)
+            return
+        if self._carry_unfinished(pull, head):
+            self._carried_told(owner, pull, head)
+            return
+        if self._newest_waited(pull, head):
+            self._end_wait(owner, pull, head)
+        self.pending.discard(pending_key)
+        log.info("work-router: %s@%s has a carried pass; not reviewed", pull, head[:12])
 
     def _passed_since(self, pull: str, head: str, since: object) -> bool:
         """Whether ``pull``'s pass at ``head`` stands, dated ``since`` or later (#3324)."""
@@ -2068,7 +2506,13 @@ class WorkRouterService:
 
     async def apply(self, batch: Iterable[Delivery]) -> None:
         """Send every message and start every review this batch asks for, each once."""
+        batch = list(batch)
+        # First, before any act: a failed write raises, so the batch is not committed and is
+        # read again with nothing done twice (#4794 review).
+        for delivery in batch:
+            self._note_published(delivery)
         own = self.own_logins()
+        self._check_published()
         for delivery in batch:
             if self._check is not None and delivery.stream.lower() == self._chat_repository:
                 try:
@@ -2090,6 +2534,18 @@ class WorkRouterService:
                     log.warning(
                         "work-router: release of %s failed", delivery.delivery_id, exc_info=True
                     )
+            try:
+                settled = await self._observe_design(delivery) or settled
+            except Exception:  # noqa: BLE001 - a design hiccup must not stop routing
+                log.warning(
+                    "work-router: design verdict of %s failed", delivery.delivery_id, exc_info=True
+                )
+            try:
+                self._observe_design_comment(delivery)
+            except Exception:  # noqa: BLE001 - a design hiccup must not stop routing
+                log.warning(
+                    "work-router: design comment of %s failed", delivery.delivery_id, exc_info=True
+                )
             if self._check is not None:
                 try:
                     settled = await self._observe_check(delivery) or settled
@@ -3760,16 +4216,19 @@ class WorkRouterService:
                 " starts on its own once the open review chat closes; keep waiting for its"
                 " verdict"
             )
-        asks = [
-            event
-            for event in review_history.at_head(self._history(f"{repository}#{number}"), head)
-            if event.kind == review_history.ASKED
-            and str(event.data.get("again") or "")
-            and bool(event.data.get("no_verdict")) == no_verdict
-        ]
-        if len(asks) >= (MAX_NO_VERDICT if no_verdict else MAX_AGAIN):
+        asked = self._again_count(f"{repository}#{number}", head, no_verdict=no_verdict)
+        if asked >= (MAX_NO_VERDICT if no_verdict else MAX_AGAIN):
             return _cap_refusal(repository, number, head, no_verdict)
         return ""
+
+    def _again_count(self, pull: str, head: str, *, no_verdict: bool = False) -> int:
+        """How many reviews of ``head`` were asked for again, of the kind ``no_verdict`` says."""
+        return sum(
+            event.kind == review_history.ASKED
+            and bool(str(event.data.get("again") or ""))
+            and bool(event.data.get("no_verdict")) == no_verdict
+            for event in review_history.at_head(self._history(pull), head)
+        )
 
     async def _ready_again(
         self, delivery: Delivery, owner: Owner, repository: str, number: int, head: str
@@ -3794,8 +4253,12 @@ class WorkRouterService:
             # The head already passed (#3341): there is nothing to ask again, and nothing for
             # the chat to do, so it is not woken to read so (#4253).
             log.info("work-router: %s marked ready again; it already has a review pass", at)
+            if self._carried_pass(pull, head):
+                self._stop_on_carried(owner, pull, head)
             return
-        if review_history.answered(self._history(pull), head):
+        # A verdict a newer ask came after is not standing: that review is awaited, and the
+        # verdict before it may have been a pass (#4658).
+        if self._has_verdict(pull, head):
             self._send_refusal(
                 delivery,
                 owner,
@@ -3953,6 +4416,12 @@ class WorkRouterService:
                 f"{pull} at {head[:12]} has its verdict, so no review is missing: read it in"
                 " this chat or on the Work page, and do not ask a person about this refusal"
             )
+        key = f"{pull}@{head}"
+        running = key in self._in_flight or f"review:{key}" in self.pending
+        # A kept request left alone, its start ended, takes the newer note too (#4658).
+        running = running or bool(self._requests(pull, head))
+        if running and not no_verdict:
+            self._keep_request(pull, head, note)
         why = self._again_refusal(repository, number, head, no_verdict=no_verdict)
         if why and no_verdict and self._hand_closed_to_owner(pull, head, note):
             raise AgainRefused(
@@ -3988,7 +4457,9 @@ class WorkRouterService:
             "pull_request": pull,
             "head": head,
             "again": bool(again),
-            "outcome": "asked" if self._spent(pull, head, again) else "pending",
+            "outcome": "pending"
+            if self._requests(pull, head) or not self._spent(pull, head, again)
+            else "asked",
         }
 
     async def _note_answered(
@@ -4936,6 +5407,13 @@ class WorkRouterService:
             proven = await self._proven(self._ship_merge, repository, int(number), before, head)
         if not proven:
             return digest
+        # Read again after the last wait, with none before the row is written: a review asked
+        # for, or a newer verdict, meanwhile leaves nothing to carry (#4658).
+        events = self._history(pull)
+        fresh = review_history.standing_verdict(review_history.at_head(events, before))
+        moved = review_history.last_digest(events) != (before, known)
+        if moved or fresh is None or fresh.key != verdict.key or self._spent(pull, head):
+            return digest
         key = f"{pull}@{head}"
         # Kept pending until the chat is told, so a crash between the row and the telling is
         # finished by the retry (#4576 design): the row alone spends the head.
@@ -4986,9 +5464,7 @@ class WorkRouterService:
             # A pass (or one the owner accepted) carries over and nothing is left for the chat
             # to do (#4253): its wait on a verdict ends quietly, and the release merges or
             # offers Merge as for any pass.
-            if self._on_verdict is not None:
-                with contextlib.suppress(Exception):
-                    self._on_verdict(owner[0], [pull])
+            self._end_wait(owner, pull, head)
             shipped = review_history.ship_pass_head(self._history(pull), head)
             if shipped:
                 text = (
@@ -5026,10 +5502,9 @@ class WorkRouterService:
                 created_at=now,
             )
         )
-        if delivered and self._on_verdict is not None:
+        if delivered:
             # No verdict will come for this head, so the chat's wait on one ends here.
-            with contextlib.suppress(Exception):
-                self._on_verdict(owner[0], [pull])
+            self._end_wait(owner, pull, head)
         self.pending.discard(f"review:{key}")
         log.info("work-router: %s has %s's diff; not reviewed again", key, before[:12])
 
@@ -5133,7 +5608,14 @@ class WorkRouterService:
         key = f"{pull}@{event.head}" + (f"+{event.again}" if event.again else "")
         pending_key = f"review:{key}"
         if self._spent(pull, event.head, event.again):
-            if not event.again and self._carry_unfinished(pull, event.head):
+            if not event.again and asked and self._unasked_verdict(pull, event.head):
+                # The agent's own request met a verdict carried here as it came in (#4658).
+                self._keep_request(pull, event.head, event.note)
+                self.pending.discard(pending_key)
+                return
+            if not event.again and self._carried_pass(pull, event.head):
+                self._stop_on_carried(owner, pull, event.head)
+            elif not event.again and self._carry_unfinished(pull, event.head):
                 # The carried row was written and the router stopped before the chat heard
                 # (#4576 design): finish that hand-off, with the same ids, never a review.
                 self._carried_told(owner, pull, event.head)
@@ -5158,6 +5640,9 @@ class WorkRouterService:
             log.info("work-router: %s has its verdict; no-verdict ask dropped", key)
             return
         if key in self._in_flight:
+            if asked and not event.again and pending_key not in self.pending:
+                # That start may end without asking, as ``ask_again`` says (#4658).
+                self._keep_request(pull, event.head, event.note)
             return
         # A pass a late minor or no-code verdict makes while this start runs ends it (#4474);
         # one that stood before it began, or a review asked again, does not.
@@ -5180,6 +5665,13 @@ class WorkRouterService:
                 digest = await self._unchanged(owner, pull, event.head, skip=not asked)
                 if not digest and self._spent(pull, event.head):
                     return
+            # A pass the release carried to this head while the start ran (#4658): an ask
+            # over it would void it, and a checklist would hold a head that passed.
+            overtaken = not event.again and not asked
+            if overtaken and self._carried_pass(pull, event.head):
+                settle = False  # no chat was opened for this head: nothing to close
+                self._stop_on_carried(owner, pull, event.head)
+                return
             if (
                 self.pre_review_on
                 and owner[0]
@@ -5191,6 +5683,10 @@ class WorkRouterService:
             ):
                 return
             missing = await self._design_gap(owner)
+            if overtaken and self._carried_pass(pull, event.head):
+                settle = False
+                self._stop_on_carried(owner, pull, event.head)
+                return
             if missing:
                 # Every start passes here, a review request and a retry too (#4332 review).
                 self.pending.discard(pending_key)
@@ -5201,20 +5697,25 @@ class WorkRouterService:
             self._in_flight.discard(key)
             # A reason no checklist took (pre-review off, a checklist already waiting) goes.
             self._not_small.pop(f"{pull.lower()}@{event.head.lower()}", None)
-            if settle and self._fix_pass(pull, event.head):
+            if settle and self._overtaken(pull, event.head, asked=asked):
                 await self._close_settled(owner, pull, event.head)
 
     def _carry_unfinished(self, pull: str, head: str) -> bool:
         """Whether ``head``'s standing verdict is a carried one whose hand-off to the chat did
         not finish: its start is still pending, which the hand-off drops last, and ``head`` is
-        still the newest head of ``pull``'s history, so ending the chat's waits on ``pull``
-        (not kept per head) cannot end a newer head's (#4576 design review)."""
+        still the newest (``_newest_waited``)."""
         if f"review:{pull}@{head}" not in self.pending:
             return False
         events = self._history(pull)
         verdict = review_history.standing_verdict(review_history.at_head(events, head))
         if verdict is None or not verdict.key.startswith("carried:"):
             return False
+        return self._newest_waited(pull, head)
+
+    def _newest_waited(self, pull: str, head: str) -> bool:
+        """Whether ``head`` is the newest head of ``pull`` a chat can wait on, so ending its
+        waits on ``pull`` (not kept per head) cannot end a newer head's (#4576 design review)."""
+        events = self._history(pull)
         # A chat waits on a head once its review is asked for or a pass carried to it; a late
         # row at an older head (a verdict, an unstarted note) starts no wait.
         waits = [
@@ -5239,7 +5740,7 @@ class WorkRouterService:
             "head": event.head,
         }
         if asked:
-            retry["asked"] = True
+            retry.update(asked=True, note=event.note)
         if event.again:
             retry.update(again=event.again, note=event.note)
         self.pending.put(pending_key, retry, self._clock())
@@ -5257,6 +5758,19 @@ class WorkRouterService:
             and verdict.key.startswith(("minor-fixed:", "no-code-fixed:"))
         )
 
+    def _overtaken(self, pull: str, head: str, *, asked: bool) -> bool:
+        """Whether a pass that needs no review came to ``head`` while its review started: a
+        late verdict's fix (#4474), or one carried, which the agent's own request outranks
+        (#4658)."""
+        return self._fix_pass(pull, head) or (not asked and self._carried_pass(pull, head))
+
+    def _unasked_verdict(self, pull: str, head: str) -> bool:
+        """Whether a verdict stands at ``head`` though no review was ever asked for there."""
+        return self._has_verdict(pull, head) and not any(
+            event.kind == review_history.ASKED
+            for event in review_history.at_head(self._history(pull), head)
+        )
+
     async def _close_settled(self, owner: Owner, pull: str, head: str) -> None:
         """Close the Work's review chat that waits only on ``pull`` at ``head``, which passed
         with no new review after a late minor or no-code verdict (#4474). A chat that still
@@ -5269,9 +5783,14 @@ class WorkRouterService:
             events = review_history.at_head(self._history(ref.lower()), sha)
             return review_history.passed(review_history.standing_verdict(events))
 
+        why = (
+            "only its base branch changed since a commit that passed"
+            if self._carried_pass(pull, head)
+            else "the review before it asked only for minor fixes, and the fix stayed within the"
+            " limit"
+        )
         reason = (
-            f"{pull} at {head[:12]} passed without a second review: the review before it asked"
-            " only for minor fixes, and the fix stayed within the limit. Nothing else in this"
+            f"{pull} at {head[:12]} passed without a second review: {why}. Nothing else in this"
             " chat waits on a review."
         )
         try:
@@ -5329,6 +5848,8 @@ class WorkRouterService:
             self._say_not_small(owner, pull, event.head)
             return settled
         grown = await self._growth(pull, event)
+        if not event.again and self._carried_pass(pull, event.head):
+            return False  # passed during the read (#4658): the start stops on it, unheld
         # The read let other work run, which may have sent a checklist or cleared this head.
         settled = self._checklist_settled(pull, event, again=again)
         if settled is not None:
@@ -5348,6 +5869,7 @@ class WorkRouterService:
             grown=grown,
             helpers=helpers,
             how=PRE_REVIEW_HOW,
+            big=review_paperwork.BIG_PULL_LINES,
         )
         message_id = f"work-event:pre-review:{pull}@{event.head}"
         caller, claim = self._printing.get(pull) or ("", None)
@@ -5500,6 +6022,18 @@ class WorkRouterService:
                 " mark it ready with `gh pr ready`, then call this again"
             )
         key = f"{pull}@{head}"
+        if self._requests(pull, head) and self._has_verdict(pull, head):
+            # Its own request is still to be asked, over the verdict carried here (#4658).
+            waits = self._wait_on_review(owner, pull, asked=True)
+            return {
+                "pull_request": pull,
+                "head": head,
+                "outcome": "pending",
+                "waiting": bool(waits),
+            }
+        if self._carried_pass(pull, head):
+            # Carried here before the checklist was done: no verdict is coming (#4658).
+            return {"pull_request": pull, "head": head, "outcome": "not reviewed"}
         if self._spent(pull, head):
             # The agent's own review request asked first (#3933), and its ask ended the hold.
             raise AgainRefused(
@@ -5511,6 +6045,12 @@ class WorkRouterService:
         gaps += await self._verification_gaps(repository, _work_id(owner), head)
         missing = await self._design_gap(owner)
         gaps += [missing] if missing else []
+        if gaps == [design_review.WAITING_GAP]:
+            # Only the design review it already asked for holds it (#4781): nothing to fix.
+            raise AgainRefused(
+                f"{pull} at {head[:12]} gets no code review yet, so its review did not start:"
+                f" {missing}."
+            )
         if gaps:
             listed = "\n".join(f"{n}. {gap}" for n, gap in enumerate(gaps, 1))
             raise AgainRefused(
@@ -5536,7 +6076,12 @@ class WorkRouterService:
                     "next": LIGHT_NEXT_TEXT.format(pull=pull, head=head[:12]),
                 }
         await self._review(owner, Event(REVIEW, repository, number, True, head=head))
-        if self._spent(pull, head):
+        if self._requests(pull, head):
+            outcome = "pending"
+        elif self._has_verdict(pull, head):
+            # Its wait would be for a verdict that never comes (#4658).
+            return {"pull_request": pull, "head": head, "outcome": "not reviewed"}
+        elif self._spent(pull, head):
             outcome = "asked"
         elif f"review:{key}" in self.pending or key in self._in_flight:
             # In flight: another call (the ready event, or one just before) is starting this
@@ -5548,17 +6093,34 @@ class WorkRouterService:
         waits = self._wait_on_review(owner, pull, asked=True)
         return {"pull_request": pull, "head": head, "outcome": outcome, "waiting": bool(waits)}
 
-    async def design_review(self, issue: str, checkout: str = "") -> dict:
+    async def design_review(self, issue: str, checkout: str = "", owner: str = "") -> dict:
         """Start the design review of ``issue`` (#4332, ``DesignRound.ask``); a refusal is
         ``{"refused": why, "status": http status}``. With every reviewer place taken it is
         kept and tried again like a code review (#4342): ``{"queued": True, ...}``; asked again
-        while it waits, the same answer, and nothing added."""
+        while it waits, the same answer, and nothing added. With ChatGPT as the code reviewer
+        it is asked of ChatGPT first (#4722, ``_design_by_chat``). ``owner`` is the owner's
+        answer at the series limit (#4765, ``DesignRound.owner_answer``)."""
         if self._design is None:
             return {"refused": "reviews are off on this deck", "status": 409}
         key = f"{DESIGN}:{issue.lower()}"
+        if owner:
+            try:
+                skipped = await self._design.owner_answer(issue, owner)
+            except design_review.Refused as exc:
+                return {"refused": str(exc), "status": exc.status}
+            log.info("work-router: the owner's answer at %s's series limit: %s", issue, owner)
+            if skipped is not None:
+                return skipped
+        asked = await self._design_by_chat(key, issue, checkout)
+        if asked is not None:
+            return asked
         try:
             answer = await self._design.ask(issue, checkout)
         except design_review.Refused as exc:
+            if exc.why == design_review.CLOSED:
+                self.pending.discard(key)  # nothing is left to wait for (#4675)
+            if exc.why == design_review.LIMIT:  # the review point counts these (#4765)
+                log.info("work-router: %s reached the design series limit", issue)
             return {"refused": str(exc), "status": exc.status}
         except design_review.Busy as exc:
             if key not in self.pending.entries:
@@ -5571,27 +6133,52 @@ class WorkRouterService:
                 "next": f"no reviewer place is free ({exc}), so the deck keeps the request and"
                 " starts its reviewer by itself once a place frees up; the verdict comes to this"
                 " chat as a message and is posted on the issue. End the turn and write no code"
-                " until it passes; asking again adds nothing",
+                " until it passes; asking again adds nothing. Closing the issue drops the request"
+                " at its next try: after a reopen, ask again",
             }
         self.pending.discard(key)
         return answer
 
     async def _retry_design(self, key: str, entry: dict) -> None:
         """One try of a design review waiting for a place (#4342): dropped once its Work is
-        gone, its design has a verdict or has no design; otherwise tried again later."""
+        gone, its issue closed, its design has a verdict or has no design; otherwise tried
+        again later."""
         issue = str(entry.get("issue") or "")
         repository, _, number = issue.partition("#")
-        if (
+        gone = (
             self._design is None
             or not number.isdigit()
             or self._owner_of_issue(repository, int(number)) is None
-        ):
+        )
+        if entry.get("comment") and self._design_chat is not None:
+            async with self._design_lock(key):
+                entry = self.pending.entries.get(key) or {}
+                waits = bool(entry.get("comment")) and await self._retry_design_chat(
+                    key, entry, gone
+                )
+            if waits:
+                return
+            entry = self.pending.entries.get(key) or {}
+            if not entry:
+                return
+        if gone:
             self.pending.discard(key)
             return
+        if entry.get("close") and self._design_chat is not None:
+            # The chat ChatGPT gave no verdict in (#4722): closed again on each try, which is
+            # harmless, so a crash right after the fallback leaves none open.
+            why = "No design verdict in time: the deck's own reviewer takes it."
+            await self._design_chat.close(str(entry["close"]), why)
         try:
             started = await self._design.ask(issue, str(entry.get("checkout") or ""))
         except design_review.Refused as exc:
-            if exc.why in (design_review.DECIDED, design_review.NO_DESIGN):
+            over = (
+                design_review.DECIDED,
+                design_review.NO_DESIGN,
+                design_review.CLOSED,
+                design_review.LIMIT,
+            )
+            if exc.why in over:
                 self.pending.discard(key)
             else:
                 log.warning("work-router: design review of %s refused: %s; kept", issue, exc)
@@ -5602,18 +6189,377 @@ class WorkRouterService:
             self.pending.discard(key)
             log.info("work-router: design review of %s started: %s", issue, started)
 
+    async def _design_by_chat(self, key: str, issue: str, checkout: str) -> dict | None:
+        """Ask ChatGPT for the design review of ``issue`` (#4722), or ``None`` when the deck's
+        own reviewer is to be asked: ChatGPT is not this deck's reviewer now, a request
+        already waits for a place, or the chat could not be opened.
+
+        The pending entry is the record that ChatGPT was asked, and it is reserved before the
+        chat is opened: a second ask, or a retry try, that finds it opens no second chat.
+        The entry's lock is held until the reservation, so no run finishing an earlier
+        verdict acts in between; the chat itself opens outside it."""
+        async with self._design_lock(key):
+            reserved = await self._design_reserve(key, issue, checkout)
+        if not isinstance(reserved, tuple):
+            return reserved
+        return await self._design_open(key, issue, *reserved)
+
+    def _design_lock(self, key: str) -> asyncio.Lock:
+        return self._design_locks.setdefault(key, asyncio.Lock())
+
+    async def _design_reserve(self, key: str, issue: str, checkout: str):
+        """The first half of ``_design_by_chat``, under the entry's lock: its answer, or what
+        ``_design_open`` needs once the entry is reserved for the newest design."""
+        route = self._design_chat
+        waiting = self.pending.entries.get(key) or {}
+        if route is not None and waiting.get("verdict_comment"):
+            # A verdict not yet told: told now if its design is still the newest, else
+            # dropped; the record keeps a recorded one for the round count.
+            await self._finish_design_verdict(key, waiting)
+            waiting = self.pending.entries.get(key) or {}
+        if route is None or (not waiting.get("comment") and (waiting or not route.wanted())):
+            return None
+        try:
+            url, number, earlier = await self._design.target(issue)
+        except design_review.Refused as exc:
+            if exc.why == design_review.CLOSED:  # nothing is left to wait for (#4675)
+                await self._drop_design_chat(key, "The Work's issue is closed.")
+            if exc.why == design_review.LIMIT:  # the review point counts these (#4765)
+                log.info("work-router: %s reached the design series limit", issue)
+            return {"refused": str(exc), "status": exc.status}
+        entry = dict(self.pending.entries.get(key) or {})
+        if entry.get("comment") and entry.get("comment") != number and not route.wanted():
+            # A newer design, and ChatGPT is no longer the reviewer: the deck's own takes it.
+            await self._drop_design_chat(key, "The Work posted a newer design.")
+            return None
+        # Nothing is awaited from here to the reservation: it decides between two asks.
+        entry = dict(self.pending.entries.get(key) or {})
+        if entry and not entry.get("comment"):
+            return None  # fell back to the deck's own reviewer meanwhile
+        if entry.get("comment") != number and self._design.reviewing(issue.lower(), number):
+            # The deck's own reviewer is already on this design (asked while the switch was
+            # on): one design has one reviewer, so it keeps it and no chat opens.
+            if entry:
+                await self._drop_design_chat(key, "The Work posted a newer design.")
+            return None
+        answer = {
+            "issue": issue,
+            "design": url,
+            "started": "ChatGPT was asked to review the design",
+            "next": "the verdict comes to this chat as a message, and is posted on the issue;"
+            " write no code until it passes. With none from ChatGPT in"
+            f" {int(design_review.CHAT_LIMIT_S // 60)} minutes the deck's own reviewer takes"
+            " it by itself; asking again adds nothing",
+        }
+        if entry.get("comment") == number:
+            return answer
+        replaced = str(entry.get("chat") or "")
+        now = self._clock()
+        mark = (key, number, now)
+        self.pending.discard(key)
+        fields = {
+            "kind": DESIGN,
+            "issue": issue.lower(),
+            "checkout": checkout,
+            "comment": number,
+            "chat": "",
+            "asked_at": now,
+        }
+        self.pending.put(key, fields, now, at=now + RETRY_FIRST_S)
+        self._design_opening.add(mark)
+        return answer, url, number, earlier, replaced, now, mark
+
+    async def _design_open(
+        self,
+        key: str,
+        issue: str,
+        answer: dict,
+        url: str,
+        number: str,
+        earlier: str,
+        replaced: str,
+        now: float,
+        mark: tuple,
+    ) -> dict | None:
+        """The second half of ``_design_by_chat``: open the chat the entry was reserved for."""
+        route = self._design_chat
+        chat, pressed = "", False
+        try:
+            if replaced:
+                await route.close(replaced, "The Work posted a newer design: this one is over.")
+            title = design_review.chat_title(issue, number)
+            body = design_review.chat_brief(issue=issue, design_url=url, earlier=earlier)
+            chat, pressed = await route.open(title, body)
+        except Exception:  # noqa: BLE001 - not opened: the deck's own reviewer takes it
+            log.warning("work-router: no ChatGPT design chat for %s", issue, exc_info=True)
+        finally:
+            self._design_opening.discard(mark)
+        mine = self.pending.entries.get(key) or {}
+        ours = (
+            mine.get("comment") == number and mine.get("asked_at") == now and not mine.get("chat")
+        )
+        if not ours:
+            # A newer ask or the fallback took the entry while the chat opened: this chat is
+            # nobody's, and a verdict from it would be a second one.
+            if chat:
+                await route.close(chat, "This design review was asked again elsewhere.")
+            return answer
+        opened = self._clock()
+        if not chat:
+            self.pending.put(key, {"comment": "", "asked_at": 0}, opened)
+            return None
+        # ``pressed`` is kept for the log only: a start not pressed now is owed and pressed
+        # by the run in flight, so every opened chat gets the whole limit.
+        limit = opened + design_review.CHAT_LIMIT_S
+        self.pending.put(key, {"chat": chat, "opened_at": opened}, opened, at=limit)
+        log.info("work-router: design of %s went to ChatGPT in %s (%s)", issue, chat, pressed)
+        return answer
+
+    async def _drop_design_chat(self, key: str, why: str) -> None:
+        """Forget the design ChatGPT was asked about, and close its chat."""
+        chat = str((self.pending.entries.get(key) or {}).get("chat") or "")
+        self.pending.discard(key)
+        if chat and self._design_chat is not None:
+            await self._design_chat.close(chat, why)
+
+    async def _retry_design_chat(self, key: str, entry: dict, gone: bool) -> bool:
+        """One try of a design ChatGPT was asked to review (#4722); ``False`` once the deck's
+        own reviewer is to take it, the entry by then a plain waiting one.
+
+        Until the limit it only waits: it asks nobody. The limit is counted from when the chat
+        opened, not from the growing retry wait. At the limit the entry stops naming the chat
+        first, so a verdict that arrives after it is dropped, and only then is the chat
+        closed."""
+        now = self._clock()
+        chat = str(entry.get("chat") or "")
+        if (key, entry.get("comment"), entry.get("asked_at")) in self._design_opening:
+            # This process is still opening the chat: not "never opened" yet.
+            self.pending.put(key, {}, now, at=now + RETRY_FIRST_S)
+            return True
+        if gone:  # before a waiting verdict: nobody is left to tell it to
+            self.pending.discard(key)
+            if chat:
+                await self._design_chat.close(chat, "The Work this design was for is gone.")
+            return True
+        if entry.get("verdict_comment"):
+            await self._finish_design_verdict(key, entry)
+            mine = self.pending.entries.get(key) or {}
+            return bool(mine.get("comment")) or not mine
+        # A reservation with no chat is one a restart cut off: it waits a minute, no more.
+        since = float(entry.get("opened_at") or entry.get("asked_at") or 0)
+        limit = since + (design_review.CHAT_LIMIT_S if chat else RETRY_FIRST_S)
+        if now < limit:
+            self.pending.put(key, {}, now, at=limit)
+            return True
+        self.pending.put(key, {"comment": "", "chat": "", "asked_at": 0, "close": chat}, now)
+        log.info("work-router: no ChatGPT verdict on %s: the deck's reviewer takes it", key)
+        return False
+
+    def _design_chat_sender(self, login: str, comment: dict, chat: str) -> bool:
+        """Whether ``login`` may give the verdict of the design chat ``chat``
+        (``owner/repo#n``): a reviewer account, or ChatGPT's own GitHub connector under the
+        login that owns that chat's repository (as ``_from_reviewer``)."""
+        if login.casefold() in reviewer_logins():
+            return True
+        app = comment.get("performed_via_github_app")
+        return (
+            bool(login)
+            and isinstance(app, dict)
+            and app.get("slug") == REVIEWER_CONNECTOR
+            and chat.partition("/")[0].casefold() == login.casefold()
+        )
+
+    def _observe_design_comment(self, delivery: Delivery) -> None:
+        """Hand a comment created, edited or deleted on an issue to the series-limit note
+        (``DesignRound.observe_comment``, #4800 review): a withdrawal is an edit, and a new or
+        deleted design a comment event, which no gate call sees until the agent's next one."""
+        payload = delivery.payload
+        issue, comment = payload.get("issue"), payload.get("comment")
+        if (
+            self._design is None
+            or delivery.event != "issue_comment"
+            or _text(payload.get("action")) not in {"created", "edited", "deleted"}
+            or not isinstance(issue, dict)
+            or not isinstance(comment, dict)
+            or isinstance(issue.get("pull_request"), dict)
+        ):
+            return
+        deleted = _text(payload.get("action")) == "deleted"
+        found = comment.get("id")
+        number = design_review.comment_id(_text(comment.get("html_url"))) or (
+            str(found) if isinstance(found, int) else ""
+        )
+        ref = f"{delivery.stream.lower()}#{issue.get('number')}"
+        self._design.observe_comment(ref, number, _text(comment.get("body")), deleted)
+
+    async def _observe_design(self, delivery: Delivery) -> bool:
+        """Take the design verdict ChatGPT posted on a Work's issue (#4722). ``True`` for
+        every issue comment that opens with that verdict line, taken or dropped: this is its
+        only reader, and it never reaches the Work's chat as a person's comment."""
+        payload = delivery.payload
+        issue, comment = payload.get("issue"), payload.get("comment")
+        if (
+            delivery.event != "issue_comment"
+            or _text(payload.get("action")) != "created"
+            or not isinstance(issue, dict)
+            or not isinstance(comment, dict)
+            or isinstance(issue.get("pull_request"), dict)
+        ):
+            return False
+        body = _text(comment.get("body"))
+        verdict = design_review.chat_verdict_of(body)
+        if verdict is None:
+            return False
+        ref = f"{delivery.stream.lower()}#{issue.get('number')}"
+        try:
+            async with self._design_lock(f"{DESIGN}:{ref}"):
+                await self._take_design_verdict(delivery, verdict)
+        except Exception:  # noqa: BLE001 - still settled; a taken one is finished by the retry
+            log.warning(
+                "work-router: design verdict of %s failed", delivery.delivery_id, exc_info=True
+            )
+        return True
+
+    async def _take_design_verdict(self, delivery: Delivery, verdict) -> None:
+        """Take or drop one verdict comment (``_observe_design``)."""
+        payload = delivery.payload
+        issue, comment = payload["issue"], payload["comment"]
+        body = _text(comment.get("body"))
+        ref = f"{delivery.stream.lower()}#{issue.get('number')}"
+        key = f"{DESIGN}:{ref}"
+        entry = self.pending.entries.get(key) or {}
+        chat = str(entry.get("chat") or "")
+        number = str(comment.get("id") or "")
+        login, _kind = _login(payload)
+        if entry.get("verdict_comment") == number and number:
+            await self._finish_design_verdict(key, entry)  # the same delivery again
+            return
+        why = ""
+        if self._design is None or self._design_chat is None or verdict.issue != ref:
+            why = "it names another issue, or this deck asks ChatGPT for no design review"
+        elif not chat or entry.get("comment") != verdict.comment or not number:
+            why = f"no ChatGPT chat is open on design comment {verdict.comment}"
+        elif entry.get("verdict_comment"):
+            why = "that design already has its verdict"
+        elif not self._design_chat_sender(login, comment, chat):
+            why = f"{login or 'its sender'} is not the reviewer of {chat}"
+        elif self._design.verdicts.of(ref).get(verdict.comment):
+            why = "that design already has its verdict from the deck's own reviewer"
+        if why:
+            log.info("work-router: design verdict on %s dropped: %s", ref, why)
+            return
+        now = self._clock()
+        fields = {
+            "verdict": verdict.verdict,
+            "verdict_comment": number,
+            "verdict_url": _text(comment.get("html_url")),
+            "verdict_text": body[:DESIGN_VERDICT_CHARS],
+            "verdict_at": now,
+        }
+        # Written before it is recorded or told: a crash from here on is finished by the retry.
+        self.pending.put(key, fields, now, at=now + RETRY_FIRST_S)
+        await self._finish_design_verdict(key, self.pending.entries.get(key) or {})
+
+    async def _finish_design_verdict(self, key: str, entry: dict) -> None:
+        """The one step that finishes a verdict ChatGPT gave (#4722), run under the entry's
+        lock by the observer, a replayed delivery, the retry and the agent's next ask alike.
+
+        Every run asks anew whether the verdict's design is still the issue's newest: only
+        then is it recorded (once), told to the Work (once, by its comment's id), its chat
+        closed and the entry dropped. A newer design drops it untold, a recorded verdict
+        staying in the record; an unreadable issue keeps it for the next try. A design
+        posted between this read and the message is the window that stays: the message
+        names its design comment, and the code review gate reads the newest design."""
+        issue = str(entry.get("issue") or "")
+        number = str(entry.get("verdict_comment") or "")
+        repository, _, issue_number = issue.partition("#")
+        chat = str(entry.get("chat") or "")
+
+        def mine() -> bool:  # after a wait: only the run whose verdict the entry still holds
+            return (self.pending.entries.get(key) or {}).get("verdict_comment") == number
+
+        async def drop(why: str) -> None:
+            if mine():
+                self.pending.discard(key)
+                if chat and self._design_chat is not None:
+                    await self._design_chat.close(chat, why)
+
+        if self._design is None or not number or not issue_number.isdigit():
+            self.pending.discard(key)
+            return
+        owner = self._owner_of_issue(repository, int(issue_number))
+        if owner is None or self._release is None:
+            await drop("The Work this design was for is gone.")
+            return
+        if await self._design.closed(issue):
+            await drop("The Work's issue is closed.")
+            return
+        taken = design_review.Verdict(
+            issue, str(entry.get("verdict") or ""), str(entry.get("comment") or "")
+        )
+        try:
+            stale = await self._design.stale(issue, taken)
+        except design_review.Refused:
+            stale = None
+        if not mine():
+            return
+        now = self._clock()
+        if stale is None:
+            since = float(entry.get("verdict_at") or now)
+            if now - since < design_review.CHAT_LIMIT_S or self._design.verdicts.of(issue).get(
+                taken.comment
+            ):
+                # Unread: tried again. A verdict already recorded is never handed to the
+                # deck's own reviewer, whose ask that record would refuse: it waits here.
+                self.pending.put(key, {}, now)
+                return
+            # Unread for the whole limit and never recorded: as if ChatGPT gave none.
+            log.info("work-router: design verdict on %s unread too long: falls back", issue)
+            gone = {"comment": "", "chat": "", "asked_at": 0, "close": chat}
+            gone.update(verdict="", verdict_comment="", verdict_url="", verdict_text="")
+            self.pending.put(key, gone, now)
+            if chat and self._design_chat is not None:
+                # Closed here too: an ask that starts the deck's reviewer drops the entry.
+                await self._design_chat.close(chat, "The design verdict could not be checked.")
+            return
+        if stale:
+            log.info("work-router: design verdict on %s dropped: %s", issue, stale)
+            await drop("The Work posted a newer design.")
+            return
+        recorded = self._design.take(issue, taken)
+        told = await self._release.on_design_review(
+            _work_id(owner),
+            f"comment:{number}",
+            design_review.restated(str(entry.get("verdict_text") or ""), recorded),
+            str(entry.get("verdict_url") or ""),
+            gap=recorded == design_review.GAP,
+            notes=recorded == design_review.NOTES,
+        )
+        if not told:
+            # No chat, or the store would not keep it: tried again with the same id.
+            if mine():
+                self.pending.put(key, {}, self._clock())
+            return
+        await drop(f"The deck took the design verdict on {issue}.")
+
     async def design_accept(self, issue: str, comment: str, verdict: str, token: str) -> dict:
         """Whether the deck takes a design verdict before posting it (#4332,
         ``DesignRound.accept``): ``{"stale": why, "verdict": recorded}``, "" when taken, with
         the verdict the deck will record (#4463: a last-round gap is ``notes``), which the
-        post then shows; ``{"refused": why, "status": n}`` when its sender is not that design's
+        post then shows, and whether the issue is ``closed``
+        (#4675); ``{"refused": why, "status": n}`` when its sender is not that design's
         reviewer, or unread."""
         if self._design is None:
             return {"refused": "reviews are off on this deck", "status": 409}
         try:
             taken = design_review.Verdict(issue.lower(), verdict, comment)
             stale = await self._design.accept(issue, taken, token)
-            return {"stale": stale, "verdict": self._design.kept(issue, taken)}
+            closed = not stale and await self._design.closed(issue)
+            return {
+                "stale": stale,
+                "verdict": self._design.kept(issue, taken),
+                "closed": closed,
+            }
         except design_review.Refused as exc:
             return {"refused": str(exc), "status": exc.status}
 
@@ -5665,8 +6611,9 @@ class WorkRouterService:
         work = owner[1]
         if self._design is None or not owner[0] or "#" not in work:
             return ""
+        queued = self.pending.entries.get(f"{DESIGN}:{work.lower()}")
         try:
-            return await self._design.missing(work)
+            return await self._design.missing(work, queued if isinstance(queued, dict) else None)
         except Exception:  # noqa: BLE001 - an unread check holds the review, said so
             log.warning("work-router: design of %s unread", work, exc_info=True)
             return f"the design review of {work} could not be checked"
@@ -5674,12 +6621,14 @@ class WorkRouterService:
     def _tell_design_gap(self, owner: Owner, pull: str, head: str, missing: str) -> None:
         """Tell the chat, once per head and gap, why its code review did not start (#4332)."""
         now = datetime.now(UTC)
+        # A review asked and unanswered (#4781) says itself what comes next.
+        next_step = "" if missing == design_review.WAITING_GAP else _DESIGN_GAP_NEXT
         self._deliver(
             ScheduledMessage(
-                id=f"work-event:design-gap:{pull}@{head}:{missing[:40]}",
+                id=f"work-event:design-gap:{pull}@{head}:{missing[:120]}",
                 chat_id=owner[0],
                 text=f"AgentDeck: {pull} at {head[:12]} gets no code review before its design:"
-                f" {missing}. Then ask for the review with `review-request`.",
+                f" {missing}.{next_step}",
                 due_at=now,
                 created_at=now,
             )
@@ -5719,7 +6668,7 @@ class WorkRouterService:
             "head": event.head,
         }
         if asked:
-            retry["asked"] = True
+            retry.update(asked=True, note=event.note)
         asks: dict = {}
         if event.again:
             retry.update(again=event.again, note=event.note)
@@ -5743,9 +6692,11 @@ class WorkRouterService:
         except Exception:  # noqa: BLE001 - one review that could not start must not stop routing
             # It may have written and pressed: spent, as an uncertain start always is.
             self.pending.discard(pending_key)
-            if settle and self._fix_pass(pull, event.head):
+            if settle and self._overtaken(pull, event.head, asked=asked):
                 # A late minor verdict passed this head meanwhile (#4474): an ``asked`` row
                 # newer than that pass would void it. ``_review`` closes any chat opened.
+                if self._carried_pass(pull, event.head):
+                    self._stop_on_carried(owner, pull, event.head)
                 return
             self._note_asked(pull, event, digest, uncertain=True)
             log.warning("work-router: review of %s could not start", key, exc_info=True)
@@ -5757,22 +6708,37 @@ class WorkRouterService:
                 self.pending.put(pending_key, retry, self._clock())
                 log.info("work-router: %s left an older chat open; kept pending", key)
                 return
-            self.pending.discard(pending_key)
-            if settle and self._fix_pass(pull, event.head):
+            if settle and self._overtaken(pull, event.head, asked=asked):
                 # As above (#4474): no ``asked`` row over the pass; ``_review`` closes the chat.
+                if self._carried_pass(pull, event.head):
+                    self._stop_on_carried(owner, pull, event.head)
+                self.pending.discard(pending_key)
                 log.info("work-router: %s passed while its review started", key)
                 return
-            self._note_asked(pull, event, digest)
+            self.pending.discard(pending_key)
+            self._note_asked(pull, event, digest, chat=str(getattr(outcome, "chat", "") or ""))
             log.info("work-router: review of %s asked for (Work %s)", key, work)
 
-    def _note_asked(self, pull: str, event: Event, digest: str, *, uncertain: bool = False) -> None:
-        """The ``asked`` event of ``event``'s head (#3957), once per ask-again request."""
+    def _note_asked(
+        self, pull: str, event: Event, digest: str, *, uncertain: bool = False, chat: str = ""
+    ) -> None:
+        """The ``asked`` event of ``event``'s head (#3957), once per ask-again request.
+
+        ``chat`` is the review chat the ask got (#4665): a replaced chat's pass of another pull
+        request still counts only while every ask since names its own chat, so an uncertain
+        start, which names none, keeps it from counting (``review_history.kept_pass``)."""
         data = {"digest": digest, "again": event.again, "note": event.note}
         data.update(no_verdict=event.again.startswith(NO_VERDICT), uncertain=uncertain)
+        if chat:
+            data["chat"] = chat.lower()
         # A head is asked once (``_spent``) unless asked again under a request id (#3344), so
         # the head and that id name one ask; its retry or a replay writes nothing new.
         key = f"asked:{pull}@{event.head}+{event.again}"
         self._note(pull, event.head, review_history.ASKED, key, data=data)
+        if not event.again:
+            # The review now asked for is the one the agent's own request wanted (#4658).
+            for held in self._requests(pull, event.head):
+                self.pending.discard(held)
 
 
 def _grown(before: object, after: object) -> str:
@@ -5893,7 +6859,9 @@ def _ship_message(pull: str, head: str, issue: str, source: str) -> str:
         " check is recorded, keep the issue open and fix them in a new pull request"
         " for this same issue. Register that pull request with"
         f' `"fixes": "{pull}"` (POST …/pull-requests), so the deck knows it is the fix'
-        " and keeps the issue open until it merges." + SHIP_CONFLICT_HOW
+        " and keeps the issue open until it merges. If the owner later chooses no fix,"
+        f" record that with `review-accepted` on {pull}, quoting their decision."
+        + SHIP_CONFLICT_HOW
     )
 
 
@@ -6040,6 +7008,18 @@ def owner_of_issue(state, repository: str, number: int, projection=None) -> Owne
     return (chat, f"{work.ref.repository}#{work.ref.number}") if chat else None
 
 
+def issue_owner_of_pull(state, repository: str, number: int) -> Owner | None:
+    """The chat that owns the issue of this pull request's Work (#4753): the one the release
+    tells of its merge. ``owner_of_pull`` names the Work as ``owner/repo#n``."""
+    placed = owner_of_pull(state, repository, number)
+    if placed is None:
+        return None
+    work_repository, _, work_number = placed[1].rpartition("#")
+    if not work_number.isdigit():
+        return None
+    return owner_of_issue(state, work_repository, int(work_number))
+
+
 def owner_of_pull(state, repository: str, number: int) -> Owner | None:
     """The chat that registered this pull request, and the one Work that chat joined.
 
@@ -6094,14 +7074,39 @@ def _place_pull(state, legs: dict[str, str], projection) -> Owner | None:
     return chat, f"{works[0].repository}#{works[0].number}"
 
 
-def work_pulls(state, work_id: str) -> tuple[str, ...]:
+def work_pulls(state, work_id: str, projection=None) -> tuple[str, ...]:
     """Every pull request registered for this Work, as ``owner_of_pull`` places it.
 
     The release's set: a pull request counts for the Work its registering chat joined, never
-    by what its body says. Lowercased ``owner/repo#n``. One walk of the whole deck
-    (``pulls_by_work``): a caller asking about many Works takes ``pulls_lookup`` instead.
+    by what its body says. Lowercased ``owner/repo#n``. Only the pull requests a chat of this
+    Work registered are placed, since ``_place_pull`` names no other Work's: placing every
+    one of the deck's was most of a Work page's build (#4639). A caller asking about many
+    Works takes ``pulls_lookup`` instead. ``projection`` is a caller's Work grouping.
     """
-    return pulls_lookup(state)(work_id)
+    projection = projection if projection is not None else state.work_projection()
+    work = work_id.partition(":")[2].lower()
+    snapshot = getattr(state, "chat_snapshot", None)
+    chats = snapshot() if snapshot is not None else None
+    joined: dict[str, bool] = {}
+
+    def in_work(leg: str) -> bool:
+        chat = state.chat_identity_key(leg, chats)
+        if chat not in joined:
+            joined[chat] = any(
+                f"{ref.repository}#{ref.number}".lower() == work
+                for ref in projection.works_chat_joined(chat)
+            )
+        return joined[chat]
+
+    wanted = {
+        ref.identity
+        for leg, refs in tuple(state.session_pull_requests.items())
+        if refs and in_work(leg)
+        for ref in refs
+    }
+    if not wanted:
+        return ()
+    return pulls_by_work(state, projection, wanted).get(work, ())
 
 
 def pulls_lookup(state) -> Callable[[str], tuple[str, ...]]:
@@ -6192,7 +7197,41 @@ def design_queue(path: Path, issue: str) -> dict | None:
     def at(seconds) -> str:
         return datetime.fromtimestamp(float(seconds or 0), UTC).isoformat()
 
-    return {"since": at(mine.get("since")), "next_try": at(mine.get("next_at"))}
+    found = {"since": at(mine.get("since")), "next_try": at(mine.get("next_at"))}
+    if mine.get("comment"):
+        # ChatGPT was asked for this design comment (#4722), in this chat once it opened.
+        found.update(comment=str(mine["comment"]), chat=str(mine.get("chat") or ""))
+    return found
+
+
+def design_asked(streams_root: Path | str, ledger: Path, issue: str, now: float) -> bool:
+    """Whether a review of one of ``issue``'s design comments was asked for and has not
+    answered (#4781), read from local files only: the release's hold and the turn-end nudge
+    then name the design review, not ``pre-review-done``, which the design gate refuses.
+
+    True while the router's request waits for a reviewer place, or names a comment (ChatGPT's
+    chat) with no verdict recorded, or the deck's own reviewer on a comment with no verdict has
+    a ledger line younger than its age limit. It reads no GitHub, so it does not know which
+    comment is the newest: a reviewer on an older one counts until its line goes."""
+    from . import agent_review
+
+    verdicts = design_review.Verdicts.beside(Path(ledger)).of(issue)
+    queued = design_queue(pending_path(streams_root), issue)
+    if queued is not None and (not queued.get("comment") or queued["comment"] not in verdicts):
+        return True
+    for line in agent_review.design_lines(Path(ledger), issue):
+        comment = str(line.get("head") or "").removeprefix("comment-")
+        age = now - float(line.get("started") or 0)
+        if comment and comment not in verdicts and age < agent_review.MAX_AGE_S:
+            return True
+    return False
+
+
+def design_limited(ledger: Path, issue: str) -> bool:
+    """Whether the series limit stops a review of ``issue``'s design until the owner answers
+    (#4800), from the deck's own record (``Verdicts.limited``) with no GitHub call. The design
+    gate refuses ``pre-review-done`` then, so the deck must not ask the agent for it."""
+    return bool(design_review.Verdicts.beside(Path(ledger)).limited(issue))
 
 
 def handed_over_path(streams_root: Path | str) -> Path:

@@ -33,13 +33,13 @@ from . import (
     design_review,
     review_paperwork,
     review_refs,
+    work_published,
     work_release,
     work_rounds,
 )
 from .poller_ops import work_hold_labels, work_start_labels, work_unassigned_elsewhere
 from .scheduled_messages import ScheduledMessage
 from .wake_on import (
-    KIND_PULL_REQUEST,
     WakeOnRegistry,
     parse_request,
     register,
@@ -60,10 +60,14 @@ from .work_router import (
     WorkRouterService,
     base_only_between,
     behind_base,
+    design_asked,
+    design_limited,
     late_read,
     no_code_between,
+    pending_path,
     pull_files,
     pulls_lookup,
+    same_files_merge,
     ship_merge_between,
     work_busy,
     work_pulls,
@@ -158,13 +162,18 @@ REVIEWER_SWEEP_S = 300.0
 
 
 async def tell_design_dropped(
-    release, verdicts, line: dict, running: list[dict], newest_stopped: str = ""
+    release,
+    verdicts,
+    line: dict,
+    running: list[dict],
+    newest_stopped: str = "",
+    closed: Callable[[str], Awaitable[bool]] | None = None,
 ) -> bool | None:
     """Tell the Work its design reviewer of ``line`` stopped without a verdict (#4458).
 
     ``None``, nothing to tell, when that design comment is no longer the one to act on
-    (``_still_actionable``). Otherwise whether the Work was told now: ``False`` when its chat
-    could not be reached, or was told already."""
+    (``_still_actionable``), or its issue is ``closed`` (#4675). Otherwise whether the Work was told
+    now: ``False`` when its chat could not be reached, or was told already."""
     from .work import IssueRef, WorkRef
 
     key = str(line.get("pull") or "")
@@ -175,6 +184,8 @@ async def tell_design_dropped(
     if not key.startswith("design:") or ref is None or not comment or not token:
         return None
     if not _still_actionable(issue, comment, verdicts, running, newest_stopped):
+        return None
+    if closed is not None and await closed(issue):
         return None
     return await release.on_design_dropped(WorkRef.from_issue(ref).work_id, comment, token)
 
@@ -222,8 +233,14 @@ class DesignDropped:
     take yet, tried again on each tick for ``RETELL_S``. Its calls run one at a time."""
 
     def __init__(
-        self, release, verdicts, path: Path, clock: Callable[[], float] = time.time
+        self,
+        release,
+        verdicts,
+        path: Path,
+        clock: Callable[[], float] = time.time,
+        closed: Callable[[str], Awaitable[bool]] | None = None,
     ) -> None:
+        self._closed = closed
         self.release = release
         self._verdicts = verdicts
         self._path = path
@@ -231,8 +248,8 @@ class DesignDropped:
         self._lock = asyncio.Lock()
 
     @classmethod
-    def beside(cls, release, verdicts, ledger: Path) -> DesignDropped:
-        return cls(release, verdicts, ledger.with_name("design-dropped.json"))
+    def beside(cls, release, verdicts, ledger: Path, closed=None) -> DesignDropped:
+        return cls(release, verdicts, ledger.with_name("design-dropped.json"), closed=closed)
 
     def _read(self) -> dict:
         try:
@@ -282,7 +299,9 @@ class DesignDropped:
         issue = str(line.get("pull") or "").removeprefix("design:")
         newest = str(data["newest"].get(issue) or "")
         try:
-            told = await tell_design_dropped(self.release, self._verdicts, line, running, newest)
+            told = await tell_design_dropped(
+                self.release, self._verdicts, line, running, newest, self._closed
+            )
         except Exception:  # noqa: BLE001 - the store or chat failing is tried again (review)
             log.exception("work services: telling %s its reviewer stopped failed", line.get("pull"))
             told = False
@@ -298,6 +317,28 @@ def work_reviewer(config) -> str:
     return agent_review.effective(
         config.review.reviewer, review_chats=review_refs.reviewer_available()
     )
+
+
+def design_chat_route(config) -> design_review.ChatRoute:
+    """ChatGPT as the design reviewer (#4722), over the code review's chat route: the chat
+    repository's issues, and one worker started per chat."""
+    from . import chat_review, review_fallback
+
+    board = config.chat_board
+
+    def wanted() -> bool:
+        switch = review_fallback.switch_path(board)
+        return work_reviewer(config) == agent_review.CHATGPT and not review_fallback.active(switch)
+
+    async def open_chat(title: str, body: str) -> tuple[str, bool]:
+        outcome = await chat_review.open_chat(board, title, body)
+        return f"{outcome.repository}#{outcome.issue_number}".lower(), bool(outcome.task)
+
+    async def close_chat(chat: str, comment: str) -> bool:
+        repository, _, number = chat.partition("#")
+        return number.isdigit() and await chat_review.close_issue(repository, int(number), comment)
+
+    return design_review.ChatRoute(wanted, open_chat, close_chat)
 
 
 def services_enabled(config) -> bool:
@@ -491,6 +532,7 @@ CALLS: dict[str, tuple[str, ...]] = {
         "design_record",
         "note_filed",
         "note_registered",
+        "note_published",
         "note_deployed",
         "ask_again",
         "recover_review",
@@ -533,7 +575,9 @@ def build(
     verdicts = design_review.Verdicts.beside(config.review.ledger_path)
 
     # Late-bound: the release is made below, and a sweep runs only once the services start.
-    design_stopped = DesignDropped.beside(None, verdicts, config.review.ledger_path)
+    design_stopped = DesignDropped.beside(
+        None, verdicts, config.review.ledger_path, design_review.read_closed
+    )
 
     def make_reviewer(kind: str) -> agent_review.AgentReviewer:
         return agent_review.AgentReviewer(
@@ -542,6 +586,7 @@ def build(
             ledger=config.review.ledger_path,
             digest=review_refs.target_digest,
             on_stopped=design_stopped,
+            read_issue=agent_review.read_issue,
             **hooks.reviewer(),
         )
 
@@ -572,6 +617,10 @@ def build(
             verdicts,
             reviews=lambda token, issue, comment: agent_review.reviews_design(
                 config.review.ledger_path, token, issue, comment
+            ),
+            closed=design_review.read_closed,
+            reviewing=lambda issue, comment: (
+                agent_review.design_reviewer(config.review.ledger_path, issue, comment) is not None
             ),
         )
         if reviewer != agent_review.OFF
@@ -733,6 +782,10 @@ def build(
         owner = work_owner_of_issue(state, repository, int(number)) if number.isdigit() else None
         return owner[0] if owner else None
 
+    async def release_same_files(ref: str, old: str, new: str) -> bool:
+        repository, _, number = ref.partition("#")
+        return await same_files_merge(repository, int(number), old, new)
+
     async def release_digest(ref: str, head: str) -> str:
         repository, _, number = ref.partition("#")
         digest, _why = await review_refs.target_digest(repository, int(number), head)
@@ -866,15 +919,12 @@ def build(
             )
         # The chat's own waits on these merges are answered by the deploy wait, which says
         # they merged: one wake, not two.
-        merged = {ref.casefold() for ref in refs}
-        hooks.wake_registry.remove(
-            item.id
-            for item in hooks.wake_registry.for_chat(chat_id)
-            if item.kind == KIND_PULL_REQUEST
-            and not item.pending_text
-            and f"{item.repository}#{item.number}".casefold() in merged
-        )
+        hooks.wake_registry.end_merge_waits(chat_id, refs)
         return bool(requests)
+
+    def release_merge_told(chat_id: str, refs: list[str]) -> None:
+        # The release told the chat these merged (#4753): its own waits on them end.
+        hooks.wake_registry.end_merge_waits(chat_id, refs)
 
     def release_note_evidence(work_id: str, sentence: str) -> bool:
         # Appended to the summary's ``correctness`` part in place of the agent rewriting it
@@ -884,7 +934,7 @@ def build(
         from functools import partial
 
         from .web.work_view import WORK_INPUTS_TOPIC
-        from .work_resolution import ResolutionError, evidence_added
+        from .work_resolution import AGENT_WRITES, ResolutionError, evidence_added
 
         if db is None:
             return False
@@ -893,8 +943,11 @@ def build(
                 work_id, partial(evidence_added, sentence=sentence)
             )
         except ResolutionError:
-            return False  # no room in the part: the agent is asked to rewrite it
+            written = False  # no room in the part: the agent is asked to rewrite it
         if not written:
+            # The rewrite the deck now asks for changes only this part, so it is let past the
+            # limit on summary writes (#4726).
+            db.allow_work_resolution_write(work_id, AGENT_WRITES)
             return False
         state.bus.publish(WORK_INPUTS_TOPIC)
         return True
@@ -936,6 +989,18 @@ def build(
     def earlier_pulls(work_id: str) -> frozenset[str]:
         return getattr(round_of(work_id), "earlier", None) or frozenset()
 
+    def release_design_waits(work_id: str) -> bool:
+        # A design review asked for and not answered (#4781): the deck's own reviewer in the
+        # ledger, or the router's waiting entry (a reviewer place, or ChatGPT's chat).
+        issue = work_id.removeprefix("github_issue:")
+        if design is None or "#" not in issue:
+            return False
+        # Or the series limit stopped it until the owner answers (#4800): the gate refuses
+        # ``pre-review-done`` then too.
+        return design_asked(
+            config.github_webhook.path, config.review.ledger_path, issue, time.time()
+        ) or design_limited(config.review.ledger_path, issue)
+
     # The Ship now presses running here (#4558): the router runs them, the release's hold
     # line reads them.
     ship_runs = ShipRuns()
@@ -963,6 +1028,7 @@ def build(
             green_heads=release_green_heads,
             failed_heads=release_failed_heads,
             replaced_checks=work_release.replaced_checks,
+            same_files=release_same_files,
             moved_heads=release_moved_heads,
             unclean_heads=release_unclean_heads,
             merge=work_release.merge,
@@ -984,8 +1050,10 @@ def build(
             loading_processes=release_loading,
             late_read=release_late_read,
             wait_deploy=release_wait_deploy,
+            merge_told=release_merge_told,
             note_evidence=release_note_evidence,
             rerun_verification=release_rerun,
+            design_waits=release_design_waits,
         ),
         enabled=enabled,
     )
@@ -1160,8 +1228,27 @@ def build(
 
         return await close_settled_review(config.chat_board, work, pull, head, settled, reason)
 
+    # The published label on a Work's issue (#4794): registrations and rounds from the
+    # database at sync time, so every process decides from the same set.
+    registrations = work_published.Registrations(db)
+    published = work_published.PublishedLabels(
+        work_published.Ports(
+            labels=release.ports.policy.published_labels,
+            registered=registrations.registered,
+            registered_issues=registrations.registered_issues,
+            pull_state=work_published.gh_pull_state,
+            issue_labels=work_published.gh_issue_labels,
+            edit_label=work_published.gh_edit_label,
+            create_label=work_published.gh_create_label,
+            open_issues=work_published.gh_open_issues,
+        ),
+        pending_path(config.github_webhook.path),
+        time.time,
+    )
     router = WorkRouterService(
         config.github_webhook.path,
+        published=published,
+        works_of_pull=registrations.works_of_pull,
         chat_repository=config.chat_board.repository,
         newest_comment=newest_comment,
         switched=switched_repositories,
@@ -1197,6 +1284,7 @@ def build(
             helpers=first,
         ),
         design=design,
+        design_chat=design_chat_route(config) if design is not None else None,
         verification_rows=work_verification_rows,
         tests_checked=tests_checked,
         light=light,
@@ -1347,6 +1435,7 @@ def plain_outcome(outcome: object) -> dict:
         "type": "started",
         "heads": [list(pair) for pair in heads],
         "summary": str(getattr(outcome, "summary", "") or ""),
+        "chat": str(getattr(outcome, "chat", "") or ""),
     }
 
 
@@ -1355,7 +1444,9 @@ def outcome_from(raw: dict) -> object:
     if raw.get("type") != "started":
         return raw.get("value")
     heads = tuple(tuple(pair) for pair in raw.get("heads") or ())
-    return agent_review.Started(heads=heads, summary=str(raw.get("summary") or ""))
+    return agent_review.Started(
+        heads=heads, summary=str(raw.get("summary") or ""), chat=str(raw.get("chat") or "")
+    )
 
 
 #: The review-start errors that cross the socket by name.

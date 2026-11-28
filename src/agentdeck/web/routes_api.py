@@ -342,6 +342,16 @@ async def get_usage(request: Request) -> dict:
     }
 
 
+@router.get("/review-asked")
+async def get_review_asked(request: Request, pull: str) -> dict:
+    """Whether a review of ``pull`` (``owner/repo#n``) was asked for yet, at any head: the
+    helper checks run only before that (#4726, ``pre_review_helpers.review_asked``)."""
+    from .. import review_history
+
+    events = get_state(request).review_events(pull.strip().lower())
+    return {"pull": pull, "asked": any(item.kind == review_history.ASKED for item in events)}
+
+
 @router.get("/host-stats")
 async def get_host_stats(request: Request) -> dict:
     return {"host_stats": jsonable_encoder(get_state(request).host_stats)}
@@ -592,7 +602,7 @@ async def get_planned_reset(request: Request, account_key: str) -> dict:
 async def put_planned_reset(
     request: Request, account_key: str, body: PlannedResetRequest
 ) -> dict:
-    """Plan a usage reset: ``HH:MM`` on the host's clock or an ISO time (#3379)."""
+    """Plan a usage reset: ``HH:MM`` or an ISO date and time; no zone means the host's (#3379)."""
     if not body.at.strip():
         raise HTTPException(status_code=400, detail="give a time; DELETE clears the plan")
     return _set_planned_reset(request, account_key, body.at)
@@ -1166,7 +1176,13 @@ async def get_work_resolution(request: Request, session_key: str) -> dict:
 async def put_work_resolution(
     request: Request, session_key: str, body: WorkResolutionRequest
 ) -> dict:
-    from ..work_resolution import ResolutionError, WorkResolution, normalize_part
+    from ..work_resolution import (
+        AGENT_WRITES,
+        ResolutionError,
+        ResolutionRefused,
+        WorkResolution,
+        normalize_part,
+    )
 
     _account, session, _provider = resolve_current_leg(request, session_key)
     binding = _session_run(request, session_key, session.key, work_id=body.work_id)
@@ -1177,18 +1193,29 @@ async def put_work_resolution(
         }
     except ResolutionError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    stored = get_control_db(request).set_work_resolution(
-        WorkResolution(
-            binding.work_id, run_id=binding.run_id, session_key=session.key, **parts
+    try:
+        stored = get_control_db(request).set_work_resolution(
+            WorkResolution(
+                binding.work_id, run_id=binding.run_id, session_key=session.key, **parts
+            ),
+            limit=AGENT_WRITES,
         )
-    )
+    except ResolutionRefused as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     if stored is None:
         raise HTTPException(status_code=503, detail="the Work resolution could not be stored")
     # An open Work page shows it: announced, so the page's stream reads it (#3228).
     from .work_view import WORK_INPUTS_TOPIC
 
     get_state(request).bus.publish(WORK_INPUTS_TOPIC)
-    return _resolution_payload(binding.work_id, stored)
+    payload = _resolution_payload(binding.work_id, stored)
+    if stored.writes >= AGENT_WRITES:
+        # Said on the write that uses the last one up, so the next is not tried and wasted.
+        payload["note"] = (
+            f"Written {stored.writes} times: a further write is refused unless its solution"
+            " part changed (#4726)."
+        )
+    return payload
 
 
 # --- Work live check ------------------------------------------------------
@@ -1593,6 +1620,24 @@ async def post_session_wake_on(
                 "already_happened": True,
                 "deployment": done.payload(),
             }
+        if fields.get("name") and fields.get("sha"):
+            # A named deploy can also end as a commit status or a check run (#4662), which
+            # ``seen_deployments`` does not read. Only with a commit: a wait without one is
+            # about later deploys, and a probe has no registration time to drop older ones.
+            wanted = {key: value for key, value in fields.items() if key != "timeout_s"}
+            probe = WakeRequest(id="", session_key=session_key, chat_id="", **wanted)
+            ended = await asyncio.to_thread(service.seen_deploy_result, probe)
+            if ended is not None and ended.state == "success":
+                return {
+                    **_wake_on_payload(request, session_key, service),
+                    **seen,
+                    "already_happened": True,
+                    "result": ended.summary,
+                }
+            if ended is not None:
+                # No second delivery will come for it, so the reply says it now; the wait is
+                # still kept, for a deploy run again.
+                seen["already_failed"] = ended.summary
     if fields.get("kind") == KIND_COMMIT:
         # A result already stored for the commit (#3863): the agent's own read of GitHub can
         # lag the webhook, and a second wait on a met check stayed open.
@@ -1706,6 +1751,14 @@ async def post_session_review_request(
         registered = service.register(session_key, chat_id, asked=True, **wait)
     except WakeRequestError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    def live_wait() -> dict:
+        # A start that stopped on a carried pass meanwhile ended this wait, before the request
+        # was known to it (#4658): the review asked for now has one again.
+        if any(item.id == registered.id for item in service.registry.for_chat(chat_id)):
+            return registered.payload()
+        return service.register(session_key, chat_id, asked=True, **wait).payload()
+
     try:
         asked = await router_service.ask_again(
             ref.repository, ref.number, note, no_verdict=body.no_verdict
@@ -1718,7 +1771,7 @@ async def post_session_review_request(
             "pull_request": f"{ref.repository}#{ref.number}",
             "outcome": "already asked",
             "detail": str(exc),
-            "registered": registered.payload(),
+            "registered": live_wait(),
         }
     except AgainRefused as exc:
         if registered.id not in held:
@@ -1727,7 +1780,7 @@ async def post_session_review_request(
             # The wait it renewed goes back as it was: nothing was asked for (#3453).
             service.registry.update(held[registered.id])
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    return {"session_key": session_key, **asked, "registered": registered.payload()}
+    return {"session_key": session_key, **asked, "registered": live_wait()}
 
 
 class ReviewAcceptedBody(BaseModel):
@@ -1746,16 +1799,12 @@ async def post_session_review_accepted(
     session_key, _session = resolve_chat_key(request, session_key)
     ref = _pull_request_ref(body.pull_request)
     state = get_state(request)
-    if ref.identity not in {held.identity for held in state.pull_requests_for(session_key)}:
+    held = {item.identity: item for item in state.pull_requests_for(session_key)}
+    if ref.identity not in held:
         raise HTTPException(
             status_code=409,
             detail=f"this chat has not registered {ref.repository}#{ref.number};"
             " register it first (POST …/pull-requests)",
-        )
-    router_service = getattr(request.app.state, "work_router", None)
-    if router_service is None or not router_service.enabled:
-        raise HTTPException(
-            status_code=409, detail="this deck does not route Work events, so it keeps no pass"
         )
     note = body.note.strip()
     if not note or len(note) > MAX_REVIEW_NOTE:
@@ -1764,11 +1813,55 @@ async def post_session_review_accepted(
             detail="quote the owner's decision in the note, as posted on the issue;"
             f" at most {MAX_REVIEW_NOTE} characters",
         )
+    declined = await _decline_shipped_fix(request, session_key, state, held[ref.identity])
+    if declined:
+        return {"session_key": session_key, **declined}
+    router_service = getattr(request.app.state, "work_router", None)
+    if router_service is None or not router_service.enabled:
+        raise HTTPException(
+            status_code=409, detail="this deck does not route Work events, so it keeps no pass"
+        )
     try:
         accepted = await router_service.accept(ref.repository, ref.number, note)
     except AgainRefused as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return {"session_key": session_key, **accepted}
+
+
+async def _decline_shipped_fix(
+    request: Request, session_key: str, state, ref: PullRequestRef
+) -> dict | None:
+    """When ``ref`` shipped with Ship now for its Work and has merged, the owner's acceptance
+    of its findings means no fix follows (#4797): record that, so the Work's live check may
+    close its issue. ``None`` otherwise: the usual acceptance of a review applies. One still
+    open is not declined here: its findings may be at a newer head the owner accepts, which
+    needs that head's pass."""
+    from ..review_history import FIX_DECLINED
+
+    work = ref.work_id
+    if not work:
+        # Registered for no Work by name: the chat's own Work, as the router places it.
+        try:
+            work = _pull_work(request, session_key, session_key, "")
+        except HTTPException:
+            return None
+    work = work.removeprefix("github_issue:")
+    pull = f"{ref.repository}#{ref.number}".lower()
+    if not work or not any(
+        record.shipped and record.pull.lower() == pull for record in state.shipped_by_work(work)
+    ):
+        return None
+    if await _pull_state(pull) != "MERGED":
+        return None
+    if not state.note_shipped_fix(pull, work, FIX_DECLINED):
+        raise HTTPException(
+            status_code=503, detail=f"the owner's decision on {pull} could not be stored; retry"
+        )
+    return {
+        "pull_request": pull,
+        "outcome": "fix declined: its Ship now findings are left as shipped, and the issue"
+        " may close once the live check is verified",
+    }
 
 
 class ShipNowTarget(BaseModel):
@@ -2056,10 +2149,18 @@ async def get_session_deck_bug(request: Request, session_key: str) -> dict:
 
 @router.post("/sessions/{session_key}/design-review")
 async def post_session_design_review(request: Request, session_key: str) -> dict:
-    """Review the design of this chat's Work before its code (#4332): a deck reviewer reads
-    the issue's newest ``**Design:**`` comment, and its verdict comes to this chat."""
+    """Review the design of this chat's Work before its code (#4332): a reviewer (ChatGPT
+    when it reviews the code, #4722; else a deck reviewer) reads the issue's newest
+    ``**Design:**`` comment, and its verdict comes to this chat. An optional JSON body
+    ``{"owner": "more"|"skip"}`` carries the owner's answer at the series limit (#4765)."""
     from .. import issue_post
     from ..services_link import ServicesUncertain
+
+    try:
+        body = await request.json()
+    except ValueError:
+        body = {}
+    owner = str(body.get("owner") or "") if isinstance(body, dict) else ""
 
     session_key, session = resolve_chat_key(request, session_key)
     work = issue_post.issue_post_target(get_state(request), session_key)
@@ -2070,7 +2171,10 @@ async def post_session_design_review(request: Request, session_key: str) -> dict
         raise HTTPException(status_code=409, detail="this deck does not route Work events")
     checkout = str(session.cwd) if session is not None and session.cwd else ""
     try:
-        answer = await router_service.design_review(f"{work.repository}#{work.number}", checkout)
+        issue = f"{work.repository}#{work.number}"
+        # Only when sent: a services process from before #4765 takes no such argument.
+        asks = {"owner": owner} if owner else {}
+        answer = await router_service.design_review(issue, checkout, **asks)
     except ServicesUncertain as exc:
         # The services process may still start it: say how to find out, not "the Work page",
         # which an agent cannot read (#4337).
@@ -2085,7 +2189,8 @@ DESIGN_UNCERTAIN_TEXT = (
     " time, and may still start the reviewer. Read `GET` on this same path: its `state` says"
     " whether a reviewer is on your design or still starting (`reviewing`), whether it waits for a"
     " reviewer place (`queued`: it starts by itself, so end the turn and wait for the"
-    " verdict, which comes to this chat as a message), or neither (`unreviewed`). Only on"
+    " verdict, which comes to this chat as a message), or neither (`unreviewed`). On"
+    " `closed: true` the issue is closed: do what its `next` says. Otherwise, only on"
     " `unreviewed` ask again; asking again is safe anyway: while a reviewer is starting or"
     " running on the same design comment, or the request waits for a place, it starts no second."
 )
@@ -2096,8 +2201,8 @@ async def get_session_design_review(request: Request, session_key: str) -> dict:
     """Where this chat's Work's design review stands (#4337): ``state`` is ``none``,
     ``unreviewed``, ``queued`` (waiting for a reviewer place, #4342), ``reviewing``,
     ``pass``, ``gap`` or ``notes`` (passed with notes, #4463), with the design comment, its
-    reviewer
-    and what to do ``next``. Read here, never asked of the merge service, so it answers even
+    reviewer and what to do ``next``; ``closed: true`` when the issue is closed and no
+    reviewer runs (#4675). Read here, never asked of the merge service, so it answers even
     while a request to it hangs."""
     import time
 
@@ -2139,7 +2244,12 @@ async def get_session_design_review(request: Request, session_key: str) -> dict:
     queued = work_router.design_queue(work_router.pending_path(config.github_webhook.path), issue)
     try:
         found = await design_review.status(
-            issue, verdicts, reviewer, design_review.read_comments, queued
+            issue,
+            verdicts,
+            reviewer,
+            design_review.read_comments,
+            queued,
+            design_review.read_closed,
         )
     except design_review.Refused as exc:
         raise HTTPException(status_code=exc.status, detail=str(exc)) from exc

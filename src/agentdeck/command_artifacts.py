@@ -150,6 +150,14 @@ def claude_permission_settings(allow_rules: list[str]) -> dict[str, Any]:
 #: chat, and Claude Code's own default of 1,536 costs about 2,600 more tokens each (#4080).
 SKILL_DESCRIPTION_CHARS = 200
 
+#: Longest shell output a worker gets back whole: about 4k tokens. Claude Code saves a
+#: longer one to a file and hands the chat its first 2 KB and the file's path, so the rest
+#: is read by part, not carried on every later call (#4725). Its own default is 30,000.
+#: The price: a command that fails keeps only its first 16,000 characters, unsaved, so
+#: the end of a failed run that printed more is lost (above 30,000 it already was). Both
+#: checked live on Claude Code 2.1.332.
+BASH_OUTPUT_CHARS = 16_000
+
 
 def ensure_claude_settings(
     root: Path,
@@ -163,9 +171,9 @@ def ensure_claude_settings(
     ``capture`` adds the kanban command-capture hooks. ``allow_rules`` is the
     classifier skip list; a chat that does not run in ``auto`` gets none, since
     in ``plan`` or ``default`` mode an allow rule would pre-approve a write the
-    mode exists to stop (#2271). ``cut`` names the tools and plugins its
-    repository's chats start without (#4252). Each combination is its own file,
-    so a spawn only ever points at one that already says what it needs.
+    mode exists to stop (#2271). ``cut`` names the tools, plugins, connectors,
+    skills and guide files this chat starts without (#4252, #4727). Each combination
+    is its own file, so a spawn only ever points at one that already says what it needs.
     """
     name = "claude-command-artifact-hooks" if capture else "claude-worker-settings"
     cut_settings = cut.settings() if cut is not None else {}
@@ -176,10 +184,12 @@ def ensure_claude_settings(
     target = root / f"{name}{'' if allow_rules else '-no-skip'}{suffix}.json"
     settings = claude_permission_settings(allow_rules or [])
     settings["skillListingMaxDescChars"] = SKILL_DESCRIPTION_CHARS
+    settings["bashOutputMaxChars"] = BASH_OUTPUT_CHARS
     if deny := cut_settings.get("permissions", {}).get("deny"):
         settings["permissions"]["deny"] = deny
-    if plugins := cut_settings.get("enabledPlugins"):
-        settings["enabledPlugins"] = plugins
+    for key in ("enabledPlugins", "deniedMcpServers", "skillOverrides", "claudeMdExcludes"):
+        if value := cut_settings.get(key):
+            settings[key] = value
     if capture:
         hooks = hook_groups()
         for event, groups in settings["hooks"].items():

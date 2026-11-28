@@ -290,6 +290,9 @@ class RouterLink:
     def note_registered(self, repository: str, number: int) -> None:
         self._later.send("router", "note_registered", repository, number)
 
+    def note_published(self) -> None:
+        self._later.send("router", "note_published")
+
     def wake_sweep(self) -> None:
         self._later.send("services", "wake_sweep")
 

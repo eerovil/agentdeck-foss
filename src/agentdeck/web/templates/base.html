@@ -31,6 +31,8 @@
     var updatePending = false;
     var updateRetry = null;
     var RETRY_MS = 5000;
+    // One check for a page's several streams opening together.
+    var CHECK_GAP_MS = 2000;
     // Hidden inputs are machinery, not work: action_timing.js leaves a filled
     // carrier behind after a press.
     var VALUE_FIELDS = 'input:not([type=hidden]), textarea, select';
@@ -210,8 +212,21 @@
       if (window.AgentDeckPageRefresh) window.AgentDeckPageRefresh.reload(by);
       else window.location.reload();
     }
+    // Voice mode here or in an extra chat's frame. Asked only for a deploy's reload: one
+    // that helps a page gone dead must still happen with voice mode on (#4645).
+    function voiceHolds() {
+      var pages = [window];
+      document.querySelectorAll('.session-extra-frame').forEach(function (frame) {
+        pages.push(frame.contentWindow);
+      });
+      return pages.some(function (page) {
+        try {
+          return !!(page.AgentDeckVoiceHoldsReload && page.AgentDeckVoiceHoldsReload());
+        } catch (_) { return false; }
+      });
+    }
     function reloadWhenIdle() {
-      if (reloading || !updatePending || workInProgress()) return;
+      if (reloading || !updatePending || workInProgress() || voiceHolds()) return;
       reloading = true;
       if (updateRetry !== null) { clearInterval(updateRetry); updateRetry = null; }
       timedReload('update');
@@ -236,9 +251,24 @@
     });
     window.addEventListener('load', function () {
       navigator.serviceWorker.register('/sw.js').then(function (reg) {
-        reg.update();
+        registration = reg;
+        checkForUpdate();
       }).catch(function () {});
     });
+    // A page left open never loads again: chats are opened in place. So it also asks
+    // when someone comes back to it, and when a live stream opens again, which is what
+    // a deploy's restart does to it (#4645: an hour-old page ran the old voice mode).
+    var registration = null;
+    var askedAt = 0;
+    function checkForUpdate() {
+      if (!registration || Date.now() - askedAt < CHECK_GAP_MS) return;
+      askedAt = Date.now();
+      registration.update().catch(function () { /* asked again next time */ });
+    }
+    document.addEventListener('visibilitychange', function () {
+      if (document.visibilityState === 'visible') checkForUpdate();
+    });
+    document.addEventListener('htmx:sseOpen', checkForUpdate);
     // Fallback for a notification tap when the worker can't navigate the window
     // itself (an uncontrolled, frozen PWA client): the SW asks the page to go to
     // the notification's chat (#3348), or home, and we land on a freshly loaded
@@ -291,6 +321,7 @@
   <script src="/static/composer_phrases.js?v={{ asset_ver }}" defer></script>
   <script src="/static/composer_speech.js?v={{ asset_ver }}" defer></script>
   <script src="/static/voice_mode.js?v={{ asset_ver }}" defer></script>
+  <script src="/static/pocket_mode.js?v={{ asset_ver }}" defer></script>
   <script src="/static/chat_jump.js?v={{ asset_ver }}" defer></script>
   <script src="/static/issue_post.js?v={{ asset_ver }}" defer></script>
   <script src="/static/code_copy.js?v={{ asset_ver }}" defer></script>

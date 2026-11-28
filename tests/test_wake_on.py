@@ -36,6 +36,9 @@ from agentdeck.providers.instructions import agentdeck_session_instructions, gui
 from agentdeck.wake_on import (
     LIVE_READ_AGAIN_S,
     LIVE_READ_CAP_S,
+    MERGE_HOLD_S,
+    MERGE_HOLD_SUFFIX,
+    MERGE_TOLD_S,
     RECOVER_RETRY_S,
     RECOVER_UNCERTAIN_NOTE,
     REVIEW_TIMEOUT_MINUTES,
@@ -53,6 +56,7 @@ from agentdeck.wake_on import (
     registry_path,
     seen_result,
     settled_head,
+    status_is_ci,
     timeout_message,
 )
 from agentdeck.webhook_tailer import Delivery, WebhookTailer
@@ -739,6 +743,70 @@ def test_a_deployment_wait_wakes_on_a_status_only_deploy_like_vercel(root, servi
     assert "finished: success (https://vercel.com/x)" in scheduled[0].text
 
 
+def deploy_run(root, delivery, conclusion, at, *, action="completed", sha=SHA, name="deploy"):
+    """A ``check_run`` delivery for a deploy that is one job of a workflow (#4662)."""
+    run = {"head_sha": sha, "name": name, "started_at": at, "conclusion": conclusion}
+    if conclusion:
+        run["completed_at"] = at
+    deliver(root, event="check_run", delivery=delivery, action=action, check_run=run)
+
+
+def test_a_named_deployment_wait_wakes_on_a_check_run_that_ended_as_a_deploy(
+    root, service, scheduled, clock
+):
+    """#4662: a site deploying in a workflow job, ``deploy-cloudflare``, is reported by GitHub
+    only as a check run. A named wait takes a success or a failure (``timed_out`` told as
+    one); a skipped or cancelled run, a run still going, a workflow run and an unnamed wait
+    do not."""
+    # Around the test's own clock: a fixed date fails once the failure grace is past (#4675).
+    start = datetime.fromtimestamp(clock.now, UTC)
+
+    def at(seconds: int) -> str:
+        return (start + timedelta(seconds=seconds)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    named = register(service, deployment=f"eerovil/agentdeck@{SHA[:10]}", name="deploy")
+    unnamed = register(service, deployment=f"eerovil/agentdeck@{SHA[:10]}")
+    deploy_run(root, "d1", "", at(0), action="created")
+    deploy_run(root, "d2", "skipped", at(1), action="created")
+    deploy_run(root, "d3", "cancelled", at(2))
+    deliver(
+        root,
+        event="workflow_run",
+        delivery="d4",
+        action="completed",
+        workflow_run={"head_sha": SHA, "name": "deploy", "conclusion": "success"},
+    )
+    deploy_run(root, "d5", "success", at(3), name="build")
+    drain(service)
+    assert scheduled == []
+    deploy_run(root, "d6", "timed_out", at(5))
+    drain(service)
+    assert len(scheduled) == 1 and "finished: failure" in scheduled[0].text
+    assert [held.id for held in service.registry.all()] == [unnamed.id]
+    assert named.id in scheduled[0].id
+
+
+@pytest.mark.parametrize(
+    "skipped_action_order", [("created", "completed"), ("completed", "created")]
+)
+def test_a_skipped_check_run_after_a_deploy_does_not_hide_its_success(
+    root, service, skipped_action_order
+):
+    """#4662 design review: GitHub sends a skipped run as a ``created`` delivery already
+    concluded and a ``completed`` one, in either order; neither is the deploy's newest state.
+    A run started again with no conclusion yet is: it is waited on."""
+    deploy_run(root, "d1", "success", "2026-11-25T10:00:00Z")
+    for n, action in enumerate(skipped_action_order):
+        deploy_run(root, f"s{n}", "skipped", "2026-11-25T11:00:00Z", action=action)
+    request = parse_request(deployment=f"eerovil/agentdeck@{SHA}", name="deploy")
+    request.pop("timeout_s")
+    probe = WakeRequest(id="", session_key="k", chat_id="", **request)
+    ended = service.seen_deploy_result(probe)
+    assert ended is not None and ended.state == "success"
+    deploy_run(root, "r1", "", "2026-11-25T12:00:00Z", action="created")
+    assert service.seen_deploy_result(probe) is None
+
+
 def test_a_deck_deploy_wait_wakes_once_the_running_deck_includes_the_commit(root, scheduled):
     asked = []
 
@@ -1227,6 +1295,15 @@ async def test_a_live_read_says_what_the_commit_checks_finished_with():
         request, reading([{**done, "name": "test", "conclusion": "success"}], [])
     )
     assert runs_only.ci and runs_only.state == "success"
+    # #4726: the statuses a result rests on are named, so a repository that names its deploy
+    # status can tell they are CI; a name on the wait filters them as it filters the result.
+    assert green.statuses == ("drone",) and runs_only.statuses == ()
+    both = [{"context": "drone/pr", "state": "success"}, {"context": "Vercel", "state": "success"}]
+    assert (await read_live(request, reading([], both))).statuses == ("drone/pr", "Vercel")
+    named = WakeRequest(
+        id="w", session_key="k", chat_id="k", kind="commit", repository="o/r", sha=SHA, name="pr"
+    )
+    assert (await read_live(named, reading([], both))).statuses == ("drone/pr",)
     # A skipped job says nothing; a failing status is the result.
     red = await read_live(
         request,
@@ -1496,6 +1573,34 @@ async def test_a_review_chat_closed_on_github_with_no_verdict_is_asked_again(
     assert answered.id not in {item.id for item in service.registry.all()}, "its verdict won"
 
 
+@pytest.mark.parametrize(
+    ("deploy", "context", "expected"),
+    [
+        ("promote/production", "continuous-integration/drone/pr", True),
+        ("promote/production", "continuous-integration/drone/push", True),
+        ("promote/production", "continuous-integration/drone/promote/production", False),
+        ("promote/production", "continuous-integration/drone/promote/staging", False),
+        ("Promote/Production", "ci/PROMOTE-staging", False),
+        ("promote/production", "Continuous-Integration/Drone/PR", True),  # whatever the case
+        ("promote/production", "ci/promoted", False),  # not a build of a pull request or push
+        ("promote/production", "Vercel", False),  # another service's status may be a deploy
+        ("promote/production", "ci/pusher", False),  # a whole word, not a substring
+        # The manifest may write the deploy's whole name: a build is still a build.
+        ("drone/promote/production", "continuous-integration/drone/pr", True),
+        ("drone/push", "continuous-integration/drone/push", False),  # the deploy itself
+        ("", "continuous-integration/drone/pr", False),  # no deploy named: nothing is sure
+        ("///", "continuous-integration/drone/pr", False),
+        ("promote/production", "", False),
+        ("Vercel", "Vercel", False),
+    ],
+)
+def test_a_commit_status_is_ci_only_beside_a_named_deploy_of_another_kind(
+    deploy, context, expected
+):
+    """#4726: with the status names real Drone repositories report."""
+    assert status_is_ci(deploy, context) is expected
+
+
 def test_green_ci_on_a_ready_head_and_an_already_told_merge_end_without_a_message(
     root, scheduled, clock
 ):
@@ -1557,6 +1662,40 @@ def test_green_ci_on_a_ready_head_and_an_already_told_merge_end_without_a_messag
     deliver(root, event="status", delivery="p2", state="success", sha=SHA, context="Vercel")
     drain(service)
     assert len(scheduled) == 3 and "commit status Vercel" in scheduled[2].text
+    # #4726: Drone reports CI as a commit status. Where the manifest names the deploy status,
+    # a green status that is not of its kind is CI the deck settles; the deploy and its
+    # staging sibling, a red one, and any status in a repository naming no deploy still wake.
+    drone = "continuous-integration/drone/"
+    names = {"eerovil/agentdeck": "promote/production"}
+    service._deploy_name = lambda repository: names.get(repository, "")
+
+    def commit_status(delivery, context, state="success", name=""):
+        fields = {"name": name} if name else {}
+        register(service, commit=f"eerovil/agentdeck@{SHA}", **fields)
+        deliver(root, event="status", delivery=delivery, state=state, sha=SHA, context=context)
+        drain(service)
+
+    commit_status("d1", drone + "pr")
+    commit_status("d2", drone + "push", name="drone/push")
+    assert len(scheduled) == 3 and service.registry.all() == ()
+    commit_status("d3", drone + "promote/production")
+    commit_status("d4", drone + "promote/staging")
+    commit_status("d5", drone + "pr", state="failure")
+    assert [item.text.split(" finished: ")[0].split()[-3] for item in scheduled[3:]] == [
+        drone + "promote/production",
+        drone + "promote/staging",
+        drone + "pr",
+    ]
+    names.clear()
+    commit_status("d6", drone + "pr")
+    assert len(scheduled) == 7, "no deploy name: any status may be the deploy"
+    names["eerovil/agentdeck"] = "promote/production"
+    ready[0] = False
+    commit_status("d7", drone + "pr")
+    assert len(scheduled) == 8, "a draft's green status still wakes"
+    del scheduled[3:]
+    ready[0] = True
+    service._deploy_name = lambda repository: ""
     ready[0] = False  # a draft, or a head the cache does not know
     register(service, commit=f"eerovil/agentdeck@{SHA}")
     status("g2", "success")
@@ -2720,6 +2859,12 @@ async def test_a_check_runs_its_shell_command_and_is_stopped_at_its_time_limit(
     account = {"CLAUDE_CONFIG_DIR": "/acct"}
     _, output, _ = await run_check('echo "$CLAUDE_CONFIG_DIR"', "", 5, env=account)
     assert output.strip() == "/acct"
+    # #4662: it reaches GitHub as a job does, the caching ``gh`` first on PATH and git
+    # through AgentDeck's credential helper.
+    monkeypatch.setenv("AGENTDECK_GH_SHIM_DIR", str(tmp_path / "shim"))
+    _, output, _ = await run_check('echo "$PATH"; echo "[$GIT_CONFIG_COUNT]"', "", 5)
+    first, count = output.splitlines()[:2]
+    assert first.split(":")[0] == str(tmp_path / "shim") and count not in {"[]", "[0]"}
 
 
 ACCOUNT_SERVER = r"""
@@ -2884,6 +3029,43 @@ def test_a_finished_check_is_seen_in_each_ci_shape_until_it_runs_again(root, mon
     run("check_run", 6, done=True, at=t(1), name="untimed")
     run("check_run", 7, done=False, at="", name="untimed")
     assert seen("tie") is None and seen("untimed") is None
+
+
+@pytest.mark.anyio
+async def test_the_api_tells_a_named_deploy_check_run_already_ended(tmp_path):
+    """#4662: a named deploy on a commit that already ended as a check run is told at
+    registration: a success keeps no wait, a failure is said and the wait is kept for a deploy
+    run again, and a wait with no commit is about later deploys only."""
+    config = AppConfig(
+        history=HistoryConfig(db_path=str(tmp_path / "budgets.db")),
+        restart_nudge=RestartNudgeConfig(file=str(tmp_path / "restart-nudge.json")),
+        github_webhook=GitHubWebhookConfig(state_dir=str(tmp_path / "github-webhooks")),
+        accounts=[
+            AccountConfig(provider="claude_code", label="alt", config_dir=str(tmp_path / "alt"))
+        ],
+    )
+    app = create_app(config)
+    key = "claude_code:alt:fresh"
+    streams = tmp_path / "github-webhooks"
+    name = "deploy-cloudflare"
+    deploy_run(streams, "d1", "success", "2026-11-25T10:00:00Z", name=name)
+    deploy_run(streams, "d2", "failure", "2026-11-25T10:00:00Z", sha="b" * 40, name=name)
+    app.state.app_state.session_key_has_token = lambda candidate: candidate == key
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        url = f"/api/sessions/{key}/wake-on"
+        done = await client.post(url, json={"deployment": f"eerovil/agentdeck@{SHA}", "name": name})
+        failed = await client.post(
+            url, json={"deployment": f"eerovil/agentdeck@{'b' * 40}", "name": name}
+        )
+        later = await client.post(url, json={"deployment": "eerovil/agentdeck", "name": name})
+        held = (await client.get(url)).json()
+    assert done.json()["already_happened"] is True
+    assert "finished: success" in done.json()["result"]
+    assert "finished: failure" in failed.json()["already_failed"]
+    assert not failed.json().get("already_happened")
+    assert not later.json().get("already_happened") and "already_failed" not in later.json()
+    ids = {wait["id"] for wait in held["waits"]}
+    assert ids == {failed.json()["registered"]["id"], later.json()["registered"]["id"]}
 
 
 @pytest.mark.anyio
@@ -3086,6 +3268,20 @@ async def test_the_api_registers_lists_and_cancels_a_wait(tmp_path, monkeypatch)
             json={"pull_request": "eerovil/agentdeck#9", "note": "no verdict", "no_verdict": True},
         )
         after_busy = await client.get(f"/api/sessions/{key}/wake-on")
+
+        async def stopped(repository, number, note="", *, no_verdict=False):
+            # #4658: a start that stopped on a carried pass ended the wait meanwhile; the
+            # request's review needs one, so the reply names a wait that is live.
+            registry = app.state.wake_on.registry
+            registry.remove([item.id for item in registry.all() if item.kind == "review"])
+            return {"pull_request": f"{repository}#{number}", "outcome": "pending"}
+
+        app.state.work_router = SimpleNamespace(enabled=True, ask_again=stopped)
+        renewed = await client.post(
+            f"/api/sessions/{key}/review-request",
+            json={"pull_request": "eerovil/agentdeck#9", "note": "the owner decided"},
+        )
+        after_renewed = await client.get(f"/api/sessions/{key}/wake-on")
         accepts = []
 
         async def accept(repository, number, note):
@@ -3335,6 +3531,34 @@ async def test_the_api_registers_lists_and_cancels_a_wait(tmp_path, monkeypatch)
             f"/api/sessions/{key}/review-accepted",
             json={"pull_request": "eerovil/agentdeck#9", "note": " "},
         )
+        # #4797: the owner left #9's Ship now findings as shipped. Once it merged, its acceptance
+        # records that no fix follows and asks the router for no pass: it has one.
+        # Registered for no Work by name, it is the chat's own Work's (``_pull_work``).
+        assert not next(
+            ref for ref in state.pull_requests_for(key) if ref.number == 9
+        ).work_id
+        # Still open, it is the usual acceptance: findings at a newer head need their pass.
+        open_accept = await client.post(
+            f"/api/sessions/{key}/review-accepted",
+            json={"pull_request": "eerovil/agentdeck#9", "note": "accept the new findings"},
+        )
+        assert open_accept.status_code == 200 and "declined" not in open_accept.text
+        assert state.shipped_by_work("eerovil/agentdeck#7")[0].fix == "eerovil/agentdeck#11"
+        accepts.pop()
+        pull_states["eerovil/agentdeck#9"] = "MERGED"
+        from agentdeck.state import REVIEWS_TOPIC
+
+        drawn = state.bus.revision(REVIEWS_TOPIC)
+        declined = await client.post(
+            f"/api/sessions/{key}/review-accepted",
+            json={"pull_request": "eerovil/agentdeck#9", "note": "leave it as shipped"},
+        )
+        assert declined.status_code == 200, declined.text
+        # The Work page redraws: its Shipped line for #9 goes.
+        assert state.bus.revision(REVIEWS_TOPIC) > drawn
+        assert declined.json()["outcome"].startswith("fix declined")
+        [record] = state.shipped_by_work("eerovil/agentdeck#7")
+        assert record.fix == "declined"
         after_accept = await client.get(f"/api/sessions/{key}/wake-on")
         # #4016: the request crosses the services socket to the router and back, as it does
         # once the router runs in agentdeck-services.service.
@@ -3403,6 +3627,9 @@ async def test_the_api_registers_lists_and_cancels_a_wait(tmp_path, monkeypatch)
     assert [item["kind"] for item in after_cap.json()["waits"]] == ["pull_request"]
     assert busy.status_code == 200 and busy.json()["outcome"] == "already asked", busy.text
     assert [item["kind"] for item in after_busy.json()["waits"]] == ["pull_request", "review"]
+    assert busy.json()["registered"]["id"] == after_busy.json()["waits"][-1]["id"]
+    assert renewed.json()["registered"]["id"] == after_renewed.json()["waits"][-1]["id"]
+    assert renewed.json()["registered"]["id"] != busy.json()["registered"]["id"]
     assert accepted.status_code == 200, accepted.text
     assert accepted.json()["outcome"] == "review pass recorded"
     assert blank_accept.status_code == 422 and "decision" in blank_accept.text
@@ -3518,6 +3745,24 @@ def test_a_later_deploy_that_contains_a_killed_merge_wakes_its_wait(
     assert [m.id for m in scheduled] == [f"wake-on:{request.id}"]
     assert f"contains {SHA[:12]}" in scheduled[0].text and "success" in scheduled[0].text
     assert following.registry.all() == ()
+
+
+def test_a_later_commit_whose_deploy_check_run_succeeded_wakes_its_wait(
+    root, following, scheduled, clock, compared
+):
+    """#4662 D6: a later commit's deploy that reports as a check run counts as #4445's later
+    deploy for a named wait; a skipped run on that commit does not."""
+    request = register(
+        following, deployment=f"eerovil/agentdeck@{SHA}", name="deploy", timeout_minutes=120
+    )
+    compared["answers"][LATER] = True
+    deploy_run(root, "s1", "skipped", _at(clock, 30), sha=LATER, action="created")
+    drain(following)
+    assert scheduled == []
+    deploy_run(root, "d1", "success", _at(clock, 60), sha=LATER)
+    drain(following)
+    assert [m.id for m in scheduled] == [f"wake-on:{request.id}"]
+    assert f"contains {SHA[:12]}" in scheduled[0].text
 
 
 def test_a_deploy_from_before_the_wait_is_found_by_its_first_scan(
@@ -3736,3 +3981,106 @@ def test_a_rerun_that_fails_again_and_a_second_failing_check_are_told(
     following.expire_due()
     assert len(scheduled) == 3 and len({m.id for m in scheduled}) == 3
     assert all(m.id.startswith(f"wake-on:build-failed:{request.id}:") for m in scheduled)
+
+
+def test_a_merged_wake_of_the_works_own_chat_is_held_for_the_decks_merged_message(
+    root, scheduled, clock
+):
+    """#4753: the release tells the chat that owns a Work of the merge itself, usually seconds
+    after the chat's own merge wait would: that wake is held three minutes, and ended without
+    a message by whichever of the two reaches the wait first."""
+    owned: list[bool] = [True]
+    notices: list[str] = []
+    service = settling_service(
+        root,
+        scheduled,
+        clock,
+        owns_pull=lambda request: owned[0],
+        release_notices=lambda chat_id, since: list(notices),
+    )
+    registry = service.registry
+    chat = "claude_code:alt:one"
+    clock.now -= 2 * MERGE_TOLD_S  # each delivery below is received after its wait began
+
+    def merged(delivery, number=12, was_merged=True):
+        deliver(
+            root,
+            event="pull_request",
+            delivery=delivery,
+            action="closed",
+            number=number,
+            pull_request={"number": number, "merged": was_merged},
+        )
+        drain(service)
+
+    def held():
+        return [(item.number, bool(item.held_text), item.deadline) for item in registry.all()]
+
+    # Held, not sent; registered again or delivered again, it keeps its short deadline.
+    first = register(service, pull_request="eerovil/agentdeck#12")
+    merged("h1")
+    due = clock.now + MERGE_HOLD_S
+    assert scheduled == [] and held() == [(12, True, due)]
+    assert service.next_due() == due
+    assert register(service, pull_request="eerovil/agentdeck#12").id == first.id
+    merged("h1b")
+    service.expire_due()
+    assert scheduled == [] and held() == [(12, True, due)]
+    # The release tells the chat first: the wait ends, and no wake told the chat.
+    register(service, "claude_code:alt:two", pull_request="eerovil/agentdeck#12")
+    register(service, pull_request="eerovil/agentdeck#13")
+    assert registry.end_merge_waits(chat, ["EeroVil/AgentDeck#12"]) == 1
+    assert [(item.chat_id, item.number) for item in registry.all()] == [
+        ("claude_code:alt:two", 12),
+        (chat, 13),
+    ], "only that chat's wait on that merge"
+    registry.remove(item.id for item in registry.all())
+    assert scheduled == [] and registry.end_merge_waits(chat, []) == 0
+    # The deck's message reached the chat before the hold ran out: gone quietly.
+    register(service, pull_request="eerovil/agentdeck#12")
+    merged("h2")
+    notices.append("work-release:eerovil/agentdeck#7:live-check:eerovil/agentdeck#12")
+    clock.now += MERGE_HOLD_S
+    service.expire_due()
+    assert scheduled == [] and registry.all() == ()
+    # No message from the deck (another pull request of the Work is still open, or the
+    # release is late): the wake is sent once, and says the deck's message is still to come.
+    notices.clear()
+    register(service, pull_request="eerovil/agentdeck#12")
+    merged("h3")
+    clock.now += MERGE_HOLD_S - 1
+    service.expire_due()
+    assert scheduled == []
+    clock.now += 1
+    service.expire_due()
+    service.expire_due()
+    assert len(scheduled) == 1 and registry.all() == ()
+    assert "agentdeck#12 was merged" in scheduled[0].text
+    assert scheduled[0].text.endswith(MERGE_HOLD_SUFFIX)
+    # Claimed for sending, then the release, which reads the file from its own process: the
+    # wake the wait owes stays, and is sent once.
+    again = register(service, pull_request="eerovil/agentdeck#12")
+    merged("h4")
+    claimed = registry.claim_held(again.id)
+    assert claimed is not None and claimed.pending_text.endswith(MERGE_HOLD_SUFFIX)
+    assert registry.claim_held(again.id) is None, "claimed once"
+    assert WakeOnRegistry(registry.path).end_merge_waits(chat, ["eerovil/agentdeck#12"]) == 0
+    assert [item.id for item in registry.all()] == [again.id]
+    service.expire_due()
+    assert len(scheduled) == 2 and registry.all() == ()
+    # The release first, then the hold's end: nothing left to claim, nothing sent.
+    register(service, pull_request="eerovil/agentdeck#13")
+    merged("h5", 13)
+    waiting = registry.all()[0]
+    registry.end_merge_waits(chat, ["eerovil/agentdeck#13"])
+    service._end_hold(waiting)
+    assert len(scheduled) == 2 and registry.all() == ()
+    # Closed without a merge, or a chat that does not own the Work: woken at once, as before.
+    register(service, pull_request="eerovil/agentdeck#14")
+    merged("h6", 14, was_merged=False)
+    assert len(scheduled) == 3 and MERGE_HOLD_SUFFIX not in scheduled[2].text
+    owned[0] = False
+    register(service, pull_request="eerovil/agentdeck#15")
+    merged("h7", 15)
+    assert len(scheduled) == 4 and MERGE_HOLD_SUFFIX not in scheduled[3].text
+    assert registry.all() == ()

@@ -237,6 +237,17 @@ RECOVER_UNCERTAIN_NOTE = (
 #: A merge wait ends with no message when the release's own merge notice reached the same chat
 #: this recently (#4253): the chat already heard of the merge.
 MERGE_TOLD_S = 30 * 60.0
+#: How long a merged wake of the chat that owns the pull request's Work is held for the deck's
+#: own merged message (#4753). Read from a week of real wakes: where that message came after
+#: the wake and the merge left the Work nothing open, it came within 102 seconds, 55 times of
+#: 55.
+MERGE_HOLD_S = 180.0
+#: What a held wake sent after all adds, as the deck's own merged message never came.
+MERGE_HOLD_SUFFIX = (
+    " The deck's own merged message has not come yet. If this merge leaves no pull request"
+    " of your Work open, that message follows with the live-check steps: do not close the"
+    " issue before it, and if your turn ends first, end it on a short time wait for it."
+)
 #: The release's merge notice: ``work-release:<work>:live-check:<owner/repo#n,...>``.
 RELEASE_NOTICE_PREFIX = "work-release:"
 LIVE_CHECK_KEY = ":live-check:"
@@ -277,6 +288,11 @@ _CI_EVENTS = {"check_suite", "check_run", "workflow_run", "status"}
 #: deploy that runs only on ``main``. An unnamed commit wait woke on one and its agent had to
 #: read the checks by hand and wait again (#3910); a wait naming the check still takes it.
 _NO_RESULT = frozenset({"skipped", "neutral"})
+#: A check run that is a deploy ends one of these ways, ``timed_out`` told as a failure
+#: (#4662). ``skipped``, ``neutral``, ``cancelled``, ``stale`` and ``action_required`` are no
+#: deploy ending: a Cloudflare ``deploy-cloudflare`` job is skipped on every pull request, and a
+#: cancelled one leaves the wait to #4445's later commits.
+_DEPLOY_RUN_ENDINGS = {"success": "success", "failure": "failure", "timed_out": "failure"}
 
 _REPOSITORY_RE = re.compile(r"^([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)$")
 #: An ``owner/repo#n`` or ``repo#n`` in a reviewer's closing line.
@@ -333,6 +349,9 @@ class WakeRequest:
     #: behalf (#4253): the live check after a merge, carried by the deploy wait the deck
     #: registered instead of asking the chat to. "" on a wait the chat registered itself.
     then: str = ""
+    #: The merged wake held for the deck's own merged message (#4753): its text, sent at the
+    #: wait's deadline unless the release ended the wait first. "" on any other wait.
+    held_text: str = ""
     #: A finished non-success check on a deployment wait's own commit (#4445): its words, the
     #: check (``event:name``), its own time, and whether the chat was told. A check that
     #: passes again later clears it (``WakeOnRegistry.note_failed``).
@@ -800,6 +819,10 @@ class Outcome:
     #: a deployment status or, like Vercel, as a commit status, so neither is CI here; only
     #: surely-CI green on a ready head is the deck's own to settle (#4253, ``CI_EVENTS``).
     ci: bool = False
+    #: The names of the commit statuses the result rests on. In a repository whose manifest
+    #: names its deploy status, a pull request's or a push's build is CI too (#4726,
+    #: ``status_is_ci``).
+    statuses: tuple[str, ...] = ()
 
 
 def match(request: WakeRequest, delivery: Delivery) -> Outcome | None:
@@ -820,11 +843,19 @@ def match(request: WakeRequest, delivery: Delivery) -> Outcome | None:
     # commit status; a check suite or workflow run is CI, and can finish before the
     # deploy it belongs to does. A commit status is also how CI such as Drone reports,
     # so a deployment wait takes one only when a name says which status is the deploy.
+    # A deploy that is one job of a workflow (such as ``deploy-cloudflare``) is a check
+    # run, taken the same way: only by name, and only when it ended as a deploy ends
+    # (``deploy_run_ending``, #4662).
     if request.kind == KIND_DEPLOYMENT:
-        if delivery.event == "status" and not request.name:
+        if delivery.event in {"status", "check_run"} and not request.name:
             return None
-        if delivery.event not in {"deployment_status", "status"}:
+        if delivery.event not in {"deployment_status", "status", "check_run"}:
             return None
+        if delivery.event == "check_run":
+            ending = deploy_run_ending(payload)
+            if ending is None:
+                return None
+            conclusion = ending
     if request.sha and not sha.lower().startswith(request.sha):
         return None
     if request.name and not _name_matches(request.name, name):
@@ -837,7 +868,32 @@ def match(request: WakeRequest, delivery: Delivery) -> Outcome | None:
     )
     if url:
         summary += f" ({url})"
-    return Outcome(summary, conclusion.lower(), ci=delivery.event in CI_EVENTS)
+    return Outcome(
+        summary,
+        conclusion.lower(),
+        ci=delivery.event in CI_EVENTS,
+        statuses=(name,) if delivery.event == "status" else (),
+    )
+
+
+#: The last word of a commit status that reports a build of a pull request or of a push.
+BUILD_ENDS = (["pr"], ["push"])
+
+
+def status_is_ci(deploy_name: str, context: str) -> bool:
+    """Whether the commit status ``context`` is surely CI in a repository whose production
+    deploy reports as the status ``deploy_name`` (``[[repos]] deploy_name``, #4726).
+
+    Drone reports its pull-request and push builds as commit statuses
+    (``continuous-integration/drone/pr``, ``…/push``), and its deploys too
+    (``…/drone/promote/production``, ``…/drone/promote/staging``). Only a status whose name
+    ends in the word ``pr`` or ``push`` is a build; every other one (a promotion, or another
+    service's such as Vercel's) may be a deploy and still wakes the chat, and so does one that
+    carries the deploy name, however long the manifest writes it. Without a deploy name
+    nothing is sure, so none is CI, as before."""
+    have = _words(context)
+    named = deploy_name.strip().lower()
+    return bool(_words(named)) and named not in context.lower() and have[-1:] in BUILD_ENDS
 
 
 _WORD_RE = re.compile(r"[^\W_]+")
@@ -1284,6 +1340,26 @@ def _tail_records(
     return records
 
 
+def deploy_run_ending(payload: dict) -> str | None:
+    """How a check run delivery ended as a deploy (``success`` or ``failure``), else
+    ``None``: not finished, or finished some way that is no deploy ending (#4662)."""
+    run = payload.get("check_run")
+    if not isinstance(run, dict):
+        return None
+    return _DEPLOY_RUN_ENDINGS.get(_text(run.get("conclusion")).lower())
+
+
+def _not_a_deploy(event: str, payload: dict) -> bool:
+    """Whether a check run record holds a conclusion that is no deploy ending, whatever its
+    action: GitHub sends a skipped run as a ``created`` delivery already concluded, and a
+    second ``completed`` one (#4662 design review). One with no conclusion yet is running."""
+    if event != "check_run":
+        return False
+    run = payload.get("check_run")
+    concluded = isinstance(run, dict) and bool(_text(run.get("conclusion")))
+    return concluded and deploy_run_ending(payload) is None
+
+
 def _subject(event: str, payload: dict) -> tuple[str, str, datetime | None]:
     """``(sha, name, when)`` a CI delivery is about, finished or not; ``when`` is the
     source's own time of that state (``None`` when it has none that parses)."""
@@ -1349,7 +1425,8 @@ def seen_deploy_result(
     else ``None``: what the wait's timeout reads (#4080).
 
     It takes what the wait itself takes: a failure as well as a success, a commit status
-    when the wait has a name, and any commit when it names none. The newest state of each
+    or a check run that ended as a deploy ends when the wait has a name (#4662), and any
+    commit when it names none. The newest state of each
     environment decides, as in ``seen_result``, so a failed deploy after a good one is told
     as failed and one running again is waited on; for a named wait everything the name
     matches counts as one deploy, across both events. A wait with no commit is about deploys
@@ -1357,7 +1434,9 @@ def seen_deploy_result(
     """
     if request.kind != KIND_DEPLOYMENT:
         return None
-    events = {"deployment_status", "status"} if request.name else {"deployment_status"}
+    events = (
+        {"deployment_status", "status", "check_run"} if request.name else {"deployment_status"}
+    )
     return _newest_outcome(streams_root, request, events, tail_bytes)
 
 
@@ -1374,6 +1453,8 @@ def _newest_outcome(
         ):
             continue
         if not request.sha and when is not None and when.timestamp() < request.registered_at:
+            continue
+        if request.kind == KIND_DEPLOYMENT and _not_a_deploy(delivery.event, delivery.payload):
             continue
         # A named deploy can report by commit status and by deployment status, under
         # different words, and both are the one thing the wait names.
@@ -1648,8 +1729,15 @@ async def read_live(
         + (f"; not passing: {', '.join(failing[:5])}" if failing else "")
         + ")"
     )
-    # Only check runs read are surely CI: a commit status among them may be a deploy.
-    return Outcome(summary, state, ci=not has_status)
+    # Only check runs read are surely CI: a commit status among them may be a deploy, unless
+    # the repository names its deploy status and these are not of its kind (#4726).
+    names = tuple(
+        _text(status.get("context"))
+        for status in statuses.get("statuses") or []
+        if isinstance(status, dict)
+        and (not request.name or _name_matches(request.name, _text(status.get("context"))))
+    )
+    return Outcome(summary, state, ci=not has_status, statuses=names)
 
 
 def merge_notice_told(message_ids: Iterable[str], pull: str) -> bool:
@@ -1985,6 +2073,7 @@ async def run_check(
     check runs as its chat's account (``WakeOnService``'s ``check_env``, built by
     ``check_account_env``), and with none named ``agentdeck mcp-call`` refuses.
     """
+    from . import gh_shim, github_identity
     from .mcp_call import MCP_CONFIG_ENV
 
     # Never the web's own account: with no ``env`` naming one, ``mcp-call`` refuses.
@@ -1993,6 +2082,11 @@ async def run_check(
     }
     environment[MCP_CONFIG_ENV] = ""
     environment.update(env or {})
+    # A check reaches GitHub as a queued job does (#4274, #4662): the caching ``gh`` first on
+    # PATH and AgentDeck's credential helper for git. Without them the web's PATH held only
+    # the real ``gh``, with no login, so the ``gh`` read the waits guide suggests exited 4.
+    environment["PATH"] = gh_shim.worker_path(environment)
+    github_identity.configure_github_git(environment)
     try:
         process = await asyncio.create_subprocess_exec(
             "/bin/bash",
@@ -2101,7 +2195,8 @@ class WakeOnRegistry:
                         # landed between the two registrations, and is not tailed yet,
                         # still counts.
                         session_key=request.session_key,
-                        deadline=request.deadline,
+                        # A held merged wake keeps its own short deadline (#4753).
+                        deadline=held.deadline if held.held_text else request.deadline,
                         # Registered again after its review chat stopped: a fresh wait.
                         stopped="",
                         cut_from=0.0,
@@ -2376,6 +2471,44 @@ class WakeOnRegistry:
             self._answered.get(f"{chat_id}|*", 0.0),
         )
 
+    def claim_held(self, request_id: str) -> WakeRequest | None:
+        """Take a held merged wake to send it (#4753): its text becomes the message the wait
+        owes. One locked step on the wait as it is held now, so the release ending the wait
+        (``end_merge_waits``) and this never both win: None when the wait is gone or holds
+        nothing."""
+        with self._file.locked():
+            current = list(self.all())
+            for index, held in enumerate(current):
+                if held.id == request_id and held.held_text and not held.pending_text:
+                    current[index] = replace(held, pending_text=held.held_text, held_text="")
+                    self._save(current)
+                    return current[index]
+        return None
+
+    def end_merge_waits(self, chat_id: str, pulls: Iterable[str]) -> int:
+        """End ``chat_id``'s own waits on these merges without a message: the deck told it
+        of them itself (#4253, #4753). How many ended.
+
+        One locked step that reads each wait as it is held now (#4753 design review): a wait
+        that owes its message (``claim_held``, or a wake not saved yet) stays until sent.
+        """
+        wanted = {str(pull).casefold() for pull in pulls}
+        with self._file.locked():
+            current = list(self.all())
+            kept = [
+                item
+                for item in current
+                if not (
+                    item.kind == KIND_PULL_REQUEST
+                    and item.chat_id == chat_id
+                    and not item.pending_text
+                    and f"{item.repository}#{item.number}".casefold() in wanted
+                )
+            ]
+            if len(kept) != len(current):
+                self._save(kept)
+            return len(current) - len(kept)
+
     def remove(self, ids: Iterable[str]) -> int:
         doomed = set(ids)
         with self._file.locked():
@@ -2556,7 +2689,9 @@ class WakeOnService:
         ask_review: Callable[[str, int, str], Awaitable[str]] | None = None,
         recover_review: Callable[[str, int], Awaitable[str]] | None = None,
         ready_head: Callable[[WakeRequest], bool] = lambda request: False,
+        deploy_name: Callable[[str], str] = lambda repository: "",
         release_notices: Callable[[str, datetime], Iterable[str]] = lambda chat_id, since: (),
+        owns_pull: Callable[[WakeRequest], bool] = lambda request: False,
         check_env: Callable[[str], dict[str, str]] = lambda session_key: {},
         note: Callable[[str, str, str], bool] | None = None,
         compare: Callable[[str, str, str], Awaitable[bool]] | None = None,
@@ -2599,7 +2734,14 @@ class WakeOnService:
         self._recover_review = recover_review
         self._recovery_uncertain: dict[str, float] = {}
         self._ready_head = ready_head
+        # The commit status a repository's manifest names as its production deploy, or ""
+        # (#4726): its other green statuses on a ready head are CI the deck settles too.
+        self._deploy_name = deploy_name
         self._release_notices = release_notices
+        # Whether a merge wait's chat owns the Work of its pull request, in a repository the
+        # release merges (#4753): the release then tells it of the merge itself, so the wake
+        # is held for that message (``MERGE_HOLD_S``).
+        self._owns_pull = owns_pull
         # Waits a read or a re-ask is settling now: ``expire_due`` and ``next_due`` leave them.
         self._settling: set[str] = set()
         self._side_tasks: set[asyncio.Task] = set()
@@ -2686,6 +2828,10 @@ class WakeOnService:
     def seen_result(self, request: WakeRequest) -> Outcome | None:
         """``seen_result`` over this service's streams."""
         return seen_result(self._streams_root, request)
+
+    def seen_deploy_result(self, request: WakeRequest) -> Outcome | None:
+        """``seen_deploy_result`` over this service's streams."""
+        return seen_deploy_result(self._streams_root, request)
 
     def _seen_at_timeout(self, request: WakeRequest) -> Outcome | None:
         """What the deck already holds for a wait at its timeout, else ``None``: the delivery
@@ -2982,6 +3128,9 @@ class WakeOnService:
                 continue
             if request.pending_text:
                 self._fire(request, request.pending_text)
+            elif request.held_text:
+                if request.deadline <= now:
+                    self._end_hold(request)
             elif request.reopen_owed:
                 if reopen_due(request, now):
                     self._settle(request, self._reopen_watch)
@@ -3426,13 +3575,17 @@ class WakeOnService:
         on the head of a ready pull request the release merges or merged (a deploy's result
         at that head still wakes it), or a merge the release's own
         notice told the chat of in the last ``MERGE_TOLD_S``."""
+        if request.held_text:
+            return  # held already: a delivery read again changes nothing
         quiet = ""
+        hold = False
         try:
             if (
                 request.kind == KIND_COMMIT
-                and outcome.ci
                 and outcome.state == "success"
+                and (outcome.ci or outcome.statuses)
                 and self._ready_head(request)
+                and self._surely_ci(request, outcome)
             ):
                 quiet = "green on the head of a ready pull request the deck merges"
             elif request.kind == KIND_PULL_REQUEST and outcome.state == "merged":
@@ -3440,6 +3593,8 @@ class WakeOnService:
                 ids = self._release_notices(request.chat_id, since)
                 if merge_notice_told(ids, f"{request.repository}#{request.number}"):
                     quiet = "the deck's own merge notice already told the chat"
+                else:
+                    hold = bool(self._owns_pull(request))
         except Exception:  # noqa: BLE001 - an unread cache wakes the chat as before
             log.warning("wake-on: could not tell whether %s is settled", request.id, exc_info=True)
         if quiet:
@@ -3459,7 +3614,49 @@ class WakeOnService:
             self.registry.remove([request.id])
             self._forget(request.id)
             return
-        self._fire(request, fired_message(request, outcome, read=read))
+        text = fired_message(request, outcome, read=read)
+        if hold:
+            # The release tells this chat of the merge itself, usually seconds later
+            # (#4753): held on the wait, which the release ends when it does.
+            held = self.registry.revise(
+                request.id,
+                request.deadline,
+                held_text=text + MERGE_HOLD_SUFFIX,
+                deadline=self._clock() + MERGE_HOLD_S,
+            )
+            if held is not None:
+                log.info("wake-on: holding %s's merged wake for the deck's message", request.id)
+                return
+            if not any(item.id == request.id for item in self.registry.all()):
+                return  # ended in between, by the release telling the chat
+        self._fire(request, text)
+
+    def _end_hold(self, request: WakeRequest) -> None:
+        """A held merged wake at its deadline (#4753): gone quietly when the deck's merged
+        message reached the chat, else claimed and sent."""
+        pull = f"{request.repository}#{request.number}"
+        try:
+            since = datetime.now(UTC) - timedelta(seconds=MERGE_TOLD_S)
+            told = merge_notice_told(self._release_notices(request.chat_id, since), pull)
+        except Exception:  # noqa: BLE001 - an unread store wakes the chat
+            log.warning("wake-on: could not read notices for %s", request.id, exc_info=True)
+            told = False
+        if told:
+            log.info("wake-on: ended %s's held merged wake: the deck told the chat", request.id)
+            self.registry.remove([request.id])
+            self._forget(request.id)
+            return
+        claimed = self.registry.claim_held(request.id)
+        if claimed is not None:
+            self._fire(claimed, claimed.pending_text)
+
+    def _surely_ci(self, request: WakeRequest, outcome: Outcome) -> bool:
+        """Whether a green result is CI and no deploy: check runs alone (``Outcome.ci``), or
+        commit statuses that are all CI by the repository's deploy name (#4726)."""
+        if not outcome.statuses:
+            return outcome.ci
+        name = self._deploy_name(request.repository)
+        return bool(name) and all(status_is_ci(name, status) for status in outcome.statuses)
 
     def _keep_note(self, request: WakeRequest, note_id: str, text: str) -> bool:
         """Keep ``text`` for ``request``'s chat's next message, waking nothing (#4306). A note

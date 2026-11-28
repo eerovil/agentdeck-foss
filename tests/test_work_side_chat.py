@@ -324,6 +324,11 @@ async def test_new_chat_starts_once_in_the_works_checkout_and_joins_the_work(tmp
     assert "data-work-new-chat-open" in page.text
     assert f'data-work-new-chat-folder="{checkout.resolve()}"' in page.text
 
+    # A secret is never a new chat's first message (#4610), and the press stays free.
+    secret = await _post(app, _press("side-chat-0001", "/secret TOKEN hunter2"))
+    assert secret.status_code == 422 and "hunter2" not in secret.text
+    assert starts == []
+
     first = await _post(app, _press("side-chat-0001"))
     assert first.status_code == 202, first.text
     assert first.headers["X-AgentDeck-New-Chat"] == "started"

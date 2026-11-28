@@ -179,7 +179,9 @@ def test_session_guide_requires_concise_updates_and_handoffs_for_every_role():
 #: first push, before any checklist that could carry it. 24_950 since #4579: the owner
 #: approved one Work line telling the agent to report a deck it thinks is wrong (`deck-bug`)
 #: rather than override it; it is needed every turn, so it cannot move to a guide topic.
-SESSION_GUIDE_BUDGET_CHARS = 24_950
+#: 25_600 since #4679: the owner approved the price of each wish in a question, and pricing
+#: it again in the design and the code; both are needed at the moment of asking.
+SESSION_GUIDE_BUDGET_CHARS = 25_600
 
 
 def test_session_guide_stays_within_its_budget_and_points_at_every_topic(
@@ -358,6 +360,13 @@ def test_subagent_rule_reaches_every_claude_role():
         assert "anything you would finish in two or three calls: do it inline" in flat
         # Batching: fewer, broader legs rather than several narrow ones.
         assert "prefer one broad leg to several narrow ones" in flat
+        # One wake for all of them (#4727): a leg left in the background wakes the chat
+        # for a turn of its own, and 85 % of those turns only read the notice (#4707).
+        assert (
+            "prefer one broad leg to several narrow ones, all in one message with"
+            " `run_in_background: false`: a background leg wakes this chat for a turn of"
+            " its own." in flat
+        )
         # The substance #1572 requires kept: the justification is the cap, and
         # parent context is the near-free axis it is not.
         assert "The reason is the cap, not your context window" in flat
@@ -482,10 +491,7 @@ def test_a_claude_guide_names_the_token_variable_so_chats_share_their_cached_gui
     }
     assert guides["tok-123"] == guides["tok-456"]
     assert "tok-123" not in guides["tok-123"]
-    assert (
-        "`~/agentdeck/.venv/bin/agentdeck session-key $AGENTDECK_SESSION_TOKEN` as a command"
-        in guides["tok-123"]
-    )
+    assert "session token `$AGENTDECK_SESSION_TOKEN`" in " ".join(guides["tok-123"].split())
     assert SESSION_TOKEN_ENV == "AGENTDECK_SESSION_TOKEN"  # what the worker sets, and the text
 
 
@@ -511,6 +517,33 @@ def test_session_token_is_the_identity_a_codex_or_fresh_worker_chat_has():
         "chat's session key; it is not yours, so resolve your own from the token above "
         "before any call." in flat
     )
+    # A Work agent's first turn runs `bookkeep`, which prints the key: it is told that, not
+    # to spend a call of its own on the key (#4727). Every other role still needs the call,
+    # and so does a Codex Work: `bookkeep` reads the token from a variable its shell lacks.
+    work = " ".join(
+        agentdeck_session_instructions(
+            provider="claude_code", role="work", session_token="tok-123", origin=""
+        ).split()
+    )
+    assert "agentdeck session-key" not in work
+    assert (
+        "session token `$AGENTDECK_SESSION_TOKEN`. `~/agentdeck/.venv/bin/agentdeck bookkeep`"
+        " prints the session key it stands for as the `session_key` of its first line, with"
+        " or without a request, and every `<session-key>` below means that value; make no"
+        " call only to learn it"
+    ) in work
+    assert "it is not yours, so take your own from `bookkeep` before any call." in work
+    assert work.index("Your own session key") < work.index("pull-requests")
+    assert "agentdeck session-key tok-123` as a command of its own" in " ".join(
+        agentdeck_session_instructions(
+            provider="codex", role="work", session_token="tok-123", origin=""
+        ).split()
+    )
+    for provider in ("claude_code", "codex"):
+        for role in ("primary", "delegated"):
+            assert "agentdeck session-key" in agentdeck_session_instructions(
+                provider=provider, role=role, session_token="tok-123"
+            )
     # Without a token the guide must not imply the session has one.
     assert "agentdeck session-key" not in agentdeck_session_instructions(
         provider="claude_code", role="primary"
@@ -576,18 +609,21 @@ def test_work_session_guide_says_what_the_deck_reads_and_names_no_poller():
         # How to draw and screenshot moved to the checklist sent on ready (#4252).
         assert "`<!-- agentdeck-diagram -->`" not in flat
         assert LOOK_CHECK_LINE not in flat
-        assert "a diagram when it adds a new feature" in flat
+        # No diagram duty in the guide: only the owner's ask draws one (#4721).
+        assert "a diagram when it adds a new feature" not in flat
         # The bookkeeping in one call, and reads batched (#4254).
         assert "~/agentdeck/.venv/bin/agentdeck bookkeep" in flat
         assert "`--summary -`" in flat and "`--wake-on '<JSON body>'`" in flat
         assert "Read every file you already know you need in one call" in flat
+        # Big files in parts: about 2 % of a big read's lines are quoted later (#4767).
+        assert "except a file over about 10k characters: read it alone, in parts" in flat
         assert "Never merge a pull request yourself" in flat
         # #3437: a verified live check closes the issue, with no ask; a merge never does.
         assert "write `Refs #<issue>`, not `Closes`" in flat
         # ... unless the issue asks for `Closes`, as #3838 did (#3880).
         assert "unless the issue itself asks for `Closes`" in flat
         # Marking ready sends the pre-review checklist first (#3880).
-        assert "short pre-review checklist" in flat and "`pre-review-done`" in flat
+        assert "a pre-review checklist" in flat and "`pre-review-done`" in flat
         # The live check and the close are in the merge message (#4252).
         assert "close the issue yourself; the merge message says when to keep it open" in flat
         assert "check the change live and record it as that message says" in flat
@@ -599,11 +635,54 @@ def test_work_session_guide_says_what_the_deck_reads_and_names_no_poller():
         assert "beside the first full test run" in flat
         # The Work's issue, not the body's first reference; and room to run (#4567 helpers).
         assert "pre-review-helpers --cwd . --pull <pr> --issue <work issue>`" in flat
-        assert "background call with `timeout: 1800000`, in Codex escalated" in flat
+        # As a queued job, which a runtime restart does not kill (#4662).
+        assert "test run: `~/agentdeck/.venv/bin/agentdeck job submit --cwd <abs>" in flat
+        assert "1800000" not in flat
         # No poller duties: nothing dispatches this chat, so nothing is owed to one.
         assert "There is no control command and no terminal report to file" in flat
         assert "worker-control" not in flat
         assert "poller dispatch owns" not in flat
+
+
+def test_every_guide_prices_each_wish_and_only_a_work_prices_it_again():
+    """#4679: the owner chose a wish without knowing that it was most of the code."""
+    for provider in ("claude_code", "codex"):
+        for role in GUIDED_ROLES:
+            flat = " ".join(agentdeck_session_instructions(provider=provider, role=role).split())
+            assert "its own price and the version without it" in flat, role
+            assert "mark a price you only guessed" in flat, role
+            again = "Price the person's wishes again" in flat
+            assert again == (role == "work"), role
+            if again:
+                assert "Never ask under 200 lines. Over it, ask before going on" in flat
+                assert "about double what you told them (else your first estimate)" in flat
+                assert "one of several wishes is most of it and they were never told" in flat
+                assert "keep or leave out the dearest wish" in flat
+                assert "what each costs and what they lose" in flat
+                assert "Their answer is the new price told" in flat
+
+
+def test_the_replay_topic_says_when_to_suggest_one_and_stays_read_only():
+    """#4654: a Work agent is pointed at the replay rules before ready; the rest is served."""
+    for provider in ("claude_code", "codex"):
+        work = agentdeck_session_instructions(provider=provider, role="work")
+        flat = " ".join(work.split())
+        assert "read `GET $AGENTDECK_URL/api/guide/replay` before marking it ready" in flat
+        primary = agentdeck_session_instructions(provider=provider, role="primary")
+        assert "/api/guide/replay" not in primary
+    replay = " ".join(guide_topics()["replay"].split())
+    assert "suggesting sometimes, not on every change" in replay
+    assert "Not for look, text, a refactor" in replay
+    assert "what past data, and how many cases" in replay
+    assert "not be read from the same source as the rule" in replay
+    assert "what it cannot show" in replay and "what it costs the owner" in replay
+    assert "Read-only always: a local copy first" in replay
+    assert "only through a route already approved for it" in replay
+    assert "keep it a draft until they answer" in replay
+    assert "only a local copy needs no question: run it" in replay
+    assert "does not stop an HTTP request, a mail or a queue" in replay
+    assert "Explain every mismatch before marking the pull request ready" in replay
+    assert "the Work summary's `correctness`" in replay
 
 
 def test_the_pre_review_checklist_says_how_to_do_each_point():
@@ -612,14 +691,17 @@ def test_the_pre_review_checklist_says_how_to_do_each_point():
     flat = " ".join(PRE_REVIEW_HOW.split())
     assert "--verification --session-token" in flat
     assert "Start it right after the pull request's first push" in flat  # #4567
-    # A diagram only for a new feature or when the owner asked for one (#4254), one per
-    # feature, read by its boxes (#3860).
-    assert "only when this Work adds a new feature" in flat
-    assert "or when the owner asked for one (#4254)" in flat
-    assert "read each diagram's title and `## Boxes`" in flat
-    assert "named after the feature, never the issue" in flat
-    assert "Changing, fixing or tidying an existing feature draws nothing" in flat
-    assert "the Work page's Diagram button opens your live page" in flat
+    # A diagram only when the owner asked for one (#4721): a new feature draws nothing, and
+    # the existing ones are neither read nor kept in step.
+    assert "Diagram: none, unless the owner asked this Work for one (#4721)" in flat
+    assert "do not write, update or read `docs/diagrams/`" in flat
+    assert "a new feature draws nothing" in flat
+    assert "only when this Work adds a new feature" not in flat
+    assert "read each diagram's title" not in flat
+    # ... but an asked-for one still extends the feature's own diagram (#3860).
+    assert "first list `docs/diagrams/` and extend the diagram that already covers" in flat
+    assert "keep it matching the code" not in flat
+    assert '"Diagrams" part of `GET $AGENTDECK_URL/api/live-prototype/guide`' in flat
     # Screenshots are cropped and scaled before they are read (#4254).
     assert "scale it down to at most 800 pixels wide before you open it" in flat
     assert "`<!-- agentdeck-diagram -->`" in flat and "never post a second one" in flat
@@ -635,6 +717,9 @@ def test_the_pre_review_checklist_says_how_to_do_each_point():
     # Each step's variants, each with its test (#4407, #4430).
     assert "Fix a gap or name it. Under each step, list its variants:" in flat
     assert "`no test: <why>`" in flat and "Write the missing tests before you post" in flat
+    # The big pull request's reading guide (#4786), in the checklist's how and not the brief.
+    assert "body section opening `Reading guide:`. In a line or two, why the change" in flat
+    assert "what is safe to skip (tests, migrations, generated files, docs)" in flat
     # The deck's checklist carries it.
     from agentdeck.work_router import PRE_REVIEW_TEXT
 

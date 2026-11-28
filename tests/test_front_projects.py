@@ -226,7 +226,7 @@ async def test_a_hidden_project_stays_hidden_through_a_push_and_a_reload(tmp_pat
         names = ["trailhead", "bazaar", "agentdeck"]
         assert await tabs.evaluate_all(order) == [*names, ""]
         assert await tabs.last.get_attribute("aria-pressed") == "true"
-        assert await page.locator("#front-tabs").evaluate(
+        assert await page.locator("#front-bar").evaluate(
             "el => getComputedStyle(el).position") == "sticky"
 
         # A tap shows only that project.
@@ -331,6 +331,86 @@ async def test_a_hidden_project_stays_hidden_through_a_push_and_a_reload(tmp_pat
         assert await page.evaluate(hidden) == {n: True for n in names if n != first}
         await tabs.last.click()
 
+        # On a phone a swipe to the right on a row opens its Work, whose tap opens its chat
+        # (#4625). A short one, a mostly vertical one and one the browser took over open
+        # nothing, and none of them steps the tabs.
+        swipe_row = """(row, [end, points]) => {
+          const fire = (type, x, y) => {
+            const at = new Touch({identifier: 1, target: row, clientX: x, clientY: y});
+            row.dispatchEvent(new TouchEvent(type, {bubbles: true, changedTouches: [at],
+              touches: type === 'touchstart' || type === 'touchmove' ? [at] : []}));
+          };
+          fire('touchstart', 100, 300);
+          points.forEach(([x, y]) => fire('touchmove', x, y));
+          const seen = [row.classList.contains('fr-swiping'),
+                        row.classList.contains('fr-swipe-ready')];
+          fire(end, ...(points[points.length - 1] || [190, 300]));
+          return [...seen, row.classList.contains('fr-swiping')];
+        }"""
+        for end, points, seen in (
+            ("touchend", [[120, 300], [160, 300]], [True, False, False]),
+            ("touchend", [[105, 320], [190, 400]], [False, False, False]),
+            ("touchend", [[105, 320], [190, 302]], [False, False, False]),
+            ("touchend", [[80, 300], [190, 302]], [False, False, False]),
+            ("touchend", [[120, 300], [190, 300], [100, 300]], [True, False, False]),
+            ("touchend", [[120, 305], [190, 500]], [True, False, False]),
+            ("touchcancel", [[120, 300], [190, 300]], [True, True, False]),
+        ):
+            assert await deck_row.evaluate(swipe_row, [end, points]) == seen, (end, points)
+        # A second finger drops the swipe, whether it lands or only shows up in a move.
+        for landed in ("touchstart", "touchmove"):
+            assert await deck_row.evaluate("""(row, landed) => {
+              const at = (id, x) => new Touch({identifier: id, target: row, clientX: x,
+                                               clientY: 300});
+              const fire = (type, touches, changed) => row.dispatchEvent(new TouchEvent(type, {
+                bubbles: true, touches: touches, changedTouches: [changed]}));
+              const [a, b] = [at(1, 190), at(2, 250)];
+              fire('touchstart', [at(1, 100)], at(1, 100));
+              fire('touchmove', [a], a);
+              const before = row.classList.contains('fr-swipe-ready');
+              fire(landed, [a, b], b);
+              const after = row.classList.contains('fr-swiping');
+              fire('touchend', [], a);
+              return [before, after];
+            }""", landed) == [True, False], landed
+        # A row is held from a push while it moves, and takes the push when it is let go.
+        held = await deck_row.evaluate("""row => {
+          const list = row.parentNode, next = row.cloneNode(true);
+          const fire = (type, x) => {
+            const at = new Touch({identifier: 1, target: row, clientX: x, clientY: 300});
+            row.dispatchEvent(new TouchEvent(type, {bubbles: true, changedTouches: [at],
+              touches: type === 'touchend' ? [] : [at]}));
+          };
+          fire('touchstart', 100);
+          fire('touchmove', 130);
+          next.dataset.workRev = 'pushed';
+          htmx.swap(list, [...list.children].map(
+            el => (el === row ? next : el).outerHTML).join(''), {swapStyle: 'keyed-works'},
+            {contextElement: list});
+          const kept = row.isConnected;
+          fire('touchend', 130);
+          return [kept, row.isConnected,
+                  list.querySelectorAll('[data-work-rev="pushed"]').length];
+        }""")
+        assert held == [True, False, 1]
+        assert await page.evaluate(hidden) in (None, {})
+        assert await page.evaluate("location.pathname") == "/"
+        # A fast swipe can be sampled as only a start and an end.
+        for points in ([[120, 300], [190, 305]], []):
+            await deck_row.evaluate(swipe_row, ["touchend", points])
+            await page.wait_for_url(base + work_href(DECK.work_id))
+            await page.go_back()
+            await deck_row.wait_for()
+        await tabs.first.wait_for()
+        # On a wide screen a row does not swipe: the tabs step, as anywhere on the list.
+        await page.set_viewport_size({"width": 1440, "height": 900})
+        assert await deck_row.evaluate(
+            swipe_row, ["touchend", [[120, 300], [190, 300]]]) == [False, False, False]
+        assert await page.evaluate("location.pathname") == "/"
+        assert await page.evaluate(hidden) not in (None, {})
+        await page.set_viewport_size({"width": 390, "height": 844})
+        await tabs.last.click()
+
         # A push that makes agentdeck the newest leaves the tabs where they were, and so does
         # opening a chat over the list.
         active = await deck_row.get_attribute("data-work-active")
@@ -358,6 +438,24 @@ async def test_a_hidden_project_stays_hidden_through_a_push_and_a_reload(tmp_pat
           return !hit || !hit.closest('#front-tabs');
         }""")
         assert await tabs.evaluate_all(order) == [*names, ""]
+        # The list under the chat scrolls in its own padded box; scrolled, the tabs park at that
+        # box's top edge with no strip of rows above them (#4629).
+        gap = """() => {
+          const box = document.querySelector('.session-sidebar');
+          const room = document.createElement('div');
+          room.style.height = '3000px';
+          box.appendChild(room);
+          box.scrollTop = 600;
+          const tabs = document.getElementById('front-bar').getBoundingClientRect();
+          const gap = tabs.top - box.getBoundingClientRect().top;
+          box.scrollTop = 0;
+          room.remove();
+          return gap;
+        }"""
+        assert abs(await page.evaluate(gap)) < 1
+        # Turning the phone takes the padding away, and the tabs follow.
+        await page.set_viewport_size({"width": 1100, "height": 600})
+        assert abs(await page.evaluate(gap)) < 1
         await page.set_viewport_size({"width": 1440, "height": 900})
         await page.goto(base + work_href(DECK.work_id))
         side = page.locator(".front-columns > .session-sidebar")
@@ -373,7 +471,9 @@ async def test_a_hidden_project_stays_hidden_through_a_push_and_a_reload(tmp_pat
         # A push that redraws the header between the press and the release still folds the
         # group the press started on: the browser clicks neither header (#3432).
         head = side.locator('[data-front-group="working"]')
-        box = await head.bounding_box()
+        # Read in the page at once: a push between finding and measuring leaves no box.
+        box = await page.evaluate("""() => document.querySelector(
+            '.session-sidebar [data-front-group="working"]').getBoundingClientRect().toJSON()""")
         await page.mouse.move(box["x"] + 40, box["y"] + box["height"] / 2)
         await page.mouse.down()
         pressed = await head.element_handle()

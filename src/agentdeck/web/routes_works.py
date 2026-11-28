@@ -21,7 +21,7 @@ import shutil
 import time
 import uuid
 from collections import OrderedDict
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -36,10 +36,10 @@ from pydantic import BaseModel, Field
 from .. import review_history, wayfinder_map, work_actions, work_counter
 from ..board_watch import BOARD_TOPIC
 from ..models import IssueRef
-from ..state import REVIEWS_TOPIC
+from ..state import REVIEWS_TOPIC, PersonWords
 from ..work import WorkRef
 from ..work_actions import STAR, UNSTAR, WorkActionPress, finish_question
-from ..work_attention import FINISH, HIDE
+from ..work_attention import FINISH, HIDE, ISSUE_CLOSED
 from ..work_claims import assignee_of, own_assignee, run_gh_write, start_issue, take_over
 from ..work_hidden import UNHIDE
 from ..work_overview import (
@@ -60,6 +60,7 @@ from ..work_workspace import parse_work_id
 from .deps import (
     get_config,
     get_control_db,
+    get_db,
     get_state,
     get_templates,
     require_access,
@@ -88,6 +89,7 @@ from .work_view import (
     render_work_sections,
     row_stub,
     runtime_queue,
+    sessions_scanned,
     start_chat_title,
     start_follow_up_round,
     tree_revision,
@@ -98,9 +100,14 @@ from .work_view import (
 _RELEASING: set[asyncio.Task] = set()
 
 
-def _release_worktrees(request: Request, work_id: str) -> None:
-    """Give the finished Work's worktrees back, off the press (#3274)."""
-    task = asyncio.create_task(release_work_worktrees(request.app, work_id))
+def _release_worktrees(request: Request, *work_ids: str) -> None:
+    """Give the finished Works' worktrees back, off the press (#3274), one Work at a time."""
+
+    async def release() -> None:
+        for work_id in work_ids:
+            await release_work_worktrees(request.app, work_id)
+
+    task = asyncio.create_task(release())
     _RELEASING.add(task)
     task.add_done_callback(_RELEASING.discard)
 
@@ -234,9 +241,10 @@ def _index_rows(
     return rows
 
 
-def _matches(row: WorkIndexRow, query: str) -> bool:
-    """Every word of the search appears in the title, the source or the Work id."""
-    text = f"{row.title} {row.source_label} {row.work_id}".casefold()
+def _matches(row: WorkIndexRow, query: str, board) -> bool:
+    """Every word of the search appears in the title, the source, the project or the Work id."""
+    project = work_project(row.repository, board)
+    text = f"{row.title} {row.source_label} {project} {row.work_id}".casefold()
     return all(word in text for word in query.casefold().split())
 
 
@@ -483,7 +491,7 @@ async def older_finished(
         timed.append((_older_key(finished, item.last_activity, work_id, done=closed), item))
     if q.strip():
         rows = _index_rows(snapshot, tuple(item for _, item in timed), records=records)
-        matched = {row.work_id for row in rows if _matches(row, q)}
+        matched = {row.work_id for row in rows if _matches(row, q, snapshot.board)}
         timed = [entry for entry in timed if entry[1].ref.work_id in matched]
     timed.sort(key=lambda entry: entry[0], reverse=True)
     cursor = _parse_older_cursor(before) if before else None
@@ -785,7 +793,7 @@ async def work_page(request: Request, work_id: str) -> HTMLResponse:
         )
         response.headers["Cache-Control"] = "no-cache"
         return response
-    detail = await load_work_detail(request.app, ref, times=times)
+    detail = await load_work_detail(request.app, ref, times=times, wait_for_issue=False)
     if detail is None:
         raise HTTPException(status_code=404, detail="nothing on this deck names this Work")
     note_work_opened(request.app, ref.work_id)
@@ -987,7 +995,7 @@ class WorkPageBuilds:
                 return build
             before = work_page_key(app, ref, ())
             revisions = _revision_reader(app.state.app_state)
-            detail = await load_work_detail(app, ref)
+            detail = await load_work_detail(app, ref, wait_for_issue=False)
             if detail is None:
                 return None
             work_counter.count(work_counter.WORK_PAGE_BUILD)
@@ -1158,11 +1166,15 @@ def _message_receipt(
     state: str,
     status_code: int = 200,
     issue_post=None,
+    finished: Sequence[str] = (),
 ) -> HTMLResponse:
     response = get_templates(request).TemplateResponse(
         request,
         "partials/work_message_receipt.html",
-        {"text": text, "target": target, "state": state, "issue_post": issue_post},
+        {
+            "text": text, "target": target, "state": state, "issue_post": issue_post,
+            "finished": list(finished),
+        },
     )
     response.status_code = status_code
     return response
@@ -1237,27 +1249,36 @@ _ACTION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
 _GH_TIMEOUT_S = 30.0
 
 
-def _pressed_receipt(request: Request, press: WorkActionPress) -> HTMLResponse:
+@dataclass(frozen=True)
+class PressAnswer:
+    """What became of one press, for the page's receipt or a chat's JSON (#4643)."""
+
+    text: str
+    state: str = "refused"
+    status_code: int = 409
+
+
+def _answer_receipt(request: Request, answer: PressAnswer) -> HTMLResponse:
+    return _message_receipt(
+        request, text=answer.text, state=answer.state, status_code=answer.status_code
+    )
+
+
+def _pressed_answer(press: WorkActionPress) -> PressAnswer:
     """The answer to a press whose action id was already used: what that press did."""
     if press.state == "sent":
-        text = f"Already sent: {press.result or press.label}"
-        return _message_receipt(request, text=text, state="sent")
+        return PressAnswer(f"Already sent: {press.result or press.label}", "sent", 200)
     if press.state == "failed":
-        text = f"{press.label} was not sent: {press.result}".rstrip(": ")
-        return _message_receipt(request, text=text, state="refused", status_code=409)
-    text = f"{press.label} may already have been sent, so it was not sent again."
-    return _message_receipt(request, text=text, state="uncertain", status_code=202)
+        return PressAnswer(f"{press.label} was not sent: {press.result}".rstrip(": "))
+    return PressAnswer(
+        f"{press.label} may already have been sent, so it was not sent again.", "uncertain", 202
+    )
 
 
-def _not_again(request: Request, label: str, how: str, age: float) -> HTMLResponse:
+def _not_again(label: str, how: str, age: float) -> PressAnswer:
     """The refusal of a press that repeats one still standing."""
     when = "just now" if age < 60 else f"{round(age / 60)} min ago"
-    return _message_receipt(
-        request,
-        text=f"{label} {how} {when}; it was not sent again.",
-        state="refused",
-        status_code=409,
-    )
+    return PressAnswer(f"{label} {how} {when}; it was not sent again.")
 
 
 _DECK_REQUEST_TARGET_RE = re.compile(
@@ -1361,7 +1382,7 @@ async def _deck_run_request(
         )
         return JSONResponse({"outcome": "done", "detail": detail}, status_code=202)
     if design is not None:
-        dropped, kept = await _design_accept(request, issue, design, sender)
+        dropped, kept, closed = await _design_accept(request, issue, design, sender)
         if dropped is not None:
             return dropped
         if kept and kept != design.verdict:
@@ -1401,7 +1422,14 @@ async def _deck_run_request(
     kept = str(recorded.get("verdict") or design.verdict) if design is not None else ""
     told = (
         await release.on_design_review(
-            work_id, action_id, command, url, gap=kept == "gap", notes=kept == "notes"
+            work_id,
+            action_id,
+            command,
+            url,
+            gap=kept == "gap",
+            notes=kept == "notes",
+            # Only when so: a services process from before #4675 takes no such argument.
+            **({"closed": True} if closed else {}),
         )
         if design is not None
         else await release.on_findings(work_id, action_id, parsed.instruction, url)
@@ -1433,11 +1461,12 @@ async def _deck_run_request(
 
 async def _design_accept(
     request: Request, issue: str, design, sender: str
-) -> tuple[JSONResponse | None, str]:
+) -> tuple[JSONResponse | None, str, bool]:
     """The answer to a design verdict the deck does not take (#4332), or ``None`` when it takes
     it: refused when its sender is not the reviewer the deck started on that design, dropped
     when it is about a design the agent has since replaced. With it, the verdict the deck will
-    record (#4463), "" when the merge service did not say."""
+    record (#4463), "" when the merge service did not say, and whether the issue is closed
+    (#4675)."""
     router_service = getattr(request.app.state, "work_router", None)
     if router_service is None or not router_service.enabled:
         raise HTTPException(status_code=409, detail="this deck does not route Work events")
@@ -1446,15 +1475,15 @@ async def _design_accept(
         raise HTTPException(status_code=403, detail=answer["refused"])
     if "refused" in answer:
         detail = f"{answer['refused']}; send the same request again"
-        return JSONResponse({"outcome": "retry", "detail": detail}, status_code=503), ""
+        return JSONResponse({"outcome": "retry", "detail": detail}, status_code=503), "", False
     if not answer.get("stale"):
-        return None, str(answer.get("verdict") or "")
+        return None, str(answer.get("verdict") or ""), bool(answer.get("closed"))
     logger.info("deck-request: design verdict for %s dropped: %s", issue, answer["stale"])
     detail = (
         f"This design verdict was not posted or handed on: {answer['stale']}. The newer design"
         " has a review of its own; stop this one."
     )
-    return JSONResponse({"outcome": "done", "detail": detail}, status_code=202), ""
+    return JSONResponse({"outcome": "done", "detail": detail}, status_code=202), "", False
 
 
 def _design_verdict(command: str, issue: str):
@@ -1463,6 +1492,8 @@ def _design_verdict(command: str, issue: str):
     from ..design_review import verdict_of
 
     verdict = verdict_of(command)
+    if verdict is not None and not verdict.command:
+        return None  # the bare line is ChatGPT's own comment (#4722), not a deck request
     if verdict is not None and verdict.issue != issue.lower():
         raise HTTPException(
             status_code=400,
@@ -1590,6 +1621,7 @@ async def _agent_review(request: Request, step: work_actions.Step, label: str) -
             pulls=step.pulls,
             releases=releases_of(request.app),
             earlier=earlier_of(request.app),
+            pressed=True,
         )
     except chat_review.ReviewError as exc:
         return "failed", str(exc)
@@ -1648,6 +1680,7 @@ async def _write(
                 board=chat_board_of(request.app),
                 releases=releases_of(request.app),
                 earlier=earlier_of(request.app),
+                pressed=True,
             )
         except chat_review.ReviewError as exc:
             # ``open_review`` finds the open chat before it writes one, so a refusal here is
@@ -1839,7 +1872,7 @@ async def work_take_over(request: Request, work_id: str) -> HTMLResponse:
                 state="refused",
                 status_code=409,
             )
-        return _pressed_receipt(request, earlier)
+        return _answer_receipt(request, _pressed_answer(earlier))
     other = other_deck_work(request.app, ref)
     person = deck_person()
     if other is None or not person:
@@ -1862,12 +1895,12 @@ async def work_take_over(request: Request, work_id: str) -> HTMLResponse:
     recent = work_actions.recent_press(db.load_work_actions(ref.work_id), work_actions.TAKE_OVER)
     if recent is not None:
         how = "was sent" if recent.state == "sent" else "may have been sent"
-        return _not_again(request, label, how, recent.age_s())
+        return _answer_receipt(request, _not_again(label, how, recent.age_s()))
     reserved = db.reserve_work_action(action_id, ref.work_id, work_actions.TAKE_OVER)
     if not reserved:
         pressed = db.work_action(action_id) if reserved is not None else None
         if pressed is not None:
-            return _pressed_receipt(request, pressed)
+            return _answer_receipt(request, _pressed_answer(pressed))
         return _message_receipt(
             request,
             text="The deck could not record this press, so nothing was sent.",
@@ -1925,29 +1958,52 @@ async def work_action(request: Request, work_id: str) -> HTMLResponse:
         return _message_receipt(
             request, text="That is not a Work action.", state="refused", status_code=422
         )
+    return _answer_receipt(
+        request,
+        await _press(
+            request,
+            ref,
+            action,
+            str(form.get("client_action_id") or ""),
+            confirmed=str(form.get("confirmed") or ""),
+        ),
+    )
+
+
+async def _press(
+    request: Request,
+    ref: WorkRef,
+    action: str,
+    action_id: str,
+    *,
+    confirmed: str = "",
+    detail: Any = None,
+    spoken_by: tuple[str, str] | None = None,
+    unless: Callable[[], PressAnswer | None] | None = None,
+) -> PressAnswer:
+    """One press of a Work action, the page's or a spoken one (#4643), and what became of it.
+
+    ``detail`` is the Work's page as the caller just read it, else it is read here. A spoken
+    press names the words it was made for (``spoken_by``), and ``unless`` is its last check,
+    made with the reservation: an answer from it means nothing is pressed.
+    """
     label = work_actions.LABELS[action]
     # The press's own id is its identity: one the server made up would give a replay a new
     # one and walk past the reservation, so a press without a usable id writes nothing.
-    action_id = str(form.get("client_action_id") or "")
     if not _ACTION_ID_RE.fullmatch(action_id):
-        return _message_receipt(
-            request,
-            text=f"{label} was not sent: the press carried no usable action ID.",
-            state="refused",
-            status_code=422,
+        return PressAnswer(
+            f"{label} was not sent: the press carried no usable action ID.", "refused", 422
         )
     db = get_control_db(request)
     earlier = db.work_action(action_id)
     if earlier is not None:
-        if earlier.work_id != ref.work_id or earlier.action != action:
-            return _message_receipt(
-                request,
-                text="That action ID was already used for something else; nothing was sent.",
-                state="refused",
-                status_code=409,
+        if earlier.work_id != ref.work_id or (earlier.action != action and spoken_by is None):
+            return PressAnswer(
+                "That action ID was already used for something else; nothing was sent."
             )
-        return _pressed_receipt(request, earlier)
-    detail = await load_work_detail(request.app, ref, workspace=False)
+        return _pressed_answer(earlier)
+    if detail is None:
+        detail = await load_work_detail(request.app, ref, workspace=False)
     if detail is None:
         raise HTTPException(status_code=404, detail="nothing on this deck names this Work")
     try:
@@ -1959,12 +2015,10 @@ async def work_action(request: Request, work_id: str) -> HTMLResponse:
             deck_release=bool(release is not None and release.handles(detail.card.work_id)),
             approval=detail.approval,
             shippable=detail.shippable,
-            confirmed=str(form.get("confirmed") or ""),
+            confirmed=confirmed,
         )
     except work_actions.Refused as refused:
-        return _message_receipt(
-            request, text=refused.text, state="refused", status_code=refused.status
-        )
+        return PressAnswer(refused.text, "refused", refused.status)
     # The window check and the reservation are adjacent synchronous calls with no await
     # between them, so two presses landing together cannot both pass the check.
     # Merge when ready and Withdraw are refused above while they would repeat themselves (a
@@ -1979,59 +2033,252 @@ async def work_action(request: Request, work_id: str) -> HTMLResponse:
     )
     if recent is not None:
         how = "was sent" if recent.state == "sent" else "may have been sent"
-        return _not_again(request, label, how, recent.age_s())
-    reserved = db.reserve_work_action(action_id, ref.work_id, action)
+        return _not_again(label, how, recent.age_s())
+    stopped = unless() if unless is not None else None
+    if stopped is not None:
+        return stopped
+    reserved = db.reserve_work_action(action_id, ref.work_id, action, spoken_by=spoken_by)
     if reserved is None:
-        return _message_receipt(
-            request,
-            text="The deck could not record this action, so it was not sent.",
-            state="refused",
-            status_code=409,
-        )
+        return PressAnswer("The deck could not record this action, so it was not sent.")
     if not reserved:
         pressed = db.work_action(action_id)
         if pressed is not None:
-            return _pressed_receipt(request, pressed)
-        return _message_receipt(
-            request, text=f"{label} was already pressed.", state="refused", status_code=409
-        )
+            return _pressed_answer(pressed)
+        return PressAnswer(f"{label} was already pressed.")
     outcome, receipt = await _write(request, step, label, action_id)
     if outcome == "uncertain":
         logger.warning("work action %s on %s is uncertain: %s", action, ref.work_id, receipt)
-        return _message_receipt(
-            request,
-            text=f"{receipt}, so it will not be sent again.",
-            state="uncertain",
-            status_code=202,
-        )
+        return PressAnswer(f"{receipt}, so it will not be sent again.", "uncertain", 202)
     db.settle_work_action(action_id, outcome, receipt)
     if outcome == "failed":
-        return _message_receipt(
-            request, text=f"{label} was not sent: {receipt}", state="refused", status_code=409
-        )
+        return PressAnswer(f"{label} was not sent: {receipt}")
     if action == work_actions.TRIED_OK:
         # A person tried it live (#4210): the check the Work waited for, recorded as the
         # agent's would be, so its line and Finish read verified.
         db.set_work_live_check(ref.work_id, "verified", "tried live by a person", "")
     if action in {work_actions.CLOSE, work_actions.TRIED_OK}:
         # Closing it here is the person's sign-off too, so it needs no Finish after (#2510).
-        if db.finish_work(ref.work_id, datetime.now(UTC)):
+        if _finish(db, ref.work_id):
             _release_worktrees(request, ref.work_id)
     if action in {
-        work_actions.PAUSE, work_actions.RESUME, work_actions.START, work_actions.TRIED_OK
+        work_actions.CLOSE, work_actions.PAUSE, work_actions.RESUME, work_actions.START,
+        work_actions.TRIED_OK,
     }:
         if action == work_actions.RESUME:
             # One Resume ends every pause the Work had, the label's and this deck's (#2559).
             db.resume_work(ref.work_id)
+        reread = getattr(
+            getattr(request.app.state, "issues", None), "refresh_issue_records", None
+        )
+        if reread is not None and action in {work_actions.CLOSE, work_actions.TRIED_OK}:
+            try:
+                # Finished is read from the cached issue, which still says open (#4631).
+                await reread([(ref.repository, ref.number)], limit=1)
+            except Exception:  # noqa: BLE001 -- the issue is closed; its webhook brings it
+                logger.warning("re-read of closed %s failed", ref.work_id, exc_info=True)
         service = getattr(request.app.state, "work_overview", None)
         if service is not None:
             try:
-                # The row moves to or from Paused on this press, not the next pass.
+                # The row moves on this press, not the next pass.
                 await service.refresh()
-            except Exception:  # noqa: BLE001 -- the pause is made; the next pass shows it
+            except Exception:  # noqa: BLE001 -- the action is made; the next pass shows it
                 logger.exception("work overview refresh after %s of %s failed", action, ref.work_id)
     logger.info("work action %s on %s: %s", action, ref.work_id, receipt)
-    return _message_receipt(request, text=receipt, state="sent")
+    return PressAnswer(receipt, "sent", 200)
+
+
+#: How long after the owner's own message the deck chat may press for it (#4643). Longer than
+#: a spoken request takes, short enough that a wake-on hours later presses nothing.
+SPOKEN_MERGE_S = 15 * 60
+
+
+class SpokenMerge(BaseModel):
+    # The Work as ``owner/repo#n``, ``repo#n`` or its number.
+    work: str
+    # The deck chat's own session token. Never its key, which every chat can read.
+    source: str = Field(alias="from")
+
+
+@router.post("/api/works/merge")
+async def spoken_merge(request: Request, body: SpokenMerge) -> JSONResponse:
+    """Press the Work page's merge button for the owner, who said so to the deck chat (#4643).
+
+    The press is the page's own (``_press``): Merge on a Ready Work, else Merge when ready,
+    with the same checks and refusals, so it skips no review, test or queue. Only the deck
+    chat may ask, and only for the Work the owner's latest message from a page plainly asks
+    to merge, by its number (``spoken_merge.asks``), shortly after it. That is checked at the
+    press's reservation, so a newer message, a Stop or the like counts until then. Each such
+    message presses a Work once: a repeated call answers with what its press did.
+    """
+    from .. import meta_chat
+    from .. import spoken_merge as spoken_merge_words
+    from ..chat_jump import work_matches
+    from ..work_release import MERGE_APPROVED
+    from . import routes_actions
+
+    routes_actions._require_same_origin(request)
+    state, db = get_state(request), get_control_db(request)
+
+    def refuse(text: str, status: int = 409, **more: Any) -> JSONResponse:
+        return JSONResponse({"state": "refused", "detail": text, **more}, status_code=status)
+
+    key = state.session_key_for_token(body.source.strip())
+    if key is None or not meta_chat.is_deck_chat(state, get_db(request), key):
+        return refuse("Only the deck chat presses Merge for the owner; nothing was sent.", 403)
+    chat = state.chat_identity_key(key)
+    service = getattr(request.app.state, "work_overview", None)
+    # Waits a moment for a due rebuild, so a Work just started counts as a match.
+    overview = await service.current(wait=2.0) if service is not None else None
+    every = overview.cards if overview else ()
+    cards = work_matches(every, body.work)
+    if not cards:
+        return refuse(f"There is no Work {body.work.strip()!r}; nothing was sent.", 404)
+    if len(cards) > 1:
+        return refuse(
+            f"Several Works are {body.work.strip()!r}; nothing was sent. Ask which one.",
+            works=[{"work": card.work_id, "title": card.title} for card in cards],
+        )
+    ref = WorkRef.from_work_id(cards[0].work_id)
+    if ref is None:
+        return refuse("This Work has no GitHub issue to act on; nothing was sent.", 422)
+    others = [
+        other.repository
+        for card in work_matches(every, str(ref.number))
+        if (other := WorkRef.from_work_id(card.work_id)) is not None
+        and other.work_id != ref.work_id
+    ]
+    title = cards[0].title
+    name = ref.repository.rpartition("/")[2]
+    if any(other.rpartition("/")[2].casefold() == name.casefold() for other in others):
+        name = ref.repository.replace("/", " ")  # a namesake: the owner's name tells them apart
+    say_it = f"Tell them its title, and to say: merge {name} {ref.number}."
+
+    def asking() -> PersonWords | None:
+        """The owner's words that stand now, when they plainly ask for this Work."""
+        said = state.person_words.get(chat)
+        if said is None or not spoken_merge_words.asks(
+            said.words, ref.repository, ref.number, others=others
+        ):
+            return None
+        return said
+
+    def in_time(said: PersonWords) -> bool:
+        return datetime.now(UTC) - said.at <= timedelta(seconds=SPOKEN_MERGE_S)
+
+    def earlier_press() -> WorkActionPress | None:
+        press = db.newest_spoken_press(chat, ref.work_id)
+        return press if press is not None and press.age_s() <= SPOKEN_MERGE_S else None
+
+    def answered(answer: PressAnswer, action: str, **more: Any) -> JSONResponse:
+        return JSONResponse(
+            {
+                "state": answer.state,
+                "work": ref.source_key,
+                "title": title,
+                "button": work_actions.LABELS[action],
+                "detail": answer.text,
+                **more,
+            },
+            status_code=answer.status_code,
+        )
+
+    async def not_asked(press: WorkActionPress | None) -> JSONResponse:
+        """No plain request stands: this call pressed nothing, whatever ``press`` did before."""
+        if press is None and taken_back:
+            return refuse(
+                "The owner took the request back or wrote again while it was being handled, so"
+                " nothing was sent. If their newest message still asks for it, call again.",
+                403,
+                title=title,
+            )
+        if press is None:
+            return refuse(
+                "The owner's latest message is not a plain request to merge this Work, made in"
+                f" the last {SPOKEN_MERGE_S // 60} minutes, so nothing was sent. {say_it}",
+                403,
+                title=title,
+            )
+        age = press.age_s()
+        when = "just now" if age < 60 else f"{round(age / 60)} min ago"
+        done = {
+            "sent": "was sent",
+            "failed": f"was not sent: {press.result}".rstrip(": "),
+        }.get(press.state, "may have been sent")
+        text = (
+            "This call pressed nothing: the owner's latest message is not a plain request to"
+            f" merge this Work. An earlier press of {press.label} for it, made {when}, {done}."
+        )
+        if press.sent and press.action == work_actions.APPROVE_MERGE:
+            # Read after the press: one withdrawn or cleared since must not sound under way.
+            now = await load_work_detail(request.app, ref, workspace=False)
+            stands = now is not None and now.approval == MERGE_APPROVED
+            text += (
+                " It still stands."
+                if stands
+                else " It does not stand now: it was withdrawn or cleared, or the Work has merged."
+            )
+        # The press's own time of day is for the chat to say, so it goes beside the words.
+        return answered(
+            PressAnswer(f"{text} To press now: {say_it}", "earlier", 200),
+            press.action,
+            pressed_at=press.reserved_at,
+        )
+
+    taken_back = False
+    said = asking()
+    if said is None:
+        return await not_asked(earlier_press())
+    action_id = hashlib.sha256(
+        f"spoken-merge|{chat}|{said.send_id}|{ref.work_id}".encode()
+    ).hexdigest()[:40]
+    earlier = db.work_action(action_id)
+    if earlier is not None:
+        # Before the time check: a late repeat is told what its press did, not "nothing".
+        return answered(_pressed_answer(earlier), earlier.action)
+    if not in_time(said):
+        return await not_asked(earlier_press())
+    detail = await load_work_detail(request.app, ref, workspace=False)
+    if detail is None:
+        return refuse("Nothing on this deck names this Work; nothing was sent.", 404)
+    ready = detail.attention is not None and work_actions.MERGE in detail.attention.actions
+    action = work_actions.MERGE if ready else work_actions.APPROVE_MERGE
+    found: WorkActionPress | None = None
+
+    def still_asked() -> PressAnswer | None:
+        # The one check that lets a spoken press through (#4643): what the owner said, or did
+        # to take it back, while the overview and the Work were read counts here.
+        nonlocal taken_back, found
+        current = asking()
+        if current is not None and current.send_id == said.send_id and in_time(current):
+            return None
+        taken_back, found = True, earlier_press()
+        return PressAnswer("The owner took it back; nothing was sent.")
+
+    if not ready and detail.approval == MERGE_APPROVED:
+        # Not a refusal to the owner: the press they ask for already stands.
+        answer = PressAnswer(
+            "Merge when ready is already pressed: the deck merges this Work once its review"
+            " passes and its tests are green. Nothing new was sent.",
+            "sent",
+            200,
+        )
+    else:
+        answer = await _press(
+            request,
+            ref,
+            action,
+            action_id,
+            detail=detail,
+            spoken_by=(chat, said.send_id),
+            unless=still_asked,
+        )
+        if taken_back:
+            return await not_asked(found)
+        pressed = db.work_action(action_id)
+        if pressed is not None:
+            # Another call for the same message may have pressed the other button meanwhile.
+            action = pressed.action
+    return answered(answer, action)
 
 
 def _new_work_receipt(
@@ -2376,6 +2623,8 @@ async def guess_new_work_project(request: Request) -> JSONResponse:
     form = await request.form()
     text = str(form.get("text") or "").strip()
     options = _new_work_targets(request)
+    if routes_actions._reserved_secret_refusal(text) is not None:
+        return JSONResponse({"repository": ""})  # Never shown to the model (#4610).
     if len(text) < guess.PROJECT_GUESS_MIN_CHARS or len(options) < 2:
         return JSONResponse({"repository": ""})
     if not guess.guessing_enabled(request.app):
@@ -2432,6 +2681,10 @@ async def file_new_work(request: Request) -> HTMLResponse:
         return refuse("choose a repository a Poller on this host manages.")
     raw = form.get("message")
     text = raw.strip() if isinstance(raw, str) else ""
+    reserved_secret = routes_actions._reserved_secret_refusal(text)
+    if reserved_secret is not None:
+        # The text becomes a GitHub issue and the agent's brief (#4610).
+        return refuse(f"{reserved_secret}.")
     title = first_line_title(text)
     if not title:
         return refuse("write what the Work is about.")
@@ -2451,6 +2704,11 @@ async def file_new_work(request: Request) -> HTMLResponse:
     spec_only = form.get("spec_only") == "1"
     labels = new_work.labels_for(target, spec_only)
     choice, unpicked = _new_work_choice(request, target, labels, form)
+    if not unpicked and _deck_starts(request, target, labels):
+        # The project's own default model (#4723) where the press picked none.
+        from ..work_start import with_project_model
+
+        choice = with_project_model(request.app, target.repository, choice)
     db = get_control_db(request)
     earlier = db.work_action(action_id)
     if earlier is not None:
@@ -2690,6 +2948,12 @@ async def work_new_chat(request: Request, work_id: str) -> HTMLResponse:
     if not text:
         return _message_receipt(
             request, text="Write what the new chat should do.", state="refused", status_code=422
+        )
+    reserved_secret = routes_actions._reserved_secret_refusal(text)
+    if reserved_secret is not None:
+        # The text opens the new chat's brief, so a secret's value would reach its agent (#4610).
+        return _message_receipt(
+            request, text=f"Not started: {reserved_secret}", state="refused", status_code=422
         )
     account = next(
         (item for item in new_chat_accounts(request) if item.key == account_key), None
@@ -3059,6 +3323,91 @@ async def works_seen(request: Request) -> HTMLResponse:
     )
 
 
+def _finish(db: Any, work_id: str) -> bool:
+    """Record a person's Finish; the caller gives the worktrees back."""
+    if not db.finish_work(work_id, datetime.now(UTC)):
+        return False
+    # A finished Work belongs in Recently finished, not on the Hidden list.
+    db.unhide_work(work_id)
+    return True
+
+
+#: Works one Finish all press may name (#4623), and the skipped ones its answer names.
+MAX_FINISH_ALL = 200
+MAX_SKIPS_NAMED = 3
+
+
+@router.post("/works/finish-all", response_class=HTMLResponse)
+async def works_finish_all(request: Request) -> HTMLResponse:
+    """Finish every Work the press names that still only waits for it (#4623).
+
+    The press names the Works that were on the page. One fresh overview decides about them
+    all: a Work that reopened, left the group, was starred or has an open pull request is
+    skipped and said so. Like Finish, this deck's own record only. Each Work is recorded on
+    its own, so a stop halfway keeps those done and a second press is safe.
+    """
+    from . import routes_actions
+
+    routes_actions._require_same_origin(request)
+    form = await request.form()
+    named: dict[str, WorkRef] = {}
+    for value in form.getlist("work"):
+        ref, _ = _resolve(str(value))
+        if ref is None:
+            raise HTTPException(status_code=422, detail="not a Work id")
+        named[ref.work_id] = ref
+
+    def refused(text: str) -> HTMLResponse:
+        return _message_receipt(request, text=text, state="refused", status_code=409)
+
+    if not named:
+        return refused("No Work to finish; nothing changed.")
+    if len(named) > MAX_FINISH_ALL:
+        return refused(f"At most {MAX_FINISH_ALL} Works at once; nothing changed.")
+    service = getattr(request.app.state, "work_overview", None)
+    try:
+        # `refresh` answers False both unchanged and unbuilt, so the scans are asked first.
+        if service is None or not await sessions_scanned(request.app):
+            raise RuntimeError("the sessions are not scanned yet")
+        await service.refresh()
+        front = service.overview.front
+    except Exception:  # noqa: BLE001 -- without a fresh list nothing is finished
+        logger.exception("work overview refresh before Finish all failed")
+        return refused("The deck could not check the Works; nothing changed.")
+    ready = {row.finish_all_id for row in front.finishable}
+    opened = {
+        row.actor.work_id
+        for row in front.needs_you
+        if not row.starred and row.attention.category == ISSUE_CLOSED and row.finish.confirm
+    }
+    db = get_control_db(request)
+    finished: list[str] = []
+    skipped: list[str] = []
+    for work_id, ref in named.items():
+        label = f"{ref.repository.rpartition('/')[2]}#{ref.number}"
+        if work_id in opened:
+            skipped.append(f"{label} has an open pull request")
+        elif work_id not in ready:
+            skipped.append(f"{label} no longer waits for Finish")
+        elif _finish(db, work_id):
+            finished.append(work_id)
+        else:
+            skipped.append(f"{label} could not be recorded")
+    text = f"Finished {len(finished)}."
+    if skipped:
+        more = len(skipped) - MAX_SKIPS_NAMED
+        text += f" Skipped {len(skipped)}: " + "; ".join(skipped[:MAX_SKIPS_NAMED])
+        text += f"; and {more} more." if more > 0 else "."
+    if not finished:
+        return refused(text)
+    _release_worktrees(request, *finished)
+    try:
+        await service.refresh()
+    except Exception:  # noqa: BLE001 -- the change is recorded; the next pass shows it
+        logger.exception("work overview refresh after Finish all failed")
+    return _message_receipt(request, text=text, state="sent", finished=finished)
+
+
 @router.post("/works/{work_id:path}/visibility", response_class=HTMLResponse)
 async def work_visibility(request: Request, work_id: str) -> HTMLResponse:
     """Hide a Work from Needs you, or bring it back (#2238).
@@ -3127,10 +3476,8 @@ async def work_visibility(request: Request, work_id: str) -> HTMLResponse:
                 state="refused",
                 status_code=409,
             )
-        done = db.finish_work(ref.work_id, datetime.now(UTC))
+        done = _finish(db, ref.work_id)
         if done:
-            # A finished Work belongs in Recently finished, not on the Hidden list.
-            db.unhide_work(ref.work_id)
             _release_worktrees(request, ref.work_id)
         text = "Finished. It moves to Recently finished."
     else:

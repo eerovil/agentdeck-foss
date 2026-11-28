@@ -3270,6 +3270,33 @@ async def test_a_service_worker_claim_waits_for_a_picked_model(tmp_path, monkeyp
 
 @pytest.mark.browser
 @pytest.mark.serviceworker
+@pytest.mark.parametrize("event", ["visibilitychange", "htmx:sseOpen"])
+async def test_a_page_left_open_installs_a_deploys_worker_and_reloads(
+    tmp_path, monkeypatch, event
+):
+    """A deploy changes `/sw.js` under a page that never navigates: shown again, or its
+    stream open again, the page installs the new worker and reloads (#4645)."""
+    from agentdeck.web import routes_pwa
+
+    app = _continuable_session_app(tmp_path, monkeypatch)
+    async with _live_server(app) as base, async_playwright() as playwright:
+        browser = await playwright.chromium.launch()
+        context = await _worker_claim_context(browser, 390, 844)
+        page = await _settled_worker_page(context, f"{base}/chats")
+        # Past the load's own check and any of the streams' (CHECK_GAP_MS).
+        await page.wait_for_timeout(2500)
+        monkeypatch.setattr(routes_pwa, "cache_stamp", lambda: "the-next-deploy")
+        await page.wait_for_timeout(1000)
+        assert await page.evaluate("() => window.__preReload") is True
+        await page.evaluate("name => document.dispatchEvent(new Event(name))", event)
+        await page.wait_for_function(
+            "() => window.__preReload === undefined", timeout=20000
+        )
+        await browser.close()
+
+
+@pytest.mark.browser
+@pytest.mark.serviceworker
 async def test_a_service_worker_claim_lands_over_a_typed_deck_filter(
     tmp_path, monkeypatch
 ):
@@ -4314,6 +4341,56 @@ async def test_local_file_route_previews_html_and_serves_binary_inline(tmp_path)
     assert missing_response.status_code == 404
 
 
+async def test_local_file_download_hands_back_the_file_itself(tmp_path):
+    """A preview's Download button saves the file unchanged, even a text one (#4814)."""
+    app = _app_with_state(tmp_path)
+    calendar = tmp_path / "trip.ics"
+    calendar_bytes = b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nEND:VCALENDAR\r\n"
+    calendar.write_bytes(calendar_bytes)
+    unknown = tmp_path / "notes"
+    unknown.write_bytes(b"plain")
+    diagram = tmp_path / "flow.md"
+    diagram.write_text("```mermaid\nflowchart TD\n  a --> b\n```\n")
+    page = tmp_path / "page.html"
+    page.write_text("<script>alert('no')</script>")
+    locked = tmp_path / "locked.ics"
+    locked.write_bytes(calendar_bytes)
+    locked.chmod(0)
+
+    async with _client(app) as client:
+        locked_download = await client.get(f"{locked}?download=1")
+        calendar_page = await client.get(str(calendar))
+        calendar_download = await client.get(f"{calendar}?download=1")
+        numbered_download = await client.get(f"{calendar}:2?download=1")
+        unknown_download = await client.get(f"{unknown}?download=1")
+        page_preview = await client.get(str(page))
+        diagram_view = await client.get(f"{diagram}?bare=1")
+        page_download = await client.get(f"{page}?download=1")
+        missing = await client.get(f"{tmp_path / 'missing.ics'}?download=1")
+
+    assert "local-file-view" in calendar_page.text
+    assert 'href="?download=1" download="trip.ics">Download<' in calendar_page.text
+    for response in (calendar_download, numbered_download):
+        assert response.status_code == 200
+        assert response.content == calendar_bytes
+        assert response.headers["content-type"].startswith("text/calendar")
+        assert response.headers["content-disposition"] == 'attachment; filename="trip.ics"'
+        assert response.headers["cache-control"] == "no-store"
+        assert response.headers["x-content-type-options"] == "nosniff"
+    assert unknown_download.headers["content-type"] == "application/octet-stream"
+    assert unknown_download.content == b"plain"
+    # The full-screen diagram view of a markdown file offers it too.
+    assert 'href="?download=1" download="flow.md"' in diagram_view.text
+    # An .html entry's sandboxed preview offers the same button.
+    assert f'href="{page}?download=1" download="page.html">Download<' in page_preview.text
+    assert page_download.content == b"<script>alert('no')</script>"
+    assert page_download.headers["content-disposition"].startswith("attachment;")
+    assert missing.status_code == 404
+    if os.geteuid() != 0:  # root reads any file
+        assert locked_download.status_code == 403
+        assert locked_download.json() == {"detail": "local file is not readable"}
+
+
 async def test_local_file_route_hides_private_turn_uploads(tmp_path, monkeypatch):
     from agentdeck.web import uploads
 
@@ -4329,6 +4406,7 @@ async def test_local_file_route_hides_private_turn_uploads(tmp_path, monkeypatch
 
     async with _client(app) as client:
         response = await client.get(str(attachment))
+        download = await client.get(f"{attachment}?download=1")
         # A page previewed from the spool's parent cannot reach into it either.
         wrapper = await client.get(str(tmp_path / "page.html"))
         base = re.search(r'<iframe src="([^"]+)"', wrapper.text).group(1).rsplit("/", 1)[0]
@@ -4337,6 +4415,7 @@ async def test_local_file_route_hides_private_turn_uploads(tmp_path, monkeypatch
 
     assert response.status_code == 404
     assert response.json() == {"detail": "local file not found"}
+    assert (download.status_code, download.json()) == (404, response.json())
     assert spooled.status_code == 404
     assert (public.status_code, public.content) == (200, b"public image")
 
@@ -6519,12 +6598,11 @@ async def test_repeated_tool_calls_merge_into_one_card_and_expand(tmp_path):
 
 
 @pytest.mark.browser
-async def test_in_between_replies_fold_into_the_tool_card_and_deck_notices_are_one_line(
-    tmp_path,
-):
-    """Issue #3200: only the reply that ends a turn reads as a message, across the
-    turns the deck woke up only the latest one does, and the deck's own messages are
-    one grey line; all of them open on a tap."""
+async def test_in_between_replies_read_in_full_and_deck_notices_are_one_line(tmp_path):
+    """Issue #3200: across the turns the deck woke up only the latest reply reads as a
+    message, and the deck's own messages are one grey line; both open on a tap.
+    Issue #4704: the agent's in-between lines inside a turn read in full and split
+    the tool calls around them into steps of their own."""
     from agentdeck.models import TranscriptEvent
     from agentdeck.web.render import render_transcript_events
 
@@ -6551,6 +6629,7 @@ async def test_in_between_replies_fold_into_the_tool_card_and_deck_notices_are_o
         TranscriptEvent(seq=1, role="user", text=wake, ts=ts),
         say(2, "Find the code."),
         bash(3),
+        bash(23),
         say(4, "Body didn't show; let me get it."),
         bash(5),
         bash(6),
@@ -6571,10 +6650,11 @@ async def test_in_between_replies_fold_into_the_tool_card_and_deck_notices_are_o
         say(18, "Still live."),
     ]
     rendered = render_transcript_events(app.state.templates, events, session_key="k")
+    # The chat moved to another leg inside the turn: the line is still in-between.
     working = render_transcript_events(
-        app.state.templates,
-        [say(19, "Looking at the logs now."), bash(20), bash(21)],
-        session_key="k",
+        app.state.templates, [say(19, "Looking at the logs now.")], session_key="k"
+    ) + '<div class="ev leg-switch"></div>' + render_transcript_events(
+        app.state.templates, [bash(20), bash(21)], session_key="k"
     )
     answered = render_transcript_events(
         app.state.templates, [say(22, "Found it.")], session_key="k"
@@ -6598,11 +6678,14 @@ async def test_in_between_replies_fold_into_the_tool_card_and_deck_notices_are_o
               const rows = Array.from(transcript.children)
                 .filter(row => !row.classList.contains('tool-block-summary'));
               const lines = transcript.querySelectorAll('.tool-block-summary');
-              const line = lines[0];
+              const first = lines[0];
+              const line = lines[lines.length - 1];
               const closed = {
                 lines: lines.length,
+                first: first.textContent,
+                firstBefore: first.nextElementSibling === rows[2],
                 text: line.textContent,
-                before: line.nextElementSibling === rows[1],
+                before: line.nextElementSibling === rows[5],
                 hidden: rows.filter(row => row.getBoundingClientRect().height === 0).length,
                 height: Math.round(line.getBoundingClientRect().height),
               };
@@ -6616,6 +6699,7 @@ async def test_in_between_replies_fold_into_the_tool_card_and_deck_notices_are_o
                   .find(row => row.textContent.includes('ls 9')).classList.contains('tool-quiet'),
                 lone: seqRow(14).classList.contains('tool-quiet'),
               };
+              first.click();
               line.click();
               await frame();
               const shape = rows.map(row => [
@@ -6630,12 +6714,15 @@ async def test_in_between_replies_fold_into_the_tool_card_and_deck_notices_are_o
               const seams = [1, 2, 3, 4, 5].map(i => Math.round(
                 rows[i + 1].getBoundingClientRect().top - rows[i].getBoundingClientRect().bottom
               ));
-              const heights = { deck: height(rows[0]), note: height(rows[1]) };
-              const count = rows[2].querySelector('.tool-run-count').textContent;
-              rows[3].click();
+              const heights = {
+                deck: height(rows[0]), note: height(rows[7]), between: height(rows[4]),
+              };
+              const count = rows[5].querySelector('.tool-run-count').textContent;
+              const firstCount = rows[2].querySelector('.tool-run-count').textContent;
+              rows[7].click();
               await frame();
-              const unfolded = rows[3].classList.contains('ev-unfolded');
-              const unfoldedHeight = height(rows[3]);
+              const unfolded = rows[7].classList.contains('ev-unfolded');
+              const unfoldedHeight = height(rows[7]);
               rows[0].querySelector('summary').click();
               await frame();
               // The agent is still working: its latest line reads in full.
@@ -6646,28 +6733,32 @@ async def test_in_between_replies_fold_into_the_tool_card_and_deck_notices_are_o
               transcript.insertAdjacentHTML('beforeend', live[1]);
               await frame();
               const answered = liveRow().classList.contains('ev-folded');
-              return { closed, shape, heights, seams, count, unfolded, unfoldedHeight,
+              return { closed, shape, heights, seams, count, firstCount, unfolded, unfoldedHeight,
                        deckOpen: height(rows[0]), working, answered, quiet };
             }""",
             [working, answered],
         )
         await browser.close()
 
-    # A finished turn's steps sit behind one line until it is tapped.
+    # A finished turn's steps sit behind one line until it is tapped. The
+    # in-between line is not a step, so it splits the turn's calls into two lines.
     assert result["closed"] == {
-        "lines": 1, "text": result["closed"]["text"], "before": True,
-        "hidden": 6, "height": result["closed"]["height"],
+        "lines": 2, "first": result["closed"]["first"], "firstBefore": True,
+        "text": result["closed"]["text"], "before": True,
+        "hidden": 5, "height": result["closed"]["height"],
     }
+    assert result["closed"]["first"].startswith("2 stepsBash ×2")
     # The deck-woken turn's folded reply is one of those steps.
-    assert result["closed"]["text"].startswith("6 stepsBash ×3 · 3 notes")
+    assert result["closed"]["text"].startswith("3 stepsBash ×2 · 1 note")
     assert result["closed"]["height"] < 32
     assert result["shape"] == [
         "deck:",
-        "note:tool-run-lead",
-        # A note between two calls of one tool sits inside that tool's run.
-        "tool:tool-run-lead tool-run-joined",
-        "note:tool-run-item",
-        "tool:tool-run-item",
+        # In-between lines read in full and split the turn's tool calls (#4704).
+        "reply:",
+        "tool:tool-run-lead",
+        "tool:tool-run-item tool-run-end",
+        "reply:",
+        "tool:tool-run-lead",
         "tool:tool-run-item tool-run-end",
         # The deck woke the agent again and it replied again, so this one folds.
         "note:",
@@ -6686,20 +6777,23 @@ async def test_in_between_replies_fold_into_the_tool_card_and_deck_notices_are_o
         "deck:",
         "reply:",
     ]
-    assert result["closed"]["lines"] == 1
-    # Notes and tool calls of one turn read as one card with no gaps inside it.
-    assert result["seams"][:4] == [0, 0, 0, 0]
-    assert result["seams"][4] == 8  # the real reply is its own message
-    assert result["count"] == "×3"
+    # Calls of one tool read as one card; an in-between line is its own message.
+    # (An opened steps line sits between a line and the calls after it.)
+    assert result["seams"][1] == 0 and result["seams"][4] == 0
+    assert result["seams"][2] == 8
+    assert result["seams"][0] > 8 and result["seams"][3] > 8
+    assert result["count"] == "×2"
+    assert result["firstCount"] == "×2"
     assert result["heights"]["deck"] < 24  # one line, though the text is long
     assert result["heights"]["note"] < 32
+    assert result["heights"]["between"] > 0
     assert result["unfolded"] and result["unfoldedHeight"] > result["heights"]["note"]
     assert result["deckOpen"] > 60
     assert result["quiet"] == {
         "line": True, "lineBorder": "0px", "answered": False, "lone": True,
     }
     assert result["working"] is False  # shown in full while the turn is running
-    assert result["answered"] is True  # folded once the turn's reply arrived
+    assert result["answered"] is False  # and still in full once the turn's reply arrived
 
 
 @pytest.mark.browser
@@ -9163,6 +9257,11 @@ async def test_a_diagram_file_draws_full_screen_and_a_tapped_box_shows_its_note(
         await page.fill("#live-send textarea", "Split it in two")
         await page.click("#live-send button[type=submit]")
         await expect(page.locator("#live-status")).to_have_text("Sent to the agent.")
+        # A secret goes with no words before it, or its value would be ordinary text (#4610).
+        async with page.expect_response("**/inject"):
+            await page.fill("#live-send textarea", "  /secret TOKEN hunter2")
+            await page.click("#live-send button[type=submit]")
+        await expect(page.locator("#live-send textarea")).to_have_value("")
         await page.click("#live-box-clear")
         picked_after_clear = await page.locator("#live-box").is_hidden()
         panel_after_clear = await page.locator("#live-side").is_hidden()
@@ -9193,6 +9292,8 @@ async def test_a_diagram_file_draws_full_screen_and_a_tapped_box_shows_its_note(
     assert chat_frames == 0
     assert note_fill == amber and note_code == 0
     assert "About the box \u201cReady?\u201d in the diagram: Split it in two" in sent[0]
+    assert len(sent) == 2 and "About the box" not in sent[1]
+    assert re.search(r'name="message"\r\n\r\n/secret TOKEN hunter2\r\n', sent[1])
     assert picked_after_clear
     assert panel_at_start and composing == [True, False] and panel_after_clear
     assert on_prototype == [False, True]
@@ -11632,6 +11733,13 @@ async def test_session_sse_primes_and_pushes_each_live_fragment(
                 return seen
         pytest.fail(f"missing topics {expected - set(seen)}; saw {seen}")
 
+    async def next_event(expected, *, limit=12):
+        for _ in range(limit):
+            event = await asyncio.wait_for(gen.__anext__(), timeout=20.0)
+            if topic(event) == expected:
+                return event
+        pytest.fail(f"no {expected} event")
+
     try:
         events = [
             await asyncio.wait_for(gen.__anext__(), timeout=5.0)
@@ -11692,6 +11800,24 @@ async def test_session_sse_primes_and_pushes_each_live_fragment(
         # A worker's interaction reaches the deck as a change to its chat (#2865).
         app.state.app_state.sessions_changed((parent_key,))
         assert "interaction" in await next_until({"interaction"})
+
+        # A usage-limit retry leaves the open page once the chat has carried on (#4671).
+        from agentdeck.quota_retry import message_for
+
+        state = app.state.app_state
+        stopped = replace(
+            state.sessions[parent_key],
+            turn_failed=True,
+            automatic_retry_at=datetime.now(UTC) + timedelta(hours=1),
+            # Its runtime has reported it: only then is a missing failure believed.
+            capabilities=frozenset({*parent.capabilities, Capability.INJECT}),
+        )
+        state.update_session(stopped)
+        retry = message_for(state.sessions[parent_key])
+        assert app.state.scheduled_messages.schedule(retry) is not None
+        assert "Retrying at" in await next_event("held-messages")
+        state.update_session(replace(stopped, turn_failed=False, automatic_retry_at=None))
+        assert "Retrying at" not in await next_event("held-messages")
     finally:
         await gen.aclose()
 
@@ -12349,7 +12475,7 @@ async def test_account_page_saves_and_applies_new_chat_defaults(tmp_path, monkey
         assert 'value="high" selected' in saved.text
 
         dashboard = await client.get("/chats")
-        assert 'data-default-model="Fable 5.1"' in dashboard.text
+        assert 'data-default-model="Fable"' in dashboard.text
         assert 'data-default-effort="High"' in dashboard.text
 
         created = await client.post(
@@ -12366,6 +12492,17 @@ async def test_account_page_saves_and_applies_new_chat_defaults(tmp_path, monkey
             "/sessions/claude_code%3Atest%3Asid1/continue",
             data={"account_key": "claude_code:test", "model": "", "effort": ""},
         )
+        # One chat picked by hand: the alias itself reaches the spawn (#4697).
+        picked_fable = await client.post(
+            "/sessions/new",
+            data={
+                "account_key": "claude_code:test",
+                "cwd": str(tmp_path),
+                "message": "Start on Fable",
+                "model": "fable",
+                "effort": "medium",
+            },
+        )
 
         invalid_model = await client.post(
             "/accounts/claude_code%3Atest/new-chat-defaults",
@@ -12378,9 +12515,11 @@ async def test_account_page_saves_and_applies_new_chat_defaults(tmp_path, monkey
 
     assert created.status_code == 202
     assert continued.status_code == 202
+    assert picked_fable.status_code == 202
     assert [(call["model"], call["effort"]) for call in starts] == [
         ("fable", "high"),
         ("fable", "high"),
+        ("fable", "medium"),
     ]
     assert invalid_model.status_code == 422
     assert invalid_effort.status_code == 422
@@ -12410,8 +12549,26 @@ async def test_account_page_plans_a_usage_reset_and_marks_the_week_bar(tmp_path)
         saved = await client.post(path, data={"at": "23:59"})
         page = await client.get("/accounts/claude_code%3Atest")
         read = await client.get(f"/api{path}")
+        # #4717: the page's field sends a date and time with no zone, on the host's clock.
+        typed = (datetime.now() + timedelta(days=3)).strftime("%Y-%m-%dT%H:%M")
+        in_three_days = datetime.fromisoformat(typed).astimezone()
+        dated = await client.post(path, data={"at": typed})
+        dated_read = await client.get(f"/api{path}")
+        past = await client.post(
+            path, data={"at": (now.astimezone() - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M")}
+        )
         cleared = await client.delete(f"/api{path}")
         refused = await client.put(f"/api{path}", json={"at": "soon"})
+        day_alone = await client.put(f"/api{path}", json={"at": typed[:10]})
+        # A week that resets by itself before the plan keeps its own countdown.
+        await client.put(f"/api{path}", json={"at": (now + timedelta(days=9)).isoformat()})
+        later_plan = await client.get("/accounts/claude_code%3Atest")
+        # A reading whose reset has already passed is stale, not a week that ends first.
+        fresh = state.usage["claude_code:test"]
+        state.set_usage(replace(fresh, seven_day_resets_at=now - timedelta(minutes=5)))
+        stale_week = await client.get("/accounts/claude_code%3Atest")
+        state.set_usage(fresh)
+        await client.delete(f"/api{path}")
         unknown = await client.put(
             "/api/accounts/claude_code%3Anope/planned-reset", json={"at": "12:00"}
         )
@@ -12424,8 +12581,16 @@ async def test_account_page_plans_a_usage_reset_and_marks_the_week_bar(tmp_path)
     assert "↺" in page.text and "⚠" not in page.text
     assert read.json()["account"] == "claude_code:test"
     assert datetime.fromisoformat(read.json()["at"]) > now
+    # The field takes a date, and shows the saved one back.
+    assert 'type="datetime-local"' in before.text
+    assert f'value="{typed}"' in dated.text and "Saved" in dated.text
+    assert datetime.fromisoformat(dated_read.json()["at"]) == in_three_days
+    assert "already passed" in past.text
     assert cleared.json() == {"account": "claude_code:test", "at": None}
     assert refused.status_code == 400
+    assert day_alone.status_code == 400
+    assert "↺" not in later_plan.text and "Planned:" in later_plan.text
+    assert "↺" in stale_week.text
     assert unknown.status_code == 404
 
 

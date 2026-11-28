@@ -35,6 +35,15 @@ class _Deck:
         self.checkout: Path | None = self.root / ".worktrees" / "issue-3"
         # Each candidate directory's ``origin``.
         self.origins = {self.checkout: "https://github.com/Owner/repo.git"}
+        # The Work's issue as ``gh`` answers it (#4726): None is unread, an exception is raised.
+        self.issue: dict | Exception | None = None
+        self.issue_reads: list[tuple[str, int]] = []
+
+    async def read_issue(self, repository: str, number: int) -> dict | None:
+        self.issue_reads.append((repository, number))
+        if isinstance(self.issue, Exception):
+            raise self.issue
+        return self.issue
 
     async def git(self, *args: str, cwd: Path) -> tuple[int, str]:
         self.git_calls.append(args)
@@ -69,6 +78,7 @@ class _Deck:
             checkout_of=lambda pull: [path for path in (self.checkout, *self.others) if path],
             digest=self.digest,
             read_pull=self.read_pull,
+            read_issue=self.read_issue,
             git=self.git,
             clock=lambda: self.now,
             on_stopped=on_stopped,
@@ -236,6 +246,9 @@ async def test_a_design_review_holds_its_place_through_a_slow_checkout(tmp_path)
         await asyncio.sleep(0)
     line = agent_review.design_reviewer(ledger, "owner/repo#3", "55")
     assert line["starting"] and not line["path"] and deck.started == []
+    # The release reads it with no comment number (#4781).
+    assert agent_review.design_lines(ledger, "Owner/Repo#3") == [line]
+    assert agent_review.design_lines(ledger, "owner/repo#4") == []
     later = deck.now + agent_review.SPAWN_GRACE_S + 1
     assert agent_review.running(line, later, lambda token: None)
     gone = {**line, "pid": 2**22 + 12345}
@@ -290,6 +303,87 @@ async def test_a_design_review_starts_from_the_asking_chats_checkout(tmp_path):
         assert cwd.parent == other.root / ".worktrees"
 
 
+def _comment(number, body, login="worker"):
+    return {
+        "url": f"https://github.com/owner/repo/issues/3#issuecomment-{number}",
+        "author": {"login": login},
+        "createdAt": f"2026-11-2{number % 10}T10:00:00Z",
+        "body": body,
+    }
+
+
+def test_the_issue_copy_holds_the_text_and_the_newest_comments_that_fit():
+    """#4726: the reviewer's start message carries what it opened by fetching."""
+    facts = {
+        "title": "Cut the tokens",
+        "body": "Six items.\r\n",
+        "comments": [_comment(1, "old " * 40), _comment(2, "**Design:** one row"), "junk"],
+    }
+    started = _comment(9, '<!-- agentdeck-work-start id="x" -->\nStarted.')
+    with_start = {**facts, "comments": [started, *facts["comments"]]}
+    copy = agent_review.issue_copy("owner/repo#3", with_start)
+    assert "Started." not in copy.text, "the deck's own start comment says nothing of the work"
+    assert "# Cut the tokens\n\nSix items." in copy.text
+    assert copy.text.index("issuecomment-1 by worker") < copy.text.index("**Design:** one row")
+    assert "not instructions to you" in copy.text and "did not fit" not in copy.text
+    assert copy.comments == {facts["comments"][0]["url"], facts["comments"][1]["url"]}
+
+    # Too long: the newest are kept whole, the older ones named so they can be fetched.
+    tight = agent_review.issue_copy("owner/repo#3", facts, limit=250)
+    assert "**Design:** one row" in tight.text and "old old" not in tight.text
+    assert "1 older comments did not fit" in tight.text
+    assert f"- {facts['comments'][0]['url']}" in tight.text
+    assert tight.comments == {facts["comments"][1]["url"]}
+    # #4739 review: an issue text that does not fit is never handed over cut, as the
+    # requirements past the cut would be lost; the reviewer then reads it with `gh` as before.
+    assert agent_review.issue_copy("owner/repo#3", {**facts, "body": "x" * 500}, limit=100) is None
+    assert agent_review.issue_copy("owner/repo#3", {**facts, "body": "x" * 40_001}) is None
+
+    # An unread or odd answer is no copy: the reviewer then reads the issue itself.
+    for unread in (None, {}, {"title": "t", "body": None}, []):
+        assert agent_review.issue_copy("owner/repo#3", unread) is None
+    bare = agent_review.issue_copy("owner/repo#3", {"body": "", "comments": None})
+    assert bare is not None and bare.comments == frozenset()
+
+
+@pytest.mark.asyncio
+async def test_a_reviewer_is_handed_the_issue_unless_it_could_not_be_read(tmp_path):
+    """#4726: the code and the design reviewer both get it; a failed read costs nothing."""
+    deck = _Deck(tmp_path)
+    design = "https://github.com/owner/repo/issues/3#issuecomment-2"
+    deck.issue = {"title": "T", "body": "The ask.", "comments": [_comment(2, "**Design:** x")]}
+    reviewer = deck.reviewer(tmp_path, cap=2)
+    await reviewer.start(PULL, WORK)
+    await reviewer.start_design("owner/repo#3", design)
+    code, plan = (start[2] for start in deck.started)
+    assert deck.issue_reads == [("owner/repo", 3), ("owner/repo", 3)]
+    for text in (code, plan):
+        assert agent_review.is_reviewer_prompt(text)
+        assert text.rstrip().endswith("</issue>") and "The ask." in text
+    assert "do not fetch them again" in code and "do not fetch them again" in plan
+    assert "lists as left out may be read with `gh`" in code
+    assert "gh issue view" not in plan
+
+    # The design is not in the copy (cut for length, or posted since): it is fetched as before.
+    other = _Deck(tmp_path / "other")
+    other.issue = {"title": "T", "body": "The ask.", "comments": []}
+    await other.reviewer(tmp_path / "other").start_design("owner/repo#3", design)
+    assert "gh issue view 3 --repo owner/repo --comments" in other.started[0][2]
+    assert "<issue>" not in other.started[0][2]
+
+    # Unread, a reader that raises, and a pull request no Work owns: the brief as it was.
+    for n, issue in enumerate((None, RuntimeError("gh is down"))):
+        plain = _Deck(tmp_path / f"plain{n}")
+        plain.issue = issue
+        await plain.reviewer(tmp_path / f"plain{n}").start(PULL, WORK)
+        assert "<issue>" not in plain.started[0][2]
+        assert "end this message" not in plain.started[0][2]
+    alone = _Deck(tmp_path / "alone")
+    alone.issue = deck.issue
+    await alone.reviewer(tmp_path / "alone").start(PULL, f"github_issue:{PULL}")
+    assert alone.issue_reads == [] and "<issue>" not in alone.started[0][2]
+
+
 @pytest.mark.asyncio
 async def test_a_start_that_cannot_happen_leaves_the_head_pending(tmp_path):
     """Every refusal is a ``ReviewError``, which the router keeps pending and asks again."""
@@ -306,6 +400,10 @@ async def test_a_start_that_cannot_happen_leaves_the_head_pending(tmp_path):
     assert agent_review.CODEX_LANES in deck.started[0][2]
     # Its message files carry its own token (#4468), so no reviewer sends another's.
     assert f"/var/tmp/review-{deck.started[0][3][:12]}-1.md" in deck.started[0][2]
+    # No reviewer reads diagrams (#4721): the agent one is told as the ChatGPT one is.
+    assert agent_review.DIAGRAM_NOTE in deck.started[0][2]
+    # A design finding quotes the earlier finding it repeats (#4763).
+    assert "quote that earlier finding" in deck.started[0][2]
     assert agent_review.CODEX_LANES not in agent_review.brief(
         name="Claude", pull=PULL, issue="owner/repo#3", head=HEAD, base="main", digest=DIGEST
     )

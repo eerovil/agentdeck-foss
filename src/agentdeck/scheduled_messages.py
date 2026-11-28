@@ -228,6 +228,24 @@ def _must_wait(
     )
 
 
+def _retry_still_applies(message: ScheduledMessage, session: Session) -> bool:
+    """Whether a quota retry would still be sent: its chat is as the limit stopped it.
+
+    True for a row that is no quota retry.
+    """
+    retry = message.quota_retry
+    if retry is None:
+        return True
+    source, reset_epoch = retry
+    reset = session.automatic_retry_at
+    return bool(
+        session.key == source
+        and session.turn_failed
+        and reset is not None
+        and abs(reset.timestamp() - reset_epoch) < 1.0
+    )
+
+
 class ScheduledMessageService:
     """Claim due rows and hand them to ``InjectionService`` with a stable ID.
 
@@ -244,6 +262,8 @@ class ScheduledMessageService:
         resolve_target: Callable[[str], ScheduledTarget | None],
         *,
         resolve_answer_target: Callable[[str], ScheduledTarget | None] | None = None,
+        current_session: Callable[[str], Session | None] = lambda _chat_id: None,
+        session_known: Callable[[str], bool] = lambda _session_key: True,
         on_change: Callable[[str], None] | None = None,
         on_delivering: Callable[[str], None] | None = None,
         on_delivered: Callable[[str, str], None] | None = None,
@@ -255,6 +275,11 @@ class ScheduledMessageService:
         self._resolve_target = resolve_target
         # A held answer's chat need not be able to take a new turn (#4106).
         self._resolve_answer_target = resolve_answer_target or resolve_target
+        # The chat's current leg whether or not it can take a message now, for what the
+        # page shows; None while it is not known.
+        self._current_session = current_session
+        # Whether a scan has found this leg yet: until then an older one stands in for it.
+        self._session_known = session_known
         self._on_change = on_change or (lambda _chat_id: None)
         self._on_delivering = on_delivering or (lambda _session_key: None)
         # A held send is a person's message, so a parked card's answer is relayed from
@@ -325,7 +350,32 @@ class ScheduledMessageService:
         return self._store.scheduled_message_ids_since(chat_id, prefix, since)
 
     def visible(self, chat_id: str) -> tuple[ScheduledMessage, ...]:
-        return self._store.load_visible_scheduled_messages(chat_id)
+        """The chat's waiting bubbles, without a quota retry that would not be sent (#4671).
+
+        A chat that moved to another account leaves its retry stored until the reset. It is
+        hidden rather than cancelled: the move may come to nothing, or the same chat may
+        stop on the same reset again, and a cancelled retry is never made again.
+        """
+        messages = self._store.load_visible_scheduled_messages(chat_id)
+        if not any(m.quota_retry and m.state == "scheduled" for m in messages):
+            return messages
+        session = self._current_session(chat_id)
+        return tuple(
+            m for m in messages if m.state != "scheduled" or not self._known_stale(m, session)
+        )
+
+    def _known_stale(self, message: ScheduledMessage, session: Session | None) -> bool:
+        """Whether a waiting quota retry is known not to be sent; not knowing is no proof."""
+        if message.quota_retry is None or session is None:
+            return False
+        source, _reset = message.quota_retry
+        if not self._session_known(source):
+            return False
+        if session.key == source and Capability.INJECT not in session.capabilities:
+            # A leg its runtime has not reported yet, as after a restart, reads as not
+            # failed and without a reset.
+            return False
+        return not _retry_still_applies(message, session)
 
     def pending_ids(self) -> frozenset[str]:
         """Deferred turns that still own a future delivery."""
@@ -457,22 +507,12 @@ class ScheduledMessageService:
                 # Discovery may still be warming after a web restart. Leave the
                 # row scheduled and retry on the next chat change (#2865).
                 return False
-            quota_retry = message.quota_retry
-            if quota_retry is not None:
-                source, reset_epoch = quota_retry
-                current_reset = target.session.automatic_retry_at
-                still_due = bool(
-                    target.session.key == source
-                    and target.session.turn_failed
-                    and current_reset is not None
-                    and abs(current_reset.timestamp() - reset_epoch) < 1.0
-                )
-                if not still_due:
-                    if waiting:
-                        self.cancel(message.id, message.chat_id)
-                    else:
-                        self._fail_mid_send(message, QUOTA_RETRY_SUPERSEDED)
-                    continue
+            if not _retry_still_applies(message, target.session):
+                if waiting:
+                    self.cancel(message.id, message.chat_id)
+                else:
+                    self._fail_mid_send(message, QUOTA_RETRY_SUPERSEDED)
+                continue
             if _must_wait(message, target, self._injector):
                 # The chat is the deck's own and its runtime is restarting: wait for
                 # its chat to change instead of failing the send (#2847, #2865).

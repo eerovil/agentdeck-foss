@@ -50,6 +50,7 @@ from ..public_origin import public_origin as deck_public_origin
 from ..run_execution import MAX_CONTINUATIONS, SAFE_STATES, read_outcomes
 from ..scheduled_messages import RUNTIME_HOLD, HeldAnswer, HeldAttachment, ScheduledMessage
 from ..session_secrets import (
+    IssuedSecret,
     SecretCommand,
     SecretCommandError,
     SecretRuntimeError,
@@ -237,6 +238,7 @@ async def _hold_for_runtime(
         cleanup_uploaded_files(uploads.paths)
         raise HTTPException(status_code=409, detail="This message id is already in use.")
     _note_person_message(request, session.key)
+    _person_words_accepted(request, session.key, message)
     # A replay of a send already held: the first request's files are the kept ones. A
     # generic file is saved at a path keyed by its action id and content, so a replay can
     # land on the very file the held row keeps; only the replay's other copies go.
@@ -335,6 +337,24 @@ async def _render_start_accepted(
     return response
 
 
+def _from_page(request: Request) -> bool:
+    return request.headers.get("hx-request", "").lower() == "true"
+
+
+def _person_message_arrived(request: Request, session_key: str) -> None:
+    """Before anything is awaited: a page's message takes back the words that stood (#4643)."""
+    if _from_page(request):
+        get_state(request).person_message_arrived(session_key, supplied_action_id(request))
+
+
+def _person_words_accepted(request: Request, session_key: str, text: str) -> None:
+    """A page's message was accepted, so its words may stand as a request (#4643)."""
+    if _from_page(request):
+        get_state(request).person_message_accepted(
+            session_key, supplied_action_id(request), text
+        )
+
+
 def _note_person_message(request: Request, session_key: str) -> None:
     """Record a person's own message, sent from one of the deck's pages (#4562).
 
@@ -343,9 +363,8 @@ def _note_person_message(request: Request, session_key: str) -> None:
     deck notice and a scheduled delivery send no such header. It is a marker, not a lock:
     a client that sets it on purpose is taken for a person.
     """
-    if request.headers.get("hx-request", "").lower() != "true":
-        return
-    get_state(request).note_person_message(session_key)
+    if _from_page(request):
+        get_state(request).note_person_message(session_key)
 
 
 def _note_boss_turn(request: Request, session_key: str, form: FormData, text: str) -> None:
@@ -600,6 +619,46 @@ def _secret_command_or_422(
     except SecretCommandError as exc:
         cleanup_uploaded_files(uploads)
         raise HTTPException(status_code=422, detail=str(exc)) from None
+
+
+def _admit_secret(command: SecretCommand, uploads: SavedUploads, action_id: str | None) -> str:
+    """The value-free stand-in a secret's send is checked with before its ticket is issued."""
+    if uploads.paths:
+        cleanup_uploaded_files(uploads.paths)
+        raise HTTPException(
+            status_code=422, detail="A secret command cannot include attachments"
+        )
+    if not action_id:
+        raise HTTPException(status_code=422, detail="secret action id required")
+    return secret_notice(command.name, "pending-ticket")
+
+
+async def _issue_secret(command: SecretCommand, session_key: str, action_id: str) -> IssuedSecret:
+    """Hand the value to the runtime; only the name and the ticket go on from here."""
+    try:
+        return await issue_runtime_secret(
+            runtime_socket_path(),
+            session_key=session_key,
+            action_id=action_id,
+            name=command.name,
+            value=command.value,
+        )
+    except SecretRuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from None
+
+
+async def _revoke_secret(issued: IssuedSecret) -> None:
+    with contextlib.suppress(SecretRuntimeError):
+        await revoke_runtime_secret(runtime_socket_path(), issued.ticket)
+
+
+def _reserved_secret_refusal(message: str) -> str | None:
+    """Why ``message`` is refused where no chat can take a secret, or None."""
+    try:
+        _reject_reserved_secret_command(message, SavedUploads())
+    except HTTPException as exc:
+        return str(exc.detail)
+    return None
 
 
 def _reject_reserved_secret_command(message: str, uploads: SavedUploads) -> None:
@@ -910,6 +969,7 @@ async def inject_message(request: Request, session_key: str) -> HTMLResponse:
     client_action_id = bind_action(
         request, session_key=session.key, provider=account.provider_id
     )
+    _person_message_arrived(request, session.key)
     config = get_config(request).inject
     injector = get_injector(request)
     hold = False
@@ -950,16 +1010,9 @@ async def inject_message(request: Request, session_key: str) -> HTMLResponse:
         # Handing a credential over is most often needed *while* the agent works,
         # and the queue never carries the value — only the name and a one-use
         # ticket, which is what the notice below is built from.
-        if uploads.paths:
-            cleanup_uploaded_files(uploads.paths)
-            raise HTTPException(
-                status_code=422, detail="A secret command cannot include attachments"
-            )
-        if not client_action_id:
-            raise HTTPException(status_code=422, detail="secret action id required")
-        # Run every local admission check against a value-free stand-in before
-        # the runtime starts retaining the value.
-        message = secret_notice(secret_command.name, "pending-ticket")
+        # Every local admission check then runs against the value-free stand-in,
+        # before the runtime starts retaining the value.
+        message = _admit_secret(secret_command, uploads, client_action_id)
     try:
         effort = _selected_effort(form, provider)
     except HTTPException:
@@ -985,16 +1038,7 @@ async def inject_message(request: Request, session_key: str) -> HTMLResponse:
             return fresh
     try:
         if secret_command is not None:
-            try:
-                issued = await issue_runtime_secret(
-                    runtime_socket_path(),
-                    session_key=session.key,
-                    action_id=client_action_id,
-                    name=secret_command.name,
-                    value=secret_command.value,
-                )
-            except SecretRuntimeError as exc:
-                raise HTTPException(status_code=503, detail=str(exc)) from None
+            issued = await _issue_secret(secret_command, session.key, client_action_id)
             message = secret_notice(issued.name, issued.ticket)
         with timing_span(request, "queue"):
             result = await injector.start(
@@ -1014,10 +1058,10 @@ async def inject_message(request: Request, session_key: str) -> HTMLResponse:
     if not result.accepted:
         cleanup_uploaded_files(uploads.paths)
         if issued is not None:
-            with contextlib.suppress(SecretRuntimeError):
-                await revoke_runtime_secret(runtime_socket_path(), issued.ticket)
+            await _revoke_secret(issued)
         raise HTTPException(status_code=403, detail=result.reason)
     _note_boss_turn(request, session.key, form, message)
+    _person_words_accepted(request, session.key, message)
     status = injector.status(session.key)
     queued_item = status.items[-1] if status and status.items else None
     posted = None
@@ -1128,6 +1172,7 @@ async def _deck_chat_fresh_leg(
         cleanup_uploaded_files([*images, *files])
         raise HTTPException(status_code=403, detail=start_failure_message(result.reason))
     _note_boss_turn(request, session.key, {}, message)
+    _person_words_accepted(request, session.key, message)
     return await _render_start_accepted(request, token, result_id="inject-result")
 
 
@@ -1140,6 +1185,7 @@ async def cancel_held_message(
 ) -> HTMLResponse:
     _require_same_origin(request)
     _account, session, _provider = resolve_current_leg(request, session_key)
+    get_state(request).withdraw_person_words(session.key)
     chat_id = _held_chat_id(request, session.key)
     if not request.app.state.scheduled_messages.cancel(message_id, chat_id):
         raise HTTPException(status_code=409, detail="This message is already sending.")
@@ -1172,6 +1218,7 @@ async def dismiss_pending_message(
     """
     _require_same_origin(request)
     _account, session, _provider = resolve_session(request, session_key)
+    get_state(request).withdraw_person_words(session.key)
     injector = get_injector(request)
     if injector.discard(session.key, item_id):
         return HTMLResponse("")
@@ -1244,6 +1291,8 @@ async def resend_unsent_message(
     _require_same_origin(request)
     row_account, row_session, row_provider = resolve_session(request, session_key)
     account, session, provider = resolve_current_leg(request, session_key)
+    # An older message said again: it stands for nothing itself, and is newer than what stood.
+    get_state(request).withdraw_person_words(session.key)
     injector = get_injector(request)
     result = await _cross_leg_refusal(
         injector, row_account, row_session, row_provider, session, item_id
@@ -1281,6 +1330,7 @@ async def steer_turn(request: Request, session_key: str) -> HTMLResponse:
     client_action_id = bind_action(
         request, session_key=session.key, provider=account.provider_id
     )
+    _person_message_arrived(request, session.key)
     config = get_config(request).inject
     if not config.enabled:
         raise HTTPException(status_code=403, detail="active-turn steering unavailable")
@@ -1311,6 +1361,7 @@ async def steer_turn(request: Request, session_key: str) -> HTMLResponse:
     if not receipt.result.accepted:
         raise HTTPException(status_code=409, detail=receipt.result.reason)
     _note_boss_turn(request, session.key, form, message)
+    _person_words_accepted(request, session.key, message)
     return HTMLResponse(
         '<div id="steer-result" class="inject-result complete">'
         "Sent to active turn.</div>"
@@ -1323,6 +1374,7 @@ async def interrupt_turn(request: Request, session_key: str) -> HTMLResponse:
     account, session, provider = resolve_current_leg(request, session_key)
     session_key = session.key
     bind_action(request, session_key=session.key, provider=account.provider_id)
+    get_state(request).withdraw_person_words(session.key)
     if Capability.INTERRUPT not in session.capabilities:
         raise HTTPException(status_code=403, detail="turn interruption unavailable")
     with timing_span(request, "runtime"):
@@ -1509,6 +1561,10 @@ async def pending_interaction(
 @router.post("/sessions/{session_key}/interaction", response_class=HTMLResponse)
 async def answer_interaction(request: Request, session_key: str) -> HTMLResponse:
     _require_same_origin(request)
+    # Before the form is awaited, like every other way to take words back (#4643).
+    get_state(request).withdraw_person_words(
+        resolve_current_leg(request, session_key)[1].key
+    )
     with timing_span(request, "form"):
         form = await request.form()
     session, remaining, held = await _answer_interaction(
@@ -1710,6 +1766,7 @@ async def _answer_interaction(
     account, session, provider = resolve_current_leg(request, session_key)
     session_key = session.key
     bind_action(request, session_key=session.key, provider=account.provider_id)
+    get_state(request).withdraw_person_words(session.key)
     restarting = provider.runtime_unreachable(account, session)
     if Capability.INTERACT not in session.capabilities and not restarting:
         raise HTTPException(status_code=403, detail="interaction unavailable")
@@ -1744,6 +1801,13 @@ async def _answer_interaction(
             for value in values(question.id)
             if isinstance(value, str) and value.strip()
         ]
+        # An answer reaches the model as it is, so a secret is never taken as one (#4610).
+        # An option the agent offered is its own words.
+        offered = {(o.value or o.label).strip() for o in question.options}
+        for value in given:
+            if value in offered:
+                continue
+            _reject_reserved_secret_command(value, SavedUploads())
         if given:
             answers[question.id] = given
     if interaction.dismissible:
@@ -2218,6 +2282,7 @@ async def continue_session(request: Request, session_key: str) -> Response:
         request, session_key
     )
     session_key = source_session.key
+    get_state(request).withdraw_person_words(session_key)
     if Capability.TRANSCRIPT not in source_session.capabilities:
         raise HTTPException(status_code=404, detail="transcript unavailable")
     content_type = request.headers.get("content-type", "").lower()
@@ -2376,10 +2441,9 @@ async def _continue_chat(
         first = raw_first.strip() if isinstance(raw_first, str) else ""
         # A temporary secret is entered only in an existing chat's box: as the first
         # message of a new chat it would reach the agent in plain text.
-        try:
-            _reject_reserved_secret_command(first, SavedUploads())
-        except HTTPException as exc:
-            return reject(str(exc.detail))
+        reserved_secret = _reserved_secret_refusal(first)
+        if reserved_secret is not None:
+            return reject(reserved_secret)
         undeliverable = provider.user_message_refusal(first) if first else None
         if undeliverable is not None:
             return reject(undeliverable)

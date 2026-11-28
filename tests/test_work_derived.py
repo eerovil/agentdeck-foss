@@ -16,6 +16,7 @@ from public_copy import private_feature
 
 from agentdeck import chat_board as _chat_board
 from agentdeck import mac_runner as _mac_runner
+from agentdeck.web import work_view
 from agentdeck.web.work_view import WORK_INPUTS_TOPIC
 from agentdeck.work import WorkRef
 from agentdeck.work_derived import (
@@ -563,6 +564,9 @@ def test_a_reply_ending_on_a_question_waits_for_the_answer_and_is_never_asked():
     assert (merged.kind, merged.live_checking, merged.line.startswith("Needs you")) == (
         ASKED_IN_CHAT, False, True
     )
+    # The wait it stands over still shows, so Close issue is held (#4631).
+    assert merged.self_waking
+    assert not status(last_text=ideas, ended_at=AT, asks=True, merged=True).self_waking
     pending = status(last_text=ideas, ended_at=AT, closed=True, live_pending=True, waits=deploy)
     assert pending.kind == ASKED_IN_CHAT
     assert status(last_text=ideas, ended_at=AT, review_pr=9).kind == ASKED_IN_CHAT
@@ -1042,10 +1046,14 @@ def test_finish_then_a_message_then_a_turn_that_ends_reads_through_d7():
     assert later.kind == UNFINISHED
 
 
-def test_a_deck_run_works_verification_job_is_a_wait():
+def test_a_deck_run_works_verification_job_is_a_wait(tmp_path):
     """#2965: agentdeck#2974's verification job had no Run, so it never became the card's
-    verification and the Work read as ended while its tests ran."""
-    from agentdeck.web.work_view import derived_for
+    verification and the Work read as ended while its tests ran. #4756: the same for the
+    design review its agent asked for, whose verdict comes to the chat as a message."""
+    import json
+    import time
+
+    from agentdeck.web.work_view import _derived_key, derived_for
 
     session = _session(last_progress=AT, last_text="Queued the verification run.")
     app = SimpleNamespace(
@@ -1065,6 +1073,45 @@ def test_a_deck_run_works_verification_job_is_a_wait():
         {**job, "purpose": ""},
     ):
         assert derived_for(app, snapshot, WORK, card(), [other]).kind == UNFINISHED
+
+    ledger, root = tmp_path / "ledger.json", tmp_path / "hooks" / "log"
+    app.state.config = SimpleNamespace(
+        review=SimpleNamespace(ledger_path=ledger), github_webhook=SimpleNamespace(path=root)
+    )
+    issue = f"{WORK.repository}#{WORK.number}".lower()
+    line = {"token": "t", "pull": f"design:{issue}", "head": "comment-7", "started": time.time()}
+    for lines, kind in (
+        ([line], WAITING),  # just started: running however its chat reads
+        ([{**line, "started": time.time() - 4 * 3600}], UNFINISHED),  # past its age
+        ([{**line, "pull": "design:eerovil/agentdeck#1"}], UNFINISHED),  # another issue
+        ([{**line, "pull": "eerovil/agentdeck#9"}], UNFINISHED),  # a code reviewer
+    ):
+        ledger.write_text(json.dumps(lines))
+        found = derived_for(app, snapshot, WORK, card())
+        assert found.kind == kind, lines
+    assert found.line != "Waiting on its design review"
+    ledger.write_text(json.dumps([line]))
+    assert derived_for(app, snapshot, WORK, card()).line == "Waiting on its design review"
+    # The cached card rebuilds when the review starts and when it ends.
+    assert _derived_key(app, snapshot, WORK)[-1] is True
+    # A reviewer past its first minutes runs while its chat thinks, read from the pass's own
+    # presentation, never one built again per reviewer.
+    reviewer = SimpleNamespace(thinking=True)
+    snapshot.state.session_key_for_token = lambda token: "reviewer" if token == "t" else None
+    snapshot.state.sessions["reviewer"] = reviewer
+    snapshot.state.session_presentation = None  # not callable: a rebuild would fail
+    snapshot.presentation = SimpleNamespace(display=lambda session: session)
+    ledger.write_text(json.dumps([{**line, "started": time.time() - 3600}]))
+    assert derived_for(app, snapshot, WORK, card()).kind == WAITING
+    reviewer.thinking = False
+    assert derived_for(app, snapshot, WORK, card()).kind == UNFINISHED
+    assert _derived_key(app, snapshot, WORK)[-1] is False
+    ledger.unlink()
+    # Waiting for a reviewer place (#4342), or asked of ChatGPT (#4722): the router's entry.
+    pending = {"pending": {f"design:{issue}": {"since": time.time(), "next_at": 0}}}
+    (tmp_path / "hooks").mkdir()
+    (tmp_path / "hooks" / "work-router-pending.json").write_text(json.dumps(pending))
+    assert derived_for(app, snapshot, WORK, card()).kind == WAITING
 
 
 def test_a_message_just_handed_to_the_chat_is_its_next_step():
@@ -1302,6 +1349,35 @@ def test_ready_for_merge_once_the_release_waits_only_for_a_person():
     assert [button.label for button in row.buttons] == ["Merge", "Open", "Hide"]
     # A push since the release's answer is a head nobody reviewed: not ready.
     assert _derived_with_reviews({}, awaiting=awaiting, head="b" * 40).kind == ENDED
+    # #4753: Merge pressed, the release no longer waits for a person, and nothing held the
+    # Work until the merge landed: it read ended, and its agent was asked for a next step
+    # seconds before the deck's own merged message. The press is the deck's wait now, also
+    # while GitHub's checks run; whatever the release says the agent owes still reads ended.
+    at = datetime.now(UTC).timestamp() - 60
+    pressed = {"asked": {"at": at, "pulls": {"eerovil/agentdeck#9": {"digest": "d"}}}}
+    for more in ({}, {"waiting_checks": True, "hold": {"why": "checks pending", "since": 5.0}}):
+        found = _derived_with_reviews({}, entry={**pressed, **more})
+        assert found.kind == WAITING and "its pull request" in found.line, more
+    # Quiet is counted from the press: the Work sat ready for hours before it.
+    assert found.deadline == datetime.fromtimestamp(at, UTC) + PR_STALE
+    long_ago = {"asked": {**pressed["asked"], "at": at - PR_STALE.total_seconds()}}
+    assert _derived_with_reviews({}, entry=long_ago).kind == PR_STUCK
+    fix = {"asked": {"at": at, "pulls": {"eerovil/agentdeck#9": {"held": {"at": 2.0}}}}}
+    failed = {"hold": {"why": "the tests failed", "since": at}}
+    for owed in ({"needs_verify": True}, failed, fix):
+        assert _derived_with_reviews({}, entry={**pressed, **owed}).kind == ENDED, owed
+    untimed = ({"asked": None}, {"asked": True}, {"asked": {"pulls": {}}}, {"asked": {"at": True}})
+    for none in untimed:
+        assert _derived_with_reviews({}, entry=none).kind == ENDED, none
+    # A project that merges on its own has no press: reviewed and tested, held only for
+    # GitHub's checks, is the deck's wait too, from when that hold began.
+    checks = {"waiting_checks": True, "hold": {"why": "checks pending", "since": at}}
+    found = _derived_with_reviews({}, entry=checks)
+    assert found.kind == WAITING and found.deadline == datetime.fromtimestamp(at, UTC) + PR_STALE
+    assert _derived_with_reviews({}, entry={**checks, "needs_verify": True}).kind == ENDED
+    assert _derived_with_reviews({}, entry={"waiting_checks": True}).kind == ENDED, "undated"
+    assert _derived_with_reviews({}, entry={"hold": checks["hold"]}).kind == ENDED
+    assert _derived_with_reviews({}, entry=pressed, draft=True).kind == ENDED
     # Another repository's pull request reads the same: no line names one (#3720).
     other = _derived_with_reviews(
         {}, repository="northwind/abacus",
@@ -1838,7 +1914,9 @@ def test_a_work_held_only_for_its_tests_is_asked_to_run_them(tmp_path):
     assert "question box" not in scheduled[0].text
 
 
-def test_a_work_whose_review_waits_on_its_checklist_is_asked_for_pre_review_done(tmp_path):
+def test_a_work_whose_review_waits_on_its_checklist_is_asked_for_pre_review_done(
+    tmp_path, monkeypatch
+):
     """#4575: store#4161's agent took a minor verdict's pass as carried and waited on the
     merge for nine hours; the request names the one step that moves it."""
     from agentdeck.web.work_view import ask_for_next_steps
@@ -1866,6 +1944,25 @@ def test_a_work_whose_review_waits_on_its_checklist_is_asked_for_pre_review_done
     text = scheduled[0].text
     assert '{"pull_request": "eerovil/agentdeck#9"}' in text
     assert '{"pull_request": "eerovil/agentdeck#10"}' in text
+    # While the Work's design review is asked and unanswered, pre-review-done would be
+    # refused: the request says to wait for its verdict first (#4781).
+    from agentdeck.web import work_view
+
+    monkeypatch.setattr(work_view, "_design_waits", lambda app, work_id: True)
+    scheduled.clear()
+    later = status(ended_at=AT + timedelta(seconds=1), asks=True)
+    assert ask_for_next_steps(app, [replace(ended, derived=later)]) == 1
+    text = scheduled[0].text
+    assert "waits on the Work's design review" in text and "it waits on you" not in text
+    assert "once it passes" in text and '{"pull_request": "eerovil/agentdeck#10"}' in text
+    # At the design-review series limit it says to ask the owner instead (#4800).
+    monkeypatch.setattr(work_view, "_design_limited", lambda app, work_id: True)
+    scheduled.clear()
+    later = status(ended_at=AT + timedelta(seconds=2), asks=True)
+    assert ask_for_next_steps(app, [replace(ended, derived=later)]) == 1
+    text = scheduled[0].text
+    assert "series limit" in text and "question box" in text and "it waits on you" not in text
+    assert '{"owner": "more"}' in text and '{"owner": "skip"}' in text and "`parked`" in text
 
 
 def test_a_work_whose_verification_failed_is_not_asked_to_run_it_again(tmp_path):
@@ -2056,6 +2153,29 @@ def test_a_posted_spec_waits_for_approval_and_is_never_asked_for_a_next_step(tmp
     assert ask_for_next_steps(app, [replace(spec, derived=found)]) == 0 and scheduled == []
     row = front_row(replace(spec, derived=found), current=False)
     assert (row.section, row.attention.category) == ("needs_you", "needs_answer")
+    # Inside one pass the project's policy is read once: each read stats every manifest (#4639).
+    reads: list[str] = []
+    app.state.work_release.ports.policy = lambda repo: (reads.append(repo), policy)[1]
+    token = work_view._PASS_REPOS.set({})
+    for _ in range(2):
+        assert work_view._posted_spec(app, WORK, spec, "chat-a") == (AT, url)
+    work_view._PASS_REPOS.reset(token)
+    assert len(reads) == 1
+    # A read that fails is not the pass's answer: the next card reads again.
+    answers = iter([OSError("gone"), policy])
+
+    def flaky(repo):
+        answer = next(answers)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    app.state.work_release.ports.policy = flaky
+    token = work_view._PASS_REPOS.set({})
+    assert work_view._posted_spec(app, WORK, spec, "chat-a") is None
+    assert work_view._posted_spec(app, WORK, spec, "chat-a") == (AT, url)
+    work_view._PASS_REPOS.reset(token)
+    app.state.work_release.ports.policy = lambda repo: policy
     assert status(spec_posted_at=AT, running=True).kind == WORKING
     # No spec posted (only the start comment, or a progress comment without the spec's
     # marker), the agent's own comment after it, a person's comment after it, a pull request
@@ -2092,6 +2212,30 @@ def test_a_fresh_ending_is_asked_about_only_once_it_has_settled(tmp_path):
     fresh = datetime.now(UTC) - timedelta(seconds=5)
     assert ask_for_next_steps(app, [card(derived=status(ended_at=fresh, asks=True))]) == 0
     assert scheduled == [] and app.state.work_endings.get(card().work_id) == (None, None)
+    # #4753: the time runs from when the Work was first seen ended, not from its turn's end.
+    # One that rested until now (Ready for merge until its Merge was pressed) ended long
+    # ago, and was asked at once, seconds before the deck's own next message.
+    from agentdeck.web.work_view import _settle_ending
+
+    long_ago = status(ended_at=AT, asks=True)
+    seen = datetime.now(UTC)
+    first = _settle_ending(app, "w", long_ago, seen)
+    assert first.ask_at == first.deadline == seen + ENDING_SETTLE
+    assert ask_for_next_steps(app, [card(derived=first)]) == 0 and scheduled == []
+    later = _settle_ending(app, "w", long_ago, seen + timedelta(minutes=1))
+    assert later.ask_at == later.deadline == first.ask_at, "counted once, not from each pass"
+    due = _settle_ending(app, "w", long_ago, seen + ENDING_SETTLE)
+    assert (due.ask_at, due.deadline) == (first.ask_at, None)
+    assert ask_for_next_steps(app, [card(derived=replace(due, ask_at=seen))]) == 1
+    # Resting in between, or a newer turn's end, starts the time again; nothing else is touched.
+    resting = status(question="Which?")
+    assert _settle_ending(app, "w", resting, seen) is resting
+    assert _settle_ending(app, "w", None, seen) is None
+    again = _settle_ending(app, "w", long_ago, seen + timedelta(minutes=9))
+    assert again.ask_at == seen + timedelta(minutes=9) + ENDING_SETTLE
+    newer = status(ended_at=AT + timedelta(minutes=1), asks=True)
+    assert _settle_ending(app, "w", newer, seen + timedelta(minutes=10)).ask_at > again.ask_at
+    assert _derived_with_reviews({}).ask_at > datetime.now(UTC), "the page's own read"
 
 
 def test_no_ledger_no_request(tmp_path):
@@ -2963,3 +3107,18 @@ def test_a_work_handed_to_another_deck_rests_instead_of_ending_as_a_bug():
     assert status(handed_over=True, running=True).kind == WORKING
     assert status(handed_over=True, question="Which day?").kind == QUESTION
     assert status(handed_over=True, closed=True).kind == CLOSED
+
+
+def test_the_review_chats_every_card_compares_stay_one_object_while_equal():
+    """#4639: each pass read them afresh, and every card compared all of them."""
+    app = SimpleNamespace(state=SimpleNamespace())
+
+    def read(*numbers):
+        return work_view._deck_reviews_key(
+            app, SimpleNamespace(review_chats={n: ("open", n) for n in numbers}, review_events={})
+        )
+
+    first = read(1, 2)
+    assert read(2, 1) is first
+    moved = read(1, 2, 3)
+    assert moved is not first and [n for n, _ in moved[0]] == [1, 2, 3]

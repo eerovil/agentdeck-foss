@@ -383,7 +383,8 @@
     const box = form.elements.message;
     const text = box.value.trim();
     if (!text || sending) return;
-    const about = pickedBox ? "About the box \u201c" + pickedBox + "\u201d in the diagram: " : "";
+    // A /secret goes as typed: with words before it the deck would not know it for one.
+    const about = pickedBox && !/^\/secret(?:\s|$)/.test(text) ? "About the box \u201c" + pickedBox + "\u201d in the diagram: " : "";
     sending = true;
     try {
       // The text stays in the box until the send is confirmed.

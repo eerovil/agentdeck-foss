@@ -16,9 +16,9 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from functools import lru_cache
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, NamedTuple
 
-from . import job_view, review_history, work_counter
+from . import job_view, review_history, work_counter, work_published
 from .chat_identity import (
     ChatIdentity,
     ChatLinkConflict,
@@ -243,6 +243,14 @@ class OperatorPresence:
     idle_for_s: float | None
 
 
+class PersonWords(NamedTuple):
+    """A person's message from a page: when it first arrived, its send id, its words (#4643)."""
+
+    at: datetime
+    send_id: str
+    words: str
+
+
 class LetGoSessionChanged(ValueError):
     """An incremental scan named a chat the live window let go (#2841): a full scan,
     not an error, brings it back."""
@@ -356,6 +364,13 @@ class AppState:
         # id so a new leg keeps it. Never written by deck notices or another agent's message.
         loaded = getattr(db, "load_person_messages", None) if db else None
         self.person_messages: dict[str, datetime] = {}
+        # The words that stand as each chat's latest request (#4643), and the message still
+        # being delivered that may become it. In memory only: after a restart none stand, and
+        # what needs them asks the person again.
+        self.person_words: dict[str, PersonWords] = {}
+        self._person_arrivals: dict[str, PersonWords] = {}
+        # Sends that could not be stored: none of them ever grants.
+        self._person_sends_unstored: set[tuple[str, str]] = set()
         for chat_id, at in (loaded() if loaded is not None else {}).items():
             try:
                 self.person_messages[chat_id] = datetime.fromisoformat(at)
@@ -1479,17 +1494,22 @@ class AppState:
         target_number: int,
         head_sha: str,
         round_id: str = "",
+        asked_for: str = "",
     ) -> None:
         """Remember the commit the review chat just opened covers for one pull request: a
         ``chat`` row in that head's review history. Every opening path comes through here.
         ``round_id`` is the round id written into the chat's body, which its reviewer stamps
-        its comments with (#4386); "" for a chat from before it."""
+        its comments with (#4386); "" for a chat from before it. ``asked_for`` is the pull
+        request whose ask opened the chat, or ``review_history.ASKED_ALL``, as its body says
+        (#4665): written in the same row, so no ``chat`` row is ever readable without it."""
         if self.db is None or not chat_repository or not head_sha:
             return
         chat = f"{chat_repository}#{chat_number}".lower()
         pull = f"{target_repo}#{target_number}".lower()
         key = f"chat:{chat}:{pull}@{head_sha.lower()}"
         data = {"chat": chat, **({"round": round_id.lower()} if round_id else {})}
+        if asked_for:
+            data["asked"] = asked_for.lower()
         self.record_review_event(pull, head_sha, review_history.CHAT, key, data=data)
 
     def record_review_event(
@@ -1528,8 +1548,12 @@ class AppState:
 
     def note_shipped_fix(self, pull: str, work: str, fix: str) -> bool:
         """Name ``fix`` as the pull request fixing what ``pull`` shipped with for the Work of
-        issue ``work`` (#4212 review); whether ``pull`` shipped for that Work."""
-        return self.db is not None and self.db.note_shipped_fix(pull, work, fix) > 0
+        issue ``work`` (#4212 review); whether ``pull`` shipped for that Work. The Work page
+        redraws: a fix the owner declined (#4797) drops its Shipped line."""
+        if self.db is None or self.db.note_shipped_fix(pull, work, fix) <= 0:
+            return False
+        self.bus.publish(REVIEWS_TOPIC)
+        return True
 
     def note_shipped(self, pull: str, head: str) -> bool:
         """Mark ``pull`` at ``head`` shipped once its review counted as passed (#4212 review);
@@ -1625,6 +1649,8 @@ class AppState:
         if current:
             self.session_pull_requests[self.chat_current_session_key(session_key)] = current
         self._republish_chat(session_key)
+        # Each Work whose registered set moved gets its published label synced (#4794).
+        work_published.request(work_published.changed_works(before, current))
         return current
 
     def reload_pull_requests(self) -> list[PullRequestRef]:
@@ -2802,6 +2828,42 @@ class AppState:
         """
         self._last_boss_turn_digest[session_key] = _text_digest(text)
         return self.open_boss_turn_window(session_key)
+
+    def person_message_arrived(self, session_key: str, send_id: str | None) -> None:
+        """A page's message reached the deck, before its delivery is awaited (#4643).
+
+        It takes back the words that stood and those still being delivered, whether it is new,
+        a resend or edited text under an old id: the page reuses ids, so nothing asks which.
+        Only the first arrival of ``send_id``, the page's own id for the send, may grant words.
+        """
+        self.withdraw_person_words(session_key)
+        chat_id = self.chat_identity_key(session_key)
+        if not send_id or (chat_id, send_id) in self._person_sends_unstored:
+            return
+        at = datetime.now(UTC)
+        first = None
+        if self.db is not None and hasattr(self.db, "record_person_send"):
+            first = self.db.record_person_send(chat_id, send_id, at.isoformat())
+        if first is None:
+            # Not stored, so a later arrival of it would look like the first.
+            self._person_sends_unstored.add((chat_id, send_id))
+        elif first:
+            self._person_arrivals[chat_id] = PersonWords(at, send_id, "")
+
+    def person_message_accepted(self, session_key: str, send_id: str | None, text: str) -> None:
+        """The message was accepted: its words stand, if nothing arrived after it (#4643)."""
+        chat_id = self.chat_identity_key(session_key)
+        arrival = self._person_arrivals.get(chat_id)
+        if arrival is None or arrival.send_id != send_id:
+            return
+        del self._person_arrivals[chat_id]
+        self.person_words[chat_id] = arrival._replace(words=text)
+
+    def withdraw_person_words(self, session_key: str) -> None:
+        """Take back the words that stand in this chat, and those still being delivered."""
+        chat_id = self.chat_identity_key(session_key)
+        self.person_words.pop(chat_id, None)
+        self._person_arrivals.pop(chat_id, None)
 
     def note_person_message(self, session_key: str) -> datetime:
         """Record a person's own message to this chat, accepted from the deck's pages (#4562).

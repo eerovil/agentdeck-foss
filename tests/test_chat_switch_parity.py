@@ -928,3 +928,42 @@ async def test_the_start_status_releases_the_fence_it_settles_against(tmp_path):
 
     assert page.status_code == 200
     assert app.state.budget_db.pending_chat_successor(CLAUDE_KEY) is None
+
+
+async def test_a_moved_chat_shows_no_retry_of_the_leg_it_left(tmp_path):
+    """#4671, over the app's own wiring: a chat whose full leg was left for another account."""
+    from dataclasses import replace
+    from datetime import timedelta
+
+    from agentdeck.quota_retry import message_for
+
+    app = _app(tmp_path, _runtime("leg-two", []))
+    state = app.state.app_state
+    chat = app.state.budget_db.chat_for_session(CLAUDE_KEY)
+    state.update_session(
+        replace(
+            state.sessions[CLAUDE_KEY],
+            turn_failed=True,
+            automatic_retry_at=datetime.now(UTC) + timedelta(hours=1),
+        )
+    )
+    retry = message_for(replace(state.sessions[CLAUDE_KEY], chat_id=chat.chat_id))
+    assert app.state.scheduled_messages.schedule(retry) is not None
+
+    async def page(key):
+        async with _client(app) as client:
+            response = await client.get(f"/sessions/{key}", follow_redirects=True)
+        assert 'id="held-messages"' in response.text
+        return response.text
+
+    assert "Retrying at" in await page(CLAUDE_KEY)
+
+    await _deliver(app, "codex/alt", f"https://deck.example/chats/{chat.chat_id}")
+    _register(app, "codex:alt:leg-two", "codex:alt", tmp_path)
+    for key in (CLAUDE_KEY, "codex:alt:leg-two"):
+        assert "Retrying at" not in await page(key)
+    assert retry.id in app.state.scheduled_messages.pending_ids()
+
+    # The leg the limit stopped is not scanned yet: whether it still waits is unknown.
+    state.sessions.pop(CLAUDE_KEY)
+    assert "Retrying at" in await page("codex:alt:leg-two")

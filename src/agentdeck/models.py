@@ -11,7 +11,7 @@ import json
 import re
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 from time import monotonic, time
@@ -60,6 +60,12 @@ SNAPSHOT_CONTEXT_MANAGEMENT_V1 = "context_management_v1"
 # with none of the history it asked for, so the deck offers a side chat only when the
 # runtime says it can make one.
 SNAPSHOT_FORK_V1 = "fork_v1"
+# The runtime has the keep-warm route (#4737, #4752), which writes a ping into an idle
+# process or resumes a stopped chat for it, and refuses any other. The deck sends no ping to
+# a runtime without the mark, and that runtime has no such route either. The mark of the
+# flag before it, ``require_live_v1``, is gone on purpose: a deck that still sends that
+# flag finds no mark and sends nothing, and the runtime refuses the flag if it comes.
+SNAPSHOT_KEEP_WARM_V1 = "keep_warm_v1"
 # The Codex runtime starts a thread with a session role and saves it (#4092). A runtime
 # without it drops the role, so a Work chat would start with no Work guide; the deck
 # refuses that start until the runtime has restarted onto this code.
@@ -495,6 +501,22 @@ class MuteLease:
 
 
 @dataclass(frozen=True)
+class CacheCall:
+    """What a chat's last model call did with the prompt cache (#4737)."""
+
+    at: datetime  # the row's own time: the cache it read or wrote lives on from here
+    lifetime: timedelta | None  # the lifetime the newest usage block in the tail named
+    read: int  # tokens it read from the cache
+    written: int  # tokens it wrote to it
+
+    @property
+    def missed(self) -> bool:
+        """It wrote more than it read: the cache was gone, and the call rebuilt it. A warm
+        call writes only what is new since the last one, a small part of what it reads."""
+        return self.written > self.read
+
+
+@dataclass(frozen=True)
 class TokenTotals:
     input_tokens: int = 0
     output_tokens: int = 0
@@ -625,6 +647,11 @@ class Session:
     # When the last call's prompt cache counts as gone (#4169); None when not known, as
     # on every provider that does not report it.
     cache_expires_at: datetime | None = None
+    # The last call's own cache reading (#4737); None like the field above.
+    cache_call: CacheCall | None = None
+    # The newest turn was opened by the deck's keep-warm ping (#4737), running or ended:
+    # the provider reports such a turn as no work, and ``last_*`` describe the turn before.
+    keep_warm_turn: bool = False
     # The cost dot (#4163): set on display copies only, from ``AppState.chat_use``.
     chat_use: ChatUse | None = None
     deep_link: str | None = None  # provider-native URL when applicable

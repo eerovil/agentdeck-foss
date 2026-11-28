@@ -12,7 +12,7 @@
 {# One line of counts, then every starred Work (#4121), then the rest by how much they need the
    owner (#3818, replacing #3578's order of a Work's life): Needs answer, Ready for merge, Needs review and Release blocked,
    Needs retry and Work error, Working now, the quick tidy-ups (Issue closed, Not started),
-   Waiting, Live checking, Waiting for a try (#4210), Recently finished, Paused, then Recently stopped. A Work is in exactly one of them, picked from the
+   Waiting, Live checking, Waiting for a try (#4210), Recently finished, Paused, then Recently stopped. A Work is in exactly one of them (a starred one in Starred as well, #4745), picked from the
    same status the Work page shows (`work_story.front_row`); Recently stopped is a shortcut to
    where each landed. Each part draws its own header, so an empty one takes no height, and the
    page's order is the DOM's, so keyboard and screen-reader order match it. #}
@@ -21,8 +21,24 @@
     {%- set part = "summary" %}{% include "partials/work_front.html" %}
   </p>
 </div>
-<nav class="front-tabs" id="front-tabs" aria-label="Show only a project" hidden></nav>
-{# Every starred Work, above everything and in no other group (#4121). #}
+{# The search (#4624) and the project tabs share one pinned line: the icon opens the field over
+   the tabs. Typing filters the rows on the page (`front_filters.js`) and brings the finished
+   Works that left it, from the search Show older has. #}
+<div class="front-bar" id="front-bar" data-front-older>
+  <button type="button" class="front-find-open" data-find-open aria-label="Search Works" title="Search Works"
+          aria-expanded="false" aria-controls="front-find">&#x2315;</button>
+  <form class="front-find" id="front-find" role="search" hidden>
+    <input type="hidden" name="search" value="1">
+    <input type="search" name="q" id="front-find-input" placeholder="Title or #number" aria-label="Search Works"
+           autocomplete="off" autocorrect="off" spellcheck="false" enterkeyhint="search"
+           hx-get="/works/finished" hx-include="closest form" hx-target="#front-older-rows" hx-swap="innerHTML"
+           hx-trigger="input changed delay:400ms, search" hx-sync="#front-bar:replace">
+    <button type="button" class="front-find-close" data-find-close aria-label="Close the search">&times;</button>
+  </form>
+  <nav class="front-tabs" id="front-tabs" aria-label="Show only a project" hidden></nav>
+</div>
+<p class="front-find-note" id="front-find-note" aria-live="polite" hidden></p>
+{# Every starred Work, above everything; each is in its own group below too (#4121, #4745). #}
 <section class="front-sec front-starred" id="front-starred" aria-label="Starred">
   <div class="front-rows" id="works-starred" sse-swap="works-starred" hx-swap="keyed-works">
     {%- set part = "starred" %}{% include "partials/work_front.html" %}
@@ -53,24 +69,15 @@
     {%- include "partials/work_front.html" %}
   </div>
   {%- if part == "finished" %}
-  {#- Show older and its search (#4289), outside the rows a live push replaces, so the older
-      rows loaded stay while the newest ones update. The wrapper folds with the group;
+  {#- Show older (#4289), outside the rows a live push replaces, so the older
+      rows loaded stay while the newest ones update; the search above the list (#4624) puts its
+      finished matches here too. The wrapper folds with the group;
       `front_filters.js` sends the project tab and empties it when the tab changes. #}
-  <div class="front-older" data-front-in="finished" data-front-older>
+  <div class="front-older" data-front-in="finished" data-front-older hx-sync="#front-bar:replace">
     <div class="front-rows front-older-rows" id="front-older-rows"></div>
     <div class="front-older-bar">
       <button type="button" class="front-older-more" id="front-older-more" hx-get="/works/finished"
               hx-target="#front-older-rows" hx-swap="beforeend" data-front-older-more>Show older</button>
-      <details class="front-older-find">
-        <summary aria-label="Search finished Works" title="Search finished Works">&#x2315;</summary>
-        <form class="front-older-search" role="search" hx-get="/works/finished"
-              hx-target="#front-older-rows" hx-swap="innerHTML">
-          <input type="hidden" name="search" value="1">
-          <input type="search" name="q" placeholder="Title or #number" aria-label="Search finished Works"
-                 autocomplete="off" hx-get="/works/finished" hx-include="closest form"
-                 hx-target="#front-older-rows" hx-swap="innerHTML" hx-trigger="input changed delay:400ms, search">
-        </form>
-      </details>
     </div>
   </div>
   {%- endif %}
@@ -85,6 +92,10 @@
 </section>
 {#- What a Work action press did (#2237): outside the keyed rows, which a push replaces, and
     after every group, since a row's button reports into the next one it finds. #}
+{#- Finish all (#4623): its button is in the Issue closed header, which every push redraws, so
+    the form is here and the request outlives the header. `work_list.js` names the Works. #}
+<form id="front-finish-all" hidden hx-post="/works/finish-all" hx-target="#work-action-result" hx-swap="innerHTML"
+      hx-sync="this:drop" data-work-action data-finish-all-form data-agentdeck-action="work_action"></form>
 <div class="work-action-result" id="work-action-result" aria-live="polite"></div>
 <section class="work-other" id="work-other" sse-swap="work-other" hx-swap="innerHTML"
          data-skip-unchanged>

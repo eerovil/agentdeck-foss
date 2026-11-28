@@ -28,7 +28,8 @@ which frees every byte of graphics memory the model and the CUDA context held.
 
 Recognition and Piper each have their own lock (#3766): one model call at a time
 per engine, and a phrase heard while the deck reads a reply aloud is not held
-behind Piper. Whisper and Parakeet share the recognition lock.
+behind Piper. Whisper and Parakeet have one each too (#4668): Parakeet's first phrase
+after a break can take long, and a phrase Whisper hears does not wait for it.
 
     POST /transcribe   body: 16-bit mono WAV   -> {"text", "language", "seconds", "segments",
                                                     "snr_db", "engine", "speech_s"}
@@ -41,6 +42,7 @@ behind Piper. Whisper and Parakeet share the recognition lock.
                        Parakeet has no doubt scores and gives none
                        ?language=en|fi  the language heard last (a hint)
                        ?only=en|fi      the one language to transcribe as (#3417)
+                       ?hint=Alexa      a word Whisper is told to expect
     POST /say          {"text", "language", "voice", "speed"} -> audio/wav
                        voice: a Piper voice name, ``[speech] voice_en|fi`` (#3455)
                        speed: how much faster than the voice's own pace (#3543)
@@ -125,6 +127,16 @@ SHORT_SPEECH_S = 1.0
 # noise too. On the owner's 200 kept phrases (#4020) all 7 such were noise ("Let's
 # go.", "Thank you, Mark Rouse.", "Oh, oh, oh."), and no real phrase was retried;
 # a short real word Whisper heard on its first try ("Se" as "Set.") is kept.
+
+# Unsure of a sound, Whisper tries up to six times, and each try may write 224 tokens:
+# one 3.6 s clip took 17 s, with the phrases behind it waiting (#4669). So it may write
+# this many tokens plus this many for each second of speech; every real phrase among
+# 3,436 the owner said fits in 16 plus 8. Past the last limit (17 s of speech) nothing
+# is capped: Whisper's own limit is near, and limit, prompt and hint share its 448.
+WRITE_TOKENS = 20
+WRITE_TOKENS_PER_S = 10
+WRITE_TOKENS_MAX = 190
+PROMPT_TOKENS_MAX = 223
 # Silero VAD closes a stretch of speech after this much quiet. It must be shorter
 # than the page's own pause (`HOST_PAUSE_MS` in voice_mode.js, 800 ms), or the
 # quiet tail every phrase ends with is kept for Whisper to make words of.
@@ -304,6 +316,40 @@ def is_phantom_text(text: str) -> bool:
     return bool(hums) and not YES_HUM.fullmatch(said.replace(" ", ""))
 
 
+def write_limit(speech_s: float) -> int | None:
+    """The tokens Whisper may write for this much speech, or None for no limit."""
+    limit = int(WRITE_TOKENS + WRITE_TOKENS_PER_S * speech_s)
+    return limit if limit <= WRITE_TOKENS_MAX else None
+
+
+def max_new_tokens(whisper, limit: int | None, prompt: str, hint: str = "") -> int | None:
+    """``limit`` as faster-whisper's ``max_new_tokens``: CTranslate2 writes at most half
+    of the prompt and that number together, so a bare limit past the prompt's length
+    would cut the words (measured: 43 asked with no prompt wrote 23)."""
+    if limit is None:
+        return None
+    sizes = [
+        len(whisper.hf_tokenizer.encode(" " + text.strip(), add_special_tokens=False).ids)
+        for text in (prompt, hint)
+        if text
+    ]
+    return max(limit, 2 * limit - min(sum(sizes), PROMPT_TOKENS_MAX))
+
+
+def watch_output(whisper) -> None:
+    """Keep the length of Whisper's newest output in ``whisper.wrote``. faster-whisper
+    hands out only the segments an output is split into, without the cut tail, so they
+    cannot tell that it reached its limit; it yields them before the next output."""
+    generate = whisper.generate_with_fallback
+
+    def watched(*args, **kwargs):
+        result = generate(*args, **kwargs)
+        whisper.wrote = len(result[0].sequences_ids[0])
+        return result
+
+    whisper.generate_with_fallback = watched
+
+
 def is_phantom(segment) -> bool:
     """A segment Whisper made up: rated as no speech, a known closing line, only
     hums, or a short stock word it was unsure was spoken."""
@@ -359,17 +405,26 @@ class Speech:
         # until the service exits and the next start tries the card again.
         self.whisper_failed = ""
         self.voices: dict[str, object] = {}
-        # Whisper and Parakeet hold the recognition lock, Piper the voice lock: a
-        # phrase is never held behind a reply being read (#3766).
+        # Whisper holds the recognition lock, Parakeet its run lock, Piper the voice
+        # lock: a phrase is never held behind a reply being read (#3766), nor is one
+        # Whisper hears behind one Parakeet hears (#4668): that took 33 s with its
+        # pages gone from memory.
         self.recognition_lock = threading.Lock()
+        self.parakeet_run_lock = threading.Lock()
         self.voice_lock = threading.Lock()
-        # One Parakeet load at a time: the warm-up loads it outside the recognition
-        # lock, and a phrase needing it meanwhile waits for that load (#3925).
+        # One Parakeet load at a time: a phrase needing it while the warm-up loads it
+        # waits for that load (#3925). The run lock is never taken
+        # inside it.
         self.parakeet_lock = threading.Lock()
         self.warming: threading.Thread | None = None
 
     def transcribe(
-        self, data: bytes, previous: str = "", only: str = "", early_s: float | None = None
+        self,
+        data: bytes,
+        previous: str = "",
+        only: str = "",
+        early_s: float | None = None,
+        hint: str = "",
     ) -> dict:
         """The phrase's words. With ``early_s``, the length of a clip of this phrase the
         page already asked about (its early pass, #4540): a phrase with no new speech
@@ -392,7 +447,7 @@ class Speech:
                     "language": only or previous or "en",
                     "seconds": round(time.monotonic() - started, 2),
                 }
-        heard = self.recognize(data, previous, only)
+        heard = self.recognize(data, previous, only, hint)
         try:
             samples = read_wav(data)
             # The tail check's spans serve the noise reading too: Silero runs once.
@@ -402,12 +457,12 @@ class Speech:
             heard["snr_db"] = None
         return heard
 
-    def recognize(self, data: bytes, previous: str = "", only: str = "") -> dict:
+    def recognize(self, data: bytes, previous: str = "", only: str = "", hint: str = "") -> dict:
         only = only if only in LANGUAGES else ""
         if self.args.engine == "parakeet" or self.whisper_failed:
             return self.transcribe_parakeet(data, previous, only)
         try:
-            heard = self.transcribe_whisper(data, previous, only)
+            heard = self.transcribe_whisper(data, previous, only, hint)
         except Exception as exc:  # CUDA errors come as RuntimeError, or worse
             log.warning("Whisper failed (%s); Parakeet hears this phrase", exc)
             return self.transcribe_parakeet(data, previous, only)
@@ -443,10 +498,9 @@ class Speech:
                             self.load_whisper()
                         except Exception as exc:  # the card missing, out of memory
                             log.warning("Whisper failed to load (%s); Parakeet hears", exc)
-                if self.args.engine == "parakeet" or self.whisper_failed:
-                    self.loaded_parakeet()
-            # Whisper's spare for a phrase it writes in another language (#3925),
-            # loaded outside the recognition lock: its first load took a minute here.
+            # The engine itself, or Whisper's spare for a phrase it writes in another
+            # language (#3925), loaded outside the recognition lock: its first load
+            # took a minute here.
             self.loaded_parakeet()
         except Exception:  # noqa: BLE001 - the phrase that needs it reports it
             log.exception("speech model warm-up failed")
@@ -459,7 +513,9 @@ class Speech:
             from faster_whisper import WhisperModel
 
             kind = compute_type(self.args.device)
-            self.whisper = WhisperModel(self.args.model, device=self.args.device, compute_type=kind)
+            whisper = WhisperModel(self.args.model, device=self.args.device, compute_type=kind)
+            watch_output(whisper)
+            self.whisper = whisper
         except Exception as exc:
             self.whisper_failed = str(exc) or type(exc).__name__
             raise
@@ -472,7 +528,9 @@ class Speech:
             gpu_mib(),
         )
 
-    def transcribe_whisper(self, data: bytes, previous: str = "", only: str = "") -> dict:
+    def transcribe_whisper(
+        self, data: bytes, previous: str = "", only: str = "", hint: str = ""
+    ) -> dict:
         samples = read_wav(data)
         with self.recognition_lock:
             if self.whisper is None:
@@ -494,12 +552,15 @@ class Speech:
             else:
                 _, _, probabilities = self.whisper.detect_language(speech)
                 language, share = choose_language(dict(probabilities), previous)
+            limit = write_limit(len(speech) / SAMPLE_RATE)
             segments, _ = self.whisper.transcribe(
                 speech,
                 language=language,
                 beam_size=self.args.beam,
                 condition_on_previous_text=False,
                 initial_prompt=self.args.prompt or None,
+                hotwords=hint or None,
+                max_new_tokens=max_new_tokens(self.whisper, limit, self.args.prompt, hint),
             )
             kept = []
             parts = []
@@ -518,8 +579,12 @@ class Speech:
                 )
                 if not phantom:
                     kept.append(segment.text.strip())
-                    retries.append(bool(segment.temperature))
-                    unsure = segment.avg_logprob < UNSURE_LOGPROB
+                    # Cut at the limit, it is a loop or noise, whatever Whisper's doubt.
+                    capped = limit is not None and self.whisper.wrote >= limit
+                    if capped:
+                        log.info("cut %r at %d tokens", segment.text.strip(), limit)
+                    retries.append(bool(segment.temperature) or capped)
+                    unsure = segment.avg_logprob < UNSURE_LOGPROB or capped
                     parts.append({"text": segment.text.strip(), "unsure": unsure})
             text = " ".join(kept).strip()
         log.info(
@@ -544,7 +609,7 @@ class Speech:
         one the deck pinned, else the one heard last."""
         language = only or (previous if previous in LANGUAGES else "en")
         samples = read_wav(data)
-        with self.recognition_lock:
+        with self.parakeet_run_lock:
             parakeet = self.loaded_parakeet()
             started = time.monotonic()
             speech = speech_only(samples)
@@ -643,6 +708,10 @@ class Speech:
         }
 
 
+# A word Whisper may be told to expect.
+HINT = re.compile(r"[A-Za-z]{1,20}")
+
+
 def early_seconds(value: str) -> float | None:
     """``?early_s=``: an early clip's length in seconds, or None when absent or not
     a length a phrase can have (#4540)."""
@@ -695,11 +764,14 @@ class Handler(BaseHTTPRequestHandler):
                 previous = params.get("language", [""])[0]
                 only = params.get("only", [""])[0]
                 early = early_seconds(params.get("early_s", [""])[0])
-                if early is None:
-                    heard = self.server.speech.transcribe(body, previous, only)
-                else:
-                    heard = self.server.speech.transcribe(body, previous, only, early_s=early)
+                hint = params.get("hint", [""])[0]
+                hint = hint if HINT.fullmatch(hint) else ""
+                heard = self.server.speech.transcribe(
+                    body, previous, only, early_s=early, hint=hint
+                )
                 self._json(200, heard)
+            elif path == "/talk":
+                self._json(200, {"speech": bool(speech_spans(read_wav(body)))})
             elif path == "/warm":
                 self.server.speech.warm()
                 self._json(202, {"warming": True})

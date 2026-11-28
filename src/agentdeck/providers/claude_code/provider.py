@@ -372,7 +372,7 @@ class ClaudeCodeProvider(SessionProvider):
         ModelChoice("opus", "Opus"),
         ModelChoice("sonnet", "Sonnet"),
         ModelChoice("haiku", "Haiku"),
-        ModelChoice("fable", "Fable 5.1"),
+        ModelChoice("fable", "Fable"),
     )
     selectable_efforts = tuple(
         EffortChoice(value, label)
@@ -1128,6 +1128,14 @@ class ClaudeCodeProvider(SessionProvider):
             account, session, message, images, allow_over_budget=allow_over_budget
         )
 
+    async def keep_warm(
+        self, account: Account, session: Session, message: str, *, delivery_id: str
+    ) -> InjectResult:
+        client = self._workers.get(account.key)
+        if client is None:
+            return InjectResult(False, "Claude workers are not enabled on the runtime service")
+        return await client.keep_warm(session.session_id, message, delivery_id=delivery_id)
+
     async def interrupt(self, account: Account, session: Session) -> InjectResult:
         client = self._workers.get(account.key)
         if client is None:
@@ -1267,8 +1275,32 @@ class ClaudeCodeProvider(SessionProvider):
             return activity
         return BACKGROUND_TASK_ACTIVITY
 
-    def _note_turn_opener(self, session: Session, path: Path | None) -> None:
-        """Whether the working turn was opened by a background notification (#2760)."""
+    def _note_turn_opener(
+        self,
+        session: Session,
+        path: Path | None,
+        meta: transcripts_mod.TranscriptMeta | None = None,
+    ) -> None:
+        """Whether the working turn was opened by a background notification (#2760), and
+        whether the newest turn is the deck's keep-warm ping (#4737).
+
+        A ping's turn is reported as no work at all, here and nowhere else, so nothing
+        that watches a chat start, end or fail a turn has to know about pings: the Work's
+        status, attention, push, the idle edge and the quota retry all read these fields.
+        ``meta`` is None where no fresh read was made, and the last answer then stands.
+        """
+        if meta is not None:
+            session.keep_warm_turn = meta.keep_warm_turn
+        if session.keep_warm_turn:
+            session.thinking = False
+            session.stalled = False
+            session.activity = None
+            session.turn_failed = False
+            session.automatic_retry_at = None
+            if path is not None and session.last_message_at is not None:
+                # The ping's own lines must not float the chat up as fresh activity.
+                session.last_activity = session.last_message_at
+                session.last_progress = session.last_message_at
         session.background_turn = bool(
             session.thinking
             and path is not None
@@ -1718,6 +1750,7 @@ class ClaudeCodeProvider(SessionProvider):
                 context_tokens=context.tokens if context else None,
                 context_compacted=context.compacted if context else False,
                 cache_expires_at=context.cache_expires_at if context else None,
+                cache_call=context.cache_call if context else None,
                 deep_link=deep_link,
                 deep_link_label="open in claude.ai" if deep_link else None,
                 show_when_idle=False,
@@ -1730,7 +1763,9 @@ class ClaudeCodeProvider(SessionProvider):
                 last_write=last_write,
                 scan_read=scan_read,
             )
-            self._note_turn_opener(session, tpath)
+            self._note_turn_opener(
+                session, tpath, scan_read.meta if scan_read is not None else None
+            )
             sessions.append(session)
 
         # Subagent pass: Task/Agent-tool subagents (isSidechain) nest under their
@@ -2005,6 +2040,7 @@ class ClaudeCodeProvider(SessionProvider):
         session.context_tokens = scan_read.context.tokens
         session.context_compacted = scan_read.context.compacted
         session.cache_expires_at = scan_read.context.cache_expires_at
+        session.cache_call = scan_read.context.cache_call
         session.deep_link = deep_link
         session.deep_link_label = "open in claude.ai" if deep_link else None
         session.show_when_idle = False
@@ -2016,7 +2052,7 @@ class ClaudeCodeProvider(SessionProvider):
             last_write=last_write,
             scan_read=scan_read,
         )
-        self._note_turn_opener(session, path)
+        self._note_turn_opener(session, path, meta)
         return session
 
     def next_liveness_deadline(
@@ -2112,10 +2148,11 @@ class ClaudeCodeProvider(SessionProvider):
             last_message_at_now = s.last_message_at
             model_now = s.model
             context_now = transcripts_mod.ContextReading(
-                s.context_tokens, s.context_compacted, s.cache_expires_at
+                s.context_tokens, s.context_compacted, s.cache_expires_at, s.cache_call
             )
             last_ev_now = None
             tp = None
+            tmeta = None
             background_active = None
             if live_now:
                 tp = transcript_paths.get(s.key)
@@ -2179,7 +2216,12 @@ class ClaudeCodeProvider(SessionProvider):
             if last_ev_now is not None:
                 s.last_event_seq = last_ev_now.seq
             s.question = question_now
-            s.context_tokens, s.context_compacted, s.cache_expires_at = context_now
+            (
+                s.context_tokens,
+                s.context_compacted,
+                s.cache_expires_at,
+                s.cache_call,
+            ) = context_now
             s.pid = pid_now
             s.deep_link = deep_link_now
             s.show_when_idle = False
@@ -2194,7 +2236,7 @@ class ClaudeCodeProvider(SessionProvider):
                 last_write=_mtime(tp) if tp is not None else s.last_activity,
             )
             # An idle row has no fresh read: it is not working, so nothing opened a turn.
-            self._note_turn_opener(s, tp)
+            self._note_turn_opener(s, tp, tmeta)
 
         return state.apply_session_changes(targets, project)
 

@@ -350,8 +350,8 @@ async def dashboard(request: Request) -> Response:
 
     # The snapshot is the refresher's, so a page load costs no Run-trace reads unless nothing
     # has been built yet or it is stale — and nothing here builds the chat list or its
-    # presentation. A stale one gets a moment to rebuild, so a reload does not paint old
-    # cards and swap them a second later (#3108).
+    # presentation. A stale one gets a short moment to rebuild, so a quick
+    # rebuild is drawn at once (#3108); a slower one swaps the cards when it lands (#4639).
     work_overview = await request.app.state.work_overview.current(wait=FRESH_WAIT_S)
     times.lap("overview")
     rows = _usage_rows(accounts, state, request.app.state.auth_watch)
@@ -380,9 +380,11 @@ async def dashboard(request: Request) -> Response:
     return resp
 
 
-# How long the front page waits for a stale Work overview's rebuild (#3108). A rebuild takes
-# about 2-3 s on this host; one slower than this is pushed to the page when it lands.
-FRESH_WAIT_S = 2.0
+# How long the front page waits for a stale Work overview's rebuild (#3108). A rebuild was
+# 0.3-0.5 s on the settled live deck, and over 2 s when it was busy; one slower than this is
+# pushed to the page when it lands. The owner chose an open that is always fast over never
+# seeing the old cards for a moment (#4639).
+FRESH_WAIT_S = 0.3
 
 # A page open slower than this logs its steps, as the Work page's does (#2654, #2841).
 SLOW_PAGE_MS = 1000.0

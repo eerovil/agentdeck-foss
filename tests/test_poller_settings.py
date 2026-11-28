@@ -85,7 +85,7 @@ def test_switching_the_primary_swaps_only_the_two_keys(root):
     assert "codex:codex removed 2026-08-07" in text
     assert 'usage_cache = "/run/user/1000/agentdeck"' in text
     assert "github_token_file" in text
-    assert '"claude_code:main" = 90' in text
+    assert "usage_ceilings" not in text  # #4728: the one line no engine reads goes
 
 
 def test_the_change_is_stamped_once_however_often_it_is_made(root):
@@ -96,29 +96,25 @@ def test_the_change_is_stamped_once_however_often_it_is_made(root):
     assert "2026-08-09 10:30Z by operator" in text
 
 
-def test_an_account_leaving_the_order_takes_its_ceiling_with_it(root):
-    """The engine refuses an Overlay whose ceiling names an account the order does not offer."""
-    poller_settings.set_worker_accounts(root, "reference", account="claude_code:main", now=_NOW)
-    text = _text(root)
-    assert "claude_code:alt" not in text
-    assert '"claude_code:main" = 90' in text
-
-
-def test_an_account_leaving_the_order_takes_its_spend_target_with_it(root):
-    """#1965 added a second per-account table. Leaving it behind would make the engine refuse
-    the Overlay, and the operator's account switch would roll back for no visible reason."""
+def test_an_account_edit_takes_the_unread_tables_out(root):
+    """#4728: nothing reads `usage_ceilings` or `usage_targets` any more. An engine from before
+    that refuses an Overlay whose table names an account the order no longer offers, so the
+    edit removes both lines and nothing else."""
     path = root / "instances" / "reference" / "overlay.toml"
     path.write_text(
         OVERLAY.replace(
-            'usage_cache =', 'usage_targets = { "claude_code:alt" = 99 }\nusage_cache ='
+            "usage_cache =", 'usage_targets = { "claude_code:alt" = 99 }\nusage_cache ='
         )
     )
 
-    poller_settings.set_worker_accounts(root, "reference", account="claude_code:main", now=_NOW)
+    after = poller_settings.set_worker_accounts(
+        root, "reference", account="claude_code:main", now=_NOW
+    )
 
     text = _text(root)
-    assert "claude_code:alt" not in text
-    assert "usage_targets = {}" in text
+    assert after.order == ("claude_code:main",) and "fallback_accounts = []" in text
+    assert "usage_ceilings" not in text and "usage_targets" not in text
+    assert "usage_cache =" in text and 'account = "claude_code:main"' in text
 
 
 def test_the_primary_always_leads_and_is_never_duplicated(root):
@@ -174,9 +170,7 @@ def test_an_edit_that_would_not_load_is_rolled_back(root, monkeypatch):
     """A broken Overlay fails every wake, so a refused button is the better outcome."""
     monkeypatch.setattr(poller_settings, "_render_string", lambda value: f'"{value}')
     with pytest.raises(poller_settings.SettingsError) as raised:
-        poller_settings.set_worker_accounts(
-            root, "reference", account="claude_code:alt", now=_NOW
-        )
+        poller_settings.set_worker_accounts(root, "reference", account="claude_code:alt", now=_NOW)
     assert "rolled back" in str(raised.value)
     assert _text(root) == OVERLAY
 

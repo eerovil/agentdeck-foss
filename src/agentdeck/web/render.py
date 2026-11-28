@@ -39,6 +39,7 @@ from ..models import (
     detailed_activity_label,
 )
 from ..models import activity_label as activity_label  # single impl lives in models
+from ..note_text import split_notes, without_notes
 from ..providers import PROVIDERS
 from ..providers.claude_code.auth import looks_like_auth_failure
 from ..state import AppState, SessionPresentation
@@ -224,10 +225,20 @@ def register_filters(templates: Jinja2Templates) -> None:
     templates.env.filters["is_deploy_checkout"] = is_deploy_checkout
 
 
-def display_chat_message(message: str | None) -> str:
+def display_chat_message(
+    message: str | None, keep_notes: bool = False, keep_routine: bool = False
+) -> str:
     """A message as the chat view shows it: no attachment envelope, no voice-mode line,
-    no deck chat brief (#3403)."""
-    return hide_brief(hide_voice_line(display_message(message)))
+    no deck chat brief (#3403), no deck notes or routine line in front of it (#4618) unless
+    ``keep_notes``: a turn whose notes are not listed beside it shows them as they are.
+    ``keep_routine`` is an agent's own words, which may quote the line."""
+    text = display_message(message)
+    if not keep_notes:
+        text = without_notes(text)
+    if not keep_routine:
+        # The routine line only tells the agent how to answer (#4253).
+        text = deck_notices.without_routine(text)
+    return hide_brief(hide_voice_line(text))
 
 
 def card_preview(value: str | None) -> str:
@@ -356,7 +367,15 @@ def _usage_rows(
         planned = plans.get(acc.key)
         if planned is not None and planned > now:
             for row in windows:
-                if row["window"] in PLANNED_RESET_WINDOWS:
+                # A window that resets by itself before the plan is not ended by it (a reset
+                # already past is a stale reading, not such a window), and the
+                # scheduler reads it the same way (`account_window_readings`, #4717).
+                natural = row["resets"]
+                if natural is not None and natural.tzinfo is None:
+                    natural = natural.replace(tzinfo=UTC)
+                if row["window"] in PLANNED_RESET_WINDOWS and (
+                    natural is None or natural <= now or planned <= natural
+                ):
                     # The person plans to reset this window, so burning it fast is the
                     # point, not a warning (#3379).
                     row["planned_reset"] = planned
@@ -871,6 +890,11 @@ def render_transcript_events(
     )
     parts = []
     for e in events:
+        notes, message = (
+            split_notes(e.text)
+            if e.role == "user" and e.text and not e.subagent and not e.answer
+            else ([], e.text)
+        )
         kind = (
             deck_notices.notice_kind(e.text, records, e.ts)
             if e.role == "user" and not e.answer
@@ -882,7 +906,8 @@ def render_transcript_events(
                 session_key=session_key,
                 event_id=chat_event_id(leg_index, e.seq),
                 observed_message=observed_messages.get(e.seq),
-                deck_label=deck_notices.label(e.text, kind) if kind else None,
+                deck_label=deck_notices.label(message, kind) if kind else None,
+                deck_notes=notes,
             )
         )
     return "".join(parts)

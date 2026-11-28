@@ -138,6 +138,7 @@ EARLY_WAYS = {
     "question": "no early pass: question box",
     "other": "no early pass: not a message",
     "cap": "no early pass: phrase too long",
+    "noise": "no early pass: noise after the words",
     "cut": "no early pass: cut short",
 }
 MAX_TIMING_MS = 120_000
@@ -1041,6 +1042,9 @@ async def timed(key: str, phrase_id: str, timing: dict, host: dict | None = None
             kept["waited"] = timing["waited"]
         if isinstance(timing.get("early"), str) and timing["early"] in EARLY_WAYS:
             kept["early"] = timing["early"]
+        # The answer was read from its draft, while the agent wrote it (#4543).
+        if timing.get("draft") is True:
+            kept["draft"] = True
         record = {"at": time.time(), "timing_for": phrase_id, "timing": kept}
         await asyncio.to_thread(_save, key, record)
 

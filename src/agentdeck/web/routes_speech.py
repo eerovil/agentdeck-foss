@@ -13,7 +13,8 @@ While voice mode waits for its wake word, the page posts each phrase to
 Whisper made of a waiting phrase to ``/api/speech/wake-log``. Both write a line to
 the wake log, joined by the page's phrase id, which ``scripts/wake_report.py`` reads
 to compare the two checks; a phrase either check woke on, or the detector nearly
-did, keeps its audio there for 30 days.
+did, keeps its audio there for 30 days. A kiosk whose sound starts late has ``carry``
+lines there (#4684).
 
 With ``[speech] keep_audio_days`` set, every transcribed phrase also keeps its
 audio, words and the service's noise reading in ``keep_audio_dir`` for that many
@@ -131,6 +132,11 @@ ENGINES = ("whisper", "parakeet")
 # The wake words a page may ask the detector for (``scripts/wake_server.py``); the
 # first is every page's own.
 WAKE_WORDS = ("jarvis", "alexa")
+# Wake words whose phrase is never heard as words when speech recognition does not
+# confirm them (#4788): Whisper wrote "Hey Jarvis" said alone as "Harvest." or "Hate
+# armies!" and sent that, so the page listens for the next phrase instead. An
+# unconfirmed "Alexa" (`wake_confirm = []`) is still heard whole, as before.
+NAME_ONLY_WORDS = ("jarvis",)
 # How speech recognition writes each wake word, as ``voice_mode.js``'s ``WAKE_WORDS``
 # do: a detector wake on a word in ``[speech] wake_confirm`` counts only when the
 # words heard in its clip match (#4372).
@@ -140,6 +146,8 @@ WAKE_SPOKEN = {
     ),
     "alexa": re.compile(r"\b(?:alexa|aleksa|alexia|alexis|alekza|elexa)\b", re.I),
 }
+# The name speech recognition is told to expect as it confirms a wake.
+WAKE_HINT = {"alexa": "Alexa"}
 _kept_lock = threading.Lock()
 # The speech service's warm-ups (#3766), held so none is collected before it ends;
 # nothing awaits them.
@@ -213,6 +221,16 @@ async def transcribe(request: Request) -> JSONResponse:
     return JSONResponse(heard, background=BackgroundTask(_run_later, later))
 
 
+@router.post("/api/speech/talk")
+async def talk(request: Request) -> JSONResponse:
+    """Whether Silero hears speech in a clip, as ``{"speech"}``, with no words made of it:
+    voice mode ends a phrase that loud noise holds open (#4645). Nothing is kept."""
+    _require_same_origin(request)
+    audio = await _audio(request)
+    reply = await _forward(request, "/talk", content=audio, headers={"Content-Type": "audio/wav"})
+    return JSONResponse({"speech": reply.json().get("speech") is not False})
+
+
 async def _run_later(saves: list) -> None:
     for save in saves:
         await save
@@ -235,6 +253,7 @@ async def _hear(
     language: str | None = None,
     *,
     later: list | None = None,
+    hint: str = "",
 ) -> dict:
     """The host's words for ``audio``, as ``/api/speech/transcribe`` answers them, and
     the phrase kept for the bench as ``source`` (#3934); ``None`` keeps nothing. With
@@ -257,6 +276,8 @@ async def _hear(
         path = f"/transcribe?language={previous}"
     else:
         path = "/transcribe"
+    if hint:
+        path += ("&" if "?" in path else "?") + f"hint={hint}"
     early_s = _early_s(request.query_params.get("early_s"))
     if early_s is not None:
         path += ("&" if "?" in path else "?") + f"early_s={early_s}"
@@ -503,6 +524,8 @@ async def wake(request: Request) -> JSONResponse:
         "score": float(found.get("score") or 0.0),
         "speech_after": bool(found.get("speech_after")),
     }
+    if result["woken"] and word in NAME_ONLY_WORDS and word not in speech.wake_confirm:
+        result["name_only"] = True
     window = request.query_params.get("window") == "1"
     confirm: dict = {}
     if result["woken"] and word in speech.wake_confirm:
@@ -561,7 +584,8 @@ async def _confirm_wake(
 ) -> tuple[dict, dict | None]:
     """Whether speech recognition hears ``word`` in a clip the detector woke on
     (#4372): the kitchen's "Alexa" woke on noise at 0.94, where Whisper heard no
-    words at all, while every real wake came back as "Alexa." in about 0.55 s.
+    words at all. Speech recognition is told to expect the name (``WAKE_HINT``), as it
+    wrote quiet real calls as other words, unless its words go on as the message.
 
     Returns the wake log's fields, ``{"confirmed", "heard", "confirm_ms"}``, and the
     words in ``/api/speech/transcribe``'s shape when the page would ask for them next
@@ -574,7 +598,10 @@ async def _confirm_wake(
     try:
         if not speech.socket:
             raise HTTPException(status_code=503, detail="no speech service configured")
-        heard = await _hear(request, audio, "voice" if goes_on else None, language)
+        # Whisper wrote quiet real calls the detector scored 1.0 as "All right." or
+        # "Next up.". No hint when its words are sent on, which it could change.
+        hint = "" if goes_on else WAKE_HINT.get(word, "")
+        heard = await _hear(request, audio, "voice" if goes_on else None, language, hint=hint)
     except HTTPException:
         took = round((time.monotonic() - started) * 1000)
         return {"confirmed": False, "heard": None, "confirm_ms": took}, None
@@ -643,6 +670,8 @@ class _StreamPhrase:
         self.detected: dict | None = None
         self.confirm: dict | None = None
         self.confirming = False
+        # Told to beep before its confirm answered.
+        self.sure = False
         self.finished = False
         # The language the page heard last when the phrase started, for a confirm.
         self.language: str | None = None
@@ -726,9 +755,12 @@ class WakeStream:
         if sock is not None:
             with contextlib.suppress(OSError):
                 sock.setsockopt(SOL_SOCKET, SO_SNDBUF, STREAM_RECORD_BYTES)
+        # Only a word that is confirmed has a beep to give before its `woken`.
+        sure = self.speech.wake_sure.get(self.word) if self.confirms else None
+        query = f"threshold={threshold}&word={self.word}" + (f"&sure={sure}" if sure else "")
         writer.write(
             (
-                f"POST /stream?threshold={threshold}&word={self.word} HTTP/1.1\r\n"
+                f"POST /stream?{query} HTTP/1.1\r\n"
                 f"Host: wake\r\nUpgrade: {STREAM_UPGRADE}\r\nConnection: Upgrade\r\n"
                 "Content-Length: 0\r\n\r\n"
             ).encode()
@@ -822,6 +854,8 @@ class WakeStream:
                 continue
             if "crossed" in event:
                 await self._crossed(event)
+            elif "sure" in event:
+                await self._sure(event)
             elif "end" in event:
                 phrase = self.phrases.get(str(event["end"]))
                 if phrase is not None:
@@ -835,13 +869,29 @@ class WakeStream:
         phrase.crossed = event
         if not self.confirms:
             # "Hey Jarvis" beeps at once; what follows in the phrase is the message.
-            await self._send({"woken": phrase.id, "score": event.get("score")})
+            woke: dict = {"woken": phrase.id, "score": event.get("score")}
+            if self.word in NAME_ONLY_WORDS:
+                woke["name_only"] = True
+                # Where it crossed: the page tells a sentence said straight after
+                # the name from the name alone by it (#4804).
+                if isinstance(event.get("at"), (int, float)):
+                    woke["at"] = event["at"]
+            await self._send(woke)
             return
         phrase.confirming = True
         await self._send({"confirming": phrase.id})
         task = asyncio.create_task(self._confirm(phrase))
         self.tasks.add(task)
         task.add_done_callback(self.tasks.discard)
+
+    async def _sure(self, event: dict) -> None:
+        """The detector is sure enough to beep while speech recognition still checks
+        the name (#4614). One already answered has beeped, or will not."""
+        phrase = self.phrases.get(str(event["sure"]))
+        if phrase is None or not phrase.confirming:
+            return
+        phrase.sure = True
+        await self._send({"sure": phrase.id, "score": event.get("score")})
 
     async def _confirm(self, phrase: _StreamPhrase) -> None:
         """Whether Whisper hears the name in the phrase's last 2 s (#4372), beside
@@ -890,7 +940,10 @@ class WakeStream:
         # moment it reads it, and that cancels this task.
         if _first_line(phrase.id):
             await self._log(phrase, woken, score, audio)
-        await self._send({"done": phrase.id, "woken": woken, "score": score})
+        done: dict = {"done": phrase.id, "woken": woken, "score": score}
+        if woken and not self.confirms and self.word in NAME_ONLY_WORDS:
+            done["name_only"] = True
+        await self._send(done)
 
     async def _log(self, phrase: _StreamPhrase, woken: bool, score: float, audio: bytes) -> None:
         assert phrase.detected is not None
@@ -910,6 +963,8 @@ class WakeStream:
             "stream": True,
             # Seconds into the phrase of the frame that crossed, or null.
             "crossed_at": phrase.detected.get("at"),
+            # Beeped before its confirm answered.
+            **({"sure": True} if phrase.sure else {}),
             **(phrase.confirm or {}),
         }
         await asyncio.to_thread(
@@ -935,8 +990,9 @@ async def wake_stream(websocket: WebSocket) -> None:
     The page sends text ``{"phrase": id, "mic"}``, then 16 kHz 16-bit mono audio as
     binary messages, then ``{"end": id}``, and ``{"ping": 1}`` every 10 s. It gets
     ``{"woken": id, "score"}`` the moment the phrase wakes ("Alexa" once speech
-    recognition heard the name, after ``{"confirming": id}``), one ``{"done": id,
-    "woken", "score"}`` per ended phrase, and ``{"fallback": reason}`` before the
+    recognition heard the name, after ``{"confirming": id}``, and ``{"sure": id}`` when
+    the detector's score reached ``[speech] wake_sure``: beep, do not listen yet), one
+    ``{"done": id, "woken", "score"}`` per ended phrase, and ``{"fallback": reason}`` before the
     deck closes a stream that cannot go on."""
     if not _same_origin_socket(websocket):
         await websocket.close(code=1008)
@@ -971,7 +1027,10 @@ async def wake_log(request: Request) -> Response:
     check, ``ms`` the wait from the phrase's end to the words, ``detected`` that
     the detector woke on it first. ``{"waiting": "start"|"stop", "spell"}`` marks
     when a spell of waiting starts and stops instead, so the report counts the time
-    really spent waiting."""
+    really spent waiting. ``{"carry": "paused"|"started"|"tapped", "kiosk",
+    "audio"}`` marks a kiosk page whose sound did not start after a load, and that it
+    then went on by itself or by a tap (#4684);
+    ``audio`` is the page's audio state."""
     _require_same_origin(request)
     body = await _json_object(request)
     speech = get_config(request).speech
@@ -981,6 +1040,17 @@ async def wake_log(request: Request) -> Response:
         if body.get("waiting") not in ("start", "stop") or not spell:
             raise HTTPException(status_code=400, detail="a waiting start or stop and its spell")
         line = {"check": "waiting", "state": body["waiting"], "spell": spell, "mode": speech.wake}
+        await asyncio.to_thread(_write_wake_log, folder, line, None)
+        return Response(status_code=204)
+    if "carry" in body:
+        if body.get("carry") not in ("paused", "started", "tapped"):
+            raise HTTPException(status_code=400, detail="a carry paused, started or tapped")
+        line = {
+            "check": "carry",
+            "state": body["carry"],
+            "kiosk": str(body.get("kiosk") or "")[:MAX_ID_CHARS],
+            "audio": str(body.get("audio") or "")[:MAX_ID_CHARS],
+        }
         await asyncio.to_thread(_write_wake_log, folder, line, None)
         return Response(status_code=204)
     phrase = _phrase_id(body.get("id"))

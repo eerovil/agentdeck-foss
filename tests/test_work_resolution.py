@@ -76,6 +76,56 @@ def test_a_resolution_write_replaces_the_one_record_and_keeps_the_title(tmp_path
     assert reopened.work_resolution(WORK_ID) == stored
 
 
+def test_a_write_past_the_limit_is_taken_only_when_the_solution_changed(tmp_path):
+    """#4726: a third write that leaves the solution as it is costs a call and tells nobody
+    anything, so the deck refuses it; a repeat of the stored record uses no write up."""
+    from agentdeck.db import Db
+    from agentdeck.work_resolution import ResolutionRefused
+
+    db = Db(tmp_path / "control.sqlite3")
+    early = db.set_work_resolution(_resolution(solution="", rationale="", correctness=""), limit=2)
+    assert early.writes == 1
+    assert db.set_work_resolution(_resolution(solution="", rationale="", correctness=""), limit=2)
+    whole = db.set_work_resolution(_resolution(), limit=2)
+    assert whole.writes == 2, "the same record sent twice was one write"
+    again = db.set_work_resolution(_resolution(run_id="run-9"), limit=2)
+    assert again.writes == 2, "a retry is not refused"
+    # It is stored all the same: the page compares its time with the newest head (#3199).
+    assert again.updated_at > whole.updated_at and again.run_id == "run-9"
+
+    with pytest.raises(ResolutionRefused, match="written 2 times"):
+        db.set_work_resolution(_resolution(correctness="The suite passed."), limit=2)
+    assert db.work_resolution(WORK_ID).correctness == whole.correctness, "nothing was stored"
+
+    changed = db.set_work_resolution(_resolution(solution="A table instead."), limit=2)
+    assert changed.solution == "A table instead." and changed.writes == 3
+    # No limit, as for a caller that is not the Work's agent: always taken.
+    assert db.set_work_resolution(_resolution(solution="A table instead.", correctness="x"))
+
+    # The deck's own ask to rewrite the summary lets one more through, whatever it changes.
+    with pytest.raises(ResolutionRefused):
+        db.set_work_resolution(_resolution(solution="A table instead.", correctness="y"), limit=2)
+    assert db.allow_work_resolution_write(WORK_ID, 2)
+    asked = db.set_work_resolution(
+        _resolution(solution="A table instead.", correctness="y"), limit=2
+    )
+    assert asked.correctness == "y" and asked.writes == 2
+    with pytest.raises(ResolutionRefused):
+        db.set_work_resolution(_resolution(solution="A table instead.", correctness="z"), limit=2)
+    assert db.allow_work_resolution_write("github_issue:o/r#404", 2), "no summary: nothing to do"
+
+
+def test_a_summary_from_before_the_count_reads_as_written_once(tmp_path):
+    from agentdeck.db import Db
+
+    db = Db(tmp_path / "control.sqlite3")
+    db.set_work_resolution(_resolution())
+    with db._lock, db._conn:
+        db._conn.execute("UPDATE work_metadata SET resolution_writes = NULL")
+    assert db.work_resolution(WORK_ID).writes == 1
+    assert db.set_work_resolution(_resolution(correctness="Passed."), limit=2).writes == 2
+
+
 def test_the_decks_evidence_is_added_to_the_correctness_part_once_and_only_if_it_fits():
     """#4253: the deck writes its own review and test evidence once a Work waits for Merge."""
     resolution = _resolution()
@@ -558,7 +608,14 @@ async def test_the_worker_writes_its_own_works_resolution_and_a_retry_replaces_i
         assert body["rationale"] == _BODY["rationale"]
         assert body["background"] == ""  # a four-part write from an older guide still works
 
-        again = await client.put(url, json={**_BODY, "correctness": "The selected suite passed."})
+        assert "note" not in early.json() and "refused unless" in first.json()["note"]
+        # #4726: a third write that leaves the solution as it is is refused, and says why.
+        third = await client.put(url, json={**_BODY, "correctness": "The selected suite passed."})
+        assert third.status_code == 409 and "solution" in third.json()["detail"]
+        assert (await client.get(url)).json()["resolution"]["correctness"] == _BODY["correctness"]
+        again = await client.put(
+            url, json={**_BODY, "solution": "S2", "correctness": "The selected suite passed."}
+        )
         assert again.status_code == 200
         read = (await client.get(url)).json()["resolution"]
 

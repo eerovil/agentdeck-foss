@@ -491,6 +491,10 @@ class FakeDb:
     def work_start_choice(self, work_id):
         return getattr(self, "choices", {}).get(work_id)
 
+    def record_work_start_choice(self, work_id, choice):
+        self.choices = {**getattr(self, "choices", {}), work_id: choice}
+        return True
+
     def work_agent_chat(self, work_id):
         return getattr(self, "agent_chats", {}).get(work_id)
 
@@ -1447,6 +1451,87 @@ def test_a_malformed_worker_choice_has_no_configured_answer(tmp_path):
     assert work_accounts(tmp_path) == {"eerovil/agentdeck": None}
 
 
+def test_a_projects_own_model_holds_between_its_two_dates(tmp_path, caplog):
+    """#4723: ``[worker] model`` is the project's default; the dates end a trial by itself."""
+    from datetime import date
+
+    from agentdeck.poller_ops import work_models
+
+    _switched(
+        tmp_path,
+        "games",
+        '[worker]\naccount = "claude_code:main"\nmodel = " sonnet "\n'
+        "model_from = 2026-12-02\nmodel_until = 2026-12-09\n",
+    )
+    _switched(tmp_path, "always", '[worker]\nmodel = "haiku"\n')
+    _switched(tmp_path, "notes", '[worker]\naccount = "claude_code:main"\n')
+    _switched(tmp_path, "typo", '[worker]\nmodel = "sonnet"\nmodel_until = "2026-12-09"\n')
+    _switched(tmp_path, "blank", '[worker]\nmodel = ""\n')
+    _switched(
+        tmp_path,
+        "backwards",
+        '[worker]\nmodel = "opus"\nmodel_from = 2026-12-09\nmodel_until = 2026-12-02\n',
+    )
+    _switched(tmp_path, "broken", "this is not toml = [")
+    # Not UTF-8: sorted first, and still only its own project's loss.
+    _switched(tmp_path, "a-latin", "")
+    (tmp_path / "instances" / "a-latin" / "overlay.toml").write_bytes(b'[worker]\nmodel = "\xff"\n')
+    # Two issue repositories in one project, the model for one of them only.
+    _switched(tmp_path, "site", '[worker]\nmodel = "sonnet"\nmodel_repos = ["Site", "gone"]\n')
+    manifest = tmp_path / "instances" / "site" / "poller.toml"
+    manifest.write_text(manifest.read_text() + '[[repos]]\nid = "other"\nholds_issues = true\n')
+
+    def on(day):
+        return work_models(tmp_path, date(2026, 12, day))
+
+    rest = {"eerovil/always": "haiku", "eerovil/site": "sonnet"}
+    assert on(1) == rest
+    assert on(2) == on(8) == {**rest, "eerovil/games": "sonnet"}
+    assert on(9) == rest
+    for name in ("typo", "blank", "backwards"):
+        assert f"{name}'s [worker] model" in caplog.text
+    assert "broken's overlay is unreadable" in caplog.text
+    assert "a-latin's overlay is unreadable" in caplog.text
+    assert "site's model_repos names no issue repository: {'gone'}" in caplog.text
+
+
+async def test_a_work_starts_on_its_projects_model_unless_the_press_picked_one(
+    tmp_path, startable, monkeypatch, caplog
+):
+    """#4723: the project's model fills a start that picked none, and is saved under the Work
+    so a later leg of its chat keeps it; a picked model, and a Codex account, are left alone."""
+    from agentdeck import poller_ops
+    from agentdeck.db import StartChoice
+    models = {"eerovil/agentdeck": "sonnet"}
+    monkeypatch.setattr(poller_ops, "work_models", lambda root: models)
+    app, db, injector = fake_app(tmp_path)
+    work = "github_issue:eerovil/agentdeck#7"
+
+    assert await start_work_agent(app, "eerovil/AgentDeck", 7) == "started"
+    assert injector.calls[-1]["model"] == "sonnet"
+    assert db.choices[work] == StartChoice(model="sonnet")
+    # A replayed start is spent: it saves nothing over the Work's own record.
+    db.choices = {}
+    assert await start_work_agent(app, ISSUE, 7) == "already started"
+    assert db.choices == {}
+
+    picked = StartChoice("claude_code:main", "opus", "high")
+    assert work_start.with_project_model(app, ISSUE, picked) is picked
+    kept = work_start.with_project_model(app, ISSUE, StartChoice("claude_code:main", "", "high"))
+    assert kept == StartChoice("claude_code:main", "sonnet", "high")
+    # A Codex pick is left alone, and a mistyped model is neither filled nor saved.
+    codex = StartChoice("codex:codex")
+    assert work_start.with_project_model(app, ISSUE, codex) is codex
+    models[ISSUE] = "sonet"
+    assert work_start.with_project_model(app, ISSUE, None) is None
+    assert "project model “sonet” is not offered" in caplog.text
+    # No model set for the project, or none readable: the deck's own choice, as before.
+    models.clear()
+    assert work_start.with_project_model(app, ISSUE, None) is None
+    monkeypatch.setattr(poller_ops, "work_models", lambda root: 1 / 0)
+    assert work_start.with_project_model(app, ISSUE, None) is None
+
+
 def _accounts(app, *keys):
     app.state.accounts = [SimpleNamespace(key=key, provider_id=key.split(":")[0]) for key in keys]
 
@@ -1627,7 +1712,18 @@ async def test_the_first_message_says_whether_the_project_merges_on_its_own(
     #3134: an issue carrying the spec-only label is told to write the spec, not build it.
     #3147: it is told which repositories its CI or its review proves, so it runs no job there.
     #3919: and which need its CI green beside the job.
-    #4172: and which repository of a project that waits merges on its own."""
+    #4172: and which repository of a project that waits merges on its own.
+    #4724: and that its repository's guide is over the size limit, imports counted."""
+    from agentdeck.guide_size import GUIDE_LIMIT
+
+    # Exactly at the limit says nothing; one character over it does, biggest file first.
+    # Measured in the agent's worktree: the main checkout's own guide, far over, says nothing.
+    worktree = startable / ".worktrees" / "issue-7"
+    worktree.mkdir(parents=True)
+    (startable / "AGENTS.md").write_text("x" * GUIDE_LIMIT * 2)
+    (worktree / "CLAUDE.md").write_text("@AGENTS.md\n" if not auto_release else "")
+    rules = GUIDE_LIMIT - (len("@AGENTS.md\n") - 1 if not auto_release else 0)
+    (worktree / "AGENTS.md").write_text("é" * rules)
     evidence = '[[repos]]\nid = "agent-evidence"\nholds_artifacts = true\n'
     proven = (
         '[[repos]]\nid = "store"\nholds_code = true\nverification = "github_checks"\n'
@@ -1705,6 +1801,9 @@ async def test_the_first_message_says_whether_the_project_merges_on_its_own(
     else:
         wanted += " " + work_start.OPEN_PULL_TEXT.format(pulls=pull)
         wanted += " " + work_start.OTHER_CHECKOUTS_TEXT.format(paths="`~/store`, `~/robot`")
+        wanted += " " + work_start.BIG_GUIDE_TEXT.format(
+            files="`AGENTS.md`, `CLAUDE.md`", size=GUIDE_LIMIT + 1, limit=GUIDE_LIMIT
+        )
     # #3274: last, where it works; claimed under the id Finish releases, whatever the case.
     assert app.state.runtime_asked[0]["work_id"] == "github_issue:eerovil/agentdeck#7"
     wanted += " " + work_start.WORKTREE_TEXT.format(

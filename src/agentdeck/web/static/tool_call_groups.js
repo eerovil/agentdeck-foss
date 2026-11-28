@@ -13,12 +13,12 @@
   // all of those correct without any cross-fragment server bookkeeping.
   var activeCleanup = null;
 
-  // The agent's in-between lines ("Find the code.") fold the same way (#3200):
-  // within one turn only the reply that ends it reads as a message, and across
-  // turns the deck woke up only the latest one does. An assistant
-  // reply followed by more of the turn (a tool call or another reply) before the
-  // next user message or deck notice is folded to one muted line and joins the
-  // card of the tool calls after it. A tap opens it again.
+  // The agent's in-between lines ("Find the code.") read in full (#4704): they
+  // tell a person what the agent is doing, so they stay outside the steps line
+  // and split the tool calls around them into runs of their own. Only a reply
+  // that ended a turn the deck woke up folds (#3200), once the agent replied
+  // again before the person's next message: it becomes one muted line, joins
+  // the card of any tool calls after it, and opens on a tap.
   function keyOf(node) {
     if (!node.classList || !node.classList.contains('tool-call')) return null;
     return node.dataset ? (node.dataset.toolKey || null) : null;
@@ -32,13 +32,15 @@
     return true;
   }
 
-  // Does the turn go on after nodes[i]? Sub-agent rows are part of the turn
-  // around them, and so is a note the agent never saw (chat_notes.js, #3227);
+  // Does the turn go on after nodes[i], making it an in-between line? Sub-agent
+  // rows are part of the turn around them, and so are a note the agent never saw
+  // (chat_notes.js, #3227) and the line where the chat moved to another leg;
   // anything else that is not the agent's own work ends it.
   function turnContinues(nodes, i) {
     for (var j = i + 1; j < nodes.length; j++) {
       var list = nodes[j].classList;
-      if (!list || !list.contains('ev') || list.contains('sub') || list.contains('chat-note')) continue;
+      if (!list || !list.contains('ev') || list.contains('sub') || list.contains('chat-note')
+          || list.contains('leg-switch')) continue;
       return list.contains('tool') || list.contains('assistant');
     }
     return false;
@@ -70,35 +72,16 @@
     return false;
   }
 
-  // While the agent is still working (the chat ends in its tool calls, not a
-  // reply), its latest line in that turn reads in full, so a person can see what
-  // it is doing. It folds once the turn moves on.
-  function liveLine(nodes) {
-    for (var i = nodes.length - 1; i >= 0; i--) {
-      var list = nodes[i].classList;
-      if (!isEv(nodes[i]) || list.contains('leg-switch')) continue;
-      if (!list.contains('tool')) return -1;
-      for (var j = i - 1; j >= 0; j--) {
-        if (!isEv(nodes[j])) continue;
-        if (foldable(nodes[j])) return j;
-        if (!nodes[j].classList.contains('tool')) return -1;
-      }
-      return -1;
-    }
-    return -1;
-  }
-
   function regroup(transcript) {
     var nodes = Array.prototype.slice.call(transcript.children).filter(function (node) {
       return !node.classList.contains('tool-block-summary');
     });
-    // Between two of the person's own messages only the agent's latest reply
-    // reads in full: an earlier reply that ended a turn the deck woke up folds
-    // too. A reply to the person's own message never does.
-    var live = liveLine(nodes);
+    // Between two of the person's own messages an earlier reply that ended a
+    // turn the deck woke up folds. An in-between line never does, nor does a
+    // reply to the person's own message.
     var folded = nodes.map(function (node, i) {
-      if (!foldable(node) || i === live) return false;
-      return turnContinues(nodes, i) || (deckWoken(nodes, i) && repliedAgain(nodes, i));
+      if (!foldable(node) || turnContinues(nodes, i)) return false;
+      return deckWoken(nodes, i) && repliedAgain(nodes, i);
     });
     var keys = nodes.map(function (node, i) { return folded[i] ? null : keyOf(node); });
     // Folded lines are see-through when deciding what is next to what.

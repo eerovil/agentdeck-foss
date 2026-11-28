@@ -702,7 +702,9 @@
   // Another script opening a chat in place, as a click on its card would: a chat's jump
   // to another chat and back (#3816, chat_jump.js), which voice mode carries on into.
   window.AgentDeckSessionNavigation = {
-    open: function (path) { return openSession(null, path, true); }
+    open: function (path) { return openSession(null, path, true); },
+    // A front-page row swiped to the right on a phone (#4625): its Work, not its chat.
+    openRowWork: function (link) { if (startPageLoad(link)) location.assign(link.href); }
   };
 
   // A phone opens a front-page row's chat rather than its Work (#2512): almost every visit
@@ -769,22 +771,25 @@
   // on the window runs after every document handler, so a click one of them took over in
   // place never counts. A stopped load leaves no event, hence the time limit.
   var pageLoad = null;
+  // Marks the load of a Work page as started; false when that same load is already under way.
+  function startPageLoad(link) {
+    var href = new URL(link.href, location.href).href;
+    var now = Date.now();
+    if (pageLoad && pageLoad.href === href && now - pageLoad.at < 20000) return false;
+    pageLoad = {href: href, at: now};
+    // The page can take seconds to come: the row says it is on its way.
+    var row = link.closest('.fr');
+    if (row) row.classList.add('fr-opening');
+    link.setAttribute('aria-busy', 'true');
+    return true;
+  }
   window.addEventListener('click', function (event) {
     var link = event.target.closest && event.target.closest('a[href^="/works/"]');
     if (event.defaultPrevented || !link || !isPlainClick(event, link)) return;
     var url = new URL(link.href, location.href);
     if (url.origin !== location.origin || !isWorkPath(url.pathname)) return;
     if (url.pathname === location.pathname) return;  // a place on this page: nothing loads
-    var now = Date.now();
-    if (pageLoad && pageLoad.href === url.href && now - pageLoad.at < 20000) {
-      event.preventDefault();
-      return;
-    }
-    pageLoad = {href: url.href, at: now};
-    // The page can take seconds to come: the row says it is on its way.
-    var row = link.closest('.fr');
-    if (row) row.classList.add('fr-opening');
-    link.setAttribute('aria-busy', 'true');
+    if (!startPageLoad(link)) event.preventDefault();
   });
   window.addEventListener('pageshow', function () {
     pageLoad = null;

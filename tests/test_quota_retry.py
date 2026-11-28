@@ -149,6 +149,84 @@ async def test_due_quota_retry_is_cancelled_after_the_chat_moves_on(tmp_path):
     assert store.load_visible_scheduled_messages("chat-1") == ()
 
 
+def test_a_retry_that_would_not_be_sent_is_hidden_but_kept(tmp_path):
+    from dataclasses import replace
+
+    from agentdeck.scheduled_messages import RUNTIME_HOLD, ScheduledMessage
+
+    reset = datetime.now(UTC) + timedelta(hours=1)
+    source = _session(reset)
+    retry = message_for(source)
+    store = Db(tmp_path / "agentdeck.db")
+    current = [source]
+    unscanned = set()
+    scheduled = ScheduledMessageService(
+        store,
+        None,
+        # The chat cannot take a message now, as a leg in the middle of a turn may not.
+        lambda _chat: None,
+        current_session=lambda _chat: current[0],
+        session_known=lambda key: key not in unscanned,
+    )
+    assert scheduled.schedule(retry) is not None
+    held = ScheduledMessage(
+        id="held-1",
+        chat_id="chat-1",
+        text="from a person",
+        due_at=datetime.now(UTC),
+        created_at=datetime.now(UTC),
+        hold_reason=RUNTIME_HOLD,
+    )
+    assert scheduled.schedule(held) is not None
+
+    def shown():
+        return {message.id for message in scheduled.visible("chat-1")}
+
+    both = {retry.id, held.id}
+    for session, expected in (
+        (source, both),
+        # The chat moved on, also when the new leg stopped on a limit of its own.
+        (_session(reset, key="claude_code:alt:successor"), {held.id}),
+        (replace(source, turn_failed=False, automatic_retry_at=None), {held.id}),
+        (replace(source, turn_failed=False), {held.id}),
+        (replace(source, automatic_retry_at=None), {held.id}),
+        (replace(source, automatic_retry_at=reset + timedelta(hours=5)), {held.id}),
+        # Not known yet, right after a restart.
+        (None, both),
+        # Found on disk before its runtime has reported it.
+        (
+            replace(
+                source, turn_failed=False, automatic_retry_at=None, capabilities=frozenset()
+            ),
+            both,
+        ),
+        # A moved chat's new leg is known by its key alone.
+        (
+            replace(_session(reset, key="claude_code:alt:b"), capabilities=frozenset()),
+            {held.id},
+        ),
+        # Back on the same failure: the same retry stands.
+        (source, both),
+    ):
+        current[0] = session
+        assert shown() == expected
+        assert retry.id in scheduled.pending_ids()
+
+    # An older leg stands in while the one the limit stopped is not scanned yet.
+    current[0] = _session(reset, key="claude_code:alt:older")
+    unscanned.add(source.key)
+    assert shown() == both
+    unscanned.clear()
+    assert shown() == {held.id}
+
+    # One being sent, or one that failed, is shown wherever the chat is.
+    current[0] = _session(reset, key="claude_code:alt:successor")
+    assert store.claim_scheduled_message(retry.id)
+    assert shown() == both
+    store.settle_scheduled_message(retry.id, "failed", "why")
+    assert shown() == both
+
+
 # --- a Work's chat moves to another listed account (#3362) -------------------
 
 

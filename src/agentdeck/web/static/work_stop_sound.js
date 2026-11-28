@@ -4,11 +4,11 @@
 // in a new, unseen row there plays two soft notes. Each row's stop is `data-work-id` plus
 // `data-work-stopped` (when it stopped), so a Work that stops, resumes and stops again
 // chimes again, while a reconnect or a repeated push of the same rows does not. A starred
-// Work is listed in Starred alone (#4121), so a stop there counts the same, by the same rule
-// as Recently stopped: a closed issue or a Work no agent started is not a stop. A star moves
-// a row there with the stop it already had, which Recently stopped's cap may have kept out of
-// that list, so a stop the page already holds in another list is not a new one. Starred is
-// swapped first in a push, so a stop that is new in this push is in no other list yet.
+// Work is also listed in Starred (#4121, #4745), so a stop there counts the same, by the same
+// rule as Recently stopped: a closed issue or a Work no agent started is not a stop. A star
+// puts a row there with the stop it already had, which Recently stopped's cap may have kept
+// out of that list, so a stop the page already holds in another list is not a new one. Starred
+// is swapped first in a push, so a stop that is new in this push is in no other list yet.
 //
 // - Rows already on the page when it loads never chime; only a push can.
 // - One chime per push, however many Works stopped in it.

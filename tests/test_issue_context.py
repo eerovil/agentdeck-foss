@@ -857,3 +857,22 @@ async def test_refreshed_pull_rows_wake_the_work_routers_backstop(tmp_path, monk
     read[0] = 0
     await resolver.refresh_pull_rows([("eerovil/agentdeck", 9)], limit=4)
     assert woken == [1]
+
+
+def test_a_backlog_finds_each_issue_by_its_key_the_first_listed_winning():
+    from types import SimpleNamespace
+
+    from agentdeck.issue_context import IssueBacklog, RepositoryIssues, identity
+
+    def issue(repository, number, title):
+        return SimpleNamespace(identity=identity(repository, number), title=title)
+
+    backlog = IssueBacklog(
+        repositories=(
+            RepositoryIssues("a/b", (issue("a/b", 1, "first"), issue("a/b", 1, "second"))),
+            RepositoryIssues("c/b", (issue("c/b", 1, "other"),)),
+        )
+    )
+    assert backlog.issue("A/B", 1).title == "first"
+    assert backlog.issue("c/b", 1).title == "other"
+    assert backlog.issue("a/b", 2) is None

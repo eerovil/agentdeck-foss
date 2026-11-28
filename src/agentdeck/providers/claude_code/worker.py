@@ -26,7 +26,7 @@ import sys
 import time
 import uuid
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +49,7 @@ from ...models import (
     SNAPSHOT_CAPABILITIES_KEY,
     SNAPSHOT_CONTEXT_MANAGEMENT_V1,
     SNAPSHOT_FORK_V1,
+    SNAPSHOT_KEEP_WARM_V1,
     SNAPSHOT_RELOCATE_V1,
     SNAPSHOT_REWIND_V1,
     SNAPSHOT_SPARE_V1,
@@ -58,7 +59,7 @@ from ...models import (
     ForkFrom,
     open_questions_id,
 )
-from ...worker_cuts import Cut, WorkerCuts, repository_of
+from ...worker_cuts import Cut, WorkerCuts, repeated_home_guides, repository_of
 from ...worker_limits import EXIT_MEMORY_CAP
 from .. import account_health
 from ..delivery import (
@@ -126,6 +127,10 @@ BYPASS_PERMISSIONS_MODE = "bypassPermissions"
 # The ``decision_reason_type`` of a safety check bypass does not lift: a single
 # command's own, and one on a part of a chained command (#2342, #3867).
 _BYPASS_SAFETY_REASON_TYPES = frozenset({"safetyCheck", "subcommandResults"})
+# Claude Code's built-in privacy check (a call's input holds the account's email
+# address) comes as a ``hook`` reason instead (#4612). Any other hook still asks.
+_PRIVACY_CHECK_EVENT = "tool.check"
+_PRIVACY_CHECK_SOURCE = "plugin:cc-plugin-privacy"
 # Where a new owned chat's switch starts is the host's ``start_bypassed``
 # (#2319, a setting since #3748 so a public install runs in its configured mode).
 # Only a new record takes it: a saved record keeps its own choice, and one
@@ -161,6 +166,18 @@ BACKGROUND_AGENT_MAX_AGE_S = 2 * 3600.0
 # write, which reads as idle while the message it was just given is still in its
 # queue: a person's message was killed two seconds after it landed that way.
 IDLE_RECLAIM_GRACE_S = 60.0
+
+
+class _KeyLock(asyncio.Lock):
+    """A chat's lock that gives back the place its holder reserved when it is let go."""
+
+    def __init__(self, on_release: Callable[[], None]) -> None:
+        super().__init__()
+        self._on_release = on_release
+
+    def release(self) -> None:
+        self._on_release()
+        super().release()
 # How long after voice mode last woke a chat (#4360) its idle process is reclaimed
 # only after every other idle one. Voice mode turning off does not end it: a hold
 # left behind runs out by itself.
@@ -185,6 +202,20 @@ UNREAD_CLOCK_SLACK_S = 5.0
 # what the CLI emits when it throws (a crash), and the limit is not a crash: the turn finishes,
 # having said nothing but this. Requiring `is_error` here is what would make the whole circuit
 # a no-op against the only shape production produces (#1733).
+#
+# A cap on one model reads the same way with the model's name in the window's place:
+# "You've hit your Fable limit · resets Dec 2, 10am (Europe/Helsinki). Switch to another
+# model, or manage usage credits at https://claude.ai/settings/usage?from=cc_cli_limit_message,
+# to continue." (#4764). That chat waits for the reset (or moves to another account) like any
+# spent window, but the account's circuit stays shut: its other models still answer, and the
+# usage meter cannot see one model's cap, so a circuit opened for it would both block chats
+# that can run and be closed again by the next healthy meter read. The name is open (up to
+# three words) so the next model's name matches too. "rate limit" stays out: throttling is
+# transient.
+_MODEL_CAP_MARKER = re.compile(
+    r"you'?ve hit your (?!rate\b)[a-z][a-z0-9.-]*(?: [a-z0-9][a-z0-9.-]*){0,2} limit ·? ?resets\b",
+    re.IGNORECASE,
+)
 _HARD_QUOTA_MARKERS = re.compile(
     r"""
       you'?ve\ hit\ your\ (?:weekly|usage|session|5-hour|five-hour)\ limit
@@ -202,12 +233,24 @@ _HARD_QUOTA_MARKERS = re.compile(
 # same words — a turn spent working on this very issue does — and that must not cost the
 # account its eligibility, so text the provider did not label an error has to *be* the refusal
 # rather than merely contain it.
-_SYNTHETIC_REFUSAL_MAX_CHARS = 200
+_SYNTHETIC_REFUSAL_MAX_CHARS = 300  # the model cap's line is ~190 characters (#4764)
+
+
+def _is_model_cap(evidence: str) -> bool:
+    """Whether a limit line caps one model rather than the account's own windows (#4764)."""
+    normalized = _plain_apostrophes(evidence)
+    return _MODEL_CAP_MARKER.search(normalized) is not None and not _HARD_QUOTA_MARKERS.search(
+        normalized
+    )
 
 
 def _plain_apostrophes(value: str) -> str:
     """The CLI renders this line with either apostrophe; match one alphabet, not two."""
     return value.replace("’", "'")
+
+
+def _limit_marker(text: str) -> re.Match[str] | None:
+    return _HARD_QUOTA_MARKERS.search(text) or _MODEL_CAP_MARKER.search(text)
 
 
 def _hard_quota_evidence(event: dict[str, Any]) -> str | None:
@@ -239,7 +282,7 @@ def _hard_quota_evidence(event: dict[str, Any]) -> str | None:
         elif isinstance(current, (list, tuple)):
             stack.extend(current)
     for value in provider_errors:
-        if _HARD_QUOTA_MARKERS.search(_plain_apostrophes(value)):
+        if _limit_marker(_plain_apostrophes(value)) is not None:
             return value[:500]
 
     subtype = str(event.get("subtype") or "").lower()
@@ -252,12 +295,12 @@ def _hard_quota_evidence(event: dict[str, Any]) -> str | None:
     normalized = _plain_apostrophes(text)
     if event.get("is_error") is True or subtype in {"error", "error_during_execution"}:
         # An error result's text is the provider's own message, so the marker may sit anywhere.
-        return text[:500] if _HARD_QUOTA_MARKERS.search(normalized) else None
+        return text[:500] if _limit_marker(normalized) is not None else None
     # A successful result's text is whatever the agent said. Only the synthetic refusal shape
     # counts: one line, short, and opening with the refusal itself.
     if "\n" in text or len(text) > _SYNTHETIC_REFUSAL_MAX_CHARS:
         return None
-    match = _HARD_QUOTA_MARKERS.search(normalized)
+    match = _limit_marker(normalized)
     if match is None or match.start() > 0:
         return None
     return text[:500]
@@ -638,6 +681,17 @@ def _normalize_block(block: _Block, session_id: str | None) -> dict[str, Any]:
     }
 
 
+def _is_privacy_check(request: dict[str, Any]) -> bool:
+    """Whether a ``can_use_tool`` gate is Claude Code's own privacy check."""
+    return (
+        request.get("decision_reason_type") == "hook"
+        # A question is always the boss's, whatever a check said about its text.
+        and request.get("tool_name") != "AskUserQuestion"
+        and request.get("decision_reason_hook_event") == _PRIVACY_CHECK_EVENT
+        and request.get("decision_reason_hook_source") == _PRIVACY_CHECK_SOURCE
+    )
+
+
 def _normalize_interaction(
     pending: object, session_id: str | None
 ) -> dict[str, Any] | None:
@@ -894,6 +948,9 @@ class ClaudeWorkerHost:
         # already answered rather than sending the same answer twice (#3451).
         self._question_locks: dict[str, asyncio.Lock] = {}
         self._key_locks: dict[str, asyncio.Lock] = {}
+        # Chats admitted to start a process that is not running yet (#4752): each holds a
+        # place from the admission that found it free until its chat's lock is let go.
+        self._starting: set[str] = set()
         self._holder_store = HolderStore(state_dir / f"{account.label}.holders.json")
         self._holder_dir = state_dir / "holders" / account.label
         self._holders: dict[str, HolderInfo] = self._holder_store.load()
@@ -924,13 +981,20 @@ class ClaudeWorkerHost:
             self._settings_files[(auto, cut)] = path
         return path
 
-    async def _cut_for(self, cwd: str) -> Cut:
-        """What a chat starting in ``cwd`` runs without: its repository's cut (#4252)."""
-        if not self._worker_cuts.repositories:
-            # Every repository has the host's cut, so there is no remote to read.
-            return self._worker_cuts.for_repository(None)
-        repository = await asyncio.to_thread(repository_of, cwd)
-        return self._worker_cuts.for_repository(repository)
+    async def _cut_for(self, rec: WorkerRecord) -> Cut:
+        """What this chat starts without: its repository's cut (#4252), a Work's own chat
+        also its repository's unused connectors and skills, and a second copy of the
+        account's global guide (#4727)."""
+        work = resolve_session_role(delegated=rec.delegated, role=rec.role) == "work"
+        repository = None
+        if self._worker_cuts.repositories:
+            # With no repository of its own lists there is no remote to read.
+            repository = await asyncio.to_thread(repository_of, rec.cwd)
+        cut = self._worker_cuts.for_repository(repository, work=work)
+        # Read at each start, so a guide edited in one folder only loads again at once.
+        # Two small local files, read in place: a thread hop would cost every spawn more.
+        guides = repeated_home_guides(self.account.root)
+        return replace(cut, guides=guides) if guides else cut
 
     @staticmethod
     def _publish_artifact_context(record: WorkerRecord) -> bool:
@@ -957,7 +1021,7 @@ class ClaudeWorkerHost:
         """
         lock = self._key_locks.get(key)
         if lock is None:
-            lock = asyncio.Lock()
+            lock = _KeyLock(lambda: self._starting.discard(key))
             self._key_locks[key] = lock
         return lock
 
@@ -1014,6 +1078,7 @@ class ClaudeWorkerHost:
         *,
         exclude: _LiveWorker | None = None,
         automated: bool = False,
+        ping: bool = False,
     ) -> bool:
         """Whether this (re)spawn may take an account-local slot, cleaning up first.
 
@@ -1031,21 +1096,72 @@ class ClaudeWorkerHost:
           7/4 on 2026-10-13 (#3009).
 
         Refusals are logged, so ``at_capacity`` never leaves the journal silent.
+
+        An admitted start holds its place from here on (#4752): the process it starts
+        joins ``_live`` only after its launch, and two chats starting at once both saw
+        the last free place. The caller holds its chat's lock, and letting go of that
+        lock gives the place back, so a start that fails or is refused later leaks none.
+        One start asking twice (a guide restart, then its spawn) holds one place: its own
+        is never counted against it.
+
+        ``ping`` is the keep-warm ping resuming a stopped chat (#4752). It takes a free
+        place, or one an idle chat with nothing running gives up, and nothing else: it
+        never ends a stalled turn and never goes past the cap, whatever the chat's role.
         """
-        if len(self._interactive_live(exclude=exclude)) < self.max_workers:
-            return True
-        if await self._free_admission_slot(key) is not None:
-            return True
-        if role == "primary" and not automated:
+        while True:
+            taken = self._places_taken(key, exclude)
+            if taken < self.max_workers:
+                self._starting.add(key)
+                return True
+            if ping:
+                freed = await self._reclaim_slot(
+                    self._idle_victims(key, time.time()), self._is_quiet_idle, key, "idle"
+                )
+            else:
+                freed = await self._free_admission_slot(key)
+            if freed is None:
+                break
+            if not ping and self._places_taken(key, exclude) < taken:
+                # As before the count: one process stopped admits one start, also on an
+                # account a person's chats took past the cap. Stopping it waited, so the
+                # place is this start's only if no other start took it meanwhile.
+                self._starting.add(key)
+                return True
+        if role == "primary" and not automated and not ping:
             log.warning(
                 "admitting %s:%s past the %d-slot cap: a person asked for this chat",
                 self.account.key,
                 key,
                 self.max_workers,
             )
+            self._starting.add(key)
             return True
         self._log_at_capacity(key)
         return False
+
+    def _places_taken(self, key: str, exclude: _LiveWorker | None) -> int:
+        """Running processes that hold a place, plus other chats' starts in flight."""
+        starting = sum(
+            1 for other in self._starting if other != key and not self._runs(self._live.get(other))
+        )
+        return len(self._interactive_live(exclude=exclude)) + starting
+
+    @staticmethod
+    def _runs(live: _LiveWorker | None) -> bool:
+        return live is not None and live.process.returncode is None
+
+    def _is_quiet_idle(self, key: str, live: _LiveWorker, now: float) -> bool:
+        """Idle with nothing running behind it: no helper agent and no background command.
+        The only process a keep-warm ping may stop to make room (#4752)."""
+        if not self._is_reclaimable_idle(key, live, now):
+            return False
+        if self._voice_until.get(key, 0.0) > now:
+            return False  # a person is talking to it: idle between phrases is still use
+        rec = self._records.get(key)
+        if rec is None:
+            return not live.background_agents
+        self._sync_background_agents(rec, live)
+        return not live.background_agents and not self._background_shell_tasks(rec, live)
 
     def _quiet_for(self, key: str, live: _LiveWorker, now: float) -> float:
         """Seconds since this worker last received input or produced output."""
@@ -1934,6 +2050,7 @@ class ClaudeWorkerHost:
                 *WORKER_SNAPSHOT_CAPABILITIES,
                 SNAPSHOT_CONTEXT_MANAGEMENT_V1,
                 SNAPSHOT_FORK_V1,
+                SNAPSHOT_KEEP_WARM_V1,
                 SNAPSHOT_RELOCATE_V1,
                 SNAPSHOT_REWIND_V1,
                 SNAPSHOT_SPARE_V1,
@@ -2079,8 +2196,16 @@ class ClaudeWorkerHost:
         correlation: DeliveryCorrelation | None = None,
         fork_from: ForkFrom | None = None,
         automated: bool = False,
+        keep_warm: bool = False,
     ) -> DeliverResult:
         """Idempotent work delivery: steer if live, revive if finished, else spawn.
+
+        ``keep_warm`` is the keep-warm ping's (#4737, #4752): it is written into an idle
+        process, or into one resumed for it when a place is free, and is refused otherwise
+        (``_keep_warm_refusal``). It names the session and the last finished turn its
+        sender judged, and is refused when either moved. It never joins a running turn,
+        never starts a new chat and never retries a resume. Decided here, under the
+        worker's lock, because the caller's view of the process is seconds old.
 
         ``delegated`` has no default here (see ``KeyedWorkerHost``): it decides the
         session's trust level, so every caller must state it. ``automated`` says no
@@ -2110,8 +2235,21 @@ class ClaudeWorkerHost:
             require_active=require_active,
             command_artifacts=command_artifacts,
             fork=(f"{fork_from.session_id}@{fork_from.ref}" if fork_from else None),
+            keep_warm=keep_warm,
         )
         async with self._key_lock(key):
+            if keep_warm and (
+                fresh
+                or require_active
+                or context_maintenance
+                or context_rollover
+                or fork_from is not None
+                or images
+                or cwd is not None
+                or expected_session_id is None
+                or not expected_last_result_at
+            ):
+                return DeliverResult(False, "rejected", reason="keep_warm_invalid")
             if fork_from is not None and (
                 not fresh or require_idle or require_active or context_maintenance
                 or context_rollover
@@ -2197,6 +2335,13 @@ class ClaudeWorkerHost:
                 or not (live.turn_active or live.background_agents)
             ):
                 return DeliverResult(False, "rejected", reason="worker_inactive")
+            if keep_warm:
+                refusal = self._keep_warm_refusal(rec, live)
+                if refusal:
+                    return DeliverResult(False, "rejected", reason=refusal)
+                # A ping names no command policy, and must not clear the chat's own: a
+                # chat resumed for it would run without it for that process's life.
+                command_artifacts = rec.command_artifacts
             if require_idle and rec is not None:
                 if live is not None:
                     self._sync_background_agents(rec, live)
@@ -2343,7 +2488,7 @@ class ClaudeWorkerHost:
             # healthy worker it was meant to replace.
             if live is not None:
                 if not await self._admit_interactive(
-                    key, role, exclude=live, automated=automated
+                    key, role, exclude=live, automated=automated, ping=keep_warm
                 ):
                     return DeliverResult(False, "rejected", reason="at_capacity")
                 admission_checked = True
@@ -2354,7 +2499,9 @@ class ClaudeWorkerHost:
             # policy applies here only. Steering a live worker is always allowed
             # so in-flight work finishes even at the cap or over budget.
             if not admission_checked:
-                if not await self._admit_interactive(key, role, automated=automated):
+                if not await self._admit_interactive(
+                    key, role, automated=automated, ping=keep_warm
+                ):
                     return DeliverResult(False, "rejected", reason="at_capacity")
             source_record = rec
             if (
@@ -2528,6 +2675,15 @@ class ClaudeWorkerHost:
                         context_rollover=context_rollover,
                     )
                 restore_source_after_clean_rollover_failure()
+                if keep_warm:
+                    # A ping is worth one try: no second resume, and never a new chat.
+                    close_unwritten_turn()
+                    if rec.receipts.forget(delivery_id, write_started=False):
+                        self._save_state()
+                    log.info("keep-warm resume of %s failed: %s", key, exc)
+                    return DeliverResult(
+                        False, "rejected", reason="resume_failed", session_id=rec.session_id
+                    )
                 if resume_id is not None:
                     if retrying_context:
                         close_unwritten_turn()
@@ -3266,6 +3422,41 @@ class ClaudeWorkerHost:
             return None
         return continued_chat_cwd(recorded)
 
+    def _keep_warm_refusal(self, rec: WorkerRecord | None, live: _LiveWorker | None) -> str:
+        """Why a keep-warm ping may not be written to this chat now, or "" (#4737, #4752).
+
+        A ping is worth its price only while the chat's prompt cache is alive and the
+        ping's call reads it. So it joins no turn, and it is refused wherever the chat's
+        next start would do more than launch the same prompt again: a rollback point (the
+        ping would use it up), a context operation, a turn left open or messages unread
+        (that chat is owed a real wake), a directory gone, and a session guide that
+        changed since its process last started, which makes a prompt no cache holds. A
+        stopped chat is resumed, never begun anew, so its transcript must be there. A
+        place for it is admission's.
+        """
+        if rec is None or not rec.session_id:
+            return "worker_not_resumable"
+        running = self._runs(live)
+        if running:
+            self._sync_background_agents(rec, live)
+            if live.turn_active or live.background_agents:
+                return "active_turn"
+        if (
+            rec.resume_at
+            or rec.resume_at_session
+            or rec.pending_context_delivery_id
+            or rec.pending_context_operation
+            or rec.turn_open_at
+            or rec.unread_messages
+            or self._relocation_target(rec, live, fresh=False, cwd=None) is not None
+            or rec.guide_fingerprint != session_guide_fingerprint(self._current_guide(rec))
+        ):
+            # The next real message starts this chat another way, and its cache with it.
+            return "worker_restart_due"
+        if not running and not self._has_transcript(rec.session_id):
+            return "worker_not_resumable"
+        return ""
+
     def _current_guide(self, rec: WorkerRecord) -> str:
         """The guide a process started for ``rec`` now gets, without a relocation note."""
         return agentdeck_session_instructions(
@@ -3846,7 +4037,7 @@ class ClaudeWorkerHost:
         # Each worker gets a cgroup of its own, so a runaway one is killed alone
         # instead of taking the runtime and every other chat with it (#1546).
         scope_unit, scope_prefix = await self._memory_scope(key)
-        cut = await self._cut_for(rec.cwd)
+        cut = await self._cut_for(rec)
         command = self._command(
             resume_id,
             model=model,
@@ -4278,7 +4469,8 @@ class ClaudeWorkerHost:
         A check on one part of a chained command (``cd x && rm -f y/*``) comes
         as ``subcommandResults`` rather than ``safetyCheck`` (#3867). With
         bypass on, nothing but a safety check makes a subcommand ask, so both
-        are refused alike.
+        are refused alike. The built-in privacy check comes as ``hook`` (#4612).
+        Its refusal must not tell Claude to rewrite its way past the check.
         """
         if event.get("type") != "control_request":
             return None
@@ -4287,7 +4479,10 @@ class ClaudeWorkerHost:
         if (
             not isinstance(request, dict)
             or request.get("subtype") != "can_use_tool"
-            or request.get("decision_reason_type") not in _BYPASS_SAFETY_REASON_TYPES
+            or not (
+                request.get("decision_reason_type") in _BYPASS_SAFETY_REASON_TYPES
+                or _is_privacy_check(request)
+            )
             or not isinstance(request_id, str)
         ):
             return None
@@ -4303,8 +4498,14 @@ class ClaudeWorkerHost:
             "Claude Code's safety check stopped this call. Permissions are bypassed "
             "in this chat, so nobody was asked and the call was refused."
             + (f" The check said: {detail}" if detail else "")
-            + " Rewrite the command so the check no longer applies instead of "
-            "retrying it unchanged."
+            + (
+                " Leave the flagged data out; do not split, encode or otherwise disguise "
+                "it. If the task needs that data, ask the person with a question; they can "
+                "turn bypass off, and then the call asks them for approval."
+                if _is_privacy_check(request)
+                else " Rewrite the command so the check no longer applies instead of "
+                "retrying it unchanged."
+            )
         )
         return {
             "type": "control_response",
@@ -4359,7 +4560,7 @@ class ClaudeWorkerHost:
                     else None
                 )
             )
-            if quota_evidence is not None:
+            if quota_evidence is not None and not _is_model_cap(quota_evidence):
                 persisted = account_health.trip_hard_quota(
                     self._usage_cache_dir,
                     self.account.key,

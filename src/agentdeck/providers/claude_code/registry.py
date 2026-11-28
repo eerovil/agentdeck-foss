@@ -14,6 +14,8 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import os
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -45,36 +47,77 @@ def _parse_ts(value: object) -> datetime | None:
         return None
 
 
+# A file this young may be written again within the same clock tick and size, so what was
+# read of it is not kept.
+_SETTLED_S = 2.0
+# The files of each sessions directory as last read: path -> (stat signature, entry).
+# ``None`` is a malformed file.
+_READ: dict[str, dict[str, tuple[tuple, RegistryEntry | None]]] = {}
+
+
 def read_registry(config_dir: Path) -> list[RegistryEntry]:
-    """Parse all sessions/*.json; malformed files are skipped, never fatal."""
+    """Parse all sessions/*.json; malformed files are skipped, never fatal.
+
+    The CLI leaves a file behind for every process it ever ran, and the liveness sweep reads
+    them all on the event loop, so a file that has not moved is not read again (#4639).
+    """
     sessions_dir = config_dir / "sessions"
+    try:
+        with os.scandir(sessions_dir) as listing:
+            names = sorted(item.name for item in listing if item.name.endswith(".json"))
+    except OSError:
+        return []
+    before = _READ.get(str(sessions_dir), {})
+    kept: dict[str, tuple[tuple, RegistryEntry | None]] = {}
     entries: list[RegistryEntry] = []
-    if not sessions_dir.is_dir():
-        return entries
-    for path in sorted(sessions_dir.glob("*.json")):
+    for name in names:
+        path = os.path.join(sessions_dir, name)
         try:
-            data = json.loads(path.read_text())
-            pid = int(data["pid"])
-            session_id = str(data["sessionId"])
-        except (OSError, ValueError, TypeError, KeyError) as exc:
-            log.debug("skipping malformed registry file %s: %s", path.name, exc)
+            stat = os.stat(path)
+        except OSError:
             continue
-        cwd = data.get("cwd")
-        proc_start = data.get("procStart")
-        entries.append(
-            RegistryEntry(
-                pid=pid,
-                session_id=session_id,
-                cwd=Path(cwd) if isinstance(cwd, str) else None,
-                started_at=_parse_ts(data.get("startedAt")),
-                proc_start=str(proc_start) if proc_start is not None else None,
-                version=data.get("version"),
-                kind=data.get("kind"),
-                entrypoint=data.get("entrypoint"),
-                raw=data,
-            )
-        )
+        signature = (stat.st_ino, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size)
+        known = before.get(name)
+        if known is not None and known[0] == signature:
+            entry = known[1]
+            kept[name] = known
+        else:
+            try:
+                entry = _read_entry(Path(path))
+            except OSError as exc:
+                log.debug("skipping unreadable registry file %s: %s", name, exc)
+                continue
+            if time.time() - stat.st_ctime > _SETTLED_S:
+                kept[name] = (signature, entry)
+        if entry is not None:
+            entries.append(entry)
+    _READ[str(sessions_dir)] = kept
     return entries
+
+
+def _read_entry(path: Path) -> RegistryEntry | None:
+    """One file parsed, ``None`` when malformed. Raises ``OSError`` when it cannot be read."""
+    raw = path.read_bytes()
+    try:
+        data = json.loads(raw)
+        pid = int(data["pid"])
+        session_id = str(data["sessionId"])
+    except (ValueError, TypeError, KeyError) as exc:
+        log.debug("skipping malformed registry file %s: %s", path.name, exc)
+        return None
+    cwd = data.get("cwd")
+    proc_start = data.get("procStart")
+    return RegistryEntry(
+        pid=pid,
+        session_id=session_id,
+        cwd=Path(cwd) if isinstance(cwd, str) else None,
+        started_at=_parse_ts(data.get("startedAt")),
+        proc_start=str(proc_start) if proc_start is not None else None,
+        version=data.get("version"),
+        kind=data.get("kind"),
+        entrypoint=data.get("entrypoint"),
+        raw=data,
+    )
 
 
 def proc_starttime(pid: int, proc_root: Path = PROC_ROOT) -> str | None:

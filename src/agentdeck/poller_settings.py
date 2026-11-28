@@ -29,7 +29,7 @@ from __future__ import annotations
 import os
 import tomllib
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -49,11 +49,10 @@ class WorkerAccounts:
     """One instance's worker account order as the page shows it."""
 
     instance: str
-    editable: bool = False        # is there an Overlay here that we could write?
-    account: str = ""             # the primary — the account a wake dispatches on first
+    editable: bool = False  # is there an Overlay here that we could write?
+    account: str = ""  # the primary — the account a wake dispatches on first
     fallbacks: tuple[str, ...] = ()
-    ceilings: dict[str, float] = field(default_factory=dict)
-    note: str = ""                # why it is not editable, when it is not
+    note: str = ""  # why it is not editable, when it is not
 
     @property
     def order(self) -> tuple[str, ...]:
@@ -83,19 +82,11 @@ def read_worker_accounts(root: str | Path, instance: str) -> WorkerAccounts:
     fallbacks = worker.get("fallback_accounts")
     if not isinstance(fallbacks, list):
         fallbacks = []
-    ceilings = worker.get("usage_ceilings")
-    if not isinstance(ceilings, dict):
-        ceilings = {}
     return WorkerAccounts(
         instance=instance,
         editable=os.access(path, os.W_OK),
         account=account,
         fallbacks=tuple(key for key in fallbacks if isinstance(key, str) and key),
-        ceilings={
-            str(key): float(value)
-            for key, value in ceilings.items()
-            if isinstance(value, int | float)
-        },
         note="" if os.access(path, os.W_OK) else "overlay.toml is not writable by the deck",
     )
 
@@ -124,7 +115,7 @@ def set_worker_accounts(
         raise SettingsError(f"overlay.toml could not be read: {exc}") from exc
 
     try:
-        raw = tomllib.loads(original)
+        tomllib.loads(original)
     except tomllib.TOMLDecodeError as exc:
         raise SettingsError(f"overlay.toml is not valid TOML: {exc}") from exc
 
@@ -138,19 +129,15 @@ def set_worker_accounts(
     lines = _set_key(lines, "worker", "account", _render_string(account))
     lines = _set_key(lines, "worker", "fallback_accounts", _render_list(rest))
 
-    # A per-account percentage may only name an account the order still offers — the engine's
-    # own offline inspection refuses the Overlay otherwise, which would roll this whole edit
-    # back — so an account leaving the order takes its entries with it. Both tables are pruned:
-    # leaving `usage_targets` (#1965) behind would refuse the switch the operator just asked
-    # for. Nothing else in the table is touched.
-    worker = raw.get("worker") if isinstance(raw.get("worker"), dict) else {}
+    # Nothing reads the old per-account tables any more (#4728), so they are taken out with
+    # this edit. Left behind, one naming an account that just left the order would make an
+    # engine from before #4728 (a rollback, a slot not yet promoted) refuse the Overlay.
+    # Nothing else in the table is touched.
     for key in ("usage_ceilings", "usage_targets"):
-        table = worker.get(key) if isinstance(worker, dict) else None
-        if not isinstance(table, dict):
-            continue
-        kept = {name: value for name, value in table.items() if name in order}
-        if kept != table:
-            lines = _set_key(lines, "worker", key, _render_ceilings(kept))
+        span = _table_span(lines, "worker")
+        found = _key_span(lines, span, key) if span is not None else None
+        if found is not None:
+            lines = [*lines[: found[0]], *lines[found[1] :]]
 
     stamp = (now or datetime.now(UTC)).strftime("%Y-%m-%d %H:%MZ")
     lines = _insert_before(lines, "worker", "account", f"{MARKER} on {stamp} by {by}.\n")
@@ -218,7 +205,7 @@ def _key_span(lines: Sequence[str], span: tuple[int, int], key: str) -> tuple[in
         head = lines[index].lstrip()
         if not head.startswith(key):
             continue
-        after = head[len(key):].lstrip()
+        after = head[len(key) :].lstrip()
         if not after.startswith("="):
             continue
         depth = 0
@@ -261,7 +248,7 @@ def _set_key(lines: list[str], table: str, key: str, rendered: str) -> list[str]
         return [*tail, "\n", f"[{table}]\n", line]
     found = _key_span(lines, span, key)
     if found is not None:
-        return [*lines[: found[0]], line, *lines[found[1]:]]
+        return [*lines[: found[0]], line, *lines[found[1] :]]
     at = _body_end(lines, span)
     return [*lines[:at], line, *lines[at:]]
 
@@ -273,7 +260,7 @@ def _insert_before(lines: list[str], table: str, key: str, line: str) -> list[st
     found = _key_span(lines, span, key)
     if found is None:
         return lines
-    return [*lines[: found[0]], line, *lines[found[0]:]]
+    return [*lines[: found[0]], line, *lines[found[0] :]]
 
 
 def _drop_marker(lines: list[str], table: str) -> list[str]:
@@ -306,13 +293,3 @@ def _render_string(value: str) -> str:
 
 def _render_list(values: Sequence[str]) -> str:
     return "[" + ", ".join(_render_string(value) for value in values) + "]"
-
-
-def _render_ceilings(ceilings: dict[str, float]) -> str:
-    if not ceilings:
-        return "{}"
-    parts = []
-    for key, value in ceilings.items():
-        number = int(value) if float(value).is_integer() else value
-        parts.append(f"{_render_string(str(key))} = {number}")
-    return "{ " + ", ".join(parts) + " }"

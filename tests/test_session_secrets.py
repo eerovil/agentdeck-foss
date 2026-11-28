@@ -19,6 +19,19 @@ def test_secret_command_rejects_process_control_environment_names(name):
         parse_secret_command(f"/secret {name} value-never-echoed")
 
 
+@pytest.mark.parametrize("lead", ["", "  ", "\n", "\ufeff", " \ufeff "])
+def test_secret_command_is_seen_wherever_the_page_sees_one(lead):
+    """The page's check is JavaScript's ``\\s``: whatever it counts as a secret, so does this."""
+    command = parse_secret_command(f"{lead}/secret\ufeff TOKEN  a b ")
+    assert command is not None
+    assert (command.name, command.value) == ("TOKEN", "a b ")
+    for malformed in ("/secret", "/secret TOKEN", "/secret 1BAD value"):
+        with pytest.raises(SecretCommandError):
+            parse_secret_command(lead + malformed)
+    for ordinary in ("/secrets A b", "about /secret A b", ""):
+        assert parse_secret_command(lead + ordinary) is None
+
+
 def test_store_is_retry_stable_single_use_and_expires_without_exposing_values():
     now = 100.0
     store = SessionSecretStore(ttl_s=10.0, clock=lambda: now)

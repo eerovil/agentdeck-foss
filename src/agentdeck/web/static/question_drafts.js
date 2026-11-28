@@ -32,19 +32,27 @@
     });
   }
 
+  // A secret is never kept (#4610), and one an older page saved is never put back.
+  function isSecret(value) { return /^\s*\/secret(?:\s|$)/.test(value); }
+
   function save(form) {
     var saved = {};
     fields(form).forEach(function (el) {
       if (el.type === 'radio' || el.type === 'checkbox') {
         if (!el.checked) return;
         (saved[el.name] = saved[el.name] || []).push(el.value);
-      } else if (el.value) saved[el.name] = el.value;
+      } else if (el.value && !isSecret(el.value)) saved[el.name] = el.value;
     });
     write(form, saved);
   }
 
   function restore(form) {
     var saved = read(form);
+    var names = Object.keys(saved);
+    names.filter(function (name) {
+      return typeof saved[name] === 'string' && isSecret(saved[name]);
+    }).forEach(function (name) { delete saved[name]; });
+    if (Object.keys(saved).length < names.length) write(form, saved);
     fields(form).forEach(function (el) {
       if (!(el.name in saved)) return;
       var value = saved[el.name];

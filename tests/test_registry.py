@@ -73,3 +73,54 @@ def test_session_deep_link_none_on_garbled_token(make_proc):
 
 def test_session_deep_link_none_when_proc_missing(make_proc):
     assert registry.session_deep_link(9999, proc_root=make_proc.root) is None
+
+
+def test_a_settled_file_is_read_once_until_it_moves(tmp_path, monkeypatch):
+    """#4639: the liveness sweep re-read every process file the CLI ever left behind."""
+    import itertools
+    import os
+    import time
+
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    stamps = itertools.count(1_700_000_000)
+    reads: list[str] = []
+    real = registry._read_entry
+    monkeypatch.setattr(registry, "_read_entry", lambda p: (reads.append(p.name), real(p))[1])
+    clock = [time.time()]
+    monkeypatch.setattr(registry.time, "time", lambda: clock[0])
+
+    def write(name, session_id):
+        text = json.dumps({"pid": 7, "sessionId": session_id})
+        (sessions / name).write_text(text)
+        # Each write its own second: the clock here jumps, the filesystem's does not.
+        stamp = next(stamps)
+        os.utime(sessions / name, (stamp, stamp))
+
+    def ids():
+        reads.clear()
+        return [entry.session_id for entry in registry.read_registry(tmp_path)]
+
+    write("2.json", "bb")
+    write("1.json", "aa")
+    (sessions / "bad.json").write_text("{")
+    # Just written: it may be written again within one clock tick, so it is not kept yet.
+    assert ids() == ["aa", "bb"] and ids() == ["aa", "bb"]
+    assert reads == ["1.json", "2.json", "bad.json"]
+
+    clock[0] += 60
+    ids()
+    assert ids() == ["aa", "bb"] and reads == []
+    # Rewritten in place, replaced by rename, deleted and recreated each read afresh.
+    write("1.json", "cc")
+    assert ids() == ["cc", "bb"] and "1.json" in reads
+    write("new.tmp", "dd")
+    os.replace(sessions / "new.tmp", sessions / "2.json")
+    assert ids() == ["cc", "dd"]
+    (sessions / "bad.json").write_text('{"pid": 8, "sessionId": "ff"}')
+    assert ids() == ["cc", "dd", "ff"]
+    (sessions / "bad.json").unlink()
+    (sessions / "1.json").unlink()
+    assert ids() == ["dd"]
+    write("1.json", "ee")
+    assert ids() == ["ee", "dd"]

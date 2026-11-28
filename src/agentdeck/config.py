@@ -19,7 +19,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from . import default_db, worker_limits
 from .github_webhook_log import KEEP_ROTATIONS, ROTATE_BYTES
 from .models import Account
-from .worker_cuts import WorkerCuts
+from .worker_cuts import RepositoryCut, WorkerCuts
 
 log = logging.getLogger(__name__)
 
@@ -197,6 +197,9 @@ class InjectConfig(BaseModel):
     # When set, always prefills the New-chat "working directory" field with this
     # path (overriding the remembered last-used cwd). Empty = remember last-used.
     new_chat_default_cwd: str = ""
+    # A Work chat waiting on the deck is sent one short ping before its one-hour prompt
+    # cache runs out, for up to four hours (#4737, ``keep_warm``). Set false to stop them.
+    keep_warm_pings: bool = True
 
     @field_validator("timeout_s", "delegation_timeout_s")
     @classmethod
@@ -296,16 +299,25 @@ DEFAULT_DISABLED_TOOLS = ["Workflow", "ScheduleWakeup", "ReportFindings", "Share
 DEFAULT_DISABLED_PLUGINS = ["productivity@synced", "engineering@synced"]
 
 
+def _names(values: list[str] | None) -> tuple[str, ...] | None:
+    """A configured list of names without blanks or repeats; an unset list stays unset."""
+    if values is None:
+        return None
+    return tuple(dict.fromkeys(name.strip() for name in values if name.strip()))
+
+
 class ClaudeWorkerRepository(BaseModel):
     """One repository's own worker settings (#4252): unset fields keep the host's lists.
 
     Keyed ``owner/repo`` under ``[claude_workers.repositories]``, so a repository whose
     chats need a tool or plugin the host cuts can turn it back on (an empty list cuts
-    nothing). A name ``mcp__<server>`` among the tools drops that whole connector.
+    nothing). A name ``mcp__<server>`` among the tools drops that connector's tools.
     """
 
     disabled_tools: list[str] | None = None
     disabled_plugins: list[str] | None = None
+    work_disabled_connectors: list[str] | None = None
+    work_disabled_skills: list[str] | None = None
 
 
 class ClaudeWorkersConfig(BaseModel):
@@ -359,6 +371,12 @@ class ClaudeWorkersConfig(BaseModel):
     # Taken out of each worker's tool list and plugins, through its settings file (#4252).
     disabled_tools: list[str] = list(DEFAULT_DISABLED_TOOLS)
     disabled_plugins: list[str] = list(DEFAULT_DISABLED_PLUGINS)
+    # Taken out of a Work's own chat only (#4727): connectors by the name the CLI shows
+    # ("claude.ai Figma", "sentry"), dropped with their instruction text, and skills by
+    # name. A chat a person starts keeps them all. Empty by default: which ones a host's
+    # repositories never use is for its owner to say.
+    work_disabled_connectors: list[str] = []
+    work_disabled_skills: list[str] = []
     # Keyed "owner/repo": [claude_workers.repositories."owner/repo"] (#4252).
     repositories: dict[str, ClaudeWorkerRepository] = {}
     # Keyed by account label: [claude_workers.accounts.<label>]
@@ -369,10 +387,14 @@ class ClaudeWorkersConfig(BaseModel):
         return WorkerCuts(
             tools=tuple(self.disabled_tools),
             plugins=tuple(self.disabled_plugins),
+            work_connectors=_names(self.work_disabled_connectors) or (),
+            work_skills=_names(self.work_disabled_skills) or (),
             repositories={
-                name.strip().casefold(): (
-                    None if repo.disabled_tools is None else tuple(repo.disabled_tools),
-                    None if repo.disabled_plugins is None else tuple(repo.disabled_plugins),
+                name.strip().casefold(): RepositoryCut(
+                    tools=_names(repo.disabled_tools),
+                    plugins=_names(repo.disabled_plugins),
+                    work_connectors=_names(repo.work_disabled_connectors),
+                    work_skills=_names(repo.work_disabled_skills),
                 )
                 for name, repo in self.repositories.items()
             },
@@ -775,10 +797,21 @@ class SpeechConfig(BaseModel):
     another for one wake word, such as ``{alexa = 0.9}`` where "Alexa" woke on speech
     that scored about 0.7 (#4343). ``wake_confirm`` names the wake words a detector
     wake counts for only once speech recognition hears the word in the clip too
-    (#4372): "Alexa" woke on kitchen noise at 0.94, where Whisper heard no words, and
-    every real wake came back as "Alexa." in about 0.55 s. "Hey Jarvis" is left out:
+    (#4372): "Alexa" woke on kitchen noise at 0.94, where Whisper heard no words.
+    Whisper is told to expect "Alexa", as it wrote quiet real calls as other words.
+    "Hey Jarvis" is left out:
     Whisper writes it "Hey Charvis" or "Hey Tarvis" in about a third of real wakes
-    (#4368), so the check would turn those away.
+    (#4368), so the check would turn those away. ``wake_sure`` is the detector score
+    at which such a word beeps at once, before speech recognition has answered
+    (#4614): that answer takes 0.6 s, and up to 7 s while the speech
+    service is busy. Listening still waits for it. It is empty by default, so a
+    confirmed word beeps only once its wake is accepted (the owner's ask, #4779): in
+    the wake log 26 of 76 early beeps at ``{alexa = 0.99}`` were for wakes speech
+    recognition then refused. At 0.99 "Alexa" beeps early on 90 of 97 kept real wakes
+    and on 27 of 139 refused ones; every detection would beep falsely about 15 times
+    a day. A word left out beeps only once confirmed.
+    The wake log's ``sure`` says it was told to the page, which at night or when
+    hushed does not beep; a score at or under the wake threshold beeps on every one.
 
     ``voice_en`` and ``voice_fi`` are the Piper voices the host reads replies with
     (#3455); ``scripts/speech_setup.sh`` downloads the ones named here, so a new
@@ -819,6 +852,9 @@ class SpeechConfig(BaseModel):
         Annotated[str, Field(pattern=r"^[a-z]+$")], Annotated[float, Field(gt=0, lt=1)]
     ] = Field(default_factory=dict)
     wake_confirm: list[Literal["jarvis", "alexa"]] = Field(default_factory=lambda: ["alexa"])
+    wake_sure: dict[Literal["jarvis", "alexa"], Annotated[float, Field(gt=0, lt=1)]] = Field(
+        default_factory=dict
+    )
     wake_log_dir: str = "~/.local/share/agentdeck/speech/wake"
     voice_en: str = Field(default="en_US-ryan-high", pattern=r"^[A-Za-z0-9_-]+$")
     voice_fi: str = Field(default="fi_FI-harri-medium", pattern=r"^[A-Za-z0-9_-]+$")

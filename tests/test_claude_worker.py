@@ -9,7 +9,9 @@ import subprocess
 import sys
 import tempfile
 import time
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import conftest
 import pytest
@@ -34,6 +36,7 @@ from agentdeck.providers.claude_code.worker import (
     LOGIN_REFRESH_RETRY_DELAY_S,
     NETWORK_RETRY_DELAY_S,
     ClaudeWorkerHost,
+    WorkerError,
     WorkerRecord,
 )
 from agentdeck.providers.delivery import ReceiptSweep
@@ -142,6 +145,218 @@ async def test_active_only_claude_followup_refuses_an_ended_turn_in_a_live_proce
 
     assert not result.accepted and result.reason == "worker_inactive"
     assert len(spawned) == 1
+    await host.stop()
+
+
+async def _ping(host, key="owner/repo#1", delivery_id="p", **over):
+    """The keep-warm route's call: fenced to the chat's session and last finished turn."""
+    rec = host._records.get(key)
+    fence = {
+        "expected_session_id": rec.session_id if rec else "sid-none",
+        "expected_last_result_at": rec.last_result_at if rec else 1.0,
+    }
+    return await host.deliver(
+        key,
+        "ping",
+        delivery_id=delivery_id,
+        keep_warm=True,
+        delegated=False,
+        **{**fence, **over},
+    )
+
+
+async def _rested(host, spawned, key, tmp_path, *, stopped=False):
+    """A chat that finished one turn, its process idle or stopped as an idle reclaim leaves
+    it, with its transcript on disk and its delivery grace over."""
+    await host.deliver(key, "first", cwd=str(tmp_path), delivery_id=f"{key}-1", delegated=False)
+    process = spawned[-1]["process"]
+    process.stdout.emit({"type": "result", "subtype": "success"})
+    await _settle()
+    rec = host._records[key]
+    rec.last_delivery_at -= IDLE_RECLAIM_GRACE_S + 1
+    transcript = tmp_path / "cfg" / "projects" / "p" / f"{rec.session_id}.jsonl"
+    transcript.parent.mkdir(parents=True, exist_ok=True)
+    transcript.write_text("")
+    if stopped:
+        await host._terminate(host._live.pop(key))
+    return process
+
+
+async def test_a_keep_warm_ping_joins_no_turn_and_is_fenced_to_the_chat_it_was_judged_on(
+    tmp_path, monkeypatch
+):
+    """#4737, #4752: the runtime itself refuses a ping that would interrupt, restart or
+    reach a chat that moved on since the web process looked."""
+    host, spawned = _host(tmp_path)
+    unknown = await _ping(host, delivery_id="p0")
+    assert not unknown.accepted and unknown.reason == "worker_changed"
+    assert spawned == []
+
+    await host.deliver(
+        "owner/repo#1", "first", cwd=str(tmp_path), delivery_id="one", delegated=False
+    )
+    process = spawned[0]["process"]
+    mid_turn = await _ping(host, delivery_id="p1", expected_last_result_at=1.0)
+    assert not mid_turn.accepted and mid_turn.reason == "worker_changed"
+    host._records["owner/repo#1"].last_result_at = 5.0  # a turn ended before; one runs now
+    mid_turn = await _ping(host, delivery_id="p1b")
+    assert not mid_turn.accepted and mid_turn.reason == "active_turn"
+
+    process.stdout.emit({"type": "result", "subtype": "success"})
+    await _settle()
+    # A ping cannot also ask for what only a new process or a new context gives, and one
+    # that names no session or no finished turn is no ping.
+    for n, over in enumerate(
+        [
+            {"fresh": True},
+            {"cwd": str(tmp_path)},
+            {"expected_session_id": None},
+            {"expected_last_result_at": None},
+            {"expected_last_result_at": 0.0},
+        ]
+    ):
+        invalid = await _ping(host, delivery_id=f"bad{n}", **over)
+        assert not invalid.accepted and invalid.reason == "keep_warm_invalid"
+    # The turn the sender saw end is not the newest one, or the chat is another session.
+    for n, over in enumerate(
+        [{"expected_last_result_at": 5.0}, {"expected_session_id": "sid-older"}]
+    ):
+        moved = await _ping(host, delivery_id=f"moved{n}", **over)
+        assert not moved.accepted and moved.reason == "worker_changed"
+
+    # The next real message starts this chat another way: no ping before that one.
+    rec = host._records["owner/repo#1"]
+    for field, value in [
+        ("guide_fingerprint", "an-older-guide"),
+        ("resume_at", "line-9"),
+        ("unread_messages", [{"id": "m"}]),
+        ("pending_context_operation", "compact"),
+    ]:
+        with monkeypatch.context() as patch:
+            patch.setattr(rec, field, value)
+            restart = await _ping(host, delivery_id=f"restart-{field}")
+        assert not restart.accepted and restart.reason == "worker_restart_due", field
+
+    assert len(process.stdin.lines) == 1
+    sent = await _ping(host, delivery_id="p4")
+    assert sent.accepted and sent.action == "queued"
+    assert process.stdin.lines[1]["message"]["content"][0]["text"] == "ping"
+    assert len(spawned) == 1
+    await host.stop()
+
+
+async def test_a_keep_warm_ping_resumes_a_stopped_chat_once_and_never_starts_a_new_one(
+    tmp_path, monkeypatch
+):
+    """#4752: an idle process is stopped within minutes on a full account, and the chat it
+    ran still reads its cache, so the ping starts it again."""
+    host, spawned = _host(tmp_path)
+    await _rested(host, spawned, "owner/repo#1", tmp_path, stopped=True)
+    rec = host._records["owner/repo#1"]
+    session_id = rec.session_id
+    transcript = tmp_path / "cfg" / "projects" / "p" / f"{session_id}.jsonl"
+
+    transcript.unlink()
+    gone = await _ping(host, delivery_id="gone")
+    assert not gone.accepted and gone.reason == "worker_not_resumable"
+    transcript.write_text("")
+    with monkeypatch.context() as patch:
+        patch.setattr(rec, "turn_open_at", 12.0)  # a restart cut its turn: owed a real wake
+        cut = await _ping(host, delivery_id="cut")
+    assert not cut.accepted and cut.reason == "worker_restart_due"
+    assert len(spawned) == 1
+
+    # A resume that dies while starting is not tried again and opens no turn.
+    with monkeypatch.context() as patch:
+        tries = []
+
+        async def dies(*args, **kwargs):
+            tries.append(args)
+            raise WorkerError("claude worker exited while starting")
+
+        patch.setattr(host, "_launch", dies)
+        failed = await _ping(host, delivery_id="dies")
+    assert not failed.accepted and failed.reason == "resume_failed"
+    assert len(tries) == 1 and rec.turn_open_at == 0.0 and rec.session_id == session_id
+    assert host._starting == set()
+
+    rec.command_artifacts = {"mode": "observe"}
+    resumed = await _ping(host, delivery_id="p1")
+    assert resumed.accepted and resumed.action == "revived"
+    assert rec.command_artifacts == {"mode": "observe"}  # a ping changes no policy
+    assert "--resume" in spawned[1]["args"] and session_id in spawned[1]["args"]
+    assert spawned[1]["process"].stdin.lines[0]["message"]["content"][0]["text"] == "ping"
+    await host.stop()
+
+
+async def test_a_keep_warm_resume_takes_a_free_place_or_a_quiet_idle_one_and_no_other(
+    tmp_path, monkeypatch
+):
+    """#4752: the ping never ends a stalled turn and never goes past the cap, though its
+    chat is a person's and an ordinary message to it would."""
+    host, spawned = _host(tmp_path, max_workers=1, stall_after_s=1.0)
+    await _rested(host, spawned, "pinged", tmp_path, stopped=True)
+    await host.deliver("other", "go", cwd=str(tmp_path), delivery_id="o1", delegated=False)
+    await _settle()
+    host._live["other"].last_event_at -= 60  # its turn is stalled: a message may end it
+    host._records["other"].last_delivery_at -= 5
+    busy = await _ping(host, "pinged", "busy")
+    assert not busy.accepted and busy.reason == "at_capacity"
+    assert host._live["other"].process.returncode is None
+
+    spawned[-1]["process"].stdout.emit({"type": "result", "subtype": "success"})
+    await _settle()
+    graced = await _ping(host, "pinged", "graced")  # handed a message a moment ago
+    assert not graced.accepted and graced.reason == "at_capacity"
+    host._records["other"].last_delivery_at -= IDLE_RECLAIM_GRACE_S + 1
+    with monkeypatch.context() as patch:
+        patch.setattr(host, "_background_shell_tasks", lambda rec, live: frozenset({"sh-1"}))
+        working = await _ping(host, "pinged", "working")  # a background command runs
+    assert not working.accepted and working.reason == "at_capacity"
+    with monkeypatch.context() as patch:
+        patch.setitem(host._voice_until, "other", time.time() + 60)
+        spoken = await _ping(host, "pinged", "spoken")  # a person is talking to it
+    assert not spoken.accepted and spoken.reason == "at_capacity"
+    assert "other" in host._live and host._starting == set()
+
+    resumed = await _ping(host, "pinged", "room")
+    assert resumed.accepted and resumed.action == "revived"
+    assert "other" not in host._live and "pinged" in host._live
+    await host.stop()
+
+
+async def test_two_chats_starting_at_once_cannot_both_take_the_last_place(tmp_path):
+    """#4752: a start holds its place from admission, not from the launch that follows it,
+    and gives it back when it lets go of its chat's lock."""
+    host, spawned = _host(tmp_path, max_workers=1)
+    launch, gate = host._launch, asyncio.Event()
+
+    async def slow(*args, **kwargs):
+        await gate.wait()
+        return await launch(*args, **kwargs)
+
+    host._launch = slow
+
+    def start(key):
+        return asyncio.create_task(
+            host.deliver(key, "go", cwd=str(tmp_path), delegated=False, automated=True)
+        )
+
+    first, second = start("a"), start("b")
+    await _settle()
+    assert host._starting == {"a"}
+    gate.set()
+    results = await asyncio.gather(first, second)
+    assert [r.accepted for r in results] == [True, False]
+    assert results[1].reason == "at_capacity" and len(spawned) == 1
+    assert host._starting == set()
+
+    # One start that asks twice holds one place: a restart for a new guide at the cap.
+    spawned[0]["process"].stdout.emit({"type": "result", "subtype": "success"})
+    await _settle()
+    host._records["a"].guide_fingerprint = "an-older-guide"
+    again = await host.deliver("a", "next", delegated=False, automated=True)
+    assert again.accepted and again.action == "revived" and len(spawned) == 2
     await host.stop()
 
 
@@ -2534,6 +2749,7 @@ async def test_a_chat_outside_auto_mode_gets_the_block_hooks_but_no_skip_list(tm
     assert settings["permissions"]["allow"] == []
     assert set(settings["hooks"]) == {"PermissionDenied", "PreToolUse"}
     assert settings["skillListingMaxDescChars"] == 200  # every chat loads the list (#4080)
+    assert settings["bashOutputMaxChars"] == 16_000  # about 4k tokens come back whole (#4725)
     await host.stop()
 
 
@@ -2589,10 +2805,108 @@ async def test_each_repository_gets_its_own_cut_of_tools_and_plugins(tmp_path):
     await host.stop()
 
 
+async def test_only_a_works_own_chat_starts_without_unused_connectors_and_skills(tmp_path):
+    """#4727: a repository's Work chats drop the connectors and skills it never uses; a
+    chat a person starts in the same checkout keeps them."""
+    from agentdeck.config import ClaudeWorkersConfig
+
+    cuts = ClaudeWorkersConfig.model_validate(
+        {
+            "work_disabled_connectors": ["claude.ai Figma", " sentry ", "sentry", ""],
+            "work_disabled_skills": ["unused-skill"],
+            "repositories": {
+                "Owner/Uses-Sentry": {"work_disabled_connectors": ["claude.ai Figma"]},
+                "owner/uses-all": {"work_disabled_connectors": [], "work_disabled_skills": []},
+            },
+        }
+    ).worker_cuts()
+    host, spawned = _host(tmp_path, worker_cuts=cuts)
+    for name in ("uses-sentry", "uses-all", "plain"):
+        path = tmp_path / name
+        path.mkdir()
+        subprocess.run(["git", "init", "-q", str(path)], check=True)
+        remote = f"https://github.com/owner/{name}.git"
+        subprocess.run(["git", "-C", str(path), "remote", "add", "origin", remote], check=True)
+    starts = (
+        ("uses-sentry", "work"),
+        ("uses-all", "work"),
+        ("plain", "work"),
+        ("plain", "primary"),
+    )
+    for index, (name, role) in enumerate(starts):
+        await host.deliver(
+            f"chat-{index}", "start", cwd=str(tmp_path / name), delegated=False, role=role
+        )
+    sentry, uses_all, work, person = (_settings(item["args"]) for item in spawned)
+    figma = {"serverName": "claude.ai Figma"}
+    assert sentry["deniedMcpServers"] == [figma]
+    assert sentry["skillOverrides"] == {"unused-skill": "off"}  # an unset list keeps the host's
+    assert work["deniedMcpServers"] == [figma, {"serverName": "sentry"}]
+    assert work["skillOverrides"] == {"unused-skill": "off"}
+    for settings in (uses_all, person):
+        assert "deniedMcpServers" not in settings and "skillOverrides" not in settings
+    # A checkout whose repository could not be read may be one that keeps them all.
+    assert cuts.for_repository(None, work=True).connectors == ()
+    assert cuts.for_repository(None, work=True).skills == ()
+    # The cut of tools and plugins still reaches every chat, and the skip list stays.
+    for settings in (work, person):
+        assert settings["permissions"]["deny"][0] == "Workflow"
+        assert "Bash(git status *)" in settings["permissions"]["allow"]
+    await host.stop()
+
+
+async def test_an_account_with_its_own_folder_loads_the_global_guide_once(tmp_path, monkeypatch):
+    """#4727: an account whose folder is not ``~/.claude`` loaded the same global guide
+    twice, once as its own and once as a guide of the home folder above every checkout."""
+    from agentdeck.worker_cuts import repeated_home_guides
+
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    host, spawned = _host(tmp_path)
+    own = tmp_path / "cfg" / "CLAUDE.md"
+    own.parent.mkdir(parents=True, exist_ok=True)
+    home_guide = home / ".claude" / "CLAUDE.md"
+
+    async def excluded(key: str) -> list[str] | None:
+        await host.deliver(key, "start", cwd=str(tmp_path), delegated=False)
+        return _settings(spawned[-1]["args"]).get("claudeMdExcludes")
+
+    assert await excluded("neither-file") is None
+    home_guide.write_text("Always answer in English.\n")
+    assert await excluded("no-own-guide") is None
+    own.write_text("Always answer in Finnish.\n")
+    assert await excluded("guides-differ") is None  # a home guide that says more still loads
+    own.write_text("Always answer in English.\n")
+    assert await excluded("a-copy") == [str(home_guide)]
+    # The account whose folder is ``~/.claude`` has one file under both names: never cut,
+    # or it would load no global guide at all. The same holds for a link to it.
+    assert repeated_home_guides(home / ".claude", home) == ()
+    own.unlink()
+    own.symlink_to(home_guide)
+    assert repeated_home_guides(own.parent, home) == ()
+    # A home folder reached through a symlink is named by both of its paths.
+    own.unlink()
+    own.write_text("Always answer in English.\n")
+    linked = tmp_path / "linked-home"
+    linked.symlink_to(home)
+    assert repeated_home_guides(own.parent, linked) == (
+        str(linked / ".claude" / "CLAUDE.md"),
+        str(home_guide),
+    )
+    # A guide that links to itself cuts nothing, and does not stop the chat starting.
+    own.unlink()
+    (own.parent / "loop").symlink_to(own)
+    own.symlink_to(own.parent / "loop")
+    assert repeated_home_guides(own.parent, home) == ()
+    await host.stop()
+
+
 def test_a_host_built_without_cuts_cuts_nothing(tmp_path):
     host, _ = _host(tmp_path)
     settings = json.loads(host._settings_file(True, Cut()).read_text())
     assert "deny" not in settings["permissions"] and "enabledPlugins" not in settings
+    assert not {"deniedMcpServers", "skillOverrides", "claudeMdExcludes"} & set(settings)
 
 
 async def test_the_classifier_fallback_gate_is_surfaced_not_denied(tmp_path):
@@ -2663,6 +2977,69 @@ async def test_a_safety_check_with_bypass_off_still_asks_the_boss(tmp_path, reas
     await _settle()
 
     assert host.snapshot()["workers"]["issue-1"]["pending_interaction"]["id"] == "s1"
+    assert not any(line.get("type") == "control_response" for line in proc.stdin.lines)
+    await host.stop()
+
+
+def _emit_hook_check(proc, request_id: str, **changes) -> None:
+    # The shape Claude Code 2.1.317's privacy check sends in bypass mode (#4612).
+    request = {
+        "subtype": "can_use_tool",
+        "tool_name": "Bash",
+        "display_name": "Bash",
+        "input": {"command": "echo someone@example.com"},
+        "description": "echo someone@example.com",
+        "decision_reason": "This call's input holds your account email address, which may "
+        "leave this machine. If nobody asked to send it, go on without it.",
+        "decision_reason_type": "hook",
+        "decision_reason_hook_event": "tool.check",
+        "decision_reason_hook_source": "plugin:cc-plugin-privacy",
+        "tool_use_id": "toolu_1",
+        "suppress_always_allow_rule": True,
+    }
+    proc.stdout.emit(
+        {"type": "control_request", "request_id": request_id, "request": {**request, **changes}}
+    )
+
+
+async def test_the_privacy_check_in_bypass_is_refused_with_its_reason(tmp_path):
+    host, spawned = _host(tmp_path, start_bypassed=True)
+    await host.deliver("issue-1", "start", cwd=str(tmp_path), delegated=False)
+    proc = spawned[0]["process"]
+
+    _emit_hook_check(proc, "s1")
+    await _settle()
+
+    assert host.snapshot()["workers"]["issue-1"]["pending_interaction"] is None
+    answer = proc.stdin.lines[-1]["response"]
+    assert answer["request_id"] == "s1"
+    assert answer["response"]["behavior"] == "deny"
+    assert "holds your account email address" in answer["response"]["message"]
+    assert "Rewrite the command" not in answer["response"]["message"]
+    assert "ask the person" in answer["response"]["message"]
+    await host.stop()
+
+
+@pytest.mark.parametrize(
+    ("bypassed", "changes"),
+    [
+        (False, {}),
+        (True, {"decision_reason_hook_source": "plugin:cc-plugin-other"}),
+        (True, {"decision_reason_hook_source": None}),
+        (True, {"decision_reason_hook_event": "PreToolUse"}),
+        (True, {"tool_name": "AskUserQuestion", "input": {"questions": [{"question": "Q?"}]}}),
+    ],
+)
+async def test_other_hook_gates_still_ask_the_boss(tmp_path, bypassed, changes):
+    host, spawned = _host(tmp_path, start_bypassed=bypassed)
+    await host.deliver("issue-1", "start", cwd=str(tmp_path), delegated=False)
+    proc = spawned[0]["process"]
+
+    _emit_hook_check(proc, "s1", **changes)
+    await _settle()
+
+    worker = host.snapshot()["workers"]["issue-1"]
+    assert worker["pending_interaction"]["id"].startswith("s1")
     assert not any(line.get("type") == "control_response" for line in proc.stdin.lines)
     await host.stop()
 
@@ -2853,6 +3230,59 @@ async def test_the_synthetic_weekly_limit_answer_opens_the_circuit(tmp_path):
     cleared = host.snapshot()["workers"]["issue-1"]
     assert cleared["last_result_limit"] == ""
     assert cleared["last_result_limit_reset_at"] == 0.0
+    # A cap on the chat's model, in the exact shape two Work chats stopped on (#4764): the
+    # window is named by the model, the reset by its date, and a sentence follows it.
+    account_health.clear(cache, "claude_code:test")
+    fable = (
+        "You've hit your Fable limit · resets Dec 2, 10am (Europe/Helsinki). Switch to another "
+        "model, or manage usage credits at "
+        "https://claude.ai/settings/usage?from=cc_cli_limit_message, to continue."
+    )
+    spawned[0]["process"].stdout.emit(
+        {"type": "result", "subtype": "success", "is_error": True, "result": fable}
+    )
+    await _settle()
+    row = host.snapshot()["workers"]["issue-1"]
+    assert row["last_result_limit"] == fable
+    reset = datetime.fromtimestamp(row["last_result_limit_reset_at"], ZoneInfo("Europe/Helsinki"))
+    assert (reset.month, reset.day, reset.hour) == (12, 2, 10)
+    # One model's cap leaves the account's other models running: no account circuit.
+    assert account_health.open_circuit(cache, "claude_code:test") is None
+    # The same cap as an ordinary-looking answer, with a longer name, month and zone.
+    longer = (
+        "You've hit your Opus 4.5 limit · resets December 22, 10am "
+        "(America/Argentina/Buenos_Aires). Switch to another model, or manage usage credits at "
+        "https://claude.ai/settings/usage?from=cc_cli_limit_message, to continue."
+    )
+    spawned[0]["process"].stdout.emit({"type": "result", "subtype": "success", "result": longer})
+    await _settle()
+    row = host.snapshot()["workers"]["issue-1"]
+    assert row["last_result_limit"] == longer
+    assert row["last_result_limit_reset_at"] > 0
+    assert account_health.open_circuit(cache, "claude_code:test") is None
+    # An error result may carry the cap after a prefix; it is still one model's cap.
+    prefixed = "API Error: You've hit your Fable limit · resets Dec 2, 10am (Europe/Helsinki)"
+    spawned[0]["process"].stdout.emit(
+        {"type": "result", "subtype": "success", "is_error": True, "result": prefixed}
+    )
+    await _settle()
+    assert host.snapshot()["workers"]["issue-1"]["last_result_limit"] == prefixed
+    assert account_health.open_circuit(cache, "claude_code:test") is None
+    spawned[0]["process"].stdout.emit(
+        {"type": "result", "subtype": "success", "error": prefixed, "result": "done"}
+    )
+    await _settle()
+    assert account_health.open_circuit(cache, "claude_code:test") is None
+    # Throttling worded the same way is transient, not a spent window.
+    spawned[0]["process"].stdout.emit({
+        "type": "result",
+        "subtype": "success",
+        "is_error": True,
+        "result": "You've hit your rate limit · resets 11am (Europe/Helsinki)",
+    })
+    await _settle()
+    assert account_health.open_circuit(cache, "claude_code:test") is None
+    assert host.snapshot()["workers"]["issue-1"]["last_result_limit"] == ""
     await host.stop()
 
 
@@ -3997,7 +4427,8 @@ async def test_a_held_worker_finishes_its_turn_and_question_across_a_restart(
         "issue-1", "please ask", cwd=str(tmp_path), delegated=False, delivery_id="d-1"
     )
     assert result.accepted
-    assert first._holders["issue-1"].written() == {"d-1"}, "recorded before the CLI read it"
+    # The holder records the id on its own time after the socket write returns (#4775).
+    await _until(lambda: first._holders["issue-1"].written() == {"d-1"})
     await _until(lambda: first._live["issue-1"].pending_interaction)
     await first.stop()
 

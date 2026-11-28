@@ -43,6 +43,8 @@ retention_days = 30
 enabled = false             # write-capability kill-switch; opt in only on a trusted bind
 timeout_s = 900
 # max_message_chars = 16000  # optional cap on a sent message; unset means no limit
+# keep_warm_pings = true     # ping a Work chat that waits on the deck before its one-hour
+#                            # prompt cache runs out, for up to four hours (#4737)
 
 # Deterministic attention tracking. Sessions report waiting/finished through the
 # local API; unreported completed turns safely fall back to finished.

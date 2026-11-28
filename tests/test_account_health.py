@@ -111,6 +111,25 @@ def test_exact_provider_quota_line_supplies_its_next_named_zone_reset():
 
     assert reset == datetime(2026, 10, 12, 17, 50, tzinfo=UTC)
     assert account_health.stated_reset_at("resets tomorrow at noon", now=now) is None
+    # A window further off names its date, and the CLI adds a sentence after it (#4764).
+    dated = (
+        "You've hit your Fable limit · resets Dec 2, 10am (Europe/Helsinki). Switch to another "
+        "model, or manage usage credits at https://claude.ai/settings/usage, to continue."
+    )
+    assert account_health.stated_reset_at(dated, now=now) == datetime(2026, 12, 2, 8, 0, tzinfo=UTC)
+    # No year is said, so a date already past this year is next year's.
+    assert account_health.stated_reset_at(
+        "resets Jan 3, 9:30am (Europe/Helsinki)", now=now
+    ) == datetime(2027, 1, 3, 7, 30, tzinfo=UTC)
+    assert account_health.stated_reset_at("resets Foo 3, 9am (Europe/Helsinki)", now=now) is None
+    assert account_health.stated_reset_at("resets Feb 30, 9am (Europe/Helsinki)", now=now) is None
+    assert account_health.stated_reset_at(
+        "resets Feb 29, 9am (Europe/Helsinki)", now=now
+    ) == datetime(2028, 2, 29, 7, 0, tzinfo=UTC)
+    assert account_health.stated_reset_at(
+        "resets Dec 2, 10am (Europe/Helsinki).", now=now
+    ) == datetime(2026, 12, 2, 8, 0, tzinfo=UTC)
+    assert account_health.stated_reset_at("resets 9am (Europe/Helsinki) or so", now=now) is None
 
 
 @pytest.mark.parametrize(

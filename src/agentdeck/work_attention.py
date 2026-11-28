@@ -31,6 +31,7 @@ from .work_story import (
     NOT_STARTED,
     WorkStatus,
     _needs_you,
+    close_offered,
     waiting_attention,
 )
 
@@ -182,6 +183,19 @@ def _review_url(card: WorkCard) -> str:
 
 
 def operator_attention(card: WorkCard, story: WorkStatus) -> OperatorAttention | None:
+    """Which decision the Work waits on, with Close issue where it is offered (#4631).
+
+    That is once its merges are done, or with none to make. It replaces Finish, which is
+    refused while the issue is open.
+    """
+    attention = _attention(card, story)
+    if attention is None or CLOSE in attention.actions or not close_offered(card):
+        return attention
+    kept = tuple(action for action in attention.actions if action not in {FINISH, HIDE})
+    return replace(attention, actions=(*kept, CLOSE, HIDE))
+
+
+def _attention(card: WorkCard, story: WorkStatus) -> OperatorAttention | None:
     """Which decision the Work waits on, or None when it needs nobody.
 
     ``story`` is ``work_status(card)``. Every Work ``work_story`` puts in Needs you gets

@@ -46,7 +46,7 @@ def pull_body(
                 "merged_at": merged_at,
                 "updated_at": updated_at,
                 "head": {"ref": "agent/branch", "sha": head_sha},
-                "base": {"ref": "master"},
+                "base": {"ref": "master", "sha": "b" * 40},
             },
             "repository": {
                 "full_name": AGENTDECK.slug,
@@ -145,6 +145,8 @@ def test_pull_request_writes_through_in_the_readers_shape(root, cache, service):
     # The head commit rides the same row (#2088): it is what says whether a finished
     # review is about the commit this pull request would merge.
     assert pull.head_sha == "a" * 40
+    # And its base commit, which a local checkout counts the size's code lines against (#4812).
+    assert lookup.value["baseRefOid"] == "b" * 40
     assert not stored_terminal(cache, PR_KEY)
 
 

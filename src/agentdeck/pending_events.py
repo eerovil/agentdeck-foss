@@ -12,7 +12,8 @@ before anything is written to the provider and keeps them under its action id: a
 that delivery, in this process or after a restart, carries the same notes (so the fence sees
 the same text and replays instead of sending twice), and no other delivery can take them. A
 clean refusal puts them back for the next message. A delivery whose outcome is unknown keeps
-them: at-most-once, as for the message itself.
+them: at-most-once, as for the message itself. A rolled-back message's notes are added
+again as new ones, since the agent has forgotten them (#4618).
 """
 
 from __future__ import annotations
@@ -22,30 +23,17 @@ from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
+from .note_text import NOTES_END as NOTES_END
+from .note_text import NOTES_HEADING as NOTES_HEADING
+from .note_text import split_notes as split_notes
+from .note_text import with_notes as with_notes
+from .note_text import without_notes as without_notes
 from .providers.delivery import delivery_participated
 
 log = logging.getLogger(__name__)
 
-#: The line that opens the notes in front of a message.
-NOTES_HEADING = (
-    "Deck notes that came while you were not woken (#4303), oldest first."
-    " They need nothing from you unless one says so:"
-)
-#: Between the notes and the message they ride on.
-NOTES_END = "--- The message itself follows. ---"
-
 #: How long a delivered note is kept for the record. A waiting one is kept until it goes.
 KEEP_DELIVERED = timedelta(days=7)
-
-
-def with_notes(notes: Sequence[str], message: str) -> str:
-    """``message`` with ``notes`` in front of it, or ``message`` alone when there are none."""
-    if not notes:
-        return message
-    lines = [NOTES_HEADING, ""]
-    for number, note in enumerate(notes, start=1):
-        lines.append(f"{number}. {note.strip()}")
-    return "\n".join([*lines, "", NOTES_END, "", message])
 
 
 def carries_notes(message: str) -> bool:

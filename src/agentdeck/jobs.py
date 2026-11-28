@@ -463,6 +463,18 @@ HIDDEN_FAILURES_NOTE = (
     "The command exited 0, but its output reports failed or erroring tests, so it counts as "
     "failed. A pipe (`pytest … | tail`) hides pytest's own exit code; run pytest unpiped."
 )
+# pytest's exit code when it ran no test at all.
+PYTEST_NO_TESTS_EXIT = 5
+# What a verification that had nothing left to run once its quarantined tests were left out
+# says instead of a list of failing tests it does not have (#4776).
+NOTHING_LEFT_LINES = (
+    "Every test this verification selected is quarantined until its fix issue closes "
+    "(#3055), so nothing was left to run. It proves nothing about this commit, and no test "
+    "failed.",
+    "To check a quarantined test itself, submit it as a plain job, without `--verification`: "
+    "only a verification leaves quarantined tests out. Prove the commit with the full "
+    "verification selection.",
+)
 # A missing worker can be transient during recovery, but retrying a permanently
 # removed account every dispatch tick would spend a day producing log noise.
 NOTIFY_RETRY_S = 60.0
@@ -1107,6 +1119,10 @@ class JobQueue:
             # A Work the deck releases has no Run, so its Work alone is enough (#2895).
             raise JobError("a verification job must name the Run or the Work it verifies")
         lane = canonical_lane(lane)
+        if is_helpers_command(argv):
+            # The helper checks run on this host, where the Claude login is, and never move
+            # (#4662): no pod or remote machine has it.
+            lane, lane_defaulted = LOCAL, False
         if lane not in LANES:
             raise JobError(f"unknown lane {lane!r}; expected one of {', '.join(LANES)}")
         if lane in REMOTE_LANES and lane not in configured_lanes():
@@ -1336,6 +1352,23 @@ class JobQueue:
         that can spill goes to a pod, and the rest wait.
         """
         waiting = self.waiting()
+        # The helper checks start at once, before any lane is asked (#4662): they hold their
+        # own ``helpers`` host slot inside the command, not a heavy one, so neither a full
+        # lane nor test suites queued ahead may hold them back. ``/dev/null`` stands in for
+        # the slot; with no slot inode no heavy-slot count sees them.
+        for job in waiting:
+            if job.id in self._running or not is_helpers_command(job.command):
+                continue
+            try:
+                fd = os.open(os.devnull, os.O_RDONLY)
+            except OSError:  # pragma: no cover - /dev/null is always there
+                log.exception("jobs: could not start helper checks %s", job.id)
+                continue
+            self._running[job.id] = _Running(
+                task=asyncio.create_task(self._run(job, fd), name=f"job-{job.id}"),
+                slot_inode=None,
+            )
+        waiting = [job for job in waiting if not is_helpers_command(job.command)]
         full: set[str] = set()
         short = False
         skipped = self._skipped_lanes()
@@ -2975,6 +3008,14 @@ _SPILL_TARGETS = frozenset(
 )
 
 
+def is_helpers_command(command: Iterable[str]) -> bool:
+    """Whether a job runs ``agentdeck pre-review-helpers`` (#4662): an ``agentdeck`` program,
+    by any path to it, whose first argument is that subcommand. Nothing wrapped in another
+    program (a shell, ``timeout``) is taken: only this exact command skips the heavy slot."""
+    argv = [str(part) for part in command]
+    return len(argv) > 1 and Path(argv[0]).name == "agentdeck" and argv[1] == "pre-review-helpers"
+
+
 def _spill_lanes(job: Job, down: frozenset[str] | None = None) -> list[str]:
     """The lanes a queued job may start on while every slot of its own is taken, in order."""
     found = (_fallback(job, target, down) for target in _spill_order(job.lane))
@@ -3102,9 +3143,24 @@ def _child_env(job: Job) -> dict[str, str]:
     # Where a pytest run records when each test started and stopped, read back
     # by `agentdeck job tests` (#2297). Anything that is not this suite ignores it.
     env[TIMINGS_ENV] = str(timings_path_for_log(job.log_path))
-    # The queue started this job only with the folder usable (``_scratch_is_short``).
-    if scratch_root() and job.lane not in REMOTE_LANES:
+    # The queue started this job only with the folder usable (``_scratch_is_short``). The
+    # helper checks start without that gate and keep their temporary files in their own
+    # clones, so they keep the runtime's own TMPDIR (#4662).
+    helpers = is_helpers_command(getattr(job, "command", ()))
+    if scratch_root() and job.lane not in REMOTE_LANES and not helpers:
         env["TMPDIR"] = scratch_root()
+    if helpers:
+        # The helpers spend the submitting chat's own Claude account while it has room
+        # (``pre_review_helpers.own_claude_account``), not whichever has the most (#4662).
+        env.pop("AGENTDECK_ACCOUNT_KEY", None)
+        from .restart_nudge import session_key_parts
+
+        parts = session_key_parts(getattr(job, "session_key", None) or "")
+        if parts is not None and parts[0] == "claude_code":
+            env["AGENTDECK_ACCOUNT_KEY"] = f"{parts[0]}:{parts[1]}"
+        # They read the deck's usage over its API (``--url``), which a test suite must not.
+        if os.environ.get("AGENTDECK_URL"):
+            env["AGENTDECK_URL"] = os.environ["AGENTDECK_URL"]
     if job.quarantined:
         env[QUARANTINE_ENV] = json.dumps(list(job.quarantined))
         if job.lane in REMOTE_LANES:
@@ -3448,6 +3504,26 @@ def _failing_tests_lines(job: Job, tail: str) -> list[str]:
     return lines
 
 
+def _nothing_left_to_run(job: Job) -> bool:
+    """Whether pytest ran no test because the queue left every selected one out (#4776).
+
+    Still a failed job, because a verification that ran nothing must never count as green,
+    but not one with failing tests to name.
+    """
+    if not (
+        job.state == FAILED and job.exit_code == PYTEST_NO_TESTS_EXIT and job.quarantined
+    ):
+        return False
+    # ``job.quarantined`` is every quarantined test of the repository, not what this command
+    # chose: only a command whose node ids are all quarantined is known to have had them left
+    # out. Only node ids are read: telling a file argument from an option's value (``-c
+    # tests/pytest.ini``) needs pytest's own option table, and a file argument that collected
+    # nothing beside a quarantined id is rare enough to share this notice.
+    tests = [str(part) for part in job.command[1:] if "::" in str(part)]
+    left_out = set(job.quarantined)
+    return bool(tests) and all(test in left_out for test in tests)
+
+
 def job_message(job: Job, *, followed_up: bool = False) -> str:
     """What the submitting chat is told when its job ends.
 
@@ -3462,6 +3538,9 @@ def job_message(job: Job, *, followed_up: bool = False) -> str:
     }.get(job.state, job.state)
     if job.state == FAILED and HIDDEN_FAILURES_NOTE in (job.note or ""):
         outcome = "failed: its exit code 0 hid the test failures its output reports"
+    nothing_left = _nothing_left_to_run(job)
+    if nothing_left:
+        outcome = "ran no tests: every test it selected is quarantined"
     cut_off = job.state == INTERRUPTED and bool(job.started_at)
     if cut_off:
         outcome = f"was cut off by a runtime restart after {_cut_off_minutes(job)} min"
@@ -3486,7 +3565,10 @@ def job_message(job: Job, *, followed_up: bool = False) -> str:
     if job.state == INTERRUPTED:
         lines.append("")
         lines.append("Resubmit it with `agentdeck job submit` if you still need it.")
-    rerun = [] if followed_up or job.follows else _failing_tests_lines(job, tail)
+    if nothing_left:
+        rerun = list(NOTHING_LEFT_LINES)
+    else:
+        rerun = [] if followed_up or job.follows else _failing_tests_lines(job, tail)
     if rerun:
         lines.append("")
         lines.extend(rerun)

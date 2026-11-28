@@ -96,6 +96,7 @@
       return true;
     }
     if (el.querySelector('[aria-expanded="true"]')) return true;
+    if (el.classList.contains('fr-swiping')) return true; // under a finger's swipe (#4625)
     if (el.querySelector('[data-wm-dragging]')) return true; // a wayfinder map mid-drag (#3627)
     if (Array.prototype.some.call(el.querySelectorAll('input[type=radio], input[type=checkbox]'),
       function (box) { return box.checked !== box.defaultChecked; })) return true;
@@ -298,6 +299,18 @@
     }, 0);
   });
 
+  // A row let go of after a swipe (#4625): it is swapped at once for the one it is owed.
+  window.AgentDeckRows = {
+    settle: function (row) {
+      var owed = row._agentdeckOwed;
+      if (!owed || !row.isConnected || inUse(row)) return;
+      row._agentdeckOwed = null;
+      row.before(owed);
+      cleanup(row);
+      htmx.process(owed);
+    }
+  };
+
   if (window.htmx) defineExtension();
   else document.addEventListener('DOMContentLoaded', defineExtension);
 
@@ -426,6 +439,7 @@
     var all = parseInt(count.getAttribute('data-count-all'), 10);
     if (!isNaN(all)) count.setAttribute('data-count-all', String(Math.max(0, all + by)));
     head.hidden = value === 0;
+    if (window.AgentDeckFront) window.AgentDeckFront.showFinishAll();
   }
 
   // The keyed list a row sits in: the swap target, whose children are the rows.
@@ -472,9 +486,15 @@
   document.addEventListener('htmx:beforeRequest', function (e) {
     var form = e.detail && e.detail.elt;
     if (!form || !form.matches || !form.matches('form[data-work-action]')) return;
+    if (form.matches('[data-finish-all-form]')) {
+      Object.keys(finishAll(form)).forEach(holdFinishing);
+      return;
+    }
     var row = finishingRow(form);
-    if (!row || row.hidden) return;
-    var id = row.getAttribute('data-work-id');
+    if (row && !row.hidden) holdFinishing(row.getAttribute('data-work-id'));
+  });
+
+  function holdFinishing(id) {
     var hold = finishing[id] = {until: Date.now() + FINISHING_MS, lists: []};
     rowsOf(document, id).forEach(function (each) {
       if (hold.lists.indexOf(listOf(each)) === -1) hold.lists.push(listOf(each));
@@ -482,6 +502,50 @@
     });
     // The deadline holds with no push at all, as when the stream has gone quiet.
     window.setTimeout(function () { if (finishing[id] === hold) release(id); }, FINISHING_MS);
+  }
+
+  // Finish all (#4623): asks once, with the count, and names only the Works that are on the
+  // page as it is pressed. `_finishAll` is those, each row's Work to the one its Finish acts on.
+  function finishAll(form) { return form._finishAll || {}; }
+
+  document.addEventListener('htmx:confirm', function (e) {
+    var form = e.detail && e.detail.elt;
+    if (!form || !form.matches || !form.matches('[data-finish-all-form]')) return;
+    e.preventDefault();
+    if (form._finishAllBusy) return;
+    var rows = window.AgentDeckFront ? window.AgentDeckFront.finishable() : [];
+    if (!rows.length || !window.confirm(
+      rows.length === 1 ? 'Finish 1 Work?' : 'Finish ' + rows.length + ' Works?')) return;
+    form._finishAll = {};
+    rows.forEach(function (row) {
+      form._finishAll[row.getAttribute('data-work-id')] = row.getAttribute('data-finish-id');
+    });
+    form._finishAllBusy = true;
+    e.detail.issueRequest(true);
+  });
+
+  document.addEventListener('htmx:configRequest', function (e) {
+    var form = e.detail && e.detail.elt;
+    if (!form || !form.matches || !form.matches('[data-finish-all-form]')) return;
+    var named = finishAll(form);
+    e.detail.parameters.work = Object.keys(named).map(function (id) { return named[id]; });
+  });
+
+  document.addEventListener('htmx:afterRequest', function (e) {
+    var form = e.detail && e.detail.elt;
+    if (!form || !form.matches || !form.matches('[data-finish-all-form]')) return;
+    form._finishAllBusy = false;
+    var done = [];
+    if (e.detail.successful) {
+      var holder = document.createElement('template');
+      holder.innerHTML = e.detail.xhr.responseText;
+      var note = holder.content.querySelector('[data-finished-works]');
+      try { done = note ? JSON.parse(note.getAttribute('data-finished-works')) : []; } catch (_) { done = []; }
+    }
+    var named = finishAll(form);
+    Object.keys(named).forEach(function (id) {
+      if (done.indexOf(named[id]) === -1 && finishing[id]) release(id);
+    });
   });
 
   // Shows every row of the Work held back again, back on its group's count.

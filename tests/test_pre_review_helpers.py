@@ -1,5 +1,5 @@
-"""``agentdeck pre-review-helpers``: three Haiku helpers and an Opus whole review before a first
-review (#4437, #4531)."""
+"""``agentdeck pre-review-helpers``: three Haiku helpers, and an Opus whole review while it is
+switched on, before a first review (#4437, #4531, #4533)."""
 
 from __future__ import annotations
 
@@ -38,7 +38,86 @@ def usage_log(tmp_path, monkeypatch) -> Path:
     """Every test's usage log is its own (#4510), never the host's."""
     path = tmp_path / "usage" / "usage.jsonl"
     monkeypatch.setenv("AGENTDECK_HELPER_USAGE_LOG", str(path))
+    # No test asks the host's own deck whether a review was asked for (#4726).
+    monkeypatch.setattr(helpers, "review_asked", lambda url, ref: False)
     return path
+
+
+REVIEW_ASKED = helpers.review_asked
+
+
+def test_no_helper_run_once_a_review_was_asked_for(monkeypatch, capsys, usage_log, tmp_path):
+    """#4726: the helpers run only before a pull request's first review. A later run prints
+    why and spends nothing; ``--again`` is a person's way past it."""
+    asked: list[tuple[str, str]] = []
+    monkeypatch.setattr(helpers, "review_asked", lambda url, ref: asked.append((url, ref)) or True)
+    monkeypatch.setattr(helpers, "check_network", lambda: None)
+    monkeypatch.setattr(helpers, "read_pull", lambda spec, cwd: pull())
+    ran: list[str] = []
+    monkeypatch.setattr(helpers, "_run_locked", lambda *a: ran.append("ran") or 0)
+    args = argparse.Namespace(cwd=str(tmp_path), pull="o/r#9", issue="", url="http://deck")
+    assert helpers.run_helpers(args) == 0
+    out = capsys.readouterr().out
+    assert out.strip() == helpers.REVIEWED.format(ref="o/r#9")
+    assert "Helper checks: o/r#9" not in out, "nothing to post as a receipt"
+    assert asked == [("http://deck", "o/r#9")] and not ran
+    lines = logged(usage_log)
+    assert {(line["exit"], line["why"]) for line in lines} == {
+        ("did_not_run", "a review was already asked for")
+    }
+    assert helpers.run_helpers(argparse.Namespace(**{**vars(args), "again": True})) == 0
+    assert ran == ["ran"] and len(asked) == 1, "--again does not ask"
+    # No review asked yet: the run goes on.
+    monkeypatch.setattr(helpers, "review_asked", lambda url, ref: False)
+    assert helpers.run_helpers(args) == 0
+    assert ran == ["ran", "ran"]
+    # #4739 review: a head checked before its review has a saved report. Once the review was
+    # asked for, a run on it says the same short line and does not print the report again.
+    monkeypatch.setattr(helpers, "ROOT", tmp_path / "heads")
+    checked = pull(head_oid="a" * 40)
+    monkeypatch.setattr(helpers, "read_pull", lambda spec, cwd: checked)
+    saved = helpers.head_files(checked)[1]
+    saved.parent.mkdir()
+    saved.write_text("THE SAVED REPORT\n")
+    capsys.readouterr()
+    assert helpers.run_helpers(args) == 0
+    assert "THE SAVED REPORT" in capsys.readouterr().out and ran == ["ran", "ran"]
+    monkeypatch.setattr(helpers, "review_asked", lambda url, ref: True)
+    assert helpers.run_helpers(args) == 0
+    assert capsys.readouterr().out.strip() == helpers.REVIEWED.format(ref="o/r#9")
+
+
+@pytest.mark.parametrize(
+    ("answer", "expected"),
+    [
+        ({"asked": True}, True),
+        ({"asked": False}, False),
+        ({"asked": "yes"}, False),
+        ({}, False),
+        ([], False),
+        (None, False),
+    ],
+)
+def test_review_asked_reads_the_deck_and_an_unread_answer_is_no(monkeypatch, answer, expected):
+    import httpx
+
+    seen: list[tuple[str, dict]] = []
+
+    def get(url, **kwargs):
+        seen.append((url, kwargs["params"]))
+        if answer is None:
+            raise httpx.ConnectError("down")
+        return httpx.Response(200, json=answer, request=httpx.Request("GET", url))
+
+    monkeypatch.setattr(httpx, "get", get)
+    assert REVIEW_ASKED("http://deck/", "o/r#9") is expected
+    assert seen == [("http://deck/api/review-asked", {"pull": "o/r#9"})]
+    monkeypatch.setattr(
+        httpx,
+        "get",
+        lambda url, **k: httpx.Response(500, request=httpx.Request("GET", url)),
+    )
+    assert REVIEW_ASKED("http://deck", "o/r#9") is False
 
 
 def logged(path: Path) -> list[dict]:
@@ -75,15 +154,16 @@ def pull(**fields) -> Pull:
 
 
 def test_each_helper_runs_isolated_and_bounded():
-    """The design review's isolation: its own 5-minute ``timeout``, no transcript, no user
+    """The design review's isolation: its own 10-minute ``timeout``, no transcript, no user
     settings or hooks, no MCP, sandboxed Bash with no network, no edits or web tools."""
     argv = helpers.helper_command(repo=Path("/var/tmp/x/repo"))
-    assert argv[:4] == ["timeout", "-k", "10", "300"]
+    assert argv[:4] == ["timeout", "-k", "10", "600"]
     assert argv[argv.index("--model") + 1] == "claude-haiku-5-5"
     assert {"--no-session-persistence", "--strict-mcp-config", "--disable-slash-commands"} <= set(
         argv
     )
     assert argv[argv.index("--setting-sources") + 1] == ""
+    assert argv[argv.index("--output-format") + 1] == "stream-json" and "--verbose" in argv
     sandbox = json.loads(argv[argv.index("--settings") + 1])["sandbox"]
     assert sandbox["enabled"] and sandbox["allowUnsandboxedCommands"] is False
     assert sandbox["network"]["allowedDomains"] == ["none.invalid"]
@@ -108,6 +188,14 @@ def test_each_helper_runs_isolated_and_bounded():
     assert whole[4:] == [
         "claude-opus-5-5" if arg == "claude-haiku-5-5" else arg for arg in argv[4:]
     ], "otherwise the same isolation"
+    # #4720: a helper replies with its findings only, at the CLI's own effort (a lower one
+    # dropped known bugs on #4711's replay).
+    assert "--effort" not in argv
+    prompt = helpers.PROMPT.format(title="t", cwd="/c", pass_text=helpers.PASSES[1][1], issue="i")
+    assert "Your reply is only the findings" in " ".join(prompt.split())
+    assert "write nothing about the items that are fine" in " ".join(prompt.split())
+    assert "Write the list out" not in prompt
+    assert prompt.count("## Findings") == 1, "what `findings_of` reads the reply by"
 
 
 def test_the_helper_env_drops_deck_and_github_variables(tmp_path, monkeypatch):
@@ -127,9 +215,12 @@ def test_the_helper_env_drops_deck_and_github_variables(tmp_path, monkeypatch):
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/own")
     env = helpers.helper_env(tmp_path / "bin", tmp_path / "acct")
     # #4437 review: an allowlist, so an unrelated secret never reaches the model's Bash.
-    assert set(env) - helpers._KEPT_ENV <= {"CLAUDE_CONFIG_DIR", "ENABLE_CLAUDEAI_MCP_SERVERS"} | {
-        k for k in env if k.startswith("LC_")
-    }
+    assert set(env) - helpers._KEPT_ENV <= {
+        "CLAUDE_CONFIG_DIR",
+        "ENABLE_CLAUDEAI_MCP_SERVERS",
+        "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS",
+    } | {k for k in env if k.startswith("LC_")}
+    assert env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"] == "1"  # #4656
     assert "OPENAI_API_KEY" not in env and "AWS_SECRET_ACCESS_KEY" not in env
     assert env["HOME"] == os.environ["HOME"]
     assert env["PATH"].startswith(f"{tmp_path / 'bin'}{os.pathsep}")
@@ -146,6 +237,14 @@ def test_the_helper_env_drops_deck_and_github_variables(tmp_path, monkeypatch):
         ("no reference", "", None),
         ("Refs #7", "a/b#5", ("a/b", 5)),
         ("Refs #7", "8", ("o/r", 8)),
+        # A bare number is the body's reference, in whichever repository it names (#4641).
+        ("Refs a/issues#7", "7", ("a/issues", 7)),
+        ("Refs #3\nRefs https://github.com/a/issues/issues/7", "7", ("a/issues", 7)),
+        ("Refs a/issues#7", "8", ("o/r", 8)),
+        ("Refs a/issues#7", "o/r#7", ("o/r", 7)),
+        ("no reference", "7", ("o/r", 7)),
+        ("Refs https://github.com/a/x/pull/7", "7", ("o/r", 7)),
+        ("Refs A/issues#7\nCloses a/issues#7", "7", ("a/issues", 7)),
     ],
 )
 def test_the_issue_is_given_or_the_bodys_reference(body, given, issue):
@@ -157,6 +256,8 @@ def test_a_bad_pull_or_issue_is_refused():
         helpers.read_pull("not-a-pull", ".")
     with pytest.raises(NotRun):
         helpers.issue_of(pull(), "o/r#x")
+    with pytest.raises(NotRun, match="ambiguous"):
+        helpers.issue_of(pull(body="Fixes #7\nRefs a/issues#7"), "7")
 
 
 USAGE = [
@@ -452,8 +553,8 @@ def test_a_closed_output_does_not_stop_the_run(tmp_path):
             "",
             'exit 1: {"type": "result", "result": "## Findings\\n1. half"}',
         ),
-        ("", 124, "", "timed out after 5 minutes"),
-        ("", 137, "", "timed out after 5 minutes"),
+        ("", 124, "", "timed out after 10 minutes"),
+        ("", 137, "", "timed out after 10 minutes"),
         (
             json.dumps({"type": "result", "result": "`## Findings` is last\n## Findings\n1. b"}),
             0,
@@ -471,6 +572,103 @@ def test_each_helpers_outcome(tmp_path, raw, code, found, failed):
     assert outcome.findings == found and outcome.failed == failed
     expected = "ok" if not failed else "timeout" if code in (124, 137) else "failed"
     assert outcome.exit == expected
+
+
+def _turn(text, **fields):
+    return {"type": "result", "subtype": "success", "is_error": False, "result": text, **fields}
+
+
+def _said(text):
+    content = [{"type": "thinking", "thinking": ""}, {"type": "text", "text": text}]
+    return {"type": "assistant", "message": {"content": content}, "parent_tool_use_id": None}
+
+
+def _block(*texts):
+    found = [{"kind": "bug", "text": text, "confidence": 60} for text in texts]
+    return f"```json\n{json.dumps({'findings': found}, ensure_ascii=False)}\n```"
+
+
+ONE = "1. [bug, confidence 60] one"
+LATER = "(Another message from this helper:)\nIt ended; they stand."
+
+
+@pytest.mark.parametrize(
+    ("part", "events", "found"),
+    [
+        # A background command's end starts one more turn after the findings.
+        (4, [_turn(_block("one")), _turn("It ended; they stand.")], f"{ONE}\n\n{LATER}"),
+        (
+            1,
+            [_turn("## Findings\n1. bad"), _turn("It ended; they stand.")],
+            f"1. bad\n\n{LATER}",
+        ),
+        # The findings again: once. A changed list: both.
+        (4, [_turn(_block("one")), _turn("Again:\n" + _block("one"))], ONE),
+        (
+            4,
+            [_turn(_block("one")), _turn(_block("two"))],
+            f"{ONE}\n\n(A later list from this helper:)\n1. [bug, confidence 60] two",
+        ),
+        # The changed list written mid-turn, after a turn that already had one.
+        (
+            4,
+            [_turn(_block("one")), _said(_block("two")), _turn("Done.")],
+            f"{ONE}\n\n(A later list from this helper:)\n1. [bug, confidence 60] two"
+            "\n\n(Another message from this helper:)\nDone.",
+        ),
+        # A later turn that failed, or said nothing, keeps the findings.
+        (
+            4,
+            [_turn(_block("one")), _turn("API Error", is_error=True)],
+            f"{ONE}\n\n(This helper's last turn failed: API Error)",
+        ),
+        (
+            1,
+            [_turn("## Findings\n1. bad"), _turn("")],
+            "1. bad\n\n(This helper's last turn failed: no reply)",
+        ),
+        # A finding that quotes the heading: in its line, in a fence, indented.
+        *(
+            (1, [_turn(f"notes\n## Findings\n{listed}")], listed.strip())
+            for listed in (
+                "1. bad:\n```\n## Findings\n1. quoted\n```\n2. worse",
+                "1. bad:\n\n    ## Findings\n    1. quoted\n2. worse",
+                "1. bad:\n~~~md\n## Findings\n",
+            )
+        ),
+        (1, [_turn('## Findings\n1. `"## Findings"` is cut')], '1. `"## Findings"` is cut'),
+        # Findings, a tool call, then one more message in the same turn.
+        (
+            4,
+            [_said("notes"), _said(_block("one")), _turn("It ended; they stand.")],
+            f"{ONE}\n\n{LATER}",
+        ),
+        # What was said on the way stays out when the reply has the findings.
+        (4, [_said(_block("draft")), _turn(_block("one"))], ONE),
+        # A line separator inside a text, which ``splitlines`` would cut at.
+        (4, [_turn(_block("one\u2028more"))], f"{ONE}\u2028more"),
+        # No findings in any reply: all of them, as they are.
+        (
+            4,
+            [_turn("a"), _turn("b")],
+            "(No readable findings block; the reply as it is:)\na\n\nb",
+        ),
+    ],
+)
+def test_findings_survive_a_later_message(tmp_path, part, events, found):
+    """#4656: each turn prints its own ``result``; the cost is the run's, the time the turn's."""
+    for event in events:
+        if event["type"] == "result":
+            event["duration_ms"] = 60000
+    events[-1]["total_cost_usd"] = 1.5
+    path = tmp_path / "out.json"
+    lines = [{"type": "system", "subtype": "init"}, *events, {"type": "system"}]
+    path.write_text("\n".join(json.dumps(line, ensure_ascii=False) for line in lines))
+    outcome = helpers.read_outcome(part, path, 0)
+    assert (outcome.findings, outcome.exit, outcome.cost_usd) == (found, "ok", 1.5)
+    if events[-1].get("is_error"):  # the same when the CLI exits with the error
+        assert helpers.read_outcome(part, path, 1) == outcome
+    assert outcome.minutes == sum(event["type"] == "result" for event in events)
 
 
 # The shape ``claude -p --output-format json`` printed on 2026-11-19 (#4510), trimmed.
@@ -497,6 +695,58 @@ REAL_RESULT = {
         }
     },
 }
+
+
+def _spent(message_id, model="claude-haiku-5-5", content=(), **usage):
+    """One model call's message as ``stream-json`` prints it, with its own usage."""
+    message = {"id": message_id, "model": model, "content": list(content), "usage": usage}
+    return {"type": "assistant", "message": message, "parent_tool_use_id": None}
+
+
+def test_a_helper_with_no_result_keeps_what_its_messages_spent(tmp_path):
+    """#4728: a helper that timed out printed no ``result``, so its line said it spent
+    nothing. Each message carries its own call's usage: one id counts once, at its largest
+    reading, and messages after the last ``result`` add to that result's whole-run usage."""
+    spent = {"input_tokens": 3, "cache_creation_input_tokens": 7000}
+    # #4754: one block per row, as the stream prints them; thinking shows nothing
+    read = {"type": "tool_use", "id": "toolu_1", "name": "Read", "input": {"file_path": "a.py"}}
+    thinking = {"type": "thinking", "thinking": "", "signature": "x" * 400}
+    first = _spent("msg_1", content=[thinking], **spent, output_tokens=1)
+    again = _spent("msg_1", content=[read], **spent, output_tokens=90)
+    text = {"type": "text", "text": "## Findings\nNo findings."}
+    second = _spent("msg_2", content=[text], cache_read_input_tokens=7000, output_tokens=20)
+    path = tmp_path / "1.json"
+    path.write_text("\n".join(map(json.dumps, [first, again, second])) + "\n{cut off")
+    timed_out = helpers.read_outcome(1, path, 124, wall_s=600.0)
+    assert timed_out.exit == "timeout" and timed_out.usage == {
+        "model": "claude-haiku-5-5",
+        "input_tokens": 3,
+        "output_tokens": 110,
+        "cache_read_tokens": 7000,
+        "cache_write_tokens": 7000,
+        "cost_usd": None,
+        "reply_chars": 24,
+        "tool_chars": len('{"file_path": "a.py"}'),
+        "tool_calls": 1,
+    }
+    # a block printed again under its message id counts once; other shapes count nothing
+    odd_blocks = _spent("msg_3", content=[text, "text", {"type": "text", "text": None}, read])
+    assert helpers.written_of([again, again, second, second, odd_blocks, {"type": "user"}]) == {
+        "reply_chars": 48,
+        "tool_chars": 2 * len('{"file_path": "a.py"}'),
+        "tool_calls": 2,
+    }
+    assert helpers.written_of([_said("ab"), _said("ab")])["reply_chars"] == 4  # no id: each row
+    # A later turn cut short: the finished turn's result covers the run so far, and only the
+    # messages after it are added. Messages before a result are inside it already.
+    path.write_text("\n".join(map(json.dumps, [first, REAL_RESULT, second])))
+    later = helpers.read_outcome(1, path, 137).usage
+    assert (later["cache_read_tokens"], later["output_tokens"]) == (11382 + 7000, 57 + 20)
+    assert later["cache_write_tokens"] == 6665 and later["cost_usd"] == 0.00147552
+    # A finished run is its result alone, and a message with no usage or a bad one adds nothing.
+    odd = [_said("text"), {"type": "assistant", "message": {"usage": {"input_tokens": "9"}}}]
+    assert helpers.usage_so_far([first, REAL_RESULT]) == helpers.usage_of(REAL_RESULT)
+    assert helpers.usage_so_far(odd, "m") == helpers.usage_of(None, "m")
 
 
 def test_a_helpers_usage_is_read_whatever_its_exit(tmp_path):
@@ -528,6 +778,7 @@ def test_a_helpers_usage_is_read_whatever_its_exit(tmp_path):
     path = tmp_path / "1.json"
     path.write_text(json.dumps({**REAL_RESULT, "is_error": True}))
     failed = helpers.read_outcome(1, path, 1, wall_s=3.0)
+    spent |= {"reply_chars": 0, "tool_chars": 0, "tool_calls": 0}  # a result alone shows none
     assert failed.exit == "failed" and failed.usage == spent and failed.wall_s == 3.0
 
 
@@ -559,9 +810,19 @@ printf '{"type":"result","result":"## Findings\\\\n1. a.py:1 from %s","duration_
 """
 
 
+def test_the_whole_review_is_switched_off(monkeypatch):
+    """#4533: the owner dropped it; a run's helpers follow the switch."""
+    assert helpers.active_parts() == (1, 2, 3)
+    monkeypatch.setattr(helpers, "WHOLE_REVIEW", True)
+    assert helpers.active_parts() == (1, 2, 3, 4)
+
+
+@pytest.mark.parametrize("whole_on", [True, False])
 def test_a_whole_run_prints_the_findings_and_leaves_nothing(
-    repos, tmp_path, monkeypatch, capsys, usage_log
+    repos, tmp_path, monkeypatch, capsys, usage_log, whole_on
 ):
+    count = 4 if whole_on else 3
+    monkeypatch.setattr(helpers, "WHOLE_REVIEW", whole_on)
     _origin, checkout, b1, _b2, head = repos
     root = tmp_path / "runs"
     claude = tmp_path / "fake-claude"
@@ -575,9 +836,12 @@ def test_a_whole_run_prints_the_findings_and_leaves_nothing(
     issue = {"title": "T", "body": "THE ISSUE BODY", "comments": [{"body": "A LATE COMMENT"}]}
     monkeypatch.setattr(helpers, "read_issue", lambda *a: issue)
     monkeypatch.setattr(helpers, "review_chat_settings", lambda: ("~/chat", "o/chat"))
-    monkeypatch.setattr(
-        helpers, "reviewer_rules", lambda *a: ({"reviewer-SKILL.md": "THE RULES"}, ["lacks x"])
-    )
+
+    def rules(*a):
+        assert whole_on, "no rules are read for a helper that is off"
+        return {"reviewer-SKILL.md": "THE RULES"}, ["lacks x"]
+
+    monkeypatch.setattr(helpers, "reviewer_rules", rules)
     monkeypatch.setattr(helpers, "check_network", lambda: None)
     monkeypatch.setattr(helpers, "check_sandbox", lambda: None)
     monkeypatch.setattr(helpers, "account_roots", lambda: {"claude_code:main": tmp_path / "acct"})
@@ -594,12 +858,13 @@ def test_a_whole_run_prints_the_findings_and_leaves_nothing(
             (left / name / "m").mkdir(parents=True)
         assert sorted(run.transcripts) == sorted(left / name for name in os.listdir(left))
         # #4437 review: one clone each, so no helper changes what another reads.
-        assert len({str(repo) for repo in repos.values()}) == 4
+        assert len({str(repo) for repo in repos.values()}) == count
         # #4531: the whole review's inputs sit in its own clone, where its sandbox reads them.
-        inputs = repos[helpers.WHOLE] / ".git" / "helper-review"
-        assert (inputs / "rules" / "reviewer-SKILL.md").read_text() == "THE RULES"
-        assert "A LATE COMMENT" in (inputs / "context.md").read_text()
-        assert "+change" in (inputs / "diff.patch").read_text()
+        if whole_on:
+            inputs = repos[helpers.WHOLE] / ".git" / "helper-review"
+            assert (inputs / "rules" / "reviewer-SKILL.md").read_text() == "THE RULES"
+            assert "A LATE COMMENT" in (inputs / "context.md").read_text()
+            assert "+change" in (inputs / "diff.patch").read_text()
         return real_start(run, repos, *rest)
 
     monkeypatch.setattr(helpers, "start_helpers", start)
@@ -622,14 +887,17 @@ def test_a_whole_run_prints_the_findings_and_leaves_nothing(
     text = capsys.readouterr().out
     assert later[:12] not in text
     assert f"at {head[:12]} (base {b1[:12]}), on claude_code:main" in text
-    assert text.count("1. a.py:1 from ") == 4 and "/repo" in text
+    assert text.count("1. a.py:1 from ") == count and "/repo" in text
     # The fake's reply has no findings block: the whole review shows it as it is.
-    assert "(No readable findings block; the reply as it is:)" in text
-    assert "Warning: lacks x" in text
-    whole = [p for p in seen[:4] if "standing in for AgentDeck's pull-request reviewer" in p]
-    assert len(whole) == 1 and "rules/reviewer-SKILL.md" in whole[0] and "lacks x" in whole[0]
-    prompts = [p for p in seen[:4] if p not in whole]
-    envs, gh = seen[4], seen[5]
+    assert ("(No readable findings block; the reply as it is:)" in text) is whole_on
+    assert ("Warning: lacks x" in text) is whole_on
+    assert ("Helper 4" in text) is whole_on
+    whole = [p for p in seen[:count] if "standing in for AgentDeck's pull-request reviewer" in p]
+    assert len(whole) == count - 3
+    if whole_on:
+        assert "rules/reviewer-SKILL.md" in whole[0] and "lacks x" in whole[0]
+    prompts = [p for p in seen[:count] if p not in whole]
+    envs, gh = seen[count], seen[count + 1]
     assert all("THE ISSUE BODY" in p and "git diff base HEAD" in p for p in prompts)
     assert len({p.split("**")[1] for p in prompts}) == 3, "one list per helper"
     # #4482: the "Every way in" question rides with the rest of the repository, once.
@@ -644,14 +912,16 @@ def test_a_whole_run_prints_the_findings_and_leaves_nothing(
     assert list(left.iterdir()) == [], "and Claude's folder for it"
     # #4510: one usage line per helper, kept after the run's folder is gone.
     lines = logged(usage_log)
-    assert [line["helper"] for line in lines] == [1, 2, 3, 4]
-    assert lines[3]["name"] == "whole review"
+    assert [line["helper"] for line in lines] == [1, 2, 3, 4][:count]
+    if whole_on:
+        assert lines[3]["name"] == "whole review"
     for line in lines:
         assert line["pull"] == "o/r#9" and line["head"] == head
         assert line["account"] == "claude_code:main" and line["exit"] == "ok"
         assert (line["input_tokens"], line["output_tokens"]) == (10, 20)
         assert (line["cache_read_tokens"], line["cache_write_tokens"]) == (30, 40)
         assert line["cost_usd"] == 0.25 and line["model"] == "claude-haiku-5-5"
+        assert (line["reply_chars"], line["tool_chars"], line["tool_calls"]) == (0, 0, 0)
         assert line["wall_s"] >= 0 and line["name"] == helpers.NAMES[line["helper"]]
     # The slot is free again.
     from agentdeck.host_slots import helper_slot_paths, try_take_slot
@@ -664,7 +934,7 @@ def test_a_whole_run_prints_the_findings_and_leaves_nothing(
     assert helpers.run_helpers(args) == 0
     again = capsys.readouterr().out
     assert f"from {saved}, follows" in again and text.split("\n", 1)[1].strip() in again
-    assert len(logged(usage_log)) == 4
+    assert len(logged(usage_log)) == count
     # While a run on that head holds the lock, a second one refuses and names the report file.
     held, _ = helpers.take_head_lock(lock)
     try:
@@ -685,7 +955,7 @@ def test_a_whole_run_prints_the_findings_and_leaves_nothing(
     assert refused.returncode == 1, refused.stderr
     assert f"already running (pid {os.getpid()})" in refused.stdout
     assert str(saved) in refused.stdout and "Helper checks:" not in refused.stdout
-    assert len(logged(usage_log)) == 4, "a refused run logs nothing"
+    assert len(logged(usage_log)) == count, "a refused run logs nothing"
 
 
 REFUSED = """
@@ -741,7 +1011,12 @@ def test_an_unreadable_pull_request_still_names_it(repos, monkeypatch, capsys, u
     )
 
 
-def test_a_run_that_cannot_start_says_why_and_exits_0(tmp_path, monkeypatch, capsys, usage_log):
+@pytest.mark.parametrize("whole_on", [True, False])
+def test_a_run_that_cannot_start_says_why_and_exits_0(
+    tmp_path, monkeypatch, capsys, usage_log, whole_on
+):
+    count = 4 if whole_on else 3
+    monkeypatch.setattr(helpers, "WHOLE_REVIEW", whole_on)
     monkeypatch.setattr(helpers, "read_pull", lambda spec, cwd: pull(head_oid="h" * 40))
     monkeypatch.setattr(helpers, "issue_text", lambda *a: "")
 
@@ -761,7 +1036,7 @@ def test_a_run_that_cannot_start_says_why_and_exits_0(tmp_path, monkeypatch, cap
         (2, "did_not_run"),
         (3, "did_not_run"),
         (4, "did_not_run"),
-    ]
+    ][:count]
     assert lines[0]["why"] == "no network to the Claude API: unreachable"
     assert lines[0]["input_tokens"] == 0 and lines[0]["cost_usd"] is None
     assert lines[0]["model"] == "", "no model ran"
@@ -788,7 +1063,7 @@ def test_a_run_that_cannot_start_says_why_and_exits_0(tmp_path, monkeypatch, cap
         .startswith("Helper checks: o/r#9 did not run (the helpers cannot start: ")
     )
     lines = logged(usage_log)
-    assert len(lines) == 4 and {line["exit"] for line in lines} == {"did_not_run"}
+    assert len(lines) == count and {line["exit"] for line in lines} == {"did_not_run"}
     assert lines[0]["head"] == "h" * 40 and lines[0]["account"] == "claude_code:main"
     assert "no review-chat checkout" not in str(lines), "one line each, not two for helper 4"
     usage_log.unlink()
@@ -803,9 +1078,12 @@ def test_a_run_that_cannot_start_says_why_and_exits_0(tmp_path, monkeypatch, cap
     with pytest.raises(SystemExit):
         helpers.run_helpers(argparse.Namespace(**{**vars(args), "again": True}))
     capsys.readouterr()
-    lines = logged(usage_log)
-    assert [(line["helper"], line["exit"]) for line in lines] == [(4, "did_not_run")]
-    assert "no review-chat checkout" in lines[0]["why"]
+    if whole_on:
+        lines = logged(usage_log)
+        assert [(line["helper"], line["exit"]) for line in lines] == [(4, "did_not_run")]
+        assert "no review-chat checkout" in lines[0]["why"]
+    else:
+        assert not usage_log.exists(), "no helper started, none skipped"
     monkeypatch.setattr(helpers, "read_pull", lambda spec, cwd: pull(body="nothing"))
     assert helpers.run_helpers(args) == 0
     assert "names no issue" in capsys.readouterr().out
@@ -822,7 +1100,7 @@ def test_a_run_that_cannot_start_says_why_and_exits_0(tmp_path, monkeypatch, cap
     assert helpers.run_helpers(args) == 0
     assert "did not run (this head's lock" in capsys.readouterr().out
     lines = logged(usage_log)
-    assert len(lines) == 4 and {line["exit"] for line in lines} == {"did_not_run"}
+    assert len(lines) == count and {line["exit"] for line in lines} == {"did_not_run"}
 
 
 def test_a_run_cut_short_logs_what_its_helpers_spent(tmp_path, usage_log, monkeypatch):
@@ -834,6 +1112,12 @@ def test_a_run_cut_short_logs_what_its_helpers_spent(tmp_path, usage_log, monkey
     done = subprocess.Popen(["true"])
     done.wait()
     running = subprocess.Popen(["sleep", "30"])
+    # #4728: what the running one printed before the kill is its usage so far.
+    (run.directory / "out" / f"{helpers.WHOLE}.json").write_text(
+        json.dumps(
+            _spent("msg_1", "claude-opus-5-5", cache_read_input_tokens=900, output_tokens=40)
+        )
+    )
     run.processes = [done, running]
     # #4531: each process's own helper, the whole review here among them.
     run.parts = [1, helpers.WHOLE]
@@ -849,6 +1133,8 @@ def test_a_run_cut_short_logs_what_its_helpers_spent(tmp_path, usage_log, monkey
     assert [(line["helper"], line["exit"]) for line in lines] == [(1, "ok"), (4, "interrupted")]
     assert lines[1]["model"] == "claude-opus-5-5" and lines[1]["name"] == "whole review"
     assert lines[0]["cache_read_tokens"] == 11382 and lines[1]["input_tokens"] == 0
+    assert (lines[1]["cache_read_tokens"], lines[1]["output_tokens"]) == (900, 40)
+    assert lines[1]["cost_usd"] is None
     assert lines[0]["wall_s"] == 2.0 and lines[1]["wall_s"] >= 60
     # The default path is the deck's data folder, honouring XDG_DATA_HOME.
     monkeypatch.delenv("AGENTDECK_HELPER_USAGE_LOG")
@@ -943,3 +1229,11 @@ def test_a_long_issue_body_is_cut_before_its_use_cases(monkeypatch):
     text = helpers.issue_text("o/r", 7, ".")
     assert text.endswith("[… the rest of the walkthroughs is cut]")
     assert len(text) < helpers.MAX_ISSUE_CHARS + 200
+
+
+def test_no_helper_reads_diagrams():
+    """#4721: a Work keeps no diagram up, so a helper's find about one would bring the work
+    back; both helper prompts say so, over the review rules they load."""
+    for prompt in (helpers.PROMPT, helpers.WHOLE_PROMPT):
+        assert "Do not read or report on diagrams (`docs/diagrams/`)" in prompt
+        assert "is never a finding (#4721)" in " ".join(prompt.split())

@@ -23,7 +23,7 @@ import re
 import time
 import unicodedata
 from collections import OrderedDict
-from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Coroutine, Iterable, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass, field, fields, is_dataclass, replace
 from datetime import UTC, datetime, timedelta
@@ -35,6 +35,7 @@ import httpx
 from markupsafe import Markup
 
 from .. import (
+    keep_warm,
     live_prototype,
     review_history,
     review_refs,
@@ -149,6 +150,7 @@ from ..work_story import (
     WorkStatus,
     front_row,
     front_sections,
+    idle_deadline,
     message_target,
     opening_chat,
     waiting_attention,
@@ -630,7 +632,38 @@ def _cached_pulls(app: Any, urls: Sequence[str], *, strict: bool = False) -> dic
         if strict:
             raise
         return {}
-    return {wanted[ref]: record for ref, record in records.items() if ref in wanted}
+    return {
+        wanted[ref]: _code_lines_row(ref[0], record)
+        for ref, record in records.items()
+        if ref in wanted
+    }
+
+
+def _code_lines_row(repository: str, row: Any) -> Any:
+    """``row`` with each file's ``additions`` and ``deletions`` counted without whole-line
+    comments, when a local checkout counted its head (``code_lines``, #4812); else as it is.
+
+    A copy: the cached row itself keeps GitHub's numbers, which the webhook write-through
+    compares against. A file the count does not name keeps GitHub's numbers too."""
+    from .. import code_lines
+
+    files = row.get("files") if isinstance(row, dict) else None
+    head = row.get("headRefOid") if isinstance(row, dict) else None
+    base = row.get("baseRefOid") if isinstance(row, dict) else None
+    if not isinstance(files, list) or not all(isinstance(sha, str) and sha for sha in (head, base)):
+        return row
+    counted = code_lines.COUNTER.held(repository, base, head)
+    if counted is None:
+        return row
+    lines = counted.files
+
+    def recount(item: Any) -> Any:
+        path = item.get("path") if isinstance(item, dict) else None
+        if not isinstance(path, str) or path not in lines:
+            return item
+        return {**item, "additions": lines[path][0], "deletions": lines[path][1]}
+
+    return {**row, "files": [recount(item) for item in files]}
 
 
 @dataclass(frozen=True)
@@ -717,7 +750,9 @@ def gather_pass(app: Any, reads: _PassReads | None = None) -> _Pass:
         chat_titles=own_chat_titles(
             reads.chat_titles, projection, lambda key: state.chat_identity_key(key, chats)
         ),
-        chat_reviews=_chat_reviews(app, reads.review_events),
+        chat_reviews=_kept(
+            app, "work_chat_reviews", _chat_reviews(app, reads.review_events)
+        ),
         review_events=reads.review_events,
         review_chats=_review_chats(app),
         insight_states=assistant_insight_states(assistant) if assistant is not None else {},
@@ -1064,7 +1099,19 @@ def _deck_reviews_key(app: Any, snapshot: Any) -> tuple[tuple, tuple[int, int], 
         )
         return reviews, reviewed, retried
 
-    return _per_pass(("deck_reviews", id(snapshot)), read)
+    return _per_pass(
+        ("deck_reviews", id(snapshot)), lambda: _kept(app, "work_deck_reviews_key", read())
+    )
+
+
+def _kept(app: Any, name: str, value: Any) -> Any:
+    """``value``, or the equal object an earlier pass read, so each card's check ends at "the
+    same object": it holds every review chat, and was compared card by card (#4639)."""
+    before = getattr(app.state, name, None)
+    if before is not None and before == value:
+        return before
+    setattr(app.state, name, value)
+    return value
 
 
 def _derived_key(app: Any, snapshot: Any, ref: WorkRef) -> tuple:
@@ -1098,7 +1145,74 @@ def _derived_key(app: Any, snapshot: Any, ref: WorkRef) -> tuple:
     return (
         owner, waits, reviews, reviewed, awaiting, asked, retried, queued, handed, held, live,
         retrying, _handed_over(app, ref.work_id),
+        f"{ref.repository}#{ref.number}".lower() in _design_reviews(app, snapshot),
     )
+
+
+def _design_reviews(app: Any, snapshot: Any) -> dict[str, datetime]:
+    """The issues (``owner/repo#n``, lower case) whose design review is under way, each with
+    when it was asked (#4756), worked out once per pass.
+
+    Under way is a deck design reviewer still running (``agent_review.running``, on the
+    shared reviewer ledger), or the router's saved request for one: waiting for a reviewer
+    place (#4342) or asked of ChatGPT (#4722). A reviewer on an older design comment counts
+    too: it ends within ``agent_review.MAX_AGE_S``, and one that stops with no verdict tells
+    the Work (#4458). Unreadable files are no review.
+    """
+
+    def read() -> dict[str, datetime]:
+        from .. import agent_review, work_router
+
+        config = getattr(app.state, "config", None)
+        found: dict[str, datetime] = {}
+        ledger = getattr(getattr(config, "review", None), "ledger_path", None)
+        state = getattr(snapshot, "state", None)
+        # The pass's own presentation, built once (``gather_pass``): a fresh one walks every
+        # session, costly at thousands of them (#4756 review).
+        presentation = getattr(snapshot, "presentation", None)
+
+        def alive(token: str) -> bool | None:
+            finder = getattr(state, "session_key_for_token", None)
+            key = finder(token) if finder is not None else None
+            session = state.sessions.get(key) if key else None
+            if session is None:
+                return None
+            shown = presentation if presentation is not None else state.session_presentation()
+            return bool(shown.display(session).thinking)
+
+        try:
+            lines = json.loads(Path(ledger).read_text()) if ledger else []
+        except (OSError, ValueError, TypeError):
+            lines = []
+        now = time.time()
+        for line in lines if isinstance(lines, list) else ():
+            pull = str(line.get("pull") or "") if isinstance(line, dict) else ""
+            if not pull.startswith("design:"):
+                continue
+            try:
+                if not agent_review.running(line, now, alive):
+                    continue
+                started = datetime.fromtimestamp(float(line.get("started") or 0), UTC)
+            except (TypeError, ValueError, OSError):
+                continue
+            found[pull.removeprefix("design:")] = started
+        root = getattr(getattr(config, "github_webhook", None), "path", None)
+        try:
+            data = json.loads(work_router.pending_path(root).read_text()) if root else {}
+        except (OSError, ValueError, TypeError):
+            data = {}
+        entries = data.get("pending") if isinstance(data, dict) else None
+        for key, entry in (entries.items() if isinstance(entries, dict) else ()):
+            if not str(key).startswith(f"{work_router.DESIGN}:") or not isinstance(entry, dict):
+                continue
+            try:
+                since = datetime.fromtimestamp(float(entry.get("since") or 0), UTC)
+            except (TypeError, ValueError, OSError):
+                continue
+            found.setdefault(str(key).split(":", 1)[1].lower(), since)
+        return found
+
+    return _per_pass(("design_reviews", id(snapshot)), read)
 
 
 def own_rows(app, rows: list[FrontRow], theirs: set[str]) -> list[FrontRow]:
@@ -1200,6 +1314,7 @@ def derived_for(
     from ..work_router import owner_of_issue
 
     if not _switched(app, ref.repository):
+        (getattr(app.state, "work_ended_seen", None) or {}).pop(ref.work_id, None)
         return None
     state = snapshot.state
     projection = getattr(snapshot, "projection", None)
@@ -1388,6 +1503,13 @@ def derived_for(
         # Its tests began when this Work's open verification job was queued (#4562 helper
         # checks): a run started after a person's message is the work that message asked for.
         wait_starts.extend(_verification_starts(jobs, ref.work_id, verification))
+    designing = _design_reviews(app, snapshot).get(f"{ref.repository}#{ref.number}".lower())
+    if designing is not None:
+        # The design review the agent asked for (#4756): its verdict comes to the chat as a
+        # message, so a turn that ends on the request has its next step. #4752 was asked for
+        # one while its reviewer read the design.
+        waits.append(("its design review", None))
+        wait_starts.append(designing)
     waits.extend((job.label, None) for job in card.jobs)
     for job in card.jobs:
         begun = getattr(job, "queued", None) or job.since
@@ -1437,10 +1559,15 @@ def derived_for(
             chat_href = str(chat_path(session.key) or "")
         except Exception:  # noqa: BLE001 -- the line stands without a link
             chat_href = ""
+    pressed_at = None if pr_waits else _deck_merges(app, ref.work_id, card.outputs)
+    if pressed_at is not None:
+        # The deck's own wait for the merge a person pressed (#4753), bounded like the
+        # agent's: quiet for ``PR_STALE`` since the press, it reads as stuck.
+        pr_waits.append(("its pull request", None))
     pr_hold = _pr_hold(app, ref.work_id, answers) if pr_waits else _PrHold()
     moved = [
         _aware(at)
-        for at in (ended_at, pr_hold.since, pr_hold.findings_at, pr_hold.passed_at)
+        for at in (ended_at, pr_hold.since, pr_hold.findings_at, pr_hold.passed_at, pressed_at)
         if at is not None
     ]
     # The chat marked itself waiting for a person and ended its turn (#3106): the Mac runner's
@@ -1585,7 +1712,74 @@ def derived_for(
         spec_posted_at=spec[0] if spec is not None else None,
         spec_url=spec[1] if spec is not None else "",
     )
-    return derived_status(inputs, now=datetime.now(UTC))
+    now = datetime.now(UTC)
+    return _settle_ending(app, ref.work_id, derived_status(inputs, now=now), now)
+
+
+def _settle_ending(app: Any, work_id: str, status: Any, now: datetime) -> Any:
+    """Give an ended Work its time to settle from when it was first seen ended (#4753).
+
+    The deck asks ``ENDING_SETTLE`` after a turn ends with no next step. Counted from the
+    turn's end, that time was long past for a Work that rested until now (Ready for merge
+    until its Merge was pressed, In review until its pass), so it was asked at once, seconds
+    before the deck's own next message: 47 of 77 such requests in a week followed a Merge
+    press. The status's deadline is that time, so the Work refresher wakes for it; kept in
+    this process's memory, so a restart only starts the time again.
+    """
+    from ..work_derived import ENDED, ENDING_SETTLE
+
+    seen = getattr(app.state, "work_ended_seen", None)
+    if seen is None:
+        seen = app.state.work_ended_seen = {}
+    if status is None or status.kind != ENDED or status.at is None:
+        seen.pop(work_id, None)
+        return status
+    ended, since = seen.get(work_id, (None, None))
+    if ended != status.at or since is None:
+        since = max(status.at, now)
+        seen[work_id] = (status.at, since)
+    ask_at = since + ENDING_SETTLE
+    return replace(status, ask_at=ask_at, deadline=ask_at if now < ask_at else None)
+
+
+def _deck_merges(app: Any, work_id: str, outputs: Sequence[Any]) -> datetime | None:
+    """Since when the deck holds this Work's merge itself, else ``None`` (#4753).
+
+    Two cases, in both of which nothing is the agent's to do, so the Work rests as if its
+    agent had registered a merge wait. A person pressed Merge and the release is merging: from
+    the press. Or the release waits only on GitHub's checks at a reviewed and tested head,
+    pressed or not (a project that merges on its own never is): from the press, else from when
+    that hold began. Not when the release says the agent owes something (no test run started,
+    a press held for a CI fix, any other hold): those keep the deck's request for a next step.
+    Unreadable is no, and so is a press with no time (an old record) that nothing else dates.
+    """
+    from ..work_release import _held_for_fix
+
+    store = getattr(getattr(app.state, "work_release", None), "store", None)
+    if store is None or not any(not o.settled and not o.draft for o in outputs):
+        return None
+    try:
+        entry = store.get(work_id)
+    except Exception:  # noqa: BLE001 -- unreadable: no wait of the deck's is assumed
+        return None
+    if not isinstance(entry, Mapping) or entry.get("needs_verify") or _held_for_fix(dict(entry)):
+        return None
+    asked, hold = entry.get("asked"), entry.get("hold")
+    at = asked.get("at") if isinstance(asked, Mapping) else None
+    if entry.get("waiting_checks"):
+        if _epoch(at) is None and isinstance(hold, Mapping):
+            at = hold.get("since")
+    elif hold:
+        return None
+    at = _epoch(at)
+    return datetime.fromtimestamp(at, UTC) if at is not None else None
+
+
+def _epoch(value: object) -> float | None:
+    """``value`` as a time in seconds, else ``None``: a flag is not one."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
 
 
 def _posted_spec(
@@ -1605,9 +1799,14 @@ def _posted_spec(
 
     if not chat_id or any(output.is_open for output in card.outputs):
         return None
-    try:
+
+    def spec_only_label() -> str:
         policy = app.state.work_release.ports.policy(ref.repository)
-        label = str(getattr(policy, "spec_only_label", "") or "")
+        return str(getattr(policy, "spec_only_label", "") or "")
+
+    # Reading a policy stats every poller manifest (#4639). A failed read is not remembered.
+    try:
+        label = _per_pass(("spec_only_label", ref.repository.lower()), spec_only_label)
     except Exception:  # noqa: BLE001 -- no policy read: no spec-only label known
         return None
     if not carries_label({"labels": list(card.labels)}, label):
@@ -1943,8 +2142,12 @@ def _shipped_of(state: Any, ref: Any, card: Any = None) -> tuple[str, ...]:
     earlier = SimpleNamespace(
         earlier=frozenset(round_key(output) for output in getattr(card, "earlier_outputs", ()))
     )
+    # One whose findings the owner left as shipped (#4797) has no fix to come.
     return tuple(
-        record.pull for record in records if not work_rounds.is_earlier(record.pull, earlier)
+        record.pull
+        for record in records
+        if not work_rounds.is_earlier(record.pull, earlier)
+        and record.fix != review_history.FIX_DECLINED
     )
 
 
@@ -1969,7 +2172,42 @@ def _held_for_agent(app: Any, repository: str, number: int) -> bool:
         return False
 
 
-def _pre_review_waits(app: Any, state: Any, work_id: str) -> str:
+def _design_waits(app: Any, work_id: str) -> bool:
+    """Whether the Work's design review was asked for and has not answered (#4781,
+    ``work_router.design_asked``), or waits on the owner at the series limit (#4800);
+    unreadable is no, so the checklist's words stand."""
+    from ..work_router import design_asked
+
+    config = getattr(app.state, "config", None)
+    issue = work_id.removeprefix("github_issue:")
+    try:
+        if config is None or "#" not in issue:
+            return False
+        return design_asked(
+            config.github_webhook.path, config.review.ledger_path, issue, time.time()
+        ) or _design_limited(app, work_id)
+    except Exception:  # noqa: BLE001 -- unreadable: the checklist's words, as before
+        logger.debug("design review of %s unread", work_id, exc_info=True)
+        return False
+
+
+def _design_limited(app: Any, work_id: str) -> bool:
+    """Whether the series limit stops the Work's design review until the owner answers
+    (#4800, ``work_router.design_limited``); unreadable is no."""
+    from ..work_router import design_limited
+
+    config = getattr(app.state, "config", None)
+    issue = work_id.removeprefix("github_issue:")
+    try:
+        return (
+            config is not None and "#" in issue and design_limited(config.review.ledger_path, issue)
+        )
+    except Exception:  # noqa: BLE001 -- unreadable: the other words stand
+        logger.debug("design series limit of %s unread", work_id, exc_info=True)
+        return False
+
+
+def _pre_review_waits(app: Any, state: Any, work_id: str, projection: Any = None) -> str:
     """The line naming the Work's pull requests whose review waits on the agent's pre-review
     checklist (#3880), which has no time limit; "" when none does."""
     from ..work_router import work_pulls
@@ -1982,7 +2220,9 @@ def _pre_review_waits(app: Any, state: Any, work_id: str) -> str:
         rounds = work_rounds.load(getattr(app.state, "control_db", None), [work_id])
         pulls = [
             pull
-            for pull in work_rounds.current(work_pulls(state, work_id), rounds.get(work_id))
+            for pull in work_rounds.current(
+                work_pulls(state, work_id, projection), rounds.get(work_id)
+            )
             if held(pull)
         ]
     except Exception:  # noqa: BLE001 -- unreadable: the page stands without the line
@@ -1990,6 +2230,11 @@ def _pre_review_waits(app: Any, state: Any, work_id: str) -> str:
         return ""
     if not pulls:
         return ""
+    if _design_waits(app, work_id):
+        return (
+            f"Pre-review: the review of {', '.join(pulls)} waits on the Work's design review;"
+            " the agent goes through its checklist once the design passes."
+        )
     return (
         f"Pre-review: waiting for the agent to go through its checklist on {', '.join(pulls)}."
         " The review starts once it has."
@@ -2321,7 +2566,8 @@ def _cached_card(
         and entry[0] == by_value
         and len(entry[1]) == len(by_identity)
         and all(a is b for a, b in zip(entry[1], by_identity, strict=True))
-        and entry[2] == shared
+        # The same object first: a mapping compares itself entry by entry (#4639).
+        and (entry[2] is shared or entry[2] == shared)
         and (entry[3] is None or now < entry[3])
     ):
         cache[key] = (*entry[:5], gate)
@@ -3904,8 +4150,10 @@ def ask_for_next_steps(
             continue
         if card.work_id in held:
             continue
-        if datetime.now(UTC) < derived.at + ENDING_SETTLE:
-            continue  # a person who stopped the turn may still be typing (#2965)
+        if datetime.now(UTC) < (getattr(derived, "ask_at", None) or derived.at + ENDING_SETTLE):
+            # A person who stopped the turn may still be typing (#2965), and the deck's own
+            # next message to a Work that rested until now may still be on its way (#4753).
+            continue
         ref = WorkRef.from_work_id(card.work_id)
         owner = owner_of_issue(state, ref.repository, ref.number) if ref is not None else None
         if owner is None:
@@ -3941,7 +4189,13 @@ def ask_for_next_steps(
 def _nudge_text(app: Any, card: WorkCard, ref: str) -> str:
     """The request a Work that ended without a next step is sent: the one ending that applies
     when the deck knows it (#2999, #4575), else the whole list."""
-    from ..work_endings import NUDGE_TEXT, PRE_REVIEW_NUDGE_TEXT, REVIEW_PASSED_NUDGE_TEXT
+    from ..work_endings import (
+        DESIGN_LIMIT_NUDGE_TEXT,
+        DESIGN_WAIT_NUDGE_TEXT,
+        NUDGE_TEXT,
+        PRE_REVIEW_NUDGE_TEXT,
+        REVIEW_PASSED_NUDGE_TEXT,
+    )
 
     held = [
         f"{output.repository}#{output.number}"
@@ -3950,7 +4204,14 @@ def _nudge_text(app: Any, card: WorkCard, ref: str) -> str:
     ]
     if held:
         bodies = " or ".join(f'`{{"pull_request": "{pull}"}}`' for pull in held)
-        return PRE_REVIEW_NUDGE_TEXT.format(ref=ref, pulls=", ".join(held), bodies=bodies)
+        text = (
+            DESIGN_LIMIT_NUDGE_TEXT
+            if _design_limited(app, card.work_id)
+            else DESIGN_WAIT_NUDGE_TEXT
+            if _design_waits(app, card.work_id)
+            else PRE_REVIEW_NUDGE_TEXT
+        )
+        return text.format(ref=ref, pulls=", ".join(held), bodies=bodies)
     if _waiting_on_tests(app, card.work_id):
         return REVIEW_PASSED_NUDGE_TEXT.format(ref=ref)
     return NUDGE_TEXT.format(ref=ref)
@@ -4540,6 +4801,9 @@ class WorkOverviewService:
         self._seen_end = 0.0
         # The next derived deadline (``_derived_deadlines``), kept with nobody watching.
         self._work_deadline: datetime | None = None
+        # When a waiting chat's keep-warm ping next falls due (#4737): a pass runs then,
+        # watched or not, and decides from a fresh build.
+        self._keep_warm_at: datetime | None = None
         # What the top bar's list showed at the last ``needs_you`` publication (#3239).
         self._needs_you = NeedsYouMenu().signature
         # The list's stops the phone was told about (#3348), read from the store once, and
@@ -4705,8 +4969,8 @@ class WorkOverviewService:
         """The last overview, building one first if none exists yet.
 
         A stale one is rebuilt behind the caller. ``wait`` is how long to wait for that
-        rebuild: the front page waits a moment, so a reload paints the current cards rather
-        than the old ones swapped for the new a second later (#3108). A rebuild slower than
+        rebuild: the front page waits a short moment (``FRESH_WAIT_S``), so a quick rebuild
+        is painted at once rather than swapped in (#3108, #4639). A rebuild slower than
         that is still answered with the old cards, and the page's own stream receives the
         new ones as a ``works`` push.
         """
@@ -4754,7 +5018,14 @@ class WorkOverviewService:
                 ):
                     self._stale_since = changed_since
                 raise
-            self._deadline = time_deadline(now, overview.cards, overview.other)
+            # A row going idle (#4633) redraws the page but moves no card, so only here.
+            self._deadline = min(
+                filter(None, (
+                    time_deadline(now, overview.cards, overview.other),
+                    idle_deadline(overview.front.rows, now),
+                )),
+                default=None,
+            )
             self._seen_end = seen_end
             # The derived states the deck acts on by itself (a quiet review, an unanswered
             # request) fall due with nobody watching too (#2960).
@@ -4776,6 +5047,13 @@ class WorkOverviewService:
         # message and publishes, neither of which is thread-safe.
         held = await reread_ended_issues(self._app, overview.cards, degraded=overview.degraded)
         ask_for_next_steps(self._app, overview.cards, degraded=overview.degraded, held=held)
+        try:
+            self._keep_warm_at = keep_warm.tend_waiting_chats(
+                self._app, overview.cards, degraded=overview.degraded, now=datetime.now(UTC)
+            )
+        except Exception:  # noqa: BLE001 -- a ping is never worth a failed pass
+            self._keep_warm_at = None
+            logger.exception("Keep-warm pings failed")
         if held:
             # A held Work owes a pass: the one its read publishes, or a retry of a failed one.
             self.refresh_soon(delay=ENDING_REREAD_RETRY_S)
@@ -4858,6 +5136,9 @@ class WorkOverviewService:
                     due_at = phone_at if due_at is None else min(due_at, phone_at)
                 if sweep_at is not None:
                     due_at = sweep_at if due_at is None else min(due_at, sweep_at)
+                warm_at = self._keep_warm_at
+                if warm_at is not None:
+                    due_at = warm_at if due_at is None else min(due_at, warm_at)
                 if due_at is not None:
                     timeout = max(0.0, (due_at - datetime.now(UTC)).total_seconds())
                 changed = await self._wait_for_change(sub, timeout)
@@ -4884,6 +5165,12 @@ class WorkOverviewService:
                     # Spent: the pass sets the next one, and a failed pass must not spin here.
                     self._work_deadline = None
                     self._stale = True
+                if warm_at is not None and datetime.now(UTC) >= warm_at:
+                    # A ping's window opened (#4737): spent the same way. A pass that ends
+                    # before it judges the pings (no scan yet, a failed build) is tried again.
+                    self._keep_warm_at = datetime.now(UTC) + keep_warm.LOOK_AGAIN
+                    self._stale = True
+                    owed = True
                 if (not self._watched() and not owed) or not self._due():
                     # A connect with nothing owed only re-plans the deadline above.
                     continue
@@ -5366,7 +5653,9 @@ class StepTimes:
         return " ".join(f"{name}={ms:.0f}ms" for name, ms in self.steps.items())
 
 
-async def _reread_settled_issue(app: Any, ref: WorkRef, facts: WorkFacts) -> bool:
+async def _reread_settled_issue(
+    app: Any, ref: WorkRef, facts: WorkFacts, *, publish: bool = True
+) -> bool:
     """Re-read a deck-run Work's open issue once its pull requests have all settled (#2947).
 
     The deck hears a close only from the ``issues`` ``closed`` delivery, and no Poller re-reads
@@ -5394,9 +5683,65 @@ async def _reread_settled_issue(app: Any, ref: WorkRef, facts: WorkFacts) -> boo
     except Exception:  # noqa: BLE001 -- the page draws from the cache as it is
         logger.warning("work %s issue re-read failed", ref.work_id, exc_info=True)
         return False
-    if read:
+    if read and publish:
         app.state.app_state.bus.publish(WORK_INPUTS_TOPIC)
     return bool(read)
+
+
+async def _reread_issue(
+    app: Any, ref: WorkRef, facts: WorkFacts, *, publish: bool = True
+) -> bool:
+    return await _reread_settled_issue(
+        app, ref, facts, publish=publish
+    ) or await _reread_tree_issue(app, ref, facts)
+
+
+def _held_issue(app: Any, ref: WorkRef) -> Any:
+    """The issue record the deck holds now; None when it cannot be read."""
+    try:
+        key = (ref.repository, ref.number)
+        return app.state.issues.cached_issues([key]).get(key)
+    except Exception:  # noqa: BLE001 -- unreadable: as no record
+        logger.debug("issue record of %s unreadable", ref.work_id, exc_info=True)
+        return None
+
+
+def _reread_issue_behind(app: Any, ref: WorkRef, facts: WorkFacts) -> None:
+    """``_reread_issue`` behind a drawn page, one run per Work at a time (#4639). A page waited
+    most of a second for GitHub; now its open pages redraw when the record moved. Only then:
+    redrawing after a read that failed, or answered the same, would read again, without end.
+    """
+
+    async def run() -> None:
+        await _reread_issue(app, ref, facts, publish=False)
+        held = await asyncio.to_thread(_held_issue, app, ref)
+        if held is not None and held != facts.record:
+            # Moves the page's key (``work_page_key``) whatever the overview makes of it.
+            wayfinder_map.bump_generation()
+            app.state.app_state.bus.publish(WORK_INPUTS_TOPIC)
+
+    _run_behind(app, "work_issue_rereads", ref, run)
+
+
+def _run_behind(
+    app: Any, name: str, ref: WorkRef, run: Callable[[], Coroutine[Any, Any, None]]
+) -> None:
+    """``run`` in the background, one per Work at a time; ``name`` is where ``app.state``
+    keeps the running ones."""
+    running: dict[str, asyncio.Task] | None = getattr(app.state, name, None)
+    if running is None:
+        running = {}
+        setattr(app.state, name, running)
+    task = running.get(ref.work_id)
+    if task is not None and not task.done():
+        return
+    task = running[ref.work_id] = asyncio.get_running_loop().create_task(run())
+
+    def forget(done: asyncio.Task) -> None:
+        if running.get(ref.work_id) is done:
+            del running[ref.work_id]
+
+    task.add_done_callback(forget)
 
 
 async def load_work_detail(
@@ -5405,8 +5750,14 @@ async def load_work_detail(
     *,
     workspace: WorkWorkspace | None | bool = True,
     times: StepTimes | None = None,
+    wait_for_issue: bool = True,
 ) -> WorkDetail | None:
     """One Work's page, or None when nothing on the deck names it.
+
+    ``wait_for_issue=False`` draws a page from the issue record and text the deck holds and
+    reads GitHub behind it (#4639): a text never read is drawn empty and swapped in. The
+    record of a Work with none yet is still waited for, and so is an action press, which
+    decides on what the record says.
 
     ``workspace=True`` inspects the workspace (bounded git reads, in a thread).
     """
@@ -5446,9 +5797,9 @@ async def load_work_detail(
     # The same facts the front page reads, so the Work page agrees with it (#2229).
     candidate = SimpleNamespace(ref=ref, work=work)
     facts = (await asyncio.to_thread(gather_facts, app, snapshot, [candidate]))[ref.work_id]
-    if await _reread_settled_issue(app, ref, facts) or await _reread_tree_issue(
-        app, ref, facts
-    ):
+    if facts.record and not wait_for_issue:
+        _reread_issue_behind(app, ref, facts)
+    elif await _reread_issue(app, ref, facts):
         facts = (await asyncio.to_thread(gather_facts, app, snapshot, [candidate]))[ref.work_id]
     lap("facts")
     card, chats = _card(
@@ -5476,7 +5827,14 @@ async def load_work_detail(
         return None
     # One set of reads, so the tree and the issue's text share one refresh behind the page.
     reads = _TreeReads(ref, getattr(app.state, "issues", None))
-    issue_text = page_text(await reads.read("issue_body", ref.repository, ref.number))
+    # A map's diagram is drawn from the body, so a map waits for one never read.
+    labels = facts.record.get("labels") if isinstance(facts.record, Mapping) else None
+    wait_for_text = wait_for_issue or wayfinder_map.is_map(
+        labels if isinstance(labels, list) else ()
+    )
+    issue_text = page_text(
+        await reads.read("issue_body", ref.repository, ref.number, wait=wait_for_text)
+    )
     tree = await _work_tree(app, ref, facts.record, reads=reads)
     if reads.stale:
         _refresh_tree(app, ref, reads)
@@ -5502,7 +5860,9 @@ async def load_work_detail(
             release, "approval_reason", ref.work_id, _shown_pulls(card)
         ),
         approval_waits=_release_read(release, "approval_waits", ref.work_id),
-        pre_review_waits=_pre_review_waits(app, snapshot.state, ref.work_id),
+        pre_review_waits=_pre_review_waits(
+            app, snapshot.state, ref.work_id, snapshot.projection
+        ),
         shippable=shippable,
         ship_findings=_ship_findings(snapshot, card, shippable),
         shipped=_shipped_of(snapshot.state, ref, card),
@@ -5627,7 +5987,8 @@ class _TreeReads:
     """A Work page tree's GitHub reads, drawn from what the cache holds (#3739).
 
     A held value is used even when out of date, so opening a page never waits on GitHub
-    for a map its webhooks keep current; only a read with nothing held waits. Each read is
+    for a map its webhooks keep current; only a read with nothing held waits, and not even
+    that with ``wait=False`` (#4639), which returns None and leaves it stale. Each read is
     kept, with whether it was out of date, so ``_refresh_tree`` can re-read them afterwards
     and tell the open pages to redraw only when GitHub's answer moved."""
 
@@ -5637,7 +5998,7 @@ class _TreeReads:
         self.drawn: dict[tuple, Any] = {}
         self.stale = False
 
-    async def read(self, name: str, *args: Any) -> Any:
+    async def read(self, name: str, *args: Any, wait: bool = True) -> Any:
         held = getattr(self.issues, f"held_{name}", None)
         try:
             value, fresh = held(*args) if held is not None else (None, False)
@@ -5646,7 +6007,7 @@ class _TreeReads:
                 "tree %s: held %s%s unreadable", self.ref.work_id, name, args, exc_info=True
             )
             value, fresh = None, False
-        if value is None:
+        if value is None and wait:
             method = getattr(self.issues, name, None)
             try:
                 value = await method(*args) if method is not None else None
@@ -5666,12 +6027,6 @@ def _refresh_tree(app: Any, ref: WorkRef, reads: _TreeReads) -> None:
     time, and redraw its open pages when GitHub's answer differs from what was drawn
     (#3739). The reads go through the shared cache's leases, so two pages or processes still
     fetch each row once."""
-    running: dict[str, asyncio.Task] | None = getattr(app.state, "work_tree_refreshes", None)
-    if running is None:
-        running = app.state.work_tree_refreshes = {}
-    task = running.get(ref.work_id)
-    if task is not None and not task.done():
-        return
 
     async def again(name: str, *args: Any) -> Any:
         method = getattr(reads.issues, name, None)
@@ -5691,12 +6046,7 @@ def _refresh_tree(app: Any, ref: WorkRef, reads: _TreeReads) -> None:
             wayfinder_map.bump_generation()
             app.state.app_state.bus.publish(WORKS_TOPIC)
 
-    def forget(done: asyncio.Task) -> None:
-        if running.get(ref.work_id) is done:
-            del running[ref.work_id]
-
-    running[ref.work_id] = asyncio.get_running_loop().create_task(run())
-    running[ref.work_id].add_done_callback(forget)
+    _run_behind(app, "work_tree_refreshes", ref, run)
 
 
 async def _wayfinder_diagram(

@@ -34,7 +34,7 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from . import agent_review, runtime_feed, session_copy, work_services
+from . import agent_review, runtime_feed, session_copy, work_published, work_services
 from .config import AppConfig
 from .db import open_db
 from .issue_context import IssueResolver
@@ -59,6 +59,23 @@ OTHER_TIMEOUT_S = 30.0
 # How long a load of a let-go Work's chats waits for the copy to hold them.
 LOAD_WAIT_S = 5.0
 RECONNECT_MIN_S = 0.5
+#: How long a call from the web waits for a whole chat copy before it is answered "restarting"
+#: (#4738). Under the web's ``services_link.CONNECT_WAIT_S``, and long enough for the first
+#: read after a start, which took under a second with the web up.
+COPY_WAIT_S = 8.0
+#: The held read of the chat copy while it is not whole: the web publishes nothing when its
+#: first scans end, so a long read would learn of it only at its keepalive (#4738).
+COPY_POLL_S = 1.0
+#: The calls the web sends without waiting for an answer (``services_link.Later``): a refusal
+#: reaches nobody and the call is dropped, so they run on the copy there is, as before #4738.
+UNWAITED = frozenset(
+    {
+        ("router", "note_filed"),
+        ("router", "note_registered"),
+        ("router", "note_published"),
+        ("release", "star"),
+    }
+)
 RECONNECT_MAX_S = 5.0
 
 
@@ -334,6 +351,10 @@ class SessionFollower:
         #: which refills the copy from a web that may not have scanned yet; ``copied`` is set
         #: once, for the first.
         self.complete = False
+        #: When this copy was last started over. A first scan that never ends must not refuse
+        #: every call for good: after ``START_SCAN_WAIT_SECONDS`` the copy there is counts,
+        #: as it does for ``scanned``.
+        self._began = time.monotonic()
         self._applied = asyncio.Event()
         self._task: asyncio.Task | None = None
 
@@ -364,16 +385,39 @@ class SessionFollower:
                 await asyncio.wait_for(self._applied.wait(), left)
         return True
 
+    async def whole(self, timeout: float) -> bool:
+        """Wait until the copy is a whole one; whether it is by ``timeout`` (#4738).
+
+        Not yet read after a start, or refilled from a web that has not scanned, the copy
+        holds no chat or only some: a call placing a pull request in its Work would refuse
+        one that is registered.
+        """
+        deadline = time.monotonic() + timeout
+        while not self.complete:
+            if time.monotonic() - self._began >= work_services.START_SCAN_WAIT_SECONDS:
+                return True
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return False
+            self._applied.clear()
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self._applied.wait(), left)
+        return True
+
     def apply(self, answer: dict) -> None:
-        self._applied.set()
-        changed, registrations = session_copy.apply(self._state, answer)
-        if registrations:
-            self.reload_registrations()
-        if answer.get("reset"):
-            self.complete = False
-        if answer.get("scanned"):
-            self.complete = True
-            self.copied.set()
+        try:
+            changed, registrations = session_copy.apply(self._state, answer)
+            if registrations:
+                self.reload_registrations()
+            if answer.get("reset"):
+                self.complete = False
+                self._began = time.monotonic()
+            if answer.get("scanned"):
+                self.complete = True
+                self.copied.set()
+        finally:
+            # Last, so a waiter reads the new flags; set even when an answer was half applied.
+            self._applied.set()
         if changed or registrations:
             # What ``sessions_changed`` announces in the web; the release looks again.
             self._state.bus.publish("sessions", changed)
@@ -399,7 +443,9 @@ class SessionFollower:
         epoch: str | None = None
         backoff = RECONNECT_MIN_S
         while True:
-            params: dict[str, Any] = {"wait": session_copy.KEEPALIVE_S}
+            params: dict[str, Any] = {
+                "wait": session_copy.KEEPALIVE_S if self.complete else COPY_POLL_S
+            }
             if since is not None and epoch is not None:
                 params.update(since=since, epoch=epoch)
             try:
@@ -469,10 +515,13 @@ def create_services_app(
             config, state=state, db=db, issues=issues, hooks=hooks, watcher=watcher
         )
         services.before_router_call = follower.reload_registrations
+        # Registrations and rounds changed here record their label syncs too (#4794).
+        work_published.configure(services.router.pending, nudge=services.router.note_published)
         # A cached pull request row the hourly refresh rewrote wakes the backstop (#3903).
         issues.on_pull_rows = services.router.wake_sweep
         app.state.services = services
         app.state.state = state
+        app.state.whole_copy = follower.whole
         tasks = [asyncio.create_task(forward(state, feed), name="services-forward")]
         if watchdog:
             from . import loop_watchdog
@@ -529,6 +578,16 @@ def create_services_app(
         args = body.get("args") if isinstance(body, dict) else None
         kwargs = body.get("kwargs") if isinstance(body, dict) else None
         services = app.state.services
+        whole = getattr(app.state, "whole_copy", None)
+        gated = target != "services" and (target, method) not in UNWAITED
+        if gated and whole is not None and not await whole(COPY_WAIT_S):
+            # Nothing was done, so the web says "restarting; try again" (#4738): answered
+            # from a copy still empty after a start, ``pre-review-done`` refused a
+            # registered pull request as one no Work's chat registered.
+            log.info("services: %s.%s refused: the chat copy is not whole yet", target, method)
+            return JSONResponse(
+                {"error": {"type": "Starting", "message": "the chat copy is not whole yet"}}, 503
+            )
 
         async def run() -> Any:
             return await services.call(target, method, list(args or ()), dict(kwargs or {}))

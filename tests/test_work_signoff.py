@@ -353,6 +353,247 @@ def test_closing_the_issue_from_the_deck_is_the_sign_off(tmp_path, monkeypatch):
     assert released == [WORK.work_id], "a refused close gives nothing back"
 
 
+def _closed_works(tmp_path, monkeypatch, count):
+    """``count`` Works whose issues closed and wait for Finish, all in the same repository."""
+    from test_work_ui import WORK, _add
+
+    from agentdeck.work import WorkRef
+
+    app, record = _deck(
+        tmp_path, monkeypatch, closed_at=NOW - timedelta(minutes=5), cutoff=NOW - timedelta(days=1)
+    )
+    works = [WORK, *(WorkRef(WORK.repository, 4700 + i) for i in range(1, count))]
+    for work in works[1:]:
+        _add(app, f"claude_code:main:worker-{work.number}", work,
+             last_activity=NOW - timedelta(minutes=10))
+    records = {(work.repository, work.number): dict(record) for work in works}
+    app.state.issues.cached_issues = lambda refs: records
+    return app, records, works
+
+
+@pytest.mark.asyncio
+async def test_finish_all_finishes_the_named_works_that_only_wait_for_it(tmp_path, monkeypatch):
+    """#4623: each named Work is checked again; the rest are skipped and said so."""
+    import re
+
+    from agentdeck import work_story
+
+    released = _releases(monkeypatch)
+    app, records, works = _closed_works(tmp_path, monkeypatch, 6)
+    one, two, reopened, opened, unrecorded, unnamed = works
+    real = work_story.FrontRow.finish.fget
+    monkeypatch.setattr(work_story.FrontRow, "finish", property(
+        lambda row: replace(real(row), confirm="o/store#9 is still open. Finish anyway?")
+        if row.actor.work_id == opened.work_id else real(row)
+    ))
+    await app.state.work_overview.refresh()
+    client = _client(app)
+    front = client.get("/").text
+    head = re.search(r'data-front-group="issue_closed".*?</h3>', front, re.S).group(0)
+    button = re.search(r"<button[^>]*data-finish-all[^>]*>", head).group(0)
+    assert " hidden" not in button
+    assert set(re.findall(r'data-finish-id="([^"]+)"', front)) == {
+        work.work_id for work in works if work is not opened
+    }
+
+    db = app.state.control_db
+    real_finish = db.finish_work
+    monkeypatch.setattr(
+        db, "finish_work", lambda wid, at: wid != unrecorded.work_id and real_finish(wid, at)
+    )
+    records[(reopened.repository, reopened.number)].update(state="open", closedAt="")
+    response = client.post("/works/finish-all", data={
+        "work": [w.work_id for w in (one, two, one, reopened, opened, unrecorded)]
+    })
+
+    assert response.status_code == 200, response.text
+    assert "Finished 2. Skipped 3: " in response.text
+    assert f"#{opened.number} has an open pull request" in response.text
+    assert f"#{reopened.number} no longer waits for Finish" in response.text
+    assert f"#{unrecorded.number} could not be recorded" in response.text
+    named = re.search(r"data-finished-works='([^']*)'", response.text).group(1)
+    assert json.loads(named) == [one.work_id, two.work_id]
+    signed = {wid for wid, (_, at) in db.work_signoffs().items() if at is not None}
+    assert signed == {one.work_id, two.work_id}
+    assert released == [one.work_id, two.work_id]
+    left = _ids(app.state.work_overview.overview.front.needs_you)  # the press rebuilt it
+    assert unnamed.work_id in left and one.work_id not in left
+    assert _NoGh.calls == 0
+
+    again = client.post("/works/finish-all", data={"work": [one.work_id]})
+    assert again.status_code == 409 and "data-finished-works" not in again.text
+
+
+@pytest.mark.asyncio
+async def test_finish_all_leaves_a_starred_work_and_hides_at_one_row(tmp_path, monkeypatch):
+    import re
+
+    _releases(monkeypatch)
+    app, _records, (one, starred) = _closed_works(tmp_path, monkeypatch, 2)
+    db = app.state.control_db
+    db.star_work(starred.work_id)
+    await app.state.work_overview.refresh()
+    client = _client(app)
+    front = client.get("/").text
+
+    # Listed under Starred and in Issue closed (#4745), where Finish all still leaves it.
+    assert front.count(f'data-work-id="{starred.work_id}"') == 2
+    assert re.findall(r'data-finish-id="([^"]+)"', front) == [one.work_id]
+    assert " hidden" in re.search(r"<button[^>]*data-finish-all[^>]*>", front).group(0)
+
+    response = client.post("/works/finish-all", data={"work": [one.work_id, starred.work_id]})
+    assert response.status_code == 200, response.text
+    assert f"#{starred.number} no longer waits for Finish" in response.text
+    assert {wid for wid, (_, at) in db.work_signoffs().items() if at} == {one.work_id}
+
+
+def test_finish_all_refuses_what_it_cannot_check(tmp_path, monkeypatch):
+    app, _records, (work, _other) = _closed_works(tmp_path, monkeypatch, 2)
+    client = _client(app)
+
+    def press(*ids, **kwargs):
+        return client.post("/works/finish-all", data={"work": list(ids)}, **kwargs).status_code
+
+    assert press() == 409
+    assert press("nonsense") == 422
+    assert press(*(f"github_issue:o/r#{n}" for n in range(1, 202))) == 409
+    assert press(work.work_id, headers={"Origin": "https://evil.example"}) == 403
+
+    async def broken():
+        raise RuntimeError("no overview")
+
+    monkeypatch.setattr(app.state.work_overview, "refresh", broken)
+    assert press(work.work_id) == 409
+    assert all(at is None for _, at in app.state.control_db.work_signoffs().values())
+
+
+def test_finish_all_takes_only_issue_closed_rows_and_the_leading_child():
+    from agentdeck.work_story import FrontRow
+
+    def row(category, *, waits=True, lead=None, outputs=(), work="github_issue:o/r#1"):
+        card = SimpleNamespace(work_id=work, awaiting_finish=waits, outputs=outputs)
+        return FrontRow(card, None, "needs_you", "", attention=SimpleNamespace(category=category),
+                        lead=lead)
+
+    child = row(ISSUE_CLOSED, work="github_issue:o/r#2")
+    assert row(ISSUE_CLOSED).finish_all_id == "github_issue:o/r#1"
+    assert row(ISSUE_CLOSED, lead=child).finish_all_id == "github_issue:o/r#2"
+    assert row(ISSUE_CLOSED, waits=False).finish_all_id == ""
+    assert row("needs_answer").finish_all_id == ""  # live_failed and not_live rows
+    pull = SimpleNamespace(is_open=True, label="o/r#9")
+    assert row(ISSUE_CLOSED, outputs=(pull,)).finish_all_id == ""
+
+
+@pytest.mark.browser
+@pytest.mark.asyncio
+async def test_finish_all_asks_once_and_takes_only_what_is_shown(tmp_path, monkeypatch):
+    """#4623: the count asked, a declined ask, the fold, and a skipped row coming back."""
+    from urllib.parse import parse_qs
+
+    from conftest import async_playwright
+    from test_web import _live_server
+
+    _releases(monkeypatch)
+    app, records, works = _closed_works(tmp_path, monkeypatch, 3)
+    await app.state.work_overview.refresh()
+    async with _live_server(app) as base, async_playwright() as playwright:
+        browser = await playwright.chromium.launch()
+        page = await browser.new_page(viewport={"width": 320, "height": 640},
+                                      service_workers="block")
+        await page.goto(base + "/")
+        head = page.locator('#works-cleanup [data-front-group="issue_closed"]')
+        button = head.locator("[data-finish-all]")
+        await button.wait_for()
+        await page.wait_for_load_state("load")
+        # Asked of the page, not of one node: the first push redraws the header.
+        await page.wait_for_function("""() => {
+          const box = document.querySelector('#works-cleanup [data-front-group="issue_closed"]')
+            ?.getBoundingClientRect();
+          return box && box.height > 0 && box.height <= 37;
+        }""")
+        rows = page.locator("#works-cleanup article[data-finish-id]")
+        assert await rows.count() == 3
+
+        await head.locator("[data-front-toggle]").click()
+        assert await button.is_hidden()  # folded away
+        await head.locator("[data-front-toggle]").click()
+        assert await button.is_visible()
+
+        # Finish all takes only what a search shows, and a search looks inside the fold (#4624).
+        numbers = [work.number for work in works]
+        await head.locator("[data-front-toggle]").click()
+        await page.locator("[data-find-open]").click()
+        await page.locator("#front-find-input").fill(f"#{numbers[0]}")
+        assert await button.is_hidden()
+        finishable = "() => AgentDeckFront.finishable().map(row => row.dataset.workId)"
+        assert await page.evaluate(finishable) == [works[0].work_id]
+        await page.locator("#front-find-input").fill("#")
+        assert await button.is_visible() and len(await page.evaluate(finishable)) == 3
+        await page.keyboard.press("Escape")
+        assert await button.is_hidden()  # folded away again
+        await head.locator("[data-front-toggle]").click()
+
+        # A row on a project the tabs hide is left out of the press.
+        await rows.nth(2).evaluate("row => row.setAttribute('data-work-project', 'elsewhere')")
+        await page.evaluate("""() => {
+          localStorage.setItem('agentdeck-front-hidden-projects', '{"elsewhere": true}');
+          AgentDeckFront.apply();
+        }""")
+        left = await rows.nth(2).get_attribute("data-work-id")
+
+        asked, sent = [], []
+        answer = {"accept": False}
+
+        async def on_dialog(dialog):
+            asked.append(dialog.message)
+            await (dialog.accept() if answer["accept"] else dialog.dismiss())
+
+        page.on("dialog", on_dialog)
+        held = asyncio.Event()
+
+        async def hold(route):
+            sent.append(parse_qs(route.request.post_data)["work"])
+            if answer.get("fail") == "refused":
+                return await route.fulfill(status=409, content_type="text/html", body="<p>No</p>")
+            if answer.get("fail") == "lost":
+                return await route.abort()
+            await held.wait()
+            await route.continue_()
+
+        await page.route("**/works/finish-all", hold)
+        await button.click()
+        assert asked == ["Finish 2 Works?"] and sent == []
+        assert await rows.nth(0).is_visible()  # nothing folded either
+
+        answer["accept"] = True
+        for fail in ("refused", "lost"):  # every row comes back, and a new press is taken
+            answer["fail"] = fail
+            async with page.expect_request("**/works/finish-all"):
+                await button.click()
+            await page.wait_for_function(
+                "() => !document.querySelector('#front-finish-all')._finishAllBusy"
+            )
+            assert await page.locator("[data-work-finishing]").count() == 0, fail
+            assert await rows.nth(0).is_visible() and await rows.nth(1).is_visible()
+            assert await button.is_visible()
+        assert [len(ids) for ids in sent] == [2, 2]
+        answer["fail"] = ""
+        sent.clear()
+        skipped = await rows.nth(0).get_attribute("data-work-id")
+        done = await rows.nth(1).get_attribute("data-work-id")
+        ref = next(w for w in works if w.work_id == skipped)
+        records[(ref.repository, ref.number)].update(state="open", closedAt="")
+        await button.click()
+        await page.locator(f'#works-cleanup [data-work-id="{done}"]').wait_for(state="hidden")
+        assert await button.is_hidden()
+        held.set()
+        await page.locator("#work-action-result [data-finished-works]").wait_for()
+        assert len(sent) == 1 and set(sent[0]) == {skipped, done} and left not in sent[0]
+        await page.locator(f'[data-work-id="{done}"][data-front-section="finished"]').wait_for()
+        assert await page.locator(f'[data-work-id="{skipped}"][data-work-finishing]').count() == 0
+        await browser.close()
+
+
 @pytest.mark.browser
 @pytest.mark.asyncio
 async def test_finish_takes_the_row_away_on_the_press_and_a_refusal_puts_it_back(

@@ -117,10 +117,10 @@ async def test_star_on_the_work_page_marks_the_work_everywhere(tmp_path, monkeyp
     assert card.starred
     home = client.get("/", params={"chats": "0"}).text
     assert 'class="fr-star"' in home
-    # In Starred above every other group, and the only row of it on the page (#4121).
+    # In Starred above every other group (#4121), and in its own group too (#4745).
     assert home.index('id="works-starred"') < home.index(f'data-work-id="{WORK.work_id}"')
     assert home.index(f'data-work-id="{WORK.work_id}"') < home.index('id="works-needs"')
-    assert home.count(f'data-work-id="{WORK.work_id}"') == 1
+    assert home.count(f'data-work-id="{WORK.work_id}"') == 2
     assert 'data-work-star="unstar"' in client.get(work_href(WORK.work_id)).text
 
     assert client.post(work_href(WORK.work_id) + "/star", data={"action": "x"}).status_code == 422
@@ -158,7 +158,8 @@ async def test_a_star_moves_the_row_whole_between_parts_on_a_live_stream(tmp_pat
 
     stars.star_work(WORK.work_id)
     moved = await pushed()
-    assert whole(moved["starred"]) and absent(moved["active"])
+    # Now in both (#4745): Starred gets the row whole, Working now already holds it.
+    assert whole(moved["starred"]) and not absent(moved["active"])
     assert "data-work-same" in (await pushed())["starred"]
 
     stars.star_work(WORK.work_id, starred=False)
@@ -447,8 +448,8 @@ async def test_the_paused_group_folds_and_stays_folded_through_a_reload(tmp_path
 
 @pytest.mark.browser
 @pytest.mark.asyncio
-async def test_a_star_moves_the_row_to_starred_and_back_live_on_a_phone(tmp_path, monkeypatch):
-    """#4121: an open page follows a star with no reload, at a phone's width, one row at a time."""
+async def test_a_star_lists_the_row_in_starred_too_live_on_a_phone(tmp_path, monkeypatch):
+    """#4121: an open page follows a star with no reload, at a phone's width."""
     from conftest import async_playwright
     from test_web import _live_server
 
@@ -469,9 +470,11 @@ async def test_a_star_moves_the_row_to_starred_and_back_live_on_a_phone(tmp_path
         stars.star_work(WORK.work_id)
         await service.refresh()
         await page.locator(f"#works-starred {row}").wait_for(timeout=15000)
+        # In Starred and still in its own group (#4745).
         await page.wait_for_function(
-            "sel => document.querySelectorAll(sel).length === 1", arg=row
+            "sel => document.querySelectorAll(sel).length === 2", arg=row
         )
+        assert await page.locator(f"#works {row}").count() == 1
         assert await page.locator("#works-starred .fr-group-count").inner_text() == "1"
         width = "document.documentElement.scrollWidth"
         assert await page.evaluate(width) <= 390

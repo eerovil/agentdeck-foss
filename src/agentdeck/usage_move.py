@@ -78,7 +78,7 @@ def pick_account(
         return None
     notes: list[str] = []
     chosen = choose_account(
-        list(others), usage_cache, {}, notes, cold=True, planned_resets=planned_resets
+        list(others), usage_cache, notes, cold=True, planned_resets=planned_resets
     )
     for note in notes:
         log.info("usage move: %s", note)

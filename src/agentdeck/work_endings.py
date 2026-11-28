@@ -74,6 +74,27 @@ REVIEW_PASSED_NUDGE_TEXT = (
 #: The request when a pull request's review waits on the agent's own ``pre-review-done``
 #: (#4575): store#4161's agent took a minor verdict's pass as carried, told the owner to press
 #: Merge, and the review nobody started cost nine hours.
+#: The ending while the review of a pull request whose checklist waits is held by the Work's
+#: design review, asked and unanswered (#4781): ``pre-review-done`` would be refused.
+DESIGN_WAIT_NUDGE_TEXT = (
+    "AgentDeck: your last turn on {ref} ended, and the review of {pulls} waits on the Work's"
+    " design review, which was asked for and has not answered. Its verdict comes to this chat"
+    " as a message: once it passes, call `POST $AGENTDECK_URL/api/sessions/<key>/pre-review-done`"
+    " with {bodies}. Until then, end your turn on that wait, or on anything else still to do."
+)
+#: Instead, when the design-review series limit stopped the design's review until the owner
+#: answers (#4800): ``pre-review-done`` is refused until then, so the deck does not ask for it.
+DESIGN_LIMIT_NUDGE_TEXT = (
+    "AgentDeck: your last turn on {ref} ended, and the review of {pulls} waits on the Work's"
+    " design review, which the design-review series limit holds until the owner answers"
+    " (#4765). Ask them in your question box if you have not: one more review series, code"
+    " without a design review, or pause the Work. Send their answer as"
+    ' `POST $AGENTDECK_URL/api/sessions/<key>/design-review` with `{{"owner": "more"}}` or'
+    ' `{{"owner": "skip"}}`; a pause is the `parked` label on the issue. Once the design no'
+    " longer holds the code, call `POST $AGENTDECK_URL/api/sessions/<key>/pre-review-done`"
+    " with {bodies}."
+    " Until then, end your turn on that question, or on anything else still to do."
+)
 PRE_REVIEW_NUDGE_TEXT = (
     "AgentDeck: your last turn on {ref} ended, but the review of {pulls} has not started: it"
     " waits on you. The deck sent its pre-review checklist and no review runs, and nothing"

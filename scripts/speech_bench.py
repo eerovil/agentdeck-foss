@@ -468,6 +468,9 @@ def large_runner(engine: dict, only: str):
             beam_size=beam,
             condition_on_previous_text=False,
             initial_prompt=prompt or None,
+            max_new_tokens=server.max_new_tokens(
+                model, server.write_limit(len(speech) / server.SAMPLE_RATE), prompt
+            ),
         )
         text = " ".join(s.text.strip() for s in segments if not server.is_phantom(s)).strip()
         if text:  # voice mode's hint for the next phrase

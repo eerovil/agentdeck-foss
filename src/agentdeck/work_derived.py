@@ -79,12 +79,19 @@ Work's own facts. Nothing here is stored and nothing here asks the agent to call
    it**. A hold only a person lifts (the spec-only label) is **Needs you — its pull
    request held: spec-only label** at once; any other that nothing moved for ``PR_STALE`` (no
    push, no review, no turn) is **Needs you — … · nothing since 13:02**, Needs retry, reported as
-   a bug when its hold is a ready head no review ever started on (#4579);
+   a bug when its hold is a ready head no review ever started on (#4579). A person's Merge
+   press the release now carries out, and a reviewed and tested head the release holds only
+   for GitHub's checks, are the deck's own such waits, with no wake-on behind them (#4753):
+   **Waiting on its pull request**, quiet counted from the press or from when the checks
+   began to hold it. Not where the release says the agent owes something: no test run, a
+   press held for a CI fix, any other hold;
 9. otherwise the agent ended its turn without a next step: no question, no wait, no review,
    no closed issue. Its pull requests all merged with the issue still open is one of these:
    the agent decides whether work is left and closes the issue if not. That is never a
    resting state (#2960). Once the ending has rested ``ENDING_SETTLE`` (a person who stopped
-   the turn to type gets to send their message first, #2965), the deck asks the agent once
+   the turn to type gets to send their message first, #2965), counted from when the Work was
+   first seen ended (``ask_at``) and not from the turn's end, so the deck's own next message to
+   a Work that rested until now gets there first (#4753), the deck asks the agent once
    for its next step (**Working — asked
    the agent for its next step**); if the next turn ends the same way, or nothing ran within
    ``NUDGE_GRACE``, **Needs you — the agent ended without a next step · last said "…" ·
@@ -377,6 +384,13 @@ class DerivedStatus:
     #: A question's Work whose pull request is also Ready for merge (#4294): the question keeps
     #: the headline, and the Merge it would otherwise hide is offered beside its Answer.
     ready_pr: int | None = None
+    #: Something wakes the agent by itself, whatever the line says (#4631): a question in the
+    #: chat outranks the agent's own waits and jobs, so ``kind`` alone does not tell.
+    self_waking: bool = False
+    #: When the deck asks an ``ENDED`` Work for its next step (#4753): ``ENDING_SETTLE`` after
+    #: the Work was first seen ended, which is later than the turn's end when something else
+    #: held it until now. ``None`` reads as the turn's end plus ``ENDING_SETTLE``.
+    ask_at: datetime | None = None
 
 
 def is_mac_pause_link(href: str) -> bool:
@@ -515,6 +529,8 @@ def derived_status(
     rules, nudge and bug report are unchanged: they read ``kind``.
     """
     status = _first_rule(inputs, now=now, clock=clock)
+    if inputs.waits:
+        status = replace(status, self_waking=True)
     if inputs.handed_over and status.kind not in _HANDED_OVER_KEEPS:
         # Another deck works it now: this deck asks, reviews, retries and reports nothing.
         summary = "its issue went to another deck"

@@ -15,6 +15,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from agentdeck.design_review import OWNER_WAIT
 from agentdeck.poller_ops import release_policies
 from agentdeck.review_history import (
     CHECK_NAME,
@@ -84,6 +85,7 @@ class Fake:
         self.note_ok = True
         self.merge_answer = MERGED
         self.busy = False
+        self.design_waits = False
         self.green_heads_fail = False
         self.labels: set[str] | None = set()
         self.update_ok = True
@@ -97,6 +99,8 @@ class Fake:
         self.merge_commit = ""  # what GitHub reads back as a merge's commit (#4253)
         # The checks of the commits a push replaced, by sha; ``None`` unread (#4574).
         self.replaced: dict[str, str] | None = None
+        self.same: bool | None = False  # a base merge left every file alone; ``None`` unread
+        self.same_asked: list[tuple[str, str, str]] = []
         self.replaced_asked: list[tuple[str, str, str]] = []
         self.service = WorkReleaseService(
             ReleaseStore(tmp_path / "work-release.json"),
@@ -117,10 +121,12 @@ class Fake:
                 ),
                 clock=lambda: self.now,
                 busy=lambda work_id: self.busy,
+                design_waits=lambda work_id: self.design_waits,
                 issue_labels=self.issue_labels,
                 verifying=self.is_verifying,
                 failed_heads=self.failed_heads,
                 replaced_checks=self.replaced_checks,
+                same_files=self.same_files,
                 moved_heads=self.moved_heads,
                 unclean_heads=self.unclean_heads,
                 review_event=self.note,
@@ -149,6 +155,12 @@ class Fake:
 
     async def failed_heads(self, work_id):
         return set(self.red)
+
+    async def same_files(self, ref, old, new):
+        self.same_asked.append((ref, old, new))
+        if self.same is None:
+            raise OSError("no answer")
+        return self.same
 
     async def replaced_checks(self, ref, old, new):
         self.replaced_asked.append((ref, old, new))
@@ -219,12 +231,17 @@ def stamped(text, round_id):
     return f"{text}\n\n<!-- chatgpt-review -->\n<!-- review-round: {round_id} -->"
 
 
-def opened(fake, head, number, round_id, pulls=(PR,)):
-    """The rows a review chat's opening writes (``record_chat_review_head``), and its ask."""
+def opened(fake, head, number, round_id, pulls=(PR,), *, asked_for="", ask=True):
+    """The rows a review chat's opening writes (``record_chat_review_head``), and its ask.
+    ``asked_for`` is what opened it, as its body says (#4665); ``ask=False`` writes no
+    ``asked`` row, as for a chat opened by an ask about another pull request."""
     fake.now += 5
     for pull in pulls:
-        fake.note(pull, head, "asked", f"asked:{number}:{pull}", fake.now, {})
+        if ask:
+            fake.note(pull, head, "asked", f"asked:{number}:{pull}", fake.now, {})
         data = {"chat": f"{CHATS}#{number}", "round": round_id}
+        if asked_for:
+            data["asked"] = asked_for
         fake.note(pull, head, "chat", f"chat:{CHATS}#{number}:{pull}@{head}", fake.now, data)
 
 
@@ -280,8 +297,35 @@ async def test_a_merge_seen_live_asks_for_a_live_check_once_nothing_is_open(fake
     assert live_checks(fake) == [], "a draft next step is still open"
     fake.set(PR, state="CLOSED")
     await fake.service.on_pull_event(WORK, PR, "closed", False)
+    # #4753: the release ends the chat's own waits on that merge as it tells the chat of it.
+    # Only once its message is stored, and only for what merged.
+    ended: list[tuple] = []
+    fake.service.ports.merge_told = lambda chat, refs: ended.append((chat, refs))
+    stored = fake.service.ports.tell
+    fake.service.ports.tell = lambda chat, message_id, text: False
+    await fake.service._ask_live_check(WORK, fake.entry, fake.policy, [other])
+    assert ended == [] and live_checks(fake) == [], "refused: the chat's own wait wakes it"
+    fake.service.ports.tell = stored
     await fake.service.evaluate(WORK)
     [text] = live_checks(fake)
+    assert ended == [("chat-a", [other])]
+    # A draft named beside the merge keeps its chat's wait: only what landed ends one. A port
+    # that fails changes nothing else.
+    for landed, wanted in (([other], [other]), ((), None)):
+        del ended[:]
+        fake.entry["told"] = [k for k in fake.entry["told"] if not k.startswith("live-check:")]
+        await fake.service._ask_live_check(
+            WORK, fake.entry, fake.policy, [other, PR], landed=landed
+        )
+        assert ended == ([("chat-a", wanted)] if wanted else []), landed
+
+    def failing(chat, refs):
+        raise OSError("locked")
+
+    fake.service.ports.merge_told = failing
+    fake.entry["told"] = []
+    await fake.service._ask_live_check(WORK, fake.entry, fake.policy, [other])
+    assert fake.entry["live_check_asked"]["pulls"] == [other]
     assert other in text and "`deployment` wake-on for eerovil/site" in text
     assert "Do not read the GitHub deployments API" in text  # #3584
     assert "/live-check" in text and "`not_live`" in text
@@ -310,6 +354,15 @@ async def test_a_merge_seen_live_asks_for_a_live_check_once_nothing_is_open(fake
     said = deploy_sentence(Policy(), ["eerovil/agentdeck#3196", "eerovil/other-tool#7"])
     assert said.startswith("eerovil/agentdeck#3196: This deck deploys it")
     assert "eerovil/other-tool#7: Nothing on this host watches" in said
+    # #4662: a deploy reported as a check run is waited on by its name.
+    named = Policy(
+        deploys=frozenset({"eerovil/site", "eerovil/blog"}),
+        deploy_names=(("eerovil/site", "deploy-cloudflare"),),
+    )
+    said_named = deploy_sentence(named, ["eerovil/site#1", "eerovil/blog#2"])
+    assert 'wake-on for eerovil/blog, eerovil/site (with `"name": "deploy-cloudflare"`) and' in (
+        said_named
+    )
     assert "deploy by hand is `not_live`" in said, "not a nothing_to_check and a Finish"
     # #4320: a change only a later deploy applies (a chart in another repository) is
     # redeployed now by the guide's route, not mentioned as optional; a route the agent's tools
@@ -1247,14 +1300,32 @@ async def test_a_design_verdict_reaches_the_works_chat_once(fake):
     ((chat, message_id, text),) = fake.told
     assert chat == "chat-a" and message_id == f"work-release:{WORK}:design:abcdefgh15"
     assert "found a gap" in text and "race for row 4" in text and "/design-review" in text
+    # #4802: an existing guard is named, not duplicated.
+    assert "already covered: <file:line>, <test>" in text and "instead of adding" in text
     passed = "/claude Design review of eerovil/agentdeck#7: pass 4\nok"
     assert await fake.service.on_design_review(WORK, "abcdefgh16", passed, url, gap=False)
-    assert "passed" in fake.told[1][2] and "Build to this design" in fake.told[1][2]
-    assert "once the owner has approved it" in fake.told[1][2]  # #4476
+    assert "passed" in fake.told[1][2] and "build to it" in fake.told[1][2]
     # Passed with notes after the last round (#4463): start coding, no new design.
     assert await fake.service.on_design_review(WORK, "abcdefgh18", gap, url, gap=False, notes=True)
     assert "passed with notes" in fake.told[2][2] and "start coding" in fake.told[2][2]
-    assert "Do not post another design" in fake.told[2][2]
+    assert "do not post another design" in fake.told[2][2]
+    assert "look for one the code already has" in fake.told[2][2]  # #4802 helpers
+    # #4476, #4807: on a redesign the owner's answers decide, answered or not; the build
+    # instruction is only for any other design, never an "otherwise" a redesign falls into.
+    told = fake.told
+    for said in (told[1][2], told[2][2]):
+        assert OWNER_WAIT in said and "Otherwise" not in said
+        assert "For any other design, " in said.split(OWNER_WAIT, 1)[1]
+    assert "unanswered, write no code" in OWNER_WAIT and "once all are answered" in OWNER_WAIT
+    assert "rethinking it together, shipping now or a pause" in OWNER_WAIT
+    # On a closed issue each verdict asks for nothing more here (#4675).
+    for n, asks in enumerate(({"gap": True}, {"gap": False, "notes": True}, {"gap": False})):
+        key = f"abcdefgh3{n}"
+        assert await fake.service.on_design_review(WORK, key, gap, url, closed=True, **asks)
+        said = fake.told[-1][2]
+        assert "issue is closed" in said and "race for row 4" in said and "reopen" in said
+        assert "POST" not in said and "start coding" not in said
+        assert "Build to this" not in said
     fake.service.ports.chat = lambda work_id: None
     assert not await fake.service.on_design_review(WORK, "abcdefgh17", passed, url, gap=False)
 
@@ -1275,6 +1346,14 @@ async def test_a_design_reviewer_that_stopped_with_no_verdict_is_told_once_per_s
     assert chat == "chat-a" and message_id == f"work-release:{WORK}:design-dropped:5:t1"
     assert "stopped without a verdict" in text and "/design-review" in text
     assert "comment 5" in text
+
+    async def closed(issue):
+        return issue == "eerovil/agentdeck#7"
+
+    # Its issue closed meanwhile: nothing to ask for (#4675).
+    late = {**line, "token": "t9"}
+    assert await tell_design_dropped(fake.service, verdicts, late, [], "", closed) is None
+    assert len(fake.told) == 1
     # Asked again, the second reviewer stops too: told again.
     assert await tell_design_dropped(fake.service, verdicts, {**line, "token": "t2"}, [])
     # Another reviewer runs on this or a newer design, or a verdict counted: nothing.
@@ -1795,6 +1874,38 @@ async def test_a_press_holds_through_the_agents_fix_of_a_red_merge_queue_head(fa
     assert "asked" not in fake.entry
 
 
+@pytest.mark.parametrize("same", [True, False, None])
+async def test_a_press_stands_across_a_base_merge_that_left_every_file_alone(fake, same):
+    """#4635: a pull request it was built on merged, so its diff shrank, and the
+    agent's base merge left every file as it was. The press stands at the new diff; a merge
+    not proven so, or unread, needs a new press."""
+    fake.policy = Policy(auto_release=False, github_checks=frozenset({"eerovil/agentdeck"}))
+    await passed(fake)
+    fake.set(PR, checks="pending")
+    await fake.service.request_merge(WORK)
+    fake.same = same
+    shrunk = "e" * 64
+    fake.set(PR, head=OTHER)
+    fake.digests[(PR, OTHER)] = shrunk
+    await fake.service.evaluate(WORK)
+    assert fake.same_asked == [(PR, HEAD, OTHER)]
+    told = [key for _chat, key, _text in fake.told if ":press-cleared:" in key]
+    assert bool(told) is not bool(same)
+    await passed(fake, head=OTHER, digest=shrunk)
+    assert fake.merged == []
+    fake.set(PR, checks="green")
+    await fake.service.evaluate(WORK)
+    assert fake.merge_heads == ([OTHER] if same else [])
+
+
+async def test_a_press_that_is_the_review_never_moves_to_a_new_diff(fake):
+    """#4635: there the person's look was the review, so a changed diff needs a new one."""
+    fake.service.ports = replace(fake.service.ports, press_is_review=True)
+    fake.same = True
+    assert not await fake.service._same_files(PR, HEAD, OTHER)
+    assert fake.same_asked == []
+
+
 async def test_a_held_press_reads_the_ci_failure_at_the_push_and_drops_on_changes(fake):
     """#4574 design review: no look saw the red base-merged head before the fix landed, so the
     failure is read when the changed diff is seen. A changes-needed review of the fix drops the
@@ -2063,6 +2174,15 @@ async def test_a_joint_round_fixed_on_two_pull_requests_says_what_holds_and_then
     fake.now += 5
     pre = f"work-event:pre-review:{second}@{fixed}"
     fake.note(second, fixed, "checklist", pre, fake.now, {"printed": True})
+    # While the Work's design review runs, the review waits on that, not on pre-review-done,
+    # which the design gate would refuse: nothing tells the chat to call it (#4781).
+    fake.design_waits = True
+    await fake.service.evaluate(WORK)
+    assert [t for t in fake.told if ":pre-review:" in t[1]] == []
+    assert "metso#77: its review waits on the Work's design review" in hold_line(
+        fake.entry["hold"]
+    )
+    fake.design_waits = False
     await fake.service.evaluate(WORK)
     [(_c, _m, verify)] = [t for t in fake.told if ":verify:" in t[1]]
     assert "merges once it is green" in verify
@@ -3284,6 +3404,8 @@ async def test_open_pull_findings_still_ask_for_a_push(fake):
     # Within it, the outside call's defaults are looked up before a fix relies on them (#4499).
     assert "look up that call's defaults first (timeouts, retries, caching" in told
     assert "which defaults you checked and why each fits" in told
+    # And an existing guard is named before a second one is added (#4802).
+    assert "look for one the code already has" in told and "add no second one" in told
     # So does the reviewer's own changes-needed verdict on an open pull request.
     await fake.service.on_verdict(WORK, "changes-needed", HEAD[:12], "", ())
     (verdict,) = verdict_messages(fake, "changes-needed")
@@ -3493,6 +3615,23 @@ async def test_a_base_update_carries_no_pass_a_review_was_asked_again_after(fake
         fake.set(PR, head=current, state="OPEN")
         assert "no review pass" in await fake.service.evaluate(WORK)
         assert fake.merged == [] and not [e for e in fake.events if e.key.startswith("carried:")]
+    # #4658: the same when the ask, or a verdict at the new head, lands while the digest is read.
+    ports = fake.service.ports
+    for kind in ("asked", "changes"):
+        fake.events.clear()
+        fake.set(PR, head=HEAD, state="OPEN")
+        await fake.service.on_verdict(WORK, "pass", HEAD[:12], DIGEST, source="comment:1")
+        fake.merged.clear()
+
+        async def digest(ref, head, kind=kind):
+            fake.note(PR, OTHER, kind, "meanwhile", fake.now + 1, {})
+            return DIGEST
+
+        fake.service.ports = replace(ports, digest=digest)
+        fake.set(PR, head=OTHER, state="OPEN")
+        assert "no review pass" in await fake.service.evaluate(WORK)
+        assert fake.merged == [] and not [e for e in fake.events if e.key.startswith("carried:")]
+    fake.service.ports = ports
     # With no ask since, the same base update carries it (#3314).
     fake.events.clear()
     fake.set(PR, head=HEAD, state="OPEN")
@@ -3653,6 +3792,7 @@ async def test_a_minor_verdict_lets_a_small_fix_pass_with_no_review(fake):
     assert key == f"work-release:{WORK}:verdict:minor:{PR}@{HEAD[:12]}"
     assert "minor fixes" in text and f"at most {MINOR_LINES} lines" in text
     assert "look up that call's defaults first" in text  # #4499: a minor fix can add a call
+    assert "look for one the code already has" in text  # #4802 helpers: a minor guard too
     assert fake.service.no_code_head(WORK, PR) == (HEAD, frozenset(files), True)
     fake.set(PR, head=OTHER)
     fake.digests[(PR, OTHER)] = "e" * 64
@@ -4070,6 +4210,88 @@ async def test_a_replaced_chats_late_pass_keeps_the_newer_chats_held_pass(fake):
     await fake.service._read_held(WORK)
     assert not fake.service._holds_pass(WORK)
     assert fake.passed().kind == "pass" and fake.merge_heads == [HEAD]
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    ["a sibling's new commit", "a re-ask", "a press", "unmarked", "a press that lost"],
+)
+async def test_a_chat_replaced_for_a_sibling_keeps_its_pass(fake, replacement):
+    """#4665: one review chat lists every pull request of a Work, and a sibling's new commit
+    replaced X while it still reviewed this one at HEAD. X's pass is a whole review of HEAD,
+    so it is recorded, keyed and told as X's. A chat opened by an ask about this pull request
+    (a re-ask, a press, one from before the mark, a press whose own chat lost to Y, which writes
+    its ``asked`` row naming Y) is a new review of it, and X's pass answers nothing."""
+    opened(fake, HEAD, 3, RX)
+    marks = {
+        "a sibling's new commit": "eerovil/agentdeck#10",
+        "a re-ask": PR,
+        "a press": "*",
+        "unmarked": "",
+        "a press that lost": "eerovil/agentdeck#10",
+    }
+    opened(fake, HEAD, 4, RY, asked_for=marks[replacement], ask=False)
+    if replacement == "a press that lost":
+        fake.note(PR, HEAD, "asked", "asked:press", fake.now, {"chat": f"{CHATS}#4"})
+    fake.now += 5
+    answer = await fake.service.on_verdict(
+        WORK, "pass", HEAD[:12], DIGEST, source="", at=fake.now, stamp=RX
+    )
+    if replacement != "a sibling's new commit":
+        assert verdict_settled(answer) and f"{CHATS}#3" in answer
+        assert fake.passed() is None and fake.merge_heads == []
+        return
+    assert "review pass recorded" in answer, answer
+    row = fake.passed()
+    assert row.kind == "pass" and row.data["chat"] == f"{CHATS}#3"
+    assert row.key == f"verdict:pass:{PR}@{HEAD}@{CHATS}#3"
+    [(_chat, _note, text)] = fake.noted
+    assert f"review chat {CHATS}#3" in text and f"{CHATS}#4" not in text
+    assert fake.merge_heads == [HEAD]
+    # Y's own answer at HEAD after it opened is the newer word: X's pass again is dropped.
+    fake.now += 5
+    await fake.service.on_verdict(WORK, "changes-needed", HEAD[:12], "", at=fake.now, stamp=RY)
+    fake.now += 5
+    late = await fake.service.on_verdict(WORK, "pass", HEAD[:12], DIGEST, at=fake.now, stamp=RX)
+    assert verdict_settled(late) and f"{CHATS}#3" in late
+
+
+@pytest.mark.parametrize("path", ["held", "refused", "merged"])
+async def test_a_kept_pass_is_its_own_chats_on_every_path(fake, path):
+    """#4665 review: a kept pass held for a failed read, refused for a wrong digest or told
+    after a merge by hand is X's, not the sibling-opened Y's, in its row and its message."""
+    opened(fake, HEAD, 3, RX)
+    opened(fake, HEAD, 4, RY, asked_for="eerovil/agentdeck#10", ask=False)
+    plain_read = fake.service.ports.read_pull
+    digest = DIGEST
+    if path == "held":
+
+        async def unread(ref):
+            return None
+
+        fake.service.ports.read_pull = unread
+    elif path == "refused":
+        digest = "0" * len(DIGEST)
+    else:
+        fake.set(PR, state="MERGED")
+    fake.now += 5
+    answer = await fake.service.on_verdict(
+        WORK, "pass", HEAD[:12], digest, source="", at=fake.now, stamp=RX
+    )
+    if path == "held":
+        assert fake.service._holds_pass(WORK), answer
+        fake.service.ports.read_pull = plain_read
+        await fake.service._read_held(WORK)
+        assert fake.passed().data["chat"] == f"{CHATS}#3"
+        assert fake.merge_heads == [HEAD]
+        return
+    kind = "refused" if path == "refused" else "late-pass"
+    [(_chat, key, text)] = [t for t in fake.told if f":verdict:{kind}:" in t[1]]
+    plain = key.removeprefix(f"work-release:{WORK}:")
+    assert fake.entry["told_chats"][plain] == f"{CHATS}#3", key
+    if path == "merged":
+        assert f"review chat {CHATS}#3" in text and f"{CHATS}#4" not in text, text
+    assert fake.passed() is None
 
 
 async def test_the_same_chats_stamped_line_after_an_acceptance_keeps_the_pass(fake):
@@ -4491,6 +4713,10 @@ async def test_a_shipped_merge_keeps_the_issue_open_until_its_fix_merges(fake):
     # The shipped pull request named as its own fix fixes nothing (#4212 review).
     fixes[PR] = PR
     assert fake.service._findings_left(WORK, later, [PR]) == [PR]
+    # The owner left the findings as shipped (#4797): no fix holds the issue open.
+    fixes[PR] = "declined"
+    assert fake.service._findings_left(WORK, later, ["eerovil/agentdeck#14"]) == []
+    fixes[PR] = PR
     # Shipped in an earlier round of a reopened Work (#4585): that round's history, it holds
     # the new round's live check open no longer.
     from datetime import UTC, datetime

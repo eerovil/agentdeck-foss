@@ -317,6 +317,10 @@ class DeliverRequest(ActionRequest):
     allow_over_budget: bool = False
     require_idle: bool = False
     require_active: bool = False
+    # The keep-warm ping's flag before it had a route of its own (#4737). Kept as a known
+    # field only to refuse it (#4752): dropped, a ping from an older deck would be
+    # delivered as an ordinary message.
+    require_live: bool = False
     expected_last_result_at: float | None = None
     expected_session_id: str | None = None
     context_maintenance: bool = False
@@ -365,6 +369,16 @@ class SpareRequest(BaseModel):
     effort: str | None = None
     # A deck-started Work's spare boots with the ``work`` role (#3590); None is a plain chat.
     role: SessionRole | None = None
+
+
+class KeepWarmRequest(ActionRequest):
+    """One keep-warm ping (#4752), fenced to the chat state its sender judged."""
+
+    key: str
+    message: str
+    delivery_id: str = Field(min_length=1)
+    expected_session_id: str = Field(min_length=1)
+    expected_last_result_at: float = Field(gt=0)
 
 
 class WorkerKeyRequest(ActionRequest):
@@ -2634,6 +2648,8 @@ def create_runtime_app(config: AppConfig) -> FastAPI:
                 # Only Claude's keyed worker cuts a copy at a line; anywhere else the
                 # fields would be dropped and the "side chat" would start empty.
                 return DeliverResult(False, "rejected", reason="fork_unsupported")
+            if body.require_live:
+                return DeliverResult(False, "rejected", reason="require_live_unsupported")
             version = (
                 {"expected_last_result_at": body.expected_last_result_at}
                 if body.expected_last_result_at is not None
@@ -2828,6 +2844,31 @@ def create_runtime_app(config: AppConfig) -> FastAPI:
     async def claude_deliver(label: str, body: DeliverRequest) -> dict[str, Any]:
         result = await _deliver_worker(
             "claude_code", label, body, action="claude_deliver"
+        )
+        return _deliver_result(result)
+
+    @app.post("/claude/accounts/{label}/keep-warm")
+    async def claude_keep_warm(label: str, body: KeepWarmRequest) -> dict[str, Any]:
+        """A route of its own, so a runtime from before it answers 404 instead of
+        delivering the ping as a message (#4752). Never a person's: it waits for a place
+        like any other machine's start, and stops less to get one."""
+        host = claude_workers.host(label)
+        result = await deliveries.serialized(
+            lambda: _timed_action(
+                "claude_keep_warm",
+                f"claude_code:{label}",
+                body.client_action_id,
+                lambda: host.deliver(
+                    body.key,
+                    body.message,
+                    delivery_id=body.delivery_id,
+                    expected_session_id=body.expected_session_id,
+                    expected_last_result_at=body.expected_last_result_at,
+                    delegated=False,
+                    automated=True,
+                    keep_warm=True,
+                ),
+            )
         )
         return _deliver_result(result)
 

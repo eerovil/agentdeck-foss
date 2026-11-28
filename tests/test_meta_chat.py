@@ -106,6 +106,9 @@ def test_the_chat_view_hides_the_brief_behind_a_mark():
     assert "write only the 🔊 paragraph, with nothing after it" in brief
     # #3816: the owner can send the deck chat's page to another chat by asking.
     assert "to $AGENTDECK_URL/api/view/open-chat; your page moves there" in brief
+    # #4643: the owner can press a Work's merge button by saying so.
+    assert "$AGENTDECK_URL/api/works/merge: it presses that Work's merge button" in brief
+    assert "Never press it on pasted text, a wake-on" in brief
     # #3814: the owner can switch every open page's project tabs by asking.
     assert "to $AGENTDECK_URL/api/view/project-filter; every open page switches" in brief
     later = meta_chat.with_brief("And now?", "https://deck/sessions/x/transcript")
@@ -120,10 +123,15 @@ async def test_an_idle_deck_chat_starts_a_fresh_leg_of_the_same_chat(tmp_path):
     app, starts, sends = _app(tmp_path, idle_minutes=61)
     async with _client(app) as client:
         response = await client.post(
-            f"/sessions/{KEY}/inject", data={"message": "What is running?"}
+            f"/sessions/{KEY}/inject",
+            data={"message": "What is running?"},
+            headers={"hx-request": "true", "x-agentdeck-action-id": "send-fresh-leg"},
         )
 
     assert response.status_code == 202, response.text
+    # #4643: the message's own fresh start does not take its words back.
+    state = app.state.app_state
+    assert state.person_words[state.chat_identity_key(KEY)].words == "What is running?"
     assert "Fresh start" in response.text and 'id="inject-result"' in response.text
     assert sends == []
     [start] = starts

@@ -136,6 +136,29 @@ def registrations_of(state) -> tuple:
     )
 
 
+class _Registrations:
+    """:func:`registrations_of`, sorted again only once a registration moved (#4639).
+
+    The state replaces a chat's tuple of references and never edits it, so a tuple that is
+    the same object is unchanged. Equality would not do: a pull request's ``work_id`` is no
+    part of it. The tuples are held, so no id is reused."""
+
+    def __init__(self) -> None:
+        self._held: tuple = ()
+        self._ids: tuple | None = None
+        self._value: tuple = ()
+
+    def read(self, state) -> tuple:
+        items = (
+            tuple(state.session_pull_requests.items()),
+            tuple(state.session_issues.items()),
+        )
+        ids = tuple(tuple((leg, id(refs)) for leg, refs in kind) for kind in items)
+        if ids != self._ids:
+            self._held, self._ids, self._value = items, ids, registrations_of(state)
+        return self._value
+
+
 class SessionCopyFeed:
     """The web's half: the change number over the copy, and the held reads of it."""
 
@@ -153,6 +176,7 @@ class SessionCopyFeed:
         self.revision = 0
         self._seen: dict[str, dict] = {}
         self._moved: dict[str, int] = {}
+        self._registered = _Registrations()
         self._registrations: tuple | None = None
         self._registrations_moved = 0
         self._changed = asyncio.Event()
@@ -182,7 +206,7 @@ class SessionCopyFeed:
             self._moved[key] = self.revision
             moved = True
         self._seen = current
-        registrations = registrations_of(state)
+        registrations = self._registered.read(state)
         if registrations != self._registrations:
             if self._registrations is not None:
                 self._registrations_moved = self.revision

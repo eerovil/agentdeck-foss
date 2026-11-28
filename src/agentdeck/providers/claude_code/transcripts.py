@@ -20,14 +20,17 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import NamedTuple
 
-from ...deck_notices import without_routine
+from ...deck_notices import is_job_message, is_keep_warm, without_routine
 from ...images import SUPPORTED_IMAGE_MEDIA_TYPES
-from ...models import TokenTotals, TranscriptEvent
+from ...models import CacheCall, TokenTotals, TranscriptEvent
+from ...note_text import without_notes
 from ...questions import trailing_question as trailing_question
 from ..transcript_reader import (
     AGENT_TEXT,
+    HIDDEN_TURN,
     PROMPT,
     RESET,
+    TURN,
     LineParser,
     NewestMessages,
     TranscriptMeta,
@@ -672,6 +675,8 @@ class ContextReading(NamedTuple):
     # When the prompt cache of the last call counts as gone (#4169): its time plus 90 % of
     # the lifetime its usage block names, None when the tail names none.
     cache_expires_at: datetime | None = None
+    # The last call itself (#4737), None when the tail holds none with a time.
+    cache_call: CacheCall | None = None
 
 
 # The two lifetimes Anthropic's prompt cache has, shortest first: a usage block that
@@ -753,17 +758,16 @@ def _context_in_tail(path: Path, tail: int) -> tuple[ContextReading | None, bool
         return ContextReading(compacted=True), size > tail
     if latest is None:
         return None, size > tail
-    tokens = (
-        int(latest.get("input_tokens", 0) or 0)
-        + int(latest.get("cache_read_input_tokens", 0) or 0)
-        + int(latest.get("cache_creation_input_tokens", 0) or 0)
-    )
+    read = int(latest.get("cache_read_input_tokens", 0) or 0)
+    written = int(latest.get("cache_creation_input_tokens", 0) or 0)
+    tokens = int(latest.get("input_tokens", 0) or 0) + read + written
     expires = (
         latest_at + lifetime * _CACHE_SAFE_SHARE
         if latest_at is not None and lifetime is not None
         else None
     )
-    return ContextReading(tokens, cache_expires_at=expires), size > tail
+    call = CacheCall(latest_at, lifetime, read, written) if latest_at is not None else None
+    return ContextReading(tokens, cache_expires_at=expires, cache_call=call), size > tail
 
 
 def last_context_reading(path: Path, *, tail: int = 65536) -> ContextReading:
@@ -791,10 +795,12 @@ def _lifetime_further_back(found: ContextReading) -> bool:
 
 
 def _user_text(obj: dict) -> str | None:
+    """The person's own words: the deck notes and the routine line in front go before the cut
+    (#4618), which would otherwise leave a card showing nothing but notes."""
     message = obj.get("message")
     content = message.get("content") if isinstance(message, dict) else None
     if isinstance(content, str):
-        return content.strip()[:200] or None
+        return without_routine(without_notes(content).strip())[:200] or None
     if isinstance(content, list):
         parts = [
             b["text"]
@@ -802,7 +808,7 @@ def _user_text(obj: dict) -> str | None:
             if isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str)
         ]
         joined = " ".join(parts).strip()
-        return joined[:200] or None
+        return without_routine(without_notes(joined).strip())[:200] or None
     return None
 
 
@@ -832,6 +838,28 @@ def _may_carry_message(raw: bytes) -> bool:
     return b'"user"' in raw or b'"assistant"' in raw or b'"queue-operation"' in raw
 
 
+def _is_keep_warm_line(obj: dict) -> bool:
+    """The user line the deck's keep-warm ping wrote (#4737)."""
+    return (
+        obj.get("type") == "user"
+        and not obj.get("isSidechain")
+        and is_keep_warm(_user_content_text(obj))
+    )
+
+
+def _opens_background_turn(obj: dict) -> bool:
+    """A background notification, as its own user line or queued behind a running turn: it
+    opens a turn and is no message. What follows one is not a keep-warm ping's (#4737)."""
+    kind = obj.get("type")
+    if kind == "user":
+        return not obj.get("isSidechain") and _is_task_notification_line(obj)
+    return (
+        kind == "queue-operation"
+        and obj.get("operation") == "enqueue"
+        and _is_task_notification_text(obj.get("content"))
+    )
+
+
 def _newest_messages(path: Path) -> NewestMessages:
     """The newest prompt and newest agent reply, by reverse scan from EOF.
 
@@ -855,6 +883,10 @@ def _newest_messages(path: Path) -> NewestMessages:
             return (AGENT_TEXT, _assistant_text(obj))
         if ltype == "user" and (command := _agent_slash_command_text(obj)) is not None:
             return (PROMPT, command)
+        if _is_keep_warm_line(obj):
+            return (HIDDEN_TURN, None)
+        if _opens_background_turn(obj):
+            return (TURN, None)
         if ltype == "user" and not _is_noise_user(obj) and not obj.get("isSidechain"):
             return (PROMPT, _user_text(obj))  # None for tool_result-only user lines
         if (
@@ -863,6 +895,8 @@ def _newest_messages(path: Path) -> NewestMessages:
             and isinstance(obj.get("content"), str)
             and obj["content"].strip()
             and not _is_bookkeeping_text(obj["content"])
+            # A ping queued behind a running turn opens nothing of its own.
+            and not is_keep_warm(obj["content"])
         ):
             return (PROMPT, obj["content"].strip())
         return None
@@ -873,11 +907,6 @@ def _newest_messages(path: Path) -> NewestMessages:
         prefilter=_may_carry_message,
         message_timestamp=lambda obj: _parse_ts(obj.get("timestamp")),
     )
-
-
-# How ``jobs.job_message`` opens the message a chat gets when its queued job ends. A test keeps
-# the two in step: this module must not import the job queue.
-JOB_MESSAGE_PREFIX = "Your queued job "
 
 
 def _only_tool_results(obj: dict) -> bool:
@@ -892,8 +921,9 @@ def _only_tool_results(obj: dict) -> bool:
 
 def _is_background_text(text: object) -> bool:
     return _is_task_notification_text(text) or (
-        # A passed job's message opens with the routine line (#4253).
-        isinstance(text, str) and without_routine(text.lstrip()).startswith(JOB_MESSAGE_PREFIX)
+        # A passed job's message opens with the routine line (#4253), after any deck notes.
+        isinstance(text, str)
+        and is_job_message(text.lstrip())
     )
 
 
@@ -1141,6 +1171,8 @@ def transcript_meta(path: Path, *, head: int = 65536, tail: int = 32768) -> Tran
     last_message_at: datetime | None = None
     model: str | None = None
     compacted = False  # a /compact with no real prompt after it → drop stale last-prompt
+    # Inside a turn the deck's keep-warm ping opened (#4737): its reply is no message.
+    in_ping = False
     try:
         size = path.stat().st_size
         with path.open("rb") as f:
@@ -1154,7 +1186,7 @@ def transcript_meta(path: Path, *, head: int = 65536, tail: int = 32768) -> Tran
 
     def scan(blob: bytes, skip_first_partial: bool) -> None:
         nonlocal ai_title, last_prompt, first_user, cwd, last_text, last_role
-        nonlocal last_message_at, model, compacted
+        nonlocal last_message_at, model, compacted, in_ping
         lines = blob.split(b"\n")
         if skip_first_partial and lines:
             lines = lines[1:]  # a mid-file seek can land inside a line
@@ -1185,6 +1217,8 @@ def transcript_meta(path: Path, *, head: int = 65536, tail: int = 32768) -> Tran
             t = obj.get("type")
             if t == "ai-title" and isinstance(obj.get("aiTitle"), str):
                 ai_title = obj["aiTitle"].strip() or ai_title
+            elif t == "last-prompt" and is_keep_warm(obj.get("lastPrompt")):
+                pass  # the CLI's own record of the ping
             elif t == "last-prompt" and not compacted and isinstance(obj.get("lastPrompt"), str):
                 # bookkeeping fallback — written a few lines *after* the user
                 # turn, so the real user line below is what keeps us in sync.
@@ -1195,11 +1229,15 @@ def transcript_meta(path: Path, *, head: int = 65536, tail: int = 32768) -> Tran
                 message = obj.get("message")
                 if isinstance(message, dict) and isinstance(message.get("model"), str):
                     model = message["model"] or model
-                at = _assistant_text(obj)
+                at = None if in_ping else _assistant_text(obj)
                 if at:
                     last_text = at
                     last_role = "agent"
                     last_message_at = _parse_ts(obj.get("timestamp"))
+            elif _is_keep_warm_line(obj):
+                in_ping = True
+            elif _opens_background_turn(obj):
+                in_ping = False
             elif t == "user":
                 if not obj.get("isSidechain"):
                     command = _agent_slash_command_text(obj)
@@ -1213,17 +1251,20 @@ def transcript_meta(path: Path, *, head: int = 65536, tail: int = 32768) -> Tran
                         last_role = "user"
                         last_message_at = _parse_ts(obj.get("timestamp"))
                         compacted = False  # a genuine post-compact prompt is current
+                        in_ping = False
             elif (
                 t == "queue-operation"
                 and obj.get("operation") == "enqueue"
                 and isinstance(obj.get("content"), str)
                 and obj["content"].strip()
                 and not _is_bookkeeping_text(obj["content"])
+                and not is_keep_warm(obj["content"])
             ):
                 last_prompt = obj["content"].strip()  # typed-while-busy message
                 last_role = "user"
                 last_message_at = _parse_ts(obj.get("timestamp"))
                 compacted = False
+                in_ping = False
 
     scan(head_bytes, skip_first_partial=False)
     if tail_bytes:
@@ -1231,9 +1272,8 @@ def transcript_meta(path: Path, *, head: int = 65536, tail: int = 32768) -> Tran
     # The windows above can miss the newest prompt or reply entirely when one
     # agent turn is larger than the tail; the reverse scan is what decides them,
     # and their order with it. A slot it could not settle keeps the window value.
-    last_prompt, last_text, last_role, last_message_at = _newest_messages(
-        path
-    ).merged_with(
+    newest = _newest_messages(path)
+    last_prompt, last_text, last_role, last_message_at = newest.merged_with(
         prompt=last_prompt,
         text=last_text,
         role=last_role,
@@ -1248,6 +1288,7 @@ def transcript_meta(path: Path, *, head: int = 65536, tail: int = 32768) -> Tran
         last_role=last_role,
         last_message_at=last_message_at,
         model=model,
+        keep_warm_turn=newest.hidden_newest,
     )
 
 

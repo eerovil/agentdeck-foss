@@ -8,7 +8,10 @@ from unittest.mock import MagicMock
 import pytest
 from watchfiles import Change
 
-from agentdeck.models import Account, Session, SessionStatus
+from agentdeck.deck_notices import KEEP_WARM_TEXT, ROUTINE_LINE, routine
+from agentdeck.jobs import DONE, FAILED, Job, job_message, progress_message
+from agentdeck.models import Account, CacheCall, Session, SessionStatus
+from agentdeck.note_text import with_notes
 from agentdeck.providers.claude_code import provider as provider_mod
 from agentdeck.providers.claude_code import transcripts
 from agentdeck.providers.claude_code.provider import ClaudeCodeProvider
@@ -1441,11 +1444,21 @@ def test_last_context_reading_says_when_the_cache_counts_as_gone(tmp_path):
     # wider tail still finds its lifetime.
     big = {"type": "user", "message": {"role": "user", "content": "x" * 70_000}}
     _write(p, [call("2026-11-07T08:00:00Z", 0, 6110), big, call("2026-11-07T09:00:00Z", 0, 0)])
-    assert transcripts.last_context_reading(p) == (
+    assert transcripts.last_context_reading(p)[:3] == (
         101,
         False,
         datetime(2026, 11, 7, 9, 54, tzinfo=UTC),
     )
+    # The call itself (#4737): when it was, the lifetime the tail named, and what it read
+    # and wrote. One that wrote more than it read came to a cold cache.
+    warm = transcripts.last_context_reading(p).cache_call
+    assert warm == CacheCall(datetime(2026, 11, 7, 9, tzinfo=UTC), timedelta(hours=1), 100, 0)
+    assert not warm.missed
+    _write(p, [call("2026-11-07T08:00:00Z", 0, 6110)])
+    assert transcripts.last_context_reading(p).cache_call.missed
+    # A warm call writes a little too, the turn it just read: that is no miss.
+    _write(p, [call("2026-11-07T08:00:00Z", 0, 60)])
+    assert not transcripts.last_context_reading(p).cache_call.missed
     # No lifetime named, or no time: unknown, and the chat page never asks.
     _write(p, [call("2026-11-07T08:00:00Z", 0, 0)])
     assert transcripts.last_context_reading(p).cache_expires_at is None
@@ -1456,8 +1469,12 @@ def test_last_context_reading_says_when_the_cache_counts_as_gone(tmp_path):
 def test_last_context_reading_none_without_usage(tmp_path):
     p = tmp_path / "t.jsonl"
     _write(p, [USER, TOOL_RESULT])
-    assert transcripts.last_context_reading(p) == (None, False, None)
-    assert transcripts.last_context_reading(tmp_path / "missing.jsonl") == (None, False, None)
+    assert transcripts.last_context_reading(p)[:3] == (None, False, None)
+    assert transcripts.last_context_reading(tmp_path / "missing.jsonl")[:3] == (
+        None,
+        False,
+        None,
+    )
 
 
 def test_last_context_reading_reset_by_compaction(tmp_path):
@@ -1465,7 +1482,7 @@ def test_last_context_reading_reset_by_compaction(tmp_path):
     # reflects the (now much smaller) context — report unknown, not the old size.
     p = tmp_path / "t.jsonl"
     _write(p, [ASSISTANT, COMPACT_SUMMARY, COMPACT_CMD, COMPACT_STDOUT])
-    assert transcripts.last_context_reading(p) == (None, True, None)
+    assert transcripts.last_context_reading(p)[:3] == (None, True, None)
 
 
 def test_last_context_reading_finds_a_compact_behind_its_attachments(tmp_path):
@@ -1474,7 +1491,7 @@ def test_last_context_reading_finds_a_compact_behind_its_attachments(tmp_path):
     attachment = {"type": "attachment", "attachment": {"content": "x" * 44_000}}
     p = tmp_path / "t.jsonl"
     _write(p, [ASSISTANT, COMPACT_SUMMARY, COMPACT_CMD, COMPACT_STDOUT, attachment, attachment])
-    assert transcripts.last_context_reading(p) == (None, True, None)
+    assert transcripts.last_context_reading(p)[:3] == (None, True, None)
 
 
 def test_last_context_reading_finds_a_size_behind_a_large_tool_result(tmp_path):
@@ -1504,7 +1521,7 @@ def test_last_context_reading_after_post_compact_turn(tmp_path):
     }
     p = tmp_path / "t.jsonl"
     _write(p, [ASSISTANT, COMPACT_SUMMARY, post])
-    assert transcripts.last_context_reading(p) == (300, False, None)
+    assert transcripts.last_context_reading(p)[:3] == (300, False, None)
 
 
 def test_last_event_idle_after_compact(tmp_path):
@@ -2315,7 +2332,10 @@ QUEUED_ANSWER = {
     "type": "attachment",
     "attachment": {"type": "queued_command", "prompt": "yes, re-render it"},
 }
-JOB_REPORT = _said("Your queued job 0f37c6ce89bd finished successfully.\nExit code: 0")
+JOB = Job("0f37c6ce89bd", ["pytest"], "/tmp", "/nonexistent.log", 0.0, state=DONE)
+JOB_REPORT = _said(job_message(JOB).removeprefix(ROUTINE_LINE).lstrip())
+PROGRESS_REPORT = _said(progress_message(JOB, 120.0))
+NOTED_JOB_REPORT = _said(with_notes(["Review passed."], job_message(JOB)))
 
 
 @pytest.mark.parametrize(
@@ -2324,6 +2344,13 @@ JOB_REPORT = _said("Your queued job 0f37c6ce89bd finished successfully.\nExit co
         # #2760: a render watcher woke the chat after it asked a question; nobody answered.
         ([USER, ASSISTANT, TASK_NOTIFICATION, ASSISTANT, TOOL_RESULT], True),
         ([USER, ASSISTANT, JOB_REPORT, ASSISTANT], True),
+        ([USER, ASSISTANT, NOTED_JOB_REPORT, ASSISTANT], True),
+        ([USER, ASSISTANT, PROGRESS_REPORT, ASSISTANT], True),
+        ([USER, ASSISTANT, _enqueue(job_message(JOB))], False),
+        ([TASK_NOTIFICATION, ASSISTANT, _enqueue(job_message(JOB))], True),
+        # A person's own words about a job are an ordinary message.
+        ([USER, ASSISTANT, _said("Your queued job is stuck"), ASSISTANT], False),
+        ([USER, ASSISTANT, _said("Your queued job abc123 failed. Why?"), ASSISTANT], False),
         ([TASK_NOTIFICATION, ASSISTANT, USER, ASSISTANT, TOOL_RESULT], False),
         ([TASK_NOTIFICATION, ASSISTANT, IMAGE_ONLY], False),
         ([TASK_NOTIFICATION, ASSISTANT, COMPACT_SUMMARY], False),
@@ -2346,9 +2373,6 @@ def test_a_turn_a_background_notification_opened_is_told_from_a_message(
 
 
 def test_the_job_report_prefix_is_what_the_queue_sends():
-    from agentdeck.deck_notices import ROUTINE_LINE
-    from agentdeck.jobs import DONE, FAILED, Job, job_message
-
     job = Job("abc123", ["pytest", "-q"], "/tmp", "/nonexistent.log", 0.0, state=DONE)
     passed = job_message(job)
     # A passed job is a success notice and opens with the routine line (#4253); a failed one
@@ -2356,8 +2380,14 @@ def test_the_job_report_prefix_is_what_the_queue_sends():
     assert passed.startswith(ROUTINE_LINE)
     assert transcripts._is_background_text(passed)
     failed = job_message(Job("abc123", ["pytest"], "/tmp", "/nonexistent.log", 0.0, state=FAILED))
-    assert failed.startswith(transcripts.JOB_MESSAGE_PREFIX)
+    assert not failed.startswith(ROUTINE_LINE)
     assert transcripts._is_background_text(failed)
+
+
+def test_a_card_cuts_a_job_report_after_its_notes_and_routine_line():
+    said = "Your queued job 0f37c6ce89bd finished successfully.\n" + "x" * 300
+    line = _said(with_notes(["Review passed."], routine(said)))
+    assert transcripts._user_text(line) == said[:200]
 
 
 def test_only_a_working_chat_carries_its_turns_opener(tmp_path):
@@ -2373,6 +2403,98 @@ def test_only_a_working_chat_carries_its_turns_opener(tmp_path):
 
     provider._note_turn_opener(working, None)
     assert working.background_turn is False
+
+
+PING = {"type": "user", "timestamp": "2026-07-03T09:00:00Z",
+        "message": {"role": "user", "content": KEEP_WARM_TEXT}}
+PONG = {"type": "assistant", "timestamp": "2026-07-03T09:00:02Z",
+        "message": {"role": "assistant", "content": [{"type": "text", "text": "ok"}]}}
+REPLY = {"type": "assistant", "timestamp": "2026-07-03T08:00:05Z",
+         "message": {"role": "assistant", "content": [{"type": "text", "text": "Waiting on CI."}]}}
+THOUGHT = {"type": "assistant", "timestamp": "2026-07-03T09:00:01Z",
+           "message": {"role": "assistant", "content": [{"type": "thinking", "thinking": "."}]}}
+
+
+@pytest.mark.parametrize(
+    ("lines", "prompt", "text", "role", "ping_turn"),
+    [
+        # The ping and its answer are no message: the chat reads as it did before them.
+        ([USER, REPLY, PING, PONG], "hello there", "Waiting on CI.", "agent", True),
+        ([USER, REPLY, PING, THOUGHT, PONG], "hello there", "Waiting on CI.", "agent", True),
+        ([USER, REPLY, PING], "hello there", "Waiting on CI.", "agent", True),
+        ([USER, REPLY, PING, PONG, PING, PONG], "hello there", "Waiting on CI.", "agent", True),
+        # The CLI's own records of the ping, queued behind a turn or kept as its last prompt.
+        ([USER, REPLY, _enqueue(KEEP_WARM_TEXT), PING, PONG,
+          {"type": "last-prompt", "lastPrompt": KEEP_WARM_TEXT}],
+         "hello there", "Waiting on CI.", "agent", True),
+        # A real message after it is the newest turn again, and the ping's answer is still
+        # not the chat's reply.
+        ([USER, REPLY, PING, PONG, _said("go on")], "go on", "Waiting on CI.", "user", False),
+        ([USER, REPLY, PING, PONG, _enqueue("go on")], "go on", "Waiting on CI.", "user", False),
+        ([USER, REPLY, PING, PONG, _said("go on"), ASSISTANT],
+         "go on", "Doing the thing", "agent", False),
+        # So is a background notification, which is no message itself: the turn it opened is
+        # real work, and its reply is the chat's.
+        ([USER, REPLY, PING, PONG, TASK_NOTIFICATION],
+         "hello there", "Waiting on CI.", "agent", False),
+        ([USER, REPLY, PING, PONG, TASK_NOTIFICATION, ASSISTANT],
+         "hello there", "Doing the thing", "agent", False),
+        ([USER, REPLY, PING, PONG, _enqueue(TASK_NOTIFICATION["message"]["content"])],
+         "hello there", "Waiting on CI.", "agent", False),
+        # A person whose prompt opens with the ping's own words is a person.
+        ([USER, REPLY, _said("AgentDeck keep-warm: why do I see this?")],
+         "AgentDeck keep-warm: why do I see this?", "Waiting on CI.", "user", False),
+        # A person quoting the ping is a person.
+        ([USER, REPLY, _said("what is 'AgentDeck keep-warm: ' for?")],
+         "what is 'AgentDeck keep-warm: ' for?", "Waiting on CI.", "user", False),
+    ],
+)
+def test_a_keep_warm_ping_and_its_answer_are_no_message(
+    tmp_path, lines, prompt, text, role, ping_turn
+):
+    """#4737: nothing that reads a chat's last turn sees the ping."""
+    p = tmp_path / "t.jsonl"
+    _write(p, lines)
+    meta = transcripts.transcript_meta(p)
+    assert (meta.last_prompt, meta.last_text, meta.last_role) == (prompt, text, role)
+    assert meta.keep_warm_turn is ping_turn
+    if ping_turn:
+        assert meta.last_message_at == datetime(2026, 7, 3, 8, 0, 5, tzinfo=UTC)
+
+
+def test_a_keep_warm_turn_is_reported_as_no_work_at_all(tmp_path):
+    """#4737: the provider is the one place that knows, so the Work's status, attention,
+    the idle edge and the quota retry never see a ping start, end or fail a turn."""
+    p = tmp_path / "t.jsonl"
+    _write(p, [USER, REPLY, PING])
+    provider = ClaudeCodeProvider()
+    before = datetime(2026, 7, 3, 8, 0, 5, tzinfo=UTC)
+
+    def pinged():
+        return Session(
+            "claude_code:a:s", "claude_code:a", "s", SessionStatus.LIVE, thinking=True,
+            stalled=True, activity="Answering", turn_failed=True,
+            automatic_retry_at=before, last_message_at=before,
+            last_activity=before + timedelta(hours=1),
+            last_progress=before + timedelta(hours=1),
+        )
+
+    session = pinged()
+    provider._note_turn_opener(session, p, transcripts.transcript_meta(p))
+    assert session.keep_warm_turn
+    assert (session.thinking, session.stalled, session.activity) == (False, False, None)
+    assert (session.turn_failed, session.automatic_retry_at) == (False, None)
+    # Neither clock a Work's "last moved" reads is moved by the ping.
+    assert session.last_activity == session.last_progress == before
+    # No fresh read: the last answer stands.
+    session.thinking = True
+    provider._note_turn_opener(session, p)
+    assert session.thinking is False
+    # A real message ends it.
+    _write(p, [USER, REPLY, PING, PONG, _said("go on")])
+    session = pinged()
+    provider._note_turn_opener(session, p, transcripts.transcript_meta(p))
+    assert not session.keep_warm_turn and session.thinking and session.turn_failed
 
 
 async def test_the_live_window_stops_listing_old_owned_claude_workers(tmp_path, monkeypatch):

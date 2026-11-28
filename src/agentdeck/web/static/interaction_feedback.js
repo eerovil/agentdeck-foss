@@ -37,7 +37,16 @@
     var input = form && form.querySelector('textarea[name="message"]');
     return !(input && isSecretCommand(input.value));
   }
-  window.AgentDeckSendRetry = {bufferable: retryBufferable};
+  // What a send's bubble shows in place of a secret's text; null for ordinary text.
+  function secretLabel(message) {
+    if (!isSecretCommand(message)) return null;
+    var name = secretName(message);
+    return name ? 'Temporary secret ' + name + ' submitted securely' :
+      'Temporary secret command submitted securely';
+  }
+  window.AgentDeckSendRetry = {
+    bufferable: retryBufferable, isSecretCommand: isSecretCommand, secretLabel: secretLabel, secretName: secretName
+  };
 
   // The line the server sends in place of an empty box (`_attachment_only_text`, #3790).
   function attachmentOnlyText(files) {
@@ -69,11 +78,8 @@
 
     var text = document.createElement('div');
     text.className = 'ev-text';
-    var name = secretName(input.value);
-    text.textContent = isSecretCommand(input.value)
-      ? (name ? 'Temporary secret ' + name + ' submitted securely' :
-        'Temporary secret command submitted securely')
-      : (input.value.trim() || attachmentOnlyText(files));
+    text.textContent = secretLabel(input.value)
+      || (input.value.trim() || attachmentOnlyText(files));
     row.appendChild(head);
     row.appendChild(text);
     if (files.length) {

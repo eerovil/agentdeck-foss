@@ -483,12 +483,8 @@ class Overlay:
     # Accounts this project may run work on, in the order it should fall back through. The
     # primary account is always first, so a host that names none still has a one-entry list.
     accounts: tuple[str, ...] = ()
-    # Optional per-account budget ceilings. Accounts not named here keep the engine default.
-    # The keys are provider-qualified account identities from ``accounts``.
-    usage_ceilings: dict[str, float] = field(default_factory=dict)
-    # Optional per-account "spend the window this full before it resets" targets (#1965).
-    # Accounts not named here use the engine default; naming one with ``0`` opts it out.
-    usage_targets: dict[str, float] = field(default_factory=dict)
+    # ``usage_ceilings`` and ``usage_targets`` were read here and used by nothing (#4728): an
+    # Overlay that still carries either loads as before, and the tables are not looked at.
     # Where the deck publishes provider-qualified usage snapshots. Machine-local, so the
     # Overlay states it; absent means the engine cannot see usage and never blocks a wake.
     usage_cache: str = ""
@@ -779,6 +775,9 @@ LIGHT_REVIEW_LIMIT = "light_review_limit"
 #: ``promote/production``. The deploy wait the deck registers on a merge is named by it, so it
 #: reads commit statuses and counts a later deploy that contains the merge.
 DEPLOY_NAME = "deploy_name"
+#: A ``[[repos]]`` key the deck's router alone reads (#4794): the label it keeps on a Work's
+#: issue in this repository while every pull request registered for the Work has merged.
+PUBLISHED_LABEL = "published_label"
 _AUTO_RELEASE_CAPABILITIES = ("guarded_release", "merge_review")
 
 
@@ -1371,10 +1370,25 @@ def _parse_repos(raw: object, report: Report) -> tuple[Repo, ...]:
         ):
             report.add(
                 f"{location}.{DEPLOY_NAME}",
-                "must be the production deploy's status or environment name, and only beside"
-                " auto_deploys",
+                "must be the production deploy's status, check run or environment name, and"
+                " only beside auto_deploys",
                 'set it to the words of the deploy\'s commit status, for example'
                 ' "promote/production"',
+            )
+        # Read by the deck's router alone (#4794), as ``check_tests`` is.
+        published = entry.get(PUBLISHED_LABEL)
+        if published is not None and (
+            not isinstance(published, str)
+            or not published.strip()
+            or len(published.strip()) > 50
+            or not flags["holds_issues"]
+        ):
+            report.add(
+                f"{location}.{PUBLISHED_LABEL}",
+                "must be a label name of at most 50 characters, and only on a repository"
+                " that holds issues",
+                "set it to the label a Work's issue carries once its pull requests merged,"
+                ' for example "julkaistu"',
             )
         repo = Repo(
             id=repo_id,
@@ -1441,42 +1455,6 @@ def _parse_repos(raw: object, report: Report) -> tuple[Repo, ...]:
             "add at least one [[repos]] entry that holds issues",
         )
     return tuple(repos)
-
-
-def _account_percentages(
-    worker: dict,
-    key: str,
-    accounts: tuple[str, ...],
-    report: Report,
-    *,
-    example: str,
-    remedy: str,
-) -> dict[str, float]:
-    """One `[worker]` table mapping an account key to a percentage, validated.
-
-    A bad entry is reported and dropped rather than refusing the whole Overlay: the account
-    order it decorates is still usable, and the engine's defaults still apply to it.
-    """
-    raw = worker.get(key, {})
-    parsed: dict[str, float] = {}
-    if not isinstance(raw, dict):
-        report.add(
-            f"overlay.worker.{key}", "must be a table from account key to percentage", example
-        )
-        return parsed
-    for name, value in raw.items():
-        location = f"overlay.worker.{key}.{name}"
-        if not isinstance(name, str) or not isinstance(value, int | float):
-            report.add(location, "must be a numeric percentage", "use a number from 0 to 100")
-            continue
-        if name not in accounts:
-            report.add(location, "names an account the worker order does not offer", remedy)
-            continue
-        if not 0 <= float(value) <= 100:
-            report.add(location, "must be between 0 and 100", "use a valid percentage")
-            continue
-        parsed[name] = float(value)
-    return parsed
 
 
 def _host_path(value: str, where: str, report: Report) -> str:
@@ -1571,23 +1549,6 @@ def parse_overlay(raw: dict, report: Report) -> Overlay:
         fallbacks = []
     accounts = tuple(key for key in dict.fromkeys([account, *fallbacks]) if key)
 
-    usage_ceilings = _account_percentages(
-        worker,
-        "usage_ceilings",
-        accounts,
-        report,
-        example='e.g. usage_ceilings = { "claude_code:main" = 50, "codex:codex" = 90 }',
-        remedy="add it to account/fallback_accounts or remove this ceiling",
-    )
-    usage_targets = _account_percentages(
-        worker,
-        "usage_targets",
-        accounts,
-        report,
-        example='e.g. usage_targets = { "claude_code:alt" = 99 }',
-        remedy="add it to account/fallback_accounts or remove this target",
-    )
-
     usage_cache = worker.get("usage_cache", "")
     if not isinstance(usage_cache, str):
         report.add(
@@ -1605,8 +1566,6 @@ def parse_overlay(raw: dict, report: Report) -> Overlay:
         checkouts=checkouts,
         account=account,
         accounts=accounts,
-        usage_ceilings=usage_ceilings,
-        usage_targets=usage_targets,
         usage_cache=usage_cache,
         credentials=_table(raw, "credentials", report, "overlay"),
         log_path=log_path,

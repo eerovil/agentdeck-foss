@@ -151,6 +151,63 @@ async def test_deliver_endpoint_disabled_returns_404():
     assert r.status_code == 404
 
 
+async def test_a_keep_warm_ping_has_a_route_of_its_own_and_its_old_flag_is_refused():
+    """#4737, #4752: the ping reaches Claude's host fenced and as a machine's message, and
+    the flag an older deck sent on the message route starts nothing for any provider."""
+    app = create_runtime_app(
+        AppConfig.model_validate(
+            {
+                "claude_workers": {"enabled": True},
+                "accounts": [
+                    {"provider": "claude_code", "label": "main", "config_dir": "~/.claude"},
+                    {"provider": "codex", "label": "codex", "config_dir": "~/.codex"},
+                ],
+            }
+        )
+    )
+    claude, codex = MagicMock(), MagicMock()
+    claude.deliver = AsyncMock(return_value=DeliverResult(True, "delivered", session_id="s1"))
+    codex.deliver = AsyncMock(return_value=DeliverResult(True, "spawned", session_id="t1"))
+    app.state.claude_workers.hosts["main"] = claude
+    app.state.codex_workers.hosts["codex"] = codex
+    old = {"key": "k", "message": "ping", "delivery_id": "keep-warm:1", "require_live": True}
+    ping = {
+        "key": "k",
+        "message": "ping",
+        "delivery_id": "keep-warm:1",
+        "expected_session_id": "s1",
+        "expected_last_result_at": 12.5,
+    }
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://runtime"
+    ) as client:
+        for path in ("/claude/accounts/main/deliver", "/workers/accounts/codex/codex/deliver"):
+            refused = (await client.post(path, json=old)).json()
+            assert not refused["accepted"] and refused["reason"] == "require_live_unsupported"
+        claude.deliver.assert_not_awaited()
+        codex.deliver.assert_not_awaited()
+        # Without the session and the turn it was judged on, it is no ping at all.
+        for missing in ("expected_session_id", "expected_last_result_at"):
+            unfenced = {k: v for k, v in ping.items() if k != missing}
+            reply = await client.post("/claude/accounts/main/keep-warm", json=unfenced)
+            assert reply.status_code == 422
+        sent = await client.post("/claude/accounts/main/keep-warm", json=ping)
+
+    assert sent.json()["accepted"] is True
+    claude.deliver.assert_awaited_once()
+    call = claude.deliver.await_args
+    assert call.args == ("k", "ping")
+    assert call.kwargs == {
+        "delivery_id": "keep-warm:1",
+        "expected_session_id": "s1",
+        "expected_last_result_at": 12.5,
+        "delegated": False,
+        "automated": True,
+        "keep_warm": True,
+    }
+
+
 async def test_deliver_and_key_endpoints_route_to_host():
     app = _runtime_app()
     host = MagicMock()

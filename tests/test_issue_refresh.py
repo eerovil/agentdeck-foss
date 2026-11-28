@@ -17,10 +17,13 @@ class _Resolver:
         self.calls = 0
         self.fail = fail
         self.called = asyncio.Event()
+        self.called_again = asyncio.Event()
 
     async def resolve(self, *, force: bool = False):
         self.calls += 1
         self.called.set()
+        if self.calls > 1:
+            self.called_again.set()
         if self.fail:
             raise RuntimeError("GitHub is unreachable")
         return object()
@@ -47,8 +50,9 @@ async def test_a_failed_refresh_does_not_kill_the_loop():
     service = IssueRefreshService(resolver, interval_s=0.01)
     service.start()
     try:
-        await asyncio.sleep(0.1)
-        assert resolver.calls > 1
+        # Wait for the second call itself: a busy host can spend any fixed sleep
+        # on logging the first failure (#4677).
+        await asyncio.wait_for(resolver.called_again.wait(), timeout=10.0)
     finally:
         await service.stop()
 

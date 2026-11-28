@@ -301,3 +301,24 @@ async def test_a_review_verdict_without_a_commit_is_refused(tmp_path):
 
     assert response.status_code == 422
     assert retired.status_code == 405
+
+
+async def test_review_asked_says_whether_a_pull_request_had_a_review_asked(tmp_path):
+    """#4726: the helper checks ask this before a run, at any head and whatever the case."""
+    from agentdeck import review_history
+
+    app = _app(tmp_path)
+    state = app.state.app_state
+    assert state.record_review_event("own/code#9", "a" * 40, review_history.CHECKLIST, "k1")
+    assert state.record_review_event("own/code#8", "b" * 40, review_history.ASKED, "k2")
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+
+        async def asked(pull: str):
+            return (await client.get("/api/review-asked", params={"pull": pull})).json()["asked"]
+
+        assert await asked("own/code#9") is False, "a checklist is not yet an ask"
+        assert await asked("Own/Code#8") is True
+        assert await asked("own/code#7") is False
+        assert await asked("") is False
+        assert (await client.get("/api/review-asked")).status_code == 422

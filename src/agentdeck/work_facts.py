@@ -349,6 +349,9 @@ class WorkFacts:
     finished_at: datetime | None = None
     # The issue closed and no person has finished the Work since (#2510, ``awaiting_finish``).
     awaiting_finish: bool = False
+    # A pull request its chats registered that is not known to have settled, and is not placed
+    # in another Work (#4631): ``outputs`` leaves out one the deck has not read yet.
+    unsettled_registered: bool = False
     # A person paused the Work on this deck rather than with its Poller's label (#2559).
     deck_paused: bool = False
     # A person starred the Work (#3116): it goes ahead of unstarred Works in every line.
@@ -454,6 +457,17 @@ def _registered_output(
     if number is None:
         return item.exclusive
     return number == ref.number and (item.exclusive or where[0].lower() == ref.repository.lower())
+
+
+def _may_be_open(ref: WorkRef, row: Mapping[str, Any] | None, home: str) -> bool:
+    """Whether a registered pull request may be open and this Work's (#4631).
+
+    Not settled, or not read yet; not placed in another Work, nor on another issue's branch.
+    """
+    if pull_state(row) in _SETTLED or home not in ("", _issue_key(ref)):
+        return False
+    number = issue_number_from_branch(str((row or {}).get("headRefName") or ""))
+    return number is None or number == ref.number
 
 
 def _discover(
@@ -584,6 +598,11 @@ def work_facts(
         earlier_outputs=tuple(output for output in outputs if round_key(output) in earlier),
         round_started_at=getattr(round_, "started_at", None),
         finished_at=finished_at,
+        unsettled_registered=ref is not None
+        and any(
+            _may_be_open(ref, rows.get(item.url.lower()), _home(item.url, homes or {}))
+            for item in registered
+        ),
     )
 
 

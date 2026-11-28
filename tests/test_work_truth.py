@@ -170,7 +170,8 @@ def test_a_closed_issue_whose_close_time_is_unknown_is_finished_never_quiet():
     dated = _done(3, closed=NOW - timedelta(days=30), moved=None)
     dated = replace(dated, card=replace(dated.card, starred=True))
     sections = front_sections([starred, dated], now=NOW)
-    assert sections.starred == (dated, starred) and sections.finished_more == 0
+    assert [row.card for row in sections.starred] == [dated.card, starred.card]
+    assert sections.finished_more == 0
 
 
 def _done(number: int, *, closed: datetime, moved: datetime | None):

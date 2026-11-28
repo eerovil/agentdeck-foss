@@ -30,6 +30,7 @@ from agentdeck.providers.claude_code import transcripts as claude_transcripts
 from agentdeck.providers.codex import transcripts as codex_transcripts
 from agentdeck.providers.codex.appserver import AppServerError, CodexAppServer
 from agentdeck.providers.delivery import DeliveryReceipts
+from agentdeck.session_secrets import secret_notice
 
 
 def _jsonl(path: Path, rows: list[dict]) -> Path:
@@ -1095,6 +1096,83 @@ async def test_box_side_chat_starts_once_then_takes_every_later_message(tmp_path
     await app.state.injector.stop()
 
 
+async def test_box_side_chat_gives_a_secret_as_a_ticket_only(tmp_path, monkeypatch):
+    """#4610: the value reaches neither the side chat nor the answer, whatever happens."""
+    from agentdeck.session_secrets import IssuedSecret
+
+    app = _app(tmp_path)
+    starts = _forkable(monkeypatch)
+    turn, sends = _box_side_chat(monkeypatch, app)
+    issued, revoked = [], []
+
+    async def issue(_socket, **kwargs):
+        issued.append(kwargs)
+        return IssuedSecret(ticket="one-use", name=kwargs["name"])
+
+    async def revoke(_socket, ticket):
+        revoked.append(ticket)
+
+    monkeypatch.setattr("agentdeck.web.routes_actions.issue_runtime_secret", issue)
+    monkeypatch.setattr("agentdeck.web.routes_actions.revoke_runtime_secret", revoke)
+    value = "hunter2-value"
+
+    def post(client, action, text, **kwargs):
+        return client.post(
+            "/sessions/codex:test:sid/side-chat",
+            data={"message": text},
+            headers={"origin": "http://test", "x-agentdeck-action-id": action},
+            **kwargs,
+        )
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        # With no side chat yet there is nobody to give it to, and none is started.
+        early = await post(client, "secret-0001", f"/secret TOKEN {value}")
+        assert early.status_code == 409 and value not in early.text
+        await settle()
+        assert (starts, sends, issued) == ([], [], [])
+        assert app.state.app_state.side_chat_forks(["codex:test:sid"]) == []
+        assert (await post(client, "side-0001", "hi")).status_code == 202
+        for _ in range(20):
+            await settle()
+            if starts:
+                break
+        _live_side(app, starts[0]["session_token"])
+        turn["newest"] = (11, "turn-5")
+        sent = await post(client, "secret-0002", f"  /secret TOKEN {value}")
+        assert sent.status_code == 202 and value not in sent.text
+        assert [(i["session_key"], i["action_id"], i["name"], i["value"]) for i in issued] == [
+            ("codex:test:side", "secret-0002", "TOKEN", value)
+        ]
+        assert len(sends) == 1
+        assert "moved on" in sends[0]["message"]
+        assert "secret-run one-use" in sends[0]["message"]
+        assert value not in sends[0]["message"]
+        for text in ("/secret TOKEN", f"/secret PATH {value}"):
+            bad = await post(client, "secret-0003", text)
+            assert bad.status_code == 422 and value not in bad.text
+        attached = await post(
+            client, "secret-0004", f"/secret TOKEN {value}",
+            files={"images": ("a.txt", b"notes", "text/plain")},
+        )
+        assert attached.status_code == 422 and "attachments" in attached.text
+        assert len(sends) == 1
+        # A refused send takes its ticket back; one that may have written keeps it.
+        for outcome, status, gone in (
+            (InjectResult(False, "unsure", write_uncertain=True), 503, []),
+            (InjectResult(False, "down", runtime_unreachable=True), 503, []),
+            (InjectResult(False, "full"), 409, ["one-use"]),
+        ):
+
+            async def answer(*args, outcome=outcome, **kwargs):
+                return outcome
+
+            monkeypatch.setattr(app.state.injector, "start", answer)
+            refused = await post(client, f"secret-{outcome.reason}", f"/secret TOKEN {value}")
+            assert refused.status_code == status and value not in refused.text
+            assert revoked == gone
+    await app.state.injector.stop()
+
+
 async def test_box_side_chat_that_is_gone_is_replaced(tmp_path, monkeypatch):
     app = _app(tmp_path)
     starts = _forkable(monkeypatch)
@@ -1237,6 +1315,82 @@ async def test_box_side_chat_takes_the_chats_place_with_its_own_draft(tmp_path, 
                 sent_id,
             )
             assert await pending.count() == 0
+            # A secret shows no value, and one that failed comes back nowhere (#4610).
+            async def refuse_secret(route):
+                await route.fulfill(status=503, json={"detail": "unsure"})
+
+            await page.route("**/side-chat", refuse_secret)
+            await page.evaluate(
+                """() => {
+                  window.seenCards = [];
+                  new MutationObserver(() => document.querySelectorAll('.side-view-pending')
+                    .forEach(card => window.seenCards.push(card.textContent)))
+                    .observe(document.body, {childList: true, subtree: true});
+                }"""
+            )
+            await box.fill("/secret TOKEN hunter2")
+            await box.press("Enter")
+            error = page.locator("[data-side-error]")
+            await error.filter(has_text="Re-enter the secret").wait_for()
+            assert await box.input_value() == ""
+            assert "hunter2" not in await page.evaluate("JSON.stringify({...sessionStorage})")
+            assert set(await page.evaluate("window.seenCards")) == {
+                "Temporary secret TOKEN submitted securely"
+            }
+            assert await page.evaluate(
+                "!document.querySelector('[data-side-view]')._uncertainSend"
+            )
+            # One that got through leaves its card until the notice with its name lands.
+            await page.unroute("**/side-chat", refuse_secret)
+            live = await page.locator("[data-side-view-body]").evaluate("el => el.outerHTML")
+
+            async def take_secret(route):
+                await route.fulfill(status=202, content_type="text/html", body=live)
+
+            await page.route("**/side-chat", take_secret)
+            await box.fill("/secret TOKEN hunter2")
+            await box.press("Enter")
+            await page.wait_for_function(
+                "() => !document.querySelector('[data-side-view]').dataset.sending"
+            )
+            assert await pending.count() == 1
+            await page.evaluate(
+                """notice => {
+                  const line = document.createElement('div');
+                  line.className = 'ev user';
+                  line.dataset.eventSeq = line.dataset.eventId = '99';
+                  line.innerHTML = '<div class="ev-text"></div>';
+                  line.firstChild.textContent = notice;
+                  document.querySelector('[data-side-view-log]').dispatchEvent(
+                    new CustomEvent('htmx:sseMessage',
+                      {bubbles: true, detail: {data: line.outerHTML}}));
+                }""",
+                secret_notice("TOKEN", "ticket"),
+            )
+            await pending.first.wait_for(state="detached")
+            await page.unroute("**/side-chat", take_secret)
+            await page.route("**/side-chat", refuse_secret)
+            await box.fill("/secret TOKEN hunter2")
+            await box.press("Enter")
+            await error.filter(has_text="Re-enter the secret").wait_for()
+            assert await error.inner_text() == "unsure. Re-enter the secret to try again."
+            # A failed ordinary send is not put before a secret typed meanwhile.
+            await page.evaluate(
+                """() => {
+                  const plain = window.fetch;
+                  window.fetch = (...args) => new Promise((done, fail) => {
+                    window.loseSend = () => { window.fetch = plain; fail(new Error('lost')); };
+                  });
+                }"""
+            )
+            await box.fill("plain words")
+            await box.press("Enter")
+            await box.fill("/secret TOKEN hunter2")
+            await page.evaluate("window.loseSend()")
+            await error.filter(has_text="Not sent: plain words").wait_for()
+            assert await box.input_value() == "/secret TOKEN hunter2"
+            await page.unroute("**/side-chat", refuse_secret)
+            await box.fill("")
             # A lost answer is an uncertain write: sending the same words again reuses the
             # action id, so the deck can deliver it once.
             ids = []

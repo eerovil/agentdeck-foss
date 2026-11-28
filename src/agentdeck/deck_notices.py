@@ -17,18 +17,42 @@ import re
 from collections.abc import Iterable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 
+from .note_text import without_notes
 from .voice_mode import without_voice_line
 
 #: ``scheduled_messages`` ID prefixes the deck writes for its own messages to a chat.
-DECK_KINDS = frozenset({"wake-on", "work-release", "work-ending", "work-event", "work-handover"})
+DECK_KINDS = frozenset(
+    {"wake-on", "work-release", "work-ending", "work-event", "work-handover", "keep-warm"}
+)
+
+#: The ping that keeps a waiting Work chat's one-hour prompt cache alive (#4737). It asks
+#: nothing: a call that reads the cache renews it, and that call is all it is for.
+KEEP_WARM_PREFIX = "AgentDeck keep-warm: "
+KEEP_WARM_TEXT = (
+    f"{KEEP_WARM_PREFIX}this only keeps this chat's prompt cache warm while it waits."
+    " Nothing happened and nothing is asked of you. Answer with the single word ok,"
+    " and call no tools."
+)
 
 #: What the deck's own messages begin with, when no delivery record is found.
 _PREFIX_KINDS = (
+    (KEEP_WARM_PREFIX, "keep-warm"),
     ("AgentDeck wake-on: ", "wake-on"),
     ("AgentDeck watch: ", "wake-on"),
     ("AgentDeck event: ", "work-event"),
     ("AgentDeck: your last turn on ", "work-ending"),
     ("AgentDeck: ", "work-release"),
+)
+
+#: What ``jobs.job_message`` and ``jobs.progress_message`` write. Sent on their own, so they
+#: have no record of these kinds (#4618). The report's own lines are part of the match: a
+#: person's words may begin with the same sentence.
+_JOB_RE = re.compile(
+    r"Your queued job (\S+) (finished successfully|failed|was cancelled|did not run"
+    r"|was cut off by a runtime restart[^.:\n]*|is still running"
+    r"|ran no tests: every test it selected is quarantined)[.:]"
+    r".*?\nCommand: .*?\nWorking directory: .*?\nFull output: ",
+    re.DOTALL,
 )
 
 #: The Work start brief (``work_start.FIRST_TEXT`` after ``work_side_chat.context_line``).
@@ -51,6 +75,20 @@ def routine(text: str) -> str:
 def without_routine(text: str) -> str:
     """``text`` without a leading routine line, so its sender and label read as before."""
     return text.removeprefix(ROUTINE_LINE).lstrip("\n") if text.startswith(ROUTINE_LINE) else text
+
+
+def is_keep_warm(text: object) -> bool:
+    """Whether ``text`` is the deck's keep-warm ping, which no reader counts as a message.
+
+    The whole text, not its opening words: a person's prompt that begins the same way is
+    theirs, and hiding it would lose their turn from the chat's last message and attention.
+    """
+    return isinstance(text, str) and without_notes(text).strip() == KEEP_WARM_TEXT
+
+
+def is_job_message(text: str) -> bool:
+    """Whether ``text``, which may open with notes, is the queue's own report about a job."""
+    return _JOB_RE.match(without_routine(without_notes(text))) is not None
 
 
 #: When the transcript event a delivery record wrote can carry a time, relative to the
@@ -86,7 +124,8 @@ def notice_kind(
     """
     if not text:
         return None
-    text = without_voice_line(text)
+    # The notes in front of a message say nothing about who sent it (#4618).
+    text = without_voice_line(without_notes(text))
     sent = [(kind_of_record(rid), at) for rid, at in records.get(text, ())]
     sent = [(kind, at) for kind, at in sent if kind is not None]
     if sent:
@@ -100,7 +139,11 @@ def notice_kind(
     if _START_RE.match(text):
         return "work-start"
     text = without_routine(text)
+    if is_job_message(text):
+        return "job"
     for prefix, prefix_kind in _PREFIX_KINDS:
+        if prefix_kind == "keep-warm" and not is_keep_warm(text):
+            continue  # only the ping itself; the same opening words are a person's
         if text.startswith(prefix):
             return "work-handover" if " is now run by the deck" in text[:120] else prefix_kind
     return None
@@ -109,9 +152,11 @@ def notice_kind(
 def candidate_texts(events: Iterable) -> list[str]:
     """The user texts worth looking up in the delivery records."""
     # A deck message sent while voice mode was on ends in the voice line (#3875); its
-    # record holds the text without it.
+    # record holds the text without it, and without any notes it carried (#4618).
     return [
-        without_voice_line(e.text) for e in events if e.role == "user" and e.text and not e.answer
+        without_voice_line(without_notes(e.text))
+        for e in events
+        if e.role == "user" and e.text and not e.answer
     ]
 
 
@@ -140,6 +185,8 @@ def label(text: str, kind: str) -> str:
         return "Turn ended without a next step"
     if kind == "work-handover":
         return "Work handed over to the deck"
+    if kind == "keep-warm":
+        return "Cache kept warm"
     text = without_routine(text)
     body = text.split(": ", 1)[1] if ": " in text[:40] else text
     first = body.split("\n", 1)[0]
@@ -166,6 +213,9 @@ def label(text: str, kind: str) -> str:
             return _clip(f"Problem back · {m.group(1)}")
         if m := re.match(r"your check for (.+?) itself failed", first):
             return _clip(f"Watch check failing · {m.group(1)}")
+    if kind == "job":
+        if m := _JOB_RE.match(text):
+            return _clip(f"Job {m.group(2)} · {m.group(1)[:8]}")
     if kind == "work-event":
         if m := re.match(rf"(.+?) (?:commented|posted) on (?:issue|pull request) {_REF}", first):
             return _clip(

@@ -595,7 +595,8 @@ def _planned_target(target_pct: float, planned_reset: datetime | None, now: date
     """The target, raised to the whole window while a planned reset is ahead (#3379).
 
     Whatever is left at the reset is lost, so the aim is every point the CLI will still run.
-    A target of 0 is the operator opting the account out, and a plan does not override it.
+    A target of 0 opts an account out, and a plan does not override it; no caller sets one
+    since the Overlay's per-account targets went (#4728).
     """
     if target_pct <= 0 or planned_reset is None or planned_reset <= now:
         return target_pct
@@ -623,7 +624,7 @@ def account_expiring_headroom(
     nothing about — ignorance must not promote an account over a measured one.
     """
     moment = now or datetime.now(UTC)
-    target_pct = _planned_target(target_pct, planned_reset, moment)
+    planned_target = _planned_target(target_pct, planned_reset, moment)
     if target_pct <= 0:
         return 0.0
     shortfall = 0.0
@@ -634,9 +635,15 @@ def account_expiring_headroom(
         if length is None:
             continue
         remaining = (resets_at - moment).total_seconds()
-        if remaining <= 0 or remaining > length * EXPIRY_HORIZON_RATIO:
+        if remaining <= 0:
             continue
-        shortfall = max(shortfall, target_pct - pct)
+        # A window the person ends by hand is expiring however far off that is: they set the
+        # end, and the account page lets them set it days ahead (#4717).
+        # A window that resets by itself before the plan keeps its usual horizon and target.
+        by_plan = resets_at == planned_reset
+        if not by_plan and remaining > length * EXPIRY_HORIZON_RATIO:
+            continue
+        shortfall = max(shortfall, (planned_target if by_plan else target_pct) - pct)
     return max(0.0, shortfall)
 
 
@@ -659,7 +666,7 @@ def account_budget_pace(
     work; it never withholds any.
     """
     moment = now or datetime.now(UTC)
-    target_pct = _planned_target(target_pct, planned_reset, moment)
+    planned_target = _planned_target(target_pct, planned_reset, moment)
     pace: float | None = None
     for window, pct, resets_at in account_window_readings(
         usage_cache, account, now=moment, planned_reset=planned_reset
@@ -669,7 +676,9 @@ def account_budget_pace(
         hours = (resets_at - moment).total_seconds() / 3600
         if hours <= 0:
             continue
-        rate = max(0.0, target_pct - pct) / hours if target_pct > 0 else 0.0
+        # Only a window the plan ends is aimed at the whole of it (#4717).
+        aim = planned_target if resets_at == planned_reset else target_pct
+        rate = max(0.0, aim - pct) / hours if aim > 0 else 0.0
         pace = rate if pace is None else max(pace, rate)
     return pace
 

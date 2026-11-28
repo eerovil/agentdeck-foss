@@ -646,6 +646,14 @@ class SessionProvider(ABC):
     ) -> InjectResult:
         return InjectResult(False, "this provider cannot steer active turns")
 
+    async def keep_warm(
+        self, account: Account, session: Session, message: str, *, delivery_id: str
+    ) -> InjectResult:
+        """Write the deck's keep-warm ping into a chat that is idle, resuming its stopped
+        process when the runtime allows, and refuse otherwise (#4737, #4752). A provider
+        whose runtime cannot refuse never sends."""
+        return InjectResult(False, "this provider has no cache to keep warm")
+
     async def interrupt(self, account: Account, session: Session) -> InjectResult:
         return InjectResult(False, "this provider cannot interrupt active turns")
 

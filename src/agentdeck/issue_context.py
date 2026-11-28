@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import hashlib
 import json
 import logging
@@ -442,8 +443,15 @@ class IssueBacklog:
         return tuple(issue for entry in self.repositories for issue in entry.issues)
 
     def issue(self, repository: str, number: int) -> IssueContext | None:
-        key = identity(repository, number)
-        return next((issue for issue in self.issues if issue.identity == key), None)
+        return self._issues_by_identity.get(identity(repository, number))
+
+    @functools.cached_property
+    def _issues_by_identity(self) -> dict[str, IssueContext]:
+        """Every issue by its join key: a front-page pass looks one up for each card (#4639)."""
+        found: dict[str, IssueContext] = {}
+        for issue in self.issues:
+            found.setdefault(issue.identity, issue)
+        return found
 
     def as_json(self) -> dict:
         return {

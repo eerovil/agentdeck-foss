@@ -1,17 +1,17 @@
-"""``agentdeck pre-review-helpers``: three Haiku helpers and one Opus whole review check a
-change before its first review (#4437, #4531).
+"""``agentdeck pre-review-helpers``: three Haiku helpers check a change before its first review
+(#4437). A fourth, an Opus whole review (#4531), is switched off (``WHOLE_REVIEW``, #4533).
 
 Right after a pull request's first push, beside its first full test run, the coding agent runs
 this command from its own checkout (#4567), so the finds join that first fix round; the
 checklist on ready asks for it again only when the coder changed more than the finds asked.
 It starts three ``claude -p --model claude-haiku-5-5`` helpers at once, each with one of the
 lists #4428 measured (every path and input; the rest of the repository; libraries and other
-services), plus the issue and its use cases, and beside them one ``claude-opus-5-5`` pass that
-reviews the whole change by the reviewer's own rules and gives each suspicion a confidence;
-only those at ``CONFIDENCE_FLOOR`` or above are kept (#4512's variant c). It prints what they
-found. The coder fixes each
-real find and posts one ``Helper checks:`` comment on the issue; ``pre-review-done`` refuses
-the first review without it (``review_paperwork``). On the benchmark this caught 5.8 of 7
+services), plus the issue and its use cases. Switched on, the Opus pass (``claude-opus-5-5``)
+goes beside them: it reviews the whole change by the reviewer's own rules and gives each
+suspicion a confidence, and only those at ``CONFIDENCE_FLOOR`` or above are kept (#4512's
+variant c). It prints what they found. The coder fixes each real find and posts one
+``Helper checks:`` comment on the issue; ``pre-review-done`` refuses the first review without
+it (``review_paperwork``). On the benchmark this caught 5.8 of 7
 known bugs per pull request with the review, against 3.0 for the review alone (#4428, #4434).
 
 Each helper:
@@ -23,19 +23,20 @@ Each helper:
 - runs with read-only tools in Claude Code's sandbox with no network (``--settings``), no
   user settings, hooks or CLAUDE.md (``--setting-sources ""``), no MCP servers, no saved
   transcript, only an allowlist of environment variables, and a ``gh`` that refuses;
-- is bounded by its own ``timeout -k 10 300`` (600 for the Opus pass), and gets SIGTERM when
+- is bounded by its own ``timeout -k 10 600``, as the Opus pass is, and gets SIGTERM when
   this command dies (``PR_SET_PDEATHSIG``), so a killed caller leaves nothing spending the
   account.
 
 One run per pull request and head: a second one finds the first's lock and refuses, naming
 the file the first writes its report to, which a later run for that head prints instead of
-spending again (#4531 design review). The command runs in the background (up to about 22
-minutes), so its caller may be gone when it ends; the report file is how it is read then.
+spending again (#4531 design review). The command is queued as an ``agentdeck job`` (up to
+about 22 minutes, #4662), so its caller may be gone when it ends; the report file is how it
+is read then.
 
 The run spends a Claude account: a Claude chat's own, else (a Codex chat, or an own account at
 its limit) the one the deck shows with most room. It holds one ``helpers`` host slot. The Opus
-pass needs the reviewer's rule files from the review-chat checkout; without its ``SKILL.md``
-that pass alone does not run. Every way it cannot run prints
+pass, when on, needs the reviewer's rule files from the review-chat checkout; without its
+``SKILL.md`` that pass alone does not run. Every way it cannot run prints
 ``Helper checks: did not run (<why>)``, which the coder posts as it is: a failed run never
 holds the review back.
 
@@ -70,17 +71,26 @@ from pathlib import Path
 from .github_identity import github_git_environment
 
 MODEL = "claude-haiku-5-5"
+#: Whether the Opus whole review runs. Off by the owner's choice (#4533): on 56 pull requests
+#: it caught 13 % of the late findings, under the 30 % it had to. Review point, a week after it
+#: shipped: if late findings per pull request rise, switch it on; else remove its code.
+WHOLE_REVIEW = False
 #: The whole-review pass's model (#4531, assumed): Opus, as #4512 measured it.
 WHOLE_MODEL = "claude-opus-5-5"
-#: One helper's limit, enforced by its own ``timeout`` parent, not by this process.
-HELPER_TIMEOUT_S = 300
+#: One helper's limit, enforced by its own ``timeout`` parent, not by this process. 600, as
+#: the whole review's (#4662): at 300 a third of the Haiku helpers timed out (270 of 795 from
+#: 21 to 25 Nov 2026), and the finished ones' 90th percentile was 270-286 s. Review point:
+#: after 300 more Haiku runs, over 10 % still timing out means the prompts or the model, not a
+#: longer limit.
+HELPER_TIMEOUT_S = 600
 #: The whole-review pass's own limit (#4531, assumed): #4512's median pass took 2.7 minutes.
 WHOLE_TIMEOUT_S = 600
 #: The whole review keeps a suspicion at this confidence or above (#4531, assumed: fitted on
 #: #4512's data, about 45 % of late findings at 0.8 false ones per pull request).
 CONFIDENCE_FLOOR = 25
-#: How long a run waits for a ``helpers`` host slot before it does not run: one Opus pass and
-#: its clones, so a third run waits for a slot to free rather than not running (#4531).
+#: How long a run waits for a ``helpers`` host slot before it does not run: one run's 600
+#: seconds and its clones, so a third run waits for a slot to free rather than not running
+#: (#4531).
 SLOT_WAIT_S = 660.0
 ROOT = Path("/var/tmp/agentdeck-helpers")
 #: A leftover run directory (its command was SIGKILLed) older than this is removed.
@@ -187,7 +197,11 @@ mismatch, quoting the default or the doc line.""",
 WHOLE = 4
 #: Each helper's name, for the report and the usage log.
 NAMES = {**{part: name for part, (name, _text) in PASSES.items()}, WHOLE: "whole review"}
-PARTS = (*PASSES, WHOLE)
+
+
+def active_parts() -> tuple[int, ...]:
+    """The helpers a run starts and logs."""
+    return (*PASSES, WHOLE) if WHOLE_REVIEW else tuple(PASSES)
 
 
 def model_of(part: int) -> str:
@@ -198,8 +212,13 @@ def timeout_of(part: int) -> int:
     return WHOLE_TIMEOUT_S if part == WHOLE else HELPER_TIMEOUT_S
 
 
+#: The reply is only the findings (#4720): on #4711's replay that about kept the catch (3.50 against
+#: 3.67 known bugs alone, 5.50 against 5.17 with the reviewer) at a third less cost, where
+#: `--effort low` dropped bugs. Review point: after 100 live pull requests, if the helpers'
+#: own fixed finds per pull request fall by more than a quarter from 0.36-0.6 (#4703), go
+#: back to "Write the list out, item by item, before deciding".
 PROMPT = """You are a helper agent. The coding agent that wrote a pull request started you,
-with three other helpers, before it marks the pull request ready for review. It will fix what
+with other helpers, before it marks the pull request ready for review. It will fix what
 you find, so look for real bugs in its change, not style.
 
 The pull request: "{title}"
@@ -210,8 +229,11 @@ any file in the checkout. Stay inside this checkout, plus installed library sour
 virtualenv or site-packages) if you need them. Do not read other checkouts of this repository
 on this host, do not use `gh`, GitHub or the web, and do not edit any file.
 
-Your one job is this list. Write the list out, item by item, before deciding: an item that is
-not written out was not checked.
+Your one job is this list. Work through it item by item to the end, but do the checking in
+your tool calls and your own thinking, not in your reply: do not restate the diff, the code or
+the list, and write nothing about the items that are fine. Your reply is only the findings
+below. Do not read or report on diagrams (`docs/diagrams/`): one that is missing or no
+longer matches the code is never a finding (#4721).
 
 {pass_text}
 
@@ -254,6 +276,8 @@ How this run differs from the reviewer's own:
   closing a chat, CI/check runs, verification jobs and screenshots: none of that exists here.
   Review the code, the tests, the docs in the diff, the use-case walkthrough, and the
   architecture, as the rules require.
+- Do not read or report on diagrams (`docs/diagrams/`), whatever the rules say of them: one
+  that is missing or no longer matches the code is never a finding (#4721).
 - Read files with your file tools and `git`; "connector reads" in the rules mean those. Stay
   inside your working directory and the files named above; do not use `gh`, GitHub or the
   web, and do not edit any file.
@@ -406,18 +430,42 @@ def read_pull(spec: str, cwd: str) -> Pull:
 
 
 def issue_of(pull: Pull, given: str = "") -> tuple[str, int] | None:
-    """The Work's issue: ``given``, else the first ``Refs #n`` (or ``Closes``…) of the body."""
+    """The Work's issue: ``given``, else the first ``Refs #n`` (or ``Closes``…) of the body.
+
+    A bare number is the body's reference with that number, as a Work's issue may be in another
+    repository than its pull request (#4641); else the pull request's own repository's. A body
+    naming that number in two repositories is refused; a pull request's URL is no issue."""
     from .review_paperwork import _REFERENCE_RE
 
+    references = [
+        (
+            (
+                found.group("url_repo") or found.group("repo") or pull.repository,
+                int(found.group("url_n") or found.group("n")),
+            ),
+            found.group(0).lower(),
+        )
+        for found in _REFERENCE_RE.finditer(pull.body)
+    ]
     if given:
         match = _PULL_RE.match(given.strip())
         if match is None:
             raise NotRun(f"--issue must be `owner/repo#n` or a number, not {given!r}")
-        return (match.group("repo") or pull.repository, int(match.group("n")))
-    for found in _REFERENCE_RE.finditer(pull.body):
-        repository = found.group("url_repo") or found.group("repo") or pull.repository
-        return (repository, int(found.group("url_n") or found.group("n")))
-    return None
+        number = int(match.group("n"))
+        if match.group("repo"):
+            return (match.group("repo"), number)
+        named = {
+            repository.lower(): repository
+            for (repository, n), found in references
+            if n == number and "/pull/" not in found
+        }
+        if len(named) > 1:
+            raise NotRun(
+                f"--issue {number} is ambiguous, the body names it in"
+                f" {' and '.join(named.values())}: pass it as `owner/repo#n`"
+            )
+        return (next(iter(named.values()), pull.repository), number)
+    return references[0][0] if references else None
 
 
 def read_issue(repository: str, number: int, cwd: str) -> dict:
@@ -700,6 +748,34 @@ def read_usage(url: str) -> list[dict]:
     return [row for row in rows if isinstance(row, dict)]
 
 
+#: What a run prints instead of checking a pull request whose review was asked for (#4726).
+REVIEWED = (
+    "A review of {ref} was already asked for, so the helper checks do not run again (#4726):"
+    " the review reads this head. Post no `Helper checks:` comment for it. Pass --again only"
+    " when a person asked for another helper run."
+)
+
+
+def review_asked(url: str, ref: str) -> bool:
+    """Whether the deck says a review of ``ref`` was asked for yet, at any head (#4726): the
+    helpers run only before a pull request's first review, since a review round later reads
+    the fix itself (#4708: re-runs on later heads cost 5.6 units in six days). An unreadable
+    answer is ``False``: the helpers then run as before."""
+    import httpx
+
+    try:
+        answer = httpx.get(
+            url.rstrip("/") + "/api/review-asked",
+            params={"pull": ref},
+            timeout=10.0,
+            trust_env=False,
+        )
+        answer.raise_for_status()
+        return answer.json().get("asked") is True
+    except (httpx.HTTPError, httpx.InvalidURL, ValueError, AttributeError):
+        return False
+
+
 def account_roots() -> dict[str, Path]:
     from .config import load_config
 
@@ -897,8 +973,11 @@ def helper_command(binary: str = "claude", repo: Path | None = None, part: int =
         "-p",
         "--model",
         model_of(part),
+        # One ``result`` per turn: ``json`` prints the last one only, which lost the findings
+        # when a background command's end started another turn (#4656).
         "--output-format",
-        "json",
+        "stream-json",
+        "--verbose",
         "--no-session-persistence",
         "--setting-sources",
         "",
@@ -955,6 +1034,8 @@ def helper_env(bin_dir: Path, account_root: Path | None) -> dict[str, str]:
     env["PATH"] = f"{bin_dir}{os.pathsep}{env.get('PATH', '')}"
     # ``--strict-mcp-config`` alone leaves the account's claude.ai connectors on (``locked``).
     env["ENABLE_CLAUDEAI_MCP_SERVERS"] = "false"
+    # A background command that ends after the findings starts one more turn (#4656).
+    env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"] = "1"
     if account_root is not None:
         claude_env.point_at(env, account_root)
     return env
@@ -1000,15 +1081,33 @@ def start_helpers(
             )
 
 
+#: At a line's start only: a helper's notes may name the heading before its list does.
+_HEADING_RE = re.compile(r"(?m)^[ \t]*## Findings")
+
+
 def findings_of(text: str) -> str:
     """The ``## Findings`` list of a helper's reply, or the whole reply when it has none. The
-    last heading counts: a helper's notes may name the heading before its list does."""
-    head, sep, tail = text.rpartition("## Findings")
-    head = text if not sep else head
-    return (tail if sep else head).strip() or "No findings."
+    first heading counts: a finding may quote another one, fenced, quoted or indented, and a
+    cut there would lose the findings above it. At worst some notes show too (#4656)."""
+    heading = _HEADING_RE.search(text)
+    return (text[heading.end() :] if heading else text).strip() or "No findings."
 
 
 _JSON_BLOCK_RE = re.compile(r"```json[ \t]*\r?\n(?P<body>.*?)\r?\n[ \t]*```", re.S)
+
+
+def _findings_block(text: str) -> list[dict] | None:
+    """The findings in a whole review's last ```json block, ``None`` when it cannot be read."""
+    blocks = list(_JSON_BLOCK_RE.finditer(text))
+    data = None
+    if blocks:
+        with contextlib.suppress(ValueError):
+            # ``strict=False``: a raw newline inside a finding's text (#4532 helper check)
+            data = json.loads(blocks[-1].group("body"), strict=False)
+    found = data.get("findings") if isinstance(data, dict) else None
+    if not isinstance(found, list) or not all(isinstance(item, dict) for item in found):
+        return None
+    return found
 
 
 def whole_findings(text: str, floor: int = CONFIDENCE_FLOOR) -> tuple[str, int]:
@@ -1018,14 +1117,8 @@ def whole_findings(text: str, floor: int = CONFIDENCE_FLOOR) -> tuple[str, int]:
     passed off as scored (#4532 review). A reply whose block cannot be read, or holds an
     entry that is not a finding object, gives its own text, as a Haiku helper's reply
     without a ``## Findings`` list does: nothing in it is lost in silence."""
-    blocks = list(_JSON_BLOCK_RE.finditer(text))
-    data = None
-    if blocks:
-        with contextlib.suppress(ValueError):
-            # ``strict=False``: a raw newline inside a finding's text (#4532 helper check)
-            data = json.loads(blocks[-1].group("body"), strict=False)
-    found = data.get("findings") if isinstance(data, dict) else None
-    if not isinstance(found, list) or not all(isinstance(item, dict) for item in found):
+    found = _findings_block(text)
+    if found is None:
         reply = text.strip() or "No findings."
         return "(No readable findings block; the reply as it is:)\n" + reply, 0
     kept, unscored, dropped = [], [], 0
@@ -1062,22 +1155,81 @@ def whole_findings(text: str, floor: int = CONFIDENCE_FLOOR) -> tuple[str, int]:
     return "\n".join(lines), dropped
 
 
-def _result_event(raw: str) -> dict | None:
-    """The CLI's ``result`` object: the whole output, else its last line that is one."""
-    with contextlib.suppress(ValueError):
-        whole = json.loads(raw)
-        if isinstance(whole, dict) and whole.get("type") == "result":
-            return whole
-    for line in reversed(raw.splitlines()):
+def _events(raw: str) -> list[dict]:
+    """The output's JSON lines. Split on newlines only: ``splitlines`` also cuts at U+2028,
+    which JSON leaves unescaped inside a text."""
+    events = []
+    for line in raw.split("\n"):
         with contextlib.suppress(ValueError):
-            candidate = json.loads(line)
-            if isinstance(candidate, dict) and candidate.get("type") == "result":
-                return candidate
-    return None
+            event = json.loads(line)
+            if isinstance(event, dict):
+                events.append(event)
+    return events
+
+
+def _result_event(events: list[dict]) -> dict | None:
+    """The CLI's last ``result``: its cost and ``modelUsage`` cover the whole run (checked on
+    Claude Code 2.1.317), its ``result`` and ``duration_ms`` only the last turn."""
+    results = [event for event in events if event.get("type") == "result"]
+    return results[-1] if results else None
+
+
+def _has_findings(part: int, text: str) -> bool:
+    return _findings_block(text) is not None if part == WHOLE else bool(_HEADING_RE.search(text))
+
+
+def replies_of(part: int, events: list[dict]) -> list[str]:
+    """Each finished turn's reply, in order. A turn whose reply lacks the findings also gives
+    the messages it wrote them in, before its last one (#4656)."""
+    replies, messages = [], []
+    for event in events:
+        if event.get("type") == "result":
+            reply = str(event.get("result") or "")
+            if not event.get("is_error"):
+                if not _has_findings(part, reply):
+                    replies += [text for text in messages if _has_findings(part, text)]
+                if reply:
+                    replies.append(reply)
+            messages = []
+        elif event.get("type") == "assistant" and not event.get("parent_tool_use_id"):
+            message = event.get("message")
+            content = message.get("content") if isinstance(message, dict) else None
+            for block in content if isinstance(content, list) else ():
+                if isinstance(block, dict) and isinstance(block.get("text"), str):
+                    messages.append(block["text"])
+    return list(dict.fromkeys(replies))
+
+
+def all_findings(part: int, replies: list[str]) -> tuple[str, int]:
+    """Every reply in order: its findings, or the reply as it is, since a later message may
+    correct a finding (#4656). The count under the floor is the last list's."""
+    if not any(_has_findings(part, reply) for reply in replies):
+        replies = ["\n\n".join(replies)]  # no findings in any: the whole text as it is
+    shown: list[str] = []
+    seen: set[str] = set()
+    dropped = 0
+    for reply in replies:
+        if len(replies) > 1 and not _has_findings(part, reply):
+            shown.append(f"(Another message from this helper:)\n{reply.strip()}")
+            continue
+        text, dropped = whole_findings(reply) if part == WHOLE else (findings_of(reply), 0)
+        if text not in seen:  # the same list given twice is shown once
+            shown.append(f"(A later list from this helper:)\n{text}" if seen else text)
+            seen.add(text)
+    return "\n\n".join(shown), dropped
 
 
 def _count(value) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
+#: A usage log field and the API's name for it in a message's or a result's ``usage``.
+_TOKEN_FIELDS = (
+    ("input_tokens", "input_tokens"),
+    ("output_tokens", "output_tokens"),
+    ("cache_read_tokens", "cache_read_input_tokens"),
+    ("cache_write_tokens", "cache_creation_input_tokens"),
+)
 
 
 def usage_of(event: dict | None, model: str = MODEL) -> dict:
@@ -1113,12 +1265,7 @@ def usage_of(event: dict | None, model: str = MODEL) -> dict:
             usage[key] = sum(_count(row.get(field_)) for row in per_model.values())
     elif isinstance(event.get("usage"), dict):
         top = event["usage"]
-        for key, field_ in (
-            ("input_tokens", "input_tokens"),
-            ("output_tokens", "output_tokens"),
-            ("cache_read_tokens", "cache_read_input_tokens"),
-            ("cache_write_tokens", "cache_creation_input_tokens"),
-        ):
+        for key, field_ in _TOKEN_FIELDS:
             usage[key] = _count(top.get(field_))
     cost = event.get("total_cost_usd")
     if isinstance(cost, int | float) and not isinstance(cost, bool):
@@ -1133,11 +1280,84 @@ def usage_of(event: dict | None, model: str = MODEL) -> dict:
     return usage
 
 
-def read_outcome(part: int, path: Path, code: int, wall_s: float = 0.0) -> Outcome:
+def usage_so_far(events: list[dict], model: str = MODEL) -> dict:
+    """What a run spent as far as its output shows (#4728): its last ``result``'s usage, plus
+    each message's own after it. A helper that timed out or was stopped prints no ``result``
+    for its last turn, often for none, and was logged as having spent nothing.
+
+    A message's ``usage`` is one model call's; the stream repeats a message once per content
+    block, so each id counts once, at its largest reading. The output count is the stream's
+    last reading, which may be short of the final one, and such a tail has no cost.
+    """
+    last = max((i for i, event in enumerate(events) if event.get("type") == "result"), default=-1)
+    usage = usage_of(events[last] if last >= 0 else None, model)
+    calls: dict[object, dict] = {}
+    for index, event in enumerate(events[last + 1 :]):
+        message = event.get("message") if event.get("type") == "assistant" else None
+        spent = message.get("usage") if isinstance(message, dict) else None
+        if not isinstance(spent, dict):
+            continue
+        call = calls.setdefault(message.get("id") or index, {"model": message.get("model")})
+        for key, field_ in _TOKEN_FIELDS:
+            call[key] = max(call.get(key, 0), _count(spent.get(field_)))
+    if not calls:
+        return usage
+    for key, _ in _TOKEN_FIELDS:
+        usage[key] += sum(call[key] for call in calls.values())
+    models = {call["model"] for call in calls.values() if isinstance(call["model"], str)}
+    if last < 0 and models:
+        usage["model"] = ",".join(sorted(models))
+    return usage
+
+
+def written_of(events: list[dict]) -> dict:
+    """How much a run's output shows (#4754): the characters of its reply text and of its
+    tool calls, and how many of those it made. Output tokens also pay for thinking, which the
+    output does not show; beside these lengths the token report splits them into reply, tool
+    calls and thinking. A subagent's messages count too: its tokens are in the run's usage.
+
+    The stream gives each content block once; a block seen again under the same message id
+    is counted once.
+    """
+    written = {"reply_chars": 0, "tool_chars": 0, "tool_calls": 0}
+    seen: set[tuple] = set()
+    for event in events:
+        message = event.get("message") if event.get("type") == "assistant" else None
+        content = message.get("content") if isinstance(message, dict) else None
+        for block in content if isinstance(content, list) else ():
+            if not isinstance(block, dict):
+                continue
+            text, asked = block.get("text"), block.get("type") == "tool_use"
+            if not asked and not isinstance(text, str):
+                continue
+            key = (message.get("id"), block.get("id") if asked else text)
+            if message.get("id") and key in seen:
+                continue
+            seen.add(key)
+            if asked:
+                written["tool_chars"] += len(json.dumps(block.get("input") or {}))
+                written["tool_calls"] += 1
+            else:
+                written["reply_chars"] += len(text)
+    return written
+
+
+def _spent(events: list[dict], model: str) -> dict:
+    """A usage log line's own fields: what the run spent, and how much its output shows."""
+    return {**usage_so_far(events, model), **written_of(events)}
+
+
+def _read_events(path: Path) -> tuple[str, list[dict]]:
     raw = path.read_text(encoding="utf-8", errors="replace") if path.exists() else ""
-    event = _result_event(raw)
-    # A failed helper may still have spent tokens: its usage is kept whatever the exit (#4510).
-    spent = {"usage": usage_of(event, model_of(part)), "wall_s": wall_s}
+    return raw, _events(raw)
+
+
+def read_outcome(part: int, path: Path, code: int, wall_s: float = 0.0) -> Outcome:
+    raw, events = _read_events(path)
+    event = _result_event(events)
+    # A failed helper may still have spent tokens: its usage is kept whatever the exit (#4510),
+    # and one that printed no ``result`` keeps what its messages say (#4728).
+    spent = {"usage": _spent(events, model_of(part)), "wall_s": wall_s}
     if code in (124, 137):  # ``timeout``'s own exit, or its SIGKILL after ``-k``
         return Outcome(
             part,
@@ -1145,26 +1365,32 @@ def read_outcome(part: int, path: Path, code: int, wall_s: float = 0.0) -> Outco
             exit="timeout",
             **spent,
         )
-    if code != 0:  # a result printed before a failure is not a finished helper (#4437 review)
+    replies = replies_of(part, events)
+    last_failed = event is not None and (event.get("is_error") or not event.get("result"))
+    # A later turn that failed does not take an earlier turn's findings with it (#4656).
+    kept = last_failed and any(_has_findings(part, reply) for reply in replies)
+    # A result printed before a failure is not a finished helper (#4437 review).
+    if code != 0 and not kept:
         last = (raw.strip().splitlines()[-1:] or [""])[0][:200]
         return Outcome(
             part, failed=f"exit {code}" + (f": {last}" if last else ""), exit="failed", **spent
         )
-    if event is None or event.get("is_error") or not event.get("result"):
+    if event is None or (last_failed and not kept):
         why = (raw.strip().splitlines()[-1:] or [f"exit {code}"])[0][:200]
         if event is not None and event.get("is_error"):
             why = str(event.get("result") or event.get("subtype") or why)[:200]
         return Outcome(part, failed=why, exit="failed", **spent)
-    findings, dropped = (
-        whole_findings(str(event["result"]))
-        if part == WHOLE
-        else (findings_of(str(event["result"])), 0)
-    )
+    findings, dropped = all_findings(part, replies)
+    if kept:
+        error = event.get("subtype") if event.get("is_error") else ""
+        why = str(event.get("result") or error or "no reply")[:200]
+        findings += f"\n\n(This helper's last turn failed: {why})"
+    turns = [turn for turn in events if turn.get("type") == "result"]
     return Outcome(
         part,
         findings=findings,
         dropped=dropped,
-        minutes=float(event.get("duration_ms") or 0) / 60000,
+        minutes=sum(float(turn.get("duration_ms") or 0) for turn in turns) / 60000,
         cost_usd=float(spent["usage"].get("cost_usd") or 0),  # per-model costs without a total
         **spent,
     )
@@ -1239,28 +1465,31 @@ def not_run(part: int, why: str) -> Outcome:
 
 def log_not_run(pull: str, why: str, head: str = "", account: str = "") -> None:
     """A ``did_not_run`` line for each helper of a run that never started them."""
-    log_usage(pull, head, account, [not_run(part, why) for part in PARTS])
+    log_usage(pull, head, account, [not_run(part, why) for part in active_parts()])
 
 
 def log_cut_short(run: Run, pull: str, head: str, account: str, started: float) -> None:
     """The run was killed or failed while its helpers ran (#4510 helper check): a helper that
     had finished gets its own line from its output, one still running an ``interrupted`` line
-    (its tokens are unknown). Called before ``stop`` removes the output."""
+    with what its output shows so far (#4728; a message still on its way is not in it).
+    Called before ``stop`` removes the output."""
     note_ended(run, started)  # one that ended since ``wait_all`` last looked
     outcomes = []
     for index, part in enumerate(run.parts[: len(run.processes)]):
+        output = run.directory / "out" / f"{part}.json"
         if index not in run.ended:
             outcomes.append(
                 Outcome(
                     part,
                     failed="the run was stopped",
                     exit="interrupted",
+                    usage=_spent(_read_events(output)[1], model_of(part)),
                     wall_s=time.monotonic() - started,
                 )
             )
             continue
         code, wall_s = run.ended[index]
-        outcomes.append(read_outcome(part, run.directory / "out" / f"{part}.json", code, wall_s))
+        outcomes.append(read_outcome(part, output, code, wall_s))
     log_usage(pull, head, account, outcomes)
 
 
@@ -1401,6 +1630,12 @@ def run_helpers(args: argparse.Namespace) -> int:
         log_not_run(ref, why, pull.head_oid)
         return 0
     issue = f"{found[0]}#{found[1]}"
+    # Before the lock and the saved report: a head checked before its review would otherwise
+    # print that whole report again, which is the reading this skip saves (#4739 review).
+    if not getattr(args, "again", False) and review_asked(args.url, ref):
+        _say(REVIEWED.format(ref=ref))
+        log_not_run(ref, "a review was already asked for", pull.head_oid)
+        return 0
     lock_fd = None
     if pull.head_oid:
         # Before anything is spent: one run per pull request and head (#4531 design review).
@@ -1480,19 +1715,20 @@ def _run_locked(
                 )
             base, warning = base_commit(checkout, pull, head)
             warnings += [warning] if warning else []
-            parts = list(PARTS)
+            parts = list(active_parts())
             rules: dict[str, str] = {}
-            try:
-                chat_checkout, chat_repository = review_chat_settings()
-                rules, missing = reviewer_rules(
-                    pull.repository, chat_checkout, chat_repository, deck_root()
-                )
-                warnings += missing
-            except NotRun as exc:
-                # The whole review alone does not run; the Haiku helpers go on (#4531).
-                parts.remove(WHOLE)
-                skipped.append(not_run(WHOLE, str(exc)))
-                missing = []
+            missing: list[str] = []
+            if WHOLE in parts:
+                try:
+                    chat_checkout, chat_repository = review_chat_settings()
+                    rules, missing = reviewer_rules(
+                        pull.repository, chat_checkout, chat_repository, deck_root()
+                    )
+                    warnings += missing
+                except NotRun as exc:
+                    # The whole review alone does not run; the Haiku helpers go on (#4531).
+                    parts.remove(WHOLE)
+                    skipped.append(not_run(WHOLE, str(exc)))
             ROOT.mkdir(parents=True, exist_ok=True)
             sweep_stale()
             run.slot_fd = take_a_slot(helper_slot_paths(), time.monotonic() + SLOT_WAIT_S)
@@ -1538,8 +1774,8 @@ def _run_locked(
             start_helpers(run, repos, prompts, env)
         except OSError as exc:
             _say(did_not_run(f"the helpers cannot start: {exc}", ref))
-            # One that did start before the failure is stopped by ``stop``; nothing it spent
-            # is readable, so every helper counts as not run.
+            # One that did start before the failure is stopped by ``stop`` a moment after
+            # it began, before it could spend anything, so every helper counts as not run.
             with _signals_held():
                 log_not_run(ref, f"the helpers cannot start: {exc}", head, account)
                 logged = True
@@ -1579,9 +1815,9 @@ def _run_locked(
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         prog="agentdeck pre-review-helpers",
-        description="Three Haiku helpers and one Opus whole review check a pull request's"
-        " change before its first review, and print what they found (#4437, #4531). Takes up"
-        " to about 22 minutes: run it in the background.",
+        description="Three Haiku helpers check a pull request's change before its first review,"
+        " and print what they found (#4437). Takes up"
+        " to about 22 minutes: queue it as an `agentdeck job`.",
     )
     parser.add_argument(
         "--again",
@@ -1590,7 +1826,12 @@ def main(argv: list[str]) -> int:
     )
     parser.add_argument("--cwd", required=True, help="the pull request's checkout")
     parser.add_argument("--pull", required=True, help="owner/repo#n, or n in --cwd's repository")
-    parser.add_argument("--issue", default="", help="the Work's issue; default: the body's Refs")
+    parser.add_argument(
+        "--issue",
+        default="",
+        help="owner/repo#n, or n: the body's Refs with that number, else --pull's repository's;"
+        " default: the body's first Refs",
+    )
     parser.add_argument(
         "--url",
         default=os.environ.get("AGENTDECK_URL", "http://127.0.0.1:8756"),

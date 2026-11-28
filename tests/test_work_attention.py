@@ -38,7 +38,7 @@ from agentdeck.work_facts import (
     target_branches,
     work_facts,
 )
-from agentdeck.work_overview import OtherDeckWork, WorkAttention, build_work_card
+from agentdeck.work_overview import OtherDeckWork, WorkAttention, WorkChat, build_work_card
 from agentdeck.work_story import NEEDS_YOU, front_row, work_status
 from agentdeck.work_workspace import RunVerification
 
@@ -180,6 +180,131 @@ def test_a_closed_issue_waits_for_its_finish():
         "Merged",
         ("finish", "answer", "hide"),
     )
+
+
+MERGED = {PR.lower(): _row("merged")}
+
+
+@pytest.mark.parametrize("kind", ["asked_in_chat", "unfinished", "died", "live_failed", "not_live"])
+def test_a_merged_work_that_needs_you_offers_close_issue(kind):
+    """Its issue is still open (#4631): one press ends it, and Finish would be refused."""
+    work = _work(rows=MERGED, derived=_derived(kind, "waits"))
+    story = work_status(work)
+    detail = operator_attention(work, story)
+
+    assert detail.actions[-2:] == ("close", "hide") and "finish" not in detail.actions
+    assert "finish the Work" not in story.you
+    (close,) = [item for item in work_actions.buttons(work, detail) if item.action == "close"]
+    assert (close.label, close.confirm) == ("Close issue", "")
+    # The You line links the chat, so a row with a message button leaves Open out on the page.
+    page = work_actions.buttons(work, detail, "/chats/a", page=True)
+    first = "answer" if "answer" in detail.actions else "open"
+    assert [item.action for item in page] == [first, "close", "hide"]
+    assert ("close the issue" in story.you) == (kind in {"live_failed", "not_live"})
+    held = work_status(replace(work, scheduled=True))
+    assert "close the issue" not in held.you
+
+
+def test_close_issue_needs_every_pull_request_landed():
+    asked = _work(rows=MERGED, derived=_derived("asked_in_chat"))
+    (merged,) = asked.outputs
+    second = replace(merged, repository="acme/other", number=9)
+
+    def offered(*outputs):
+        work = replace(asked, outputs=outputs)
+        return "close" in operator_attention(work, work_status(work)).actions
+
+    assert offered(merged, second) and offered(merged, replace(second, state="closed"))
+    for state in ("open", ""):  # an unresolved state is not known to have landed
+        assert not offered(merged, replace(second, state=state))
+    assert not offered() and not offered(replace(merged, state="closed"))
+
+
+def test_close_issue_is_offered_without_any_pull_request():
+    """Research or a question answered in the chat has nothing to merge (#4631)."""
+
+    def work(record, state="open", registered=()):
+        facts = work_facts(WORK, record=record, rows={}, registered=registered)
+        card = build_work_card(WORK, issue=None, title="W", issue_state=state, facts=facts)
+        return replace(card, derived=_derived("asked_in_chat"))
+
+    def offered(card):
+        detail = operator_attention(card, work_status(card))
+        return detail is not None and "close" in detail.actions
+
+    issue = {"title": "Why?", "state": "OPEN"}
+    assert offered(work(issue))
+    # A pull request it cannot read yet, a record that is a pull request's own, an issue whose
+    # state or record is unknown: not known to have nothing open.
+    assert not offered(work(issue, registered=(Registration(PR, True),)))
+    # One that closed unmerged is none, and so is another issue's; an unplaced open one is not.
+    shared = (Registration(PR, False),)
+    for row, expected in (
+        (_row("closed"), True),
+        ({**_row(), "headRefName": "agent/issue-77"}, True),
+        ({**_row(), "headRefName": "some-fix"}, False),
+    ):
+        facts = work_facts(WORK, record=issue, rows={PR.lower(): row}, registered=shared)
+        card = build_work_card(WORK, issue=None, title="W", issue_state="open", facts=facts)
+        assert offered(replace(card, derived=_derived("asked_in_chat"))) is expected
+    # Unread beside a merged one too.
+    other = Registration("https://github.com/eerovil/agentdeck/pull/8", True)
+    facts = work_facts(WORK, record=issue, rows=MERGED, registered=(Registration(PR, True), other))
+    merged = build_work_card(WORK, issue=None, title="W", issue_state="open", facts=facts)
+    assert not offered(replace(merged, derived=_derived("asked_in_chat")))
+    assert not offered(work({**issue, "is_pr": True}))
+    assert not offered(work(issue, state="")) and not offered(work(None))
+    for kind in ("question", "spec_wait", "waiting", "working", "parked"):
+        assert not offered(replace(work(issue), derived=_derived(kind)))
+    assert not offered(replace(work(issue), working_count=1))
+    assert not offered(replace(work(issue), derived=_derived("asked_in_chat", self_waking=True)))
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"paused": True}, {"scheduled": True}, {"has_sub_issues": True},
+        {"labels": ("wayfinder:map",)}, {"awaiting_finish": True}, {"work_state": "done"},
+        {"derived": _derived("question")}, {"derived": _derived("stalled")},
+        {"derived": _derived("spec_wait")}, {"derived": _derived("review_escalated")},
+        {"attention": (_ask("mcp_form"),)},
+        {"derived": _derived("asked_in_chat", self_waking=True)},
+        {"working_count": 1},  # another of its chats is mid-turn under the asked_in_chat one
+        {"derived": _derived("working")}, {"derived": _derived("unfinished", live_checking=True)},
+        {"derived": _derived("closed")}, {"derived": _derived("waiting")},
+        {"derived": None, "working_count": 1}, {"derived": None, "attention": (_ask("mcp_form"),)},
+    ],
+    ids=str,
+)
+def test_close_issue_is_not_offered_on_a_merged_work(extra):
+    work = replace(_work(rows=MERGED, derived=_derived("asked_in_chat")), **extra)
+    detail = operator_attention(work, work_status(work))
+
+    assert detail is None or "close" not in detail.actions
+
+
+def test_close_issue_waits_for_every_chat_of_the_work():
+    """The derived status speaks for the chat that asked; a second one may be mid-turn."""
+
+    def offered(*, working):
+        chats = [
+            WorkChat(key, key, key, f"/chats/{key}", busy, None, (), legs=(key,))
+            for key, busy in (("asker", False), ("runner", working))
+        ]
+        card = build_work_card(
+            WORK, issue=None, title="Work", chats=chats,
+            facts=work_facts(WORK, rows=MERGED, registered=(Registration(PR, True),)),
+        )
+        work = replace(card, derived=_derived("asked_in_chat"))
+        return "close" in operator_attention(work, work_status(work)).actions
+
+    assert offered(working=False) and not offered(working=True)
+
+
+def test_a_parent_issue_is_known_from_its_cached_record():
+    record = {"state": "OPEN", "subIssues": {"total": 2, "completed": 1}}
+    assert _work(record=record).has_sub_issues
+    assert not _work(record={"state": "OPEN"}).has_sub_issues
 
 
 def test_a_merge_waiting_on_a_check_that_never_ran_is_blocked():

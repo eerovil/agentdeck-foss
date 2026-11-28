@@ -433,6 +433,8 @@ class WebhookStatusCacheService:
             "baseRefName": base.get("ref"),
             "headRefOid": head.get("sha"),
             "updatedAt": updated_at,
+            # The base commit a local checkout counts the size's code lines against (#4812).
+            **({"baseRefOid": base["sha"]} if isinstance(base.get("sha"), str) else {}),
             # Whether GitHub merges it by itself (#2275), in ``gh pr view``'s shape; a payload
             # without the key leaves the row without, which reads as not armed.
             **(

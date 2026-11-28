@@ -254,6 +254,31 @@
   var VOICE_TIMED_MS = 60000;
   var HOST_NO_SPEECH_MS = 8000;
   var HOST_PHRASE_MAX_MS = 28000;
+  // "Hey Jarvis" with a sentence after it in the same breath (#4804): sound going on
+  // at least SAID_AFTER_NAME_MS past the name, its closing pause left out, is a
+  // message, and the whole phrase goes to Whisper as before #4788. Shorter is the
+  // name alone, which Whisper wrote as "Harvest.", so it listens for the next phrase.
+  // Measured from the stream's crossing when it names one; else the name is taken
+  // to end NAME_ENDS_MS into the phrase, which starts with a little sound before it.
+  // The owner's name alone ran 0.9 to 1.8 s with its pause; three sentences lost on
+  // 27 Nov ran 5 to 14 s past the name.
+  var SAID_AFTER_NAME_MS = 1500;
+  var NAME_ENDS_MS = 1200;
+  // Loud noise is told from talk by the host (#4645): past TALK_FROM_MS a phrase's last
+  // TALK_TAIL_MS are asked about every TALK_CHECK_MS, and no speech in them ends it.
+  var TALK_FROM_MS = 3000;
+  var TALK_TAIL_MS = 2000;
+  var TALK_CHECK_MS = 1500;
+  var TALK_CARRY_MS = 600;
+  // A phrase about to end on a pause asks the host first whether the pause holds
+  // speech (#4789): in a car the owner's quieter words sat at the road noise's level,
+  // even filtered, and the level took them for a pause and cut the sentence. A pause
+  // with no chunk over PAUSE_SOUND_LINE is plain silence and ends unasked. An answer
+  // not back in PAUSE_CHECK_MS ends the phrase as before; a "no" with more audio
+  // after its window asks about the newest, up to PAUSE_ROUNDS times.
+  var PAUSE_SOUND_LINE = 0.005;
+  var PAUSE_CHECK_MS = 700;
+  var PAUSE_ROUNDS = 3;
   var HOST_STALL_MS = 3000;
   // Sound that starts while words wait to be sent holds the send back; after this
   // long the sound so far is checked, and with no words in it the send goes (#3449).
@@ -283,16 +308,43 @@
     jarvis: {
       word: 'jarvis', name: 'Hey Jarvis',
       // How Whisper writes "Hey Jarvis" (#3476): "Hey, Jarvis.", "Hi Jarvis!", "Hei Jarvis".
-      re: /\b(?:hey|hei|hay|hi|hai|a)[\s,.!-]*(?:jarvis|jarvi|javis|jarves|jarvus)\b[\s,.!?:;-]*/i
+      re: /\b(?:hey|hei|hay|hi|hai|a)[\s,.!-]*(?:jarvis|jarvi|javis|jarves|jarvus)\b[\s,.!?:;-]*/i,
+      // "Ei tarvis" is Finnish for "no need", so "Tarvis" is the name only after a greeting.
+      calls: calls('hey|hei|hay|hi|hai', '(?:j|ch)ar[vb][ieu]s|javis',
+        'jarvi|tarvis|travis|darvis|garvis|harvis')
     },
     alexa: {
       word: 'alexa', name: 'Alexa',
-      re: /\b(?:alexa|aleksa|alexia|alexis|alekza|elexa)\b[\s,.!?:;-]*/i
+      re: /\b(?:alexa|aleksa|alexia|alexis|alekza|elexa)\b[\s,.!?:;-]*/i,
+      calls: calls('hey|hei|hi', 'alexa|aleksa|alexia|alexis|alekza|elexa', '')
     }
   };
+  // How a call may be misspelt (#4645), one list for all three: `woke`, the start of a
+  // phrase the detector woke on; `starts` and `ends`, a call around words said while it
+  // listens. Whisper writes "Hei" as "Ei" (no): there, and for a bare name, the name must
+  // stand alone or before a mark, so "Jarvis on rikki" and
+  // "Ei Jarvis vaan" stay words.
+  function calls(greetings, names, greeted) {
+    var gap = '[\\s,.!-]*';
+    var after = '\\b[\\s,.!?:;-]*';
+    var apart = '\\b(?=\\s*(?:[,.!?:;]+(?:\\s|$)|$))[\\s,.!?:;-]*';
+    var any = '(?:' + names + (greeted ? '|' + greeted : '') + ')';
+    var plain = '(?:a' + gap + any + '|(?:ei' + gap + ')?(?:' + names + '))';
+    var full = '(?:' + greetings + ')' + gap + any;
+    return {
+      woke: new RegExp('^\\s*(?:(?:' + full + '|' + plain + ')' + after + ')+', 'i'),
+      starts: new RegExp('^\\s*(?:' + full + after + '|' + plain + apart + ')+', 'i'),
+      ends: new RegExp('(?:\\b(?:' + full + '|ei' + gap + '(?:' + names + '))' + after + ')+$', 'i')
+    };
+  }
   function wakeWord() {
     var control = document.querySelector('[data-voice-wake-word]');
     return WAKE_WORDS[control && control.getAttribute('data-voice-wake-word')] || WAKE_WORDS.jarvis;
+  }
+  // Where `text` holds the wake word, as a regex match. `woke`: the detector heard it,
+  // so a name Whisper misspelt at the start counts too (#4645).
+  function findName(text, woke) {
+    return (woke && wakeWord().calls.woke.exec(text)) || wakeWord().re.exec(text);
   }
   function wakeName(text) { return text.replace(/Hey Jarvis/g, wakeWord().name); }
   // While it waits for the wake word no bubble shows: the hint covered the message box
@@ -354,6 +406,8 @@
   // A carried voice mode whose audio the browser will not start without a tap.
   var CARRY_PAUSED = 'Voice mode paused · tap 🎧 to go on';
   var CARRY_START_MS = 1000;
+  // How often a kiosk paused so tries its sound again (#4684).
+  var CARRY_RETRY_MS = 2000;
   var TAP_TO_ANSWER = 'Answer on screen · tap 🎤 to answer';
   // Said alone, it switches 🎤 to Jarvis (#3540, #3787).
   var ROOM_PHRASE = /^(?:(?:lopeta|lopetta|lopettaa) kuuntel\w*|älä kuuntele|stop listening)$/;
@@ -383,6 +437,25 @@
 
   // The one voice-mode state on the page, or null when it is off.
   var voice = null;
+  // When someone last touched this page or came back to it (#4645).
+  var touchedAt = 0;
+  var AT_HAND_MS = 30000;
+  function touched(event) { if (event.isTrusted) touchedAt = Date.now(); }
+  document.addEventListener('pointerdown', touched, true);
+  document.addEventListener('keydown', touched, true);
+  document.addEventListener('visibilitychange', function () {
+    if (!document.hidden) touchedAt = Date.now();
+  });
+  // Whether voice mode went on by itself after a reload in this browser, with no touch:
+  // '1' or '0', as last seen.
+  var SURVIVES_KEY = 'agentdeck:voice-survives-reload';
+  function survives(yes) {
+    if (touchedAt) return;
+    try { localStorage.setItem(SURVIVES_KEY, yes ? '1' : '0'); } catch (e) { /* not stored */ }
+  }
+  function survivesReload() {
+    try { return localStorage.getItem(SURVIVES_KEY) === '1'; } catch (e) { return false; }
+  }
   // The audio of a chat just left in place, playing already, for the next one.
   var spare = null;
 
@@ -1030,7 +1103,7 @@
     rec.onresult = function (event) {
       if (v.overheard !== rec) return;
       var text = event.results[0][0].transcript;
-      var name = rec.waking && wakeWord().re.exec(text);
+      var name = rec.waking && findName(text, rec.woken || event.results[0].woke);
       // Woken by a window, a phrase that is only the reading's echo was the name
       // alone (#3842).
       if (rec.woken && !name && echoOf(text, played.text)) {
@@ -1216,7 +1289,9 @@
   // to the deck as it is heard (`/api/speech/wake-stream`), so the beep comes on
   // the 80 ms frame the name ends in rather than after the 0.8 s pause. Only what the
   // level gate hears goes, with its 4 chunks before, as for a clip. The deck answers
-  // each phrase once with `done` (and "Hey Jarvis" with an early `woken`); a phrase
+  // each phrase once with `done` (and "Hey Jarvis" with an early `woken`, "Alexa" with
+  // a `sure` that only beeps while its confirm runs, sent only where `[speech]
+  // wake_sure` names it: by default "Alexa" beeps on its `woken`, #4779); a phrase
   // with no `done` 2 s after its end, or whose socket closed first, goes as a clip
   // as before, under the same id. One socket per page load (`PAGE_ID`), open while
   // the microphone is; a new one from the same page replaces the old at the deck.
@@ -1271,12 +1346,13 @@
       // The deck accepts before it reaches the detector: only an answer proves the
       // stream, so a detector down for long backs off to 30 s.
       self.tries = 0;
-      var id = msg.done || msg.woken || msg.confirming;
+      var id = msg.done || msg.woken || msg.confirming || msg.sure;
       var handler = id && self.handlers[id];
       if (!handler) return;
       if (msg.done) { delete self.handlers[id]; handler.done(msg); }
       else if (msg.woken) handler.woken(msg);
-      else handler.confirming();
+      else if (msg.confirming) handler.confirming();
+      else handler.sure();
     };
     ws.onclose = function () {
       if (self.ws !== ws) return;
@@ -1376,11 +1452,34 @@
     var waited = 0;
     var sound = 0;
     var softFor = 0;
+    // Where in the phrase its last full-level chunk ended (#4804): soft sound or noise
+    // after the name is no sentence.
+    var loudTo = 0;
+    var asked = 0;
+    var asking = false;
+    var deaf = false;
+    // The pause check (#4789): its own flag, so a tail check in flight never lets a
+    // pause end unasked; `pauseId` makes an answer stale once sound comes back.
+    var pausing = false;
+    var pauseId = 0;
+    var pauseTimer = null;
+    var pauseSound = false;
+    // Only while listening for a message or an answer, or once the name was heard
+    // inside this phrase: waiting for the name ends a phrase on its level, as before.
+    function checksPause() { return v.purpose !== 'wake' || self.woken; }
+    // Each pause the host heard speech in: a tail check asked before it is stale.
+    var spoke = 0;
+    // Not while Whisper hears every waiting phrase: more, shorter ones are more work.
+    var checksTalk = v.purpose !== 'wake' || this.wake() === 'detector';
     // The room's level outlives each listener, on the microphone it was heard by.
     var gate = cap.gate || (cap.gate = new Gate(chunkMs));
     function feed(samples) {
       if (self.done) return;
-      if (self.hushed()) { phrase = []; before = []; waited = 0; self.early = null; return; }
+      if (self.hushed()) {
+        phrase = []; before = []; waited = 0; asked = 0; self.early = null;
+        if (pausing) { pausing = false; pauseId += 1; clearTimeout(pauseTimer); }
+        return;
+      }
       if (self.onchunk) self.onchunk(samples, cap.rate);
       self.fedAt = Date.now();
       var heard = level(samples);
@@ -1395,6 +1494,7 @@
           phrase = before.slice();
           before = [];
           self.streamStart(phrase, cap.rate);
+          loudTo = phrase.length * chunkMs;
           sound = chunkMs;
           self.heardSound = true;
           if (self.onspeechstart) self.onspeechstart();
@@ -1417,26 +1517,124 @@
       softFor = loud ? 0 : softFor + chunkMs;
       var goesOn = loud || (soft && softFor <= HOST_SOFT_MS);
       quiet = goesOn ? 0 : quiet + chunkMs;
-      // Sound came back inside the pause: the early words are not the phrase's.
+      // Sound came back inside the pause: the early words are not the phrase's, and a
+      // pause check in flight is about a pause that is over.
       if (goesOn && self.early) self.early = null;
+      if (goesOn) {
+        pauseSound = false;
+        if (pausing) { pausing = false; pauseId += 1; clearTimeout(pauseTimer); }
+      } else if (heard >= PAUSE_SOUND_LINE) {
+        pauseSound = true;
+      }
       if (loud) self.late = false;
       else if (soft && !goesOn) self.late = true;
       if (loud) {
+        loudTo = phrase.length * chunkMs;
         sound += chunkMs;
         if (self.onsound) self.onsound(sound);
       }
-      if (quiet >= HOST_PAUSE_MS || phrase.length * chunkMs >= HOST_PHRASE_MAX_MS) {
-        if (quiet >= HOST_PAUSE_MS) gate.paused();
-        self.endedAt = Date.now() - quiet;
-        self.capped = quiet < HOST_PAUSE_MS;
-        self.finish(phrase);
+      var paused = quiet >= HOST_PAUSE_MS;
+      var full = phrase.length * chunkMs >= HOST_PHRASE_MAX_MS;
+      if (paused && !full && checksPause() && !deaf && (pausing || pauseSound)) {
+        // The host's answer ends the phrase or keeps it going; chunks join meanwhile.
+        if (!pausing) askPause(1);
+      } else if (paused || full) {
+        endPhrase(phrase);
         return;
+      }
+      var long = phrase.length * chunkMs;
+      if (long >= TALK_FROM_MS && long - asked >= TALK_CHECK_MS && checksTalk && !asking && !deaf) {
+        asking = true;
+        asked = long;
+        askTalk(phrase);
       }
       // Recognized early in the pause (#3765), soft sound or not (#4540); only quiet
       // and soft sound join the phrase after it.
       if (quiet >= HOST_EARLY_MS && !self.early && self.recognizesEarly()) {
         self.early = self.earlyPass(phrase, cap.rate);
       }
+    }
+    function endPhrase(chunks) {
+      if (quiet >= HOST_PAUSE_MS) gate.paused();
+      // How far into the phrase full-level sound went (#4804): its closing pause and
+      // the soft tail before it are left out.
+      self.soundedMs = Math.min(Math.max(0, chunks.length * chunkMs - quiet), loudTo);
+      self.endedAt = Date.now() - quiet;
+      self.capped = quiet < HOST_PAUSE_MS;
+      self.finish(chunks);
+    }
+    // Whether the pause that would end the phrase holds speech (#4789). Its answer
+    // covers only the chunks it heard (`upTo`): a "no" with any chunk after
+    // them asks about the newest, and after PAUSE_ROUNDS the phrase ends with every
+    // chunk heard. Any failure ends it as the level would have, and nothing in this
+    // phrase asks the host again.
+    function askPause(round) {
+      pausing = true;
+      pauseId += 1;
+      var id = pauseId;
+      var mine = phrase;
+      var upTo = phrase.length;
+      var clip = phrase.slice(-(Math.ceil(HOST_PAUSE_MS / chunkMs) + 1));
+      function settle(found) {
+        if (self.done || self.aborted || phrase !== mine || id !== pauseId) return;
+        clearTimeout(pauseTimer);
+        pausing = false;
+        pauseId += 1;
+        if (!found) { deaf = true; endPhrase(phrase); return; }
+        if (found.speech) {
+          // Words in the pause: the phrase goes on as if the sound never stopped.
+          quiet = 0;
+          spoke += 1;
+          pauseSound = false;
+          self.early = null;
+          return;
+        }
+        // The chunks after the window join the phrase: words in them under the room's
+        // line would not start the next one, so carrying them could lose them.
+        if (phrase.length > upTo && round < PAUSE_ROUNDS) { askPause(round + 1); return; }
+        // Unchecked chunks may hold words the early pass never heard: hear it all.
+        if (phrase.length > upTo) self.early = null;
+        endPhrase(phrase);
+      }
+      pauseTimer = setTimeout(function () { settle(null); }, PAUSE_CHECK_MS);
+      fetch('/api/speech/talk', {
+        method: 'POST', headers: { 'Content-Type': 'audio/wav' }, body: wav(clip, cap.rate)
+      }).then(function (response) {
+        if (!response.ok) throw new Error('talk ' + response.status);
+        return response.json();
+      }).then(function (found) {
+        settle(found && typeof found.speech === 'boolean' ? found : null);
+      }).catch(function () { settle(null); });
+    }
+    // Whether the host hears speech in the phrase's last moments; no answer leaves the
+    // phrase to its level and its cap.
+    function askTalk(mine) {
+      // A word may start just as the check runs: the chunks from here on go to the next
+      // listener instead, whole.
+      var upTo = mine.length - Math.ceil(TALK_CARRY_MS / chunkMs);
+      var at = Date.now();
+      var since = spoke;
+      var tail = mine.slice(-Math.ceil(TALK_TAIL_MS / chunkMs));
+      var askedMs = mine.length * chunkMs;
+      fetch('/api/speech/talk', {
+        method: 'POST', headers: { 'Content-Type': 'audio/wav' }, body: wav(tail, cap.rate)
+      }).then(function (response) {
+        if (!response.ok) throw new Error('talk ' + response.status);
+        return response.json();
+      }).then(function (found) {
+        asking = false;
+        if (self.done || self.aborted || phrase !== mine || found.speech !== false) return;
+        // A pause already begun ends the phrase itself, its early pass kept; words a
+        // pause check heard since the tail was taken outweigh its "no".
+        if (quiet || spoke !== since) return;
+        self.endedAt = at - TALK_TAIL_MS;
+        self.noise = true;
+        // Its last TALK_TAIL_MS held no speech, and the chunks past `upTo` go on to
+        // the next listener (#4804).
+        self.soundedMs = Math.min(Math.max(0, askedMs - TALK_TAIL_MS), upTo * chunkMs, loudTo);
+        cap.carry = phrase.slice(upTo);
+        self.finish(phrase.slice(0, upTo));
+      }).catch(function () { asking = false; deaf = true; });
     }
     cap.sink = feed;
     // The phrase so far, for a check that does not end it (#3449).
@@ -1490,6 +1688,10 @@
       if (streamed) streamed.body = heardBody;
       // Woken by the stream, with its answer lost: the clip only logs it (#4539).
       if (streamed && !streamed.whole) this.clipStreamed(streamed, heardBody);
+      if (streamed && streamed.nameOnly && !this.saidAfterName(streamed.at)) {
+        this.listenAfterName();
+        return;
+      }
       this.afterWindow(heardBody);
       return;
     }
@@ -1532,7 +1734,9 @@
     var url = '/api/speech/wake?id=' + id + wakeQuery() + langQuery(v) + micQuery(body);
     var init = { method: 'POST', headers: { 'Content-Type': 'audio/wav' }, body: body };
     // Not woken, nothing more happens to the phrase; woken with nothing after it, it
-    // is the wake word alone. A detector that cannot answer leaves it to Whisper.
+    // is the wake word alone. A detector that cannot answer leaves "Alexa" to
+    // Whisper; "Hey Jarvis" is heard as words only with a sentence after it
+    // (`saidAfterName`, #4804), else it listens for the next phrase.
     var stopWatch = this.watchAnswer();
     hostRequest(v, url, init, function () { return !self.aborted; }, function () {
       if (v.mode === 'waiting') showStatus(waitingLine());
@@ -1545,14 +1749,47 @@
     }).then(function (found) {
       if (self.aborted) return;
       if (!found.woken || self.hushed()) { self.end(); return; }
+      // Silero's own "speech after the name" must agree with the length (#4804).
+      if (found.name_only && !(found.speech_after && self.saidAfterName())) {
+        self.listenAfterName();
+        return;
+      }
       if (!found.speech_after) { self.heard(wakeWord().name, true); self.end(); return; }
       // A wake the host confirmed by hearing the name (#4372) carries the phrase's
       // words already: they are not asked for again.
       self.transcribe(body, { id: id, ended: ended, detected: true },
         found.heard ? Promise.resolve(found.heard) : null);
     }).catch(function () {
-      if (!self.aborted) self.transcribe(body, { id: id, ended: ended });
+      if (self.aborted) return;
+      if (wakeWord() === WAKE_WORDS.jarvis) { self.listenAfterName(); return; }
+      self.transcribe(body, { id: id, ended: ended });
     });
+  };
+
+  // Whether a phrase "Hey Jarvis" woke on goes on past the name with a sentence
+  // (#4804): `at`, the stream's crossing in seconds into the phrase, when known. A
+  // phrase cut by a tap has no measure and counts as the name alone.
+  // One that does is heard whole, and must then hold the name in Whisper's words
+  // (`heard`): one that does not ("Harvest.") was the name and noise.
+  HostRecognition.prototype.saidAfterName = function (at) {
+    if (typeof this.soundedMs !== 'number') return false;
+    var name = typeof at === 'number' && at >= 0 ? at * 1000 : NAME_ENDS_MS;
+    var said = this.soundedMs - name >= SAID_AFTER_NAME_MS;
+    if (said) this.nameFirst = true;
+    return said;
+  };
+
+  // "Hey Jarvis" said alone (#4788; one with a sentence after it, #4804, goes to
+  // Whisper whole): its phrase never goes to Whisper, which wrote the name said
+  // alone as "Harvest." or "Hate armies!" and sent that. It listens for the
+  // next phrase, with the listening beep after this one, however early the stream's
+  // own beep came, so the person knows when to say it.
+  HostRecognition.prototype.listenAfterName = function () {
+    if (this.hushed()) { this.end(); return; }
+    this.beepedAt = 0;
+    this.v.beeped = 0;
+    this.heard(wakeWord().name, true);
+    this.end();
   };
 
   // A phrase heard after a window woke (#3842): the name was heard already, so it
@@ -1631,7 +1868,7 @@
     if (!this.recognizesEarly()) return this.v.purpose === 'question' ? 'question' : 'other';
     // A phrase that ends on its own always has one: sound coming back drops it, and
     // the next 0.3 s of pause makes another.
-    return this.capped ? 'cap' : 'cut';
+    return this.noise ? 'noise' : this.capped ? 'cap' : 'cut';
   };
 
   // Whether this listener streams its phrases (#4539): the wait for the name where
@@ -1649,7 +1886,8 @@
     if (!this.streams() || !v.stream || this.hushed()) return;
     var s = { id: wakeLogId(), whole: true };
     var handler = {
-      woken: function () { self.streamWoken(s); },
+      woken: function (msg) { self.streamWoken(s, msg); },
+      sure: function () { self.beepEarly(s); },
       confirming: function () {
         s.confirming = true;
         clearTimeout(s.timer);
@@ -1657,7 +1895,7 @@
       done: function (msg) {
         s.answered = true;
         clearTimeout(s.timer);
-        if (msg.woken) { self.streamWoken(s); return; }
+        if (msg.woken) { self.streamWoken(s, msg); return; }
         if (s.woke || s.clipped || !s.body || self.aborted) return;
         self.end();
       },
@@ -1680,19 +1918,34 @@
     if (!this.v.stream || !this.v.stream.audio(samples, rate)) s.whole = false;
   };
 
-  // The stream heard the name: the beep now, before the phrase ends. What follows in
-  // the phrase is the message, heard whole at its end as after a reading's window.
-  HostRecognition.prototype.streamWoken = function (s) {
+  // The stream is sure of the name, with speech recognition still checking it
+  // (#4614; only where `[speech] wake_sure` is set, empty by default since #4779): the beep now, the listening once that says yes. Words
+  // said meanwhile are kept (`Capture`). A no takes back nothing: it goes on waiting.
+  HostRecognition.prototype.beepEarly = function (s) {
+    if (this.beepedAt || s.woke || s.clipped || this.aborted || this.hushed() || quietNight()) return;
+    this.beepedAt = Date.now();
+    tone(880);
+  };
+
+  // The stream heard the name: the beep now, before the phrase ends, unless it was
+  // given already. What follows in the phrase is the message, heard whole at its end
+  // as after a reading's window, except after "Hey Jarvis" (`name_only`, #4788)
+  // with no sentence after it (`saidAfterName`, #4804), which listens for the next
+  // phrase instead.
+  HostRecognition.prototype.streamWoken = function (s, msg) {
     var v = this.v;
     if (s.woke || s.clipped || this.aborted || this.hushed() || quietNight()) return;
     s.woke = true;
+    s.nameOnly = !!(msg && msg.name_only);
+    // Where the name crossed, so a sentence after it is told from the name alone.
+    if (msg && typeof msg.at === 'number') s.at = msg.at;
     clearTimeout(s.timer);
     this.woken = true;
     this.wokeAt = this.waited || 0;
-    v.beeped = Date.now();
-    tone(880);
+    if (!this.beepedAt) { this.beepedAt = Date.now(); tone(880); }
     showStatus('Listening…');
     // The phrase had ended, waiting for this answer: it is heard now.
+    if (s.body && s.nameOnly && !this.saidAfterName(s.at)) { this.listenAfterName(); return; }
     if (s.body) this.afterWindow(s.body);
   };
 
@@ -1842,6 +2095,17 @@
     // Every result comes through here: one that comes back into the night, for a
     // phrase heard before it, is dropped too (#4368).
     if (this.hushed()) return;
+    // This phrase's own beep stands for the one before listening (#4539).
+    // A "Hey Jarvis" phrase heard whole for its sentence (#4804) whose words do not
+    // start with the name was the name alone, misheard: it only listens, with the
+    // listening beep after it, as `listenAfterName`.
+    if (this.nameFirst && woke && !findName(text, true)) {
+      text = wakeWord().name;
+      doubts = [];
+      this.beepedAt = 0;
+      this.v.beeped = 0;
+    }
+    if (this.beepedAt) this.v.beeped = this.beepedAt;
     var result = [{ transcript: text }];
     result.isFinal = true;
     result.woke = woke;
@@ -1938,7 +2202,9 @@
       // Device names show only once the microphone is allowed: look again.
       v.capture.rematch();
     }).catch(function () {
-      if (!stale()) off('Microphone blocked');
+      if (stale()) return;
+      survives(false);
+      off('Microphone blocked');
     });
   }
 
@@ -1960,6 +2226,25 @@
     return text.toLowerCase().replace(/[^\p{L}\p{N}\s]+/gu, ' ').trim().split(/\s+/)
       .filter(Boolean);
   }
+
+  // Whether a reload for a new deploy must wait (base.html's `reloadWhenIdle`, #4645).
+  // Never mid-sentence, the wake phrase included. Between sentences it goes ahead where
+  // voice mode was seen to go on by itself after a reload; a browser that refuses sound
+  // until a tap waits until someone touches the page, as they may be far from the phone.
+  // carryOn starts it again. A kiosk reloads between sentences.
+  window.AgentDeckVoiceHoldsReload = function () {
+    // Pocket mode (#4792): a reload would bring the lit page back in the pocket, with
+    // voice mode on or not.
+    if (document.documentElement.classList.contains('pocket-on')) return true;
+    var v = voice;
+    if (!v || v.carrying) return !!v;
+    if (v.mode === 'speaking' || v.speaking || v.relaying || v.replyDeadline || v.question ||
+        v.jump || v.checks > 0 || (listeningMode(v) && (heard(v) || v.hearing))) return true;
+    if (document.querySelector('[data-kiosk]')) return false;
+    // Put away: the reload waits until the page is shown.
+    if (document.hidden) return true;
+    return !survivesReload() && Date.now() - touchedAt > AT_HAND_MS;
+  };
 
   function heard(v) {
     return v.phrases.join(' ').trim();
@@ -1995,9 +2280,17 @@
 
   // The words after the wake word `name` found in `text`, and their doubts.
   function afterWake(text, doubts, name) {
-    var tail = text.slice(name.index + name[0].length);
+    return cutCalls(text, doubts, name.index + name[0].length, false);
+  }
+
+  // `text` from `from` on without the wake word called at its start (said twice), or
+  // with `ends` at its end too, and its doubts (#4645). Empty when it is only calls.
+  function cutCalls(text, doubts, from, ends) {
+    var call = wakeWord().calls;
+    var tail = text.slice(from).replace(call.starts, '').replace(/^\s+/, '');
+    var cut = text.length - tail.length;
+    if (ends) tail = tail.replace(call.ends, '');
     var message = tail.trim();
-    var cut = text.length - tail.replace(/^\s+/, '').length;
     return { text: message, doubts: moveSpans(doubts, -cut, message.length) };
   }
 
@@ -2161,14 +2454,22 @@
 
   function run(v) {
     var rec = new HostRecognition(v);
+    // A listener let go of mid-phrase never ends: its phrase is not this one's.
+    v.hearing = false;
     rec.unasked = v.purpose === 'wake';
     v.rec = rec;
     v.startedAt = Date.now();
     rec.onresult = function (event) {
       if (current() !== v || v.rec !== rec) return;
       v.quickEnds = 0;
+      var said = { text: event.results[0][0].transcript.trim(), doubts: event.results[0].doubts };
+      // Already listening, the name called again is not words: it goes on listening.
+      if (v.purpose !== 'wake') {
+        said = cutCalls(said.text, said.doubts, 0, true);
+        if (!said.text) { idle(v); return; }
+      }
       idle(v);
-      addPhrase(v, event.results[0][0].transcript.trim(), event.results[0].doubts);
+      addPhrase(v, said.text, said.doubts);
       if (event.results[0].woke) v.woke = true;
       // Unheard as the words came back: the fast agent, asked now (#3765), may see the
       // turn end before they are sent, and they still say so (#3520).
@@ -2835,6 +3136,10 @@
     (token.clocks || []).forEach(function (clock) {
       if (clock.voice) return;
       clock.voice = Date.now();
+      // Its answer is heard while the agent writes it (#4543): the log says so. Set
+      // only once a draft's sound starts, and only while its finished line has not
+      // landed, so an answer not heard before its line is not counted.
+      if (token.draft && !token.draft.rowId) clock.draft = true;
       timed(v, clock);
     });
   }
@@ -2859,6 +3164,7 @@
     if (clock.waited) timing.waited = clock.waited;
     if (typeof clock.stt === 'number') timing.stt = clock.stt;
     if (typeof clock.early === 'string') timing.early = clock.early;
+    if (clock.draft) timing.draft = true;
     try {
       fetch('/api/voice/sent', {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, keepalive: true,
@@ -2940,7 +3246,7 @@
     // Only the name alone listens next; any other way on, an early beep is spent.
     var beeped = v.beeped;
     v.beeped = 0;
-    var match = wakeWord().re.exec(text);
+    var match = findName(text, woke);
     if (!match && !woke) return;
     var message = text;
     if (match) {
@@ -3219,6 +3525,8 @@
 
   function speakReply(v) {
     if (current() !== v || working()) return;
+    // Its sound not started yet (#4684): the reply stays unread, and going on reads it.
+    if (v.carryPaused) { v.replyDeadline = 0; return; }
     // A note still being read finishes first; its end listens, and this reads next.
     if (v.speaking && v.noting) {
       clearTimeout(v.replyTimer);
@@ -3604,6 +3912,7 @@
       return;
     }
     draft.token = token;
+    token.draft = draft;
     // A reply read now keeps the turn's end from reading it again (`speakReply`).
     v.noting = true;
     draftLanded(v);
@@ -4065,7 +4374,8 @@
 
   // A chat opened with voice mode on in the one left: it starts at once as the
   // taps left it. A browser that will not play without a tap on this page (a
-  // full load) pauses it instead, and a tap on 🎧 or 🎤 goes on. 🎤 on its own,
+  // full load) pauses it instead, and a tap on 🎧 or 🎤 goes on
+  // (a kiosk also tries by itself, `keepStarting`). 🎤 on its own,
   // used like dictation, starts again only in the same chat (a reload): any other
   // chat or Work opens with it off, a move asked for by voice included (#4051).
   function carryOn() {
@@ -4090,7 +4400,7 @@
       if (kept.reads) startReading(v, true);
       if (hears) startHearing(v);
     }
-    if (v.audio.state === 'running') { go(); return; }
+    if (v.audio.state === 'running') { survives(true); go(); return; }
     setTimeout(function () {
       if (voice !== v || !v.carrying || v.audio.state === 'running') return;
       v.reads = !!kept.reads;
@@ -4098,9 +4408,51 @@
       if (v.reads) v.button.setAttribute('aria-pressed', 'true');
       v.carrying = false;
       remember(v);
+      survives(false);
       rest(CARRY_PAUSED);
+      if (document.querySelector('[data-kiosk]')) keepStarting(v);
     }, CARRY_START_MS);
-    try { v.audio.resume().then(go, function () { /* the pause above */ }); } catch (e) { /* paused */ }
+    try { v.audio.resume().then(function () {
+      if (voice === v && v.carrying) survives(true);
+      go();
+    }, function () { /* the pause above */ }); } catch (e) { /* paused */ }
+  }
+
+  // A kiosk may show no 🎧 to tap, so the pause above would leave it deaf (#4684): it
+  // tries its sound again until it starts, then goes on as after a tap, or until a tap
+  // does (`resumeFromPause`). Not in its quiet hours: the morning's first try goes on.
+  // It stays a rest meanwhile, so a deploy's reload is not held.
+  function keepStarting(v) {
+    v.carryPaused = true;
+    logCarry(v, 'paused');
+    function again() {
+      if (voice !== v || !v.carryPaused) return;
+      // Listening was turned on some other way.
+      if (v.captureReady) { v.carryPaused = false; return; }
+      if (!quietNight()) {
+        // Only from a rest: anything being read as the sound starts is heard out first.
+        if (v.audio.state === 'running' && v.mode === 'resting') {
+          survives(true);
+          logCarry(v, 'started');
+          v.carryPaused = false;
+          resumeFromPause(v);
+          return;
+        }
+        try { v.audio.resume().then(null, function () { /* tried again */ }); } catch (e) { /* tried again */ }
+      }
+      setTimeout(again, CARRY_RETRY_MS);
+    }
+    setTimeout(again, CARRY_RETRY_MS);
+  }
+
+  // A kiosk's pause and its end, for the wake log, so a deaf kiosk can be explained
+  // later (#4684): 'paused', then 'started' by itself or 'tapped'; best effort.
+  function logCarry(v, state) {
+    var kiosk = document.querySelector('[data-kiosk]');
+    fetch('/api/speech/wake-log', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, keepalive: true,
+      body: JSON.stringify({ carry: state, kiosk: kiosk ? kiosk.getAttribute('data-kiosk') : '', audio: v.audio.state })
+    }).catch(function () { /* only logged */ });
   }
 
   // ---- jumping to another chat (#3816) ---------------------------------------
@@ -4355,6 +4707,7 @@
   });
 
   function resumeFromPause(v) {
+    if (v.carryPaused) { v.carryPaused = false; logCarry(v, 'tapped'); }
     if (v.audio && v.audio.resume) v.audio.resume();
     wakeLock();
     if (v.hears && !v.captureReady) openMicrophone(v);

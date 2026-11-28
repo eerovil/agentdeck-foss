@@ -132,9 +132,20 @@ async def register_pull(app: Any, leg: str, ref: Any) -> bool:
         return True
     current = state.chat_current_session_key(leg)
     keys = (*dict.fromkeys((*state.chat_session_keys(leg), leg, current)),)
+    # The Works this pull request was registered for before, and the one it is for now.
+    works = {
+        item.work_id
+        for refs in tuple(state.session_pull_requests.values())
+        for item in refs
+        if item.identity == ref.identity
+    } | {ref.work_id}
     if not state.db.register_chat_pull_request(current, keys, ref):
         log.warning("services: %s was not stored for %s", ref.identity, leg)
         return False
+    from .. import work_published
+
+    # Committed: their published labels are synced again (#4794), whatever the read-back.
+    work_published.request(works)
     stored = state.db.load_session_pull_requests()
     if not held(stored, keys, ref):
         return False

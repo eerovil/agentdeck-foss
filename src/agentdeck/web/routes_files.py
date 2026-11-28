@@ -3,6 +3,8 @@
 An ``.html``/``.htm`` link renders: whatever form the link took, the file is
 shown as a sandboxed preview rather than as escaped source. ``?raw=1`` or a
 trailing ``:line`` asks for the source instead, the same way ``.md`` links do.
+``?download=1`` skips every view and hands back the file itself as an attachment,
+so a phone can save a text file (an ``.ics``, say) instead of opening a page.
 """
 
 from __future__ import annotations
@@ -375,6 +377,8 @@ def _render_preview(request: Request, entry: Path) -> HTMLResponse:
             "entry_path": str(entry),
             "preview_src": str(preview_src),
             "source_href": f"{quote(str(entry))}?raw=1",
+            "download_href": f"{quote(str(entry))}?download=1",
+            "download_name": entry.name,
         },
     )
     response.headers["Cache-Control"] = "private, no-store"
@@ -500,7 +504,11 @@ def _diagram_parts(content: str) -> dict | None:
 
 @router.get("/{local_path:path}", response_class=Response)
 async def local_file(
-    request: Request, local_path: str, raw: bool = False, bare: bool = False
+    request: Request,
+    local_path: str,
+    raw: bool = False,
+    bare: bool = False,
+    download: bool = False,
 ) -> Response:
     """Serve any readable host file; render HTML, and other text without executing it."""
     # This catch-all is registered last and claims every unmatched path, so a
@@ -514,7 +522,7 @@ async def local_file(
     if is_private_upload_path(path):
         raise HTTPException(status_code=404, detail="local file not found")
 
-    if not raw and line_number is None:
+    if not raw and not download and line_number is None:
         entry = _preview_entry(path)
         if entry is not None:
             return _render_preview(request, entry)
@@ -527,6 +535,9 @@ async def local_file(
         raise HTTPException(status_code=403, detail="local file is not readable") from exc
     except OSError as exc:
         raise HTTPException(status_code=404, detail="local file not found") from exc
+
+    if download:
+        return _file_response(path, media_type, stat, "attachment")
 
     if _is_text_file(path, media_type) and stat.st_size <= _MAX_RENDERED_TEXT_BYTES:
         try:
@@ -563,11 +574,22 @@ async def local_file(
         response.headers["X-Content-Type-Options"] = "nosniff"
         return response
 
+    return _file_response(path, media_type, stat, "inline")
+
+
+def _file_response(
+    path: Path, media_type: str | None, stat: os.stat_result, disposition: str
+) -> FileResponse:
+    """The file's own bytes, shown in place (``inline``) or saved (``attachment``)."""
+    # stat() succeeds on a file it cannot read, and the stream would then fail
+    # after the headers went out; say so up front instead.
+    if not os.access(path, os.R_OK):
+        raise HTTPException(status_code=403, detail="local file is not readable")
     return FileResponse(
         path,
-        media_type=media_type,
+        media_type=media_type or "application/octet-stream",
         filename=path.name,
-        content_disposition_type="inline",
+        content_disposition_type=disposition,
         stat_result=stat,
         headers={
             "Cache-Control": "no-store",

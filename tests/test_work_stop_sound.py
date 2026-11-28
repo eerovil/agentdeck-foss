@@ -146,7 +146,8 @@ async def test_a_new_stop_chimes_once_and_only_when_it_may(tmp_path, monkeypatch
 @pytest.mark.browser
 @pytest.mark.asyncio
 async def test_a_starred_works_stop_chimes_from_the_starred_list(tmp_path, monkeypatch):
-    """#4121: Starred is the only list a starred Work is in, so its stops chime from there."""
+    """#4121: a starred Work's stop chimes once, from Starred, which a push swaps first; the
+    Work's rows in its own group and in Recently stopped (#4745) add no second chime."""
     from conftest import async_playwright
     from test_web import _live_server
     from test_work_stops import _deck, _pretend_it_left
@@ -164,7 +165,6 @@ async def test_a_starred_works_stop_chimes_from_the_starred_list(tmp_path, monke
         await context.add_init_script(AUDIO_STUB)
         page = await _open(context, base)
         await page.wait_for_selector(row, state="attached")
-        assert await page.locator(f'#works-stopped [data-work-id="{WORK.work_id}"]').count() == 0
         await _use(page)
         old = await page.get_attribute(row, "data-work-stopped")
         _pretend_it_left(app, WORK.work_id)

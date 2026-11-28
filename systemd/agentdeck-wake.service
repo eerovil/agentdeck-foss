@@ -15,6 +15,9 @@ Environment=GIT_TERMINAL_PROMPT=0 SSH_ASKPASS_REQUIRE=never
 ExecStart=%h/.local/share/agentdeck/speech-venv/bin/python %h/agentdeck/scripts/wake_server.py --idle-exit 0
 # Heard live, like the speech service: keep it ahead of test suites for the CPU.
 CPUWeight=500
+# Never swapped out (#4669): loaded is not enough. On a full host a break left
+# 0.6 GB of it in swap.
+MemorySwapMax=0
 # A crash restarts it, so the next wake does not wait for a cold start.
 Restart=on-failure
 RestartSec=5

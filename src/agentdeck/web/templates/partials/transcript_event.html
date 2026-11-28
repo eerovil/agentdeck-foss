@@ -60,7 +60,8 @@
     <span class="deck-notice-label">{{ deck_label or e.notice }}</span>
     {% if e.ts %}<time class="ev-time" datetime="{{ e.ts.isoformat() }}" title="{{ e.ts | chat_time_title }}">{{ e.ts | chat_time }}</time>{% endif %}
   </summary>
-  {% if e.text %}<div class="ev-text">{{ e.text | display_message }}</div>{% endif %}
+  {% for note in deck_notes | default([]) %}<div class="ev-text">{{ note }}</div>
+  {% endfor %}{% if e.text %}<div class="ev-text">{{ e.text | display_message }}</div>{% endif %}
 </details>
 {%- elif e.answer -%}
 <div id="event-{{ event_id }}" class="ev user{% if e.subagent %} sub{% endif %}" data-event-seq="{{ e.seq }}" data-event-id="{{ event_id }}" data-event-session-key="{{ session_key }}"{{ observed_attrs }}>
@@ -75,6 +76,20 @@
 </div>
 {%- elif e.role == 'tool' or (not e.text and not e.question and not e.tool_name and not e.image_media_types) -%}
 {%- else -%}
+{#- The deck's notes that rode on this message (#4618): one grey line above it, so the
+    person's own words are what the bubble shows. Not an `.ev`, so no script takes it for
+    a turn boundary of its own. #}
+{%- if deck_notes | default([]) %}
+<details class="deck-notes">
+  <summary>
+    <span class="deck-notice-dot" aria-hidden="true">●</span>
+    <span class="deck-notice-label">{{ deck_notes | length }} deck note{{ 's' if deck_notes | length != 1 }}</span>
+    {% if e.ts %}<time class="ev-time" datetime="{{ e.ts.isoformat() }}" title="{{ e.ts | chat_time_title }}">{{ e.ts | chat_time }}</time>{% endif %}
+  </summary>
+  {% for note in deck_notes %}<div class="ev-text">{{ note }}</div>
+  {% endfor %}
+</details>
+{% endif -%}
 <div id="event-{{ event_id }}" class="ev {{ e.role }}{% if e.failed %} failed{% endif %}{% if e.subagent %} sub{% endif %}"{% if e.queued %} data-queued{% endif %} data-event-seq="{{ e.seq }}" data-event-id="{{ event_id }}" data-event-session-key="{{ session_key }}"{% if e.message_id %} data-message-id="{{ e.message_id }}"{% endif %}{{ observed_attrs }}>
   <div class="ev-head">
     <span class="ev-role">{{ e.role }}{% if e.subagent %} · {{ e.subagent }}{% endif %}</span>
@@ -94,7 +109,7 @@
               aria-label="Roll the chat back to before message #{{ event_id }}" title="Roll back to before this message">↶</button>{% endif %}
     </span>
   </div>
-  {% if e.text %}<div class="ev-text">{{ e.text | display_message }}</div>{% endif %}
+  {% set shown = e.text | display_message(keep_notes=not (deck_notes | default([])), keep_routine=e.role != 'user') %}{% if shown %}<div class="ev-text">{{ shown }}</div>{% endif %}
   {% if e.image_media_types %}
   <div class="ev-images" aria-label="{{ e.image_media_types | length }} attached image{% if e.image_media_types | length != 1 %}s{% endif %}">
     {% for media_type in e.image_media_types %}<img class="ev-image" src="/sessions/{{ session_key }}/transcript-images/{{ e.seq }}/{{ loop.index0 }}" alt="Attached image {{ loop.index }}" loading="lazy">{% endfor %}

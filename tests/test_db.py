@@ -1383,6 +1383,24 @@ def test_scheduled_message_handoffs_name_each_chat_being_sent_to(tmp_path):
         assert all(at >= now for at in found.values())
         later = datetime.now(UTC) + timedelta(minutes=10)
         assert db.scheduled_message_handoffs(later, later - timedelta(minutes=2)) == {}
+        # A keep-warm ping hands its chat nothing to do (#4737): no handoff, never due,
+        # never shown, stored once, and a refusal stays on the row.
+        assert not db.chat_has_undelivered_message("chat-5")
+        assert db.chat_has_undelivered_message("chat-2")
+        assert db.record_keep_warm("keep-warm:chat-5:1", "chat-5", "ping")
+        assert not db.record_keep_warm("keep-warm:chat-5:1", "chat-5", "ping")
+        now = datetime.now(UTC)
+        assert "chat-5" not in db.scheduled_message_handoffs(now, since)
+        assert "keep-warm:chat-5:1" not in {m.id for m in db.load_due_scheduled_messages(later)}
+        assert db.load_visible_scheduled_messages("chat-5") == ()
+        assert not db.chat_has_undelivered_message("chat-5")
+        assert db.deck_message_ids("chat-5", ["ping"])["ping"][0][0] == "keep-warm:chat-5:1"
+        db.fail_keep_warm("keep-warm:chat-5:1", "worker_not_live")
+        db.fail_keep_warm("sent", "never a ping")
+        assert db.deck_message_ids("chat-5", ["ping"]) == {}
+        assert db.load_visible_scheduled_messages("chat-5") == ()
+        assert not db.record_keep_warm("keep-warm:chat-5:1", "chat-5", "ping")
+        assert "chat-3" in db.scheduled_message_handoffs(now, since)
     finally:
         db.close()
 

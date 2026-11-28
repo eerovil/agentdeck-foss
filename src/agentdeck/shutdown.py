@@ -16,6 +16,7 @@ the restartable web process's client channel to it.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from collections.abc import Awaitable, Callable
 from typing import Any, Literal
@@ -28,6 +29,57 @@ log = logging.getLogger(__name__)
 DELIVERY_DRAIN_TIMEOUT_S = 30.0
 
 ShutdownPhase = Literal["running", "stopping", "draining", "closed"]
+
+#: What a request cut off by the web process stopping is told (#4738).
+CUT_OFF_TEXT = (
+    "The deck restarted while this request was running, so its answer was lost: it may or may"
+    " not have taken effect. Read the current state before sending it again. pre-review-done"
+    " and ship-now may be sent again as they are: when the first call did take effect, the"
+    " repeat says so (a review already asked for, a press already recorded)."
+)
+
+
+class CutOffAnswer:
+    """Answer a request the stopping server cancelled, rather than a bare 500 (#4738).
+
+    A deploy gives the old web worker's in-flight requests a few seconds and then cancels
+    them. Uvicorn answers a cancelled request "500 Internal Server Error", which reads as a
+    deck fault and says nothing of whether the call took effect: a ``pre-review-done`` cut
+    off this way had already asked for its review. This outermost layer answers 504 with the
+    reason instead, and lets the cancellation go on. A response already started (a stream)
+    is left alone.
+
+    504, as ``ServicesUncertain``, and never 503: on this deck 503 means nothing was sent, and
+    the services process sends a call the web answered 503 again (``WebCalls.post``). Uvicorn
+    cancels a request's task nowhere but at the end of its graceful window.
+    """
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    async def __call__(self, scope: dict, receive: Any, send: Any) -> None:
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+        started = False
+
+        async def sending(message: dict) -> None:
+            nonlocal started
+            started = started or message.get("type") == "http.response.start"
+            await send(message)
+
+        try:
+            await self.app(scope, receive, sending)
+        except asyncio.CancelledError:
+            if not started:
+                body = json.dumps({"detail": CUT_OFF_TEXT}).encode()
+                headers = [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(body)).encode()),
+                ]
+                await send({"type": "http.response.start", "status": 504, "headers": headers})
+                await send({"type": "http.response.body", "body": body})
+            raise
 
 
 class DeliveryShutdownCoordinator:

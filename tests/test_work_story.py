@@ -1185,9 +1185,9 @@ def _ids(rows):
     return [row.card.work_id for row in rows]
 
 
-def test_a_starred_work_is_listed_in_starred_alone():
-    """#4121: every listed starred Work, what needs you first, and in no other group; yet the
-    counts line and what tells a person per Work still read it where it is."""
+def test_a_starred_work_is_listed_in_starred_and_in_its_own_group():
+    """#4121, #4745: every listed starred Work, what needs you first, each in its own group as
+    well; the counts line and what tells a person per Work read it once, where it is."""
     from dataclasses import replace
 
     from agentdeck.work_story import MAX_STOPPED, QUIET, front_sections
@@ -1204,13 +1204,27 @@ def test_a_starred_work_is_listed_in_starred_alone():
     front = front_sections([working, quiet, asking, plain], now=now)
 
     assert _ids(front.starred) == [asking.card.work_id, working.card.work_id, quiet.card.work_id]
-    # Listed there, so never a place in another: Recently stopped gives its room to the rest.
-    assert [_ids(group.rows) for group in front.groups_in("start")] == [[plain.card.work_id]]
-    assert front.others(front.active) == () and front.quiet == 0
-    assert _ids(front.stopped) == [plain.card.work_id] and MAX_STOPPED > 1
+    # Its own group lists it too, first (#3116), and Recently stopped like any other stop.
+    both = [asking.card.work_id, plain.card.work_id]
+    assert [_ids(group.rows) for group in front.groups_in("start")] == [both]
+    assert _ids(front.active) == [working.card.work_id] and front.quiet == 0
+    assert _ids(front.stopped) == both and MAX_STOPPED > 1
+    # There a star is a stop like any other: it takes a place, and is past the bound too.
+    later = [
+        replace(plain, card=replace(plain.card, work_id=f"github_issue:o/r#{n}"),
+                stopped_at=now + timedelta(minutes=n))
+        for n in range(1, MAX_STOPPED + 1)
+    ]
+    crowded = front_sections([asking, *later[1:]], now=now)
+    assert len(crowded.stopped) == MAX_STOPPED and asking.card.work_id in _ids(crowded.stopped)
+    crowded = front_sections([asking, *later], now=now)
+    assert asking.card.work_id not in _ids(crowded.stopped)
+    assert asking.card.work_id in _ids(crowded.starred)
+    # A quiet one has no group of its own: Starred alone lists it.
+    assert _ids(front.idle) == [quiet.card.work_id]
     assert asking in front.needs_you_works and working in front.active
     assert dict((key, count) for key, count, _ in front.summary)["answer"] == 2
-    assert quiet.section == QUIET and quiet in front.rows
+    assert quiet.section == QUIET and quiet.card.work_id in _ids(front.rows)
 
     # A row the person hid stays hidden, quiet or not, and an unstarred quiet Work is counted.
     put_away = front_sections(
@@ -1221,7 +1235,7 @@ def test_a_starred_work_is_listed_in_starred_alone():
 
 
 def test_a_star_takes_no_place_from_a_bounded_group_and_is_never_cut():
-    """#4121: the bounds count what their group lists, and a starred row is past none of them."""
+    """#4121: the bounds count the unstarred rows, and a starred row is past none of them."""
     from dataclasses import replace
 
     from agentdeck.work_story import MAX_FINISHED, front_row, front_sections
@@ -1238,7 +1252,7 @@ def test_a_star_takes_no_place_from_a_bounded_group_and_is_never_cut():
     rows = [front_row(active(n, starred=n == 3), current=True) for n in range(1, 5)]
     front = front_sections(rows, now=now, max_active=2)
     assert _ids(front.starred) == [rows[2].card.work_id]
-    assert _ids(front.others(front.active)) == [rows[0].card.work_id, rows[1].card.work_id]
+    assert _ids(front.active) == [row.card.work_id for row in (rows[2], rows[0], rows[1])]
     assert front.active_more == 1
 
     def done(number, **fields):
@@ -1250,7 +1264,9 @@ def test_a_star_takes_no_place_from_a_bounded_group_and_is_never_cut():
     finished = [done(n, starred=n == MAX_FINISHED + 2) for n in range(1, MAX_FINISHED + 3)]
     front = front_sections(finished, now=now)
     assert _ids(front.starred) == [finished[-1].card.work_id]
-    assert len(front.others(front.finished)) == MAX_FINISHED and front.finished_more == 1
+    # Finished this week, it is in Recently finished too (#4745), over the bound's own rows.
+    assert _ids(front.recent)[0] == finished[-1].card.work_id
+    assert len(front.recent) == MAX_FINISHED + 1 and front.finished_more == 1
 
     # Finished long ago, it stays until its star goes; hidden or unstarred, it is only counted.
     long_ago = now - timedelta(days=30)
@@ -1258,7 +1274,12 @@ def test_a_star_takes_no_place_from_a_bounded_group_and_is_never_cut():
         done(1).card, starred=True, finished_at=long_ago, last_activity=long_ago
     ))
     front = front_sections([old], now=now)
-    assert front.starred == (old,) and front.quiet == 0
+    assert _ids(front.starred) == [old.card.work_id] and front.quiet == 0
+    # Not recent, so Recently finished does not list it; nor one with no known finish time.
+    assert front.recent == () and front.kept == {old.card.work_id}
+    undated = replace(old, card=replace(old.card, finished_at=None, last_activity=None))
+    front = front_sections([undated], now=now)
+    assert _ids(front.starred) == [old.card.work_id] and front.recent == ()
     assert front_sections([old], now=now, hidden={old.card.work_id}).starred == ()
     plain = replace(old, card=replace(old.card, starred=False))
     front = front_sections([plain], now=now)
@@ -1266,8 +1287,8 @@ def test_a_star_takes_no_place_from_a_bounded_group_and_is_never_cut():
 
 
 def test_a_star_folded_under_a_parent_brings_the_parent_row_to_starred():
-    """#4121: a sub-issue has no row of its own, so its star lifts the row it is shown in, and
-    every part of the page draws that one row once."""
+    """#4121: a sub-issue has no row of its own, so its star lifts the row it is shown in, into
+    Starred and still in its own group (#4745)."""
     from dataclasses import replace
 
     from starlette.templating import Jinja2Templates
@@ -1283,7 +1304,8 @@ def test_a_star_folded_under_a_parent_brings_the_parent_row_to_starred():
     rows[12] = _star(rows[12])
     folded = fold(list(rows.values()), parents=parents, counts={parent_id: (1, 4)})
     front = front_sections(folded)
-    assert _ids(front.starred) == [parent_id] and front.groups_in("start") == ()
+    assert _ids(front.starred) == [parent_id]
+    assert [_ids(group.rows) for group in front.groups_in("start")] == [[parent_id]]
 
     templates = Jinja2Templates(directory=str(app_mod._TEMPLATES_DIR))
     render_mod.register_filters(templates)
@@ -1294,7 +1316,9 @@ def test_a_star_folded_under_a_parent_brings_the_parent_row_to_starred():
     # Under one header, the row names the category a group's header would have said.
     label = rows[11].attention.label
     assert f'<span class="fr-headline">{label}</span>' in html
-    assert f'data-work-id="{parent_id}"' not in render_work_front(templates, overview, "needs")
+    needs = render_work_front(templates, overview, "needs")
+    assert f'data-work-id="{parent_id}"' in needs and 'data-front-in="starred"' not in needs
+    assert f'<span class="fr-headline">{label}</span>' not in needs
     # What the page says when nothing is starred: nothing, no empty header.
     empty = WorkOverview(front=replace(front, needs_you=()))
     assert render_work_front(templates, empty, "starred").strip() == ""
@@ -1305,11 +1329,83 @@ def test_a_star_folded_under_a_parent_brings_the_parent_row_to_starred():
     assert '<span class="fr-headline">Finished</span>' in render_work_front(
         templates, shown, "starred"
     )
+    recent = render_work_front(templates, shown, "finished")
+    assert f'data-work-id="{done.card.work_id}"' in recent and "fr-headline" not in recent
     # A starred paused row keeps its Resume in Starred.
     paused = _star(replace(rows[11], section="paused", attention=None))
     held = WorkOverview(front=front_sections([paused]))
     assert 'value="resume"' in render_work_front(templates, held, "starred")
-    assert render_work_front(templates, held, "paused").strip() == ""
+    assert 'value="resume"' in render_work_front(templates, held, "paused")
+
+
+def test_a_work_idle_over_48_hours_is_one_line_on_the_front_page():
+    """#4633: title and age only, until something moves in it."""
+    from dataclasses import replace
+
+    from fastapi.templating import Jinja2Templates
+
+    from agentdeck import app as app_mod
+    from agentdeck.web import render as render_mod
+    from agentdeck.web.work_view import WorkOverview, render_work_front
+    from agentdeck.work_story import front_row, front_sections, idle_days, idle_deadline
+
+    templates = Jinja2Templates(directory=str(app_mod._TEMPLATES_DIR))
+    render_mod.register_filters(templates)
+    now = datetime.now(UTC)
+
+    def row(ago, *, section=None, finished=None, **fields):
+        built = front_row(_work(pull=True), current=True)
+        moved = None if ago is None else now - ago
+        card = replace(built.card, last_activity=moved, finished_at=finished, **fields)
+        return replace(built, card=card, section=section or built.section)
+
+    hour = timedelta(hours=1)
+    assert idle_days(row(48 * hour), now) == 0
+    assert idle_days(row(48 * hour + timedelta(seconds=1)), now) == 2
+    assert idle_days(row(None), now) == 0 and idle_days(row(-hour), now) == 0
+    assert idle_days(replace(row(90 * hour), children=(row(hour),)), now) == 0
+    assert idle_days(replace(row(90 * hour), children=(row(80 * hour),)), now) == 3
+    working = front_row(_work(chats=(_chat("c:a:w", "W", working=True),)), current=True)
+    long_ago = replace(working.card, last_activity=now - 90 * hour)
+    assert idle_days(replace(working, card=long_ago), now) == 0
+    # A Work that came to need a person an hour ago has moved, however old its chats are.
+    assert idle_days(replace(row(90 * hour), stopped_at=now - hour), now) == 0
+    stop = replace(row(90 * hour, section="needs_you"), stopped_at=now - 80 * hour)
+    assert idle_days(stop, now) == 3
+    # The overview is rebuilt when a row goes idle, and again as each day passes.
+    second = timedelta(seconds=1)
+    assert idle_deadline([row(47 * hour)], now) == now + hour + second
+    assert idle_deadline([row(48 * hour)], now) == now + second
+    assert idle_deadline([row(hour), row(90 * hour)], now) == now + 6 * hour
+    assert idle_deadline([row(None)], now) is None
+    # A finished Work goes by its finish, or by the chat that carried on in it.
+    assert idle_days(row(90 * hour, section="finished", finished=now - hour), now) == 0
+    assert idle_days(row(hour, section="finished", finished=now - 90 * hour), now) == 0
+    assert idle_days(row(95 * hour, section="finished", finished=now - 90 * hour), now) == 3
+
+    def html(item, part="paused"):
+        overview = WorkOverview(front=front_sections([item], now=now))
+        return render_work_front(templates, overview, part)
+
+    old, fresh = row(90 * hour, section="paused"), row(hour, section="paused")
+    assert "fr-idle" in html(old) and '<span class="fr-idle-age">3d</span>' in html(old)
+    assert "fr-line" not in html(old) and 'value="resume"' not in html(old)
+    assert "fr-idle" not in html(fresh) and 'value="resume"' in html(fresh)
+    assert "fr-idle-age" in html(stop, "stopped") and "fr-line" not in html(stop, "stopped")
+    # The day is in the revision, so a row crossing it is sent again.
+    revisions = {
+        front_sections([item], now=now).paused[0].revision
+        for item in (old, replace(old, card=replace(old.card, last_activity=now - 120 * hour)),
+                     fresh)
+    }
+    assert len(revisions) == 3
+    # Show older and Hidden keep whole rows.
+    hidden = front_sections(
+        [row(90 * hour, section="finished", finished=now - 90 * hour)], now=now,
+        hidden={old.card.work_id},
+    )
+    drawn = render_work_front(templates, WorkOverview(front=hidden), "hidden")
+    assert f'data-work-id="{old.card.work_id}"' in drawn and "fr-idle" not in drawn
 
 
 def _woken(key: str, title: str) -> WorkChat:
@@ -1925,6 +2021,19 @@ async def test_a_maps_page_draws_held_reads_at_once_and_refreshes_behind_it():
     assert ("issue_body", ref.repository, ref.number) in reads.drawn and reads.stale
     await app.state.work_tree_refreshes[ref.work_id]
     assert calls.count("issue_body") == 1 and wm.generation() == generation + 2
+
+    # #4639: a text never read is not waited for on a page open; it is read behind the page,
+    # which is then drawn again once, and a failed read draws nothing again.
+    held["issue_body"] = None
+    for answer, moved in (("First read", 1), (None, 0)):
+        fetched["issue_body"] = answer
+        reads, generation = work_view._TreeReads(ref, issues), wm.generation()
+        calls.clear()
+        assert await reads.read("issue_body", ref.repository, ref.number, wait=False) is None
+        assert calls == [] and reads.stale
+        work_view._refresh_tree(app, ref, reads)
+        await app.state.work_tree_refreshes[ref.work_id]
+        assert calls == ["issue_body"] and wm.generation() == generation + moved
 
 
 @pytest.mark.asyncio

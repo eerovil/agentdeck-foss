@@ -272,6 +272,14 @@ def test_a_filing_assigns_this_decks_person_where_another_deck_takes_unassigned(
     assert json.loads(stdin)["assignees"] == ["me"]
 
 
+def test_a_secret_is_never_filed_as_an_issue(tmp_path, monkeypatch):
+    app, gh = _app(tmp_path, monkeypatch)
+    response = _file(_client(app), message="/secret TOKEN hunter2")
+    assert response.status_code == 422
+    assert "hunter2" not in response.text
+    assert _creates(gh) == []
+
+
 async def _post_and_settle(app, **fields):
     """File through the app's own loop, then let the early start settle (#3590)."""
     import httpx
@@ -455,6 +463,13 @@ async def test_a_codex_account_its_project_names_may_be_picked(tmp_path, monkeyp
 
     assert response.status_code == 200, response.text
     assert picks == [StartChoice("codex:cx", "gpt-6-sol", "ultra")]
+    # The project's own model (#4723) fills a press that picked none, never a Codex pick.
+    from agentdeck import poller_ops
+
+    monkeypatch.setattr(poller_ops, "work_models", lambda root: {"eerovil/agentdeck": "sonnet"})
+    await _post_and_settle(app, client_action_id="press-0002", account_key="codex:cx")
+    await _post_and_settle(app, client_action_id="press-0003")
+    assert picks[1:] == [StartChoice("codex:cx"), StartChoice(model="sonnet")]
 
 
 @pytest.mark.parametrize(
@@ -1180,7 +1195,8 @@ async def test_haiku_picks_a_new_works_project_only_from_the_offered_ones(tmp_pa
     assert "- eerovil/agentdeck (agentdeck)" in prompts[0] and text in prompts[0]
     # An answer the form does not offer moves nothing.
     assert ask(text) == {"repository": ""}
-    # Too little typed, or guessing switched off: no call at all.
+    # Too little typed, a secret (#4610), or guessing switched off: no call at all.
+    assert ask("/secret TOKEN a-value-long-enough-to-be-guessed-from") == {"repository": ""}
     assert ask("fix it") == {"repository": ""}
     app.state.db.record_guessing_enabled(False)
     assert ask(text) == {"repository": ""}

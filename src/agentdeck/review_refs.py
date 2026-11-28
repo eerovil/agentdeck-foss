@@ -14,8 +14,9 @@ import hashlib
 import json
 import logging
 import re
+from functools import lru_cache
 
-from . import gh_cli
+from . import code_lines, gh_cli
 
 log = logging.getLogger(__name__)
 
@@ -37,6 +38,18 @@ TITLE = "Review {repository}#{issue}"
 
 
 DIGEST_UNREADABLE = "unreadable"
+
+#: In every review of a pull request (#4721): the reviewer does not read diagrams. Until then
+#: it checked each one against the head and its issue comment (#3860, #4254), which caught no
+#: bug and cost review rounds: 32 in the week of 18-25 Nov 2026 were only about a diagram's
+#: `classDef` lines. A Work now draws one only when the owner asks. It lives here, not in
+#: ``chat_review``, because the agent reviewer's brief says it too and the public copy keeps
+#: that one.
+DIAGRAM_NOTE = (
+    "Do not review diagrams: leave `docs/diagrams/` files and the issue's comment ending"
+    " `<!-- agentdeck-diagram -->` unread. A missing diagram, one that no longer matches the"
+    " code, and a diagram comment that differs from its file are never a finding."
+)
 
 
 # `owner/repo#123`, or the URL of that issue or its pull request. A person pasting from the
@@ -110,12 +123,15 @@ def normalise(target: str) -> tuple[str, int]:
     return repository, issue
 
 
+@lru_cache(maxsize=16384)
 def review_target(title: str) -> tuple[str, int] | None:
     """Which `owner/repo#N` a chat title is a review of, or None if it is not one (#1881).
 
     The exact inverse of `TITLE`, and deliberately strict: a chat somebody typed into the
     New chat box carries whatever words they used, and reading one of those as a review of
     the card it happens to mention would put a chip on a session about nothing.
+
+    Remembered: one page build asks about every chat on the board (#4639).
     """
     match = _TITLE_RE.match((title or "").strip())
     if match is None:
@@ -265,6 +281,19 @@ async def _read_json(argv: list[str], what: str, *, owner: str | None = None) ->
     return value if isinstance(value, dict) else None
 
 
+async def target_closed(repository: str, number: int) -> bool | None:
+    """Whether a review's target, an issue or a pull request, is closed; None if unreadable.
+
+    The issues endpoint answers for both, and a merged pull request reads as closed (#2838).
+    """
+    value = await _read_json(
+        ["gh", "api", f"repos/{repository}/issues/{number}"],
+        f"{repository}#{number}'s state",
+    )
+    state = (value or {}).get("state")
+    return None if state not in ("open", "closed") else state == "closed"
+
+
 async def pull_facts(repository: str, number: int) -> dict | None:
     """A pull request's state, draft flag, head and base commits and the issues it closes;
     None if it is none."""
@@ -289,16 +318,30 @@ _COMPARE_FILES = 300
 
 async def diff_sizes(repository: str, number: int, heads: tuple[str, ...]) -> dict[str, int]:
     """Changed lines (added plus removed) of a pull request's diff at each of ``heads``, against
-    its base branch as GitHub shows it (#4220). A head left out was unread or too wide."""
+    its base branch as GitHub shows it (#4220), whole-line comments left out when a local
+    checkout can count it (#4812). A head left out was unread or too wide."""
     facts = await _read_json(
-        ["gh", "pr", "view", str(number), "--repo", repository, "--json", "baseRefName"],
+        ["gh", "pr", "view", str(number), "--repo", repository, "--json", "baseRefName,baseRefOid"],
         f"{repository}#{number}",
     )
     base = (facts or {}).get("baseRefName")
     if not isinstance(base, str) or not base:
         return {}
+    base_oid = (facts or {}).get("baseRefOid")
+    wanted = tuple(dict.fromkeys(heads))
+    # Code lines without whole-line comments, counted locally when a checkout here holds
+    # every head (#4812); else GitHub's compare for all of them, as sizes of two kinds
+    # compared with each other would show growth that is only comments.
+    local = [
+        await code_lines.COUNTER.count(
+            repository, base_oid if isinstance(base_oid, str) else "", head
+        )
+        for head in wanted
+    ]
+    if all(counted is not None for counted in local):
+        return {head: counted.total for head, counted in zip(wanted, local, strict=True) if counted}
     sizes: dict[str, int] = {}
-    for head in dict.fromkeys(heads):
+    for head in wanted:
         compare = await _read_json(
             [
                 "gh",

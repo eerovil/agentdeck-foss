@@ -249,6 +249,10 @@
         if (line.dataset.observedActionId || !later(eventPlace(line.dataset.eventId), after) ||
             !words) return false;
         var shown = words.textContent.trim();
+        // A secret's line is the notice with its name (`secret_notice`), never its value.
+        if (card.dataset.secretName) {
+          return shown.indexOf('temporary secret named ' + card.dataset.secretName + ' is') !== -1;
+        }
         // A message voice mode dressed (#4349) shows as its words and the 🎧 mark
         // (hide_voice_line), not the lines it was sent with.
         if (card.dataset.voiced) shown = shown.replace(/\s*\u{1F3A7}$/u, '');
@@ -303,7 +307,12 @@
     var form = composer(side);
     if (sideOn(side)) {
       var input = box(form);
-      if (input) setBox(input, joined(text, input.value));
+      // Words before a /secret typed since would send its value as ordinary text (#4610),
+      // so the failed words are shown with the error instead.
+      if (input && text.trim() && window.AgentDeckSendRetry.isSecretCommand(input.value)) {
+        var error = side.querySelector('[data-side-error]');
+        showError(side, (error ? error.textContent : '') + ' Not sent: ' + text);
+      } else if (input) setBox(input, joined(text, input.value));
       putFiles(picker(form), files.concat(fileList(picker(form))));
       return;
     }
@@ -331,7 +340,11 @@
       ? voice.dress(text, id) : text;
     data.set('message', dressed);
     showError(side, '');
-    var card = pendingCard(side, text, id);
+    // As in the main box: a secret's text is never shown, kept or given back once sent,
+    // so one that failed is typed again (#4610).
+    var label = window.AgentDeckSendRetry.secretLabel(text);
+    var card = pendingCard(side, label || text, id);
+    if (label) card.dataset.secretName = window.AgentDeckSendRetry.secretName(text) || '';
     if (dressed !== text) card.dataset.voiced = '1';
     if (input) setBox(input, '');
     write(sideDraftKey(side), '');
@@ -350,7 +363,7 @@
         // A 4xx is a known refusal; a 5xx may have written, like a lost answer.
         uncertain = response.status >= 500;
         if (response.ok) {
-          delete side._uncertainSend;
+          if (!label) delete side._uncertainSend;
           swapBody(side, payload);
           // Accepted but maybe still queued: the card stays until its line lands.
           var log = side.querySelector('[data-side-view-log]');
@@ -368,6 +381,14 @@
         throw new Error(typeof reason === 'string' && reason ? reason : 'The side chat did not take the message.');
       });
     }).catch(function (error) {
+      if (label) {
+        card.remove();
+        var reason = error.message || 'The side chat could not be reached';
+        showError(side, uncertain
+          ? reason.replace(/[.\s]+$/, '') + '. Re-enter the secret to try again.' : reason);
+        giveBack(side, '', files);
+        return;
+      }
       if (uncertain) side._uncertainSend = { id: id, text: text, files: fileNames(files) };
       else delete side._uncertainSend;
       card.remove();

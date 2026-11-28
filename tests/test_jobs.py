@@ -18,7 +18,7 @@ import conftest as harness
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-from agentdeck import job_scratch
+from agentdeck import deck_notices, job_scratch
 from agentdeck import jobs as jobs_module
 from agentdeck.config import AppConfig, HistoryConfig, JobsConfig
 from agentdeck.host_slots import (
@@ -565,6 +565,47 @@ async def test_only_as_many_jobs_run_at_once_as_there_are_slots(tmp_path):
     final = await _settle(queue, second.id)
     await queue.stop()
     assert final.state == DONE
+
+
+async def test_the_helper_checks_start_at_once_here_beside_a_held_slot(tmp_path):
+    """#4662: an ``agentdeck pre-review-helpers`` job holds the command's own ``helpers``
+    slot, not a heavy one. It starts while every heavy slot is held and suites wait ahead
+    of it, on this host even when submitted for another lane, and never counts as a slot."""
+    queue = _queue(tmp_path, slots=1)
+    outsider = try_take_slot(queue._slots())
+    assert outsider is not None
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    program = bin_dir / "agentdeck"
+    program.write_text(
+        '#!/bin/sh\necho "account=$AGENTDECK_ACCOUNT_KEY tmp=${TMPDIR:-unset}"\n',
+        encoding="utf-8",
+    )
+    program.chmod(0o755)
+    await queue.start()
+    suite = queue.submit(command=[sys.executable, "-c", "print('suite')"], cwd=str(tmp_path))
+    helpers = queue.submit(
+        command=[str(program), "pre-review-helpers", "--pull", "o/r#1"],
+        cwd=str(tmp_path),
+        lane="kube",
+        lane_defaulted=True,
+        session_key="claude_code:alt:abc-123",
+    )
+    assert (helpers.lane, helpers.lane_defaulted) == (LOCAL, False)
+    final = await _settle(queue, helpers.id)
+    assert final.state == DONE and queue.get(suite.id).state == QUEUED
+    assert queue.held_slot_inodes() == {}
+    log_text = Path(final.log_path).read_text()
+    own_tmp = os.environ.get("TMPDIR") or "unset"
+    assert f"account=claude_code:alt tmp={own_tmp}\n" in log_text, "no scratch TMPDIR"
+    os.close(outsider)
+    assert (await _settle(queue, suite.id)).state == DONE
+    await queue.stop()
+    assert jobs_module.is_helpers_command(["/x/.venv/bin/agentdeck", "pre-review-helpers"])
+    assert not jobs_module.is_helpers_command(["agentdeck", "job", "pre-review-helpers"])
+    assert not jobs_module.is_helpers_command(["pytest", "pre-review-helpers"])
+    wrapped = ["timeout", "600", "agentdeck", "pre-review-helpers"]
+    assert not jobs_module.is_helpers_command(wrapped), "only the exact command skips the slot"
 
 
 async def test_a_slot_held_outside_the_queue_still_holds_the_queue_back(tmp_path):
@@ -2379,6 +2420,48 @@ def test_the_message_says_what_happened_without_needing_the_log(tmp_path):
     assert "Failing tests: could not be read." in message
     assert "full set once, on your final commit" in message
 
+    # A verification whose every selected test was quarantined ran nothing (#4776): pytest
+    # exits 5, and the notice says so instead of a failure list it cannot have.
+    log.write_text("no tests ran in 6.05s\nkube_pytest: pytest exited 5\n")
+    quarantined = replace(
+        job,
+        command=["pytest", "-q", "tests/t.py::test_flaky"],
+        exit_code=5,
+        purpose=VERIFICATION,
+        quarantined=("tests/t.py::test_flaky",),
+    )
+    message = job_message(quarantined)
+    assert "Your queued job abc123 ran no tests: every test it selected is quarantined." in (
+        message
+    )
+    assert "nothing was left to run" in message
+    assert "without `--verification`" in message
+    assert "Failing tests" not in message
+    # Still read as the deck's own job notice, not a person's words.
+    assert deck_notices.is_job_message(message)
+    # A command whose own paths collected nothing ran no test for its own reason, even when
+    # the repository has other quarantined tests (#4776 review).
+    for command in (
+        ["pytest", "-q", "tests/empty_dir"],
+        ["pytest", "-q", "tests/other.py::test_new"],
+        ["bin/test.sh"],
+    ):
+        other = job_message(replace(quarantined, command=command))
+        assert "ran no tests" not in other, command
+        assert "Failing tests: could not be read." in other or command == ["bin/test.sh"]
+    # Options and their values do not count as tests chosen.
+    marked = replace(
+        quarantined, command=["pytest", "-q", "-m", "not browser", *quarantined.quarantined]
+    )
+    assert "ran no tests" in job_message(marked)
+    # Nor does a path-shaped option value (#4778 review): the node id alone decides.
+    configured = replace(
+        quarantined, command=["pytest", "-c", "tests/pytest.ini", *quarantined.quarantined]
+    )
+    assert "ran no tests" in job_message(configured)
+    # Exit 5 with nothing left out is an ordinary failure, and still asks for the failures.
+    assert "Failing tests: could not be read." in job_message(replace(quarantined, quarantined=()))
+
 
 def test_a_failed_test_job_names_its_failing_tests_and_asks_for_a_focused_rerun(tmp_path):
     log = tmp_path / "out.log"
@@ -2860,6 +2943,24 @@ def test_a_job_on_a_remote_lane_keeps_its_temp_folder(tmp_path, monkeypatch):
 
     assert jobs_module._child_env(job)["TMPDIR"] == "/var/tmp"
     assert JOB_SCRATCH_ENV not in jobs_module._child_env(job)
+    # #4662: the helper checks run on this host but write no test files, so they take no
+    # scratch folder either, and run as their chat's own Claude account.
+    monkeypatch.setenv("AGENTDECK_ACCOUNT_KEY", "claude_code:main")
+    monkeypatch.setenv("AGENTDECK_URL", "http://127.0.0.1:9999")
+    assert "AGENTDECK_URL" not in jobs_module._child_env(job), "a suite never reaches the deck"
+    helpers = SimpleNamespace(
+        id="h",
+        lane=LOCAL,
+        log_path=tmp_path / "h.log",
+        quarantined=(),
+        command=["/x/agentdeck", "pre-review-helpers"],
+        session_key="claude_code:alt:abc",
+    )
+    env = jobs_module._child_env(helpers)
+    assert env["TMPDIR"] == "/var/tmp" and env["AGENTDECK_ACCOUNT_KEY"] == "claude_code:alt"
+    assert env["AGENTDECK_URL"] == "http://127.0.0.1:9999", "the helpers read its usage"
+    helpers.session_key = "codex:cx:t1"
+    assert "AGENTDECK_ACCOUNT_KEY" not in jobs_module._child_env(helpers)
 
 
 @pytest.mark.parametrize("lane", [LOCAL, "kube"])

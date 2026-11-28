@@ -9,6 +9,7 @@ removed (#2150): the move was characterized, not approximated, and the answers m
 from __future__ import annotations
 
 import json
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -76,7 +77,7 @@ def test_the_runtime_selects_exactly_as_the_poller_did(tmp_path, case):
     for account, pct, resets_in in spec.get("weekly", []):
         _weekly(cache, account, pct=pct, resets_in=resets_in)
 
-    chosen = choose_account(list(spec.get("accounts", [MAIN, ALT])), cache, {}, [], cold=True)
+    chosen = choose_account(list(spec.get("accounts", [MAIN, ALT])), cache, [], cold=True)
 
     assert chosen == spec["expect"]
 
@@ -93,7 +94,7 @@ class _Placement:
         self.account, self.notes = account, notes
 
 
-def _place(tmp_path, *, weekly=(), accounts=(MAIN, ALT), targets=None, circuits=(), five=None):
+def _place(tmp_path, *, weekly=(), accounts=(MAIN, ALT), circuits=(), five=None):
     cache = tmp_path / "usage"
     cache.mkdir(parents=True, exist_ok=True)
     for account in circuits:
@@ -105,7 +106,6 @@ def _place(tmp_path, *, weekly=(), accounts=(MAIN, ALT), targets=None, circuits=
     chosen = choose_account(
         list(accounts),
         cache,
-        dict(targets or {}),
         notes,
         cold=True,
         planned_resets=db.planned_resets(),
@@ -133,21 +133,16 @@ def test_a_new_card_skips_an_account_whose_five_hour_window_is_nearly_full(tmp_p
     assert _place(tmp_path / "reset", weekly=UNEVEN, five={ALT: (95.0, -hour)}).account == ALT
     both = {ALT: (95.0, hour), MAIN: (91.0, hour)}
     assert _place(tmp_path / "both", weekly=UNEVEN, five=both).account == ALT
-    # An account opted out with a target of 0 is not offered the card for having room.
-    opted = _place(tmp_path / "opted", weekly=UNEVEN, targets={MAIN: 0}, five={ALT: (92.0, hour)})
-    assert opted.account == ALT
-    # The leader need not be the full one: an opted-out main ahead of a full alt (review, #3582).
+    # A full account that does not lead moves behind one with room, and the leader stays.
     third = "claude_code:third"
     level = [(name, 85.0, timedelta(hours=160)) for name in (MAIN, ALT, third)]
     three = _place(
         tmp_path / "three",
         weekly=level,
         accounts=(MAIN, ALT, third),
-        targets={MAIN: 0},
         five={ALT: (92.0, hour), third: (50.0, hour)},
     )
-    assert three.account == third
-    assert any("opted out" in note for note in three.notes)
+    assert three.account == MAIN and not three.notes
 
 
 def test_a_new_card_skips_an_account_whose_week_is_nearly_spent(tmp_path):
@@ -183,11 +178,9 @@ def test_equal_paces_keep_the_operators_order(tmp_path):
     assert _place(tmp_path / "close", weekly=close).account == MAIN
 
 
-def test_an_account_past_its_target_or_opted_out_ranks_last(tmp_path):
+def test_an_account_past_its_target_ranks_last(tmp_path):
     weekly = [(MAIN, 96.0, timedelta(hours=10)), (ALT, 50.0, timedelta(hours=150))]
     assert _place(tmp_path / "past", weekly=weekly).account == ALT
-
-    assert _place(tmp_path / "zero", weekly=UNEVEN, targets={ALT: 0}).account == MAIN
 
 
 def test_a_missing_reading_leaves_the_operators_order(tmp_path):
@@ -226,16 +219,50 @@ def test_a_planned_reset_sends_its_account_work_first_until_then(tmp_path):
     # Kept in the deck's database, which is reopened here as the runtime would after
     # a restart (a file in the usage folder was deleted by every runtime restart).
     now = datetime.now(UTC)
-    for case in ("cold", "past", "full"):
+    for case in ("cold", "past", "full", "days"):
         (tmp_path / case).mkdir()
         db = Db(tmp_path / case / "control.db", 30)
-        at = now - timedelta(hours=1) if case == "past" else now + timedelta(hours=15)
+        ahead = timedelta(days=3) if case == "days" else timedelta(hours=15)
+        at = now - timedelta(hours=1) if case == "past" else now + ahead
         db.record_planned_reset(ALT, at)
         db.close()
     assert _place(tmp_path / "cold", weekly=weekly).account == ALT
     assert _place(tmp_path / "past", weekly=weekly).account == MAIN
-    # A target of 0 opts the account out, plan or not (the owner's choice).
-    assert _place(tmp_path / "cold", weekly=weekly, targets={ALT: 0}).account == MAIN
     # Still nothing goes to a window that would refuse the turn.
     full = [(MAIN, 22.0, timedelta(days=6)), (ALT, 100.0, timedelta(days=5))]
     assert _place(tmp_path / "full", weekly=full).account == MAIN
+    # #4717: a plan days ahead, past the usual last-quarter horizon, still sends a nearly
+    # full account work first (its slow pace alone would lose to main's).
+    nearly = [(MAIN, 22.0, timedelta(days=6)), (ALT, 85.0, timedelta(days=5))]
+    assert _place(tmp_path / "none", weekly=nearly).account == MAIN
+    assert _place(tmp_path / "days", weekly=nearly).account == ALT
+
+
+def test_a_bare_clock_time_is_the_hosts_next_one_across_a_clock_change(monkeypatch):
+    """#4717: tomorrow across a clock change, and the second reading of a repeated hour."""
+    from agentdeck.planned_reset import parse_time
+
+    monkeypatch.setenv("TZ", "Europe/Helsinki")
+    time.tzset()
+    try:
+        spring = parse_time("12:00", now=datetime(2027, 3, 27, 12, 0, tzinfo=UTC))
+        # 03:10 for the second time on the night the clocks go back; 03:30 is 20 minutes on.
+        repeated = parse_time("03:30", now=datetime(2026, 10, 25, 1, 10, tzinfo=UTC))
+        dated = parse_time("2026-11-29T14:30", now=datetime(2026, 11, 26, 12, 0, tzinfo=UTC))
+        # The same repeated hour, picked as a date and time: before it, the first 03:30; in
+        # its second run, the one still ahead; after both, refused.
+        second_run = datetime(2026, 10, 25, 1, 10, tzinfo=UTC)
+        dated_first = parse_time("2026-10-25T03:30", now=second_run - timedelta(hours=2))
+        dated_repeated = parse_time("2026-10-25T03:30", now=second_run)
+        with pytest.raises(ValueError, match="already passed"):
+            parse_time("2026-10-25T03:30", now=second_run + timedelta(hours=1))
+        with pytest.raises(ValueError, match="date and time"):
+            parse_time("2026-11-29", now=datetime(2026, 11, 26, 12, 0, tzinfo=UTC))
+    finally:
+        monkeypatch.undo()
+        time.tzset()
+    assert spring.astimezone(UTC) == datetime(2027, 3, 28, 9, 0, tzinfo=UTC)
+    assert repeated.astimezone(UTC) == datetime(2026, 10, 25, 1, 30, tzinfo=UTC)
+    assert dated.astimezone(UTC) == datetime(2026, 11, 29, 12, 30, tzinfo=UTC)
+    assert dated_first.astimezone(UTC) == datetime(2026, 10, 25, 0, 30, tzinfo=UTC)
+    assert dated_repeated.astimezone(UTC) == datetime(2026, 10, 25, 1, 30, tzinfo=UTC)

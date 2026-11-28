@@ -38,6 +38,8 @@ from .jobs import DESKTOP as DESKTOP_LANE
 from .jobs import KUBE as KUBE_LANE
 from .jobs import LANES as JOB_LANES
 from .jobs import LOCAL as LOCAL_LANE
+from .jobs import QUEUED as JOB_QUEUED
+from .jobs import RUNNING as JOB_RUNNING
 from .jobs import (
     canonical_lane,
     default_lane,
@@ -798,7 +800,16 @@ def _job(argv: list[str]) -> int:
     )
     submit.add_argument("command", nargs=argparse.REMAINDER)
 
-    subcommands.add_parser("list", help="show the queue")
+    listing = subcommands.add_parser(
+        "list",
+        help=(
+            f"show the queue: every waiting or running job and the newest finished ones, "
+            f"{JOB_LIST_ROWS} rows in all, each command cut to {JOB_LIST_CHARS} characters"
+        ),
+    )
+    listing.add_argument(
+        "--all", action="store_true", help="every job the queue keeps, with its whole command"
+    )
     status = subcommands.add_parser("status", help="show one job")
     status.add_argument("job_id")
     logs = subcommands.add_parser("logs", help="print a job's output")
@@ -818,8 +829,8 @@ def _job(argv: list[str]) -> int:
         if args.subcommand == "submit":
             return _job_submit(parser, socket_path, args)
         if args.subcommand == "list":
-            for job in list_jobs(socket_path):
-                print(_job_line(job))
+            for line in _job_list(list_jobs(socket_path), everything=args.all):
+                print(line)
             return 0
         if args.subcommand == "status":
             print(_job_line(get_job(socket_path, args.job_id)))
@@ -1368,11 +1379,41 @@ def _job_wait(socket_path: Path, job: dict) -> int:
         time.sleep(JOB_POLL_S)
 
 
-def _job_line(job: dict) -> str:
+#: What ``agentdeck job list`` prints by default (#4754): the whole queue was 172k characters,
+#: read into a chat's context by every agent that checks for a run on its head.
+JOB_LIST_ROWS = 20
+JOB_LIST_CHARS = 200
+
+
+def _job_list(jobs: list[dict], *, everything: bool = False) -> list[str]:
+    """The queue's lines, oldest first. By default every job still waiting or running and the
+    newest finished ones, ``JOB_LIST_ROWS`` in all (more only when more are waiting or
+    running), with a last line saying how many were left out."""
+    if everything:
+        return [_job_line(job) for job in jobs]
+    live = sum(1 for job in jobs if job.get("state") in (JOB_QUEUED, JOB_RUNNING))
+    spare = max(JOB_LIST_ROWS - live, 0)
+    shown = []
+    for job in reversed(jobs):
+        finished = job.get("state") not in (JOB_QUEUED, JOB_RUNNING)
+        if finished and not spare:
+            continue
+        spare -= finished
+        shown.append(job)
+    lines = [_job_line(job, JOB_LIST_CHARS) for job in reversed(shown)]
+    if len(shown) < len(jobs):
+        lines.append(f"({len(jobs) - len(shown)} older finished jobs not shown; --all lists them)")
+    return lines
+
+
+def _job_line(job: dict, command_chars: int = 0) -> str:
     parts = [job["id"], job["state"]]
     if job.get("exit_code") is not None:
         parts.append(f"exit={job['exit_code']}")
-    parts.append(job.get("label") or " ".join(job.get("command", [])))
+    command = job.get("label") or " ".join(job.get("command", []))
+    if command_chars and len(command) > command_chars:
+        command = command[: command_chars - 1] + "…"
+    parts.append(command)
     if job.get("purpose") == "verification":
         from .poller_engine.verification import describe, snapshots_tested
 

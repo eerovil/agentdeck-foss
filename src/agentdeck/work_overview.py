@@ -557,6 +557,10 @@ class WorkCard:
     # The issue carries the ``parked`` label (``work_derived.PARKED_LABEL``): a person asked
     # its agent to leave it until they write (#3560).
     parked_label: bool = False
+    # The issue has sub-issues (``work_tree.sub_issue_counts``): a parent or a map (#4631).
+    has_sub_issues: bool = False
+    # A pull request a chat registered may still be open (``WorkFacts``, #4631).
+    unsettled_registered: bool = False
     # The labels on its cached issue, as GitHub spells them: a deck-run Work reads its
     # project's spec-only label from them (#3247).
     labels: tuple[str, ...] = ()
@@ -632,6 +636,8 @@ def build_work_card(
     ``jobs`` are its chats' unfinished jobs (``work_jobs``, #2573). ``paused_label`` is the
     project manifest's (#2944).
     """
+    from .work_tree import sub_issue_counts  # imports the story, which imports this module
+
     facts = facts or WorkFacts(ref)
     finished_at = facts.finished_at
     work_id = ref.work_id
@@ -695,6 +701,8 @@ def build_work_card(
         jobs=tuple(jobs),
         scheduled=carries_label(facts.record, SCHEDULE_LABEL),
         parked_label=carries_label(facts.record, PARKED_LABEL),
+        unsettled_registered=facts.unsettled_registered,
+        has_sub_issues=sub_issue_counts(facts.record) is not None,
         labels=_labels(facts.record),
         issue_title=_issue_title(facts.record),
         reopened=_reopened(facts.record),

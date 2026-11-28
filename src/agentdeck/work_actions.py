@@ -15,7 +15,8 @@ Work does not offer at that moment, and a Work that needs nobody offers nothing.
 - ``merge`` is the deck's own release of a Work it runs (``work_release``, #2895).
 - ``start`` adds the repository's ownership label to an issue no agent works on (#3558), so
   its Poller or the deck starts a Work on it as on any labelled issue.
-- ``close`` closes the source issue; ``chatgpt_review`` and ``agent_review`` are
+- ``close`` closes the source issue, of a Work not started (#3562) or one whose merges are
+  done (#4631); ``chatgpt_review`` and ``agent_review`` are
   ``chat_review.open_review``, the review chat the chat board already opens.
 - ``approve_merge`` is Merge pressed before the Work is ready (#3320): the deck merges once the
   review passes the same diffs and the tests are green; ``withdraw_merge`` takes it back. Like
@@ -55,6 +56,7 @@ from .work_attention import (
     RESUME,
     REVIEW,
     START,
+    UNSTARTED,
     OperatorAttention,
 )
 from .work_hidden import UNHIDE
@@ -601,7 +603,13 @@ def buttons(
     found: list[ActionButton] = []
     for action in attention.actions:
         if action in WRITES:
-            found.append(ActionButton(action, LABELS[action], confirm=CONFIRMS.get(action, "")))
+            confirm = CONFIRMS.get(action, "")
+            merged = any(output.state == "merged" for output in card.outputs)
+            if action == CLOSE and attention.category != UNSTARTED and merged:
+                # Its merges are done (#4631): reopening the issue undoes it. With nothing
+                # merged the work may be half done, so it asks first.
+                confirm = ""
+            found.append(ActionButton(action, LABELS[action], confirm=confirm))
         elif action == ANSWER:
             href = "#work-message" if page else f"{card.href}#work-message"
             # Only a question is answered; a deck-run Work's stopped, died, closed or merged
@@ -612,6 +620,10 @@ def buttons(
             label = LABELS[action] if asks else "Message"
             found.append(ActionButton(action, label, href))
         elif action == OPEN:
+            if page and where_href and {ANSWER, CLOSE} <= set(attention.actions):
+                # The You line under it links the same chat; four controls wrap on a phone
+                # (#4631).
+                continue
             found.append(ActionButton(action, LABELS[action], where_href or card.href))
         elif action == INSPECT and not page:
             found.append(ActionButton(action, LABELS[action], card.href))
